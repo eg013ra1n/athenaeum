@@ -16,6 +16,7 @@ export enum ImageType {
 export interface File {
   id: number | null;
   path: string;
+  filename: string;
   size: number;
   modified_at: string; // ISO 8601 datetime
   format: FileFormat;
@@ -116,4 +117,9 @@ export interface ScanResult {
 export interface FileWithFrame {
   file: File;
   frame: Frame | null;
+}
+
+export interface DirectoryContents {
+  subdirectories: string[];
+  files: FileWithFrame[];
 }

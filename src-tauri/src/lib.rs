@@ -30,7 +30,9 @@ pub fn run() {
             commands::delete_scan_root,
             commands::start_scan,
             commands::get_files,
+            commands::get_files_by_directory,
             commands::get_duplicates,
+            commands::get_directory_contents,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

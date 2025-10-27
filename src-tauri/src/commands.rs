@@ -41,6 +41,12 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
+    // Check if path already exists
+    let existing_roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
+    if existing_roots.iter().any(|r| r.path == path) {
+        return Err("This directory is already being monitored".to_string());
+    }
+
     let id = db::upsert_scan_root(&conn, &path).map_err(|e| e.to_string())?;
 
     Ok(ScanRoot {
@@ -140,6 +146,55 @@ pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateG
     db::find_duplicate_groups(&conn).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_directory_contents(
+    directory_path: String,
+    state: State<'_, AppState>,
+) -> Result<DirectoryContents, String> {
+    use std::fs;
+
+    let path = Path::new(&directory_path);
+
+    if !path.exists() {
+        return Err("Directory does not exist".to_string());
+    }
+
+    let mut subdirectories = Vec::new();
+    let mut files_in_dir = Vec::new();
+
+    let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let entry_path = entry.path();
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+
+        if metadata.is_dir() {
+            subdirectories.push(entry_path.to_string_lossy().to_string());
+        }
+    }
+
+    // Get files from database for this directory
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let db_files = db::get_files_by_directory(&conn, &directory_path, None)
+        .map_err(|e| e.to_string())?;
+
+    files_in_dir = db_files
+        .into_iter()
+        .map(|(file, frame)| FileWithFrame { file, frame })
+        .collect();
+
+    subdirectories.sort();
+
+    Ok(DirectoryContents {
+        subdirectories,
+        files: files_in_dir,
+    })
+}
+
 // DTOs for serialization
 #[derive(serde::Serialize)]
 pub struct ScanResultDto {
@@ -153,4 +208,10 @@ pub struct ScanResultDto {
 pub struct FileWithFrame {
     pub file: File,
     pub frame: Option<Frame>,
+}
+
+#[derive(serde::Serialize)]
+pub struct DirectoryContents {
+    pub subdirectories: Vec<String>,
+    pub files: Vec<FileWithFrame>,
 }

@@ -7,13 +7,26 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL UNIQUE,
+            filename TEXT NOT NULL DEFAULT '',
             size INTEGER NOT NULL,
             modified_at TEXT NOT NULL,
             format TEXT NOT NULL CHECK(format IN ('FITS', 'XISF')),
-            content_hash TEXT NOT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
             duplicate_group_id INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
+        [],
+    )?;
+
+    // Add filename column to existing tables (migration)
+    let _ = conn.execute(
+        "ALTER TABLE files ADD COLUMN filename TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+
+    // Backfill filename from path for existing records
+    conn.execute(
+        "UPDATE files SET filename = SUBSTR(path, INSTR(path, '/') + 1) WHERE filename = ''",
         [],
     )?;
 
@@ -116,7 +129,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 
     // Create indexes for common queries
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
         [],
     )?;
     conn.execute(

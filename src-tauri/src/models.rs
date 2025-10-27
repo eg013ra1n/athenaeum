@@ -6,10 +6,11 @@ use chrono::{DateTime, Utc};
 pub struct File {
     pub id: Option<i64>,
     pub path: String,
+    pub filename: String,
     pub size: i64,
     pub modified_at: DateTime<Utc>,
     pub format: FileFormat,
-    pub content_hash: String, // xxHash XXH3_64 or XXH3_128
+    pub content_hash: String, // Kept for backwards compatibility, no longer computed
     pub duplicate_group_id: Option<i64>,
     pub created_at: DateTime<Utc>,
 }

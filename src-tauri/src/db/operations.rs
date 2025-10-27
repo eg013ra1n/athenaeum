@@ -7,10 +7,11 @@ use rusqlite::{params, Connection, Result};
 /// Insert a new file record
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
     conn.execute(
-        "INSERT INTO files (path, size, modified_at, format, content_hash, duplicate_group_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO files (path, filename, size, modified_at, format, content_hash, duplicate_group_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             file.path,
+            file.filename,
             file.size,
             file.modified_at.to_rfc3339(),
             format!("{:?}", file.format),
@@ -103,9 +104,24 @@ pub fn update_scan_root_timestamp(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Delete a scan root
+/// Delete a scan root and all associated files
 pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
+    // First, get the path of the scan root
+    let path: String = conn.query_row(
+        "SELECT path FROM scan_roots WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+
+    // Delete all files under this path (frames will be cascade deleted due to foreign key)
+    conn.execute(
+        "DELETE FROM files WHERE path LIKE ?1 || '%'",
+        params![path],
+    )?;
+
+    // Delete the scan root
     conn.execute("DELETE FROM scan_roots WHERE id = ?1", params![id])?;
+
     Ok(())
 }
 
@@ -117,7 +133,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
     };
 
     let query = format!(
-        "SELECT f.id, f.path, f.size, f.modified_at, f.format, f.content_hash, f.duplicate_group_id, f.created_at,
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.content_hash, f.duplicate_group_id, f.created_at,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
@@ -132,35 +148,36 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
         let file = File {
             id: Some(row.get(0)?),
             path: row.get(1)?,
-            size: row.get(2)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+            filename: row.get(2)?,
+            size: row.get(3)?,
+            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
                 .unwrap()
                 .with_timezone(&Utc),
-            format: if row.get::<_, String>(4)? == "FITS" {
+            format: if row.get::<_, String>(5)? == "FITS" {
                 FileFormat::FITS
             } else {
                 FileFormat::XISF
             },
-            content_hash: row.get(5)?,
-            duplicate_group_id: row.get(6)?,
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(7)?)
+            content_hash: row.get(6)?,
+            duplicate_group_id: row.get(7)?,
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(8)?)
                 .unwrap()
                 .with_timezone(&Utc),
         };
 
-        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(8) {
+        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(9) {
             frame_id.map(|fid| Frame {
                 id: Some(fid),
                 file_id: file.id.unwrap(),
-                object: row.get(9).ok(),
-                date_obs: row.get::<_, Option<String>>(10).ok().flatten().and_then(|s| {
+                object: row.get(10).ok(),
+                date_obs: row.get::<_, Option<String>>(11).ok().flatten().and_then(|s| {
                     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                 }),
-                telescop: row.get(11).ok(),
-                instrume: row.get(12).ok(),
-                exptime: row.get(13).ok(),
-                filter: row.get(14).ok(),
-                imagetyp: row.get::<_, Option<String>>(15).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+                telescop: row.get(12).ok(),
+                instrume: row.get(13).ok(),
+                exptime: row.get(14).ok(),
+                filter: row.get(15).ok(),
+                imagetyp: row.get::<_, Option<String>>(16).ok().flatten().and_then(|s| ImageType::from_str(&s)),
                 gain: None,
                 offset: None,
                 binning: None,
@@ -192,7 +209,7 @@ pub fn get_files_by_directory(
     };
 
     let query = format!(
-        "SELECT f.id, f.path, f.size, f.modified_at, f.format, f.content_hash, f.duplicate_group_id, f.created_at,
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.content_hash, f.duplicate_group_id, f.created_at,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
@@ -208,35 +225,36 @@ pub fn get_files_by_directory(
         let file = File {
             id: Some(row.get(0)?),
             path: row.get(1)?,
-            size: row.get(2)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+            filename: row.get(2)?,
+            size: row.get(3)?,
+            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
                 .unwrap()
                 .with_timezone(&Utc),
-            format: if row.get::<_, String>(4)? == "FITS" {
+            format: if row.get::<_, String>(5)? == "FITS" {
                 FileFormat::FITS
             } else {
                 FileFormat::XISF
             },
-            content_hash: row.get(5)?,
-            duplicate_group_id: row.get(6)?,
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(7)?)
+            content_hash: row.get(6)?,
+            duplicate_group_id: row.get(7)?,
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(8)?)
                 .unwrap()
                 .with_timezone(&Utc),
         };
 
-        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(8) {
+        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(9) {
             frame_id.map(|fid| Frame {
                 id: Some(fid),
                 file_id: file.id.unwrap(),
-                object: row.get(9).ok(),
-                date_obs: row.get::<_, Option<String>>(10).ok().flatten().and_then(|s| {
+                object: row.get(10).ok(),
+                date_obs: row.get::<_, Option<String>>(11).ok().flatten().and_then(|s| {
                     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                 }),
-                telescop: row.get(11).ok(),
-                instrume: row.get(12).ok(),
-                exptime: row.get(13).ok(),
-                filter: row.get(14).ok(),
-                imagetyp: row.get::<_, Option<String>>(15).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+                telescop: row.get(12).ok(),
+                instrume: row.get(13).ok(),
+                exptime: row.get(14).ok(),
+                filter: row.get(15).ok(),
+                imagetyp: row.get::<_, Option<String>>(16).ok().flatten().and_then(|s| ImageType::from_str(&s)),
                 gain: None,
                 offset: None,
                 binning: None,
@@ -256,14 +274,15 @@ pub fn get_files_by_directory(
     results.collect()
 }
 
-/// Find duplicates by size and hash
+/// Find duplicates by filename and metadata
 pub fn find_duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
     let mut stmt = conn.prepare(
-        "SELECT size, content_hash, COUNT(*) as count, GROUP_CONCAT(path, '|') as paths
-         FROM files
-         GROUP BY size, content_hash
+        "SELECT f.filename, f.size, COUNT(*) as count, GROUP_CONCAT(f.path, '|') as paths
+         FROM files f
+         LEFT JOIN frames fr ON f.id = fr.file_id
+         GROUP BY f.filename, fr.object, fr.telescop, fr.instrume, fr.filter, fr.exptime
          HAVING count > 1
-         ORDER BY count DESC, size DESC"
+         ORDER BY count DESC, f.size DESC"
     )?;
 
     let groups = stmt.query_map([], |row| {
@@ -272,8 +291,8 @@ pub fn find_duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
 
         Ok(DuplicateGroup {
             id: None,
-            size: row.get(0)?,
-            content_hash: row.get(1)?,
+            size: row.get(1)?,
+            content_hash: row.get(0)?, // Using filename as identifier
             file_count: row.get(2)?,
             file_paths,
         })

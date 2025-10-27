@@ -2,7 +2,6 @@
 // Handles directory traversal and metadata extraction
 
 use crate::db::{file_exists, insert_file, insert_frame};
-use crate::duplicates::compute_xxhash;
 use crate::fits_parser::{parse_fits, parse_xisf};
 use crate::models::{File, FileFormat};
 use chrono::Utc;
@@ -111,17 +110,22 @@ fn process_file(path: &PathBuf, conn: &Connection) -> anyhow::Result<()> {
         FileFormat::FITS
     };
 
-    // Compute hash
-    let content_hash = compute_xxhash(path)?;
+    // Extract filename for duplicate detection
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
 
     // Insert file record
     let file = File {
         id: None,
         path: path.to_string_lossy().to_string(),
+        filename,
         size,
         modified_at: modified_dt,
         format: format.clone(),
-        content_hash,
+        content_hash: String::new(), // No longer using hashing
         duplicate_group_id: None,
         created_at: Utc::now(),
     };

@@ -142,7 +142,7 @@ export function useFiles(limit?: number) {
   const fetchFiles = useCallback(async () => {
     try {
       setLoading(true);
-      const result = await invoke<FileWithFrame[]>('get_files', { limit });
+      const result = await invoke<FileWithFrame[]>('get_files', { limit: limit || null });
       setFiles(result);
       setError(null);
     } catch (e) {
@@ -177,7 +177,7 @@ export function useFilesByDirectory(directoryPath: string, limit?: number) {
       setLoading(true);
       const result = await invoke<FileWithFrame[]>('get_files_by_directory', {
         directory_path: directoryPath,
-        limit
+        limit: limit || null
       });
       setFiles(result);
       setError(null);

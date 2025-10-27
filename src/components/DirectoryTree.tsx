@@ -1,195 +1,276 @@
-import { useState, useMemo } from 'react';
-import { ChevronRight, ChevronDown, Folder, File as FileIcon } from 'lucide-react';
-import type { FileWithFrame } from '../types/models';
-
-interface DirectoryNode {
-  name: string;
-  path: string;
-  isDirectory: boolean;
-  children: Map<string, DirectoryNode>;
-  files: FileWithFrame[];
-}
+import { useState, useEffect, useMemo } from 'react';
+import { Folder, File as FileIcon, ArrowLeft, AlertCircle, Copy, Check } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import type { ScanRoot, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
 
 interface DirectoryTreeProps {
-  files: FileWithFrame[];
+  scanRoots: ScanRoot[];
+  duplicates: DuplicateGroup[];
+  refreshTrigger: number;
 }
 
-function buildTree(files: FileWithFrame[]): DirectoryNode {
-  // Determine common base path of all files to use as tree root
-  const commonPrefix = (() => {
-    if (files.length === 0) return '';
-    const splitPaths = files.map(f => f.file.path.split('/').filter(Boolean));
-    let prefix: string[] = [];
-    for (let i = 0; ; i++) {
-      const segment = splitPaths[0][i];
-      if (!segment) break;
-      if (splitPaths.every(p => p[i] === segment)) {
-        prefix.push(segment);
-      } else {
-        break;
-      }
-    }
-    return prefix.join('/');
-  })();
+export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }: DirectoryTreeProps) {
+  const [currentPath, setCurrentPath] = useState<string>('');
+  const [contents, setContents] = useState<DirectoryContents | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
-  const root: DirectoryNode = {
-    name: commonPrefix || 'root',
-    path: commonPrefix,
-    isDirectory: true,
-    children: new Map(),
-    files: [],
+  // Create a set of filenames that have duplicates for quick lookup
+  const duplicateFilenames = useMemo(() => {
+    const set = new Set<string>();
+    duplicates.forEach(group => {
+      // The content_hash field now contains the filename
+      set.add(group.content_hash);
+    });
+    return set;
+  }, [duplicates]);
+
+  // Load directory contents
+  const loadDirectory = async (path: string) => {
+    if (!path) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const result = await invoke<DirectoryContents>('get_directory_contents', {
+        directoryPath: path
+      });
+      setContents(result);
+      setCurrentPath(path);
+    } catch (e) {
+      setError(e as string);
+      setContents(null);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  files.forEach((fileWithFrame) => {
-    const parts = fileWithFrame.file.path.split('/');
-    let currentNode = root;
-
-    // Navigate/create directories
-    for (let i = 0; i < parts.length - 1; i++) {
-      const dirName = parts[i];
-      if (!dirName) continue; // Skip empty parts (from leading /)
-
-      if (!currentNode.children.has(dirName)) {
-        const dirPath = parts.slice(0, i + 1).join('/');
-        currentNode.children.set(dirName, {
-          name: dirName,
-          path: dirPath,
-          isDirectory: true,
-          children: new Map(),
-          files: [],
-        });
-      }
-      currentNode = currentNode.children.get(dirName)!;
+  // Initialize with first scan root
+  useEffect(() => {
+    if (scanRoots.length > 0 && !currentPath) {
+      loadDirectory(scanRoots[0].path);
     }
+  }, [scanRoots, currentPath]);
 
-    // Add file to the final directory
-    currentNode.files.push(fileWithFrame);
-  });
+  // Refresh when trigger changes
+  useEffect(() => {
+    if (currentPath && refreshTrigger > 0) {
+      loadDirectory(currentPath);
+    }
+  }, [refreshTrigger]);
 
-  return root;
-}
+  // Navigate up one level
+  const goUp = () => {
+    const parentPath = currentPath.split('/').slice(0, -1).join('/');
+    if (parentPath) {
+      loadDirectory(parentPath);
+    }
+  };
 
-interface TreeNodeProps {
-  node: DirectoryNode;
-  level: number;
-}
+  // Navigate to subdirectory
+  const navigateToDirectory = (dirPath: string) => {
+    loadDirectory(dirPath);
+  };
 
-function collectFiles(node: DirectoryNode): FileWithFrame[] {
-  let all: FileWithFrame[] = [...node.files];
-  node.children.forEach(child => {
-    all = all.concat(collectFiles(child));
-  });
-  return all;
-}
+  // Copy path to clipboard
+  const copyPathToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(currentPath);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (error) {
+      console.error('Failed to copy path:', error);
+    }
+  };
 
-function TreeNode({ node, level }: TreeNodeProps) {
-  const [expanded, setExpanded] = useState(level === 0);
+  // Check if current path is a root path
+  const isAtRoot = scanRoots.some(root => root.path === currentPath);
 
-  const totalFiles = useMemo(() => {
-    const countFiles = (n: DirectoryNode): number => {
-      let count = n.files.length;
-      n.children.forEach((child) => {
-        count += countFiles(child);
-      });
-      return count;
-    };
-    return countFiles(node);
-  }, [node]);
-
-  if (level === 0) {
-    // Root node - just render children
-    return (
-      <div className="space-y-1">
-        {Array.from(node.children.values()).map((child) => (
-          <TreeNode key={child.path} node={child} level={level + 1} />
-        ))}
-      </div>
-    );
-  }
+  // Get current directory name
+  const currentDirName = currentPath.split('/').pop() || currentPath;
 
   return (
-    <div>
-      {/* Directory Header */}
-      <div
-        className="flex items-center gap-2 py-2 px-3 hover:bg-gray-700 rounded cursor-pointer transition group"
-        style={{ paddingLeft: `${level * 1.5}rem` }}
-        onClick={() => setExpanded(!expanded)}
-      >
-        <div className="flex-shrink-0">
-          {expanded ? (
-            <ChevronDown size={16} className="text-gray-400" />
-          ) : (
-            <ChevronRight size={16} className="text-gray-400" />
+    <div className="bg-gray-800 rounded-lg overflow-hidden">
+      {/* Header with navigation */}
+      <div className="bg-gray-750 border-b border-gray-700 p-4">
+        <div className="flex items-center gap-3 mb-3">
+          <button
+            onClick={goUp}
+            disabled={isAtRoot || loading}
+            className="flex items-center gap-2 px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <ArrowLeft size={16} />
+            Back
+          </button>
+          <div className="flex-1 flex items-center gap-2 min-w-0">
+            <Folder size={20} className="text-blue-400 flex-shrink-0" />
+            <span className="font-mono text-sm text-gray-300 truncate" title={currentPath}>
+              {currentPath || 'Select a directory'}
+            </span>
+            {currentPath && (
+              <button
+                onClick={copyPathToClipboard}
+                className="flex items-center gap-1 px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs transition flex-shrink-0"
+                title="Copy path to clipboard"
+              >
+                {copied ? (
+                  <>
+                    <Check size={14} className="text-green-400" />
+                    <span className="text-green-400">Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy size={14} />
+                    <span>Copy</span>
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+          {contents && (
+            <span className="text-sm text-gray-400 flex-shrink-0">
+              {contents.subdirectories.length} folders, {contents.files.length} files
+            </span>
           )}
         </div>
-        <Folder size={16} className="text-blue-400 flex-shrink-0" />
-        <span className="font-medium text-sm flex-1 truncate">{node.name}</span>
-        <span className="text-xs text-gray-500 flex-shrink-0">
-          {totalFiles} {totalFiles === 1 ? 'file' : 'files'}
-        </span>
-      </div>
 
-      {/* Expanded Content */}
-      {expanded && (
-        <div className="space-y-1">
-          {/* Child Directories */}
-          {Array.from(node.children.values()).map((child) => (
-            <TreeNode key={child.path} node={child} level={level + 1} />
-          ))}
-
-          {/* Files in this directory */}
-          {collectFiles(node).map((fileWithFrame, idx) => (
-            <div
-              key={fileWithFrame.file.id || idx}
-              className="flex items-center gap-2 py-2 px-3 hover:bg-gray-750 rounded transition group"
-              style={{ paddingLeft: `${(level + 1) * 1.5}rem` }}
+        {/* Root selector */}
+        <div className="flex gap-2 flex-wrap">
+          {scanRoots.map(root => (
+            <button
+              key={root.id}
+              onClick={() => loadDirectory(root.path)}
+              className={`px-3 py-1 rounded text-sm transition ${
+                currentPath === root.path
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              }`}
             >
-              <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
-              <div className="flex-1 min-w-0 grid grid-cols-7 gap-4 items-center text-sm">
-                <span className="font-mono text-xs truncate col-span-2" title={fileWithFrame.file.path}>
-                  {fileWithFrame.file.path.split('/').pop()}
-                </span>
-                <span className="truncate text-gray-300" title={fileWithFrame.frame?.object}>
-                  {fileWithFrame.frame?.object || '-'}
-                </span>
-                <span className="truncate text-gray-400 text-xs">
-                  {fileWithFrame.frame?.telescop || '-'}
-                </span>
-                <span className="truncate text-gray-400 text-xs">
-                  {fileWithFrame.frame?.filter || '-'}
-                </span>
-                <span className="text-right text-gray-400 text-xs">
-                  {fileWithFrame.frame?.exptime ? `${fileWithFrame.frame.exptime}s` : '-'}
-                </span>
-                <span className="text-right text-gray-500 text-xs">
-                  {(fileWithFrame.file.size / 1024 / 1024).toFixed(1)} MB
-                </span>
-              </div>
-            </div>
+              {root.path.split('/').pop() || root.path}
+            </button>
           ))}
         </div>
-      )}
-    </div>
-  );
-}
-
-export default function DirectoryTree({ files }: DirectoryTreeProps) {
-  const tree = useMemo(() => buildTree(files), [files]);
-
-  return (
-    <div className="bg-gray-800 rounded-lg p-4">
-      <div className="mb-3 px-3">
-        <div className="grid grid-cols-7 gap-4 text-xs font-semibold text-gray-400 uppercase">
-          <span className="col-span-2">Filename</span>
-          <span>Object</span>
-          <span>Telescope</span>
-          <span>Filter</span>
-          <span className="text-right">Exposure</span>
-          <span className="text-right">Size</span>
-        </div>
       </div>
-      <div className="border-t border-gray-700 pt-2">
-        <TreeNode node={tree} level={0} />
+
+      {/* Content area */}
+      <div className="p-4">
+        {loading && (
+          <div className="text-center py-12 text-gray-400">
+            Loading directory...
+          </div>
+        )}
+
+        {error && (
+          <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 mb-4">
+            <div className="flex items-center gap-2 text-red-400">
+              <AlertCircle size={20} />
+              <span>Error: {error}</span>
+            </div>
+          </div>
+        )}
+
+        {!loading && contents && (
+          <div className="space-y-4">
+            {/* Subdirectories */}
+            {contents.subdirectories.length > 0 && (
+              <div>
+                <h3 className="text-sm font-semibold text-gray-400 mb-2 uppercase">Folders</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                  {contents.subdirectories.map((subdir) => (
+                    <button
+                      key={subdir}
+                      onClick={() => navigateToDirectory(subdir)}
+                      className="flex items-center gap-3 p-3 bg-gray-750 hover:bg-gray-700 rounded-lg transition text-left group"
+                    >
+                      <Folder size={20} className="text-blue-400 flex-shrink-0" />
+                      <span className="text-sm truncate font-mono group-hover:text-blue-300">
+                        {subdir.split('/').pop()}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Files */}
+            {contents.files.length > 0 && (
+              <div>
+                <h3 className="text-sm font-semibold text-gray-400 mb-2 uppercase">Files</h3>
+                <div className="bg-gray-750 rounded-lg overflow-hidden">
+                  {/* Table header */}
+                  <div className="grid grid-cols-12 gap-4 px-4 py-3 bg-gray-800 text-xs font-semibold text-gray-400 uppercase border-b border-gray-700">
+                    <div className="col-span-4">Filename</div>
+                    <div className="col-span-2">Object</div>
+                    <div className="col-span-2">Telescope</div>
+                    <div className="col-span-1">Filter</div>
+                    <div className="col-span-1 text-right">Exposure</div>
+                    <div className="col-span-1 text-right">Type</div>
+                    <div className="col-span-1 text-right">Size</div>
+                  </div>
+
+                  {/* File rows */}
+                  <div className="divide-y divide-gray-700">
+                    {contents.files.map((item, idx) => {
+                      const hasDuplicate = duplicateFilenames.has(item.file.filename);
+
+                      return (
+                        <div
+                          key={item.file.id || idx}
+                          className="grid grid-cols-12 gap-4 px-4 py-3 hover:bg-gray-700 transition items-center"
+                        >
+                          <div className="col-span-4 flex items-center gap-2 min-w-0">
+                            <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
+                            {hasDuplicate && (
+                              <AlertCircle size={14} className="text-yellow-500 flex-shrink-0" title="Duplicate file" />
+                            )}
+                            <span className="font-mono text-sm truncate" title={item.file.filename}>
+                              {item.file.filename}
+                            </span>
+                          </div>
+                          <div className="col-span-2 truncate text-sm text-gray-300">
+                            {item.frame?.object || '-'}
+                          </div>
+                          <div className="col-span-2 truncate text-sm text-gray-400">
+                            {item.frame?.telescop || '-'}
+                          </div>
+                          <div className="col-span-1 truncate text-sm text-gray-400">
+                            {item.frame?.filter || '-'}
+                          </div>
+                          <div className="col-span-1 text-right text-sm text-gray-400">
+                            {item.frame?.exptime ? `${item.frame.exptime}s` : '-'}
+                          </div>
+                          <div className="col-span-1 text-right">
+                            {item.frame?.imagetyp && (
+                              <span className={`px-2 py-0.5 rounded text-xs ${
+                                item.frame.imagetyp === 'Light'
+                                  ? 'bg-blue-900 text-blue-200'
+                                  : 'bg-gray-700 text-gray-300'
+                              }`}>
+                                {item.frame.imagetyp}
+                              </span>
+                            )}
+                          </div>
+                          <div className="col-span-1 text-right text-sm text-gray-500">
+                            {(item.file.size / 1024 / 1024).toFixed(1)} MB
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Empty state */}
+            {contents.subdirectories.length === 0 && contents.files.length === 0 && (
+              <div className="text-center py-12 text-gray-500">
+                No folders or files found in this directory.
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
