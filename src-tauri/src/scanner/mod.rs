@@ -125,8 +125,6 @@ fn process_file(path: &PathBuf, conn: &Connection) -> anyhow::Result<()> {
         size,
         modified_at: modified_dt,
         format: format.clone(),
-        content_hash: String::new(), // No longer using hashing
-        duplicate_group_id: None,
         created_at: Utc::now(),
     };
 

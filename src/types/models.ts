@@ -20,8 +20,6 @@ export interface File {
   size: number;
   modified_at: string; // ISO 8601 datetime
   format: FileFormat;
-  content_hash: string;
-  duplicate_group_id: number | null;
   created_at: string; // ISO 8601 datetime
 }
 
@@ -42,7 +40,19 @@ export interface Frame {
   ybinning: number | null;
   ccd_temp: number | null;
   set_temp: number | null;
-  focal_length: number | null;
+  focallen: number | null;
+  xpixsz: number | null;
+  pixsz: number | null;
+  ra: number | null;
+  dec: number | null;
+  sitelat: number | null;
+  lat_obs: number | null;
+  sitelong: number | null;
+  long_obs: number | null;
+  objctra: string | null;
+  objctdec: string | null;
+  override_: boolean;
+  calibration_set_id: number | null;
 }
 
 export interface Day {
@@ -122,4 +132,29 @@ export interface FileWithFrame {
 export interface DirectoryContents {
   subdirectories: string[];
   files: FileWithFrame[];
+}
+
+export interface Project {
+  id: number | null;
+  name: string;
+}
+
+export interface FramesSet {
+  id: number | null;
+  name: string | null;
+  date_obs: string | null;
+  objctra: string | null;
+  objctdec: string | null;
+  project_id: number;
+}
+
+export interface FramesSetMember {
+  frames_set_id: number;
+  frame_id: number;
+}
+
+export interface FitsHeader {
+  id: number | null;
+  file_id: number;
+  header: string;
 }

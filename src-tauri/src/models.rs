@@ -10,8 +10,6 @@ pub struct File {
     pub size: i64,
     pub modified_at: DateTime<Utc>,
     pub format: FileFormat,
-    pub content_hash: String, // Kept for backwards compatibility, no longer computed
-    pub duplicate_group_id: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -40,7 +38,19 @@ pub struct Frame {
     pub ybinning: Option<i32>,
     pub ccd_temp: Option<f64>,
     pub set_temp: Option<f64>,
-    pub focal_length: Option<f64>,
+    pub focallen: Option<f64>,
+    pub xpixsz: Option<f64>,
+    pub pixsz: Option<f64>,
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
+    pub sitelat: Option<f64>,
+    pub lat_obs: Option<f64>,
+    pub sitelong: Option<f64>,
+    pub long_obs: Option<f64>,
+    pub objctra: Option<String>,
+    pub objctdec: Option<String>,
+    pub override_: bool,
+    pub calibration_set_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -150,4 +160,37 @@ pub struct DuplicateGroup {
     pub content_hash: String,
     pub file_count: i32,
     pub file_paths: Vec<String>,
+}
+
+/// Project for organizing imaging sessions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Option<i64>,
+    pub name: String,
+}
+
+/// Frames set (imaging session within a project)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FramesSet {
+    pub id: Option<i64>,
+    pub name: Option<String>,
+    pub date_obs: Option<String>,
+    pub objctra: Option<String>,
+    pub objctdec: Option<String>,
+    pub project_id: i64,
+}
+
+/// Junction table member for frames_set_members
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FramesSetMember {
+    pub frames_set_id: i64,
+    pub frame_id: i64,
+}
+
+/// FITS header storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FitsHeader {
+    pub id: Option<i64>,
+    pub file_id: i64,
+    pub header: String,
 }

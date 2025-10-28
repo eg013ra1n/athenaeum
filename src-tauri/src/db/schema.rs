@@ -2,35 +2,21 @@ use rusqlite::{Connection, Result};
 
 /// Initialize the database schema
 pub fn init_db(conn: &Connection) -> Result<()> {
-    // Files table
+    // Files table - simplified, no hash or duplicate tracking
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL UNIQUE,
-            filename TEXT NOT NULL DEFAULT '',
+            filename TEXT NOT NULL,
             size INTEGER NOT NULL,
             modified_at TEXT NOT NULL,
             format TEXT NOT NULL CHECK(format IN ('FITS', 'XISF')),
-            content_hash TEXT NOT NULL DEFAULT '',
-            duplicate_group_id INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
         [],
     )?;
 
-    // Add filename column to existing tables (migration)
-    let _ = conn.execute(
-        "ALTER TABLE files ADD COLUMN filename TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-
-    // Backfill filename from path for existing records
-    conn.execute(
-        "UPDATE files SET filename = SUBSTR(path, INSTR(path, '/') + 1) WHERE filename = ''",
-        [],
-    )?;
-
-    // Frames table
+    // Frames table - expanded with astronomical coordinates and new fields
     conn.execute(
         "CREATE TABLE IF NOT EXISTS frames (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +27,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             instrume TEXT,
             exptime REAL,
             filter TEXT,
-            imagetyp TEXT,
             gain REAL,
             offset REAL,
             binning TEXT,
@@ -49,8 +34,22 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             ybinning INTEGER,
             ccd_temp REAL,
             set_temp REAL,
-            focal_length REAL,
-            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+            focallen REAL,
+            xpixsz REAL,
+            pixsz REAL,
+            ra REAL,
+            dec REAL,
+            sitelat REAL,
+            lat_obs REAL,
+            sitelong REAL,
+            long_obs REAL,
+            objctra TEXT,
+            objctdec TEXT,
+            override INTEGER NOT NULL DEFAULT 0,
+            imagetyp TEXT,
+            calibration_set_id INTEGER,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE SET NULL
         )",
         [],
     )?;
@@ -88,9 +87,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Calibration sets table
+    // Calibration set table (renamed from calibration_sets)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS calibration_sets (
+        "CREATE TABLE IF NOT EXISTS calibration_set (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             imagetyp TEXT NOT NULL,
             exptime REAL,
@@ -110,7 +109,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             set_id INTEGER NOT NULL,
             frame_id INTEGER NOT NULL,
             PRIMARY KEY (set_id, frame_id),
-            FOREIGN KEY (set_id) REFERENCES calibration_sets(id) ON DELETE CASCADE,
+            FOREIGN KEY (set_id) REFERENCES calibration_set(id) ON DELETE CASCADE,
             FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
         )",
         [],
@@ -127,13 +126,55 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Projects table - for organizing imaging projects
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    // Frames set table - imaging sessions within a project
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS frames_set (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            date_obs TEXT,
+            objctra TEXT,
+            objctdec TEXT,
+            project_id INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Frames set members junction table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS frames_set_members (
+            frames_set_id INTEGER NOT NULL,
+            frame_id INTEGER NOT NULL,
+            PRIMARY KEY (frames_set_id, frame_id),
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE,
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // FITS header table - stores complete original FITS header
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS fits_header (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            header TEXT NOT NULL,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_files_size ON files(size)",
         [],
     )?;
     conn.execute(
@@ -145,15 +186,31 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_frames_telescop ON frames(telescop)",
-        [],
-    )?;
-    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_frames_instrume ON frames(instrume)",
         [],
     )?;
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_frames_imagetyp ON frames(imagetyp)",
+        "CREATE INDEX IF NOT EXISTS idx_frames_ra ON frames(ra)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_dec ON frames(dec)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_objctra ON frames(objctra)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_objctdec ON frames(objctdec)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_exptime ON frames(exptime)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_filter ON frames(filter)",
         [],
     )?;
 

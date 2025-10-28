@@ -203,11 +203,12 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                   <div className="grid grid-cols-12 gap-4 px-4 py-3 bg-gray-800 text-xs font-semibold text-gray-400 uppercase border-b border-gray-700">
                     <div className="col-span-4">Filename</div>
                     <div className="col-span-2">Object</div>
-                    <div className="col-span-2">Telescope</div>
+                    <div className="col-span-2">Camera</div>
                     <div className="col-span-1">Filter</div>
                     <div className="col-span-1 text-right">Exposure</div>
                     <div className="col-span-1 text-right">Type</div>
-                    <div className="col-span-1 text-right">Size</div>
+                    <div className="col-span-1 text-right">Focal Length</div>
+                    <div className="col-span-1 text-right">Temperature</div>
                   </div>
 
                   {/* File rows */}
@@ -233,7 +234,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                             {item.frame?.object || '-'}
                           </div>
                           <div className="col-span-2 truncate text-sm text-gray-400">
-                            {item.frame?.telescop || '-'}
+                            {item.frame?.instrume || '-'}
                           </div>
                           <div className="col-span-1 truncate text-sm text-gray-400">
                             {item.frame?.filter || '-'}
@@ -253,7 +254,10 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                             )}
                           </div>
                           <div className="col-span-1 text-right text-sm text-gray-500">
-                            {(item.file.size / 1024 / 1024).toFixed(1)} MB
+                            {item.frame?.focallen ? `${item.frame.focallen}mm` : '-'}
+                          </div>
+                          <div className="col-span-1 text-right text-sm text-gray-500">
+                            {item.frame?.ccd_temp ? `${item.frame.ccd_temp}°C` : '-'}
                           </div>
                         </div>
                       );

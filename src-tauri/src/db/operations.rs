@@ -7,16 +7,14 @@ use rusqlite::{params, Connection, Result};
 /// Insert a new file record
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
     conn.execute(
-        "INSERT INTO files (path, filename, size, modified_at, format, content_hash, duplicate_group_id, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             file.path,
             file.filename,
             file.size,
             file.modified_at.to_rfc3339(),
             format!("{:?}", file.format),
-            file.content_hash,
-            file.duplicate_group_id,
             file.created_at.to_rfc3339(),
         ],
     )?;
@@ -27,11 +25,14 @@ pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
 pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
     let imagetyp_str = frame.imagetyp.as_ref().map(|t| format!("{:?}", t));
     let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
+    let override_int = if frame.override_ { 1 } else { 0 };
 
     conn.execute(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
-         gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focal_length)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, pixsz,
+         ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, calibration_set_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+         ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             frame.file_id,
             frame.object,
@@ -48,7 +49,19 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
             frame.ybinning,
             frame.ccd_temp,
             frame.set_temp,
-            frame.focal_length,
+            frame.focallen,
+            frame.xpixsz,
+            frame.pixsz,
+            frame.ra,
+            frame.dec,
+            frame.sitelat,
+            frame.lat_obs,
+            frame.sitelong,
+            frame.long_obs,
+            frame.objctra,
+            frame.objctdec,
+            override_int,
+            frame.calibration_set_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -133,8 +146,11 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
     };
 
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.content_hash, f.duplicate_group_id, f.created_at,
-                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at,
+                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp,
+                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
+                fr.focallen, fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.calibration_set_id
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          ORDER BY f.created_at DESC
@@ -158,34 +174,44 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
             } else {
                 FileFormat::XISF
             },
-            content_hash: row.get(6)?,
-            duplicate_group_id: row.get(7)?,
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(8)?)
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
                 .unwrap()
                 .with_timezone(&Utc),
         };
 
-        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(9) {
+        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(7) {
             frame_id.map(|fid| Frame {
                 id: Some(fid),
                 file_id: file.id.unwrap(),
-                object: row.get(10).ok(),
-                date_obs: row.get::<_, Option<String>>(11).ok().flatten().and_then(|s| {
+                object: row.get(8).ok(),
+                date_obs: row.get::<_, Option<String>>(9).ok().flatten().and_then(|s| {
                     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                 }),
-                telescop: row.get(12).ok(),
-                instrume: row.get(13).ok(),
-                exptime: row.get(14).ok(),
-                filter: row.get(15).ok(),
-                imagetyp: row.get::<_, Option<String>>(16).ok().flatten().and_then(|s| ImageType::from_str(&s)),
-                gain: None,
-                offset: None,
-                binning: None,
-                xbinning: None,
-                ybinning: None,
-                ccd_temp: None,
-                set_temp: None,
-                focal_length: None,
+                telescop: row.get(10).ok(),
+                instrume: row.get(11).ok(),
+                exptime: row.get(12).ok(),
+                filter: row.get(13).ok(),
+                imagetyp: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+                gain: row.get(15).ok(),
+                offset: row.get(16).ok(),
+                binning: row.get(17).ok(),
+                xbinning: row.get(18).ok(),
+                ybinning: row.get(19).ok(),
+                ccd_temp: row.get(20).ok(),
+                set_temp: row.get(21).ok(),
+                focallen: row.get(22).ok(),
+                xpixsz: row.get(23).ok(),
+                pixsz: row.get(24).ok(),
+                ra: row.get(25).ok(),
+                dec: row.get(26).ok(),
+                sitelat: row.get(27).ok(),
+                lat_obs: row.get(28).ok(),
+                sitelong: row.get(29).ok(),
+                long_obs: row.get(30).ok(),
+                objctra: row.get(31).ok(),
+                objctdec: row.get(32).ok(),
+                override_: row.get::<_, i32>(33).ok().map(|v| v == 1).unwrap_or(false),
+                calibration_set_id: row.get(34).ok(),
             })
         } else {
             None
@@ -209,8 +235,11 @@ pub fn get_files_by_directory(
     };
 
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.content_hash, f.duplicate_group_id, f.created_at,
-                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at,
+                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp,
+                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
+                fr.focallen, fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.calibration_set_id
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          WHERE f.path LIKE ?1 || '/%'
@@ -235,34 +264,44 @@ pub fn get_files_by_directory(
             } else {
                 FileFormat::XISF
             },
-            content_hash: row.get(6)?,
-            duplicate_group_id: row.get(7)?,
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(8)?)
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
                 .unwrap()
                 .with_timezone(&Utc),
         };
 
-        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(9) {
+        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(7) {
             frame_id.map(|fid| Frame {
                 id: Some(fid),
                 file_id: file.id.unwrap(),
-                object: row.get(10).ok(),
-                date_obs: row.get::<_, Option<String>>(11).ok().flatten().and_then(|s| {
+                object: row.get(8).ok(),
+                date_obs: row.get::<_, Option<String>>(9).ok().flatten().and_then(|s| {
                     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                 }),
-                telescop: row.get(12).ok(),
-                instrume: row.get(13).ok(),
-                exptime: row.get(14).ok(),
-                filter: row.get(15).ok(),
-                imagetyp: row.get::<_, Option<String>>(16).ok().flatten().and_then(|s| ImageType::from_str(&s)),
-                gain: None,
-                offset: None,
-                binning: None,
-                xbinning: None,
-                ybinning: None,
-                ccd_temp: None,
-                set_temp: None,
-                focal_length: None,
+                telescop: row.get(10).ok(),
+                instrume: row.get(11).ok(),
+                exptime: row.get(12).ok(),
+                filter: row.get(13).ok(),
+                imagetyp: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+                gain: row.get(15).ok(),
+                offset: row.get(16).ok(),
+                binning: row.get(17).ok(),
+                xbinning: row.get(18).ok(),
+                ybinning: row.get(19).ok(),
+                ccd_temp: row.get(20).ok(),
+                set_temp: row.get(21).ok(),
+                focallen: row.get(22).ok(),
+                xpixsz: row.get(23).ok(),
+                pixsz: row.get(24).ok(),
+                ra: row.get(25).ok(),
+                dec: row.get(26).ok(),
+                sitelat: row.get(27).ok(),
+                lat_obs: row.get(28).ok(),
+                sitelong: row.get(29).ok(),
+                long_obs: row.get(30).ok(),
+                objctra: row.get(31).ok(),
+                objctdec: row.get(32).ok(),
+                override_: row.get::<_, i32>(33).ok().map(|v| v == 1).unwrap_or(false),
+                calibration_set_id: row.get(34).ok(),
             })
         } else {
             None

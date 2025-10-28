@@ -30,7 +30,23 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let ybinning = read_keyword_i32(&mut fitsfile, &hdu, "YBINNING").ok();
     let ccd_temp = read_keyword_f64(&mut fitsfile, &hdu, "CCD-TEMP").ok();
     let set_temp = read_keyword_f64(&mut fitsfile, &hdu, "SET-TEMP").ok();
-    let focal_length = read_keyword_f64(&mut fitsfile, &hdu, "FOCALLEN").ok();
+    let focallen = read_keyword_f64(&mut fitsfile, &hdu, "FOCALLEN").ok();
+
+    // Pixel size
+    let xpixsz = read_keyword_f64(&mut fitsfile, &hdu, "XPIXSZ").ok();
+    let pixsz = read_keyword_f64(&mut fitsfile, &hdu, "PIXSZ").ok();
+
+    // Astronomical coordinates
+    let ra = read_keyword_f64(&mut fitsfile, &hdu, "RA").ok();
+    let dec = read_keyword_f64(&mut fitsfile, &hdu, "DEC").ok();
+    let objctra = read_keyword_string(&mut fitsfile, &hdu, "OBJCTRA").ok();
+    let objctdec = read_keyword_string(&mut fitsfile, &hdu, "OBJCTDEC").ok();
+
+    // Observatory location
+    let sitelat = read_keyword_f64(&mut fitsfile, &hdu, "SITELAT").ok();
+    let lat_obs = read_keyword_f64(&mut fitsfile, &hdu, "LAT-OBS").ok();
+    let sitelong = read_keyword_f64(&mut fitsfile, &hdu, "SITELONG").ok();
+    let long_obs = read_keyword_f64(&mut fitsfile, &hdu, "LONG-OBS").ok();
 
     // Parse DATE-OBS
     let date_obs = match (date_obs_str, time_obs) {
@@ -64,7 +80,19 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         ybinning,
         ccd_temp,
         set_temp,
-        focal_length,
+        focallen,
+        xpixsz,
+        pixsz,
+        ra,
+        dec,
+        sitelat,
+        lat_obs,
+        sitelong,
+        long_obs,
+        objctra,
+        objctdec,
+        override_: false,
+        calibration_set_id: None,
     })
 }
 
@@ -89,7 +117,19 @@ pub fn parse_xisf(_path: &Path, file_id: i64) -> Result<Frame> {
         ybinning: None,
         ccd_temp: None,
         set_temp: None,
-        focal_length: None,
+        focallen: None,
+        xpixsz: None,
+        pixsz: None,
+        ra: None,
+        dec: None,
+        sitelat: None,
+        lat_obs: None,
+        sitelong: None,
+        long_obs: None,
+        objctra: None,
+        objctdec: None,
+        override_: false,
+        calibration_set_id: None,
     })
 }
 
