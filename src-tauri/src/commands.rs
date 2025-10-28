@@ -471,7 +471,11 @@ pub async fn get_frame_set_detail(
         .map_err(|e| e.to_string())?;
 
     if !sessions_exist {
-        return Err("This frame set has no sessions. It may have been created with an older version of the application. Please delete it and recreate it using 'Auto-generate Sets'.".to_string());
+        // Return empty nights instead of error
+        return Ok(FrameSetDetail {
+            frames_set,
+            nights: Vec::new(),
+        });
     }
 
     // Get the complete structure from database

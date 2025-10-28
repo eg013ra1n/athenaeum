@@ -225,11 +225,18 @@ pub struct SessionMember {
     pub frame_id: i64,
 }
 
+/// DTO: File with optional frame metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileWithFrame {
+    pub file: File,
+    pub frame: Option<Frame>,
+}
+
 /// DTO: Session with its frames
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionWithFrames {
     pub session: Session,
-    pub frames: Vec<(File, Frame)>,
+    pub frames: Vec<FileWithFrame>,
 }
 
 /// DTO: Imaging night with its sessions

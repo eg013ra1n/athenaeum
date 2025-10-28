@@ -27,11 +27,11 @@ export default function Settings() {
       const [value, unit, frame, mode, sessionGap] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
-          defaultValue: '5.0',
+          defaultValue: '3.0',
         }),
         invoke<string>('get_setting', {
           key: 'grouping.threshold.unit',
-          defaultValue: 'arcmin',
+          defaultValue: 'deg',
         }),
         invoke<string>('get_setting', {
           key: 'grouping.coord.frame',
@@ -152,7 +152,7 @@ export default function Settings() {
           <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
           <div className="flex-1">
             <p className="font-medium text-red-400">Error</p>
-            <p className="text-sm text-red-300">{error}</p>
+            <p className="text-sm text-red-300">{String(error)}</p>
           </div>
         </div>
       )}

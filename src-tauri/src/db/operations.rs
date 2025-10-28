@@ -247,6 +247,8 @@ pub fn get_files_by_directory(
         None => String::new(),
     };
 
+    // Find files that are directly in this directory (not in subdirectories)
+    // path should start with directory_path/ but not contain additional slashes after that
     let query = format!(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp,
@@ -256,7 +258,9 @@ pub fn get_files_by_directory(
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          WHERE f.path LIKE ?1 || '/%'
-         ORDER BY f.path
+           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, '/', ''))) =
+               (LENGTH(?1) - LENGTH(REPLACE(?1, '/', '')) + 1)
+         ORDER BY f.filename
          {}",
         limit_clause
     );
@@ -958,7 +962,10 @@ pub fn get_imaging_nights_with_sessions(
                     calibration_set_id: row.get(35)?,
                 };
 
-                Ok((file, frame))
+                Ok(crate::models::FileWithFrame {
+                    file,
+                    frame: Some(frame),
+                })
             })?;
 
             let frames_vec: Result<Vec<_>> = frames.collect();

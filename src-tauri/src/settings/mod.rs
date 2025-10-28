@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 /// Application defaults for grouping settings
 pub mod defaults {
-    pub const GROUPING_THRESHOLD_VALUE: &str = "2.2";
-    pub const GROUPING_THRESHOLD_UNIT: &str = "degrees";
+    pub const GROUPING_THRESHOLD_VALUE: &str = "3.0";
+    pub const GROUPING_THRESHOLD_UNIT: &str = "deg";
     pub const GROUPING_COORD_FRAME: &str = "ICRS";
     pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "majority-object";
 }

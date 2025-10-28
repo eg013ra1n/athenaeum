@@ -108,7 +108,7 @@ export default function Objects() {
           <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
           <div className="flex-1">
             <p className="font-medium text-red-400">Error</p>
-            <p className="text-sm text-red-300">{error}</p>
+            <p className="text-sm text-red-300">{String(error)}</p>
           </div>
         </div>
       )}

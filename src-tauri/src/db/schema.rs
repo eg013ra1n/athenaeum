@@ -140,6 +140,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS frames_set (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
+            
             date_obs TEXT,
             objctra TEXT,
             objctdec TEXT,
