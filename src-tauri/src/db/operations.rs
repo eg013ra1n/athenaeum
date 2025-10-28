@@ -21,11 +21,24 @@ pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// Insert FITS header
+pub fn insert_fits_header(conn: &Connection, file_id: i64, header: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO fits_header (file_id, header) VALUES (?1, ?2)",
+        params![file_id, header],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Insert a new frame record
 pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
     let imagetyp_str = frame.imagetyp.as_ref().map(|t| format!("{:?}", t));
     let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
     let override_int = if frame.override_ { 1 } else { 0 };
+
+    // Debug: Log what we're about to insert
+    println!("insert_frame: file_id={}, object={:?}, date_obs={:?}",
+        frame.file_id, frame.object, date_obs_str);
 
     conn.execute(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
@@ -348,4 +361,618 @@ pub fn file_exists(conn: &Connection, path: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+// ============================================================================
+// Settings Operations
+// ============================================================================
+
+/// Get a setting value by key
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let result: Result<String> = conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    );
+
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Set a setting value (insert or update)
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+        params![key, value, now],
+    )?;
+    Ok(())
+}
+
+/// Delete a setting by key
+pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        params![key],
+    )?;
+    Ok(())
+}
+
+/// Get all settings
+pub fn get_all_settings(conn: &Connection) -> Result<Vec<Setting>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, value, updated_at FROM settings ORDER BY key"
+    )?;
+
+    let settings = stmt.query_map([], |row| {
+        let updated_at_str: Option<String> = row.get(2)?;
+        let updated_at = updated_at_str.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+        });
+
+        Ok(Setting {
+            key: row.get(0)?,
+            value: row.get(1)?,
+            updated_at,
+        })
+    })?;
+
+    settings.collect()
+}
+
+// ============================================================================
+// Frames Set Operations
+// ============================================================================
+
+/// Create a new frames_set and return its ID
+pub fn create_frames_set(
+    conn: &Connection,
+    name: Option<&str>,
+    date_obs: Option<&str>,
+    objctra: Option<&str>,
+    objctdec: Option<&str>,
+    total_exp_time: Option<f64>,
+    project_id: Option<i64>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO frames_set (name, date_obs, objctra, objctdec, total_exp_time, project_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![name, date_obs, objctra, objctdec, total_exp_time, project_id],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get all frames sets for a project with member counts
+pub fn get_frames_sets_by_project(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<(crate::models::FramesSet, usize)>> {
+    let mut stmt = conn.prepare(
+        "SELECT fs.id, fs.name, fs.date_obs, fs.objctra, fs.objctdec, fs.total_exp_time, fs.project_id,
+                COUNT(DISTINCT sm.frame_id) as member_count
+         FROM frames_set fs
+         LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
+         LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
+         LEFT JOIN session_members sm ON s.id = sm.session_id
+         WHERE fs.project_id = ?1 OR fs.project_id IS NULL
+         GROUP BY fs.id
+         ORDER BY fs.date_obs DESC, fs.name ASC"
+    )?;
+
+    let sets = stmt.query_map(params![project_id], |row| {
+        let set = crate::models::FramesSet {
+            id: Some(row.get(0)?),
+            name: row.get(1)?,
+            date_obs: row.get(2)?,
+            objctra: row.get(3)?,
+            objctdec: row.get(4)?,
+            total_exp_time: row.get(5)?,
+            project_id: row.get(6)?,
+        };
+        let member_count: i32 = row.get(7)?;
+        Ok((set, member_count as usize))
+    })?;
+
+    sets.collect()
+}
+
+/// Get all frame IDs that are already members of any frames_set
+pub fn get_all_frames_set_member_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT sm.frame_id
+         FROM session_members sm
+         JOIN sessions s ON sm.session_id = s.id
+         JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
+         ORDER BY sm.frame_id"
+    )?;
+
+    let frame_ids = stmt.query_map(params![], |row| row.get(0))?;
+
+    frame_ids.collect()
+}
+
+/// Delete a frames_set (cascade will delete members)
+pub fn delete_frames_set(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM frames_set WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Get all LIGHT frames for a project (for clustering)
+pub fn get_light_frames_for_project(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<(i64, crate::models::Frame)>> {
+    // For now, we'll get all LIGHT frames regardless of project
+    // In the future, we can add project filtering at the frame level
+    let mut stmt = conn.prepare(
+        "SELECT f.id, fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
+                fr.exptime, fr.filter, fr.imagetyp, fr.gain, fr.offset, fr.binning,
+                fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
+                fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
+                fr.calibration_set_id
+         FROM files f
+         INNER JOIN frames fr ON f.id = fr.file_id
+         WHERE fr.imagetyp = 'Light'
+         ORDER BY f.id"
+    )?;
+
+    let results = stmt.query_map(params![], |row| {
+        let file_id: i64 = row.get(0)?;
+
+        let date_obs_str: Option<String> = row.get(4)?;
+        let date_obs = date_obs_str.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+        });
+
+        let imagetyp_str: Option<String> = row.get(9)?;
+        let imagetyp = imagetyp_str.and_then(|s| crate::models::ImageType::from_str(&s));
+
+        let frame = crate::models::Frame {
+            id: Some(row.get(1)?),
+            file_id: row.get(2)?,
+            object: row.get(3)?,
+            date_obs,
+            telescop: row.get(5)?,
+            instrume: row.get(6)?,
+            exptime: row.get(7)?,
+            filter: row.get(8)?,
+            imagetyp,
+            gain: row.get(10)?,
+            offset: row.get(11)?,
+            binning: row.get(12)?,
+            xbinning: row.get(13)?,
+            ybinning: row.get(14)?,
+            ccd_temp: row.get(15)?,
+            set_temp: row.get(16)?,
+            focallen: row.get(17)?,
+            xpixsz: row.get(18)?,
+            pixsz: row.get(19)?,
+            ra: row.get(20)?,
+            dec: row.get(21)?,
+            sitelat: row.get(22)?,
+            lat_obs: row.get(23)?,
+            sitelong: row.get(24)?,
+            long_obs: row.get(25)?,
+            objctra: row.get(26)?,
+            objctdec: row.get(27)?,
+            override_: row.get::<_, i32>(28)? == 1,
+            calibration_set_id: row.get(29)?,
+        };
+
+        Ok((file_id, frame))
+    })?;
+
+    results.collect()
+}
+
+// ============================================================================
+// Imaging Nights and Sessions Operations
+// ============================================================================
+
+/// Create a new imaging night
+pub fn create_imaging_night(
+    conn: &Connection,
+    frames_set_id: i64,
+    start_time: &str,
+    end_time: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+         VALUES (?1, ?2, ?3)",
+        params![frames_set_id, start_time, end_time],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Create a new session within an imaging night
+pub fn create_session(
+    conn: &Connection,
+    imaging_night_id: i64,
+    instrume: &str,
+    frame_count: i32,
+    total_exp_time: Option<f64>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO sessions (imaging_night_id, instrume, frame_count, total_exp_time)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![imaging_night_id, instrume, frame_count, total_exp_time],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Insert session members (bulk insert)
+pub fn insert_session_members(
+    conn: &Connection,
+    session_id: i64,
+    frame_ids: &[i64],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    for frame_id in frame_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+            params![session_id, frame_id],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// Check if sessions exist for a frame set
+pub fn sessions_exist_for_frame_set(conn: &Connection, frames_set_id: i64) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM imaging_nights WHERE frames_set_id = ?1",
+        params![frames_set_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Delete all sessions for a frame set
+pub fn delete_sessions_for_frame_set(conn: &Connection, frames_set_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM imaging_nights WHERE frames_set_id = ?1",
+        params![frames_set_id],
+    )?;
+    Ok(())
+}
+
+/// Get frames for a specific frames_set with file info (for session detection)
+pub fn get_frames_with_files_for_set(
+    conn: &Connection,
+    frames_set_id: i64,
+) -> Result<Vec<(i64, crate::models::File, crate::models::Frame)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at,
+                fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
+                fr.exptime, fr.filter, fr.imagetyp, fr.gain, fr.offset, fr.binning,
+                fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
+                fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
+                fr.calibration_set_id
+         FROM session_members sm
+         JOIN sessions s ON sm.session_id = s.id
+         JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
+         JOIN frames fr ON sm.frame_id = fr.id
+         JOIN files f ON fr.file_id = f.id
+         WHERE in_tbl.frames_set_id = ?1
+         ORDER BY fr.date_obs ASC",
+    )?;
+
+    let results = stmt.query_map(params![frames_set_id], |row| {
+        let file = crate::models::File {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            size: row.get(3)?,
+            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            format: if row.get::<_, String>(5)? == "FITS" {
+                crate::models::FileFormat::FITS
+            } else {
+                crate::models::FileFormat::XISF
+            },
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        // Debug: Check date_obs in database
+        let date_obs_raw: Option<String> = row.get(10)?;
+        if date_obs_raw.is_none() {
+            let frame_id: i64 = row.get(7)?;
+            let filename: String = row.get(2)?;
+            println!("Frame {} ({}) has NULL date_obs in database", frame_id, filename);
+        } else {
+            println!("Frame has date_obs: {:?}", date_obs_raw);
+        }
+
+        let frame = crate::models::Frame {
+            id: row.get(7)?,
+            file_id: row.get(8)?,
+            object: row.get(9)?,
+            date_obs: date_obs_raw.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            }),
+            telescop: row.get(11)?,
+            instrume: row.get(12)?,
+            exptime: row.get(13)?,
+            filter: row.get(14)?,
+            imagetyp: row.get::<_, Option<String>>(15)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+            gain: row.get(16)?,
+            offset: row.get(17)?,
+            binning: row.get(18)?,
+            xbinning: row.get(19)?,
+            ybinning: row.get(20)?,
+            ccd_temp: row.get(21)?,
+            set_temp: row.get(22)?,
+            focallen: row.get(23)?,
+            xpixsz: row.get(24)?,
+            pixsz: row.get(25)?,
+            ra: row.get(26)?,
+            dec: row.get(27)?,
+            sitelat: row.get(28)?,
+            lat_obs: row.get(29)?,
+            sitelong: row.get(30)?,
+            long_obs: row.get(31)?,
+            objctra: row.get(32)?,
+            objctdec: row.get(33)?,
+            override_: row.get::<_, i32>(34)? == 1,
+            calibration_set_id: row.get(35)?,
+        };
+
+        let file_id: i64 = row.get(0)?;
+        Ok((file_id, file, frame))
+    })?;
+
+    results.collect()
+}
+
+/// Get frames with their files by frame IDs (for session generation during auto-clustering)
+pub fn get_frames_with_files_by_ids(
+    conn: &Connection,
+    frame_ids: &[i64],
+) -> Result<Vec<(i64, crate::models::File, crate::models::Frame)>> {
+    if frame_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build the query with placeholders for each ID
+    let placeholders = frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at,
+                fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
+                fr.exptime, fr.filter, fr.imagetyp, fr.gain, fr.offset, fr.binning,
+                fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
+                fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
+                fr.calibration_set_id
+         FROM frames fr
+         JOIN files f ON fr.file_id = f.id
+         WHERE fr.id IN ({})
+         ORDER BY fr.date_obs ASC",
+        placeholders
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+
+    // Convert frame_ids to params
+    let params_vec: Vec<&dyn rusqlite::ToSql> = frame_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+
+    let results = stmt.query_map(params_vec.as_slice(), |row| {
+        let file = crate::models::File {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            size: row.get(3)?,
+            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            format: if row.get::<_, String>(5)? == "FITS" {
+                crate::models::FileFormat::FITS
+            } else {
+                crate::models::FileFormat::XISF
+            },
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        let date_obs_raw: Option<String> = row.get(10)?;
+
+        let frame = crate::models::Frame {
+            id: row.get(7)?,
+            file_id: row.get(8)?,
+            object: row.get(9)?,
+            date_obs: date_obs_raw.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            }),
+            telescop: row.get(11)?,
+            instrume: row.get(12)?,
+            exptime: row.get(13)?,
+            filter: row.get(14)?,
+            imagetyp: row.get::<_, Option<String>>(15)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+            gain: row.get(16)?,
+            offset: row.get(17)?,
+            binning: row.get(18)?,
+            xbinning: row.get(19)?,
+            ybinning: row.get(20)?,
+            ccd_temp: row.get(21)?,
+            set_temp: row.get(22)?,
+            focallen: row.get(23)?,
+            xpixsz: row.get(24)?,
+            pixsz: row.get(25)?,
+            ra: row.get(26)?,
+            dec: row.get(27)?,
+            sitelat: row.get(28)?,
+            lat_obs: row.get(29)?,
+            sitelong: row.get(30)?,
+            long_obs: row.get(31)?,
+            objctra: row.get(32)?,
+            objctdec: row.get(33)?,
+            override_: row.get::<_, i32>(34)? == 1,
+            calibration_set_id: row.get(35)?,
+        };
+
+        let file_id: i64 = row.get(0)?;
+        Ok((file_id, file, frame))
+    })?;
+
+    results.collect()
+}
+
+/// Get imaging nights with sessions for a frame set
+pub fn get_imaging_nights_with_sessions(
+    conn: &Connection,
+    frames_set_id: i64,
+) -> Result<Vec<crate::models::ImagingNightWithSessions>> {
+    // Get all imaging nights for this frame set
+    let mut nights_stmt = conn.prepare(
+        "SELECT id, frames_set_id, start_time, end_time, created_at
+         FROM imaging_nights
+         WHERE frames_set_id = ?1
+         ORDER BY start_time ASC",
+    )?;
+
+    let nights = nights_stmt.query_map(params![frames_set_id], |row| {
+        Ok(crate::models::ImagingNight {
+            id: row.get(0)?,
+            frames_set_id: row.get(1)?,
+            start_time: row.get(2)?,
+            end_time: row.get(3)?,
+            created_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            }),
+        })
+    })?;
+
+    let mut result = Vec::new();
+
+    for night in nights {
+        let night = night?;
+        let night_id = night.id.unwrap();
+
+        // Get sessions for this night
+        let mut sessions_stmt = conn.prepare(
+            "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at
+             FROM sessions
+             WHERE imaging_night_id = ?1
+             ORDER BY instrume ASC",
+        )?;
+
+        let sessions = sessions_stmt.query_map(params![night_id], |row| {
+            Ok(crate::models::Session {
+                id: row.get(0)?,
+                imaging_night_id: row.get(1)?,
+                instrume: row.get(2)?,
+                frame_count: row.get(3)?,
+                total_exp_time: row.get(4)?,
+                created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                }),
+            })
+        })?;
+
+        let mut sessions_with_frames = Vec::new();
+
+        for session in sessions {
+            let session = session?;
+            let session_id = session.id.unwrap();
+
+            // Get frames for this session
+            let mut frames_stmt = conn.prepare(
+                "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at,
+                        fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
+                        fr.exptime, fr.filter, fr.imagetyp, fr.gain, fr.offset, fr.binning,
+                        fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
+                        fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                        fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
+                        fr.calibration_set_id
+                 FROM session_members sm
+                 JOIN frames fr ON sm.frame_id = fr.id
+                 JOIN files f ON fr.file_id = f.id
+                 WHERE sm.session_id = ?1
+                 ORDER BY fr.date_obs ASC",
+            )?;
+
+            let frames = frames_stmt.query_map(params![session_id], |row| {
+                let file = crate::models::File {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    filename: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    format: if row.get::<_, String>(5)? == "FITS" {
+                        crate::models::FileFormat::FITS
+                    } else {
+                        crate::models::FileFormat::XISF
+                    },
+                    created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                };
+
+                let frame = crate::models::Frame {
+                    id: row.get(7)?,
+                    file_id: row.get(8)?,
+                    object: row.get(9)?,
+                    date_obs: row.get::<_, Option<String>>(10)?.and_then(|s| {
+                        DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                    }),
+                    telescop: row.get(11)?,
+                    instrume: row.get(12)?,
+                    exptime: row.get(13)?,
+                    filter: row.get(14)?,
+                    imagetyp: row.get::<_, Option<String>>(15)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+                    gain: row.get(16)?,
+                    offset: row.get(17)?,
+                    binning: row.get(18)?,
+                    xbinning: row.get(19)?,
+                    ybinning: row.get(20)?,
+                    ccd_temp: row.get(21)?,
+                    set_temp: row.get(22)?,
+                    focallen: row.get(23)?,
+                    xpixsz: row.get(24)?,
+                    pixsz: row.get(25)?,
+                    ra: row.get(26)?,
+                    dec: row.get(27)?,
+                    sitelat: row.get(28)?,
+                    lat_obs: row.get(29)?,
+                    sitelong: row.get(30)?,
+                    long_obs: row.get(31)?,
+                    objctra: row.get(32)?,
+                    objctdec: row.get(33)?,
+                    override_: row.get::<_, i32>(34)? == 1,
+                    calibration_set_id: row.get(35)?,
+                };
+
+                Ok((file, frame))
+            })?;
+
+            let frames_vec: Result<Vec<_>> = frames.collect();
+            sessions_with_frames.push(crate::models::SessionWithFrames {
+                session,
+                frames: frames_vec?,
+            });
+        }
+
+        result.push(crate::models::ImagingNightWithSessions {
+            imaging_night: night,
+            sessions: sessions_with_frames,
+        });
+    }
+
+    Ok(result)
 }

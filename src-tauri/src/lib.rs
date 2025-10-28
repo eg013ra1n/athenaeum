@@ -6,11 +6,16 @@ mod scanner;
 mod duplicates;
 mod calibration;
 mod export;
+mod settings;
+mod coordinates;
+mod clustering;
+mod sessions;
 
 // Commands (Tauri API endpoints)
 mod commands;
 
 use commands::AppState;
+use settings::SettingsManager;
 use std::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -21,6 +26,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState {
             db: Mutex::new(None),
+            settings: SettingsManager::new(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::greet,
@@ -33,6 +39,15 @@ pub fn run() {
             commands::get_files_by_directory,
             commands::get_duplicates,
             commands::get_directory_contents,
+            commands::get_setting,
+            commands::set_setting,
+            commands::get_all_settings,
+            commands::delete_setting,
+            commands::get_grouping_threshold_deg,
+            commands::auto_generate_frame_sets,
+            commands::get_frames_sets,
+            commands::delete_frames_set,
+            commands::get_frame_set_detail,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

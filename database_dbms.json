@@ -1,145 +1,110 @@
 Table files {
-id integer [pk, increment
-    ]
-path text
-filename text
-created_at text
-format text
-size integer
-modified_at text
+  id integer [pk, increment]
+  path text
+  filename text
+  created_at text
+  format text
+  size integer
+  modified_at text
 }
 
 Table frames {
-id integer [pk, increment
-    ]
-file_id integer [not null, ref: > files.id
-    ]
-object text
-date_obs text
-telescop text
-instrume text
-exptime real
-filter text
-gain real
-offset real
-binning text
-xbinning integer
-ybinning integer
-ccd_temp real
-set_temp real
-focallen real
-xpixsz real
-pixsz real
-ra real
-dec real
-sitelat real
-lat_obs real
-sitelong real
-long_obs real
-objctra text
-objctdec text
-override bool
-imagetyp text
-calibration_set_id integer [ref: > calibration_set.id
-    ]
-indexes {
-date_obs
-object
-instrume
-ra
-dec
-objctra
-objctdec
-exptime
-filter
-    }
-}
+  id integer [pk, increment]
+  file_id integer [not null, ref: > files.id]
+  object text
+  date_obs text
+  telescop text
+  instrume text
+  exptime real
+  filter text
+  gain real
+  offset real
+  binning text
+  xbinning integer
+  ybinning integer
+  ccd_temp real
+  set_temp real
+  focallen real 
+  xpixsz real
+  pixsz real
+  ra real
+  dec real
+  sitelat real
+  lat_obs real
+  sitelong real
+  long_obs real
+  objctra text
+  objctdec text
+  override bool
+  imagetyp text
+  calibration_set_id integer [ref: > calibration_set.id]
 
-  
+  indexes {
+    date_obs
+    object
+    instrume
+    ra
+    dec
+    objctra
+    objctdec
+    exptime
+    filter
+    focallen
+  }
+}
 
 Table scan_roots {
-id integer [pk, increment
-    ]
-path text [not null, unique
-    ]
-enabled integer [not null, default: 1
-    ]
-last_scan text
+  id integer [pk, increment]
+  path text [not null, unique]
+  enabled integer [not null, default: 1]
+  last_scan text
 }
-
-  
 
 Table tags {
-id integer [pk, increment
-    ]
-name text [not null, unique
-    ]
-color text
+  id integer [pk, increment]
+  name text [not null, unique]
+  color text
 }
-
-  
 
 Table frame_tags {
-frame_id integer [not null, ref: > frames.id
-    ]
-tag_id integer [not null, ref: > tags.id
-    ]
-indexes {
-(frame_id, tag_id) [unique, pk
-        ]
-    }
+  frame_id integer [not null, ref: > frames.id]
+  tag_id integer [not null, ref: > tags.id]
+  indexes {
+    (frame_id, tag_id) [unique, pk]
+  }
 }
-
-  
 
 Table calibration_set {
-id integer [pk, increment
-    ]
-imagetyp text [not null
-    ]
-exptime real
-filter text
-ccd_temp real
-gain real
-binning text
-instrume text
-date text
+  id integer [pk, increment]
+  imagetyp text [not null]
+  exptime real
+  filter text
+  ccd_temp real
+  gain real
+  binning text
+  instrume text
+  date text
 }
-
-  
 
 Table calibration_set_frames {
-set_id integer [not null, ref: > calibration_set.id
-    ]
-frame_id integer [not null, ref: > frames.id
-    ]
-indexes {
-(set_id, frame_id) [unique, pk
-        ]
-    }
+  set_id integer [not null, ref: > calibration_set.id]
+  frame_id integer [not null, ref: > frames.id]
+  indexes {
+    (set_id, frame_id) [unique, pk]
+  }
 }
-
-  
 
 Table export_templates {
-id integer [pk, increment
-    ]
-name text [not null, unique
-    ]
-template text [not null
-    ]
-description text
+  id integer [pk, increment]
+  name text [not null, unique]
+  template text [not null]
+  description text
 }
-
-  
 
 Table projects {
-id integer [pk, increment
-    ]
-name text
+  id integer [pk, increment]
+  name text
 }
-
-  
 
 Table frames_set {
 id integer [pk, increment]
@@ -150,21 +115,28 @@ objctdec text
 project_id integer [not null, ref: > projects.id]
 }
 
-  
-
-Table frames_set_members {
-frames_set_id integer [not null, ref: > frames_set.id
-    ]
-frame_id integer [not null, ref: > frames.id
-    ]
+Table sessions {
+  id integer [pk, increment]
+  imaging_nights_id integer [not null, ref: > imaging_nights.id]
+  instrume text
+  start_time text
+  end_time text
 }
 
-  
+Table imaging_nights {
+  start_time text
+  end_time text
+  id integer [pk, increment]
+  frame_set_id integer [not null, ref: > frames_set.id]
+}
+
+Table session_member {
+  session_id integer [not null, ref: > sessions.id ]
+  frame_id integer [not null, ref: > frames.id]
+}
 
 Table fits_header {
-id integer [pk, increment
-    ]
-file_id integer [not null, ref: > files.id
-    ]
-header text
+  id integer [pk, increment]
+  file_id integer [not null, ref: > files.id]
+  header text
 }

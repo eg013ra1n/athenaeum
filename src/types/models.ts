@@ -145,7 +145,8 @@ export interface FramesSet {
   date_obs: string | null;
   objctra: string | null;
   objctdec: string | null;
-  project_id: number;
+  total_exp_time: number | null;
+  project_id: number | null;
 }
 
 export interface FramesSetMember {
@@ -157,4 +158,62 @@ export interface FitsHeader {
   id: number | null;
   file_id: number;
   header: string;
+}
+
+export interface Setting {
+  key: string;
+  value: string;
+  updated_at: string | null;
+}
+
+// Frame Sets DTOs
+export interface AutoGenerateResult {
+  sets_created: number;
+  frames_clustered: number;
+  frames_excluded: number;
+  frames_already_in_sets: number;
+  exclusion_reasons: string[];
+}
+
+export interface FramesSetWithCount {
+  frames_set: FramesSet;
+  member_count: number;
+}
+
+// Imaging Nights and Sessions
+export interface ImagingNight {
+  id: number | null;
+  frames_set_id: number;
+  start_time: string;
+  end_time: string;
+  created_at: string | null;
+}
+
+export interface Session {
+  id: number | null;
+  imaging_night_id: number;
+  instrume: string;
+  frame_count: number;
+  total_exp_time: number | null;
+  created_at: string | null;
+}
+
+export interface SessionMember {
+  session_id: number;
+  frame_id: number;
+}
+
+export interface SessionWithFrames {
+  session: Session;
+  frames: FileWithFrame[];
+}
+
+export interface ImagingNightWithSessions {
+  imaging_night: ImagingNight;
+  sessions: SessionWithFrames[];
+}
+
+export interface FrameSetDetail {
+  frames_set: FramesSet;
+  nights: ImagingNightWithSessions[];
 }

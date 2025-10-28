@@ -6,8 +6,55 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use fitsio::FitsFile;
 use std::path::Path;
 
+/// Extract full FITS header as text
+pub fn extract_fits_header(path: &Path) -> Result<String> {
+    let mut fitsfile = FitsFile::open(path)
+        .with_context(|| format!("Failed to open FITS file: {}", path.display()))?;
+
+    let hdu = fitsfile.primary_hdu()?;
+
+    // Read all header keywords and format as text
+    let mut header_text = String::new();
+
+    // Try to read common FITS keywords
+    let keywords = vec![
+        "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3",
+        "EXTEND", "BSCALE", "BZERO", "BUNIT",
+        "OBJECT", "DATE-OBS", "TIME-OBS", "TELESCOP", "INSTRUME",
+        "OBSERVER", "ORIGIN", "REFERENC", "AUTHOR", "DATE",
+        "EXPTIME", "EXPOSURE", "FILTER", "IMAGETYP", "FRAME",
+        "GAIN", "EGAIN", "OFFSET", "PEDESTAL",
+        "XBINNING", "YBINNING", "BINNING",
+        "CCD-TEMP", "SET-TEMP", "TEMP", "COOLTEMP",
+        "FOCALLEN", "XPIXSZ", "YPIXSZ", "PIXSZ", "PIXSCALE",
+        "RA", "DEC", "OBJCTRA", "OBJCTDEC",
+        "EQUINOX", "RADESYS", "CTYPE1", "CTYPE2",
+        "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2",
+        "CD1_1", "CD1_2", "CD2_1", "CD2_2",
+        "CDELT1", "CDELT2", "CROTA1", "CROTA2",
+        "SITELAT", "SITELONG", "LAT-OBS", "LONG-OBS", "ALT-OBS",
+        "AIRMASS", "ALTITUDE", "AZIMUTH",
+        "COMMENT", "HISTORY",
+    ];
+
+    for keyword in keywords {
+        if let Ok(value) = hdu.read_key::<String>(&mut fitsfile, keyword) {
+            header_text.push_str(&format!("{} = {}\n", keyword, value));
+        }
+    }
+
+    // If header is still empty, at least record that we tried
+    if header_text.is_empty() {
+        header_text = format!("Header extracted from: {}\n(No standard keywords found)", path.display());
+    }
+
+    Ok(header_text)
+}
+
 /// Parse FITS file metadata
 pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
+    println!("Parsing FITS file: {}", path.display());
+
     let mut fitsfile = FitsFile::open(path)
         .with_context(|| format!("Failed to open FITS file: {}", path.display()))?;
 
@@ -17,6 +64,9 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let object = read_keyword_string(&mut fitsfile, &hdu, "OBJECT").ok();
     let date_obs_str = read_keyword_string(&mut fitsfile, &hdu, "DATE-OBS").ok();
     let time_obs = read_keyword_string(&mut fitsfile, &hdu, "TIME-OBS").ok();
+
+    println!("  DATE-OBS from FITS: {:?}", date_obs_str);
+    println!("  TIME-OBS from FITS: {:?}", time_obs);
     let telescop = read_keyword_string(&mut fitsfile, &hdu, "TELESCOP").ok();
     let instrume = read_keyword_string(&mut fitsfile, &hdu, "INSTRUME").ok();
     let exptime = read_keyword_f64(&mut fitsfile, &hdu, "EXPTIME").ok();
@@ -49,9 +99,23 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let long_obs = read_keyword_f64(&mut fitsfile, &hdu, "LONG-OBS").ok();
 
     // Parse DATE-OBS
-    let date_obs = match (date_obs_str, time_obs) {
-        (Some(date), time) => parse_date_obs(&date, time.as_deref()).ok(),
-        _ => None,
+    let date_obs = match (date_obs_str.clone(), time_obs.clone()) {
+        (Some(date), time) => {
+            match parse_date_obs(&date, time.as_deref()) {
+                Ok(dt) => {
+                    println!("  Parsed date_obs successfully: {}", dt.to_rfc3339());
+                    Some(dt)
+                },
+                Err(e) => {
+                    println!("  Failed to parse date_obs: {}", e);
+                    None
+                }
+            }
+        },
+        _ => {
+            println!("  No DATE-OBS found in FITS header!");
+            None
+        }
     };
 
     // Parse IMAGETYP
@@ -135,9 +199,19 @@ pub fn parse_xisf(_path: &Path, file_id: i64) -> Result<Frame> {
 
 /// Parse DATE-OBS and optional TIME-OBS into ISO 8601 timestamp
 pub fn parse_date_obs(date_obs: &str, time_obs: Option<&str>) -> Result<DateTime<Utc>> {
-    // Try parsing ISO 8601 format first (YYYY-MM-DDTHH:MM:SS.SSS)
+    // Try parsing ISO 8601 with timezone (YYYY-MM-DDTHH:MM:SS.SSSZ)
     if let Ok(dt) = DateTime::parse_from_rfc3339(date_obs) {
         return Ok(dt.with_timezone(&Utc));
+    }
+
+    // Try parsing ISO 8601 without timezone - assume UTC
+    if let Ok(naive_dt) = NaiveDateTime::parse_from_str(date_obs, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Ok(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
+    }
+
+    // Try without fractional seconds
+    if let Ok(naive_dt) = NaiveDateTime::parse_from_str(date_obs, "%Y-%m-%dT%H:%M:%S") {
+        return Ok(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
     }
 
     // Try combining DATE-OBS and TIME-OBS
@@ -145,6 +219,10 @@ pub fn parse_date_obs(date_obs: &str, time_obs: Option<&str>) -> Result<DateTime
         let datetime_str = format!("{}T{}", date_obs, time);
         if let Ok(dt) = DateTime::parse_from_rfc3339(&datetime_str) {
             return Ok(dt.with_timezone(&Utc));
+        }
+        // Try without timezone
+        if let Ok(naive_dt) = NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%dT%H:%M:%S%.f") {
+            return Ok(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
         }
     }
 

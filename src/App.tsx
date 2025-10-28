@@ -3,8 +3,10 @@ import Layout from './components/Layout';
 import FileManager from './pages/FileManager';
 import ShootCalendar from './pages/ShootCalendar';
 import Objects from './pages/Objects';
+import FrameSetDetail from './pages/FrameSetDetail';
 import Equipment from './pages/Equipment';
 import Export from './pages/Export';
+import Settings from './pages/Settings';
 
 function App() {
   return (
@@ -15,8 +17,10 @@ function App() {
           <Route path="files" element={<FileManager />} />
           <Route path="calendar" element={<ShootCalendar />} />
           <Route path="objects" element={<Objects />} />
+          <Route path="objects/:id" element={<FrameSetDetail />} />
           <Route path="equipment" element={<Equipment />} />
           <Route path="export" element={<Export />} />
+          <Route path="settings" element={<Settings />} />
         </Route>
       </Routes>
     </BrowserRouter>

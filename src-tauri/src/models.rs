@@ -177,14 +177,8 @@ pub struct FramesSet {
     pub date_obs: Option<String>,
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
-    pub project_id: i64,
-}
-
-/// Junction table member for frames_set_members
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FramesSetMember {
-    pub frames_set_id: i64,
-    pub frame_id: i64,
+    pub total_exp_time: Option<f64>,
+    pub project_id: Option<i64>,
 }
 
 /// FITS header storage
@@ -193,4 +187,61 @@ pub struct FitsHeader {
     pub id: Option<i64>,
     pub file_id: i64,
     pub header: String,
+}
+
+/// Application settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Setting {
+    pub key: String,
+    pub value: String,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// Imaging night - top-level grouping of frames by observation night
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagingNight {
+    pub id: Option<i64>,
+    pub frames_set_id: i64,
+    pub start_time: String,
+    pub end_time: String,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Session - grouping of frames by instrument within an imaging night
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: Option<i64>,
+    pub imaging_night_id: i64,
+    pub instrume: String,
+    pub frame_count: i32,
+    pub total_exp_time: Option<f64>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Junction table member for session_members
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMember {
+    pub session_id: i64,
+    pub frame_id: i64,
+}
+
+/// DTO: Session with its frames
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWithFrames {
+    pub session: Session,
+    pub frames: Vec<(File, Frame)>,
+}
+
+/// DTO: Imaging night with its sessions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagingNightWithSessions {
+    pub imaging_night: ImagingNight,
+    pub sessions: Vec<SessionWithFrames>,
+}
+
+/// DTO: Complete frame set detail with nights and sessions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameSetDetail {
+    pub frames_set: FramesSet,
+    pub nights: Vec<ImagingNightWithSessions>,
 }

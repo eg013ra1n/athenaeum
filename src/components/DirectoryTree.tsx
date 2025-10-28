@@ -1,7 +1,7 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Folder, File as FileIcon, ArrowLeft, AlertCircle, Copy, Check } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import type { ScanRoot, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
+import type { ScanRoot, DuplicateGroup, DirectoryContents } from '../types/models';
 
 interface DirectoryTreeProps {
   scanRoots: ScanRoot[];
@@ -27,7 +27,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
   }, [duplicates]);
 
   // Load directory contents
-  const loadDirectory = async (path: string) => {
+  const loadDirectory = useCallback(async (path: string) => {
     if (!path) return;
 
     setLoading(true);
@@ -45,21 +45,21 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   // Initialize with first scan root
   useEffect(() => {
     if (scanRoots.length > 0 && !currentPath) {
       loadDirectory(scanRoots[0].path);
     }
-  }, [scanRoots, currentPath]);
+  }, [scanRoots, currentPath, loadDirectory]);
 
   // Refresh when trigger changes
   useEffect(() => {
     if (currentPath && refreshTrigger > 0) {
       loadDirectory(currentPath);
     }
-  }, [refreshTrigger]);
+  }, [refreshTrigger, currentPath, loadDirectory]);
 
   // Navigate up one level
   const goUp = () => {
@@ -87,9 +87,6 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
 
   // Check if current path is a root path
   const isAtRoot = scanRoots.some(root => root.path === currentPath);
-
-  // Get current directory name
-  const currentDirName = currentPath.split('/').pop() || currentPath;
 
   return (
     <div className="bg-gray-800 rounded-lg overflow-hidden">
@@ -224,7 +221,9 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                           <div className="col-span-4 flex items-center gap-2 min-w-0">
                             <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
                             {hasDuplicate && (
-                              <AlertCircle size={14} className="text-yellow-500 flex-shrink-0" title="Duplicate file" />
+                              <span title="Duplicate file">
+                                <AlertCircle size={14} className="text-yellow-500 flex-shrink-0" />
+                              </span>
                             )}
                             <span className="font-mono text-sm truncate" title={item.file.filename}>
                               {item.file.filename}

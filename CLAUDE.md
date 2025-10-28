@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Athenaeum is a desktop application for astrophotographers to manage FITS/XISF image files. It builds a searchable metadata catalog, detects duplicates using xxHash, and provides Lightroom-style file management with specialized astronomy features.
+Athenaeum is a desktop application for astrophotographers to manage FITS/XISF image files. It builds a searchable metadata catalog with specialized astronomy features including:
+- Automated frame set grouping by sky coordinates
+- Directory browsing with file metadata display
+- Calibration frame management
+- Export templates with path resolution
+- User-configurable settings system
 
 The application uses Tauri 2.0 (Rust backend + React frontend) with SQLite for local catalog storage.
 
@@ -33,24 +38,34 @@ The SQLite database is created in the user's app data directory by Tauri. Schema
 
 ### Frontend (React + TypeScript)
 
-- **Routing**: React Router v7 with 5 main views (File Manager, Shoot Calendar, Objects, Equipment, Export)
+- **Routing**: React Router v7 with 6 main views:
+  - `FileManager` - Directory browser with file metadata display
+  - `Objects` - Frame set library grouped by sky coordinates
+  - `ShootCalendar` - Calendar view of imaging sessions
+  - `Equipment` - Equipment and setup management
+  - `Export` - Export templates and file organization
+  - `Settings` - Application settings and configuration
 - **State Management**: React hooks + Tauri commands for backend communication
-- **Styling**: Tailwind CSS with dark theme
+- **Styling**: Tailwind CSS with dark theme (bg-gray-800/900, text-gray-100)
 - **Component Structure**:
   - `src/components/Layout.tsx` - Main app shell with sidebar navigation
-  - `src/pages/*` - One page component per mode
-  - `src/hooks/*` - Custom hooks for Tauri command invocation
-  - `src/types/*` - TypeScript interfaces matching Rust models
+  - `src/components/DirectoryTree.tsx` - Directory browser with file listing and metadata
+  - `src/pages/*` - One page component per view
+  - `src/hooks/*` - Custom hooks for Tauri command invocation (when added)
+  - `src/types/models.ts` - TypeScript interfaces matching Rust models
 
 ### Backend (Rust)
 
 - **Module Organization**:
-  - `models.rs` - Serde-compatible data structures (File, Frame, CalibrationSet, etc.)
-  - `db/` - SQLite operations and schema
+  - `models.rs` - Serde-compatible data structures (File, Frame, FramesSet, etc.)
+  - `db/` - SQLite operations (`schema.rs`, `operations.rs`)
   - `fits_parser/` - FITS/XISF metadata extraction
   - `scanner/` - Multi-threaded directory traversal with walkdir + rayon
-  - `duplicates/` - xxHash XXH3_64 computation and duplicate grouping
+  - `duplicates/` - xxHash XXH3_64 computation and duplicate detection
   - `calibration/` - Calibration frame matching algorithms
+  - `clustering/` - Sky coordinate-based frame set clustering with DBSCAN
+  - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
+  - `settings/` - Settings management with runtime and database persistence
   - `export/` - Path template resolution and file copying
   - `commands.rs` - Tauri commands exposed to frontend
 
@@ -59,24 +74,52 @@ The SQLite database is created in the user's app data directory by Tauri. Schema
 ### Database Schema
 
 See `src-tauri/src/db/schema.rs` for full schema. Key tables:
-- `files` - Physical files with hash and duplicate_group_id
-- `frames` - Metadata extracted from FITS/XISF (OBJECT, DATE-OBS, TELESCOP, INSTRUME, etc.)
+- `files` - Physical files (path, filename, size, format, modified_at)
+- `frames` - Metadata extracted from FITS/XISF with astronomical coordinates
+  - Basic: OBJECT, DATE-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP
+  - Camera: GAIN, OFFSET, XBINNING, YBINNING, CCD-TEMP, SET-TEMP
+  - Optics: FOCALLEN, XPIXSZ, PIXSZ
+  - Coordinates: RA, DEC, OBJCTRA, OBJCTDEC, SITELAT, SITELONG
 - `scan_roots` - Monitored directory paths
-- `calibration_sets` - Grouped calibration frames by type and parameters
+- `calibration_set` + `calibration_set_frames` - Grouped calibration frames
+- `projects` - Top-level organization for imaging projects
+- `frames_set` + `frames_set_members` - Frame sets grouped by sky coordinates
 - `tags` + `frame_tags` - User tagging system
 - `export_templates` - Saved export path templates
+- `fits_header` - Complete original FITS header storage
+- `settings` - Application configuration (key-value pairs)
 
-Indexes on: content_hash, size, date_obs, object, telescop, instrume, imagetyp
+Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, exptime, filter
 
 ### Key Technical Decisions
 
-**xxHash over MD5/SHA**: Non-cryptographic xxHash XXH3_64 chosen for maximum scan throughput on large datasets. Optional byte-verify available before destructive operations.
+**Frame Set Clustering**: Uses DBSCAN algorithm to group LIGHT frames by sky coordinates (RA/Dec). Frames within a configurable threshold distance are automatically grouped into frame sets. This enables organizing frames by target object without manual tagging.
 
-**FITS Parsing**: Uses `fitsio` crate. Key FITS keywords: OBJECT, DATE-OBS, TIME-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP, GAIN, OFFSET, XBINNING, YBINNING, CCD-TEMP, SET-TEMP.
+**Coordinate Parsing**: Supports multiple RA/Dec formats:
+- Decimal degrees (e.g., `123.456`, `-45.678`)
+- HMS/DMS strings (e.g., `12h34m56.7s`, `-45d40m30s`)
+- Colon-separated (e.g., `12:34:56.7`, `-45:40:30`)
+
+**Settings System**: Three-tier precedence for configuration:
+1. Runtime overrides (in-memory)
+2. Database persisted settings
+3. Default values
+
+Common settings include `grouping_threshold_arcmin` for frame set clustering.
+
+**Auto-Generate Frame Sets**:
+- Excludes frames already in any set to prevent duplicates
+- Clusters by sky coordinates with configurable threshold
+- Reports excluded frames with reasons (missing coordinates, etc.)
+- Creates named sets with aggregated metadata (total exposure time, coordinates)
+
+**FITS Parsing**: Uses `fitsio` crate. Key FITS keywords: OBJECT, DATE-OBS, TIME-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP, GAIN, OFFSET, XBINNING, YBINNING, CCD-TEMP, SET-TEMP, FOCALLEN, RA, DEC, OBJCTRA, OBJCTDEC.
 
 **XISF Parsing**: Must parse XML header according to XISF 1.0 spec and extract embedded FITS-like properties.
 
 **DATE-OBS Normalization**: Parse various formats (ISO 8601, separate DATE-OBS + TIME-OBS, legacy) into consistent timestamp for calendar grouping.
+
+**Duplicate Detection**: xxHash XXH3_64 computation available for identifying duplicate files (implementation in `duplicates/` module).
 
 **IMAGETYP to FRAME_FOLDER Mapping**:
 - LIGHT → `Lights`
@@ -96,24 +139,42 @@ Indexes on: content_hash, size, date_obs, object, telescop, instrume, imagetyp
 
 2. **Database Schema Changes**:
    - Update `src-tauri/src/db/schema.rs::init_db()`
-   - Handle migration if schema already exists (or delete dev database)
+   - Handle migration if schema already exists (or delete dev database during development)
+   - Add corresponding operations in `src-tauri/src/db/operations.rs`
 
 3. **Adding New Models**:
    - Define in `src-tauri/src/models.rs` with Serde derive
-   - Create matching TypeScript interface in `src/types/`
+   - Create matching TypeScript interface in `src/types/models.ts`
+   - Ensure field names and types match exactly
 
 4. **UI Changes**:
    - Pages are in `src/pages/`
    - Shared components in `src/components/`
    - Use Tailwind classes, dark theme (bg-gray-800/900, text-gray-100)
    - Icons from `lucide-react`
+   - Follow React hooks best practices (useCallback, useMemo, proper dependencies)
+
+5. **Working with Settings**:
+   - Settings are managed through `SettingsManager` in `src-tauri/src/settings/`
+   - Use `get_setting` and `set_setting` Tauri commands from frontend
+   - Settings support default values and database persistence
+   - Access via `state.settings` in Rust commands
+
+6. **Working with Frame Sets**:
+   - Frame sets are created via `auto_generate_frame_sets` command
+   - Clustering is performed by `src-tauri/src/clustering/` module
+   - Coordinate conversion handled by `src-tauri/src/coordinates/` module
+   - Always check if frames are already in sets before adding to prevent duplicates
 
 ## Testing Approach
 
 - **Backend**: Use `cargo test` with mock file systems and in-memory SQLite
 - **FITS Parser**: Test with real FITS files from common observatories
-- **xxHash**: Verify hash consistency and collision detection
+- **Coordinate Parsing**: Test HMS/DMS and decimal degree conversions with edge cases
+- **Frame Set Clustering**: Test DBSCAN algorithm with various coordinate distributions
+- **Settings System**: Test precedence (runtime > DB > default) and persistence
 - **Export Templates**: Test token resolution with edge cases (missing values, special chars)
+- **Duplicate Detection**: Verify hash consistency (when implemented)
 
 ## File Organization Conventions
 
@@ -134,19 +195,61 @@ const result = await invoke<ReturnType>('command_name', {
 });
 ```
 
+**Auto-Generating Frame Sets**:
+```typescript
+// From frontend
+const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
+  projectId: 1
+});
+console.log(`Created ${result.sets_created} sets with ${result.frames_clustered} frames`);
+```
+
+**Working with Settings**:
+```typescript
+// Get a setting with default
+const threshold = await invoke<string>('get_setting', {
+  key: 'grouping_threshold_arcmin',
+  defaultValue: '15'
+});
+
+// Set a setting
+await invoke('set_setting', {
+  key: 'grouping_threshold_arcmin',
+  value: '20'
+});
+```
+
 **Querying Database in Rust**:
 ```rust
-let conn = get_connection()?;
+let conn = db.conn();
 let mut stmt = conn.prepare("SELECT * FROM frames WHERE object = ?1")?;
 let frames = stmt.query_map([object], |row| {
   // map row to Frame struct
 })?;
 ```
 
-**Computing File Hash**:
+**Accessing Settings in Rust Commands**:
 ```rust
-use crate::duplicates::compute_xxhash;
-let hash = compute_xxhash(&path)?;
+#[tauri::command]
+pub async fn my_command(state: State<'_, AppState>) -> Result<f64, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let threshold = state.settings
+        .get_grouping_threshold_deg(&conn)
+        .map_err(|e| e.to_string())?;
+
+    Ok(threshold)
+}
+```
+
+**Parsing Coordinates**:
+```rust
+use crate::coordinates::{parse_ra_to_degrees, parse_dec_to_degrees};
+
+let ra_deg = parse_ra_to_degrees("12h34m56.7s")?;
+let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
 ```
 
 ## Dependencies

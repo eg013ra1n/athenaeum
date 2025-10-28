@@ -1,8 +1,8 @@
 // File scanner module
 // Handles directory traversal and metadata extraction
 
-use crate::db::{file_exists, insert_file, insert_frame};
-use crate::fits_parser::{parse_fits, parse_xisf};
+use crate::db::{file_exists, insert_file, insert_frame, insert_fits_header};
+use crate::fits_parser::{parse_fits, parse_xisf, extract_fits_header};
 use crate::models::{File, FileFormat};
 use chrono::Utc;
 use rusqlite::Connection;
@@ -137,6 +137,23 @@ fn process_file(path: &PathBuf, conn: &Connection) -> anyhow::Result<()> {
     };
 
     insert_frame(conn, &frame)?;
+
+    // Store full FITS header for future reference
+    if format == FileFormat::FITS {
+        match extract_fits_header(path) {
+            Ok(header) => {
+                println!("Storing FITS header for file_id={}, header length={} bytes", file_id, header.len());
+                if let Err(e) = insert_fits_header(conn, file_id, &header) {
+                    println!("Warning: Failed to store FITS header: {}", e);
+                    // Continue processing - header storage is non-critical
+                }
+            }
+            Err(e) => {
+                println!("Warning: Failed to extract FITS header: {}", e);
+                // Continue processing - header storage is non-critical
+            }
+        }
+    }
 
     Ok(())
 }
