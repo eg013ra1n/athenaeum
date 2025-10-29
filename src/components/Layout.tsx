@@ -17,7 +17,7 @@ export default function Layout() {
       <aside className="w-64 bg-gray-800 border-r border-gray-700">
         <div className="p-4 border-b border-gray-700">
           <h1 className="text-2xl font-bold text-blue-400">Athenaeum</h1>
-          <p className="text-xs text-gray-400 mt-1">Astrophotography Manager</p>
+          <p className="text-xs text-gray-400 mt-1">Astrophotography Library Manager</p>
         </div>
 
         <nav className="p-4 space-y-2">
