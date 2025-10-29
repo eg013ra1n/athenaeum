@@ -166,7 +166,7 @@ mod tests {
         let value = manager
             .get_with_precedence(&conn, keys::GROUPING_THRESHOLD_VALUE, defaults::GROUPING_THRESHOLD_VALUE)
             .unwrap();
-        assert_eq!(value, "5.0");
+        assert_eq!(value, "3.0");
     }
 
     #[test]

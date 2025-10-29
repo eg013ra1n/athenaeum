@@ -446,6 +446,20 @@ pub async fn delete_frames_set(
     db::delete_frames_set(&conn, frames_set_id).map_err(|e| e.to_string())
 }
 
+/// Rename a frames_set
+#[tauri::command]
+pub async fn rename_frames_set(
+    frames_set_id: i64,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::update_frames_set_name(&conn, frames_set_id, &new_name).map_err(|e| e.to_string())
+}
+
 /// Get frame set detail with imaging nights and sessions
 #[tauri::command]
 pub async fn get_frame_set_detail(

@@ -47,6 +47,7 @@ pub fn run() {
             commands::auto_generate_frame_sets,
             commands::get_frames_sets,
             commands::delete_frames_set,
+            commands::rename_frames_set,
             commands::get_frame_set_detail,
         ])
         .run(tauri::generate_context!())

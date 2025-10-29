@@ -505,6 +505,15 @@ pub fn delete_frames_set(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Update frames_set name
+pub fn update_frames_set_name(conn: &Connection, id: i64, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE frames_set SET name = ?1 WHERE id = ?2",
+        params![name, id],
+    )?;
+    Ok(())
+}
+
 /// Get all LIGHT frames for a project (for clustering)
 pub fn get_light_frames_for_project(
     conn: &Connection,

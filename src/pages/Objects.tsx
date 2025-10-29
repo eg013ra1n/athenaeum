@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 
 export default function Objects() {
@@ -11,6 +11,8 @@ export default function Objects() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [generateResult, setGenerateResult] = useState<AutoGenerateResult | null>(null);
+  const [editingSetId, setEditingSetId] = useState<number | null>(null);
+  const [editingName, setEditingName] = useState<string>('');
 
   // For now, using project_id = 1 as default
   const PROJECT_ID = 1;
@@ -73,6 +75,36 @@ export default function Objects() {
     } catch (err) {
       setError(err as string);
       console.error('Failed to delete frame set:', err);
+    }
+  };
+
+  const startEditing = (setId: number, currentName: string | null) => {
+    setEditingSetId(setId);
+    setEditingName(currentName || '');
+  };
+
+  const cancelEditing = () => {
+    setEditingSetId(null);
+    setEditingName('');
+  };
+
+  const saveRename = async (setId: number) => {
+    if (!editingName.trim()) {
+      setError('Name cannot be empty');
+      return;
+    }
+
+    try {
+      await invoke('rename_frames_set', {
+        framesSetId: setId,
+        newName: editingName.trim()
+      });
+      await loadFrameSets();
+      setEditingSetId(null);
+      setEditingName('');
+    } catch (err) {
+      setError(err as string);
+      console.error('Failed to rename frame set:', err);
     }
   };
 
@@ -163,13 +195,55 @@ export default function Objects() {
           {frameSets.map(({ frames_set, member_count }) => (
             <div
               key={frames_set.id}
-              className="bg-gray-800 rounded-lg p-4 border border-gray-700 hover:border-gray-600 transition-colors"
+              className="bg-gray-800 rounded-lg p-4 border border-gray-700 hover:border-gray-600 transition-colors group"
             >
               <div className="flex items-start justify-between mb-3">
                 <div className="flex-1 min-w-0">
-                  <h3 className="text-lg font-semibold text-gray-100 truncate">
-                    {frames_set.name || 'Untitled'}
-                  </h3>
+                  {editingSetId === frames_set.id ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={editingName}
+                        onChange={(e) => setEditingName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            saveRename(frames_set.id!);
+                          } else if (e.key === 'Escape') {
+                            cancelEditing();
+                          }
+                        }}
+                        className="flex-1 px-2 py-1 bg-gray-700 text-gray-100 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                        autoFocus
+                      />
+                      <button
+                        onClick={() => saveRename(frames_set.id!)}
+                        className="p-1 text-green-400 hover:text-green-300"
+                        title="Save"
+                      >
+                        <Check size={18} />
+                      </button>
+                      <button
+                        onClick={cancelEditing}
+                        className="p-1 text-red-400 hover:text-red-300"
+                        title="Cancel"
+                      >
+                        <X size={18} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-lg font-semibold text-gray-100 truncate">
+                        {frames_set.name || 'Untitled'}
+                      </h3>
+                      <button
+                        onClick={() => startEditing(frames_set.id!, frames_set.name)}
+                        className="p-1 text-gray-400 hover:text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Rename"
+                      >
+                        <Pencil size={14} />
+                      </button>
+                    </div>
+                  )}
                   {frames_set.objctra && frames_set.objctdec && (
                     <div className="flex items-center gap-1 text-sm text-gray-400 mt-1">
                       <MapPin size={14} />

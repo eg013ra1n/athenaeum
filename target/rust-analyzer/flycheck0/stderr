@@ -1,0 +1,35 @@
+   0.116663958s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum_lib"}: cargo::core::compiler::fingerprint: stale: changed "/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/src/settings/mod.rs"
+   0.116673083s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum_lib"}: cargo::core::compiler::fingerprint:           (vs) "/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/target/debug/.fingerprint/athenaeum-0173cd4c0585d681/dep-lib-athenaeum_lib"
+   0.116675375s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum_lib"}: cargo::core::compiler::fingerprint:                FileTime { seconds: 1761768246, nanos: 566052535 } < FileTime { seconds: 1761768250, nanos: 923054527 }
+   0.116837083s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum_lib"}: cargo::core::compiler::fingerprint: fingerprint dirty for athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri)/Check { test: false }/TargetInner { ..: lib_target("athenaeum_lib", ["staticlib", "cdylib", "rlib"], "/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/src/lib.rs", Edition2021) }
+   0.116843625s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum_lib"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleItem(ChangedFile { reference: "/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/target/debug/.fingerprint/athenaeum-0173cd4c0585d681/dep-lib-athenaeum_lib", reference_mtime: FileTime { seconds: 1761768246, nanos: 566052535 }, stale: "/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/src/settings/mod.rs", stale_mtime: FileTime { seconds: 1761768250, nanos: 923054527 } }))
+   0.128827458s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum_lib"}: cargo::core::compiler::fingerprint: fingerprint error for athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri)/Check { test: true }/TargetInner { ..: lib_target("athenaeum_lib", ["staticlib", "cdylib", "rlib"], "/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/src/lib.rs", Edition2021) }
+   0.128832041s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum_lib"}: cargo::core::compiler::fingerprint:     err: failed to read `/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/target/debug/.fingerprint/athenaeum-c4d9c2b64ec440b8/test-lib-athenaeum_lib`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.131469541s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum"}: cargo::core::compiler::fingerprint: fingerprint dirty for athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri)/Check { test: false }/TargetInner { name: "athenaeum", doc: true, ..: with_path("/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/src/main.rs", Edition2021) }
+   0.131473166s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "athenaeum_lib" })
+   0.132075666s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum"}: cargo::core::compiler::fingerprint: fingerprint dirty for athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri)/Check { test: true }/TargetInner { name: "athenaeum", doc: true, ..: with_path("/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri/src/main.rs", Edition2021) }
+   0.132078458s  INFO prepare_target{force=false package_id=athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri) target="athenaeum"}: cargo::core::compiler::fingerprint:     dirty: FsStatusOutdated(StaleDepFingerprint { name: "athenaeum_lib" })
+    Checking athenaeum v0.1.0 (/Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum/src-tauri)
+error: could not compile `athenaeum` (lib test) due to 1 previous error; 6 warnings emitted
