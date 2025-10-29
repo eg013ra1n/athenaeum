@@ -49,6 +49,7 @@ pub fn run() {
             commands::delete_frames_set,
             commands::rename_frames_set,
             commands::get_frame_set_detail,
+            commands::create_custom_frames_set,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

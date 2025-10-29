@@ -360,6 +360,7 @@ pub async fn auto_generate_frame_sets(
         let set_id = db::create_frames_set(
             &conn,
             cluster.name.as_deref(),
+            false, // is_custom = false for auto-generated sets
             cluster.date_obs.as_deref(),
             Some(&cluster.objctra),
             Some(&cluster.objctdec),
@@ -500,6 +501,198 @@ pub async fn get_frame_set_detail(
         frames_set,
         nights,
     })
+}
+
+/// Create a custom frames set with selected sessions
+#[tauri::command]
+pub async fn create_custom_frames_set(
+    name: String,
+    session_ids: Vec<i64>,
+    project_id: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    println!("Creating custom frames set: name='{}', session_ids={:?}, project_id={:?}", name, session_ids, project_id);
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get frames for all selected sessions to determine date ranges
+    let mut all_session_frames = Vec::new();
+    for session_id in &session_ids {
+        println!("Getting frames for session {}", session_id);
+        let frame_ids = db::get_frame_ids_for_session(&conn, *session_id)
+            .map_err(|e| e.to_string())?;
+
+        println!("Session {} has {} frames", session_id, frame_ids.len());
+
+        if !frame_ids.is_empty() {
+            let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids)
+                .map_err(|e| e.to_string())?;
+
+            all_session_frames.push((*session_id, frames));
+        }
+    }
+
+    if all_session_frames.is_empty() {
+        return Err("No frames found in selected sessions".to_string());
+    }
+
+    println!("Total sessions with frames: {}", all_session_frames.len());
+
+    // Get session gap threshold from settings
+    let gap_threshold_hours: f64 = state.settings
+        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
+        .map_err(|e| e.to_string())?
+        .parse()
+        .unwrap_or(6.0);
+
+    // Flatten all frames and group by session_id for later
+    let mut session_frame_map: std::collections::HashMap<i64, Vec<(i64, crate::models::File, crate::models::Frame)>> =
+        std::collections::HashMap::new();
+    let mut all_frames = Vec::new();
+
+    for (session_id, frames) in all_session_frames {
+        session_frame_map.insert(session_id, frames.clone());
+        all_frames.extend(frames);
+    }
+
+    // Detect nights from all frames combined
+    println!("Detecting nights from {} frames with gap threshold {} hours", all_frames.len(), gap_threshold_hours);
+    let detected_nights = crate::sessions::detect_sessions(all_frames, gap_threshold_hours)
+        .map_err(|e| {
+            let err_msg = format!("Failed to detect sessions: {}", e);
+            println!("{}", err_msg);
+            err_msg
+        })?;
+
+    println!("Detected {} nights", detected_nights.len());
+
+    if detected_nights.is_empty() {
+        return Err("No imaging nights could be detected from the selected sessions. Frames may be missing date/time information.".to_string());
+    }
+
+    // Calculate aggregate values from all frames
+    let mut total_exp_time: f64 = 0.0;
+    let mut earliest_date_obs: Option<String> = None;
+    let mut ra_values: Vec<f64> = Vec::new();
+    let mut dec_values: Vec<f64> = Vec::new();
+
+    for (_, frames) in &session_frame_map {
+        for (_, _, frame) in frames {
+            // Sum exposure time
+            if let Some(exp) = frame.exptime {
+                total_exp_time += exp;
+            }
+
+            // Track earliest date
+            if let Some(date) = &frame.date_obs {
+                let date_str = date.to_rfc3339();
+                if earliest_date_obs.is_none() || date_str < earliest_date_obs.as_ref().unwrap().clone() {
+                    earliest_date_obs = Some(date_str);
+                }
+            }
+
+            // Collect RA/Dec for averaging (use objctra/objctdec as strings)
+            // We'll just use the first frame's coordinates for simplicity
+            if ra_values.is_empty() {
+                if let Some(ra) = &frame.objctra {
+                    ra_values.push(0.0); // Placeholder, we'll use the string directly
+                }
+            }
+        }
+    }
+
+    // Get first frame's coordinates (simpler than averaging coordinate strings)
+    let (first_ra, first_dec) = session_frame_map.values()
+        .flat_map(|frames| frames.iter())
+        .find_map(|(_, _, frame)| {
+            if let (Some(ra), Some(dec)) = (&frame.objctra, &frame.objctdec) {
+                Some((ra.clone(), dec.clone()))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((String::new(), String::new()));
+
+    println!("Calculated aggregates: total_exp_time={}, earliest_date={:?}, coordinates={}/{}",
+             total_exp_time, earliest_date_obs, first_ra, first_dec);
+
+    // Create the custom frames_set
+    println!("Creating frames_set with name '{}'", name);
+    let set_id = db::create_frames_set(
+        &conn,
+        Some(&name),
+        true, // is_custom = true
+        earliest_date_obs.as_deref(),
+        if first_ra.is_empty() { None } else { Some(&first_ra) },
+        if first_dec.is_empty() { None } else { Some(&first_dec) },
+        Some(total_exp_time),
+        project_id,
+    ).map_err(|e| {
+        let err_msg = format!("Failed to create frames_set: {}", e);
+        println!("{}", err_msg);
+        err_msg
+    })?;
+
+    println!("Created frames_set with id {}", set_id);
+
+    // Create imaging_nights and clone sessions
+    let mut total_sessions_cloned = 0;
+    for (night_idx, night) in detected_nights.iter().enumerate() {
+        println!("Processing night {}/{}: {} to {}", night_idx + 1, detected_nights.len(), night.start_time, night.end_time);
+
+        let night_id = db::create_imaging_night(
+            &conn,
+            set_id,
+            &night.start_time,
+            &night.end_time,
+        ).map_err(|e| {
+            let err_msg = format!("Failed to create imaging_night: {}", e);
+            println!("{}", err_msg);
+            err_msg
+        })?;
+
+        println!("Created imaging_night with id {}", night_id);
+
+        // For each original session, check if any of its frames belong to this night
+        for &session_id in &session_ids {
+            if let Some(session_frames) = session_frame_map.get(&session_id) {
+                // Check if any frames from this session are in this night
+                let session_frame_ids: std::collections::HashSet<i64> =
+                    session_frames.iter().map(|(_, _, frame)| frame.id.unwrap()).collect();
+
+                let night_frame_ids: std::collections::HashSet<i64> =
+                    night.sessions.iter()
+                        .flat_map(|s| &s.frame_ids)
+                        .copied()
+                        .collect();
+
+                let intersection: Vec<i64> = session_frame_ids.intersection(&night_frame_ids)
+                    .copied()
+                    .collect();
+
+                // If this session has frames in this night, clone it
+                if !intersection.is_empty() {
+                    println!("Cloning session {} to night {} ({} overlapping frames)", session_id, night_id, intersection.len());
+                    db::clone_session(&conn, session_id, night_id)
+                        .map_err(|e| {
+                            let err_msg = format!("Failed to clone session {}: {}", session_id, e);
+                            println!("{}", err_msg);
+                            err_msg
+                        })?;
+                    total_sessions_cloned += 1;
+                } else {
+                    println!("Session {} has no frames in night {}", session_id, night_id);
+                }
+            }
+        }
+    }
+
+    println!("Successfully created custom frames_set '{}' (id {}) with {} imaging nights and {} cloned sessions",
+             name, set_id, detected_nights.len(), total_sessions_cloned);
+
+    Ok(set_id)
 }
 
 // DTOs for frame sets

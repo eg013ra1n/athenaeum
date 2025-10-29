@@ -142,6 +142,7 @@ export interface Project {
 export interface FramesSet {
   id: number | null;
   name: string | null;
+  is_custom: boolean;
   date_obs: string | null;
   objctra: string | null;
   objctdec: string | null;
@@ -196,6 +197,19 @@ export interface Session {
   frame_count: number;
   total_exp_time: number | null;
   created_at: string | null;
+}
+
+export interface SessionWithMetadata {
+  id: number | null;
+  imaging_night_id: number;
+  instrume: string;
+  frame_count: number;
+  total_exp_time: number | null;
+  created_at: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  avg_ra: string | null;
+  avg_dec: string | null;
 }
 
 export interface SessionMember {

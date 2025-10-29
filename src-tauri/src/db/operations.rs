@@ -436,16 +436,18 @@ pub fn get_all_settings(conn: &Connection) -> Result<Vec<Setting>> {
 pub fn create_frames_set(
     conn: &Connection,
     name: Option<&str>,
+    is_custom: bool,
     date_obs: Option<&str>,
     objctra: Option<&str>,
     objctdec: Option<&str>,
     total_exp_time: Option<f64>,
     project_id: Option<i64>,
 ) -> Result<i64> {
+    let is_custom_int = if is_custom { 1 } else { 0 };
     conn.execute(
-        "INSERT INTO frames_set (name, date_obs, objctra, objctdec, total_exp_time, project_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![name, date_obs, objctra, objctdec, total_exp_time, project_id],
+        "INSERT INTO frames_set (name, is_custom, date_obs, objctra, objctdec, total_exp_time, project_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![name, is_custom_int, date_obs, objctra, objctdec, total_exp_time, project_id],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -456,7 +458,7 @@ pub fn get_frames_sets_by_project(
     project_id: i64,
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(
-        "SELECT fs.id, fs.name, fs.date_obs, fs.objctra, fs.objctdec, fs.total_exp_time, fs.project_id,
+        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs, fs.objctra, fs.objctdec, fs.total_exp_time, fs.project_id,
                 COUNT(DISTINCT sm.frame_id) as member_count
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
@@ -471,13 +473,14 @@ pub fn get_frames_sets_by_project(
         let set = crate::models::FramesSet {
             id: Some(row.get(0)?),
             name: row.get(1)?,
-            date_obs: row.get(2)?,
-            objctra: row.get(3)?,
-            objctdec: row.get(4)?,
-            total_exp_time: row.get(5)?,
-            project_id: row.get(6)?,
+            is_custom: row.get::<_, i32>(2)? == 1,
+            date_obs: row.get(3)?,
+            objctra: row.get(4)?,
+            objctdec: row.get(5)?,
+            total_exp_time: row.get(6)?,
+            project_id: row.get(7)?,
         };
-        let member_count: i32 = row.get(7)?;
+        let member_count: i32 = row.get(8)?;
         Ok((set, member_count as usize))
     })?;
 
@@ -992,3 +995,60 @@ pub fn get_imaging_nights_with_sessions(
 
     Ok(result)
 }
+
+// ============================================================================
+// Custom Frames Set Operations
+// ============================================================================
+
+/// Get frame IDs for a given session
+pub fn get_frame_ids_for_session(conn: &Connection, session_id: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT frame_id FROM session_members WHERE session_id = ?1"
+    )?;
+
+    let frame_ids = stmt.query_map(params![session_id], |row| row.get(0))?;
+    frame_ids.collect()
+}
+
+/// Clone a session (create a new session with the same data but different imaging_night_id)
+/// Returns the new session_id
+pub fn clone_session(
+    conn: &Connection,
+    original_session_id: i64,
+    new_imaging_night_id: i64,
+) -> Result<i64> {
+    // Get original session data
+    let session: crate::models::Session = conn.query_row(
+        "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at
+         FROM sessions WHERE id = ?1",
+        params![original_session_id],
+        |row| {
+            Ok(crate::models::Session {
+                id: row.get(0)?,
+                imaging_night_id: row.get(1)?,
+                instrume: row.get(2)?,
+                frame_count: row.get(3)?,
+                total_exp_time: row.get(4)?,
+                created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                }),
+            })
+        },
+    )?;
+
+    // Create new session with new imaging_night_id
+    let new_session_id = create_session(
+        conn,
+        new_imaging_night_id,
+        &session.instrume,
+        session.frame_count,
+        session.total_exp_time,
+    )?;
+
+    // Copy session_members
+    let frame_ids = get_frame_ids_for_session(conn, original_session_id)?;
+    insert_session_members(conn, new_session_id, &frame_ids)?;
+
+    Ok(new_session_id)
+}
+

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight } from 'lucide-react';
+import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus } from 'lucide-react';
 import type { FrameSetDetail, ImagingNightWithSessions, SessionWithFrames } from '../types/models';
 
 export default function FrameSetDetail() {
@@ -11,6 +11,10 @@ export default function FrameSetDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedSessions, setExpandedSessions] = useState<Set<number>>(new Set());
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<number>>(new Set());
+  const [customSetName, setCustomSetName] = useState('');
+  const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [creating, setCreating] = useState(false);
 
   useEffect(() => {
     loadDetail();
@@ -87,6 +91,88 @@ export default function FrameSetDetail() {
     });
   };
 
+  const toggleSessionSelection = (sessionId: number | null | undefined) => {
+    if (!sessionId) return;
+    setSelectedSessionIds(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(sessionId)) {
+        newSet.delete(sessionId);
+      } else {
+        newSet.add(sessionId);
+      }
+      return newSet;
+    });
+  };
+
+  const toggleNightSelection = (night: ImagingNightWithSessions) => {
+    const nightSessionIds = night.sessions
+      ?.map(s => s.session?.id)
+      .filter((id): id is number => id != null) || [];
+
+    if (nightSessionIds.length === 0) return;
+
+    const allSelected = nightSessionIds.every(id => selectedSessionIds.has(id));
+
+    setSelectedSessionIds(prev => {
+      const newSet = new Set(prev);
+      if (allSelected) {
+        // Deselect all
+        nightSessionIds.forEach(id => newSet.delete(id));
+      } else {
+        // Select all
+        nightSessionIds.forEach(id => newSet.add(id));
+      }
+      return newSet;
+    });
+  };
+
+  const isNightFullySelected = (night: ImagingNightWithSessions) => {
+    const nightSessionIds = night.sessions
+      ?.map(s => s.session?.id)
+      .filter((id): id is number => id != null) || [];
+
+    return nightSessionIds.length > 0 && nightSessionIds.every(id => selectedSessionIds.has(id));
+  };
+
+  const isNightPartiallySelected = (night: ImagingNightWithSessions) => {
+    const nightSessionIds = night.sessions
+      ?.map(s => s.session?.id)
+      .filter((id): id is number => id != null) || [];
+
+    return nightSessionIds.some(id => selectedSessionIds.has(id)) && !isNightFullySelected(night);
+  };
+
+  const handleCreateCustomSet = async () => {
+    if (!customSetName.trim()) {
+      alert('Please enter a name for the custom set');
+      return;
+    }
+
+    if (selectedSessionIds.size === 0) {
+      alert('Please select at least one session');
+      return;
+    }
+
+    try {
+      setCreating(true);
+      await invoke('create_custom_frames_set', {
+        name: customSetName.trim(),
+        sessionIds: Array.from(selectedSessionIds),
+        projectId: null, // No project assignment for now (can be added later)
+      });
+
+      alert('Custom frames set created successfully!');
+      setShowCreateDialog(false);
+      setCustomSetName('');
+      setSelectedSessionIds(new Set());
+      navigate('/objects');
+    } catch (err) {
+      alert('Failed to create custom set: ' + String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="p-6">
@@ -151,8 +237,8 @@ export default function FrameSetDetail() {
 
   return (
     <div className="p-6">
-      {/* Back Button */}
-      <div className="mb-6">
+      {/* Back Button and Selection Info */}
+      <div className="mb-6 flex items-center justify-between">
         <button
           onClick={() => navigate('/objects')}
           className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
@@ -160,6 +246,21 @@ export default function FrameSetDetail() {
           <ArrowLeft size={18} />
           Back to Objects
         </button>
+
+        {selectedSessionIds.size > 0 && (
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-gray-400">
+              {selectedSessionIds.size} session{selectedSessionIds.size !== 1 ? 's' : ''} selected
+            </span>
+            <button
+              onClick={() => setShowCreateDialog(true)}
+              className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition"
+            >
+              <Plus size={18} />
+              Create Custom Set
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Frame Set Header */}
@@ -240,6 +341,16 @@ export default function FrameSetDetail() {
                 {/* Night Header */}
                 <div className="bg-gray-750 rounded-lg px-4 py-3 mb-4 border border-gray-700">
                   <div className="flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      checked={isNightFullySelected(night)}
+                      ref={(el) => {
+                        if (el) el.indeterminate = isNightPartiallySelected(night);
+                      }}
+                      onChange={() => toggleNightSelection(night)}
+                      className="w-4 h-4 cursor-pointer"
+                      title="Select all sessions in this night"
+                    />
                     <Calendar size={20} className="text-purple-400" />
                     <div>
                       <h3 className="font-semibold text-lg text-gray-100">
@@ -264,11 +375,20 @@ export default function FrameSetDetail() {
                   return (
                     <div key={sessionId || Math.random()} className="bg-gray-800 rounded-lg overflow-hidden mb-4">
                       {/* Session Header - Clickable */}
-                      <button
-                        onClick={() => toggleSession(sessionId)}
-                        className="w-full bg-gray-750 border-b border-gray-700 px-4 py-3 hover:bg-gray-700 transition-colors text-left"
-                      >
-                        <div className="flex items-center gap-3">
+                      <div className="w-full bg-gray-750 border-b border-gray-700 px-4 py-3 flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          checked={sessionId ? selectedSessionIds.has(sessionId) : false}
+                          onChange={(e) => {
+                            e.stopPropagation();
+                            toggleSessionSelection(sessionId);
+                          }}
+                          className="w-4 h-4 cursor-pointer"
+                        />
+                        <button
+                          onClick={() => toggleSession(sessionId)}
+                          className="flex-1 flex items-center gap-3 hover:bg-gray-700 transition-colors text-left -my-3 -mr-4 py-3 pr-4 rounded"
+                        >
                           {isExpanded ? (
                             <ChevronDown size={18} className="text-gray-400" />
                           ) : (
@@ -282,8 +402,8 @@ export default function FrameSetDetail() {
                               {' '}{formatExposureTime(sessionData.session?.total_exp_time)} total
                             </p>
                           </div>
-                        </div>
-                      </button>
+                        </button>
+                      </div>
 
                       {/* Frames Table - Collapsible */}
                       {isExpanded && sessionData.frames && sessionData.frames.length > 0 && (
@@ -359,6 +479,52 @@ export default function FrameSetDetail() {
           </div>
         )}
       </div>
+
+      {/* Create Custom Set Dialog */}
+      {showCreateDialog && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg max-w-md w-full p-6 border border-gray-700">
+            <h3 className="text-xl font-bold mb-4">Create Custom Set</h3>
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Set Name
+              </label>
+              <input
+                type="text"
+                value={customSetName}
+                onChange={(e) => setCustomSetName(e.target.value)}
+                placeholder="Enter custom set name"
+                className="w-full px-3 py-2 bg-gray-700 text-gray-100 rounded-lg border border-gray-600 focus:outline-none focus:border-blue-500"
+                autoFocus
+              />
+            </div>
+
+            <div className="mb-6 text-sm text-gray-400">
+              {selectedSessionIds.size} session{selectedSessionIds.size !== 1 ? 's' : ''} will be included in the new set
+            </div>
+
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => {
+                  setShowCreateDialog(false);
+                  setCustomSetName('');
+                }}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleCreateCustomSet}
+                disabled={creating || !customSetName.trim()}
+                className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition"
+              >
+                {creating ? 'Creating...' : 'Create'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

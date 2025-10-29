@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 
 export default function Objects() {
@@ -232,6 +232,9 @@ export default function Objects() {
                     </div>
                   ) : (
                     <div className="flex items-center gap-2">
+                      {frames_set.is_custom && (
+                        <Star size={16} className="text-orange-500 fill-orange-500 flex-shrink-0" title="Custom Set" />
+                      )}
                       <h3 className="text-lg font-semibold text-gray-100 truncate">
                         {frames_set.name || 'Untitled'}
                       </h3>

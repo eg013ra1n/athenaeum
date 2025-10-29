@@ -174,6 +174,7 @@ pub struct Project {
 pub struct FramesSet {
     pub id: Option<i64>,
     pub name: Option<String>,
+    pub is_custom: bool,
     pub date_obs: Option<String>,
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
@@ -216,6 +217,21 @@ pub struct Session {
     pub frame_count: i32,
     pub total_exp_time: Option<f64>,
     pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Session with aggregated metadata (for filtering in custom set creation)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWithMetadata {
+    pub id: Option<i64>,
+    pub imaging_night_id: i64,
+    pub instrume: String,
+    pub frame_count: i32,
+    pub total_exp_time: Option<f64>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub avg_ra: Option<String>,
+    pub avg_dec: Option<String>,
 }
 
 /// Junction table member for session_members
