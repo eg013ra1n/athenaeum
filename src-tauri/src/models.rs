@@ -268,3 +268,40 @@ pub struct FrameSetDetail {
     pub frames_set: FramesSet,
     pub nights: Vec<ImagingNightWithSessions>,
 }
+
+/// Equipment/Camera statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CameraStats {
+    pub instrume: String,
+    pub frame_count: i64,
+    pub total_hours: f64,
+    pub first_use: Option<String>,  // ISO 8601
+    pub last_use: Option<String>,   // ISO 8601
+}
+
+/// Calibration set with extended metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSetDetail {
+    pub id: Option<i64>,
+    pub imagetyp: ImageType,
+    pub exptime: Option<f64>,
+    pub ccd_temp: f64,           // Average temperature
+    pub temp_min: f64,
+    pub temp_max: f64,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    pub binning: Option<String>,
+    pub instrume: Option<String>,
+    pub date_start: String,      // ISO 8601
+    pub date_end: String,        // ISO 8601
+    pub date_display: String,    // e.g., "2025-10"
+    pub frame_count: i64,
+}
+
+/// Result of dark library creation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DarkLibraryResult {
+    pub sets_created: i64,
+    pub frames_grouped: i64,
+    pub frames_excluded: i64,
+}

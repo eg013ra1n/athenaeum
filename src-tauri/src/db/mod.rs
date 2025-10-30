@@ -3,9 +3,11 @@
 
 mod schema;
 mod operations;
+mod equipment;
 
 pub use schema::*;
 pub use operations::*;
+pub use equipment::*;
 
 use rusqlite::{Connection, Result};
 use std::path::PathBuf;

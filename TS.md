@@ -67,6 +67,136 @@
 
 If desired, the hash can default to XXH3_64bits for minimal storage and maximum speed, with a preference toggle to XXH3_128bits when extra headroom against accidental collisions is desired. [15][1]
 
+---
+
+## Equipment Tab & Dark Library Feature Specification
+
+### Overview
+The Equipment tab displays a library of cameras (instruments) used in astrophotography sessions, with detailed statistics and integrated dark calibration frame management. Each camera card provides access to its Dark Library for organized calibration frame sets.
+
+### Database Schema Extensions
+
+**Existing tables used:**
+- `calibration_set`: Stores grouped calibration frames
+- `calibration_set_frames`: Junction table linking sets to frames
+- `frames`: Source of calibration frame metadata
+
+**Schema extensions needed:**
+```sql
+ALTER TABLE calibration_set ADD COLUMN date_start TEXT;
+ALTER TABLE calibration_set ADD COLUMN date_end TEXT;
+ALTER TABLE calibration_set ADD COLUMN temp_min REAL;
+ALTER TABLE calibration_set ADD COLUMN temp_max REAL;
+ALTER TABLE calibration_set ADD COLUMN offset REAL;
+ALTER TABLE calibration_set ADD COLUMN frame_count INTEGER DEFAULT 0;
+```
+
+### Backend Architecture
+
+#### Settings (src-tauri/src/settings/mod.rs)
+New default values and keys:
+- `dark_library.date_threshold_days`: Default 180 days for date clustering
+- `dark_library.temp_threshold_celsius`: Default 1.0°C for temperature clustering
+
+#### Models (src-tauri/src/models.rs)
+- `CameraStats`: Equipment statistics (frame count, total hours, first/last use)
+- `CalibrationSetDetail`: Extended calibration set with date ranges and temperature bounds
+- `DarkLibraryResult`: Result of dark library creation process
+
+#### Database Operations (src-tauri/src/db/equipment.rs)
+- `get_all_cameras()`: Query all cameras with aggregated statistics
+- `get_camera_dark_library()`: Retrieve calibration sets for specific camera
+- `delete_camera_dark_library()`: Remove all sets for camera
+- `has_dark_library()`: Check if library exists
+
+#### Dark Library Algorithm (src-tauri/src/calibration/mod.rs)
+Multi-stage clustering algorithm:
+1. Query all DARK and BIAS frames for camera
+2. Group by exact match: exptime, gain, offset, binning
+3. Within groups, cluster by date threshold (consecutive frames within N days)
+4. Within date clusters, sub-cluster by temperature (±threshold)
+5. Calculate statistics: avg_temp (decimal), temp_min/max, date_start/end
+6. Store in calibration_set with linked frames
+
+#### Tauri Commands (src-tauri/src/commands.rs)
+- `get_equipment_cameras()`: Get all cameras with stats
+- `create_dark_library(instrume)`: Generate calibration sets for camera
+- `get_dark_library(instrume)`: Retrieve calibration sets
+- `delete_dark_library(instrume)`: Remove all sets
+- `has_dark_library(instrume)`: Check existence
+
+### Frontend Architecture
+
+#### TypeScript Models (src/types/models.ts)
+- `CameraStats`: Matches Rust CameraStats
+- `CalibrationSetDetail`: Matches Rust CalibrationSetDetail
+- `DarkLibraryResult`: Matches Rust DarkLibraryResult
+
+#### Components
+- `src/pages/Equipment.tsx`: Main grid view of camera cards
+- `src/components/CameraCard.tsx`: Individual camera card with stats
+- `src/components/DarkLibrary.tsx`: Dark library modal/sub-page view
+- `src/components/CalibrationSetCard.tsx`: Collapsible calibration set display
+
+#### UI/UX Flow
+1. Equipment grid displays all cameras with frame count, hours, date range
+2. "Dark Library" button on each card opens library view
+3. Empty state: "Create Dark Library" button triggers clustering
+4. Loaded state: Collapsible cards grouped by exposure time
+5. Each card shows: temp (avg with min/max), date display, gain/offset/binning, frame count
+6. "Regenerate Library" button to rebuild sets
+
+### Clustering Algorithm Details
+
+**Date Clustering:**
+- Sort frames by date_obs
+- Create clusters where consecutive frames are within threshold days
+- Example: 180-day threshold groups frames from same season
+
+**Temperature Clustering:**
+- Within each date cluster, group by temperature ±threshold
+- Calculate decimal average: (9.8°C + 10.2°C) / 2 = 10.0°C
+- Store min/max for display
+
+**Parameter Grouping:**
+- Exact match required for: exposure time, gain, offset, binning
+- This ensures calibration frames are truly interchangeable
+
+**Date Display:**
+- Primary: Year-month (e.g., "2025-10")
+- Subtitle: Full date range (e.g., "2025-10-20 to 2025-10-25")
+
+### Testing Strategy
+
+1. **Unit Tests:**
+   - Clustering algorithm with various date/temperature distributions
+   - Edge cases: missing temps, NULL exposure times, single-frame groups
+
+2. **Integration Tests:**
+   - Full workflow: scan → create library → display
+   - Multiple cameras with overlapping calibration frames
+   - Regeneration (delete + recreate)
+
+3. **UI Tests:**
+   - Empty states, loading states
+   - Large datasets (100+ calibration sets)
+   - Responsive layout
+
+### Performance Considerations
+
+- Index on `imagetyp` column for faster calibration frame queries
+- Batch inserts for calibration set creation
+- Pagination for large libraries (future enhancement)
+
+### Future Enhancements
+
+- Export calibration sets to master dark/flat files
+- Manual calibration set editing
+- Quality metrics (sigma clipping, hot pixel detection)
+- Dark library import/export for sharing
+
+---
+
 Sources
 [1] xxHash - Extremely fast non-cryptographic hash algorithm https://xxhash.com
 [2] The Filename Template Editor and Text Template Editor https://helpx.adobe.com/lightroom-classic/help/filename-template-editor-text-template.html

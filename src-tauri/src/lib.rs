@@ -50,6 +50,11 @@ pub fn run() {
             commands::rename_frames_set,
             commands::get_frame_set_detail,
             commands::create_custom_frames_set,
+            commands::get_equipment_cameras,
+            commands::create_dark_library,
+            commands::get_dark_library,
+            commands::delete_dark_library,
+            commands::has_dark_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -98,7 +98,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             gain REAL,
             binning TEXT,
             instrume TEXT,
-            date TEXT NOT NULL
+            date TEXT NOT NULL,
+            date_start TEXT,
+            date_end TEXT,
+            temp_min REAL,
+            temp_max REAL,
+            offset REAL,
+            frame_count INTEGER DEFAULT 0
         )",
         [],
     )?;
@@ -250,6 +256,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_frames_filter ON frames(filter)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_imagetyp ON frames(imagetyp)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calibration_set_instrume ON calibration_set(instrume)",
         [],
     )?;
 

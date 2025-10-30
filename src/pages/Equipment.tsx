@@ -1,18 +1,89 @@
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { CameraStats } from "../types/models";
+import CameraCard from "../components/CameraCard";
+import DarkLibrary from "../components/DarkLibrary";
+
 export default function Equipment() {
+  const [cameras, setCameras] = useState<CameraStats[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
+
+  useEffect(() => {
+    loadCameras();
+  }, []);
+
+  const loadCameras = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      const result = await invoke<CameraStats[]>("get_equipment_cameras");
+      setCameras(result);
+    } catch (err) {
+      setError(err as string);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleOpenDarkLibrary = (instrume: string) => {
+    setSelectedCamera(instrume);
+  };
+
+  const handleCloseDarkLibrary = () => {
+    setSelectedCamera(null);
+  };
+
+  if (selectedCamera) {
+    return (
+      <DarkLibrary
+        instrume={selectedCamera}
+        onClose={handleCloseDarkLibrary}
+      />
+    );
+  }
+
   return (
     <div className="p-6">
       <div className="mb-6">
         <h2 className="text-3xl font-bold mb-2">Equipment Library</h2>
         <p className="text-gray-400">
-          Browse telescopes and instruments with captured objects and dates
+          Browse instruments with captured frames and dark library management
         </p>
       </div>
 
-      <div className="bg-gray-800 rounded-lg p-4">
-        <div className="text-gray-500 text-center py-12">
-          Equipment library - Coming soon
+      {loading && (
+        <div className="text-center py-12 text-gray-400">
+          Loading equipment...
         </div>
-      </div>
+      )}
+
+      {error && (
+        <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-4">
+          <p className="text-red-400">{error}</p>
+        </div>
+      )}
+
+      {!loading && !error && cameras.length === 0 && (
+        <div className="bg-gray-800 rounded-lg p-8 text-center">
+          <p className="text-gray-400">
+            No cameras found. Scan some directories to populate your equipment library.
+          </p>
+        </div>
+      )}
+
+      {!loading && cameras.length > 0 && (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+          {cameras.map((camera) => (
+            <CameraCard
+              key={camera.instrume}
+              camera={camera}
+              onOpenDarkLibrary={handleOpenDarkLibrary}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

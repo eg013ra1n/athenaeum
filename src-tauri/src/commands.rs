@@ -710,3 +710,79 @@ pub struct FramesSetWithCount {
     pub frames_set: FramesSet,
     pub member_count: usize,
 }
+
+// ========== Equipment & Dark Library Commands ==========
+
+#[tauri::command]
+pub async fn get_equipment_cameras(
+    state: State<'_, AppState>
+) -> Result<Vec<CameraStats>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_all_cameras(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_dark_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<DarkLibraryResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get thresholds from settings
+    let date_threshold = state.settings
+        .get_dark_library_date_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    let temp_threshold = state.settings
+        .get_dark_library_temp_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    // Create the dark library
+    crate::calibration::create_dark_library(
+        &conn,
+        &instrume,
+        date_threshold,
+        temp_threshold,
+    ).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_dark_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<Vec<CalibrationSetDetail>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_camera_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_dark_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::delete_camera_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn has_dark_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<bool, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::has_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}

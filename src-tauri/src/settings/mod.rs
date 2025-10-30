@@ -12,6 +12,8 @@ pub mod defaults {
     pub const GROUPING_THRESHOLD_UNIT: &str = "deg";
     pub const GROUPING_COORD_FRAME: &str = "ICRS";
     pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "majority-object";
+    pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "180";
+    pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "1.0";
 }
 
 /// Setting keys used throughout the application
@@ -20,6 +22,8 @@ pub mod keys {
     pub const GROUPING_THRESHOLD_UNIT: &str = "grouping.threshold.unit";
     pub const GROUPING_COORD_FRAME: &str = "grouping.coord.frame";
     pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "ui.objects.auto_name_mode";
+    pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "dark_library.date_threshold_days";
+    pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "dark_library.temp_threshold_celsius";
 }
 
 /// Runtime overrides for settings (session-specific)
@@ -148,6 +152,26 @@ impl SettingsManager {
     pub fn get_grouping_threshold_deg(&self, conn: &Connection) -> Result<f64> {
         let arcsec = self.get_grouping_threshold_arcsec(conn)?;
         Ok(arcsec / 3600.0)
+    }
+
+    /// Get the dark library date threshold in days
+    pub fn get_dark_library_date_threshold(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::DARK_LIBRARY_DATE_THRESHOLD_DAYS,
+            defaults::DARK_LIBRARY_DATE_THRESHOLD_DAYS,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the dark library temperature threshold in Celsius
+    pub fn get_dark_library_temp_threshold(&self, conn: &Connection) -> Result<f64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS,
+            defaults::DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS,
+        )?;
+        Ok(value.parse()?)
     }
 }
 

@@ -231,3 +231,35 @@ export interface FrameSetDetail {
   frames_set: FramesSet;
   nights: ImagingNightWithSessions[];
 }
+
+// Equipment & Dark Library
+export interface CameraStats {
+  instrume: string;
+  frame_count: number;
+  total_hours: number;
+  first_use: string | null;
+  last_use: string | null;
+}
+
+export interface CalibrationSetDetail {
+  id: number | null;
+  imagetyp: ImageType;
+  exptime: number | null;
+  ccd_temp: number;
+  temp_min: number;
+  temp_max: number;
+  gain: number | null;
+  offset: number | null;
+  binning: string | null;
+  instrume: string | null;
+  date_start: string;
+  date_end: string;
+  date_display: string;
+  frame_count: number;
+}
+
+export interface DarkLibraryResult {
+  sets_created: number;
+  frames_grouped: number;
+  frames_excluded: number;
+}
