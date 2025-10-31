@@ -30,6 +30,5 @@ src-tauri/target
 *.db
 *.db-shm
 *.db-wal
-target/rust-analyzer/flycheck0/stderr
 .gitignore
-target/rust-analyzer/flycheck0/stdout
+target/*
