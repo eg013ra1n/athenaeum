@@ -4,11 +4,10 @@ import { format } from "date-fns";
 
 interface CameraCardProps {
   camera: CameraStats;
-  onOpenDarkLibrary: (instrume: string) => void;
-  onOpenMasterDarkLibrary: (instrume: string) => void;
+  onOpenCamera: (instrume: string) => void;
 }
 
-export default function CameraCard({ camera, onOpenDarkLibrary, onOpenMasterDarkLibrary }: CameraCardProps) {
+export default function CameraCard({ camera, onOpenCamera }: CameraCardProps) {
   const formatDate = (dateStr: string | null) => {
     if (!dateStr) return "N/A";
     try {
@@ -66,23 +65,14 @@ export default function CameraCard({ camera, onOpenDarkLibrary, onOpenMasterDark
         </div>
       </div>
 
-      {/* Library Buttons */}
-      <div className="grid grid-cols-2 gap-2">
-        <button
-          onClick={() => onOpenDarkLibrary(camera.instrume)}
-          className="flex items-center justify-center gap-1 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors text-xs font-medium"
-        >
-          <Database size={14} />
-          Dark Library
-        </button>
-        <button
-          onClick={() => onOpenMasterDarkLibrary(camera.instrume)}
-          className="flex items-center justify-center gap-1 px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-md transition-colors text-xs font-medium"
-        >
-          <Database size={14} />
-          Master Library
-        </button>
-      </div>
+      {/* View Calibration Button */}
+      <button
+        onClick={() => onOpenCamera(camera.instrume)}
+        className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors text-sm font-medium"
+      >
+        <Database size={16} />
+        View Calibration Library
+      </button>
     </div>
   );
 }

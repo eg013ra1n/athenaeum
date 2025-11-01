@@ -2,17 +2,13 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CameraStats } from "../types/models";
 import CameraCard from "../components/CameraCard";
-import DarkLibrary from "../components/DarkLibrary";
-import MasterDarkLibrary from "../components/MasterDarkLibrary";
-
-type LibraryView = "equipment" | "dark" | "master";
+import CameraDetail from "../components/CameraDetail";
 
 export default function Equipment() {
   const [cameras, setCameras] = useState<CameraStats[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
-  const [currentView, setCurrentView] = useState<LibraryView>("equipment");
 
   useEffect(() => {
     loadCameras();
@@ -31,37 +27,20 @@ export default function Equipment() {
     }
   };
 
-  const handleOpenDarkLibrary = (instrume: string) => {
+  const handleOpenCamera = (instrume: string) => {
     setSelectedCamera(instrume);
-    setCurrentView("dark");
   };
 
-  const handleOpenMasterDarkLibrary = (instrume: string) => {
-    setSelectedCamera(instrume);
-    setCurrentView("master");
-  };
-
-  const handleCloseLibrary = () => {
+  const handleCloseCamera = () => {
     setSelectedCamera(null);
-    setCurrentView("equipment");
   };
 
-  // Render dark library view
-  if (currentView === "dark" && selectedCamera) {
+  // Render camera detail view with tabs
+  if (selectedCamera) {
     return (
-      <DarkLibrary
+      <CameraDetail
         instrume={selectedCamera}
-        onClose={handleCloseLibrary}
-      />
-    );
-  }
-
-  // Render master dark library view
-  if (currentView === "master" && selectedCamera) {
-    return (
-      <MasterDarkLibrary
-        instrume={selectedCamera}
-        onClose={handleCloseLibrary}
+        onClose={handleCloseCamera}
       />
     );
   }
@@ -101,8 +80,7 @@ export default function Equipment() {
             <CameraCard
               key={camera.instrume}
               camera={camera}
-              onOpenDarkLibrary={handleOpenDarkLibrary}
-              onOpenMasterDarkLibrary={handleOpenMasterDarkLibrary}
+              onOpenCamera={handleOpenCamera}
             />
           ))}
         </div>

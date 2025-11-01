@@ -8,10 +8,11 @@ import QuickStats from "./QuickStats";
 
 interface DarkLibraryProps {
   instrume: string;
-  onClose: () => void;
+  onClose?: () => void;
+  isTabView?: boolean;
 }
 
-export default function DarkLibrary({ instrume, onClose }: DarkLibraryProps) {
+export default function DarkLibrary({ instrume, onClose, isTabView = false }: DarkLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -28,6 +29,18 @@ export default function DarkLibrary({ instrume, onClose }: DarkLibraryProps) {
 
   useEffect(() => {
     checkAndLoadLibrary();
+  }, [instrume]);
+
+  // Listen for library updates (when created from parent)
+  useEffect(() => {
+    const handleLibraryUpdate = () => {
+      checkAndLoadLibrary();
+    };
+
+    window.addEventListener("library-updated", handleLibraryUpdate);
+    return () => {
+      window.removeEventListener("library-updated", handleLibraryUpdate);
+    };
   }, [instrume]);
 
   const checkAndLoadLibrary = async () => {
@@ -136,35 +149,51 @@ export default function DarkLibrary({ instrume, onClose }: DarkLibraryProps) {
   }, [sets, filters]);
 
   return (
-    <div className="p-6">
-      {/* Header */}
-      <div className="mb-6">
-        <button
-          onClick={onClose}
-          className="flex items-center gap-2 text-gray-400 hover:text-gray-200 mb-4 transition-colors"
-        >
-          <ArrowLeft size={20} />
-          Back to Equipment
-        </button>
+    <div className={isTabView ? "" : "p-6"}>
+      {/* Header - only show if not in tab view */}
+      {!isTabView && (
+        <div className="mb-6">
+          <button
+            onClick={onClose}
+            className="flex items-center gap-2 text-gray-400 hover:text-gray-200 mb-4 transition-colors"
+          >
+            <ArrowLeft size={20} />
+            Back to Equipment
+          </button>
 
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-3xl font-bold mb-2">Dark Library</h2>
-            <p className="text-gray-400">{instrume}</p>
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-3xl font-bold mb-2">Dark Library</h2>
+              <p className="text-gray-400">{instrume}</p>
+            </div>
+
+            {sets.length > 0 && (
+              <button
+                onClick={handleRegenerateLibrary}
+                disabled={creating}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
+                Regenerate
+              </button>
+            )}
           </div>
-
-          {sets.length > 0 && (
-            <button
-              onClick={handleRegenerateLibrary}
-              disabled={creating}
-              className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
-              Regenerate
-            </button>
-          )}
         </div>
-      </div>
+      )}
+
+      {/* In tab view, show regenerate button at the top */}
+      {isTabView && sets.length > 0 && (
+        <div className="mb-4 flex justify-end">
+          <button
+            onClick={handleRegenerateLibrary}
+            disabled={creating}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
+            Regenerate Dark Library
+          </button>
+        </div>
+      )}
 
       {/* Messages */}
       {error && (
