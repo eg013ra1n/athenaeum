@@ -218,7 +218,6 @@ mod tests {
             objctra: None,
             objctdec: None,
             override_: false,
-            calibration_set_id: None,
         };
 
         (id, file, frame)

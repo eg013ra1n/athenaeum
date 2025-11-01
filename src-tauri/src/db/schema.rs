@@ -48,9 +48,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             override INTEGER NOT NULL DEFAULT 0,
             imagetyp TEXT,
             is_master INTEGER NOT NULL DEFAULT 0,
-            calibration_set_id INTEGER,
-            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
-            FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE SET NULL
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         )",
         [],
     )?;

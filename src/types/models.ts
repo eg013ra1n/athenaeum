@@ -52,7 +52,6 @@ export interface Frame {
   objctra: string | null;
   objctdec: string | null;
   override_: boolean;
-  calibration_set_id: number | null;
 }
 
 export interface Day {

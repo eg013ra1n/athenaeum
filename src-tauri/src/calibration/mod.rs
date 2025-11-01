@@ -384,12 +384,6 @@ pub fn create_dark_library(
                     "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
                     rusqlite::params![set_id, frame.id],
                 )?;
-
-                // Update frame's calibration_set_id
-                conn.execute(
-                    "UPDATE frames SET calibration_set_id = ?1 WHERE id = ?2",
-                    rusqlite::params![set_id, frame.id],
-                )?;
             }
 
             frames_grouped += cluster.frames.len() as i64;
@@ -522,12 +516,6 @@ pub fn create_master_dark_library(
             for frame in &cluster.frames {
                 conn.execute(
                     "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
-                    rusqlite::params![set_id, frame.id],
-                )?;
-
-                // Update frame's calibration_set_id
-                conn.execute(
-                    "UPDATE frames SET calibration_set_id = ?1 WHERE id = ?2",
                     rusqlite::params![set_id, frame.id],
                 )?;
             }

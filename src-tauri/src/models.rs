@@ -51,7 +51,6 @@ pub struct Frame {
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
     pub override_: bool,
-    pub calibration_set_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

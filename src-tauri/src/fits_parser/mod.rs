@@ -174,7 +174,6 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         objctra,
         objctdec,
         override_: false,
-        calibration_set_id: None,
     })
 }
 
@@ -382,7 +381,6 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         objctra,
         objctdec,
         override_: false,
-        calibration_set_id: None,
     })
 }
 

@@ -45,9 +45,9 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
     conn.execute(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp, is_master,
          gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, pixsz,
-         ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, calibration_set_id)
+         ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             frame.file_id,
             frame.object,
@@ -77,7 +77,6 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
             frame.objctra,
             frame.objctdec,
             override_int,
-            frame.calibration_set_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -166,7 +165,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.calibration_set_id
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          ORDER BY f.created_at DESC
@@ -228,7 +227,6 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 objctra: row.get(32).ok(),
                 objctdec: row.get(33).ok(),
                 override_: row.get::<_, i32>(34).ok().map(|v| v == 1).unwrap_or(false),
-                calibration_set_id: row.get(35).ok(),
             })
         } else {
             None
@@ -258,7 +256,7 @@ pub fn get_files_by_directory(
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.calibration_set_id
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          WHERE f.path LIKE ?1 || '/%'
@@ -323,7 +321,6 @@ pub fn get_files_by_directory(
                 objctra: row.get(32).ok(),
                 objctdec: row.get(33).ok(),
                 override_: row.get::<_, i32>(34).ok().map(|v| v == 1).unwrap_or(false),
-                calibration_set_id: row.get(35).ok(),
             })
         } else {
             None
@@ -534,8 +531,7 @@ pub fn get_light_frames_for_project(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
-                fr.calibration_set_id
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
          WHERE fr.imagetyp = 'Light'
@@ -583,7 +579,6 @@ pub fn get_light_frames_for_project(
             objctra: row.get(27)?,
             objctdec: row.get(28)?,
             override_: row.get::<_, i32>(29)? == 1,
-            calibration_set_id: row.get(30)?,
         };
 
         Ok((file_id, frame))
@@ -676,8 +671,7 @@ pub fn get_frames_with_files_for_set(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
-                fr.calibration_set_id
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM session_members sm
          JOIN sessions s ON sm.session_id = s.id
          JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
@@ -748,7 +742,6 @@ pub fn get_frames_with_files_for_set(
             objctra: row.get(33)?,
             objctdec: row.get(34)?,
             override_: row.get::<_, i32>(35)? == 1,
-            calibration_set_id: row.get(36)?,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -775,8 +768,7 @@ pub fn get_frames_with_files_by_ids(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
-                fr.calibration_set_id
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM frames fr
          JOIN files f ON fr.file_id = f.id
          WHERE fr.id IN ({})
@@ -845,7 +837,6 @@ pub fn get_frames_with_files_by_ids(
             objctra: row.get(33)?,
             objctdec: row.get(34)?,
             override_: row.get::<_, i32>(35)? == 1,
-            calibration_set_id: row.get(36)?,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -920,8 +911,7 @@ pub fn get_imaging_nights_with_sessions(
                         fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                         fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                         fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                        fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
-                        fr.calibration_set_id
+                        fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
                  FROM session_members sm
                  JOIN frames fr ON sm.frame_id = fr.id
                  JOIN files f ON fr.file_id = f.id
@@ -980,7 +970,6 @@ pub fn get_imaging_nights_with_sessions(
                     objctra: row.get(33)?,
                     objctdec: row.get(34)?,
                     override_: row.get::<_, i32>(35)? == 1,
-                    calibration_set_id: row.get(36)?,
                 };
 
                 Ok(crate::models::FileWithFrame {
