@@ -31,6 +31,7 @@ pub struct Frame {
     pub exptime: Option<f64>,
     pub filter: Option<String>,
     pub imagetyp: Option<ImageType>,
+    pub is_master: bool,
     pub gain: Option<f64>,
     pub offset: Option<f64>,
     pub binning: Option<String>,
@@ -60,16 +61,27 @@ pub enum ImageType {
     Flat,
     Bias,
     DarkFlat,
+    MasterLight,
+    MasterDark,
+    MasterFlat,
+    MasterBias,
+    MasterDarkFlat,
 }
 
 impl ImageType {
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
+        let s_upper = s.to_uppercase();
+        match s_upper.as_str() {
             "LIGHT" => Some(Self::Light),
             "DARK" => Some(Self::Dark),
             "FLAT" => Some(Self::Flat),
             "BIAS" => Some(Self::Bias),
             "DARKFLAT" | "DARK FLAT" => Some(Self::DarkFlat),
+            "MASTER LIGHT" | "MASTERLIGHT" => Some(Self::MasterLight),
+            "MASTER DARK" | "MASTERDARK" => Some(Self::MasterDark),
+            "MASTER FLAT" | "MASTERFLAT" => Some(Self::MasterFlat),
+            "MASTER BIAS" | "MASTERBIAS" => Some(Self::MasterBias),
+            "MASTER DARK FLAT" | "MASTERDARKFLAT" | "MASTER DARKFLAT" => Some(Self::MasterDarkFlat),
             _ => None,
         }
     }
@@ -81,6 +93,29 @@ impl ImageType {
             Self::Flat => "Calibration/Flats".to_string(),
             Self::Bias => "Calibration/Bias".to_string(),
             Self::DarkFlat => "Calibration/DarkFlats".to_string(),
+            Self::MasterLight => "Masters/Lights".to_string(),
+            Self::MasterDark => "Masters/Darks".to_string(),
+            Self::MasterFlat => "Masters/Flats".to_string(),
+            Self::MasterBias => "Masters/Bias".to_string(),
+            Self::MasterDarkFlat => "Masters/DarkFlats".to_string(),
+        }
+    }
+
+    pub fn is_master(&self) -> bool {
+        matches!(
+            self,
+            Self::MasterLight | Self::MasterDark | Self::MasterFlat | Self::MasterBias | Self::MasterDarkFlat
+        )
+    }
+
+    pub fn base_type(&self) -> Self {
+        match self {
+            Self::MasterLight => Self::Light,
+            Self::MasterDark => Self::Dark,
+            Self::MasterFlat => Self::Flat,
+            Self::MasterBias => Self::Bias,
+            Self::MasterDarkFlat => Self::DarkFlat,
+            _ => self.clone(),
         }
     }
 }

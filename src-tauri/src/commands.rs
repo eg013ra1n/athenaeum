@@ -786,3 +786,54 @@ pub async fn has_dark_library(
 
     db::has_dark_library(&conn, &instrume).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn create_master_dark_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<DarkLibraryResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get thresholds from settings
+    let date_threshold = state.settings
+        .get_dark_library_date_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    let temp_threshold = state.settings
+        .get_dark_library_temp_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    // Create the master dark library
+    crate::calibration::create_master_dark_library(
+        &conn,
+        &instrume,
+        date_threshold,
+        temp_threshold,
+    ).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_master_dark_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<Vec<CalibrationSetDetail>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_camera_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn has_master_dark_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<bool, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::has_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}

@@ -47,6 +47,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             objctdec TEXT,
             override INTEGER NOT NULL DEFAULT 0,
             imagetyp TEXT,
+            is_master INTEGER NOT NULL DEFAULT 0,
             calibration_set_id INTEGER,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
             FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE SET NULL
@@ -104,7 +105,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             temp_min REAL,
             temp_max REAL,
             offset REAL,
-            frame_count INTEGER DEFAULT 0
+            frame_count INTEGER DEFAULT 0,
+            is_master_library INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )?;
@@ -263,7 +265,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_is_master ON frames(is_master)",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_calibration_set_instrume ON calibration_set(instrume)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calibration_set_is_master ON calibration_set(is_master_library)",
         [],
     )?;
 

@@ -58,6 +58,7 @@ pub fn get_camera_dark_library(
             frame_count
         FROM calibration_set
         WHERE instrume = ?1
+        AND is_master_library = 0
         ORDER BY imagetyp, exptime, ccd_temp"
     )?;
 
@@ -103,7 +104,7 @@ pub fn get_camera_dark_library(
 /// Delete all calibration sets for a camera
 pub fn delete_camera_dark_library(conn: &Connection, instrume: &str) -> Result<()> {
     // First, get all set IDs for this camera
-    let mut stmt = conn.prepare("SELECT id FROM calibration_set WHERE instrume = ?1")?;
+    let mut stmt = conn.prepare("SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0")?;
     let set_ids: Vec<i64> = stmt
         .query_map([instrume], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -116,15 +117,88 @@ pub fn delete_camera_dark_library(conn: &Connection, instrume: &str) -> Result<(
         )?;
     }
 
-    // Delete all calibration_set entries for this camera
-    conn.execute("DELETE FROM calibration_set WHERE instrume = ?1", [instrume])?;
+    // Delete all calibration_set entries for this camera (only regular dark library)
+    conn.execute("DELETE FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0", [instrume])?;
 
     Ok(())
 }
 
 /// Check if dark library exists for camera
 pub fn has_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1")?;
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0")?;
+    let count: i64 = stmt.query_row([instrume], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// Get master calibration sets for a specific camera
+pub fn get_camera_master_dark_library(
+    conn: &Connection,
+    instrume: &str,
+) -> Result<Vec<CalibrationSetDetail>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            id,
+            imagetyp,
+            exptime,
+            ccd_temp,
+            temp_min,
+            temp_max,
+            gain,
+            offset,
+            binning,
+            instrume,
+            date_start,
+            date_end,
+            date,
+            frame_count
+        FROM calibration_set
+        WHERE instrume = ?1
+        AND is_master_library = 1
+        ORDER BY imagetyp, exptime, ccd_temp"
+    )?;
+
+    let sets = stmt
+        .query_map([instrume], |row| {
+            let imagetyp_str: String = row.get(1)?;
+            let imagetyp = ImageType::from_str(&imagetyp_str)
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+
+            let date_start: String = row.get(10)?;
+            let date_end: String = row.get(11)?;
+
+            // Generate date_display from date_start (YYYY-MM format)
+            let date_display = if let Ok(dt) = DateTime::parse_from_rfc3339(&date_start) {
+                dt.format("%Y-%m").to_string()
+            } else {
+                // Fallback if parsing fails
+                date_start.chars().take(7).collect()
+            };
+
+            Ok(CalibrationSetDetail {
+                id: Some(row.get(0)?),
+                imagetyp,
+                exptime: row.get(2)?,
+                ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                temp_min: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                temp_max: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                gain: row.get(6)?,
+                offset: row.get(7)?,
+                binning: row.get(8)?,
+                instrume: row.get(9)?,
+                date_start,
+                date_end,
+                date_display,
+                frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(sets)
+}
+
+/// Check if master dark library exists for camera
+pub fn has_master_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1")?;
     let count: i64 = stmt.query_row([instrume], |row| row.get(0))?;
     Ok(count > 0)
 }

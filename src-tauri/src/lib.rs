@@ -55,6 +55,9 @@ pub fn run() {
             commands::get_dark_library,
             commands::delete_dark_library,
             commands::has_dark_library,
+            commands::create_master_dark_library,
+            commands::get_master_dark_library,
+            commands::has_master_dark_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

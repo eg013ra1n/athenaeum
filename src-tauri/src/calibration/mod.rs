@@ -277,7 +277,7 @@ pub fn create_dark_library(
     // Delete existing library first
     delete_camera_dark_library(conn, instrume)?;
 
-    // Query all DARK and BIAS frames for this camera
+    // Query all DARK, BIAS, and DARKFLAT frames for this camera
     let mut stmt = conn.prepare(
         "SELECT
             f.id,
@@ -290,7 +290,7 @@ pub fn create_dark_library(
             f.imagetyp
         FROM frames f
         WHERE f.instrume = ?1
-        AND f.imagetyp IN ('Dark', 'Bias')
+        AND f.imagetyp IN ('Dark', 'Bias', 'DarkFlat')
         AND f.date_obs IS NOT NULL
         ORDER BY f.date_obs"
     )?;
@@ -404,4 +404,154 @@ pub fn create_dark_library(
         frames_grouped,
         frames_excluded,
     })
+}
+
+/// Creates master dark library for a specific camera
+/// This handles master calibration frames (MasterDark, MasterBias, MasterDarkFlat)
+pub fn create_master_dark_library(
+    conn: &Connection,
+    instrume: &str,
+    date_threshold_days: i64,
+    temp_threshold: f64,
+) -> Result<DarkLibraryResult> {
+    // Delete existing master library first
+    delete_camera_master_dark_library(conn, instrume)?;
+
+    // Query all MASTER DARK and MASTER BIAS frames for this camera
+    let mut stmt = conn.prepare(
+        "SELECT
+            f.id,
+            f.date_obs,
+            f.exptime,
+            f.ccd_temp,
+            f.gain,
+            f.offset,
+            f.binning,
+            f.imagetyp
+        FROM frames f
+        WHERE f.instrume = ?1
+        AND f.imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')
+        AND f.date_obs IS NOT NULL
+        ORDER BY f.date_obs"
+    )?;
+
+    let frames: Vec<CalibrationFrame> = stmt
+        .query_map([instrume], |row| {
+            let date_obs_str: String = row.get(1)?;
+            let date_obs = DateTime::parse_from_rfc3339(&date_obs_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+            let imagetyp_str: String = row.get(7)?;
+            let imagetyp = ImageType::from_str(&imagetyp_str)
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+
+            Ok(CalibrationFrame {
+                id: row.get(0)?,
+                date_obs,
+                exptime: row.get(2)?,
+                ccd_temp: row.get(3)?,
+                gain: row.get(4)?,
+                offset: row.get(5)?,
+                binning: row.get(6)?,
+                imagetyp,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let total_frames = frames.len() as i64;
+    let mut frames_grouped = 0i64;
+    let mut sets_created = 0i64;
+
+    // Group frames by exact-match parameters
+    let mut groups: HashMap<GroupKey, Vec<CalibrationFrame>> = HashMap::new();
+
+    for frame in frames {
+        let key = GroupKey {
+            exptime: frame.exptime.map(|e| format!("{:.2}", e)).unwrap_or_default(),
+            gain: frame.gain.map(|g| format!("{:.2}", g)).unwrap_or_default(),
+            offset: frame.offset.map(|o| format!("{:.2}", o)).unwrap_or_default(),
+            binning: frame.binning.clone().unwrap_or_default(),
+            imagetyp: format!("{:?}", frame.imagetyp),
+        };
+
+        groups.entry(key).or_insert_with(Vec::new).push(frame);
+    }
+
+    // Process each group
+    for (_key, group_frames) in groups {
+        // Cluster by date and temperature
+        let clusters = cluster_frames(group_frames, date_threshold_days, temp_threshold);
+
+        // Create calibration sets for each cluster
+        for cluster in clusters {
+            let (date_start, date_end) = cluster.date_range();
+            let avg_temp = cluster.avg_temp().unwrap_or(0.0);
+            let (temp_min, temp_max) = cluster.temp_range();
+            let (exptime, gain, offset, binning, imagetyp) = cluster.get_metadata();
+            let date_display = cluster.date_display();
+            let frame_count = cluster.frames.len() as i64;
+
+            // Insert calibration set with is_master_library = 1
+            conn.execute(
+                "INSERT INTO calibration_set (
+                    imagetyp, exptime, ccd_temp, temp_min, temp_max,
+                    gain, offset, binning, instrume, date,
+                    date_start, date_end, frame_count, is_master_library
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)",
+                rusqlite::params![
+                    format!("{:?}", imagetyp),
+                    exptime,
+                    avg_temp,
+                    temp_min,
+                    temp_max,
+                    gain,
+                    offset,
+                    binning,
+                    instrume,
+                    date_display,
+                    date_start.to_rfc3339(),
+                    date_end.to_rfc3339(),
+                    frame_count,
+                ],
+            )?;
+
+            let set_id = conn.last_insert_rowid();
+
+            // Link frames to set
+            for frame in &cluster.frames {
+                conn.execute(
+                    "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                    rusqlite::params![set_id, frame.id],
+                )?;
+
+                // Update frame's calibration_set_id
+                conn.execute(
+                    "UPDATE frames SET calibration_set_id = ?1 WHERE id = ?2",
+                    rusqlite::params![set_id, frame.id],
+                )?;
+            }
+
+            frames_grouped += cluster.frames.len() as i64;
+            sets_created += 1;
+        }
+    }
+
+    let frames_excluded = total_frames - frames_grouped;
+
+    Ok(DarkLibraryResult {
+        sets_created,
+        frames_grouped,
+        frames_excluded,
+    })
+}
+
+/// Delete camera's master dark library
+fn delete_camera_master_dark_library(conn: &Connection, instrume: &str) -> Result<()> {
+    // Delete all calibration sets for this camera that are master library sets
+    conn.execute(
+        "DELETE FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1",
+        rusqlite::params![instrume],
+    )?;
+    Ok(())
 }

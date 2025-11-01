@@ -121,6 +121,23 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     // Parse IMAGETYP
     let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
 
+    // Determine if this is a master file
+    // Priority 1: Check IMAGETYP keyword for "Master" prefix
+    let is_master = imagetyp.as_ref().map(|t| t.is_master()).unwrap_or(false);
+
+    // Priority 2: Check filename if IMAGETYP doesn't indicate master
+    let filename_is_master = if !is_master {
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let filename_lower = filename.to_lowercase();
+        filename_lower.contains("master") ||
+        filename_lower.contains("_calibrated_") ||
+        filename_lower.contains("-calibrated-")
+    } else {
+        false
+    };
+
     // Construct binning string if available
     let binning = match (xbinning, ybinning) {
         (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
@@ -137,6 +154,7 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         exptime,
         filter,
         imagetyp,
+        is_master: is_master || filename_is_master,
         gain,
         offset,
         binning,
@@ -160,38 +178,209 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     })
 }
 
-/// Parse XISF file metadata (placeholder)
-pub fn parse_xisf(_path: &Path, file_id: i64) -> Result<Frame> {
-    // TODO: Implement XISF parsing according to XISF 1.0 specification
-    // For now, return a minimal frame
+/// Parse XISF file metadata
+pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{BufReader, Read};
+
+    println!("Parsing XISF file: {}", path.display());
+
+    // Read the file
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
+    let mut buf_reader = BufReader::new(file);
+
+    // XISF format: binary header + XML header + image data
+    // Read only the first 1MB which should contain the XML header
+    // (XML headers are typically much smaller, but 1MB gives us safety margin)
+    let max_header_size = 1024 * 1024; // 1MB
+    let mut content = vec![0u8; max_header_size];
+    let bytes_read = buf_reader.read(&mut content)?;
+    content.truncate(bytes_read);
+
+    // Find the XML section - it starts after "<?xml"
+    let xml_start = content.windows(5)
+        .position(|w| w == b"<?xml")
+        .ok_or_else(|| anyhow::anyhow!("No XML header found in XISF file"))?;
+
+    // Find the end of XML - look for </xisf>
+    let xml_end = content.windows(7)
+        .skip(xml_start)
+        .position(|w| w == b"</xisf>")
+        .ok_or_else(|| anyhow::anyhow!("No closing </xisf> tag found in first {}KB", max_header_size / 1024))?;
+    let xml_end = xml_start + xml_end + 7; // +7 for the length of "</xisf>"
+
+    // Extract XML content
+    let xml_content = &content[xml_start..xml_end];
+    let xml_str = String::from_utf8_lossy(xml_content);
+
+    // Parse XML to extract FITSKeyword elements
+    let mut reader = Reader::from_str(&xml_str);
+    reader.config_mut().trim_text(true);
+
+    let mut fits_keywords: HashMap<String, String> = HashMap::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) if e.name().as_ref() == b"FITSKeyword" => {
+                let mut name = String::new();
+                let mut value = String::new();
+
+                for attr in e.attributes() {
+                    if let Ok(attr) = attr {
+                        match attr.key.as_ref() {
+                            b"name" => {
+                                name = String::from_utf8_lossy(&attr.value).to_string();
+                            }
+                            b"value" => {
+                                value = String::from_utf8_lossy(&attr.value).to_string();
+                                // Remove quotes if present
+                                if value.starts_with('\'') && value.ends_with('\'') {
+                                    value = value[1..value.len()-1].to_string();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if !name.is_empty() {
+                    fits_keywords.insert(name, value);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                println!("Error parsing XISF XML at position {}: {}", reader.buffer_position(), e);
+                break;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    println!("  Found {} FITS keywords in XISF", fits_keywords.len());
+
+    // Extract metadata from FITS keywords
+    let object = fits_keywords.get("OBJECT").cloned();
+    let telescop = fits_keywords.get("TELESCOP").cloned();
+    let instrume = fits_keywords.get("INSTRUME").cloned();
+    let filter = fits_keywords.get("FILTER").cloned();
+    let imagetyp_str = fits_keywords.get("IMAGETYP").cloned();
+
+    let exptime = fits_keywords.get("EXPTIME")
+        .and_then(|s| s.parse::<f64>().ok());
+    let gain = fits_keywords.get("GAIN")
+        .and_then(|s| s.parse::<f64>().ok());
+    let offset = fits_keywords.get("OFFSET")
+        .and_then(|s| s.parse::<f64>().ok());
+    let xbinning = fits_keywords.get("XBINNING")
+        .and_then(|s| s.parse::<i32>().ok());
+    let ybinning = fits_keywords.get("YBINNING")
+        .and_then(|s| s.parse::<i32>().ok());
+    let ccd_temp = fits_keywords.get("CCD-TEMP")
+        .and_then(|s| s.parse::<f64>().ok());
+    let set_temp = fits_keywords.get("SET-TEMP")
+        .and_then(|s| s.parse::<f64>().ok());
+    let focallen = fits_keywords.get("FOCALLEN")
+        .and_then(|s| s.parse::<f64>().ok());
+    let xpixsz = fits_keywords.get("XPIXSZ")
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| fits_keywords.get("YPIXSZ").and_then(|s| s.parse::<f64>().ok()));
+    let pixsz = fits_keywords.get("PIXSZ")
+        .and_then(|s| s.parse::<f64>().ok());
+
+    // Astronomical coordinates
+    let ra = fits_keywords.get("RA")
+        .and_then(|s| s.parse::<f64>().ok());
+    let dec = fits_keywords.get("DEC")
+        .and_then(|s| s.parse::<f64>().ok());
+    let objctra = fits_keywords.get("OBJCTRA").cloned();
+    let objctdec = fits_keywords.get("OBJCTDEC").cloned();
+
+    // Observatory location
+    let sitelat = fits_keywords.get("SITELAT")
+        .and_then(|s| s.parse::<f64>().ok());
+    let lat_obs = fits_keywords.get("LAT-OBS")
+        .and_then(|s| s.parse::<f64>().ok());
+    let sitelong = fits_keywords.get("SITELONG")
+        .and_then(|s| s.parse::<f64>().ok());
+    let long_obs = fits_keywords.get("LONG-OBS")
+        .and_then(|s| s.parse::<f64>().ok());
+
+    // Parse DATE-OBS
+    let date_obs = fits_keywords.get("DATE-OBS")
+        .and_then(|date_str| {
+            let time_obs = fits_keywords.get("TIME-OBS").map(|s| s.as_str());
+            match parse_date_obs(date_str, time_obs) {
+                Ok(dt) => {
+                    println!("  Parsed DATE-OBS successfully: {}", dt.to_rfc3339());
+                    Some(dt)
+                }
+                Err(e) => {
+                    println!("  Failed to parse DATE-OBS '{}': {}", date_str, e);
+                    None
+                }
+            }
+        });
+
+    // Parse IMAGETYP
+    let imagetyp = imagetyp_str.as_ref().and_then(|s| ImageType::from_str(s));
+
+    // Determine if this is a master file
+    let is_master = imagetyp.as_ref().map(|t| t.is_master()).unwrap_or(false);
+
+    // Check filename if IMAGETYP doesn't indicate master
+    let filename_is_master = if !is_master {
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let filename_lower = filename.to_lowercase();
+        filename_lower.contains("master") ||
+        filename_lower.contains("_calibrated_") ||
+        filename_lower.contains("-calibrated-")
+    } else {
+        false
+    };
+
+    // Construct binning string if available
+    let binning = match (xbinning, ybinning) {
+        (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
+        _ => None,
+    };
+
     Ok(Frame {
         id: None,
         file_id,
-        object: None,
-        date_obs: None,
-        telescop: None,
-        instrume: None,
-        exptime: None,
-        filter: None,
-        imagetyp: None,
-        gain: None,
-        offset: None,
-        binning: None,
-        xbinning: None,
-        ybinning: None,
-        ccd_temp: None,
-        set_temp: None,
-        focallen: None,
-        xpixsz: None,
-        pixsz: None,
-        ra: None,
-        dec: None,
-        sitelat: None,
-        lat_obs: None,
-        sitelong: None,
-        long_obs: None,
-        objctra: None,
-        objctdec: None,
+        object,
+        date_obs,
+        telescop,
+        instrume,
+        exptime,
+        filter,
+        imagetyp,
+        is_master: is_master || filename_is_master,
+        gain,
+        offset,
+        binning,
+        xbinning,
+        ybinning,
+        ccd_temp,
+        set_temp,
+        focallen,
+        xpixsz,
+        pixsz,
+        ra,
+        dec,
+        sitelat,
+        lat_obs,
+        sitelong,
+        long_obs,
+        objctra,
+        objctdec,
         override_: false,
         calibration_set_id: None,
     })

@@ -5,9 +5,10 @@ import { format } from "date-fns";
 interface CameraCardProps {
   camera: CameraStats;
   onOpenDarkLibrary: (instrume: string) => void;
+  onOpenMasterDarkLibrary: (instrume: string) => void;
 }
 
-export default function CameraCard({ camera, onOpenDarkLibrary }: CameraCardProps) {
+export default function CameraCard({ camera, onOpenDarkLibrary, onOpenMasterDarkLibrary }: CameraCardProps) {
   const formatDate = (dateStr: string | null) => {
     if (!dateStr) return "N/A";
     try {
@@ -28,9 +29,12 @@ export default function CameraCard({ camera, onOpenDarkLibrary }: CameraCardProp
     <div className="bg-gray-800 rounded-lg p-5 border border-gray-700 hover:border-gray-600 transition-colors">
       {/* Camera name */}
       <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Camera className="text-blue-400" size={20} />
-          <h3 className="text-lg font-semibold text-gray-100 truncate">
+        <div className="flex items-center gap-2 flex-1 min-w-0">
+          <Camera className="text-blue-400 flex-shrink-0" size={20} />
+          <h3
+            className="text-lg font-semibold text-gray-100 truncate max-w-full"
+            title={camera.instrume}
+          >
             {camera.instrume}
           </h3>
         </div>
@@ -62,14 +66,23 @@ export default function CameraCard({ camera, onOpenDarkLibrary }: CameraCardProp
         </div>
       </div>
 
-      {/* Dark Library Button */}
-      <button
-        onClick={() => onOpenDarkLibrary(camera.instrume)}
-        className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors text-sm font-medium"
-      >
-        <Database size={16} />
-        Dark Library
-      </button>
+      {/* Library Buttons */}
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          onClick={() => onOpenDarkLibrary(camera.instrume)}
+          className="flex items-center justify-center gap-1 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors text-xs font-medium"
+        >
+          <Database size={14} />
+          Dark Library
+        </button>
+        <button
+          onClick={() => onOpenMasterDarkLibrary(camera.instrume)}
+          className="flex items-center justify-center gap-1 px-3 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-md transition-colors text-xs font-medium"
+        >
+          <Database size={14} />
+          Master Library
+        </button>
+      </div>
     </div>
   );
 }

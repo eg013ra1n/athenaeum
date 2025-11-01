@@ -3,12 +3,16 @@ import { invoke } from "@tauri-apps/api/core";
 import { CameraStats } from "../types/models";
 import CameraCard from "../components/CameraCard";
 import DarkLibrary from "../components/DarkLibrary";
+import MasterDarkLibrary from "../components/MasterDarkLibrary";
+
+type LibraryView = "equipment" | "dark" | "master";
 
 export default function Equipment() {
   const [cameras, setCameras] = useState<CameraStats[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
+  const [currentView, setCurrentView] = useState<LibraryView>("equipment");
 
   useEffect(() => {
     loadCameras();
@@ -29,17 +33,35 @@ export default function Equipment() {
 
   const handleOpenDarkLibrary = (instrume: string) => {
     setSelectedCamera(instrume);
+    setCurrentView("dark");
   };
 
-  const handleCloseDarkLibrary = () => {
+  const handleOpenMasterDarkLibrary = (instrume: string) => {
+    setSelectedCamera(instrume);
+    setCurrentView("master");
+  };
+
+  const handleCloseLibrary = () => {
     setSelectedCamera(null);
+    setCurrentView("equipment");
   };
 
-  if (selectedCamera) {
+  // Render dark library view
+  if (currentView === "dark" && selectedCamera) {
     return (
       <DarkLibrary
         instrume={selectedCamera}
-        onClose={handleCloseDarkLibrary}
+        onClose={handleCloseLibrary}
+      />
+    );
+  }
+
+  // Render master dark library view
+  if (currentView === "master" && selectedCamera) {
+    return (
+      <MasterDarkLibrary
+        instrume={selectedCamera}
+        onClose={handleCloseLibrary}
       />
     );
   }
@@ -80,6 +102,7 @@ export default function Equipment() {
               key={camera.instrume}
               camera={camera}
               onOpenDarkLibrary={handleOpenDarkLibrary}
+              onOpenMasterDarkLibrary={handleOpenMasterDarkLibrary}
             />
           ))}
         </div>
