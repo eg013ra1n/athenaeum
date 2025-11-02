@@ -263,3 +263,12 @@ export interface DarkLibraryResult {
   frames_grouped: number;
   frames_excluded: number;
 }
+
+// FITS Image Data for Blink Viewer
+export interface FitsImageData {
+  image_base64: string;
+  width: number;
+  height: number;
+  is_color: boolean;
+  bit_depth: number;
+}

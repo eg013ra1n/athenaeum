@@ -10,6 +10,7 @@ mod settings;
 mod coordinates;
 mod clustering;
 mod sessions;
+mod image_processing;
 
 // Commands (Tauri API endpoints)
 mod commands;
@@ -58,6 +59,8 @@ pub fn run() {
             commands::create_master_dark_library,
             commands::get_master_dark_library,
             commands::has_master_dark_library,
+            commands::read_fits_image,
+            commands::read_fits_image_png,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

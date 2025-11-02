@@ -233,7 +233,9 @@ export default function Objects() {
                   ) : (
                     <div className="flex items-center gap-2">
                       {frames_set.is_custom && (
-                        <Star size={16} className="text-orange-500 fill-orange-500 flex-shrink-0" title="Custom Set" />
+                        <span title="Custom Set">
+                          <Star size={16} className="text-orange-500 fill-orange-500 flex-shrink-0" />
+                        </span>
                       )}
                       <h3 className="text-lg font-semibold text-gray-100 truncate">
                         {frames_set.name || 'Untitled'}

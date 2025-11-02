@@ -2,9 +2,55 @@ use crate::db::{self, Database};
 use crate::models::*;
 use crate::scanner::scan_directory;
 use crate::settings::SettingsManager;
+use crate::image_processing;
 use std::path::Path;
 use std::sync::Mutex;
+use std::num::NonZeroUsize;
 use tauri::{Manager, State};
+use lru::LruCache;
+use lazy_static::lazy_static;
+
+/// Cached image data with metadata to avoid re-encoding and re-opening FITS files
+#[derive(Clone)]
+struct CachedImage {
+    image_base64: String,
+    width: u32,
+    height: u32,
+    is_color: bool,
+    bit_depth: u8,
+}
+
+/// LRU cache for processed FITS images
+/// Cache key format: "{path}_{quality}_{midtones}_{black_point}-{white_point}"
+struct ImageCache {
+    cache: Mutex<LruCache<String, CachedImage>>,
+}
+
+impl ImageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(capacity).unwrap())),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<CachedImage> {
+        self.cache.lock().unwrap().get(key).cloned()
+    }
+
+    fn put(&self, key: String, value: CachedImage) {
+        self.cache.lock().unwrap().put(key, value);
+    }
+
+    fn resize(&self, new_capacity: usize) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.resize(NonZeroUsize::new(new_capacity).unwrap());
+    }
+}
+
+// Global image cache with default capacity of 15 images
+lazy_static! {
+    static ref IMAGE_CACHE: ImageCache = ImageCache::new(15);
+}
 
 /// App state containing database connection and settings manager
 pub struct AppState {
@@ -836,4 +882,217 @@ pub async fn has_master_dark_library(
     let conn = db.conn();
 
     db::has_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+/// Read and process FITS image for blink viewer
+/// Returns auto-stretched JPEG image as base64 with caching
+#[tauri::command]
+pub async fn read_fits_image(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<image_processing::FitsImageData, String> {
+    use std::time::Instant;
+
+    let t_cmd_start = Instant::now();
+    let path_buf = std::path::PathBuf::from(&path);
+
+    println!("\n🖼️  === FITS IMAGE REQUEST === ");
+    println!("📁 Path: {}", path_buf.display());
+
+    // Read JPEG quality setting from database (default: 50 for speed)
+    let quality: u8 = {
+        let state_lock = state.db.lock().unwrap();
+        if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            match db::get_setting(&conn, "blink_jpeg_quality") {
+                Ok(Some(value)) => value.parse().unwrap_or(50),
+                _ => 50,
+            }
+        } else {
+            50
+        }
+    };
+
+    // Read percentile clipping settings (defaults: 850/64000 for typical 16-bit astro images)
+    let black_point: u16 = {
+        let state_lock = state.db.lock().unwrap();
+        if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            match db::get_setting(&conn, "blink_black_point") {
+                Ok(Some(value)) => value.parse().unwrap_or(850),
+                _ => 850,
+            }
+        } else {
+            850
+        }
+    };
+
+    let white_point: u16 = {
+        let state_lock = state.db.lock().unwrap();
+        if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            match db::get_setting(&conn, "blink_white_point") {
+                Ok(Some(value)) => value.parse().unwrap_or(64000),
+                _ => 64000,
+            }
+        } else {
+            64000
+        }
+    };
+
+    // Read midtones balance for MTF (0.25 = typical for linear data, lower = darker, higher = brighter)
+    let midtones: f32 = {
+        let state_lock = state.db.lock().unwrap();
+        let raw_value: f32 = if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            match db::get_setting(&conn, "blink_midtones") {
+                Ok(Some(value)) => value.parse().unwrap_or(0.25),
+                _ => 0.25,
+            }
+        } else {
+            0.25
+        };
+        // Clamp to reasonable range to prevent extreme stretching
+        raw_value.max(0.001).min(0.999)
+    };
+
+    // Check if cache size setting changed and resize if needed
+    {
+        let state_lock = state.db.lock().unwrap();
+        if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            if let Ok(Some(size_str)) = db::get_setting(&conn, "blink_cache_size") {
+                if let Ok(size) = size_str.parse::<usize>() {
+                    if size >= 5 && size <= 30 {
+                        IMAGE_CACHE.resize(size);
+                    }
+                }
+            }
+        }
+    }
+
+    // Create cache key (include all stretch parameters for proper cache invalidation)
+    let cache_key = format!("{}_{}_{}_{}-{}", path, quality, midtones, black_point, white_point);
+
+    println!("⚙️  Settings: quality={}, black={}, white={}, midtones={}", quality, black_point, white_point, midtones);
+
+    // Check cache first
+    let t_cache = Instant::now();
+    if let Some(cached_image) = IMAGE_CACHE.get(&cache_key) {
+        println!("✅ CACHE HIT! (lookup time: {:?})", t_cache.elapsed());
+        println!("⏱️  TOTAL COMMAND TIME (cached): {:?}", t_cmd_start.elapsed());
+        println!("=== END ===\n");
+
+        return Ok(image_processing::FitsImageData {
+            image_base64: cached_image.image_base64,
+            width: cached_image.width,
+            height: cached_image.height,
+            is_color: cached_image.is_color,
+            bit_depth: cached_image.bit_depth,
+        });
+    }
+
+    // Cache miss - process image
+    println!("❌ CACHE MISS (lookup time: {:?}) - processing from scratch...", t_cache.elapsed());
+
+    let t_process = Instant::now();
+    let result = image_processing::read_and_process_fits(&path_buf, quality, black_point, white_point, midtones)
+        .map_err(|e| format!("Failed to read FITS image: {}", e))?;
+    println!("⏱️  Processing complete: {:?}", t_process.elapsed());
+
+    // Store in cache (with base64 string and metadata - no re-encoding needed on cache hits)
+    let t_cache_store = Instant::now();
+    let cached_image = CachedImage {
+        image_base64: result.image_base64.clone(),
+        width: result.width,
+        height: result.height,
+        is_color: result.is_color,
+        bit_depth: result.bit_depth,
+    };
+    IMAGE_CACHE.put(cache_key, cached_image);
+    println!("💾 Stored in cache: {:?}", t_cache_store.elapsed());
+
+    println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
+    println!("=== END ===\n");
+
+    Ok(result)
+}
+
+/// Read FITS image and return as PNG binary data (no base64 encoding)
+/// Optimized for faster transfer and no encoding overhead
+#[tauri::command]
+pub async fn read_fits_image_png(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<image_processing::FitsImageBinary, String> {
+    use std::time::Instant;
+
+    let t_cmd_start = Instant::now();
+    let path_buf = std::path::PathBuf::from(&path);
+
+    println!("\n🖼️  === FITS PNG IMAGE REQUEST === ");
+    println!("📁 Path: {}", path_buf.display());
+
+    // Read percentile clipping settings (defaults: 850/64000 for typical 16-bit astro images)
+    let black_point: u16 = {
+        let state_lock = state.db.lock().unwrap();
+        if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            match db::get_setting(&conn, "blink_black_point") {
+                Ok(Some(value)) => value.parse().unwrap_or(850),
+                _ => 850,
+            }
+        } else {
+            850
+        }
+    };
+
+    let white_point: u16 = {
+        let state_lock = state.db.lock().unwrap();
+        if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            match db::get_setting(&conn, "blink_white_point") {
+                Ok(Some(value)) => value.parse().unwrap_or(64000),
+                _ => 64000,
+            }
+        } else {
+            64000
+        }
+    };
+
+    // Read midtones balance for MTF (0.25 = typical for linear data, lower = darker, higher = brighter)
+    let midtones: f32 = {
+        let state_lock = state.db.lock().unwrap();
+        let raw_value: f32 = if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            match db::get_setting(&conn, "blink_midtones") {
+                Ok(Some(value)) => value.parse().unwrap_or(0.25),
+                _ => 0.25,
+            }
+        } else {
+            0.25
+        };
+        // Clamp to reasonable range to prevent extreme stretching
+        raw_value.max(0.001).min(0.999)
+    };
+
+    // Check if we should use auto-stretch (when user hasn't configured settings)
+    let use_auto_stretch = black_point == 850 && white_point == 64000;
+
+    let t_process = Instant::now();
+    let result = if use_auto_stretch {
+        println!("⚙️  Using auto-stretch (AutoSTF mode)");
+        // Pass 0,0 to trigger auto-stretch in the processing function
+        image_processing::read_and_process_fits_png(&path_buf, 0, 0, 0.25)
+    } else {
+        println!("⚙️  Settings: black={}, white={}, midtones={}", black_point, white_point, midtones);
+        image_processing::read_and_process_fits_png(&path_buf, black_point, white_point, midtones)
+    }.map_err(|e| format!("Failed to read FITS image: {}", e))?;
+
+    println!("⏱️  Processing complete: {:?}", t_process.elapsed());
+
+    println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
+    println!("=== END ===\n");
+
+    Ok(result)
 }

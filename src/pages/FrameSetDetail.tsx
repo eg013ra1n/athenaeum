@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus } from 'lucide-react';
-import type { FrameSetDetail, ImagingNightWithSessions, SessionWithFrames } from '../types/models';
+import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus, Eye } from 'lucide-react';
+import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame } from '../types/models';
+import BlinkViewer from '../components/BlinkViewer';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -15,6 +16,7 @@ export default function FrameSetDetail() {
   const [customSetName, setCustomSetName] = useState('');
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [blinkFrames, setBlinkFrames] = useState<FileWithFrame[] | null>(null);
 
   useEffect(() => {
     loadDetail();
@@ -102,6 +104,20 @@ export default function FrameSetDetail() {
       }
       return newSet;
     });
+  };
+
+  const handleOpenBlink = (frames: FileWithFrame[]) => {
+    // Filter only LIGHT frames with FITS format
+    const lightFitsFrames = frames.filter(
+      f => f.frame?.imagetyp === 'Light' && f.file.format === 'FITS'
+    );
+
+    if (lightFitsFrames.length === 0) {
+      alert('No LIGHT FITS frames found in this session');
+      return;
+    }
+
+    setBlinkFrames(lightFitsFrames);
   };
 
   const toggleNightSelection = (night: ImagingNightWithSessions) => {
@@ -395,7 +411,7 @@ export default function FrameSetDetail() {
                             <ChevronRight size={18} className="text-gray-400" />
                           )}
                           <Camera size={18} className="text-blue-400" />
-                          <div>
+                          <div className="flex-1">
                             <h4 className="font-semibold text-gray-100">{sessionData.session?.instrume || 'Unknown'}</h4>
                             <p className="text-xs text-gray-400 mt-0.5">
                               {sessionData.session?.frame_count || 0} frame{(sessionData.session?.frame_count || 0) !== 1 ? 's' : ''} •
@@ -403,6 +419,21 @@ export default function FrameSetDetail() {
                             </p>
                           </div>
                         </button>
+
+                        {/* Blink button - only show if session has 2+ LIGHT FITS frames */}
+                        {sessionData.frames && sessionData.frames.filter(f => f.frame?.imagetyp === 'Light' && f.file.format === 'FITS').length >= 2 && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleOpenBlink(sessionData.frames!);
+                            }}
+                            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded flex items-center gap-2 transition-colors"
+                            title="Open blink viewer for LIGHT frames"
+                          >
+                            <Eye size={16} />
+                            <span>Blink</span>
+                          </button>
+                        )}
                       </div>
 
                       {/* Frames Table - Collapsible */}
@@ -524,6 +555,15 @@ export default function FrameSetDetail() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Blink Viewer Modal */}
+      {blinkFrames && (
+        <BlinkViewer
+          frames={blinkFrames}
+          initialIndex={0}
+          onClose={() => setBlinkFrames(null)}
+        />
       )}
     </div>
   );

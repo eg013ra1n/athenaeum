@@ -24,6 +24,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_bytes = "0.11"
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -34,4 +35,13 @@ fitsio = "0.21"
 anyhow = "1"
 thiserror = "2"
 quick-xml = "0.36"
+image = "0.24"
+base64 = "0.21"
+lru = "0.12"
+lazy_static = "1.4"
+wide = "0.7"
+
+[profile.release]
+lto = true           # Link-time optimization for cross-function inlining
+codegen-units = 1    # Single compilation unit for better optimization
 

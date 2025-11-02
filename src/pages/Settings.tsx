@@ -10,6 +10,11 @@ export default function Settings() {
   const [coordFrame, setCoordFrame] = useState('ICRS');
   const [nameMode, setNameMode] = useState('majority-object');
   const [sessionGapHours, setSessionGapHours] = useState('6.0');
+  const [blinkJpegQuality, setBlinkJpegQuality] = useState('50');
+  const [blinkCacheSize, setBlinkCacheSize] = useState('15');
+  const [blinkBlackPoint, setBlinkBlackPoint] = useState('850');
+  const [blinkWhitePoint, setBlinkWhitePoint] = useState('64000');
+  const [blinkMidtones, setBlinkMidtones] = useState('0.25');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -24,7 +29,7 @@ export default function Settings() {
       setLoading(true);
       setError(null);
 
-      const [value, unit, frame, mode, sessionGap] = await Promise.all([
+      const [value, unit, frame, mode, sessionGap, jpegQuality, cacheSize, blackPoint, whitePoint, midtones] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
           defaultValue: '3.0',
@@ -45,6 +50,26 @@ export default function Settings() {
           key: 'session_gap_threshold_hours',
           defaultValue: '6.0',
         }),
+        invoke<string>('get_setting', {
+          key: 'blink_jpeg_quality',
+          defaultValue: '50',
+        }),
+        invoke<string>('get_setting', {
+          key: 'blink_cache_size',
+          defaultValue: '15',
+        }),
+        invoke<string>('get_setting', {
+          key: 'blink_black_point',
+          defaultValue: '850',
+        }),
+        invoke<string>('get_setting', {
+          key: 'blink_white_point',
+          defaultValue: '64000',
+        }),
+        invoke<string>('get_setting', {
+          key: 'blink_midtones',
+          defaultValue: '0.25',
+        }),
       ]);
 
       setThresholdValue(value);
@@ -52,6 +77,11 @@ export default function Settings() {
       setCoordFrame(frame);
       setNameMode(mode);
       setSessionGapHours(sessionGap);
+      setBlinkJpegQuality(jpegQuality);
+      setBlinkCacheSize(cacheSize);
+      setBlinkBlackPoint(blackPoint);
+      setBlinkWhitePoint(whitePoint);
+      setBlinkMidtones(midtones);
     } catch (err) {
       setError(err as string);
       console.error('Failed to load settings:', err);
@@ -80,6 +110,47 @@ export default function Settings() {
         return;
       }
 
+      // Validate JPEG quality
+      const jpegQualityValue = parseInt(blinkJpegQuality);
+      if (isNaN(jpegQualityValue) || jpegQualityValue < 30 || jpegQualityValue > 100) {
+        setError('JPEG quality must be between 30 and 100');
+        return;
+      }
+
+      // Validate cache size
+      const cacheSizeValue = parseInt(blinkCacheSize);
+      if (isNaN(cacheSizeValue) || cacheSizeValue < 5 || cacheSizeValue > 30) {
+        setError('Cache size must be between 5 and 30');
+        return;
+      }
+
+      // Validate black point
+      const blackPointValue = parseInt(blinkBlackPoint);
+      if (isNaN(blackPointValue) || blackPointValue < 0 || blackPointValue > 65535) {
+        setError('Black point must be between 0 and 65535');
+        return;
+      }
+
+      // Validate white point
+      const whitePointValue = parseInt(blinkWhitePoint);
+      if (isNaN(whitePointValue) || whitePointValue < 0 || whitePointValue > 65535) {
+        setError('White point must be between 0 and 65535');
+        return;
+      }
+
+      // Validate black < white
+      if (blackPointValue >= whitePointValue) {
+        setError('Black point must be less than white point');
+        return;
+      }
+
+      // Validate midtones
+      const midtonesValue = parseFloat(blinkMidtones);
+      if (isNaN(midtonesValue) || midtonesValue <= 0 || midtonesValue >= 1) {
+        setError('Midtones must be between 0 and 1 (typical: 0.25)');
+        return;
+      }
+
       await Promise.all([
         invoke('set_setting', {
           key: 'grouping.threshold.value',
@@ -100,6 +171,26 @@ export default function Settings() {
         invoke('set_setting', {
           key: 'session_gap_threshold_hours',
           value: sessionGapHours,
+        }),
+        invoke('set_setting', {
+          key: 'blink_jpeg_quality',
+          value: blinkJpegQuality,
+        }),
+        invoke('set_setting', {
+          key: 'blink_cache_size',
+          value: blinkCacheSize,
+        }),
+        invoke('set_setting', {
+          key: 'blink_black_point',
+          value: blinkBlackPoint,
+        }),
+        invoke('set_setting', {
+          key: 'blink_white_point',
+          value: blinkWhitePoint,
+        }),
+        invoke('set_setting', {
+          key: 'blink_midtones',
+          value: blinkMidtones,
         }),
       ]);
 
@@ -263,6 +354,127 @@ export default function Settings() {
                 between frames, they will be grouped into separate imaging nights. Typical night
                 sessions can span midnight (e.g., 19:00 Day 1 → 03:00 Day 2 = one night). Default
                 is 6 hours.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Blink Viewer</h3>
+
+          <div className="space-y-4">
+            {/* JPEG Quality */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                JPEG Quality ({blinkJpegQuality})
+              </label>
+              <input
+                type="range"
+                value={blinkJpegQuality}
+                onChange={(e) => setBlinkJpegQuality(e.target.value)}
+                min="30"
+                max="100"
+                step="1"
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>30 (Fastest)</span>
+                <span>100 (Highest Quality)</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                JPEG quality for blink viewer. Lower quality = faster encoding. 50 (default) provides
+                fast encoding (~1-1.5s) with acceptable quality for visual inspection. Quality 30-40
+                for maximum speed, 60-70 for better quality, 80+ for highest quality but slower.
+              </p>
+            </div>
+
+            {/* Cache Size */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Image Cache Size ({blinkCacheSize} images)
+              </label>
+              <input
+                type="range"
+                value={blinkCacheSize}
+                onChange={(e) => setBlinkCacheSize(e.target.value)}
+                min="5"
+                max="30"
+                step="1"
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>5 (Less Memory)</span>
+                <span>30 (More Memory)</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Number of processed images to keep in memory cache. Cached images load instantly
+                when revisiting them. Higher values use more memory (~20-40 MB per image depending
+                on size and quality). Default is 15 images.
+              </p>
+            </div>
+
+            {/* Black Point */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Black Point (16-bit value)
+              </label>
+              <input
+                type="number"
+                value={blinkBlackPoint}
+                onChange={(e) => setBlinkBlackPoint(e.target.value)}
+                min="0"
+                max="65535"
+                step="100"
+                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+              />
+              <p className="text-xs text-gray-500 mt-2">
+                Percentile clipping black point for 16-bit images. Pixels below this value are
+                clipped to black. Default: 850 (typical 1st percentile for astrophotography).
+                Adjust for your camera's bias level.
+              </p>
+            </div>
+
+            {/* White Point */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                White Point (16-bit value)
+              </label>
+              <input
+                type="number"
+                value={blinkWhitePoint}
+                onChange={(e) => setBlinkWhitePoint(e.target.value)}
+                min="0"
+                max="65535"
+                step="100"
+                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+              />
+              <p className="text-xs text-gray-500 mt-2">
+                Percentile clipping white point for 16-bit images. Pixels above this value are
+                clipped to white. Default: 64000 (typical 99th percentile). This approach is
+                10-20x faster than scanning for min/max and provides better visual results by
+                rejecting outliers. Industry standard for DS9, PixInsight, Astropy.
+              </p>
+            </div>
+
+            {/* Midtones Balance (MTF) */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Midtones Balance (STF)
+              </label>
+              <input
+                type="number"
+                value={blinkMidtones}
+                onChange={(e) => setBlinkMidtones(e.target.value)}
+                min="0.001"
+                max="0.999"
+                step="0.01"
+                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+              />
+              <p className="text-xs text-gray-500 mt-2">
+                Midtones Transfer Function (MTF) balance for Screen Transfer Function (STF) stretching.
+                Controls brightness of the stretch. Lower values (0.1-0.2) = darker/more contrast.
+                Higher values (0.3-0.5) = brighter. Default: 0.25 (typical for linear astronomical data).
+                Similar to PixInsight's auto-stretch midtones parameter.
               </p>
             </div>
           </div>
