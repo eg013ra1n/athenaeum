@@ -698,7 +698,7 @@ fn encode_mono_to_png(pixels: &[u8], width: usize, height: usize) -> Result<Vec<
     let encoder = PngEncoder::new_with_quality(
         &mut png_data,
         CompressionType::Fast,  // Fast compression (speed priority)
-        FilterType::NoFilter    // No filtering for speed
+        FilterType::Adaptive    // Adaptive filtering reduces file size significantly with minimal speed impact
     );
 
     encoder.encode(
@@ -719,7 +719,7 @@ fn encode_rgb_to_png(pixels: &[u8], width: usize, height: usize) -> Result<Vec<u
     let encoder = PngEncoder::new_with_quality(
         &mut png_data,
         CompressionType::Fast,  // Fast compression (speed priority)
-        FilterType::NoFilter    // No filtering for speed
+        FilterType::Adaptive    // Adaptive filtering reduces file size significantly with minimal speed impact
     );
 
     encoder.encode(

@@ -61,13 +61,35 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const loadImage = useCallback(
     async (index: number) => {
       if (index < 0 || index >= fitsFrames.length) return;
-      if (loadedImages.has(index)) return; // Already loaded
-      if (loadingIndices.has(index)) return; // Already loading
+
+      // Use functional updates to check and set loading state atomically
+      const shouldLoad = await new Promise<boolean>((resolve) => {
+        setLoadingIndices((prev) => {
+          // Check if already loading
+          if (prev.has(index)) {
+            resolve(false);
+            return prev;
+          }
+
+          // Check if already loaded using ref
+          if (loadedImagesRef.current.has(index)) {
+            resolve(false);
+            return prev;
+          }
+
+          // Mark as loading
+          resolve(true);
+          return new Set(prev).add(index);
+        });
+      });
+
+      if (!shouldLoad) {
+        return;
+      }
 
       const frame = fitsFrames[index];
       if (!frame) return;
 
-      setLoadingIndices((prev) => new Set(prev).add(index));
       setError(null);
 
       try {
@@ -129,7 +151,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         });
       }
     },
-    [fitsFrames, loadedImages, loadingIndices]
+    [fitsFrames] // Only depend on fitsFrames, not on state variables
   );
 
   // Render image to canvas
@@ -200,13 +222,14 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Cleanup blob URLs when component unmounts
   useEffect(() => {
     return () => {
-      loadedImages.forEach((url) => {
+      // Clean up all blob URLs when component unmounts
+      loadedImagesRef.current.forEach((url) => {
         if (url && url.startsWith("blob:")) {
           URL.revokeObjectURL(url);
         }
       });
     };
-  }, [loadedImages]);
+  }, []); // Empty dependency array - only run on mount/unmount
 
   // Render current image when loaded
   useEffect(() => {

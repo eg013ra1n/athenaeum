@@ -20,10 +20,26 @@ struct CachedImage {
     bit_depth: u8,
 }
 
+/// Cached PNG image data with metadata to avoid re-encoding and re-opening FITS files
+#[derive(Clone)]
+struct CachedPngImage {
+    image_data: Vec<u8>,  // PNG binary data
+    width: u32,
+    height: u32,
+    is_color: bool,
+    bit_depth: u8,
+}
+
 /// LRU cache for processed FITS images
 /// Cache key format: "{path}_{quality}_{midtones}_{black_point}-{white_point}"
 struct ImageCache {
     cache: Mutex<LruCache<String, CachedImage>>,
+}
+
+/// LRU cache for processed PNG images
+/// Cache key format: "{path}_{midtones}_{black_point}-{white_point}"
+struct PngImageCache {
+    cache: Mutex<LruCache<String, CachedPngImage>>,
 }
 
 impl ImageCache {
@@ -47,9 +63,31 @@ impl ImageCache {
     }
 }
 
+impl PngImageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(capacity).unwrap())),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<CachedPngImage> {
+        self.cache.lock().unwrap().get(key).cloned()
+    }
+
+    fn put(&self, key: String, value: CachedPngImage) {
+        self.cache.lock().unwrap().put(key, value);
+    }
+
+    fn resize(&self, new_capacity: usize) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.resize(NonZeroUsize::new(new_capacity).unwrap());
+    }
+}
+
 // Global image cache with default capacity of 15 images
 lazy_static! {
     static ref IMAGE_CACHE: ImageCache = ImageCache::new(15);
+    static ref PNG_IMAGE_CACHE: PngImageCache = PngImageCache::new(15);
 }
 
 /// App state containing database connection and settings manager
@@ -1079,6 +1117,30 @@ pub async fn read_fits_image_png(
     // Check if we should use auto-stretch (when user hasn't configured settings)
     let use_auto_stretch = black_point == 850 && white_point == 64000;
 
+    // Generate cache key
+    let cache_key = if use_auto_stretch {
+        format!("{}_auto_{}", path, midtones)
+    } else {
+        format!("{}_{}_{}-{}", path, midtones, black_point, white_point)
+    };
+
+    // Check cache first
+    if let Some(cached) = PNG_IMAGE_CACHE.get(&cache_key) {
+        println!("✨ Cache HIT for PNG: {}", path_buf.display());
+        println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
+        println!("=== END ===\n");
+        return Ok(image_processing::FitsImageBinary {
+            image_data: cached.image_data,
+            width: cached.width,
+            height: cached.height,
+            is_color: cached.is_color,
+            bit_depth: cached.bit_depth,
+            format: "png".to_string(),
+        });
+    }
+
+    println!("💾 Cache MISS for PNG: {}", path_buf.display());
+
     let t_process = Instant::now();
     let result = if use_auto_stretch {
         println!("⚙️  Using auto-stretch (AutoSTF mode)");
@@ -1090,6 +1152,17 @@ pub async fn read_fits_image_png(
     }.map_err(|e| format!("Failed to read FITS image: {}", e))?;
 
     println!("⏱️  Processing complete: {:?}", t_process.elapsed());
+
+    // Store in cache
+    let cached_image = CachedPngImage {
+        image_data: result.image_data.clone(),
+        width: result.width,
+        height: result.height,
+        is_color: result.is_color,
+        bit_depth: result.bit_depth,
+    };
+    PNG_IMAGE_CACHE.put(cache_key, cached_image);
+    println!("💾 Stored PNG in cache");
 
     println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
     println!("=== END ===\n");
