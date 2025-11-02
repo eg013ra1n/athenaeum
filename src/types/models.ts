@@ -21,6 +21,7 @@ export interface File {
   modified_at: string; // ISO 8601 datetime
   format: FileFormat;
   created_at: string; // ISO 8601 datetime
+  metadata_hash: string | null; // Quick hash for duplicate detection
 }
 
 export interface Frame {

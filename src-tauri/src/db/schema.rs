@@ -2,7 +2,7 @@ use rusqlite::{Connection, Result};
 
 /// Initialize the database schema
 pub fn init_db(conn: &Connection) -> Result<()> {
-    // Files table - simplified, no hash or duplicate tracking
+    // Files table - includes metadata hash for quick duplicate detection
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11,7 +11,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             size INTEGER NOT NULL,
             modified_at TEXT NOT NULL,
             format TEXT NOT NULL CHECK(format IN ('FITS', 'XISF')),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            metadata_hash TEXT
         )",
         [],
     )?;
@@ -220,6 +221,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_metadata_hash ON files(metadata_hash)",
         [],
     )?;
     conn.execute(

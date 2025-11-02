@@ -11,6 +11,7 @@ pub struct File {
     pub modified_at: DateTime<Utc>,
     pub format: FileFormat,
     pub created_at: DateTime<Utc>,
+    pub metadata_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

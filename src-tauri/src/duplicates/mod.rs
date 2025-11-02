@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use anyhow::Result;
 use xxhash_rust::xxh3::Xxh3;
+use chrono::{DateTime, Utc};
 
 /// Compute XXH3_64 hash for a file
 pub fn compute_xxhash(path: &Path) -> Result<String> {
@@ -23,6 +24,25 @@ pub fn compute_xxhash(path: &Path) -> Result<String> {
     }
 
     Ok(format!("{:016x}", hasher.digest()))
+}
+
+/// Compute metadata hash (quick, no file I/O required)
+/// Hashes: size + modified_time + filename
+/// Returns 16-character hex string
+pub fn compute_metadata_hash(size: i64, modified_at: &DateTime<Utc>, filename: &str) -> String {
+    let mut hasher = Xxh3::new();
+
+    // Hash file size
+    hasher.update(&size.to_le_bytes());
+
+    // Hash modified time (as unix timestamp)
+    let timestamp = modified_at.timestamp();
+    hasher.update(&timestamp.to_le_bytes());
+
+    // Hash filename
+    hasher.update(filename.as_bytes());
+
+    format!("{:016x}", hasher.digest())
 }
 
 /// Group files by size and hash to find duplicates

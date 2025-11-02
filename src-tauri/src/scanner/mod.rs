@@ -2,7 +2,8 @@
 // Handles directory traversal and metadata extraction
 
 use crate::db::{file_exists, insert_file, insert_frame, insert_fits_header};
-use crate::fits_parser::{parse_fits, parse_xisf, extract_fits_header};
+use crate::fits_parser::{parse_fits, parse_xisf, extract_fits_header, extract_xisf_header};
+use crate::duplicates::compute_metadata_hash;
 use crate::models::{File, FileFormat};
 use chrono::Utc;
 use rusqlite::Connection;
@@ -117,6 +118,9 @@ fn process_file(path: &PathBuf, conn: &Connection) -> anyhow::Result<()> {
         .unwrap_or("")
         .to_string();
 
+    // Compute metadata hash for quick duplicate detection
+    let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
+
     // Insert file record
     let file = File {
         id: None,
@@ -126,6 +130,7 @@ fn process_file(path: &PathBuf, conn: &Connection) -> anyhow::Result<()> {
         modified_at: modified_dt,
         format: format.clone(),
         created_at: Utc::now(),
+        metadata_hash: Some(metadata_hash),
     };
 
     let file_id = insert_file(conn, &file)?;
@@ -150,6 +155,21 @@ fn process_file(path: &PathBuf, conn: &Connection) -> anyhow::Result<()> {
             }
             Err(e) => {
                 println!("Warning: Failed to extract FITS header: {}", e);
+                // Continue processing - header storage is non-critical
+            }
+        }
+    } else if format == FileFormat::XISF {
+        // Store XISF header for future reference
+        match extract_xisf_header(path) {
+            Ok(header) => {
+                println!("Storing XISF header for file_id={}, header length={} bytes", file_id, header.len());
+                if let Err(e) = insert_fits_header(conn, file_id, &header) {
+                    println!("Warning: Failed to store XISF header: {}", e);
+                    // Continue processing - header storage is non-critical
+                }
+            }
+            Err(e) => {
+                println!("Warning: Failed to extract XISF header: {}", e);
                 // Continue processing - header storage is non-critical
             }
         }

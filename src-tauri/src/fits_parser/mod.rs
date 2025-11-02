@@ -51,6 +51,93 @@ pub fn extract_fits_header(path: &Path) -> Result<String> {
     Ok(header_text)
 }
 
+/// Extract full XISF header as text
+pub fn extract_xisf_header(path: &Path) -> Result<String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+    use std::fs::File;
+    use std::io::{BufReader, Read};
+
+    // Read the first 1MB which should contain the XML header
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
+    let mut buf_reader = BufReader::new(file);
+
+    let max_header_size = 1024 * 1024; // 1MB
+    let mut content = vec![0u8; max_header_size];
+    let bytes_read = buf_reader.read(&mut content)?;
+    content.truncate(bytes_read);
+
+    // Find the XML section
+    let xml_start = content.windows(5)
+        .position(|w| w == b"<?xml")
+        .ok_or_else(|| anyhow::anyhow!("No XML header found in XISF file"))?;
+
+    let xml_end = content.windows(7)
+        .skip(xml_start)
+        .position(|w| w == b"</xisf>")
+        .ok_or_else(|| anyhow::anyhow!("No closing </xisf> tag found"))?;
+    let xml_end = xml_start + xml_end + 7;
+
+    // Extract XML content
+    let xml_content = &content[xml_start..xml_end];
+    let xml_str = String::from_utf8_lossy(xml_content);
+
+    // Parse XML to extract FITSKeyword elements
+    let mut reader = Reader::from_str(&xml_str);
+    reader.config_mut().trim_text(true);
+
+    let mut header_text = String::new();
+    header_text.push_str("XISF FITS Keywords:\n");
+    header_text.push_str("==================\n\n");
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) if e.name().as_ref() == b"FITSKeyword" => {
+                let mut name = String::new();
+                let mut value = String::new();
+
+                for attr in e.attributes() {
+                    if let Ok(attr) = attr {
+                        match attr.key.as_ref() {
+                            b"name" => {
+                                name = String::from_utf8_lossy(&attr.value).to_string();
+                            }
+                            b"value" => {
+                                value = String::from_utf8_lossy(&attr.value).to_string();
+                                // Remove quotes if present
+                                if value.starts_with('\'') && value.ends_with('\'') {
+                                    value = value[1..value.len()-1].to_string();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if !name.is_empty() {
+                    header_text.push_str(&format!("{} = {}\n", name, value));
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                println!("Error parsing XISF XML: {}", e);
+                break;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    // If header is still minimal, record that we tried
+    if header_text.lines().count() <= 3 {
+        header_text = format!("Header extracted from: {}\n(No FITS keywords found in XISF)", path.display());
+    }
+
+    Ok(header_text)
+}
+
 /// Parse FITS file metadata
 pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     println!("Parsing FITS file: {}", path.display());
