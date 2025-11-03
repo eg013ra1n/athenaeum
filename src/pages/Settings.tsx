@@ -15,6 +15,8 @@ export default function Settings() {
   const [blinkBlackPoint, setBlinkBlackPoint] = useState('850');
   const [blinkWhitePoint, setBlinkWhitePoint] = useState('64000');
   const [blinkMidtones, setBlinkMidtones] = useState('0.25');
+  const [autostfShadowsClipping, setAutostfShadowsClipping] = useState('-1.5');
+  const [autostfTargetMedian, setAutostfTargetMedian] = useState('0.35');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -29,7 +31,7 @@ export default function Settings() {
       setLoading(true);
       setError(null);
 
-      const [value, unit, frame, mode, sessionGap, jpegQuality, cacheSize, blackPoint, whitePoint, midtones] = await Promise.all([
+      const [value, unit, frame, mode, sessionGap, jpegQuality, cacheSize, blackPoint, whitePoint, midtones, shadowsClipping, targetMedian] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
           defaultValue: '3.0',
@@ -70,6 +72,14 @@ export default function Settings() {
           key: 'blink_midtones',
           defaultValue: '0.25',
         }),
+        invoke<string>('get_setting', {
+          key: 'autostf.shadows_clipping',
+          defaultValue: '-1.5',
+        }),
+        invoke<string>('get_setting', {
+          key: 'autostf.target_median',
+          defaultValue: '0.35',
+        }),
       ]);
 
       setThresholdValue(value);
@@ -82,6 +92,8 @@ export default function Settings() {
       setBlinkBlackPoint(blackPoint);
       setBlinkWhitePoint(whitePoint);
       setBlinkMidtones(midtones);
+      setAutostfShadowsClipping(shadowsClipping);
+      setAutostfTargetMedian(targetMedian);
     } catch (err) {
       setError(err as string);
       console.error('Failed to load settings:', err);
@@ -151,6 +163,20 @@ export default function Settings() {
         return;
       }
 
+      // Validate AutoSTF shadows clipping
+      const shadowsClippingValue = parseFloat(autostfShadowsClipping);
+      if (isNaN(shadowsClippingValue) || shadowsClippingValue < -3.0 || shadowsClippingValue > 0.0) {
+        setError('AutoSTF Shadows Clipping must be between -3.0 and 0.0');
+        return;
+      }
+
+      // Validate AutoSTF target median
+      const targetMedianValue = parseFloat(autostfTargetMedian);
+      if (isNaN(targetMedianValue) || targetMedianValue < 0.1 || targetMedianValue > 0.6) {
+        setError('AutoSTF Target Median must be between 0.1 and 0.6');
+        return;
+      }
+
       await Promise.all([
         invoke('set_setting', {
           key: 'grouping.threshold.value',
@@ -191,6 +217,14 @@ export default function Settings() {
         invoke('set_setting', {
           key: 'blink_midtones',
           value: blinkMidtones,
+        }),
+        invoke('set_setting', {
+          key: 'autostf.shadows_clipping',
+          value: autostfShadowsClipping,
+        }),
+        invoke('set_setting', {
+          key: 'autostf.target_median',
+          value: autostfTargetMedian,
         }),
       ]);
 
@@ -475,6 +509,56 @@ export default function Settings() {
                 Controls brightness of the stretch. Lower values (0.1-0.2) = darker/more contrast.
                 Higher values (0.3-0.5) = brighter. Default: 0.25 (typical for linear astronomical data).
                 Similar to PixInsight's auto-stretch midtones parameter.
+              </p>
+            </div>
+
+            {/* AutoSTF Shadows Clipping */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                AutoSTF Shadows Clipping ({autostfShadowsClipping})
+              </label>
+              <input
+                type="range"
+                value={autostfShadowsClipping}
+                onChange={(e) => setAutostfShadowsClipping(e.target.value)}
+                min="-3.0"
+                max="0.0"
+                step="0.1"
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>-3.0 (Darker Shadows)</span>
+                <span>0.0 (Brighter Shadows)</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Controls black point calculation for AutoSTF. More negative values = darker shadows
+                (e.g. -2.8), values closer to 0 = brighter shadows (e.g. -0.5). Default: -1.5.
+                This parameter uses MAD (Median Absolute Deviation) for robust histogram analysis.
+              </p>
+            </div>
+
+            {/* AutoSTF Target Median */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                AutoSTF Target Median ({autostfTargetMedian})
+              </label>
+              <input
+                type="range"
+                value={autostfTargetMedian}
+                onChange={(e) => setAutostfTargetMedian(e.target.value)}
+                min="0.1"
+                max="0.6"
+                step="0.05"
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>0.1 (Darker/More Contrast)</span>
+                <span>0.6 (Brighter)</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Controls overall brightness after AutoSTF stretch. Lower values = darker with more
+                contrast (e.g. 0.25), higher values = brighter (e.g. 0.50). Default: 0.35.
+                This determines where the image median will be mapped to in the output.
               </p>
             </div>
           </div>
