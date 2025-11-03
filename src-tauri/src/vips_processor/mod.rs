@@ -61,8 +61,9 @@ impl VipsProcessor {
         // Calculate or apply AutoSTF
         let t_stf = Instant::now();
         let stf_params = if params.auto_stretch {
-            println!("  🔮 Calculating AutoSTF");
-            self.calculate_autostf(&image)?
+            println!("  🔮 Calculating AutoSTF (shadows: {}, median: {})",
+                     params.autostf_shadows_clipping, params.autostf_target_median);
+            self.calculate_autostf(&image, params)?
         } else {
             AutoSTFResult {
                 black_point: params.black_point as f64 / 65535.0,
@@ -125,9 +126,14 @@ impl VipsProcessor {
         Ok(image)
     }
 
-    /// Calculate AutoSTF parameters
-    fn calculate_autostf(&self, image: &VipsImage) -> Result<AutoSTFResult> {
-        autostf::calculate_autostf(image, &AutoSTFParams::default())
+    /// Calculate AutoSTF parameters using settings from ProcessParams
+    fn calculate_autostf(&self, image: &VipsImage, params: &ProcessParams) -> Result<AutoSTFResult> {
+        let autostf_params = AutoSTFParams {
+            shadows_clipping: params.autostf_shadows_clipping,
+            target_median: params.autostf_target_median,
+            use_rgb_linking: true,
+        };
+        autostf::calculate_autostf(image, &autostf_params)
     }
 
     /// Apply stretch using AutoSTF parameters with MTF curve

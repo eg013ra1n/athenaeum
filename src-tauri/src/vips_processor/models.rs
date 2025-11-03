@@ -19,6 +19,10 @@ pub struct ProcessParams {
     pub resolutions: Vec<Resolution>,
     /// JPEG quality for each resolution
     pub jpeg_quality: JpegQuality,
+    /// AutoSTF shadows clipping in MAD units (typical: -2.8 to 0.0, default: -1.5)
+    pub autostf_shadows_clipping: f32,
+    /// AutoSTF target median (0.0-1.0, typical: 0.1-0.6, default: 0.35)
+    pub autostf_target_median: f32,
 }
 
 impl Default for ProcessParams {
@@ -35,6 +39,8 @@ impl Default for ProcessParams {
                 Resolution::Full,
             ],
             jpeg_quality: JpegQuality::default(),
+            autostf_shadows_clipping: -1.5,
+            autostf_target_median: 0.35,
         }
     }
 }

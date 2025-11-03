@@ -78,22 +78,12 @@ pub fn calculate_autostf(image: &VipsImage, params: &AutoSTFParams) -> Result<Au
 
 /// Calculate image statistics for AutoSTF
 fn calculate_statistics(image: &VipsImage) -> Result<ImageStatistics> {
-    use libvips::ops;
-
     // Get image dimensions
     let width = image.get_width() as usize;
     let height = image.get_height() as usize;
     let bands = image.get_bands() as usize;
 
     println!("    Image: {}x{}, {} bands", width, height, bands);
-
-    // For multi-band images, work with the first band or average
-    let working_image = if bands > 1 {
-        // Extract first band for analysis
-        ops::extract_band(image, 0)?
-    } else {
-        image.clone()
-    };
 
     // OPTIMIZATION: Subsample image for statistics calculation (10-50x faster!)
     // Sample every 4th pixel in both dimensions = 16x fewer pixels
@@ -112,24 +102,26 @@ fn calculate_statistics(image: &VipsImage) -> Result<ImageStatistics> {
     println!("    🔒 Histogram lock acquired");
 
     println!("    [1/5] Reading pixel data from image and subsampling...");
-    // WORKAROUND: LibVIPS subsample operation also causes segfaults in concurrent processing
-    // Read full image buffer and manually subsample in pure Rust
-    let buffer = working_image.image_write_to_memory();
+    // WORKAROUND: Avoid LibVIPS ops::extract_band which causes GLib-GObject errors
+    // Read full image buffer and manually extract first band + subsample in pure Rust
+    let buffer = image.image_write_to_memory();
 
-    // Read pixel values (16-bit unsigned)
+    // Read pixel values (16-bit unsigned, interleaved if multi-band)
     let full_pixels: &[u16] = unsafe {
         std::slice::from_raw_parts(
             buffer.as_ptr() as *const u16,
-            width * height
+            width * height * bands
         )
     };
 
-    // Manually subsample: take every 4th pixel in both dimensions
+    // Manually subsample and extract first band if multi-band
+    // For multi-band: pixels are interleaved [R0,G0,B0, R1,G1,B1, ...]
     let mut sampled_pixels: Vec<u16> = Vec::with_capacity(sampled_width * sampled_height);
     for y in (0..height).step_by(sample_factor) {
         for x in (0..width).step_by(sample_factor) {
-            let idx = y * width + x;
-            sampled_pixels.push(full_pixels[idx]);
+            let pixel_idx = y * width + x;
+            let buffer_idx = pixel_idx * bands;  // First band of this pixel
+            sampled_pixels.push(full_pixels[buffer_idx]);
         }
     }
 

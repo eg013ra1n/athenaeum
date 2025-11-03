@@ -33,6 +33,28 @@ pub async fn read_fits_image_vips(
         }
     };
 
+    // Read AutoSTF settings from database
+    let (autostf_shadows_clipping, autostf_target_median) = {
+        let state_lock = state.db.lock().unwrap();
+        let db = match state_lock.as_ref() {
+            Some(db) => db,
+            None => {
+                eprintln!("❌ ERROR: Database not initialized");
+                return Err("Database not initialized".to_string());
+            }
+        };
+        let conn = db.conn();
+
+        let shadows = state.settings
+            .get_autostf_shadows_clipping(&conn)
+            .unwrap_or(-1.5);
+        let median = state.settings
+            .get_autostf_target_median(&conn)
+            .unwrap_or(0.35);
+
+        (shadows, median)
+    };
+
     // Create processing parameters
     let params = ProcessParams {
         auto_stretch: true,  // Use AutoSTF for optimal stretching
@@ -47,6 +69,8 @@ pub async fn read_fits_image_vips(
             _ => vec![Resolution::Preview],
         },
         jpeg_quality: Default::default(),
+        autostf_shadows_clipping,
+        autostf_target_median,
     };
 
     // Process the image with error context
@@ -94,6 +118,28 @@ pub async fn get_image_metadata_vips(
         }
     };
 
+    // Read AutoSTF settings from database
+    let (autostf_shadows_clipping, autostf_target_median) = {
+        let state_lock = state.db.lock().unwrap();
+        let db = match state_lock.as_ref() {
+            Some(db) => db,
+            None => {
+                eprintln!("❌ ERROR: Database not initialized");
+                return Err("Database not initialized".to_string());
+            }
+        };
+        let conn = db.conn();
+
+        let shadows = state.settings
+            .get_autostf_shadows_clipping(&conn)
+            .unwrap_or(-1.5);
+        let median = state.settings
+            .get_autostf_target_median(&conn)
+            .unwrap_or(0.35);
+
+        (shadows, median)
+    };
+
     // Quick metadata extraction (without full processing)
     // For now, we'll do a minimal process to get dimensions
     let params = ProcessParams {
@@ -104,6 +150,8 @@ pub async fn get_image_metadata_vips(
         debayer_pattern: None,
         resolutions: vec![Resolution::Thumbnail],  // Just thumbnail for speed
         jpeg_quality: Default::default(),
+        autostf_shadows_clipping,
+        autostf_target_median,
     };
 
     let result = vips.process_fits_to_jpeg(&path_buf, &params)
@@ -141,6 +189,28 @@ pub async fn batch_process_images_vips(
         }
     };
 
+    // Read AutoSTF settings from database
+    let (autostf_shadows_clipping, autostf_target_median) = {
+        let state_lock = state.db.lock().unwrap();
+        let db = match state_lock.as_ref() {
+            Some(db) => db,
+            None => {
+                eprintln!("❌ ERROR: Database not initialized");
+                return Err("Database not initialized".to_string());
+            }
+        };
+        let conn = db.conn();
+
+        let shadows = state.settings
+            .get_autostf_shadows_clipping(&conn)
+            .unwrap_or(-1.5);
+        let median = state.settings
+            .get_autostf_target_median(&conn)
+            .unwrap_or(0.35);
+
+        (shadows, median)
+    };
+
     let params = ProcessParams {
         auto_stretch: true,
         black_point: 0,
@@ -154,6 +224,8 @@ pub async fn batch_process_images_vips(
             _ => vec![Resolution::Preview],
         },
         jpeg_quality: Default::default(),
+        autostf_shadows_clipping,
+        autostf_target_median,
     };
 
     let mut results = Vec::new();
