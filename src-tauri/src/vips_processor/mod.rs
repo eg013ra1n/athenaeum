@@ -53,7 +53,7 @@ impl VipsProcessor {
         // Apply debayering if needed
         let image = if is_color {
             println!("  🌈 Debayering color image");
-            self.debayer_image(image, params.debayer_pattern.as_deref())?
+            self.debayer_image(image, fits_path)?
         } else {
             image
         };
@@ -113,17 +113,57 @@ impl VipsProcessor {
     }
 
     /// Detect if image is color (has Bayer pattern)
-    fn detect_color_image(&self, _path: &Path) -> Result<bool> {
+    fn detect_color_image(&self, path: &Path) -> Result<bool> {
         // Check FITS headers for BAYERPAT keyword
-        // For now, return false (mono)
-        Ok(false)
+        use fitsio::FitsFile;
+
+        match FitsFile::open(path) {
+            Ok(mut fptr) => {
+                let hdu = fptr.primary_hdu()
+                    .context("Failed to get primary HDU")?;
+
+                // Try to read BAYERPAT keyword
+                match hdu.read_key::<String>(&mut fptr, "BAYERPAT") {
+                    Ok(pattern) => {
+                        println!("  🎨 Detected Bayer pattern: {}", pattern);
+                        Ok(true)
+                    }
+                    Err(_) => Ok(false),  // No BAYERPAT keyword = mono image
+                }
+            }
+            Err(_) => Ok(false),  // Not a FITS file or can't open
+        }
     }
 
     /// Debayer image if it has a Bayer pattern
-    fn debayer_image(&self, image: VipsImage, _pattern: Option<&str>) -> Result<VipsImage> {
-        // Placeholder for debayering
-        // We'll implement proper Bayer demosaicing later
-        Ok(image)
+    fn debayer_image(&self, image: VipsImage, _fits_path: &Path) -> Result<VipsImage> {
+        // For Bayer pattern images from FITS files, we need to handle this differently
+        // The image is likely loaded as a single-band 16-bit image
+        // We'll use bandjoin to create an RGB image by treating the Bayer data as already debayered
+
+        println!("  🎨 Processing Bayer pattern image");
+
+        // For now, just treat the single channel as all three channels
+        // This will make it grayscale but at least it won't crash
+        // Proper debayering would require implementing the interpolation
+        let bands = image.get_bands();
+        println!("  Input image has {} bands", bands);
+
+        let rgb_image = if bands == 1 {
+            // Create RGB by duplicating the single channel three times
+            println!("  Creating RGB from single-band Bayer data");
+            let mut channels = vec![image.clone(), image.clone(), image.clone()];
+            ops::bandjoin(&mut channels)?
+        } else {
+            // Already multi-band, try to convert
+            println!("  Converting multi-band to RGB");
+            ops::colourspace(&image, ops::Interpretation::Rgb)?
+        };
+
+        println!("  ✅ Processing complete: {}x{} → RGB",
+                 rgb_image.get_width(), rgb_image.get_height());
+
+        Ok(rgb_image)
     }
 
     /// Calculate AutoSTF parameters using settings from ProcessParams
