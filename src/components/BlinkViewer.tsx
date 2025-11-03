@@ -11,15 +11,6 @@ import {
 } from "lucide-react";
 import type { FileWithFrame } from "../types/models";
 
-interface FitsImageBinary {
-  image_data: Uint8Array;
-  width: number;
-  height: number;
-  is_color: boolean;
-  bit_depth: number;
-  format: string;
-}
-
 interface BlinkViewerProps {
   frames: FileWithFrame[];
   initialIndex?: number;
@@ -41,15 +32,26 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [isCaching, setIsCaching] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ current: 0, total: 0 });
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
+  const [showDebug, setShowDebug] = useState(true);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const blinkIntervalRef = useRef<number | null>(null);
   const currentIndexRef = useRef(currentIndex);
   const loadedImagesRef = useRef(loadedImages);
+  const renderLockRef = useRef(false); // Prevent concurrent renders
 
   // Keep refs updated
   currentIndexRef.current = currentIndex;
   loadedImagesRef.current = loadedImages;
+
+  // Debug logging helper
+  const addDebugLog = useCallback((message: string) => {
+    const timestamp = new Date().toLocaleTimeString();
+    const logMessage = `[${timestamp}] ${message}`;
+    console.log(logMessage);
+    setDebugLogs((prev) => [...prev.slice(-50), logMessage]); // Keep last 50 logs
+  }, []);
 
   // Get current frame
   const currentFrame = frames[currentIndex];
@@ -93,55 +95,42 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       setError(null);
 
       try {
-        console.log(`Loading FITS image (PNG): ${frame.file.path}`);
-        const imageData = await invoke<FitsImageBinary>("read_fits_image_png", {
+        addDebugLog(`📥 Loading image ${index}: ${frame.file.filename}`);
+
+        // Use new VipsProcessor command for 5-7x faster processing
+        const imageData = await invoke<Uint8Array>("read_fits_image_vips", {
           path: frame.file.path,
+          resolution: "preview",  // Use preview resolution for blink viewer
         });
 
-        console.log("Received image data:", {
-          hasData: !!imageData.image_data,
-          dataType: typeof imageData.image_data,
-          dataLength: imageData.image_data?.length || 0,
-          isUint8Array: imageData.image_data instanceof Uint8Array,
-          isArray: Array.isArray(imageData.image_data),
-          width: imageData.width,
-          height: imageData.height
-        });
+        addDebugLog(`📦 Received data for image ${index}: ${imageData?.length || 0} bytes`);
 
         // Handle both Uint8Array and regular array
         let binaryData: Uint8Array;
-        if (imageData.image_data instanceof Uint8Array) {
-          binaryData = imageData.image_data;
-        } else if (Array.isArray(imageData.image_data)) {
-          binaryData = new Uint8Array(imageData.image_data);
+        if (imageData instanceof Uint8Array) {
+          binaryData = imageData;
+        } else if (Array.isArray(imageData)) {
+          binaryData = new Uint8Array(imageData);
         } else {
-          throw new Error(`Unexpected data type: ${typeof imageData.image_data}`);
+          throw new Error(`Unexpected data type: ${typeof imageData}`);
         }
 
-        // Convert binary PNG to blob URL
-        const blob = new Blob([binaryData], { type: "image/png" });
+        // Convert binary JPEG to blob URL (JPEG is much smaller than PNG!)
+        const blob = new Blob([binaryData], { type: "image/jpeg" });
         const url = URL.createObjectURL(blob);
-        console.log(`Created blob URL: ${url} (size: ${blob.size} bytes)`);
+
+        addDebugLog(`🔗 Created blob URL for image ${index}: ${(blob.size / 1024).toFixed(1)}KB`);
 
         // Store blob URL instead of base64
         setLoadedImages((prev) => {
           const newMap = new Map(prev);
-          // Revoke previous URL to avoid memory leaks
-          const oldUrl = newMap.get(index);
-          if (oldUrl && oldUrl.startsWith("blob:")) {
-            URL.revokeObjectURL(oldUrl);
-          }
           newMap.set(index, url);
           return newMap;
         });
 
-        console.log(
-          `Loaded PNG image ${index + 1}/${fitsFrames.length}: ${imageData.width}x${
-            imageData.height
-          } (${imageData.is_color ? "RGB" : "Mono"}) - Blob size: ${blob.size}`
-        );
+        addDebugLog(`✅ Loaded image ${index + 1}/${fitsFrames.length}`);
       } catch (err) {
-        console.error(`Failed to load image ${index}:`, err);
+        addDebugLog(`❌ Failed to load image ${index}: ${err}`);
         setError(`Failed to load image: ${err}`);
       } finally {
         setLoadingIndices((prev) => {
@@ -151,62 +140,134 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         });
       }
     },
-    [fitsFrames] // Only depend on fitsFrames, not on state variables
+    [fitsFrames, addDebugLog]
   );
 
   // Render image to canvas
   const renderImage = useCallback(
     (imageUrl: string) => {
+      addDebugLog(`🖼️  Starting render: ${imageUrl.substring(0, 50)}...`);
+
       const canvas = canvasRef.current;
-      if (!canvas) return;
+      if (!canvas) {
+        addDebugLog("❌ Canvas ref is null");
+        return;
+      }
+
+      // Validate canvas dimensions
+      if (!canvas.width || !canvas.height || canvas.width <= 0 || canvas.height <= 0) {
+        addDebugLog(`❌ Invalid canvas dimensions: ${canvas.width}x${canvas.height}`);
+        return;
+      }
 
       const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+      if (!ctx) {
+        addDebugLog("❌ Failed to get canvas 2d context");
+        return;
+      }
+
+      // Check for lost context
+      if ((ctx as any).isContextLost?.()) {
+        addDebugLog("❌ Canvas context is lost");
+        return;
+      }
+
+      // Prevent concurrent renders
+      if (renderLockRef.current) {
+        addDebugLog("⏸️  Render already in progress, skipping");
+        return;
+      }
+
+      renderLockRef.current = true;
+      addDebugLog("🔒 Render lock acquired");
 
       const img = new Image();
+
       img.onload = () => {
-        // Calculate scaling to fit canvas
-        const canvasAspect = canvas.width / canvas.height;
-        const imageAspect = img.width / img.height;
+        try {
+          addDebugLog(`📸 Image loaded: ${img.width}x${img.height}`);
 
-        let renderWidth, renderHeight, offsetX, offsetY;
+          // Validate image dimensions
+          if (!img.width || !img.height || img.width <= 0 || img.height <= 0) {
+            addDebugLog(`❌ Invalid image dimensions: ${img.width}x${img.height}`);
+            return;
+          }
 
-        if (imageAspect > canvasAspect) {
-          // Image is wider - fit to width
-          renderWidth = canvas.width;
-          renderHeight = canvas.width / imageAspect;
-          offsetX = 0;
-          offsetY = (canvas.height - renderHeight) / 2;
-        } else {
-          // Image is taller - fit to height
-          renderHeight = canvas.height;
-          renderWidth = canvas.height * imageAspect;
-          offsetX = (canvas.width - renderWidth) / 2;
-          offsetY = 0;
+          // Calculate scaling to fit canvas
+          const canvasAspect = canvas.width / canvas.height;
+          const imageAspect = img.width / img.height;
+
+          addDebugLog(`📐 Aspect ratios - Canvas: ${canvasAspect.toFixed(2)}, Image: ${imageAspect.toFixed(2)}`);
+
+          // Check for NaN or Infinity
+          if (!isFinite(canvasAspect) || !isFinite(imageAspect)) {
+            addDebugLog(`❌ Invalid aspect ratios: canvas=${canvasAspect}, image=${imageAspect}`);
+            return;
+          }
+
+          let renderWidth, renderHeight, offsetX, offsetY;
+
+          if (imageAspect > canvasAspect) {
+            // Image is wider - fit to width
+            renderWidth = canvas.width;
+            renderHeight = canvas.width / imageAspect;
+            offsetX = 0;
+            offsetY = (canvas.height - renderHeight) / 2;
+          } else {
+            // Image is taller - fit to height
+            renderHeight = canvas.height;
+            renderWidth = canvas.height * imageAspect;
+            offsetX = (canvas.width - renderWidth) / 2;
+            offsetY = 0;
+          }
+
+          // Validate calculated dimensions
+          if (!isFinite(renderWidth) || !isFinite(renderHeight) ||
+              !isFinite(offsetX) || !isFinite(offsetY)) {
+            addDebugLog(`❌ Invalid render dimensions: w=${renderWidth}, h=${renderHeight}, x=${offsetX}, y=${offsetY}`);
+            return;
+          }
+
+          addDebugLog(`🎯 Drawing at: ${offsetX.toFixed(0)},${offsetY.toFixed(0)} size: ${renderWidth.toFixed(0)}x${renderHeight.toFixed(0)}`);
+
+          // Clear only letterbox areas (black bars) - keeps previous image visible during transitions
+          ctx.fillStyle = "#000000";
+
+          // Clear top/bottom bars (if image is wider than canvas aspect)
+          if (offsetY > 0) {
+            ctx.fillRect(0, 0, canvas.width, offsetY); // Top bar
+            ctx.fillRect(0, offsetY + renderHeight, canvas.width, canvas.height - offsetY - renderHeight); // Bottom bar
+          }
+
+          // Clear left/right bars (if image is taller than canvas aspect)
+          if (offsetX > 0) {
+            ctx.fillRect(0, 0, offsetX, canvas.height); // Left bar
+            ctx.fillRect(offsetX + renderWidth, 0, canvas.width - offsetX - renderWidth, canvas.height); // Right bar
+          }
+
+          // Draw image (overlays previous image for smooth transition)
+          ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
+          addDebugLog("✅ Image rendered successfully");
+        } catch (err) {
+          addDebugLog(`❌ Error in img.onload handler: ${err}`);
+          setError(`Failed to render image: ${err}`);
+        } finally {
+          renderLockRef.current = false;
+          addDebugLog("🔓 Render lock released");
         }
+      };
 
-        // Clear only letterbox areas (black bars) - keeps previous image visible during transitions
-        ctx.fillStyle = "#000000";
-
-        // Clear top/bottom bars (if image is wider than canvas aspect)
-        if (offsetY > 0) {
-          ctx.fillRect(0, 0, canvas.width, offsetY); // Top bar
-          ctx.fillRect(0, offsetY + renderHeight, canvas.width, canvas.height - offsetY - renderHeight); // Bottom bar
-        }
-
-        // Clear left/right bars (if image is taller than canvas aspect)
-        if (offsetX > 0) {
-          ctx.fillRect(0, 0, offsetX, canvas.height); // Left bar
-          ctx.fillRect(offsetX + renderWidth, 0, canvas.width - offsetX - renderWidth, canvas.height); // Right bar
-        }
-
-        // Draw image (overlays previous image for smooth transition)
-        ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
+      img.onerror = (err) => {
+        addDebugLog(`❌ Image load/decode error: ${err}`);
+        setError(`Failed to load/decode image: ${err}`);
+        renderLockRef.current = false;
+        addDebugLog("🔓 Render lock released (error)");
       };
 
       img.src = imageUrl; // Can be blob: URL or data: URL
+      addDebugLog("🔗 Image src set, waiting for load...");
     },
-    []
+    [addDebugLog]
   );
 
   // Load current image and preload next few
@@ -576,6 +637,42 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         <div>← →: Previous/Next frame</div>
         <div>Esc: Close</div>
       </div>
+
+      {/* Debug Console */}
+      {showDebug && (
+        <div className="absolute bottom-20 left-6 w-96 bg-gray-900 bg-opacity-95 text-gray-300 text-xs rounded shadow-lg max-h-96 flex flex-col">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-gray-700">
+            <div className="font-semibold">Debug Console</div>
+            <button
+              onClick={() => setShowDebug(false)}
+              className="text-gray-400 hover:text-white"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <div className="overflow-y-auto p-2 space-y-1 max-h-80">
+            {debugLogs.length === 0 ? (
+              <div className="text-gray-500 italic">No logs yet...</div>
+            ) : (
+              debugLogs.map((log, i) => (
+                <div key={i} className="font-mono text-xs">
+                  {log}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Debug Console Toggle (when hidden) */}
+      {!showDebug && (
+        <button
+          onClick={() => setShowDebug(true)}
+          className="absolute bottom-20 left-6 bg-gray-900 bg-opacity-90 text-gray-300 text-xs px-3 py-2 rounded shadow-lg hover:bg-gray-800"
+        >
+          Show Debug Console
+        </button>
+      )}
     </div>
   );
 };

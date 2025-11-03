@@ -40,6 +40,9 @@ base64 = "0.21"
 lru = "0.12"
 lazy_static = "1.4"
 wide = "0.7"
+libvips = "1.6"
+libc = "0.2"
+num_cpus = "1.16"
 
 [profile.release]
 lto = true           # Link-time optimization for cross-function inlining

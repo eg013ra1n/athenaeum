@@ -4,6 +4,7 @@ use crate::models::*;
 use crate::scanner::scan_directory;
 use crate::settings::SettingsManager;
 use crate::image_processing;
+use crate::vips_processor::VipsProcessor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::num::NonZeroUsize;
@@ -91,11 +92,12 @@ lazy_static! {
     static ref PNG_IMAGE_CACHE: PngImageCache = PngImageCache::new(15);
 }
 
-/// App state containing database connection, settings manager, and cache manager
+/// App state containing database connection, settings manager, cache manager, and VipsProcessor
 pub struct AppState {
     pub db: Mutex<Option<Database>>,
     pub settings: Arc<SettingsManager>,
     pub cache: Arc<Mutex<Option<CacheManager>>>,
+    pub vips_processor: Arc<Mutex<Option<VipsProcessor>>>,
 }
 
 #[tauri::command]
