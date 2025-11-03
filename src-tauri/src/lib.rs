@@ -11,13 +11,16 @@ mod coordinates;
 mod clustering;
 mod sessions;
 mod image_processing;
+mod cache;
 
 // Commands (Tauri API endpoints)
 mod commands;
 
+use cache::CacheManager;
 use commands::AppState;
 use settings::SettingsManager;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tauri::{Manager, State};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -27,7 +30,28 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState {
             db: Mutex::new(None),
-            settings: SettingsManager::new(),
+            settings: Arc::new(SettingsManager::new()),
+            cache: Arc::new(Mutex::new(None)),
+        })
+        .setup(|app| {
+            // Initialize cache manager after app is ready
+            let app_handle = app.handle();
+            let state: State<AppState> = app.state();
+
+            // Get app data directory for cache
+            if let Ok(app_dir) = app_handle.path().app_data_dir() {
+                match CacheManager::new(&app_dir, state.settings.clone()) {
+                    Ok(cache_mgr) => {
+                        *state.cache.lock().unwrap() = Some(cache_mgr);
+                        println!("✅ Cache manager initialized");
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Failed to initialize cache manager: {}", e);
+                    }
+                }
+            }
+
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::greet,

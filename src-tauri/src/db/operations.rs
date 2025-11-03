@@ -154,6 +154,35 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Get a file by its path
+pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
+    conn.query_row(
+        "SELECT id, path, filename, size, modified_at, format, created_at, metadata_hash
+         FROM files WHERE path = ?1",
+        params![path],
+        |row| {
+            Ok(File {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                filename: row.get(2)?,
+                size: row.get(3)?,
+                modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
+                format: match row.get::<_, String>(5)?.as_str() {
+                    "FITS" => FileFormat::FITS,
+                    "XISF" => FileFormat::XISF,
+                    _ => FileFormat::FITS,
+                },
+                created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                    .unwrap()
+                    .with_timezone(&Utc),
+                metadata_hash: row.get(7)?,
+            })
+        },
+    )
+}
+
 /// Get all files with optional filters
 pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, Option<Frame>)>> {
     let limit_clause = match limit {

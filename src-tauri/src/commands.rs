@@ -1,10 +1,11 @@
+use crate::cache::{CacheManager, StretchParams, StretchMode};
 use crate::db::{self, Database};
 use crate::models::*;
 use crate::scanner::scan_directory;
 use crate::settings::SettingsManager;
 use crate::image_processing;
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::num::NonZeroUsize;
 use tauri::{Manager, State};
 use lru::LruCache;
@@ -90,10 +91,11 @@ lazy_static! {
     static ref PNG_IMAGE_CACHE: PngImageCache = PngImageCache::new(15);
 }
 
-/// App state containing database connection and settings manager
+/// App state containing database connection, settings manager, and cache manager
 pub struct AppState {
     pub db: Mutex<Option<Database>>,
-    pub settings: SettingsManager,
+    pub settings: Arc<SettingsManager>,
+    pub cache: Arc<Mutex<Option<CacheManager>>>,
 }
 
 #[tauri::command]
@@ -1058,6 +1060,7 @@ pub async fn read_fits_image(
 
 /// Read FITS image and return as PNG binary data (no base64 encoding)
 /// Optimized for faster transfer and no encoding overhead
+/// Now with disk-based caching for improved performance
 #[tauri::command]
 pub async fn read_fits_image_png(
     path: String,
@@ -1066,9 +1069,9 @@ pub async fn read_fits_image_png(
     use std::time::Instant;
 
     let t_cmd_start = Instant::now();
-    let path_buf = std::path::PathBuf::from(&path);
+    let path_buf = PathBuf::from(&path);
 
-    println!("\n🖼️  === FITS PNG IMAGE REQUEST === ");
+    println!("\n🖼️  === FITS PNG IMAGE REQUEST (with disk cache) === ");
     println!("📁 Path: {}", path_buf.display());
 
     // Read percentile clipping settings (defaults: 850/64000 for typical 16-bit astro images)
@@ -1117,16 +1120,124 @@ pub async fn read_fits_image_png(
     // Check if we should use auto-stretch (when user hasn't configured settings)
     let use_auto_stretch = black_point == 850 && white_point == 64000;
 
-    // Generate cache key
+    // Create stretch parameters
+    let stretch_params = if use_auto_stretch {
+        StretchParams::auto(midtones)
+    } else {
+        StretchParams::manual(black_point, white_point, midtones)
+    };
+
+    // Try to use disk cache if available
+    if let Some(cache_mgr) = state.cache.lock().unwrap().as_ref() {
+        println!("📦 Disk cache manager available");
+
+        // Get file info from database or create minimal entry
+        let file_info = {
+            let state_lock = state.db.lock().unwrap();
+            if let Some(db) = state_lock.as_ref() {
+                let conn = db.conn();
+                match db::get_file_by_path(&conn, &path) {
+                    Ok(file) => {
+                        println!("✅ File found in database: id={:?}", file.id);
+                        Some(file)
+                    }
+                    Err(e) => {
+                        println!("⚠️  File not in database ({}), creating minimal entry", e);
+                        // Create a minimal File object for cache to work
+                        // The cache doesn't really need all file details, just path and an ID
+                        let metadata = std::fs::metadata(&path_buf).ok();
+                        Some(crate::models::File {
+                            id: Some(-1), // Use -1 to indicate non-database file
+                            path: path.clone(),
+                            filename: path_buf.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            size: metadata.as_ref().map(|m| m.len() as i64).unwrap_or(0),
+                            modified_at: metadata.as_ref()
+                                .and_then(|m| m.modified().ok())
+                                .map(|t| {
+                                    let datetime = chrono::DateTime::<chrono::Utc>::from(t);
+                                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+                                })
+                                .unwrap_or_else(|| String::new()),
+                            format: None,
+                            created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                            metadata_hash: None,
+                        })
+                    }
+                }
+            } else {
+                println!("⚠️  Database not initialized");
+                None
+            }
+        };
+
+        if let Some(file) = file_info {
+            println!("🔍 Using disk cache for file: {}", file.path);
+            // Use get_or_create to handle both cache hits and misses
+            match cache_mgr.get_or_create(&file, &path_buf, &stretch_params).await {
+                Ok(cached_data) => {
+                    println!("✅ Got data from disk cache");
+                    println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
+                    println!("=== END ===\n");
+
+                    // Get metadata for the cached image
+                    let metadata = cache_mgr
+                        .get_metadata(&file.path, &stretch_params)
+                        .await
+                        .unwrap_or_else(|_| {
+                            // Fallback metadata if not found
+                            crate::cache::CacheEntry {
+                                id: None,
+                                file_id: file.id.unwrap_or(-1),
+                                file_path: file.path,
+                                file_modified_at: String::new(),
+                                cache_filename: String::new(),
+                                cache_version: String::new(),
+                                stretch_mode: stretch_params.mode.clone(),
+                                black_point: Some(black_point),
+                                white_point: Some(white_point),
+                                midtones,
+                                image_width: 0,
+                                image_height: 0,
+                                is_color: false,
+                                file_size: cached_data.len() as u64,
+                                created_at: String::new(),
+                                last_accessed_at: String::new(),
+                                access_count: 0,
+                            }
+                        });
+
+                    return Ok(image_processing::FitsImageBinary {
+                        image_data: cached_data,
+                        width: metadata.image_width,
+                        height: metadata.image_height,
+                        is_color: metadata.is_color,
+                        bit_depth: 8,
+                        format: "png".to_string(),
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Disk cache error: {}", e);
+                    // Fall through to process without cache
+                }
+            }
+        }
+
+    // Fallback to in-memory cache or direct processing
+    println!("⚠️  Disk cache not available, using in-memory cache");
+
+    // Generate in-memory cache key
     let cache_key = if use_auto_stretch {
         format!("{}_auto_{}", path, midtones)
     } else {
         format!("{}_{}_{}-{}", path, midtones, black_point, white_point)
     };
 
-    // Check cache first
+    // Check in-memory cache
     if let Some(cached) = PNG_IMAGE_CACHE.get(&cache_key) {
-        println!("✨ Cache HIT for PNG: {}", path_buf.display());
+        println!("✨ Memory cache HIT for PNG: {}", path_buf.display());
         println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
         println!("=== END ===\n");
         return Ok(image_processing::FitsImageBinary {
@@ -1139,12 +1250,11 @@ pub async fn read_fits_image_png(
         });
     }
 
-    println!("💾 Cache MISS for PNG: {}", path_buf.display());
+    println!("💾 Memory cache MISS for PNG: {}", path_buf.display());
 
     let t_process = Instant::now();
     let result = if use_auto_stretch {
         println!("⚙️  Using auto-stretch (AutoSTF mode)");
-        // Pass 0,0 to trigger auto-stretch in the processing function
         image_processing::read_and_process_fits_png(&path_buf, 0, 0, 0.25)
     } else {
         println!("⚙️  Settings: black={}, white={}, midtones={}", black_point, white_point, midtones);
@@ -1153,7 +1263,7 @@ pub async fn read_fits_image_png(
 
     println!("⏱️  Processing complete: {:?}", t_process.elapsed());
 
-    // Store in cache
+    // Store in in-memory cache
     let cached_image = CachedPngImage {
         image_data: result.image_data.clone(),
         width: result.width,
@@ -1162,7 +1272,7 @@ pub async fn read_fits_image_png(
         bit_depth: result.bit_depth,
     };
     PNG_IMAGE_CACHE.put(cache_key, cached_image);
-    println!("💾 Stored PNG in cache");
+    println!("💾 Stored PNG in memory cache");
 
     println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
     println!("=== END ===\n");
