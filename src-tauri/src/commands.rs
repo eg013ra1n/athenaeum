@@ -1128,7 +1128,8 @@ pub async fn read_fits_image_png(
     };
 
     // Try to use disk cache if available
-    if let Some(cache_mgr) = state.cache.lock().unwrap().as_ref() {
+    let cache_mgr_exists = state.cache.lock().unwrap().is_some();
+    if cache_mgr_exists {
         println!("📦 Disk cache manager available");
 
         // Get file info from database or create minimal entry
@@ -1156,13 +1157,10 @@ pub async fn read_fits_image_png(
                             size: metadata.as_ref().map(|m| m.len() as i64).unwrap_or(0),
                             modified_at: metadata.as_ref()
                                 .and_then(|m| m.modified().ok())
-                                .map(|t| {
-                                    let datetime = chrono::DateTime::<chrono::Utc>::from(t);
-                                    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-                                })
-                                .unwrap_or_else(|| String::new()),
-                            format: None,
-                            created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                                .map(|t| chrono::DateTime::<chrono::Utc>::from(t))
+                                .unwrap_or_else(|| chrono::Utc::now()),
+                            format: crate::models::FileFormat::FITS, // Assume FITS for now
+                            created_at: chrono::Utc::now(),
                             metadata_hash: None,
                         })
                     }
@@ -1175,55 +1173,92 @@ pub async fn read_fits_image_png(
 
         if let Some(file) = file_info {
             println!("🔍 Using disk cache for file: {}", file.path);
-            // Use get_or_create to handle both cache hits and misses
-            match cache_mgr.get_or_create(&file, &path_buf, &stretch_params).await {
-                Ok(cached_data) => {
-                    println!("✅ Got data from disk cache");
-                    println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
-                    println!("=== END ===\n");
 
-                    // Get metadata for the cached image
-                    let metadata = cache_mgr
-                        .get_metadata(&file.path, &stretch_params)
-                        .await
-                        .unwrap_or_else(|_| {
-                            // Fallback metadata if not found
-                            crate::cache::CacheEntry {
-                                id: None,
-                                file_id: file.id.unwrap_or(-1),
-                                file_path: file.path,
-                                file_modified_at: String::new(),
-                                cache_filename: String::new(),
-                                cache_version: String::new(),
-                                stretch_mode: stretch_params.mode.clone(),
-                                black_point: Some(black_point),
-                                white_point: Some(white_point),
-                                midtones,
-                                image_width: 0,
-                                image_height: 0,
-                                is_color: false,
-                                file_size: cached_data.len() as u64,
-                                created_at: String::new(),
-                                last_accessed_at: String::new(),
-                                access_count: 0,
-                            }
+            // Check if cache manager exists (don't hold lock)
+            let has_cache = state.cache.lock().unwrap().is_some();
+
+            if has_cache {
+                // Clone cache Arc and work with it
+                let cache_arc = state.cache.clone();
+
+                // Try to get cached data
+                let cached_data_result = {
+                    let cache_guard = cache_arc.lock().unwrap();
+                    if let Some(cache_mgr) = cache_guard.as_ref() {
+                        // We need to avoid holding the lock across await
+                        // So we'll use block_in_place to run the async code synchronously
+                        use tokio::task;
+                        use tokio::runtime::Handle;
+
+                        task::block_in_place(|| {
+                            Handle::current().block_on(async {
+                                cache_mgr.get_or_create(&file, &path_buf, &stretch_params).await
+                            })
+                        })
+                    } else {
+                        Err(anyhow::anyhow!("Cache manager not available"))
+                    }
+                };
+
+                match cached_data_result {
+                    Ok(cached_data) => {
+                        println!("✅ Got data from disk cache");
+                        println!("⏱️  TOTAL COMMAND TIME: {:?}", t_cmd_start.elapsed());
+                        println!("=== END ===\n");
+
+                        // Get metadata for the cached image
+                        let metadata = {
+                            let cache_guard = cache_arc.lock().unwrap();
+                            cache_guard.as_ref().and_then(|cache_mgr| {
+                                use tokio::task;
+                                use tokio::runtime::Handle;
+
+                                task::block_in_place(|| {
+                                    Handle::current().block_on(async {
+                                        cache_mgr.get_metadata(&file.path, &stretch_params).await.ok()
+                                    })
+                                })
+                            }).unwrap_or_else(|| {
+                                // Fallback metadata if not found
+                                crate::cache::CacheEntry {
+                                    id: None,
+                                    file_id: file.id.unwrap_or(-1),
+                                    file_path: file.path,
+                                    file_modified_at: String::new(),
+                                    cache_filename: String::new(),
+                                    cache_version: String::new(),
+                                    stretch_mode: stretch_params.mode.clone(),
+                                    black_point: Some(black_point),
+                                    white_point: Some(white_point),
+                                    midtones,
+                                    image_width: 0,
+                                    image_height: 0,
+                                    is_color: false,
+                                    file_size: cached_data.len() as u64,
+                                    created_at: String::new(),
+                                    last_accessed_at: String::new(),
+                                    access_count: 0,
+                                }
+                            })
+                        };
+
+                        return Ok(image_processing::FitsImageBinary {
+                            image_data: cached_data,
+                            width: metadata.image_width,
+                            height: metadata.image_height,
+                            is_color: metadata.is_color,
+                            bit_depth: 8,
+                            format: "png".to_string(),
                         });
-
-                    return Ok(image_processing::FitsImageBinary {
-                        image_data: cached_data,
-                        width: metadata.image_width,
-                        height: metadata.image_height,
-                        is_color: metadata.is_color,
-                        bit_depth: 8,
-                        format: "png".to_string(),
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Disk cache error: {}", e);
-                    // Fall through to process without cache
+                    }
+                    Err(e) => {
+                        eprintln!("Disk cache error: {}", e);
+                        // Fall through to process without cache
+                    }
                 }
             }
         }
+    }
 
     // Fallback to in-memory cache or direct processing
     println!("⚠️  Disk cache not available, using in-memory cache");
