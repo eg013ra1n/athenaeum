@@ -14,6 +14,7 @@ pub struct CacheEntry {
     pub black_point: Option<u16>,
     pub white_point: Option<u16>,
     pub midtones: f32,
+    pub resolution: String, // "thumbnail", "preview", or "full"
     pub image_width: u32,
     pub image_height: u32,
     pub is_color: bool,
@@ -46,34 +47,37 @@ pub struct StretchParams {
     pub black_point: u16,
     pub white_point: u16,
     pub midtones: f32,
+    pub resolution: String, // "thumbnail", "preview", or "full"
 }
 
 impl StretchParams {
-    pub fn auto(midtones: f32) -> Self {
+    pub fn auto(midtones: f32, resolution: String) -> Self {
         Self {
             mode: StretchMode::Auto,
             black_point: 0,
             white_point: 0,
             midtones,
+            resolution,
         }
     }
 
-    pub fn manual(black_point: u16, white_point: u16, midtones: f32) -> Self {
+    pub fn manual(black_point: u16, white_point: u16, midtones: f32, resolution: String) -> Self {
         Self {
             mode: StretchMode::Manual,
             black_point,
             white_point,
             midtones,
+            resolution,
         }
     }
 
     /// Generate a cache key for these parameters
     pub fn cache_key(&self, file_path: &str) -> String {
         match self.mode {
-            StretchMode::Auto => format!("{}|auto|{}", file_path, self.midtones),
+            StretchMode::Auto => format!("{}|auto|{}|{}", file_path, self.midtones, self.resolution),
             StretchMode::Manual => format!(
-                "{}|manual|{}|{}|{}",
-                file_path, self.black_point, self.white_point, self.midtones
+                "{}|manual|{}|{}|{}|{}",
+                file_path, self.black_point, self.white_point, self.midtones, self.resolution
             ),
         }
     }

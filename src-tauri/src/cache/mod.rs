@@ -8,8 +8,8 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::image_processing::{self, FitsImageBinary};
 use crate::models::File;
+use crate::rustafits_processor::{self, Resolution};
 use crate::settings::SettingsManager;
 
 pub use models::{
@@ -54,11 +54,13 @@ impl CacheManager {
         file: &File,
         file_path: &Path,
         stretch_params: &StretchParams,
+        quality: Option<u8>,
     ) -> Result<Vec<u8>> {
         println!("🔍 Cache get_or_create called for: {:?}", file_path);
         println!("   Stretch params: mode={:?}, bp={}, wp={}, mt={}",
             stretch_params.mode, stretch_params.black_point,
             stretch_params.white_point, stretch_params.midtones);
+        println!("   Quality: {:?}", quality);
 
         // Try to get from cache first
         if let Some(data) = self.get_cached(file, stretch_params).await? {
@@ -68,7 +70,7 @@ impl CacheManager {
 
         println!("   ⏳ Creating new cache entry...");
         // Cache miss - create new entry
-        self.create_cache_entry(file, file_path, stretch_params).await
+        self.create_cache_entry(file, file_path, stretch_params, quality).await
     }
 
     /// Get cached image if it exists and is valid
@@ -97,6 +99,7 @@ impl CacheManager {
                 None
             },
             stretch_params.midtones,
+            &stretch_params.resolution,
         )?;
 
         let entry = match entry {
@@ -156,27 +159,26 @@ impl CacheManager {
         file: &File,
         file_path: &Path,
         stretch_params: &StretchParams,
+        quality: Option<u8>,
     ) -> Result<Vec<u8>> {
         println!("❌ Cache miss - processing image...");
 
-        // Process the FITS file to PNG
-        let result = if stretch_params.mode == StretchMode::Auto {
-            image_processing::read_and_process_fits_png(file_path, 0, 0, stretch_params.midtones)
-        } else {
-            image_processing::read_and_process_fits_png(
-                file_path,
-                stretch_params.black_point,
-                stretch_params.white_point,
-                stretch_params.midtones,
-            )
-        }
-        .context("Failed to process FITS image")?;
-
-        // Generate cache filename
+        // Generate cache filename first
         let cache_filename = generate_cache_filename(&file.path, stretch_params);
+        let cache_path = self.cache_dir.join(&cache_filename);
 
-        // Write to disk
-        write_cache_file(&self.cache_dir, &cache_filename, &result.image_data)?;
+        // Process the FITS file to JPEG using rustafits
+        // Always use Preview resolution for now (can be made configurable later)
+        let result = rustafits_processor::process_fits_to_jpeg_cached(
+            file_path,
+            &cache_path,
+            Resolution::Preview,
+            quality,
+        )
+        .context("Failed to process FITS image with rustafits")?;
+
+        // Note: Cache file already written by rustafits directly to cache_path
+        // No need to call write_cache_file again
 
         // Get file modification time
         let file_modified_at = get_file_modified_time(file_path)?;
@@ -189,21 +191,14 @@ impl CacheManager {
             file_modified_at,
             cache_filename: cache_filename.clone(),
             cache_version: CACHE_VERSION.to_string(),
-            stretch_mode: stretch_params.mode.clone(),
-            black_point: if stretch_params.mode == StretchMode::Manual {
-                Some(stretch_params.black_point)
-            } else {
-                None
-            },
-            white_point: if stretch_params.mode == StretchMode::Manual {
-                Some(stretch_params.white_point)
-            } else {
-                None
-            },
-            midtones: stretch_params.midtones,
+            stretch_mode: StretchMode::Auto, // rustafits always uses auto-stretch
+            black_point: None,
+            white_point: None,
+            midtones: 0.35, // rustafits uses fixed midtones
+            resolution: stretch_params.resolution.clone(),
             image_width: result.width,
             image_height: result.height,
-            is_color: result.is_color,
+            is_color: false, // Will be determined from FITS metadata if needed
             file_size: result.image_data.len() as u64,
             created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             last_accessed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -237,6 +232,7 @@ impl CacheManager {
                 None
             },
             stretch_params.midtones,
+            &stretch_params.resolution,
         )?
         .ok_or_else(|| anyhow::anyhow!("Cache entry not found"))
     }
@@ -270,10 +266,10 @@ impl CacheManager {
         let conn = self.cache_db.lock().unwrap();
         clear_all_cache_entries(&conn)?;
 
-        // Delete all PNG files in cache directory
+        // Delete all JPEG files in cache directory
         for entry in std::fs::read_dir(&self.cache_dir)? {
             let entry = entry?;
-            if entry.path().extension() == Some(std::ffi::OsStr::new("png")) {
+            if entry.path().extension() == Some(std::ffi::OsStr::new("jpg")) {
                 std::fs::remove_file(entry.path())?;
             }
         }

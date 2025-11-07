@@ -14,8 +14,6 @@ pub mod defaults {
     pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "majority-object";
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "180";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "1.0";
-    pub const AUTOSTF_SHADOWS_CLIPPING: &str = "-1.5";
-    pub const AUTOSTF_TARGET_MEDIAN: &str = "0.35";
 }
 
 /// Setting keys used throughout the application
@@ -26,8 +24,6 @@ pub mod keys {
     pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "ui.objects.auto_name_mode";
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "dark_library.date_threshold_days";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "dark_library.temp_threshold_celsius";
-    pub const AUTOSTF_SHADOWS_CLIPPING: &str = "autostf.shadows_clipping";
-    pub const AUTOSTF_TARGET_MEDIAN: &str = "autostf.target_median";
 }
 
 /// Runtime overrides for settings (session-specific)
@@ -174,26 +170,6 @@ impl SettingsManager {
             conn,
             keys::DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS,
             defaults::DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS,
-        )?;
-        Ok(value.parse()?)
-    }
-
-    /// Get the AutoSTF shadows clipping parameter
-    pub fn get_autostf_shadows_clipping(&self, conn: &Connection) -> Result<f32> {
-        let value = self.get_with_precedence(
-            conn,
-            keys::AUTOSTF_SHADOWS_CLIPPING,
-            defaults::AUTOSTF_SHADOWS_CLIPPING,
-        )?;
-        Ok(value.parse()?)
-    }
-
-    /// Get the AutoSTF target median parameter
-    pub fn get_autostf_target_median(&self, conn: &Connection) -> Result<f32> {
-        let value = self.get_with_precedence(
-            conn,
-            keys::AUTOSTF_TARGET_MEDIAN,
-            defaults::AUTOSTF_TARGET_MEDIAN,
         )?;
         Ok(value.parse()?)
     }
