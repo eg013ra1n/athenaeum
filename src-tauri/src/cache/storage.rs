@@ -8,7 +8,7 @@ use super::models::StretchParams;
 pub fn generate_cache_filename(file_path: &str, params: &StretchParams) -> String {
     let key = params.cache_key(file_path);
     let hash = xxh3_64(key.as_bytes());
-    format!("{:016x}.png", hash)
+    format!("{:016x}.jpg", hash)
 }
 
 /// Get the full path for a cache file
@@ -76,7 +76,7 @@ pub fn calculate_cache_size(cache_dir: &Path) -> Result<u64> {
     for entry in std::fs::read_dir(cache_dir)? {
         let entry = entry?;
         let metadata = entry.metadata()?;
-        if metadata.is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("png")) {
+        if metadata.is_file() && entry.path().extension() == Some(std::ffi::OsStr::new("jpg")) {
             total_size += metadata.len();
         }
     }
@@ -95,7 +95,7 @@ pub fn cleanup_orphaned_files(
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("png")) {
+        if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("jpg")) {
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 if !valid_filenames.contains(&filename.to_string()) {
                     std::fs::remove_file(&path)?;

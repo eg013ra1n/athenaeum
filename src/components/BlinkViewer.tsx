@@ -97,10 +97,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       try {
         addDebugLog(`📥 Loading image ${index}: ${frame.file.filename}`);
 
-        // Use new VipsProcessor command for 5-7x faster processing
-        const imageData = await invoke<Uint8Array>("read_fits_image_vips", {
+        // Use rustafits for fast FITS to JPEG conversion
+        // Resolution is read from settings database (no parameter = use setting)
+        const imageData = await invoke<Uint8Array>("read_fits_image_rustafits", {
           path: frame.file.path,
-          resolution: "preview",  // Use preview resolution for blink viewer
         });
 
         addDebugLog(`📦 Received data for image ${index}: ${imageData?.length || 0} bytes`);

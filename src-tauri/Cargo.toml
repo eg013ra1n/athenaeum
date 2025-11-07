@@ -35,14 +35,7 @@ fitsio = "0.21"
 anyhow = "1"
 thiserror = "2"
 quick-xml = "0.36"
-image = "0.24"
-base64 = "0.21"
-lru = "0.12"
-lazy_static = "1.4"
-wide = "0.7"
-libvips = "1.6"
-libc = "0.2"
-num_cpus = "1.16"
+rustafits = { git = "https://github.com/eg013ra1n/rustafits" }
 
 [profile.release]
 lto = true           # Link-time optimization for cross-function inlining

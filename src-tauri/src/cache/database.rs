@@ -21,6 +21,7 @@ pub fn init_cache_db(db_path: &Path) -> Result<Connection> {
             black_point INTEGER,
             white_point INTEGER,
             midtones REAL NOT NULL,
+            resolution TEXT NOT NULL,
             image_width INTEGER NOT NULL,
             image_height INTEGER NOT NULL,
             is_color INTEGER NOT NULL,
@@ -31,6 +32,12 @@ pub fn init_cache_db(db_path: &Path) -> Result<Connection> {
         )",
         [],
     )?;
+
+    // Migrate existing databases: add resolution column if it doesn't exist
+    let _ = conn.execute(
+        "ALTER TABLE cache_entries ADD COLUMN resolution TEXT NOT NULL DEFAULT 'preview'",
+        [],
+    );
 
     // Create indexes for fast lookups
     conn.execute(
@@ -50,7 +57,7 @@ pub fn init_cache_db(db_path: &Path) -> Result<Connection> {
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_cache_lookup ON cache_entries(
-            file_path, cache_version, stretch_mode, black_point, white_point, midtones
+            file_path, cache_version, stretch_mode, black_point, white_point, midtones, resolution
         )",
         [],
     )?;
@@ -113,6 +120,7 @@ pub fn find_cache_entry(
     black_point: Option<u16>,
     white_point: Option<u16>,
     midtones: f32,
+    resolution: &str,
 ) -> Result<Option<CacheEntry>> {
     let mode_str = stretch_mode.to_string();
 
@@ -123,7 +131,8 @@ pub fn find_cache_entry(
            AND stretch_mode = ?3
            AND (black_point IS ?4 OR black_point = ?4)
            AND (white_point IS ?5 OR white_point = ?5)
-           AND midtones = ?6",
+           AND midtones = ?6
+           AND resolution = ?7",
     )?;
 
     let entry = stmt
@@ -134,7 +143,8 @@ pub fn find_cache_entry(
                 mode_str,
                 black_point,
                 white_point,
-                midtones
+                midtones,
+                resolution
             ],
             |row| {
                 Ok(CacheEntry {
@@ -152,13 +162,14 @@ pub fn find_cache_entry(
                     black_point: row.get(7)?,
                     white_point: row.get(8)?,
                     midtones: row.get(9)?,
-                    image_width: row.get(10)?,
-                    image_height: row.get(11)?,
-                    is_color: row.get(12)?,
-                    file_size: row.get(13)?,
-                    created_at: row.get(14)?,
-                    last_accessed_at: row.get(15)?,
-                    access_count: row.get(16)?,
+                    resolution: row.get(10)?,
+                    image_width: row.get(11)?,
+                    image_height: row.get(12)?,
+                    is_color: row.get(13)?,
+                    file_size: row.get(14)?,
+                    created_at: row.get(15)?,
+                    last_accessed_at: row.get(16)?,
+                    access_count: row.get(17)?,
                 })
             },
         )
@@ -174,10 +185,10 @@ pub fn insert_cache_entry(conn: &Connection, entry: &CacheEntry) -> Result<i64> 
     conn.execute(
         "INSERT INTO cache_entries (
             file_id, file_path, file_modified_at, cache_filename, cache_version,
-            stretch_mode, black_point, white_point, midtones,
+            stretch_mode, black_point, white_point, midtones, resolution,
             image_width, image_height, is_color, file_size,
             created_at, last_accessed_at, access_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             entry.file_id,
             entry.file_path,
@@ -188,6 +199,7 @@ pub fn insert_cache_entry(conn: &Connection, entry: &CacheEntry) -> Result<i64> 
             entry.black_point,
             entry.white_point,
             entry.midtones,
+            entry.resolution,
             entry.image_width,
             entry.image_height,
             entry.is_color,
@@ -310,13 +322,14 @@ pub fn get_oldest_entries(conn: &Connection, limit: usize) -> Result<Vec<CacheEn
                 black_point: row.get(7)?,
                 white_point: row.get(8)?,
                 midtones: row.get(9)?,
-                image_width: row.get(10)?,
-                image_height: row.get(11)?,
-                is_color: row.get(12)?,
-                file_size: row.get(13)?,
-                created_at: row.get(14)?,
-                last_accessed_at: row.get(15)?,
-                access_count: row.get(16)?,
+                resolution: row.get(10)?,
+                image_width: row.get(11)?,
+                image_height: row.get(12)?,
+                is_color: row.get(13)?,
+                file_size: row.get(14)?,
+                created_at: row.get(15)?,
+                last_accessed_at: row.get(16)?,
+                access_count: row.get(17)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

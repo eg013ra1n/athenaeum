@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Save, AlertCircle, CheckCircle } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Trash2 } from 'lucide-react';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
@@ -10,17 +10,17 @@ export default function Settings() {
   const [coordFrame, setCoordFrame] = useState('ICRS');
   const [nameMode, setNameMode] = useState('majority-object');
   const [sessionGapHours, setSessionGapHours] = useState('6.0');
-  const [blinkJpegQuality, setBlinkJpegQuality] = useState('50');
   const [blinkCacheSize, setBlinkCacheSize] = useState('15');
-  const [blinkBlackPoint, setBlinkBlackPoint] = useState('850');
-  const [blinkWhitePoint, setBlinkWhitePoint] = useState('64000');
-  const [blinkMidtones, setBlinkMidtones] = useState('0.25');
-  const [autostfShadowsClipping, setAutostfShadowsClipping] = useState('-1.5');
-  const [autostfTargetMedian, setAutostfTargetMedian] = useState('0.35');
+  const [qualityThumbnail, setQualityThumbnail] = useState('70');
+  const [qualityPreview, setQualityPreview] = useState('85');
+  const [qualityFull, setQualityFull] = useState('95');
+  const [blinkResolution, setBlinkResolution] = useState('preview');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [clearingCache, setClearingCache] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  const [cacheSuccess, setCacheSuccess] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -31,7 +31,7 @@ export default function Settings() {
       setLoading(true);
       setError(null);
 
-      const [value, unit, frame, mode, sessionGap, jpegQuality, cacheSize, blackPoint, whitePoint, midtones, shadowsClipping, targetMedian] = await Promise.all([
+      const [value, unit, frame, mode, sessionGap, cacheSize, qThumbnail, qPreview, qFull, resolution] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
           defaultValue: '3.0',
@@ -53,32 +53,24 @@ export default function Settings() {
           defaultValue: '6.0',
         }),
         invoke<string>('get_setting', {
-          key: 'blink_jpeg_quality',
-          defaultValue: '50',
-        }),
-        invoke<string>('get_setting', {
           key: 'blink_cache_size',
           defaultValue: '15',
         }),
         invoke<string>('get_setting', {
-          key: 'blink_black_point',
-          defaultValue: '850',
+          key: 'rustafits.quality.thumbnail',
+          defaultValue: '70',
         }),
         invoke<string>('get_setting', {
-          key: 'blink_white_point',
-          defaultValue: '64000',
+          key: 'rustafits.quality.preview',
+          defaultValue: '85',
         }),
         invoke<string>('get_setting', {
-          key: 'blink_midtones',
-          defaultValue: '0.25',
+          key: 'rustafits.quality.full',
+          defaultValue: '95',
         }),
         invoke<string>('get_setting', {
-          key: 'autostf.shadows_clipping',
-          defaultValue: '-1.5',
-        }),
-        invoke<string>('get_setting', {
-          key: 'autostf.target_median',
-          defaultValue: '0.35',
+          key: 'blink.resolution',
+          defaultValue: 'preview',
         }),
       ]);
 
@@ -87,13 +79,11 @@ export default function Settings() {
       setCoordFrame(frame);
       setNameMode(mode);
       setSessionGapHours(sessionGap);
-      setBlinkJpegQuality(jpegQuality);
       setBlinkCacheSize(cacheSize);
-      setBlinkBlackPoint(blackPoint);
-      setBlinkWhitePoint(whitePoint);
-      setBlinkMidtones(midtones);
-      setAutostfShadowsClipping(shadowsClipping);
-      setAutostfTargetMedian(targetMedian);
+      setQualityThumbnail(qThumbnail);
+      setQualityPreview(qPreview);
+      setQualityFull(qFull);
+      setBlinkResolution(resolution);
     } catch (err) {
       setError(err as string);
       console.error('Failed to load settings:', err);
@@ -122,13 +112,6 @@ export default function Settings() {
         return;
       }
 
-      // Validate JPEG quality
-      const jpegQualityValue = parseInt(blinkJpegQuality);
-      if (isNaN(jpegQualityValue) || jpegQualityValue < 30 || jpegQualityValue > 100) {
-        setError('JPEG quality must be between 30 and 100');
-        return;
-      }
-
       // Validate cache size
       const cacheSizeValue = parseInt(blinkCacheSize);
       if (isNaN(cacheSizeValue) || cacheSizeValue < 5 || cacheSizeValue > 30) {
@@ -136,44 +119,22 @@ export default function Settings() {
         return;
       }
 
-      // Validate black point
-      const blackPointValue = parseInt(blinkBlackPoint);
-      if (isNaN(blackPointValue) || blackPointValue < 0 || blackPointValue > 65535) {
-        setError('Black point must be between 0 and 65535');
+      // Validate quality settings
+      const qThumbnailValue = parseInt(qualityThumbnail);
+      if (isNaN(qThumbnailValue) || qThumbnailValue < 1 || qThumbnailValue > 100) {
+        setError('Thumbnail quality must be between 1 and 100');
         return;
       }
 
-      // Validate white point
-      const whitePointValue = parseInt(blinkWhitePoint);
-      if (isNaN(whitePointValue) || whitePointValue < 0 || whitePointValue > 65535) {
-        setError('White point must be between 0 and 65535');
+      const qPreviewValue = parseInt(qualityPreview);
+      if (isNaN(qPreviewValue) || qPreviewValue < 1 || qPreviewValue > 100) {
+        setError('Preview quality must be between 1 and 100');
         return;
       }
 
-      // Validate black < white
-      if (blackPointValue >= whitePointValue) {
-        setError('Black point must be less than white point');
-        return;
-      }
-
-      // Validate midtones
-      const midtonesValue = parseFloat(blinkMidtones);
-      if (isNaN(midtonesValue) || midtonesValue <= 0 || midtonesValue >= 1) {
-        setError('Midtones must be between 0 and 1 (typical: 0.25)');
-        return;
-      }
-
-      // Validate AutoSTF shadows clipping
-      const shadowsClippingValue = parseFloat(autostfShadowsClipping);
-      if (isNaN(shadowsClippingValue) || shadowsClippingValue < -3.0 || shadowsClippingValue > 0.0) {
-        setError('AutoSTF Shadows Clipping must be between -3.0 and 0.0');
-        return;
-      }
-
-      // Validate AutoSTF target median
-      const targetMedianValue = parseFloat(autostfTargetMedian);
-      if (isNaN(targetMedianValue) || targetMedianValue < 0.1 || targetMedianValue > 0.6) {
-        setError('AutoSTF Target Median must be between 0.1 and 0.6');
+      const qFullValue = parseInt(qualityFull);
+      if (isNaN(qFullValue) || qFullValue < 1 || qFullValue > 100) {
+        setError('Full quality must be between 1 and 100');
         return;
       }
 
@@ -199,32 +160,24 @@ export default function Settings() {
           value: sessionGapHours,
         }),
         invoke('set_setting', {
-          key: 'blink_jpeg_quality',
-          value: blinkJpegQuality,
-        }),
-        invoke('set_setting', {
           key: 'blink_cache_size',
           value: blinkCacheSize,
         }),
         invoke('set_setting', {
-          key: 'blink_black_point',
-          value: blinkBlackPoint,
+          key: 'rustafits.quality.thumbnail',
+          value: qualityThumbnail,
         }),
         invoke('set_setting', {
-          key: 'blink_white_point',
-          value: blinkWhitePoint,
+          key: 'rustafits.quality.preview',
+          value: qualityPreview,
         }),
         invoke('set_setting', {
-          key: 'blink_midtones',
-          value: blinkMidtones,
+          key: 'rustafits.quality.full',
+          value: qualityFull,
         }),
         invoke('set_setting', {
-          key: 'autostf.shadows_clipping',
-          value: autostfShadowsClipping,
-        }),
-        invoke('set_setting', {
-          key: 'autostf.target_median',
-          value: autostfTargetMedian,
+          key: 'blink.resolution',
+          value: blinkResolution,
         }),
       ]);
 
@@ -235,6 +188,24 @@ export default function Settings() {
       console.error('Failed to save settings:', err);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleClearCache = async () => {
+    try {
+      setClearingCache(true);
+      setError(null);
+      setCacheSuccess(false);
+
+      await invoke('clear_image_cache');
+
+      setCacheSuccess(true);
+      setTimeout(() => setCacheSuccess(false), 3000);
+    } catch (err) {
+      setError(err as string);
+      console.error('Failed to clear cache:', err);
+    } finally {
+      setClearingCache(false);
     }
   };
 
@@ -397,28 +368,91 @@ export default function Settings() {
           <h3 className="text-lg font-semibold mb-4">Blink Viewer</h3>
 
           <div className="space-y-4">
-            {/* JPEG Quality */}
+            {/* Resolution */}
             <div>
               <label className="block text-sm font-medium text-gray-300 mb-2">
-                JPEG Quality ({blinkJpegQuality})
+                Image Resolution
+              </label>
+              <select
+                value={blinkResolution}
+                onChange={(e) => setBlinkResolution(e.target.value)}
+                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+              >
+                <option value="thumbnail">Thumbnail (4x downscale)</option>
+                <option value="preview">Preview (2x2 binning)</option>
+                <option value="full">Full Resolution</option>
+              </select>
+              <p className="text-xs text-gray-500 mt-2">
+                Resolution for blink viewer images. Thumbnail is fastest, Preview balances speed and quality, Full shows maximum detail. Note: Changing this will cache images separately for each resolution.
+              </p>
+            </div>
+
+            {/* Thumbnail JPEG Quality */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Thumbnail JPEG Quality ({qualityThumbnail})
               </label>
               <input
                 type="range"
-                value={blinkJpegQuality}
-                onChange={(e) => setBlinkJpegQuality(e.target.value)}
-                min="30"
+                value={qualityThumbnail}
+                onChange={(e) => setQualityThumbnail(e.target.value)}
+                min="1"
                 max="100"
                 step="1"
                 className="w-full"
               />
               <div className="flex justify-between text-xs text-gray-500 mt-1">
-                <span>30 (Fastest)</span>
+                <span>1 (Smallest)</span>
                 <span>100 (Highest Quality)</span>
               </div>
               <p className="text-xs text-gray-500 mt-2">
-                JPEG quality for blink viewer. Lower quality = faster encoding. 50 (default) provides
-                fast encoding (~1-1.5s) with acceptable quality for visual inspection. Quality 30-40
-                for maximum speed, 60-70 for better quality, 80+ for highest quality but slower.
+                JPEG quality for thumbnail images. Default: 70. Lower values = smaller files, faster loading.
+              </p>
+            </div>
+
+            {/* Preview JPEG Quality */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Preview JPEG Quality ({qualityPreview})
+              </label>
+              <input
+                type="range"
+                value={qualityPreview}
+                onChange={(e) => setQualityPreview(e.target.value)}
+                min="1"
+                max="100"
+                step="1"
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>1 (Smallest)</span>
+                <span>100 (Highest Quality)</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                JPEG quality for preview/blink viewer images. Default: 85. Good balance of quality and file size.
+              </p>
+            </div>
+
+            {/* Full JPEG Quality */}
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Full Resolution JPEG Quality ({qualityFull})
+              </label>
+              <input
+                type="range"
+                value={qualityFull}
+                onChange={(e) => setQualityFull(e.target.value)}
+                min="1"
+                max="100"
+                step="1"
+                className="w-full"
+              />
+              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <span>1 (Smallest)</span>
+                <span>100 (Highest Quality)</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                JPEG quality for full resolution images. Default: 95. Highest quality for detailed viewing.
               </p>
             </div>
 
@@ -446,133 +480,36 @@ export default function Settings() {
                 on size and quality). Default is 15 images.
               </p>
             </div>
-
-            {/* Black Point */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Black Point (16-bit value)
-              </label>
-              <input
-                type="number"
-                value={blinkBlackPoint}
-                onChange={(e) => setBlinkBlackPoint(e.target.value)}
-                min="0"
-                max="65535"
-                step="100"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-              />
-              <p className="text-xs text-gray-500 mt-2">
-                Percentile clipping black point for 16-bit images. Pixels below this value are
-                clipped to black. Default: 850 (typical 1st percentile for astrophotography).
-                Adjust for your camera's bias level.
-              </p>
-            </div>
-
-            {/* White Point */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                White Point (16-bit value)
-              </label>
-              <input
-                type="number"
-                value={blinkWhitePoint}
-                onChange={(e) => setBlinkWhitePoint(e.target.value)}
-                min="0"
-                max="65535"
-                step="100"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-              />
-              <p className="text-xs text-gray-500 mt-2">
-                Percentile clipping white point for 16-bit images. Pixels above this value are
-                clipped to white. Default: 64000 (typical 99th percentile). This approach is
-                10-20x faster than scanning for min/max and provides better visual results by
-                rejecting outliers. Industry standard for DS9, PixInsight, Astropy.
-              </p>
-            </div>
-
-            {/* Midtones Balance (MTF) */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Midtones Balance (STF)
-              </label>
-              <input
-                type="number"
-                value={blinkMidtones}
-                onChange={(e) => setBlinkMidtones(e.target.value)}
-                min="0.001"
-                max="0.999"
-                step="0.01"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-              />
-              <p className="text-xs text-gray-500 mt-2">
-                Midtones Transfer Function (MTF) balance for Screen Transfer Function (STF) stretching.
-                Controls brightness of the stretch. Lower values (0.1-0.2) = darker/more contrast.
-                Higher values (0.3-0.5) = brighter. Default: 0.25 (typical for linear astronomical data).
-                Similar to PixInsight's auto-stretch midtones parameter.
-              </p>
-            </div>
-
-            {/* AutoSTF Shadows Clipping */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                AutoSTF Shadows Clipping ({autostfShadowsClipping})
-              </label>
-              <input
-                type="range"
-                value={autostfShadowsClipping}
-                onChange={(e) => setAutostfShadowsClipping(e.target.value)}
-                min="-3.0"
-                max="0.0"
-                step="0.1"
-                className="w-full"
-              />
-              <div className="flex justify-between text-xs text-gray-500 mt-1">
-                <span>-3.0 (Darker Shadows)</span>
-                <span>0.0 (Brighter Shadows)</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-2">
-                Controls black point calculation for AutoSTF. More negative values = darker shadows
-                (e.g. -2.8), values closer to 0 = brighter shadows (e.g. -0.5). Default: -1.5.
-                This parameter uses MAD (Median Absolute Deviation) for robust histogram analysis.
-              </p>
-            </div>
-
-            {/* AutoSTF Target Median */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                AutoSTF Target Median ({autostfTargetMedian})
-              </label>
-              <input
-                type="range"
-                value={autostfTargetMedian}
-                onChange={(e) => setAutostfTargetMedian(e.target.value)}
-                min="0.1"
-                max="0.6"
-                step="0.05"
-                className="w-full"
-              />
-              <div className="flex justify-between text-xs text-gray-500 mt-1">
-                <span>0.1 (Darker/More Contrast)</span>
-                <span>0.6 (Brighter)</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-2">
-                Controls overall brightness after AutoSTF stretch. Lower values = darker with more
-                contrast (e.g. 0.25), higher values = brighter (e.g. 0.50). Default: 0.35.
-                This determines where the image median will be mapped to in the output.
-              </p>
-            </div>
           </div>
         </div>
 
         <div className="pt-4 border-t border-gray-700">
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-          >
-            <Save size={18} />
-            {saving ? 'Saving...' : 'Save Settings'}
-          </button>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+            >
+              <Save size={18} />
+              {saving ? 'Saving...' : 'Save Settings'}
+            </button>
+
+            <button
+              onClick={handleClearCache}
+              disabled={clearingCache}
+              className="flex items-center gap-2 px-6 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+            >
+              <Trash2 size={18} />
+              {clearingCache ? 'Clearing...' : 'Clear Image Cache'}
+            </button>
+
+            {cacheSuccess && (
+              <div className="flex items-center gap-2 text-green-400">
+                <CheckCircle size={18} />
+                <span>Cache cleared!</span>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

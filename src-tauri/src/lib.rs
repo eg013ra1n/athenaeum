@@ -10,18 +10,16 @@ mod settings;
 mod coordinates;
 mod clustering;
 mod sessions;
-mod image_processing;
 mod cache;
-mod vips_processor;
+mod rustafits_processor;
 
 // Commands (Tauri API endpoints)
 mod commands;
-mod commands_vips;
+mod commands_rustafits;
 
 use cache::CacheManager;
 use commands::AppState;
 use settings::SettingsManager;
-use vips_processor::VipsProcessor;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
@@ -35,7 +33,6 @@ pub fn run() {
             db: Mutex::new(None),
             settings: Arc::new(SettingsManager::new()),
             cache: Arc::new(Mutex::new(None)),
-            vips_processor: Arc::new(Mutex::new(None)),
         })
         .setup(|app| {
             // Initialize cache manager after app is ready
@@ -52,17 +49,6 @@ pub fn run() {
                     Err(e) => {
                         eprintln!("⚠️  Failed to initialize cache manager: {}", e);
                     }
-                }
-            }
-
-            // Initialize VipsProcessor for high-performance image processing
-            match VipsProcessor::new() {
-                Ok(vips) => {
-                    *state.vips_processor.lock().unwrap() = Some(vips);
-                    println!("✅ VipsProcessor initialized");
-                }
-                Err(e) => {
-                    eprintln!("⚠️  Failed to initialize VipsProcessor: {}", e);
                 }
             }
 
@@ -98,11 +84,8 @@ pub fn run() {
             commands::create_master_dark_library,
             commands::get_master_dark_library,
             commands::has_master_dark_library,
-            commands::read_fits_image,
-            commands::read_fits_image_png,
-            commands_vips::read_fits_image_vips,
-            commands_vips::get_image_metadata_vips,
-            commands_vips::batch_process_images_vips,
+            commands::clear_image_cache,
+            commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
