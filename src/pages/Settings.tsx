@@ -4,13 +4,21 @@ import { Save, AlertCircle, CheckCircle, Trash2 } from 'lucide-react';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
+interface CacheStats {
+  total_entries: number;
+  total_size_bytes: number;
+  cache_hits: number;
+  cache_misses: number;
+  hit_rate: number;
+  max_size_bytes: number;
+}
+
 export default function Settings() {
   const [thresholdValue, setThresholdValue] = useState('5.0');
   const [thresholdUnit, setThresholdUnit] = useState<ThresholdUnit>('arcmin');
   const [coordFrame, setCoordFrame] = useState('ICRS');
   const [nameMode, setNameMode] = useState('majority-object');
   const [sessionGapHours, setSessionGapHours] = useState('6.0');
-  const [blinkCacheSize, setBlinkCacheSize] = useState('15');
   const [qualityThumbnail, setQualityThumbnail] = useState('70');
   const [qualityPreview, setQualityPreview] = useState('85');
   const [qualityFull, setQualityFull] = useState('95');
@@ -21,9 +29,11 @@ export default function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
   const [cacheSuccess, setCacheSuccess] = useState(false);
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
 
   useEffect(() => {
     loadSettings();
+    loadCacheStats();
   }, []);
 
   const loadSettings = async () => {
@@ -31,7 +41,7 @@ export default function Settings() {
       setLoading(true);
       setError(null);
 
-      const [value, unit, frame, mode, sessionGap, cacheSize, qThumbnail, qPreview, qFull, resolution] = await Promise.all([
+      const [value, unit, frame, mode, sessionGap, qThumbnail, qPreview, qFull, resolution] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
           defaultValue: '3.0',
@@ -51,10 +61,6 @@ export default function Settings() {
         invoke<string>('get_setting', {
           key: 'session_gap_threshold_hours',
           defaultValue: '6.0',
-        }),
-        invoke<string>('get_setting', {
-          key: 'blink_cache_size',
-          defaultValue: '15',
         }),
         invoke<string>('get_setting', {
           key: 'rustafits.quality.thumbnail',
@@ -79,7 +85,6 @@ export default function Settings() {
       setCoordFrame(frame);
       setNameMode(mode);
       setSessionGapHours(sessionGap);
-      setBlinkCacheSize(cacheSize);
       setQualityThumbnail(qThumbnail);
       setQualityPreview(qPreview);
       setQualityFull(qFull);
@@ -109,13 +114,6 @@ export default function Settings() {
       const sessionGapValue = parseFloat(sessionGapHours);
       if (isNaN(sessionGapValue) || sessionGapValue <= 0) {
         setError('Session gap threshold must be a positive number');
-        return;
-      }
-
-      // Validate cache size
-      const cacheSizeValue = parseInt(blinkCacheSize);
-      if (isNaN(cacheSizeValue) || cacheSizeValue < 5 || cacheSizeValue > 30) {
-        setError('Cache size must be between 5 and 30');
         return;
       }
 
@@ -160,10 +158,6 @@ export default function Settings() {
           value: sessionGapHours,
         }),
         invoke('set_setting', {
-          key: 'blink_cache_size',
-          value: blinkCacheSize,
-        }),
-        invoke('set_setting', {
           key: 'rustafits.quality.thumbnail',
           value: qualityThumbnail,
         }),
@@ -191,6 +185,33 @@ export default function Settings() {
     }
   };
 
+  const loadCacheStats = async () => {
+    try {
+      const stats = await invoke<CacheStats>('get_cache_stats');
+      setCacheStats(stats);
+    } catch (err) {
+      console.error('Failed to load cache stats:', err);
+      // Don't show error to user, just fail silently
+      setCacheStats(null);
+    }
+  };
+
+  const formatBytes = (bytes: number): string => {
+    const KB = 1024;
+    const MB = KB * 1024;
+    const GB = MB * 1024;
+
+    if (bytes >= GB) {
+      return `${(bytes / GB).toFixed(2)} GB`;
+    } else if (bytes >= MB) {
+      return `${(bytes / MB).toFixed(2)} MB`;
+    } else if (bytes >= KB) {
+      return `${(bytes / KB).toFixed(2)} KB`;
+    } else {
+      return `${bytes} bytes`;
+    }
+  };
+
   const handleClearCache = async () => {
     try {
       setClearingCache(true);
@@ -201,6 +222,9 @@ export default function Settings() {
 
       setCacheSuccess(true);
       setTimeout(() => setCacheSuccess(false), 3000);
+
+      // Reload cache stats after clearing
+      await loadCacheStats();
     } catch (err) {
       setError(err as string);
       console.error('Failed to clear cache:', err);
@@ -456,30 +480,6 @@ export default function Settings() {
               </p>
             </div>
 
-            {/* Cache Size */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Image Cache Size ({blinkCacheSize} images)
-              </label>
-              <input
-                type="range"
-                value={blinkCacheSize}
-                onChange={(e) => setBlinkCacheSize(e.target.value)}
-                min="5"
-                max="30"
-                step="1"
-                className="w-full"
-              />
-              <div className="flex justify-between text-xs text-gray-500 mt-1">
-                <span>5 (Less Memory)</span>
-                <span>30 (More Memory)</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-2">
-                Number of processed images to keep in memory cache. Cached images load instantly
-                when revisiting them. Higher values use more memory (~20-40 MB per image depending
-                on size and quality). Default is 15 images.
-              </p>
-            </div>
           </div>
         </div>
 
@@ -500,7 +500,10 @@ export default function Settings() {
               className="flex items-center gap-2 px-6 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
             >
               <Trash2 size={18} />
-              {clearingCache ? 'Clearing...' : 'Clear Image Cache'}
+              {clearingCache
+                ? 'Clearing...'
+                : `Clear Image Cache${cacheStats ? ` (${formatBytes(cacheStats.total_size_bytes)})` : ''}`
+              }
             </button>
 
             {cacheSuccess && (

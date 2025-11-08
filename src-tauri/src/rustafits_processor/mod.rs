@@ -13,6 +13,16 @@ pub enum Resolution {
 }
 
 impl Resolution {
+    /// Parse resolution from string
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "thumbnail" => Resolution::Thumbnail,
+            "preview" => Resolution::Preview,
+            "full" => Resolution::Full,
+            _ => Resolution::Preview, // Default to preview
+        }
+    }
+
     /// Get JPEG quality for this resolution
     /// Uses custom quality if provided, otherwise defaults
     pub fn jpeg_quality(&self, custom: Option<u8>) -> u8 {
@@ -62,6 +72,57 @@ pub struct ProcessedImage {
     pub width: u32,
     pub height: u32,
     pub format: String, // "jpeg"
+    pub is_color: bool, // Whether this is a color/Bayer image
+}
+
+/// Detect if a FITS file contains a color/Bayer pattern image
+///
+/// Checks for common color indicators in FITS headers:
+/// - BAYERPAT (Bayer pattern identifier)
+/// - COLORTYP (Color type)
+/// - NAXIS3 = 3 (RGB channels)
+fn detect_color_image<P: AsRef<Path>>(path: P) -> bool {
+    use fitsio::FitsFile;
+
+    let path = path.as_ref();
+
+    // Try to open FITS file and check for color indicators
+    if let Ok(mut fitsfile) = FitsFile::open(path) {
+        if let Ok(hdu) = fitsfile.primary_hdu() {
+            // Check for BAYERPAT keyword (most common for OSC cameras)
+            if let Ok(_) = hdu.read_key::<String>(&mut fitsfile, "BAYERPAT") {
+                return true;
+            }
+
+            // Check for COLORTYP keyword
+            if let Ok(colortyp) = hdu.read_key::<String>(&mut fitsfile, "COLORTYP") {
+                if colortyp.to_uppercase().contains("COLOR") ||
+                   colortyp.to_uppercase().contains("RGB") ||
+                   colortyp.to_uppercase().contains("BAYER") {
+                    return true;
+                }
+            }
+
+            // Check for XBAYEROFF/YBAYEROFF (Bayer offset indicators)
+            if hdu.read_key::<i64>(&mut fitsfile, "XBAYROFF").is_ok() ||
+               hdu.read_key::<i64>(&mut fitsfile, "YBAYROFF").is_ok() {
+                return true;
+            }
+
+            // Check for NAXIS3 = 3 (3-channel RGB image)
+            if let Ok(naxis) = hdu.read_key::<i64>(&mut fitsfile, "NAXIS") {
+                if naxis >= 3 {
+                    if let Ok(naxis3) = hdu.read_key::<i64>(&mut fitsfile, "NAXIS3") {
+                        if naxis3 == 3 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Process a FITS file to JPEG using rustafits
@@ -83,6 +144,9 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     if !input_path.exists() {
         anyhow::bail!("Input FITS file does not exist: {}", input_path.display());
     }
+
+    // Detect if this is a color image
+    let is_color = detect_color_image(input_path);
 
     // Create temporary output path
     let temp_dir = std::env::temp_dir();
@@ -108,8 +172,9 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         converter = converter.with_downscale(resolution.downscale_factor());
     }
 
-    // Apply preview mode if needed (for preview resolution)
-    if resolution.use_preview_mode() {
+    // Apply preview mode ONLY for mono images
+    // For color images, skip preview_mode to avoid binning before debayering
+    if resolution.use_preview_mode() && !is_color {
         converter = converter.with_preview_mode();
     }
 
@@ -143,6 +208,7 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         width,
         height,
         format: "jpeg".to_string(),
+        is_color,
     })
 }
 
@@ -164,6 +230,9 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         anyhow::bail!("Input FITS file does not exist: {}", input_path.display());
     }
 
+    // Detect if this is a color image
+    let is_color = detect_color_image(input_path);
+
     // Ensure output directory exists
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -180,8 +249,9 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         converter = converter.with_downscale(resolution.downscale_factor());
     }
 
-    // Apply preview mode if needed (for preview resolution)
-    if resolution.use_preview_mode() {
+    // Apply preview mode ONLY for mono images
+    // For color images, skip preview_mode to avoid binning before debayering
+    if resolution.use_preview_mode() && !is_color {
         converter = converter.with_preview_mode();
     }
 
@@ -210,5 +280,6 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         width,
         height,
         format: "jpeg".to_string(),
+        is_color,
     })
 }
