@@ -175,6 +175,7 @@ pub struct ScanRoot {
     pub id: Option<i64>,
     pub path: String,
     pub enabled: bool,
+    pub find_duplicates: bool,
     pub last_scan: Option<DateTime<Utc>>,
 }
 
@@ -195,6 +196,32 @@ pub struct DuplicateGroup {
     pub content_hash: String,
     pub file_count: i32,
     pub file_paths: Vec<String>,
+    pub file_ids: Vec<i64>,
+}
+
+/// Black hole entry (soft-deleted file)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlackHoleEntry {
+    pub id: Option<i64>,
+    pub file_id: i64,
+    pub filename: String,
+    pub original_path: String,
+    pub from_where: String,
+    pub moved_at: DateTime<Utc>,
+    pub file_size: i64,
+}
+
+/// Folder similarity result for duplicate detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderSimilarity {
+    pub folder_a: String,
+    pub folder_b: String,
+    pub similarity_percent: f64,
+    pub shared_files: i32,
+    pub shared_size: i64,
+    pub unique_a: i32,
+    pub unique_b: i32,
+    pub shared_file_ids: Vec<i64>,
 }
 
 /// Project for organizing imaging sessions

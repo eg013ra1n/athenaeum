@@ -98,6 +98,7 @@ export interface ScanRoot {
   id: number | null;
   path: string;
   enabled: boolean;
+  find_duplicates: boolean;
   last_scan: string | null; // ISO 8601 datetime
 }
 
@@ -114,6 +115,28 @@ export interface DuplicateGroup {
   content_hash: string;
   file_count: number;
   file_paths: string[];
+  file_ids: number[];
+}
+
+export interface BlackHoleEntry {
+  id: number | null;
+  file_id: number;
+  filename: string;
+  original_path: string;
+  from_where: string;
+  moved_at: string; // ISO 8601 datetime
+  file_size: number;
+}
+
+export interface FolderSimilarity {
+  folder_a: string;
+  folder_b: string;
+  similarity_percent: number;
+  shared_files: number;
+  shared_size: number;
+  unique_a: number;
+  unique_b: number;
+  shared_file_ids: number[];
 }
 
 // DTOs for Tauri commands

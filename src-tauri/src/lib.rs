@@ -86,6 +86,13 @@ pub fn run() {
             commands::has_master_dark_library,
             commands::get_cache_stats,
             commands::clear_image_cache,
+            commands::set_scan_root_duplicates_flag,
+            commands::move_to_black_hole,
+            commands::get_black_hole_files,
+            commands::restore_from_black_hole,
+            commands::send_to_void,
+            commands::send_all_to_void,
+            commands::get_duplicate_folders,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())
