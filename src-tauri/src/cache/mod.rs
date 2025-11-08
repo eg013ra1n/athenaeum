@@ -168,11 +168,12 @@ impl CacheManager {
         let cache_path = self.cache_dir.join(&cache_filename);
 
         // Process the FITS file to JPEG using rustafits
-        // Always use Preview resolution for now (can be made configurable later)
+        // Use resolution from stretch_params (user setting)
+        let resolution = Resolution::from_string(&stretch_params.resolution);
         let result = rustafits_processor::process_fits_to_jpeg_cached(
             file_path,
             &cache_path,
-            Resolution::Preview,
+            resolution,
             quality,
         )
         .context("Failed to process FITS image with rustafits")?;
@@ -198,7 +199,7 @@ impl CacheManager {
             resolution: stretch_params.resolution.clone(),
             image_width: result.width,
             image_height: result.height,
-            is_color: false, // Will be determined from FITS metadata if needed
+            is_color: result.is_color, // Detected from FITS metadata
             file_size: result.image_data.len() as u64,
             created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             last_accessed_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),

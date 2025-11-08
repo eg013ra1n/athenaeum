@@ -84,6 +84,7 @@ pub fn run() {
             commands::create_master_dark_library,
             commands::get_master_dark_library,
             commands::has_master_dark_library,
+            commands::get_cache_stats,
             commands::clear_image_cache,
             commands_rustafits::read_fits_image_rustafits,
         ])
