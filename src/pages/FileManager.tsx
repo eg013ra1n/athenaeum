@@ -1,19 +1,23 @@
 import { useState } from 'react';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy } from 'lucide-react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useScanRoots, useScan, useInitializeDatabase, useDuplicates, moveToBlackHole } from '../hooks/useTauri';
+import { useScanRoots, useScan, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
 import type { ScanResult } from '../types/models';
 
 type TabMode = 'directories' | 'browse' | 'duplicates';
+type DuplicatesViewMode = 'files' | 'folders';
 
 export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
   const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag } = useScanRoots();
   const { startScan } = useScan();
   const { duplicates, loading: dupsLoading, error: dupsError, refresh: refreshDuplicates } = useDuplicates();
+  const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
+  const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
+  const [typeFilter, setTypeFilter] = useState<string>('All Types');
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [scanningMap, setScanningMap] = useState<Record<number, boolean>>({});
   const [scanResultMap, setScanResultMap] = useState<Record<number, ScanResult>>({});
@@ -286,121 +290,333 @@ export default function FileManager() {
       )}
 
       {activeTab === 'duplicates' && (
-        /* Duplicates View */
-        <div className="bg-gray-800 rounded-lg p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-lg font-semibold">Duplicate Groups ({duplicates.length})</h3>
+        /* Duplicates View with Multi-View Tabs */
+        <div>
+          {/* Sub-tabs for different views */}
+          <div className="flex gap-2 mb-4 border-b border-gray-700">
             <button
-              onClick={refreshDuplicates}
-              disabled={dupsLoading}
-              className="text-sm text-blue-400 hover:text-blue-300 disabled:opacity-50"
+              onClick={() => setDuplicatesView('files')}
+              className={`px-4 py-2 transition relative ${
+                duplicatesView === 'files'
+                  ? 'text-yellow-400 border-b-2 border-yellow-400'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
             >
-              {dupsLoading ? 'Loading...' : 'Refresh'}
+              <div className="flex items-center gap-2">
+                <Copy size={16} />
+                File View ({duplicates.length})
+              </div>
+            </button>
+            <button
+              onClick={() => setDuplicatesView('folders')}
+              className={`px-4 py-2 transition relative ${
+                duplicatesView === 'folders'
+                  ? 'text-yellow-400 border-b-2 border-yellow-400'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <FolderOpen size={16} />
+                Folder View ({duplicateFolders.length})
+              </div>
             </button>
           </div>
 
-          {dupsError && (
-            <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded">
-              <p className="text-red-400 text-sm">Error loading duplicates: {String(dupsError)}</p>
-            </div>
-          )}
+          {/* File View */}
+          {duplicatesView === 'files' && (
+            <div className="bg-gray-800 rounded-lg p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-lg font-semibold">Duplicate Groups ({duplicates.length})</h3>
+                <div className="flex items-center gap-3">
+                  <select
+                    value={typeFilter}
+                    onChange={(e) => setTypeFilter(e.target.value)}
+                    className="bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <option value="All Types">All Types</option>
+                    <option value="Lights">Lights</option>
+                    <option value="Darks">Darks</option>
+                    <option value="Flats">Flats</option>
+                    <option value="Bias">Bias</option>
+                    <option value="Other">Other</option>
+                  </select>
+                  <button
+                    onClick={refreshDuplicates}
+                    disabled={dupsLoading}
+                    className="text-sm text-blue-400 hover:text-blue-300 disabled:opacity-50"
+                  >
+                    {dupsLoading ? 'Loading...' : 'Refresh'}
+                  </button>
+                </div>
+              </div>
 
-          {dupsLoading ? (
-            <div className="flex items-center justify-center py-12">
-              <Loader2 className="animate-spin mr-2" size={24} />
-              <span className="text-gray-400">Loading duplicates...</span>
-            </div>
-          ) : duplicates.length === 0 ? (
-            <div className="text-gray-500 text-center py-12">
-              <CheckCircle2 className="mx-auto mb-3 text-green-400" size={48} />
-              <p className="font-semibold mb-1">No duplicates found!</p>
-              <p className="text-sm">All your files are unique.</p>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              {duplicates.map((group, idx) => (
-                <div key={idx} className="bg-gray-900 rounded-lg p-4 border border-gray-700">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-3">
-                      <Copy className="text-yellow-400" size={20} />
-                      <div>
-                        <span className="font-semibold text-yellow-400">
-                          {group.file_count} identical files
+              {dupsError && (
+                <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded">
+                  <p className="text-red-400 text-sm">Error: {String(dupsError)}</p>
+                </div>
+              )}
+
+              {dupsLoading ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="animate-spin mr-2" size={24} />
+                  <span className="text-gray-400">Loading duplicates...</span>
+                </div>
+              ) : duplicates.length === 0 ? (
+                <div className="text-gray-500 text-center py-12">
+                  <CheckCircle2 className="mx-auto mb-3 text-green-400" size={48} />
+                  <p className="font-semibold mb-1">No duplicates found!</p>
+                  <p className="text-sm">All your files are unique.</p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {duplicates.filter(group => {
+                    if (typeFilter === 'All Types') return true;
+
+                    // Determine type from file paths
+                    const samplePath = group.file_paths[0]?.toLowerCase() || '';
+                    if (typeFilter === 'Lights' && (samplePath.includes('/lights/') || samplePath.includes('/light/'))) return true;
+                    if (typeFilter === 'Darks' && (samplePath.includes('/darks/') || samplePath.includes('/dark/') || samplePath.includes('/calibration/darks'))) return true;
+                    if (typeFilter === 'Flats' && (samplePath.includes('/flats/') || samplePath.includes('/flat/') || samplePath.includes('/calibration/flats'))) return true;
+                    if (typeFilter === 'Bias' && samplePath.includes('/bias/') || samplePath.includes('/calibration/bias')) return true;
+                    if (typeFilter === 'Other' &&
+                        !samplePath.includes('/lights/') && !samplePath.includes('/light/') &&
+                        !samplePath.includes('/darks/') && !samplePath.includes('/dark/') &&
+                        !samplePath.includes('/flats/') && !samplePath.includes('/flat/') &&
+                        !samplePath.includes('/bias/')) return true;
+                    return false;
+                  }).map((group, idx) => (
+                    <div key={idx} className="bg-gray-900 rounded-lg p-4 border border-gray-700">
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-3">
+                          <Copy className="text-yellow-400" size={20} />
+                          <div>
+                            <span className="font-semibold text-yellow-400">
+                              {group.file_count} identical files
+                            </span>
+                            <span className="text-gray-400 text-sm ml-3">
+                              Size: {(group.size / 1024 / 1024).toFixed(2)} MB each
+                            </span>
+                          </div>
+                        </div>
+                        <span className="text-xs font-mono text-gray-500">
+                          Hash: {group.content_hash.substring(0, 12)}...
                         </span>
-                        <span className="text-gray-400 text-sm ml-3">
-                          Size: {(group.size / 1024 / 1024).toFixed(2)} MB each
+                      </div>
+
+                      <div className="space-y-2">
+                        {group.file_paths.map((path, pathIdx) => {
+                          const fileId = group.file_ids[pathIdx];
+                          return (
+                            <div
+                              key={pathIdx}
+                              className="flex items-center justify-between p-3 bg-gray-800 rounded hover:bg-gray-750 transition"
+                            >
+                              <div className="flex-1 min-w-0">
+                                <p className="font-mono text-sm truncate" title={path}>
+                                  {path}
+                                </p>
+                                <p className="text-xs text-gray-500 mt-1">
+                                  Copy {pathIdx + 1} of {group.file_count}
+                                </p>
+                              </div>
+                              <button
+                                onClick={async () => {
+                                  if (!confirm(`Move "${path}" to Black Hole?`)) return;
+                                  try {
+                                    setMovingToBlackHole(prev => ({ ...prev, [path]: true }));
+                                    await moveToBlackHole(fileId, 'duplicates');
+                                    await refreshDuplicates();
+                                  } catch (err) {
+                                    alert(`Failed: ${String(err)}`);
+                                  } finally {
+                                    setMovingToBlackHole(prev => ({ ...prev, [path]: false }));
+                                  }
+                                }}
+                                disabled={movingToBlackHole[path]}
+                                title="Move to Black Hole"
+                                className="ml-4 p-2 text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded transition disabled:opacity-50"
+                              >
+                                {movingToBlackHole[path] ? (
+                                  <Loader2 className="animate-spin" size={16} />
+                                ) : (
+                                  <Trash2 size={16} />
+                                )}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div className="mt-3 pt-3 border-t border-gray-700 text-sm">
+                        <span className="text-gray-400">
+                          Total wasted space: {((group.size * (group.file_count - 1)) / 1024 / 1024).toFixed(2)} MB
                         </span>
                       </div>
                     </div>
-                    <span className="text-xs font-mono text-gray-500">
-                      Hash: {group.content_hash.substring(0, 12)}...
-                    </span>
-                  </div>
+                  ))}
 
-                  <div className="space-y-2">
-                    {group.file_paths.map((path, pathIdx) => {
-                      const fileId = group.file_ids[pathIdx];
-                      return (
-                        <div
-                          key={pathIdx}
-                          className="flex items-center justify-between p-3 bg-gray-800 rounded hover:bg-gray-750 transition"
-                        >
-                          <div className="flex-1 min-w-0">
-                            <p className="font-mono text-sm truncate" title={path}>
-                              {path}
-                            </p>
-                            <p className="text-xs text-gray-500 mt-1">
-                              Copy {pathIdx + 1} of {group.file_count}
-                            </p>
-                          </div>
-                          <button
-                            onClick={async () => {
-                              if (!confirm(`Move "${path}" to Black Hole?`)) return;
-                              try {
-                                setMovingToBlackHole(prev => ({ ...prev, [path]: true }));
-                                await moveToBlackHole(fileId, 'duplicates');
-                                await refreshDuplicates();
-                              } catch (err) {
-                                alert(`Failed: ${String(err)}`);
-                              } finally {
-                                setMovingToBlackHole(prev => ({ ...prev, [path]: false }));
-                              }
-                            }}
-                            disabled={movingToBlackHole[path]}
-                            className="ml-4 px-3 py-1 text-sm text-purple-400 hover:text-purple-300 hover:bg-purple-900/20 rounded transition disabled:opacity-50"
-                          >
-                            {movingToBlackHole[path] ? 'Moving...' : 'Move to Black Hole'}
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  <div className="mt-3 pt-3 border-t border-gray-700 text-sm">
-                    <span className="text-gray-400">
-                      Total wasted space: {((group.size * (group.file_count - 1)) / 1024 / 1024).toFixed(2)} MB
-                    </span>
+                  {/* Summary */}
+                  <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="font-semibold text-blue-300">Total Duplicates Summary</p>
+                        <p className="text-sm text-gray-400 mt-1">
+                          {duplicates.reduce((acc, g) => acc + g.file_count, 0)} duplicate files in {duplicates.length} groups
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-2xl font-bold text-blue-300">
+                          {(duplicates.reduce((acc, g) => acc + (g.size * (g.file_count - 1)), 0) / 1024 / 1024 / 1024).toFixed(2)} GB
+                        </p>
+                        <p className="text-sm text-gray-400">wasted space</p>
+                      </div>
+                    </div>
                   </div>
                 </div>
-              ))}
+              )}
+            </div>
+          )}
 
-              {/* Summary */}
-              <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="font-semibold text-blue-300">Total Duplicates Summary</p>
-                    <p className="text-sm text-gray-400 mt-1">
-                      {duplicates.reduce((acc, g) => acc + g.file_count, 0)} duplicate files in {duplicates.length} groups
-                    </p>
-                  </div>
-                  <div className="text-right">
-                    <p className="text-2xl font-bold text-blue-300">
-                      {(duplicates.reduce((acc, g) => acc + (g.size * (g.file_count - 1)), 0) / 1024 / 1024 / 1024).toFixed(2)} GB
-                    </p>
-                    <p className="text-sm text-gray-400">wasted space</p>
-                  </div>
-                </div>
+          {/* Folder View */}
+          {duplicatesView === 'folders' && (
+            <div className="bg-gray-800 rounded-lg p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-lg font-semibold">Folder Similarity ({duplicateFolders.length})</h3>
+                <button
+                  onClick={refreshFolders}
+                  disabled={foldersLoading}
+                  className="text-sm text-blue-400 hover:text-blue-300 disabled:opacity-50"
+                >
+                  {foldersLoading ? 'Loading...' : 'Refresh'}
+                </button>
               </div>
+
+              {foldersError && (
+                <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded">
+                  <p className="text-red-400 text-sm">Error: {String(foldersError)}</p>
+                </div>
+              )}
+
+              {foldersLoading ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="animate-spin mr-2" size={24} />
+                  <span className="text-gray-400">Analyzing folders...</span>
+                </div>
+              ) : duplicateFolders.length === 0 ? (
+                <div className="text-gray-500 text-center py-12">
+                  <CheckCircle2 className="mx-auto mb-3 text-green-400" size={48} />
+                  <p className="font-semibold mb-1">No similar folders found!</p>
+                  <p className="text-sm">No folders have &gt;70% duplicate files.</p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {duplicateFolders.map((folder, idx) => (
+                    <div key={idx} className="bg-gray-900 rounded-lg p-4 border border-gray-700">
+                      <div className="mb-3">
+                        <div className="flex items-center gap-2 mb-2">
+                          <FolderOpen className="text-orange-400" size={20} />
+                          <span className="text-lg font-semibold text-orange-400">
+                            {folder.similarity_percent.toFixed(1)}% Similar
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="space-y-3">
+                        <div className="bg-gray-800 rounded p-3">
+                          <div className="flex items-start justify-between">
+                            <div className="flex-1">
+                              <p className="text-xs text-gray-500 mb-1">Folder A:</p>
+                              <p className="font-mono text-sm">{folder.folder_a}</p>
+                              <p className="text-xs text-gray-400 mt-1">{folder.unique_a} unique files</p>
+                            </div>
+                            <button
+                              onClick={async () => {
+                                if (!confirm(`Move all files in "${folder.folder_a}" to Black Hole?`)) return;
+                                try {
+                                  // Get all file IDs that belong to this folder
+                                  const folderFileIds: number[] = [];
+                                  duplicates.forEach(group => {
+                                    group.file_paths.forEach((path, idx) => {
+                                      if (path.startsWith(folder.folder_a)) {
+                                        folderFileIds.push(group.file_ids[idx]);
+                                      }
+                                    });
+                                  });
+
+                                  // Move all files to black hole
+                                  for (const fileId of folderFileIds) {
+                                    await moveToBlackHole(fileId, 'duplicates');
+                                  }
+                                  await refreshDuplicates();
+                                  await refreshFolders();
+                                } catch (err) {
+                                  alert(`Failed: ${String(err)}`);
+                                }
+                              }}
+                              title="Delete this folder (move all files to Black Hole)"
+                              className="p-2 text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded transition"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="bg-gray-800 rounded p-3">
+                          <div className="flex items-start justify-between">
+                            <div className="flex-1">
+                              <p className="text-xs text-gray-500 mb-1">Folder B:</p>
+                              <p className="font-mono text-sm">{folder.folder_b}</p>
+                              <p className="text-xs text-gray-400 mt-1">{folder.unique_b} unique files</p>
+                            </div>
+                            <button
+                              onClick={async () => {
+                                if (!confirm(`Move all files in "${folder.folder_b}" to Black Hole?`)) return;
+                                try {
+                                  // Get all file IDs that belong to this folder
+                                  const folderFileIds: number[] = [];
+                                  duplicates.forEach(group => {
+                                    group.file_paths.forEach((path, idx) => {
+                                      if (path.startsWith(folder.folder_b)) {
+                                        folderFileIds.push(group.file_ids[idx]);
+                                      }
+                                    });
+                                  });
+
+                                  // Move all files to black hole
+                                  for (const fileId of folderFileIds) {
+                                    await moveToBlackHole(fileId, 'duplicates');
+                                  }
+                                  await refreshDuplicates();
+                                  await refreshFolders();
+                                } catch (err) {
+                                  alert(`Failed: ${String(err)}`);
+                                }
+                              }}
+                              title="Delete this folder (move all files to Black Hole)"
+                              className="p-2 text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded transition"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-3 pt-3 border-t border-gray-700 grid grid-cols-2 gap-4 text-sm">
+                        <div>
+                          <p className="text-gray-500">Shared Files:</p>
+                          <p className="font-semibold text-yellow-400">{folder.shared_files}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500">Shared Size:</p>
+                          <p className="font-semibold text-yellow-400">
+                            {(folder.shared_size / 1024 / 1024 / 1024).toFixed(2)} GB
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
