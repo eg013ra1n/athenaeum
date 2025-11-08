@@ -5,6 +5,7 @@ import type {
   ScanRoot,
   FileWithFrame,
   DuplicateGroup,
+  FolderSimilarity,
   ScanResult,
 } from '../types/models';
 
@@ -86,6 +87,21 @@ export function useScanRoots() {
     }
   }, []);
 
+  const toggleDuplicatesFlag = useCallback(async (id: number, enabled: boolean) => {
+    try {
+      await invoke('set_scan_root_duplicates_flag', { id, enabled });
+      setScanRoots((prev) =>
+        prev.map((root) =>
+          root.id === id ? { ...root, find_duplicates: enabled } : root
+        )
+      );
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    }
+  }, []);
+
   useEffect(() => {
     fetchScanRoots();
   }, [fetchScanRoots]);
@@ -96,6 +112,7 @@ export function useScanRoots() {
     error,
     addScanRoot,
     deleteScanRoot,
+    toggleDuplicatesFlag,
     refresh: fetchScanRoots,
   };
 }
@@ -233,4 +250,44 @@ export function useDuplicates() {
     error,
     refresh: fetchDuplicates,
   };
+}
+
+/**
+ * Fetch duplicate folders (folder similarity)
+ */
+export function useDuplicateFolders(threshold: number = 70.0) {
+  const [folders, setFolders] = useState<FolderSimilarity[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchFolders = useCallback(async () => {
+    try {
+      setLoading(true);
+      const result = await invoke<FolderSimilarity[]>('get_duplicate_folders', { threshold });
+      setFolders(result);
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+    } finally {
+      setLoading(false);
+    }
+  }, [threshold]);
+
+  useEffect(() => {
+    fetchFolders();
+  }, [fetchFolders]);
+
+  return {
+    folders,
+    loading,
+    error,
+    refresh: fetchFolders,
+  };
+}
+
+/**
+ * Move a file to black hole
+ */
+export async function moveToBlackHole(fileId: number, fromWhere: string): Promise<number> {
+  return await invoke<number>('move_to_black_hole', { fileId, fromWhere });
 }

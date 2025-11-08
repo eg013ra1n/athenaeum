@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useScanRoots, useScan, useInitializeDatabase, useDuplicates } from '../hooks/useTauri';
+import { useScanRoots, useScan, useInitializeDatabase, useDuplicates, moveToBlackHole } from '../hooks/useTauri';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
 import type { ScanResult } from '../types/models';
@@ -10,7 +10,7 @@ type TabMode = 'directories' | 'browse' | 'duplicates';
 
 export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
-  const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot } = useScanRoots();
+  const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag } = useScanRoots();
   const { startScan } = useScan();
   const { duplicates, loading: dupsLoading, error: dupsError, refresh: refreshDuplicates } = useDuplicates();
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
@@ -18,6 +18,7 @@ export default function FileManager() {
   const [scanningMap, setScanningMap] = useState<Record<number, boolean>>({});
   const [scanResultMap, setScanResultMap] = useState<Record<number, ScanResult>>({});
   const [scanError, setScanError] = useState<string | null>(null);
+  const [movingToBlackHole, setMovingToBlackHole] = useState<Record<string, boolean>>({});
 
   // Handle adding a new directory
   const handleAddDirectory = async () => {
@@ -201,6 +202,15 @@ export default function FileManager() {
                         )}
                       </div>
                       <div className="flex items-center gap-2">
+                        <label className="flex items-center gap-2 px-3 py-2 bg-gray-700 rounded cursor-pointer hover:bg-gray-650 transition">
+                          <input
+                            type="checkbox"
+                            checked={root.find_duplicates}
+                            onChange={(e) => root.id && toggleDuplicatesFlag(root.id, e.target.checked)}
+                            className="w-4 h-4 rounded border-gray-600 text-blue-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-0 bg-gray-600"
+                          />
+                          <span className="text-sm text-gray-300">Include in duplicates</span>
+                        </label>
                         <button
                           onClick={() => root.id && handleStartScan(root.id)}
                           disabled={isScanning}
@@ -328,33 +338,48 @@ export default function FileManager() {
                   </div>
 
                   <div className="space-y-2">
-                    {group.file_paths.map((path, pathIdx) => (
-                      <div
-                        key={pathIdx}
-                        className="flex items-center justify-between p-3 bg-gray-800 rounded hover:bg-gray-750 transition"
-                      >
-                        <div className="flex-1 min-w-0">
-                          <p className="font-mono text-sm truncate" title={path}>
-                            {path}
-                          </p>
-                          <p className="text-xs text-gray-500 mt-1">
-                            Copy {pathIdx + 1} of {group.file_count}
-                          </p>
+                    {group.file_paths.map((path, pathIdx) => {
+                      const fileId = group.file_ids[pathIdx];
+                      return (
+                        <div
+                          key={pathIdx}
+                          className="flex items-center justify-between p-3 bg-gray-800 rounded hover:bg-gray-750 transition"
+                        >
+                          <div className="flex-1 min-w-0">
+                            <p className="font-mono text-sm truncate" title={path}>
+                              {path}
+                            </p>
+                            <p className="text-xs text-gray-500 mt-1">
+                              Copy {pathIdx + 1} of {group.file_count}
+                            </p>
+                          </div>
+                          <button
+                            onClick={async () => {
+                              if (!confirm(`Move "${path}" to Black Hole?`)) return;
+                              try {
+                                setMovingToBlackHole(prev => ({ ...prev, [path]: true }));
+                                await moveToBlackHole(fileId, 'duplicates');
+                                await refreshDuplicates();
+                              } catch (err) {
+                                alert(`Failed: ${String(err)}`);
+                              } finally {
+                                setMovingToBlackHole(prev => ({ ...prev, [path]: false }));
+                              }
+                            }}
+                            disabled={movingToBlackHole[path]}
+                            className="ml-4 px-3 py-1 text-sm text-purple-400 hover:text-purple-300 hover:bg-purple-900/20 rounded transition disabled:opacity-50"
+                          >
+                            {movingToBlackHole[path] ? 'Moving...' : 'Move to Black Hole'}
+                          </button>
                         </div>
-                        <button className="ml-4 px-3 py-1 text-sm text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded transition">
-                          Delete
-                        </button>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
 
-                  <div className="mt-3 pt-3 border-t border-gray-700 flex items-center justify-between text-sm">
+                  <div className="mt-3 pt-3 border-t border-gray-700 text-sm">
                     <span className="text-gray-400">
                       Total wasted space: {((group.size * (group.file_count - 1)) / 1024 / 1024).toFixed(2)} MB
                     </span>
-                    <button className="px-3 py-1 text-yellow-400 hover:text-yellow-300 hover:bg-yellow-900/20 rounded transition">
-                      Keep Best & Delete Others
-                    </button>
                   </div>
                 </div>
               ))}

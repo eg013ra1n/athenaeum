@@ -1,5 +1,5 @@
 import { Outlet, NavLink } from 'react-router-dom';
-import { Files, Calendar, Target, Camera, Upload, Settings } from 'lucide-react';
+import { Files, Calendar, Target, Camera, Upload, Settings, Trash2 } from 'lucide-react';
 
 export default function Layout() {
   const navItems = [
@@ -8,6 +8,7 @@ export default function Layout() {
     { to: '/objects', icon: Target, label: 'Objects' },
     { to: '/equipment', icon: Camera, label: 'Equipment' },
     { to: '/export', icon: Upload, label: 'Export' },
+    { to: '/blackhole', icon: Trash2, label: 'Black Hole' },
     { to: '/settings', icon: Settings, label: 'Settings' },
   ];
 

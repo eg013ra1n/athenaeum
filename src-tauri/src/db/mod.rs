@@ -3,10 +3,12 @@
 
 mod schema;
 mod operations;
+mod operations_blackhole;
 mod equipment;
 
 pub use schema::*;
 pub use operations::*;
+pub use operations_blackhole::*;
 pub use equipment::*;
 
 use rusqlite::{Connection, Result};

@@ -86,11 +86,11 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 /// Get all scan roots
 pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, enabled, last_scan FROM scan_roots ORDER BY path"
+        "SELECT id, path, enabled, find_duplicates, last_scan FROM scan_roots ORDER BY path"
     )?;
 
     let roots = stmt.query_map([], |row| {
-        let last_scan_str: Option<String> = row.get(3)?;
+        let last_scan_str: Option<String> = row.get(4)?;
         let last_scan = last_scan_str
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc));
@@ -99,6 +99,7 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
             id: Some(row.get(0)?),
             path: row.get(1)?,
             enabled: row.get::<_, i32>(2)? == 1,
+            find_duplicates: row.get::<_, i32>(3)? == 1,
             last_scan,
         })
     })?;
@@ -109,7 +110,7 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
 /// Insert or update a scan root
 pub fn upsert_scan_root(conn: &Connection, path: &str) -> Result<i64> {
     conn.execute(
-        "INSERT INTO scan_roots (path, enabled) VALUES (?1, 1)
+        "INSERT INTO scan_roots (path, enabled, find_duplicates) VALUES (?1, 1, 1)
          ON CONFLICT(path) DO NOTHING",
         params![path],
     )?;
@@ -121,6 +122,15 @@ pub fn upsert_scan_root(conn: &Connection, path: &str) -> Result<i64> {
     )?;
 
     Ok(id)
+}
+
+/// Update scan root find_duplicates flag
+pub fn update_scan_root_duplicates_flag(conn: &Connection, id: i64, enabled: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE scan_roots SET find_duplicates = ?1 WHERE id = ?2",
+        params![if enabled { 1 } else { 0 }, id],
+    )?;
+    Ok(())
 }
 
 /// Update scan root last_scan timestamp
@@ -365,11 +375,20 @@ pub fn get_files_by_directory(
 }
 
 /// Find duplicates by filename and metadata
+/// Only includes files from scan roots where find_duplicates = 1
 pub fn find_duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
     let mut stmt = conn.prepare(
-        "SELECT f.metadata_hash, f.size, COUNT(*) as count, GROUP_CONCAT(f.path, '|') as paths
+        "SELECT f.metadata_hash, f.size, COUNT(*) as count, GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids
          FROM files f
          WHERE f.metadata_hash IS NOT NULL
+         AND NOT EXISTS (
+             SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
+         )
+         AND EXISTS (
+             SELECT 1 FROM scan_roots sr
+             WHERE sr.find_duplicates = 1
+             AND (f.path LIKE sr.path || '%' OR f.path LIKE sr.path || '/%')
+         )
          GROUP BY f.metadata_hash, f.size
          HAVING count > 1
          ORDER BY count DESC, f.size DESC"
@@ -379,12 +398,18 @@ pub fn find_duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
         let paths_str: String = row.get(3)?;
         let file_paths: Vec<String> = paths_str.split('|').map(|s| s.to_string()).collect();
 
+        let ids_str: String = row.get(4)?;
+        let file_ids: Vec<i64> = ids_str.split('|')
+            .filter_map(|s| s.parse::<i64>().ok())
+            .collect();
+
         Ok(DuplicateGroup {
             id: None,
             size: row.get(1)?,
             content_hash: row.get(0)?, // Metadata hash
             file_count: row.get(2)?,
             file_paths,
+            file_ids,
         })
     })?;
 

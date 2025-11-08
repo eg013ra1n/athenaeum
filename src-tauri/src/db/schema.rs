@@ -60,6 +60,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL UNIQUE,
             enabled INTEGER NOT NULL DEFAULT 1,
+            find_duplicates INTEGER NOT NULL DEFAULT 1,
             last_scan TEXT
         )",
         [],
@@ -218,6 +219,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Black hole table - soft delete tracking
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS black_hole (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            from_where TEXT NOT NULL,
+            moved_at TEXT NOT NULL,
+            original_path TEXT NOT NULL,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -279,6 +293,28 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_calibration_set_is_master ON calibration_set(is_master_library)",
         [],
     )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_black_hole_from_where ON black_hole(from_where)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_black_hole_moved_at ON black_hole(moved_at)",
+        [],
+    )?;
+
+    // Migrations - add columns to existing tables if they don't exist
+    // Add find_duplicates to scan_roots table (migration for existing databases)
+    let has_find_duplicates: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_roots') WHERE name='find_duplicates'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_find_duplicates {
+        conn.execute(
+            "ALTER TABLE scan_roots ADD COLUMN find_duplicates INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
 
     Ok(())
 }
