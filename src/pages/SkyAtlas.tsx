@@ -18,8 +18,6 @@ export default function SkyAtlas() {
   const [locations, setLocations] = useState<ImagingLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [selectedFilters, setSelectedFilters] = useState<string[]>([]);
-  const [allFilters, setAllFilters] = useState<string[]>([]);
   const [mapReady, setMapReady] = useState(false);
 
   const navigate = useNavigate();
@@ -30,14 +28,6 @@ export default function SkyAtlas() {
       try {
         const data = await invoke<ImagingLocation[]>('get_imaging_locations');
         setLocations(data);
-
-        // Extract unique filters
-        const filterSet = new Set<string>();
-        data.forEach(loc => {
-          loc.filters.forEach(f => filterSet.add(f));
-        });
-        setAllFilters(Array.from(filterSet).sort());
-
         setLoading(false);
       } catch (err) {
         console.error('Failed to load imaging locations:', err);
@@ -199,15 +189,10 @@ export default function SkyAtlas() {
   const addImagingMarkers = useCallback((locs: ImagingLocation[]) => {
     if (typeof window.Celestial === 'undefined') return;
 
-    // Filter locations if filters are selected
-    const filteredLocations = selectedFilters.length > 0
-      ? locs.filter(loc => loc.filters.some(f => selectedFilters.includes(f)))
-      : locs;
-
-    console.log(`Adding ${filteredLocations.length} imaging location markers`);
+    console.log(`Adding ${locs.length} imaging location markers`);
 
     // Convert to GeoJSON features
-    const features = filteredLocations.map(loc => ({
+    const features = locs.map(loc => ({
       type: 'Feature',
       id: loc.id,
       properties: {
@@ -287,7 +272,7 @@ export default function SkyAtlas() {
         });
       }
     });
-  }, [selectedFilters, navigate]);
+  }, [navigate]);
 
   // Add markers when locations are loaded
   useEffect(() => {
@@ -295,13 +280,6 @@ export default function SkyAtlas() {
       setTimeout(() => addImagingMarkers(locations), 100);
     }
   }, [locations, mapReady, loading, addImagingMarkers]);
-
-  // Update markers when filters change
-  useEffect(() => {
-    if (mapReady && locations.length > 0 && !loading) {
-      addImagingMarkers(locations);
-    }
-  }, [selectedFilters, mapReady, locations, loading, addImagingMarkers]);
 
   if (loading) {
     return (
@@ -356,44 +334,6 @@ export default function SkyAtlas() {
           Offline interactive sky map • {locations.length} imaging locations
         </p>
       </div>
-
-      {/* Filter Panel */}
-      {allFilters.length > 0 && (
-        <div className="flex-shrink-0 p-4 border-b border-gray-700 bg-gray-800">
-          <div className="flex items-center gap-4">
-            <label className="text-sm text-gray-400 font-medium">Filter by:</label>
-            <div className="flex gap-2 flex-wrap">
-              {allFilters.map(filter => (
-                <button
-                  key={filter}
-                  onClick={() => {
-                    setSelectedFilters(prev =>
-                      prev.includes(filter)
-                        ? prev.filter(f => f !== filter)
-                        : [...prev, filter]
-                    );
-                  }}
-                  className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
-                    selectedFilters.includes(filter)
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                  }`}
-                >
-                  {filter}
-                </button>
-              ))}
-              {selectedFilters.length > 0 && (
-                <button
-                  onClick={() => setSelectedFilters([])}
-                  className="px-3 py-1 rounded text-sm font-medium bg-gray-700 text-gray-300 hover:bg-gray-600"
-                >
-                  Clear All
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Sky Map - direct flex child, no wrapper */}
       <div
