@@ -29,3 +29,14 @@ body {
   width: 100%;
   height: 100vh;
 }
+
+/* Sky Atlas - prevent d3-celestial SVG overflow */
+#celestial-map {
+  overflow: hidden !important;
+}
+
+#celestial-map svg {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+}
