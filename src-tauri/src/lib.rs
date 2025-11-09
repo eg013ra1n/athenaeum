@@ -12,6 +12,8 @@ mod clustering;
 mod sessions;
 mod cache;
 mod rustafits_processor;
+mod fingerprint;
+mod relinking;
 
 // Commands (Tauri API endpoints)
 mod commands;
@@ -61,6 +63,7 @@ pub fn run() {
             commands::get_scan_roots,
             commands::delete_scan_root,
             commands::start_scan,
+            commands::rescan_all_for_content_hash,
             commands::get_files,
             commands::get_files_by_directory,
             commands::get_duplicates,
@@ -93,6 +96,13 @@ pub fn run() {
             commands::send_to_void,
             commands::send_all_to_void,
             commands::get_duplicate_folders,
+            commands::backfill_header_fingerprints,
+            commands::relink_scan_root,
+            commands::get_orphaned_files,
+            commands::delete_orphaned_files,
+            commands::check_scan_root_availability,
+            commands::check_all_scan_roots_availability,
+            commands::check_missing_files_in_scan_root,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

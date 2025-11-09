@@ -14,6 +14,8 @@ pub mod defaults {
     pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "majority-object";
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "180";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "1.0";
+    pub const DUPLICATES_USE_CONTENT_HASH: &str = "false";
+    pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "false";
 }
 
 /// Setting keys used throughout the application
@@ -24,6 +26,8 @@ pub mod keys {
     pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "ui.objects.auto_name_mode";
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "dark_library.date_threshold_days";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "dark_library.temp_threshold_celsius";
+    pub const DUPLICATES_USE_CONTENT_HASH: &str = "duplicates.use_content_hash";
+    pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "duplicates.content_hash_rescanned";
 }
 
 /// Runtime overrides for settings (session-specific)
@@ -172,6 +176,26 @@ impl SettingsManager {
             defaults::DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS,
         )?;
         Ok(value.parse()?)
+    }
+
+    /// Get whether to use content hash (xxhash) for duplicate detection
+    pub fn get_duplicates_use_content_hash(&self, conn: &Connection) -> Result<bool> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::DUPLICATES_USE_CONTENT_HASH,
+            defaults::DUPLICATES_USE_CONTENT_HASH,
+        )?;
+        Ok(value.to_lowercase() == "true")
+    }
+
+    /// Get whether content hash rescan has been completed
+    pub fn get_duplicates_content_hash_rescanned(&self, conn: &Connection) -> Result<bool> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::DUPLICATES_CONTENT_HASH_RESCANNED,
+            defaults::DUPLICATES_CONTENT_HASH_RESCANNED,
+        )?;
+        Ok(value.to_lowercase() == "true")
     }
 }
 

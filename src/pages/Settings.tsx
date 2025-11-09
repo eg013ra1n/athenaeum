@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Save, AlertCircle, CheckCircle, Trash2 } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw } from 'lucide-react';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
@@ -23,6 +23,8 @@ export default function Settings() {
   const [qualityPreview, setQualityPreview] = useState('85');
   const [qualityFull, setQualityFull] = useState('95');
   const [blinkResolution, setBlinkResolution] = useState('preview');
+  const [useContentHash, setUseContentHash] = useState(false);
+  const [contentHashRescanned, setContentHashRescanned] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [clearingCache, setClearingCache] = useState(false);
@@ -30,6 +32,14 @@ export default function Settings() {
   const [success, setSuccess] = useState(false);
   const [cacheSuccess, setCacheSuccess] = useState(false);
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+
+  // Backfill fingerprints state
+  const [backfillingFingerprints, setBackfillingFingerprints] = useState(false);
+  const [backfillSuccess, setBackfillSuccess] = useState<number | null>(null);
+
+  // Content hash rescan state
+  const [rescanningContentHash, setRescanningContentHash] = useState(false);
+  const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
   useEffect(() => {
     loadSettings();
@@ -41,7 +51,7 @@ export default function Settings() {
       setLoading(true);
       setError(null);
 
-      const [value, unit, frame, mode, sessionGap, qThumbnail, qPreview, qFull, resolution] = await Promise.all([
+      const [value, unit, frame, mode, sessionGap, qThumbnail, qPreview, qFull, resolution, contentHash, contentHashRescanned] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
           defaultValue: '3.0',
@@ -78,6 +88,14 @@ export default function Settings() {
           key: 'blink.resolution',
           defaultValue: 'preview',
         }),
+        invoke<string>('get_setting', {
+          key: 'duplicates.use_content_hash',
+          defaultValue: 'false',
+        }),
+        invoke<string>('get_setting', {
+          key: 'duplicates.content_hash_rescanned',
+          defaultValue: 'false',
+        }),
       ]);
 
       setThresholdValue(value);
@@ -89,6 +107,8 @@ export default function Settings() {
       setQualityPreview(qPreview);
       setQualityFull(qFull);
       setBlinkResolution(resolution);
+      setUseContentHash(contentHash.toLowerCase() === 'true');
+      setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
     } catch (err) {
       setError(err as string);
       console.error('Failed to load settings:', err);
@@ -173,6 +193,15 @@ export default function Settings() {
           key: 'blink.resolution',
           value: blinkResolution,
         }),
+        invoke('set_setting', {
+          key: 'duplicates.use_content_hash',
+          value: useContentHash ? 'true' : 'false',
+        }),
+        // Reset rescan flag when toggling content hash
+        invoke('set_setting', {
+          key: 'duplicates.content_hash_rescanned',
+          value: useContentHash ? 'false' : 'false',
+        }),
       ]);
 
       setSuccess(true);
@@ -246,6 +275,52 @@ export default function Settings() {
         return value.toFixed(4);
       default:
         return 'N/A';
+    }
+  };
+
+  const handleBackfillFingerprints = async () => {
+    try {
+      setBackfillingFingerprints(true);
+      setError(null);
+      setBackfillSuccess(null);
+
+      const count = await invoke<number>('backfill_header_fingerprints');
+      setBackfillSuccess(count);
+      setTimeout(() => setBackfillSuccess(null), 5000);
+    } catch (err) {
+      setError(err as string);
+      console.error('Failed to backfill fingerprints:', err);
+    } finally {
+      setBackfillingFingerprints(false);
+    }
+  };
+
+  const handleRescanContentHash = async () => {
+    try {
+      setRescanningContentHash(true);
+      setError(null);
+      setRescanSuccess(null);
+
+      const result = await invoke<{files_total: number, files_updated: number, files_skipped: number, files_missing: number, errors: string[]}>('rescan_all_for_content_hash');
+
+      if (result.errors.length > 0) {
+        setError(`Rescan completed with ${result.errors.length} errors. Check console for details.`);
+        console.error('Rescan errors:', result.errors);
+      }
+
+      setRescanSuccess({ updated: result.files_updated, total: result.files_total });
+
+      // Update the rescanned flag in state to hide warning immediately
+      if (result.files_updated > 0 || result.files_skipped > 0) {
+        setContentHashRescanned(true);
+      }
+
+      setTimeout(() => setRescanSuccess(null), 5000);
+    } catch (err) {
+      setError(err as string);
+      console.error('Failed to rescan content hashes:', err);
+    } finally {
+      setRescanningContentHash(false);
     }
   };
 
@@ -483,6 +558,57 @@ export default function Settings() {
           </div>
         </div>
 
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Duplicate Detection</h3>
+
+          <div className="space-y-4">
+            {/* Content Hash Toggle */}
+            <div>
+              <label className="flex items-center gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={useContentHash}
+                  onChange={(e) => setUseContentHash(e.target.checked)}
+                  className="w-5 h-5 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-0"
+                />
+                <div>
+                  <span className="block text-sm font-medium text-gray-300">
+                    Use File Content Hash (XXHash)
+                  </span>
+                  <span className="block text-xs text-gray-500 mt-1">
+                    When enabled, duplicate detection will use XXHash sampling (1.5MB per file) instead of metadata-based hashing. More accurate for finding true duplicates.
+                    <br />
+                    <span className="text-yellow-400 font-medium">⚠️ Not recommended for NAS or slow network storage</span> - hash computation requires reading file data which may be slow over network.
+                  </span>
+                </div>
+              </label>
+            </div>
+
+            {/* Rescan Warning */}
+            {useContentHash && !contentHashRescanned && (
+              <div className="p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
+                <p className="text-sm text-yellow-300">
+                  ⚠️ After enabling content hash, you must rescan all files to compute their hashes. New files scanned after enabling this will automatically have their content hashes computed.
+                </p>
+                <button
+                  onClick={handleRescanContentHash}
+                  disabled={rescanningContentHash}
+                  className="mt-3 flex items-center gap-2 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+                >
+                  <RefreshCw size={18} className={rescanningContentHash ? 'animate-spin' : ''} />
+                  {rescanningContentHash ? 'Computing Hashes...' : 'Rescan All Files for Content Hash'}
+                </button>
+                {rescanSuccess !== null && (
+                  <div className="mt-2 flex items-center gap-2 text-green-400">
+                    <CheckCircle size={18} />
+                    <span>Updated {rescanSuccess.updated} of {rescanSuccess.total} files</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
         <div className="pt-4 border-t border-gray-700">
           <div className="flex items-center gap-4">
             <button
@@ -510,6 +636,35 @@ export default function Settings() {
               <div className="flex items-center gap-2 text-green-400">
                 <CheckCircle size={18} />
                 <span>Cache cleared!</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Database Maintenance Section */}
+      <div className="mt-6 bg-gray-800 rounded-lg p-6">
+        <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <Database size={20} />
+          Database Maintenance
+        </h3>
+        <div className="space-y-4">
+          <div>
+            <p className="text-sm text-gray-400 mb-3">
+              Backfill header fingerprints for existing FITS files. This is required for file relinking when directories are moved.
+            </p>
+            <button
+              onClick={handleBackfillFingerprints}
+              disabled={backfillingFingerprints}
+              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+            >
+              <RefreshCw size={18} className={backfillingFingerprints ? 'animate-spin' : ''} />
+              {backfillingFingerprints ? 'Computing...' : 'Backfill Header Fingerprints'}
+            </button>
+            {backfillSuccess !== null && (
+              <div className="mt-2 flex items-center gap-2 text-green-400">
+                <CheckCircle size={18} />
+                <span>Processed {backfillSuccess} headers</span>
               </div>
             )}
           </div>

@@ -2,7 +2,7 @@ use rusqlite::{Connection, Result};
 
 /// Initialize the database schema
 pub fn init_db(conn: &Connection) -> Result<()> {
-    // Files table - includes metadata hash for quick duplicate detection
+    // Files table - includes metadata hash for quick duplicate detection and content_hash for xxhash-based detection
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -12,7 +12,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             modified_at TEXT NOT NULL,
             format TEXT NOT NULL CHECK(format IN ('FITS', 'XISF')),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            metadata_hash TEXT
+            metadata_hash TEXT,
+            content_hash TEXT
         )",
         [],
     )?;
@@ -204,6 +205,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_id INTEGER NOT NULL,
             header TEXT NOT NULL,
+            header_fingerprint TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         )",
         [],
@@ -239,6 +241,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_metadata_hash ON files(metadata_hash)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)",
         [],
     )?;
     conn.execute(
@@ -301,6 +307,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_black_hole_moved_at ON black_hole(moved_at)",
         [],
     )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fits_header_fingerprint ON fits_header(header_fingerprint)",
+        [],
+    )?;
 
     // Migrations - add columns to existing tables if they don't exist
     // Add find_duplicates to scan_roots table (migration for existing databases)
@@ -312,6 +322,32 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_find_duplicates {
         conn.execute(
             "ALTER TABLE scan_roots ADD COLUMN find_duplicates INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+
+    // Add header_fingerprint to fits_header table (migration for existing databases)
+    let has_header_fingerprint: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('fits_header') WHERE name='header_fingerprint'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_header_fingerprint {
+        conn.execute(
+            "ALTER TABLE fits_header ADD COLUMN header_fingerprint TEXT",
+            [],
+        )?;
+    }
+
+    // Add content_hash to files table (migration for existing databases)
+    let has_content_hash: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='content_hash'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_content_hash {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN content_hash TEXT",
             [],
         )?;
     }

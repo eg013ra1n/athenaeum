@@ -102,6 +102,10 @@ export interface ScanRoot {
   last_scan: string | null; // ISO 8601 datetime
 }
 
+export interface ScanRootWithAvailability extends ScanRoot {
+  is_available: boolean;
+}
+
 export interface ExportTemplate {
   id: number | null;
   name: string;
@@ -294,4 +298,23 @@ export interface FitsImageData {
   height: number;
   is_color: boolean;
   bit_depth: number;
+}
+
+// File Relinking
+export interface RelinkResult {
+  files_matched: number;
+  files_new: number;
+  files_orphaned: number;
+  orphaned_file_ids: number[];
+}
+
+export interface OrphanedFile {
+  id: number;
+  path: string;
+  filename: string;
+  size: number;
+  modified_at: string;
+  has_frame: boolean;
+  object: string | null;
+  date_obs: string | null;
 }

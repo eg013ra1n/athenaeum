@@ -107,6 +107,7 @@ pub async fn read_fits_image_rustafits(
                             format: crate::models::FileFormat::FITS,
                             created_at: chrono::Utc::now(),
                             metadata_hash: None,
+                            content_hash: None,
                         })
                     }
                 }

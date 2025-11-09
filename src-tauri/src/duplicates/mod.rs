@@ -3,24 +3,53 @@
 
 use std::path::Path;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use anyhow::Result;
 use xxhash_rust::xxh3::Xxh3;
 use chrono::{DateTime, Utc};
 
-/// Compute XXH3_64 hash for a file
+/// Compute XXH3_64 hash for a file using 3-position sampling
+/// Samples: beginning (512KB), middle (512KB), end (512KB)
+/// Uses 64KB buffer for efficient I/O
 pub fn compute_xxhash(path: &Path) -> Result<String> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Xxh3::new();
-    let mut buffer = vec![0; 8192];
+    const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer
+    const CHUNK_SIZE: usize = 512 * 1024; // 512KB per sample
 
-    loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+    let mut file = File::open(path)?;
+    let file_size = file.metadata()?.len() as usize;
+    let mut hasher = Xxh3::new();
+    let mut buffer = vec![0; BUFFER_SIZE];
+
+    // Helper to read and hash a chunk
+    let mut read_and_hash = |file: &mut File, start_pos: u64, chunk_size: usize| -> Result<()> {
+        file.seek(SeekFrom::Start(start_pos))?;
+        let mut remaining = chunk_size;
+
+        while remaining > 0 {
+            let to_read = remaining.min(BUFFER_SIZE);
+            let bytes_read = file.read(&mut buffer[..to_read])?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+            hasher.update(&buffer[..bytes_read]);
+            remaining -= bytes_read;
         }
-        hasher.update(&buffer[..bytes_read]);
+        Ok(())
+    };
+
+    // Position 1: Beginning (first 512KB from byte 0)
+    read_and_hash(&mut file, 0, CHUNK_SIZE.min(file_size))?;
+
+    // Position 2: Middle (512KB centered at midpoint)
+    if file_size > CHUNK_SIZE {
+        let middle_start = (file_size / 2).saturating_sub(CHUNK_SIZE / 2);
+        read_and_hash(&mut file, middle_start as u64, CHUNK_SIZE.min(file_size - middle_start))?;
+    }
+
+    // Position 3: End (last 512KB)
+    if file_size > CHUNK_SIZE * 2 {
+        let end_start = file_size.saturating_sub(CHUNK_SIZE);
+        read_and_hash(&mut file, end_start as u64, CHUNK_SIZE)?;
     }
 
     Ok(format!("{:016x}", hasher.digest()))
@@ -47,8 +76,8 @@ pub fn compute_metadata_hash(size: i64, modified_at: &DateTime<Utc>, filename: &
 
 /// Group files by size and hash to find duplicates
 /// This function is a wrapper - actual implementation is in db::find_duplicate_groups
-pub fn find_duplicates(conn: &rusqlite::Connection) -> Result<Vec<DuplicateGroup>> {
-    crate::db::find_duplicate_groups(conn).map_err(|e| anyhow::anyhow!(e.to_string()))
+pub fn find_duplicates(conn: &rusqlite::Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
+    crate::db::find_duplicate_groups(conn, use_content_hash).map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 /// Verify two files are byte-identical (optional safeguard)

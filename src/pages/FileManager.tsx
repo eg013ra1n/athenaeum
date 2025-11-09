@@ -1,17 +1,18 @@
-import { useState } from 'react';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useScanRoots, useScan, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
+import { invoke } from '@tauri-apps/api/core';
+import { useScanRootsWithAvailability, useScan, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
-import type { ScanResult } from '../types/models';
+import type { ScanResult, RelinkResult, OrphanedFile } from '../types/models';
 
 type TabMode = 'directories' | 'browse' | 'duplicates';
 type DuplicatesViewMode = 'files' | 'folders';
 
 export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
-  const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag } = useScanRoots();
+  const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, relinkScanRoot } = useScanRootsWithAvailability();
   const { startScan } = useScan();
   const { duplicates, loading: dupsLoading, error: dupsError, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, refresh: refreshFolders } = useDuplicateFolders(70);
@@ -23,6 +24,53 @@ export default function FileManager() {
   const [scanResultMap, setScanResultMap] = useState<Record<number, ScanResult>>({});
   const [scanError, setScanError] = useState<string | null>(null);
   const [movingToBlackHole, setMovingToBlackHole] = useState<Record<string, boolean>>({});
+  const [relinkingRootId, setRelinkingRootId] = useState<number | null>(null);
+  const [relinkResult, setRelinkResult] = useState<RelinkResult | null>(null);
+  const [missingFilesMap, setMissingFilesMap] = useState<Record<number, OrphanedFile[]>>({});
+  const [checkingMissingFiles, setCheckingMissingFiles] = useState<Record<number, boolean>>({});
+
+  // Check for missing files in available scan roots
+  const checkMissingFiles = async (rootId: number) => {
+    try {
+      setCheckingMissingFiles(prev => ({ ...prev, [rootId]: true }));
+      const missingFiles = await invoke<OrphanedFile[]>('check_missing_files_in_scan_root', { rootId });
+      setMissingFilesMap(prev => ({ ...prev, [rootId]: missingFiles }));
+    } catch (error) {
+      console.error('Failed to check missing files:', error);
+    } finally {
+      setCheckingMissingFiles(prev => ({ ...prev, [rootId]: false }));
+    }
+  };
+
+  // Check missing files for all available scan roots when they load
+  useEffect(() => {
+    scanRoots.forEach(root => {
+      if (root.id && root.is_available && !missingFilesMap[root.id]) {
+        checkMissingFiles(root.id);
+      }
+    });
+  }, [scanRoots]);
+
+  // Handle deleting missing files
+  const handleDeleteMissingFiles = async (rootId: number) => {
+    const missingFiles = missingFilesMap[rootId];
+    if (!missingFiles || missingFiles.length === 0) return;
+
+    if (confirm(`Are you sure you want to delete ${missingFiles.length} missing file records from the database?`)) {
+      try {
+        const fileIds = missingFiles.map(f => f.id);
+        await invoke('delete_orphaned_files', { fileIds });
+
+        // Update the missing files map
+        setMissingFilesMap(prev => ({ ...prev, [rootId]: [] }));
+
+        alert(`Deleted ${missingFiles.length} missing file records`);
+      } catch (error) {
+        console.error('Failed to delete missing files:', error);
+        alert(typeof error === 'string' ? error : 'Failed to delete missing files');
+      }
+    }
+  };
 
   // Handle adding a new directory
   const handleAddDirectory = async () => {
@@ -61,11 +109,41 @@ export default function FileManager() {
       const result = await startScan(rootId);
       setScanResultMap(prev => ({ ...prev, [rootId]: result }));
       setRefreshTrigger(prev => prev + 1); // Trigger refresh after scanning
+
+      // Re-check for missing files after scan completes
+      await checkMissingFiles(rootId);
     } catch (error) {
       console.error('Scan failed:', error);
       setScanError(typeof error === 'string' ? error : 'Scan failed');
     } finally {
       setScanningMap(prev => ({ ...prev, [rootId]: false }));
+    }
+  };
+
+  // Handle relinking a scan root to a new location
+  const handleRelinkScanRoot = async (rootId: number) => {
+    try {
+      setRelinkingRootId(rootId);
+      setRelinkResult(null);
+
+      const selectedPath = await open({
+        directory: true,
+        multiple: false,
+        title: 'Select new location for scan root',
+      });
+
+      if (!selectedPath || typeof selectedPath !== 'string') {
+        setRelinkingRootId(null);
+        return;
+      }
+
+      const result = await relinkScanRoot(rootId, selectedPath);
+      setRelinkResult(result);
+    } catch (error) {
+      console.error('Relink failed:', error);
+      alert(typeof error === 'string' ? error : 'Relink failed');
+    } finally {
+      setRelinkingRootId(null);
     }
   };
 
@@ -193,12 +271,79 @@ export default function FileManager() {
               {scanRoots.map((root) => {
                 const isScanning = root.id ? scanningMap[root.id] : false;
                 const scanResult = root.id ? scanResultMap[root.id] : null;
+                const isUnavailable = !root.is_available;
 
                 return (
-                  <div key={root.id} className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                  <div
+                    key={root.id}
+                    className={`bg-gray-800 rounded-lg p-4 border ${
+                      isUnavailable
+                        ? 'border-yellow-600 bg-yellow-900/10'
+                        : 'border-gray-700'
+                    }`}
+                  >
+                    {/* Unavailability Warning Banner */}
+                    {isUnavailable && (
+                      <div className="mb-3 p-3 bg-yellow-900/30 border border-yellow-700 rounded flex items-start gap-3">
+                        <AlertTriangle className="text-yellow-400 flex-shrink-0 mt-0.5" size={20} />
+                        <div className="flex-1">
+                          <p className="font-semibold text-yellow-400 mb-1">Directory Not Found</p>
+                          <p className="text-sm text-yellow-300 mb-2">
+                            This directory is not accessible. It may have been moved, renamed, or is on an unmounted drive.
+                          </p>
+                          <button
+                            onClick={() => root.id && handleRelinkScanRoot(root.id)}
+                            disabled={relinkingRootId === root.id}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded text-sm transition"
+                          >
+                            <RefreshCw size={16} className={relinkingRootId === root.id ? 'animate-spin' : ''} />
+                            {relinkingRootId === root.id ? 'Relinking...' : 'Relink Directory'}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Missing Files Warning Banner */}
+                    {!isUnavailable && root.id && missingFilesMap[root.id] && missingFilesMap[root.id].length > 0 && (
+                      <div className="mb-3 p-3 bg-orange-900/30 border border-orange-700 rounded flex items-start gap-3">
+                        <FileWarning className="text-orange-400 flex-shrink-0 mt-0.5" size={20} />
+                        <div className="flex-1">
+                          <p className="font-semibold text-orange-400 mb-1">Missing Files Detected</p>
+                          <p className="text-sm text-orange-300 mb-2">
+                            {missingFilesMap[root.id].length} file{missingFilesMap[root.id].length !== 1 ? 's' : ''} in the database no longer exist on disk.
+                            These files may have been deleted or moved to another location.
+                          </p>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => root.id && checkMissingFiles(root.id)}
+                              disabled={checkingMissingFiles[root.id]}
+                              className="flex items-center gap-2 px-3 py-1.5 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded text-sm transition"
+                            >
+                              <RefreshCw size={16} className={checkingMissingFiles[root.id] ? 'animate-spin' : ''} />
+                              {checkingMissingFiles[root.id] ? 'Checking...' : 'Recheck'}
+                            </button>
+                            <button
+                              onClick={() => root.id && handleDeleteMissingFiles(root.id)}
+                              className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded text-sm transition"
+                            >
+                              <Trash2 size={16} />
+                              Delete Records
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex-1">
-                        <span className="block font-mono text-sm font-semibold">{root.path}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="block font-mono text-sm font-semibold">{root.path}</span>
+                          {isUnavailable && (
+                            <span className="px-2 py-0.5 bg-yellow-900/50 border border-yellow-700 rounded text-xs text-yellow-400">
+                              Offline
+                            </span>
+                          )}
+                        </div>
                         {root.last_scan && (
                           <span className="text-xs text-gray-400">
                             Last scan: {format(new Date(root.last_scan), 'PPpp')}
@@ -217,7 +362,7 @@ export default function FileManager() {
                         </label>
                         <button
                           onClick={() => root.id && handleStartScan(root.id)}
-                          disabled={isScanning}
+                          disabled={isScanning || isUnavailable}
                           className="flex items-center gap-2 px-3 py-2 bg-green-600 hover:bg-green-700 rounded transition disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           {isScanning ? (
@@ -267,6 +412,36 @@ export default function FileManager() {
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {/* Relink Result Display */}
+          {relinkResult && (
+            <div className="mt-4 bg-gray-700 rounded-lg p-4 border border-gray-600">
+              <h4 className="font-semibold mb-3 flex items-center gap-2">
+                <CheckCircle2 className="text-green-500" size={18} />
+                Relinking Complete
+              </h4>
+              <div className="grid grid-cols-3 gap-4 text-sm">
+                <div>
+                  <p className="text-gray-400">Matched</p>
+                  <p className="text-xl font-bold text-green-400">{relinkResult.files_matched}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400">New Files</p>
+                  <p className="text-xl font-bold text-blue-400">{relinkResult.files_new}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400">Orphaned</p>
+                  <p className="text-xl font-bold text-yellow-400">{relinkResult.files_orphaned}</p>
+                </div>
+              </div>
+              {relinkResult.files_orphaned > 0 && (
+                <p className="mt-3 text-sm text-yellow-400">
+                  {relinkResult.files_orphaned} files could not be found at the new location.
+                  You can manage orphaned files in Settings.
+                </p>
+              )}
             </div>
           )}
         </div>
