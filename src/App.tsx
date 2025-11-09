@@ -10,6 +10,7 @@ import FrameSetDetail from './pages/FrameSetDetail';
 import Equipment from './pages/Equipment';
 import Export from './pages/Export';
 import BlackHole from './pages/BlackHole';
+import SkyAtlas from './pages/SkyAtlas';
 import Settings from './pages/Settings';
 
 function App() {
@@ -60,6 +61,7 @@ function App() {
           <Route path="calendar" element={<ShootCalendar />} />
           <Route path="objects" element={<Objects />} />
           <Route path="objects/:id" element={<FrameSetDetail />} />
+          <Route path="skyatlas" element={<SkyAtlas />} />
           <Route path="equipment" element={<Equipment />} />
           <Route path="export" element={<Export />} />
           <Route path="blackhole" element={<BlackHole />} />

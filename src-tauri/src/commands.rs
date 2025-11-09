@@ -1399,3 +1399,98 @@ pub async fn check_missing_files_in_scan_root(
     Ok(missing_files)
 }
 
+#[tauri::command]
+pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<ImagingLocation>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Query all LIGHT frames with coordinates, grouped by frame set
+    // Schema: frames_set -> imaging_nights -> sessions -> session_members -> frames
+    let mut stmt = conn.prepare("
+        SELECT
+            fs.id as frame_set_id,
+            fs.name as object_name,
+            AVG(fr.ra) as avg_ra,
+            AVG(fr.dec) as avg_dec,
+            COUNT(DISTINCT fr.id) as frame_count,
+            SUM(fr.exptime) as total_exposure,
+            GROUP_CONCAT(DISTINCT fr.filter) as filters,
+            MIN(fr.date_obs) as first_date,
+            MAX(fr.date_obs) as last_date,
+            AVG(fr.xpixsz) as avg_xpixsz,
+            AVG(fr.focallen) as avg_focallen
+        FROM frames_set fs
+        JOIN imaging_nights ino ON ino.frames_set_id = fs.id
+        JOIN sessions s ON s.imaging_night_id = ino.id
+        JOIN session_members sm ON sm.session_id = s.id
+        JOIN frames fr ON fr.id = sm.frame_id
+        WHERE fr.ra IS NOT NULL
+          AND fr.dec IS NOT NULL
+          AND fr.imagetyp = 'Light'
+        GROUP BY fs.id
+        HAVING avg_ra IS NOT NULL AND avg_dec IS NOT NULL
+    ").map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let locations = stmt.query_map([], |row| {
+        let frame_set_id: i64 = row.get(0)?;
+        let object_name: Option<String> = row.get(1)?;
+        let ra: f64 = row.get(2)?;
+        let dec: f64 = row.get(3)?;
+        let frame_count: i32 = row.get(4)?;
+        let total_exposure: f64 = row.get(5)?;
+        let filters_str: Option<String> = row.get(6)?;
+        let first_date: Option<String> = row.get(7)?;
+        let last_date: Option<String> = row.get(8)?;
+        let avg_xpixsz: Option<f64> = row.get(9)?;
+        let avg_focallen: Option<f64> = row.get(10)?;
+
+        // Parse filters from comma-separated string
+        let filters: Vec<String> = filters_str
+            .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
+            .unwrap_or_default();
+
+        // Calculate FOV if we have the necessary metadata
+        let (fov_width, fov_height) = if let (Some(pixel_size), Some(focal_len)) = (avg_xpixsz, avg_focallen) {
+            if focal_len > 0.0 {
+                // Assuming typical sensor size or using a default
+                // FOV (degrees) = 2 * arctan(sensor_size / (2 * focal_length)) * (180 / π)
+                // For now, using a simplified calculation with assumed 4096x4096 sensor
+                let pixel_scale_arcsec = (pixel_size / focal_len) * 206.265;
+                let fov_w = (pixel_scale_arcsec * 4096.0) / 3600.0;
+                let fov_h = (pixel_scale_arcsec * 4096.0) / 3600.0;
+                (Some(fov_w), Some(fov_h))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        Ok(ImagingLocation {
+            id: frame_set_id,
+            ra,
+            dec,
+            object_name,
+            frame_count,
+            total_exposure,
+            filters,
+            date_range: (
+                first_date.unwrap_or_default(),
+                last_date.unwrap_or_default()
+            ),
+            frame_set_id: Some(frame_set_id),
+            fov_width,
+            fov_height,
+        })
+    }).map_err(|e| format!("Failed to query imaging locations: {}", e))?;
+
+    let result: Vec<ImagingLocation> = locations
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect results: {}", e))?;
+
+    println!("Found {} imaging locations", result.len());
+
+    Ok(result)
+}
+
