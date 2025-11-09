@@ -12,6 +12,7 @@ pub struct File {
     pub format: FileFormat,
     pub created_at: DateTime<Utc>,
     pub metadata_hash: Option<String>,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -366,4 +367,26 @@ pub struct DarkLibraryResult {
     pub sets_created: i64,
     pub frames_grouped: i64,
     pub frames_excluded: i64,
+}
+
+/// Result of file relinking operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelinkResult {
+    pub files_matched: usize,
+    pub files_new: usize,
+    pub files_orphaned: usize,
+    pub orphaned_file_ids: Vec<i64>,
+}
+
+/// Represents an orphaned file that couldn't be relinked
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanedFile {
+    pub id: i64,
+    pub path: String,
+    pub filename: String,
+    pub size: i64,
+    pub modified_at: String,
+    pub has_frame: bool,
+    pub object: Option<String>,
+    pub date_obs: Option<String>,
 }

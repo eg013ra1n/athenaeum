@@ -170,7 +170,7 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
 /// Get a file by its path
 pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
     conn.query_row(
-        "SELECT id, path, filename, size, modified_at, format, created_at, metadata_hash, content_hash
+        "SELECT id, path, filename, size, modified_at, format, created_at, metadata_hash
          FROM files WHERE path = ?1",
         params![path],
         |row| {
@@ -191,7 +191,6 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
                     .unwrap()
                     .with_timezone(&Utc),
                 metadata_hash: row.get(7)?,
-                content_hash: row.get(8)?,
             })
         },
     )
@@ -298,7 +297,7 @@ pub fn get_files_by_directory(
     // Find files that are directly in this directory (not in subdirectories)
     // path should start with directory_path/ but not contain additional slashes after that
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
@@ -333,42 +332,41 @@ pub fn get_files_by_directory(
                 .unwrap()
                 .with_timezone(&Utc),
             metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
         };
 
-        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(9) {
+        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(8) {
             frame_id.map(|fid| Frame {
                 id: Some(fid),
                 file_id: file.id.unwrap(),
-                object: row.get(10).ok(),
-                date_obs: row.get::<_, Option<String>>(11).ok().flatten().and_then(|s| {
+                object: row.get(9).ok(),
+                date_obs: row.get::<_, Option<String>>(10).ok().flatten().and_then(|s| {
                     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                 }),
-                telescop: row.get(12).ok(),
-                instrume: row.get(13).ok(),
-                exptime: row.get(14).ok(),
-                filter: row.get(15).ok(),
-                imagetyp: row.get::<_, Option<String>>(16).ok().flatten().and_then(|s| ImageType::from_str(&s)),
-                is_master: row.get::<_, i32>(17).ok().map(|v| v == 1).unwrap_or(false),
-                gain: row.get(18).ok(),
-                offset: row.get(19).ok(),
-                binning: row.get(20).ok(),
-                xbinning: row.get(21).ok(),
-                ybinning: row.get(22).ok(),
-                ccd_temp: row.get(23).ok(),
-                set_temp: row.get(24).ok(),
-                focallen: row.get(25).ok(),
-                xpixsz: row.get(26).ok(),
-                pixsz: row.get(27).ok(),
-                ra: row.get(28).ok(),
-                dec: row.get(29).ok(),
-                sitelat: row.get(30).ok(),
-                lat_obs: row.get(31).ok(),
-                sitelong: row.get(32).ok(),
-                long_obs: row.get(33).ok(),
-                objctra: row.get(34).ok(),
-                objctdec: row.get(35).ok(),
-                override_: row.get::<_, i32>(36).ok().map(|v| v == 1).unwrap_or(false),
+                telescop: row.get(11).ok(),
+                instrume: row.get(12).ok(),
+                exptime: row.get(13).ok(),
+                filter: row.get(14).ok(),
+                imagetyp: row.get::<_, Option<String>>(15).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+                is_master: row.get::<_, i32>(16).ok().map(|v| v == 1).unwrap_or(false),
+                gain: row.get(17).ok(),
+                offset: row.get(18).ok(),
+                binning: row.get(19).ok(),
+                xbinning: row.get(20).ok(),
+                ybinning: row.get(21).ok(),
+                ccd_temp: row.get(22).ok(),
+                set_temp: row.get(23).ok(),
+                focallen: row.get(24).ok(),
+                xpixsz: row.get(25).ok(),
+                pixsz: row.get(26).ok(),
+                ra: row.get(27).ok(),
+                dec: row.get(28).ok(),
+                sitelat: row.get(29).ok(),
+                lat_obs: row.get(30).ok(),
+                sitelong: row.get(31).ok(),
+                long_obs: row.get(32).ok(),
+                objctra: row.get(33).ok(),
+                objctdec: row.get(34).ok(),
+                override_: row.get::<_, i32>(35).ok().map(|v| v == 1).unwrap_or(false),
             })
         } else {
             None
@@ -380,18 +378,13 @@ pub fn get_files_by_directory(
     results.collect()
 }
 
-/// Find duplicates by filename and metadata, or by content hash
+/// Find duplicates by filename and metadata
 /// Only includes files from scan roots where find_duplicates = 1
-///
-/// If use_content_hash is true, groups by content_hash (xxhash).
-/// If use_content_hash is false, groups by metadata_hash (size + modified + filename).
-pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
-    let hash_column = if use_content_hash { "content_hash" } else { "metadata_hash" };
-
-    let query = format!(
-        "SELECT f.{}, f.size, COUNT(*) as count, GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids
+pub fn find_duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.metadata_hash, f.size, COUNT(*) as count, GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids
          FROM files f
-         WHERE f.{} IS NOT NULL
+         WHERE f.metadata_hash IS NOT NULL
          AND NOT EXISTS (
              SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
          )
@@ -400,13 +393,10 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
              WHERE sr.find_duplicates = 1
              AND (f.path LIKE sr.path || '%' OR f.path LIKE sr.path || '/%')
          )
-         GROUP BY f.{}, f.size
+         GROUP BY f.metadata_hash, f.size
          HAVING count > 1
-         ORDER BY count DESC, f.size DESC",
-        hash_column, hash_column, hash_column
-    );
-
-    let mut stmt = conn.prepare(&query)?;
+         ORDER BY count DESC, f.size DESC"
+    )?;
 
     let groups = stmt.query_map([], |row| {
         let paths_str: String = row.get(3)?;
@@ -420,7 +410,7 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
         Ok(DuplicateGroup {
             id: None,
             size: row.get(1)?,
-            content_hash: row.get(0)?,
+            content_hash: row.get(0)?, // Metadata hash
             file_count: row.get(2)?,
             file_paths,
             file_ids,
@@ -737,7 +727,7 @@ pub fn get_frames_with_files_for_set(
     frames_set_id: i64,
 ) -> Result<Vec<(i64, crate::models::File, crate::models::Frame)>> {
     let mut stmt = conn.prepare(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash,
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
@@ -770,47 +760,46 @@ pub fn get_frames_with_files_for_set(
                 .unwrap()
                 .with_timezone(&Utc),
             metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
         };
 
         let frame = crate::models::Frame {
-            id: row.get(9)?,
-            file_id: row.get(10)?,
-            object: row.get(11)?,
-            date_obs: row.get::<_, Option<String>>(12)?.and_then(|s| {
+            id: row.get(8)?,
+            file_id: row.get(9)?,
+            object: row.get(10)?,
+            date_obs: row.get::<_, Option<String>>(11)?.and_then(|s| {
                 DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
             }),
-            telescop: row.get(13)?,
-            instrume: row.get(14)?,
-            exptime: row.get(15)?,
-            filter: row.get(16)?,
-            imagetyp: row.get::<_, Option<String>>(17)?.and_then(|s| crate::models::ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(18)? == 1,
-            gain: row.get(19)?,
-            offset: row.get(20)?,
-            binning: row.get(21)?,
-            xbinning: row.get(22)?,
-            ybinning: row.get(23)?,
-            ccd_temp: row.get(24)?,
-            set_temp: row.get(25)?,
-            focallen: row.get(26)?,
-            xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
-            ra: row.get(29)?,
-            dec: row.get(30)?,
-            sitelat: row.get(31)?,
-            lat_obs: row.get(32)?,
-            sitelong: row.get(33)?,
-            long_obs: row.get(34)?,
-            objctra: row.get(35)?,
-            objctdec: row.get(36)?,
-            override_: row.get::<_, i32>(37)? == 1,
+            telescop: row.get(12)?,
+            instrume: row.get(13)?,
+            exptime: row.get(14)?,
+            filter: row.get(15)?,
+            imagetyp: row.get::<_, Option<String>>(16)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+            is_master: row.get::<_, i32>(17)? == 1,
+            gain: row.get(18)?,
+            offset: row.get(19)?,
+            binning: row.get(20)?,
+            xbinning: row.get(21)?,
+            ybinning: row.get(22)?,
+            ccd_temp: row.get(23)?,
+            set_temp: row.get(24)?,
+            focallen: row.get(25)?,
+            xpixsz: row.get(26)?,
+            pixsz: row.get(27)?,
+            ra: row.get(28)?,
+            dec: row.get(29)?,
+            sitelat: row.get(30)?,
+            lat_obs: row.get(31)?,
+            sitelong: row.get(32)?,
+            long_obs: row.get(33)?,
+            objctra: row.get(34)?,
+            objctdec: row.get(35)?,
+            override_: row.get::<_, i32>(36)? == 1,
         };
 
         // Debug: Check date_obs in database
-        let date_obs_raw: Option<String> = row.get(12)?;
+        let date_obs_raw: Option<String> = row.get(11)?;
         if date_obs_raw.is_none() {
-            let frame_id: i64 = row.get(9)?;
+            let frame_id: i64 = row.get(8)?;
             let filename: String = row.get(2)?;
             println!("Frame {} ({}) has NULL date_obs in database", frame_id, filename);
         } else {
@@ -870,7 +859,7 @@ pub fn get_frames_with_files_by_ids(
     // Build the query with placeholders for each ID
     let placeholders = frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash,
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
@@ -909,43 +898,42 @@ pub fn get_frames_with_files_by_ids(
                 .unwrap()
                 .with_timezone(&Utc),
             metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
         };
 
-        let date_obs_raw: Option<String> = row.get(12)?;
+        let date_obs_raw: Option<String> = row.get(11)?;
 
         let frame = crate::models::Frame {
-            id: row.get(9)?,
-            file_id: row.get(10)?,
-            object: row.get(11)?,
+            id: row.get(8)?,
+            file_id: row.get(9)?,
+            object: row.get(10)?,
             date_obs: date_obs_raw.and_then(|s| {
                 DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
             }),
-            telescop: row.get(13)?,
-            instrume: row.get(14)?,
-            exptime: row.get(15)?,
-            filter: row.get(16)?,
-            imagetyp: row.get::<_, Option<String>>(17)?.and_then(|s| crate::models::ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(18)? == 1,
-            gain: row.get(19)?,
-            offset: row.get(20)?,
-            binning: row.get(21)?,
-            xbinning: row.get(22)?,
-            ybinning: row.get(23)?,
-            ccd_temp: row.get(24)?,
-            set_temp: row.get(25)?,
-            focallen: row.get(26)?,
-            xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
-            ra: row.get(29)?,
-            dec: row.get(30)?,
-            sitelat: row.get(31)?,
-            lat_obs: row.get(32)?,
-            sitelong: row.get(33)?,
-            long_obs: row.get(34)?,
-            objctra: row.get(35)?,
-            objctdec: row.get(36)?,
-            override_: row.get::<_, i32>(37)? == 1,
+            telescop: row.get(12)?,
+            instrume: row.get(13)?,
+            exptime: row.get(14)?,
+            filter: row.get(15)?,
+            imagetyp: row.get::<_, Option<String>>(16)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+            is_master: row.get::<_, i32>(17)? == 1,
+            gain: row.get(18)?,
+            offset: row.get(19)?,
+            binning: row.get(20)?,
+            xbinning: row.get(21)?,
+            ybinning: row.get(22)?,
+            ccd_temp: row.get(23)?,
+            set_temp: row.get(24)?,
+            focallen: row.get(25)?,
+            xpixsz: row.get(26)?,
+            pixsz: row.get(27)?,
+            ra: row.get(28)?,
+            dec: row.get(29)?,
+            sitelat: row.get(30)?,
+            lat_obs: row.get(31)?,
+            sitelong: row.get(32)?,
+            long_obs: row.get(33)?,
+            objctra: row.get(34)?,
+            objctdec: row.get(35)?,
+            override_: row.get::<_, i32>(36)? == 1,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -1015,7 +1003,7 @@ pub fn get_imaging_nights_with_sessions(
 
             // Get frames for this session
             let mut frames_stmt = conn.prepare(
-                "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+                "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash,
                         fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                         fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                         fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
@@ -1046,41 +1034,40 @@ pub fn get_imaging_nights_with_sessions(
                         .unwrap()
                         .with_timezone(&Utc),
                     metadata_hash: row.get(7)?,
-                    content_hash: row.get(8)?,
                 };
 
                 let frame = crate::models::Frame {
-                    id: row.get(9)?,
-                    file_id: row.get(10)?,
-                    object: row.get(11)?,
-                    date_obs: row.get::<_, Option<String>>(12)?.and_then(|s| {
+                    id: row.get(8)?,
+                    file_id: row.get(9)?,
+                    object: row.get(10)?,
+                    date_obs: row.get::<_, Option<String>>(11)?.and_then(|s| {
                         DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                     }),
-                    telescop: row.get(13)?,
-                    instrume: row.get(14)?,
-                    exptime: row.get(15)?,
-                    filter: row.get(16)?,
-                    imagetyp: row.get::<_, Option<String>>(17)?.and_then(|s| crate::models::ImageType::from_str(&s)),
-                    is_master: row.get::<_, i32>(18)? == 1,
-                    gain: row.get(19)?,
-                    offset: row.get(20)?,
-                    binning: row.get(21)?,
-                    xbinning: row.get(22)?,
-                    ybinning: row.get(23)?,
-                    ccd_temp: row.get(24)?,
-                    set_temp: row.get(25)?,
-                    focallen: row.get(26)?,
-                    xpixsz: row.get(27)?,
-                    pixsz: row.get(28)?,
-                    ra: row.get(29)?,
-                    dec: row.get(30)?,
-                    sitelat: row.get(31)?,
-                    lat_obs: row.get(32)?,
-                    sitelong: row.get(33)?,
-                    long_obs: row.get(34)?,
-                    objctra: row.get(35)?,
-                    objctdec: row.get(36)?,
-                    override_: row.get::<_, i32>(37)? == 1,
+                    telescop: row.get(12)?,
+                    instrume: row.get(13)?,
+                    exptime: row.get(14)?,
+                    filter: row.get(15)?,
+                    imagetyp: row.get::<_, Option<String>>(16)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+                    is_master: row.get::<_, i32>(17)? == 1,
+                    gain: row.get(18)?,
+                    offset: row.get(19)?,
+                    binning: row.get(20)?,
+                    xbinning: row.get(21)?,
+                    ybinning: row.get(22)?,
+                    ccd_temp: row.get(23)?,
+                    set_temp: row.get(24)?,
+                    focallen: row.get(25)?,
+                    xpixsz: row.get(26)?,
+                    pixsz: row.get(27)?,
+                    ra: row.get(28)?,
+                    dec: row.get(29)?,
+                    sitelat: row.get(30)?,
+                    lat_obs: row.get(31)?,
+                    sitelong: row.get(32)?,
+                    long_obs: row.get(33)?,
+                    objctra: row.get(34)?,
+                    objctdec: row.get(35)?,
+                    override_: row.get::<_, i32>(36)? == 1,
                 };
 
                 Ok(crate::models::FileWithFrame {

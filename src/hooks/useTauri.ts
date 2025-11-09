@@ -3,10 +3,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { useState, useEffect, useCallback } from 'react';
 import type {
   ScanRoot,
+  ScanRootWithAvailability,
   FileWithFrame,
   DuplicateGroup,
   FolderSimilarity,
   ScanResult,
+  RelinkResult,
 } from '../types/models';
 
 /**
@@ -114,6 +116,124 @@ export function useScanRoots() {
     deleteScanRoot,
     toggleDuplicatesFlag,
     refresh: fetchScanRoots,
+  };
+}
+
+/**
+ * Manage scan roots with availability checking
+ */
+export function useScanRootsWithAvailability() {
+  const [scanRoots, setScanRoots] = useState<ScanRootWithAvailability[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchScanRootsWithAvailability = useCallback(async () => {
+    try {
+      setLoading(true);
+      const roots = await invoke<ScanRoot[]>('get_scan_roots');
+      const availability = await invoke<[number, boolean][]>('check_all_scan_roots_availability');
+
+      const availabilityMap = new Map(availability);
+      const rootsWithAvailability: ScanRootWithAvailability[] = roots.map(root => ({
+        ...root,
+        is_available: availabilityMap.get(root.id!) ?? false,
+      }));
+
+      setScanRoots(rootsWithAvailability);
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const addScanRoot = useCallback(async (path: string) => {
+    try {
+      setLoading(true);
+      const newRoot = await invoke<ScanRoot>('add_scan_root', { path });
+      const rootWithAvailability: ScanRootWithAvailability = {
+        ...newRoot,
+        is_available: true, // Newly added roots should be available
+      };
+      setScanRoots((prev) => [...prev, rootWithAvailability]);
+      setError(null);
+      return newRoot;
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const deleteScanRoot = useCallback(async (id: number) => {
+    try {
+      setLoading(true);
+      await invoke('delete_scan_root', { id });
+      setScanRoots((prev) => prev.filter((root) => root.id !== id));
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const toggleDuplicatesFlag = useCallback(async (id: number, enabled: boolean) => {
+    try {
+      await invoke('set_scan_root_duplicates_flag', { id, enabled });
+      setScanRoots((prev) =>
+        prev.map((root) =>
+          root.id === id ? { ...root, find_duplicates: enabled } : root
+        )
+      );
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    }
+  }, []);
+
+  const relinkScanRoot = useCallback(async (rootId: number, newPath: string) => {
+    try {
+      setLoading(true);
+      const result = await invoke<RelinkResult>('relink_scan_root', { rootId, newPath });
+
+      // Refresh scan roots directly instead of calling fetchScanRootsWithAvailability
+      // This avoids dependency issues that could cause duplicate executions
+      const roots = await invoke<ScanRoot[]>('get_scan_roots');
+      const availability = await invoke<[number, boolean][]>('check_all_scan_roots_availability');
+      const availabilityMap = new Map(availability);
+      const rootsWithAvailability: ScanRootWithAvailability[] = roots.map(root => ({
+        ...root,
+        is_available: availabilityMap.get(root.id!) ?? false,
+      }));
+      setScanRoots(rootsWithAvailability);
+
+      return result;
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    } finally {
+      setLoading(false);
+    }
+  }, []); // Empty dependency array - function is stable
+
+  useEffect(() => {
+    fetchScanRootsWithAvailability();
+  }, [fetchScanRootsWithAvailability]);
+
+  return {
+    scanRoots,
+    loading,
+    error,
+    addScanRoot,
+    deleteScanRoot,
+    toggleDuplicatesFlag,
+    relinkScanRoot,
+    refresh: fetchScanRootsWithAvailability,
   };
 }
 

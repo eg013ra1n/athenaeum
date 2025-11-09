@@ -1,10 +1,10 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Folder, File as FileIcon, ArrowLeft, AlertCircle, Copy, Check } from 'lucide-react';
+import { Folder, File as FileIcon, ArrowLeft, AlertCircle, Copy, Check, AlertTriangle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import type { ScanRoot, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
+import type { ScanRootWithAvailability, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
 
 interface DirectoryTreeProps {
-  scanRoots: ScanRoot[];
+  scanRoots: ScanRootWithAvailability[];
   duplicates: DuplicateGroup[];
   refreshTrigger: number;
 }
@@ -131,12 +131,19 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
             <button
               key={root.id}
               onClick={() => loadDirectory(root.path)}
-              className={`px-3 py-1.5 rounded text-sm transition ${
+              disabled={!root.is_available}
+              title={!root.is_available ? 'Directory not available - go to Monitored Directories to relink' : undefined}
+              className={`px-3 py-1.5 rounded text-sm transition relative ${
                 currentPath === root.path
                   ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  : root.is_available
+                    ? 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    : 'bg-gray-800 text-gray-500 cursor-not-allowed opacity-50'
               }`}
             >
+              {!root.is_available && (
+                <AlertTriangle size={12} className="inline mr-1 text-yellow-500" />
+              )}
               {root.path.split('/').pop() || root.path}
             </button>
           ))}
