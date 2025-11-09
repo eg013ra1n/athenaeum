@@ -318,3 +318,18 @@ export interface OrphanedFile {
   object: string | null;
   date_obs: string | null;
 }
+
+// Sky Atlas
+export interface ImagingLocation {
+  id: number;
+  ra: number;
+  dec: number;
+  object_name: string | null;
+  frame_count: number;
+  total_exposure: number;  // in seconds
+  filters: string[];
+  date_range: [string, string];  // ISO date strings
+  frame_set_id: number | null;
+  fov_width: number | null;   // Field of view in degrees
+  fov_height: number | null;  // Field of view in degrees
+}

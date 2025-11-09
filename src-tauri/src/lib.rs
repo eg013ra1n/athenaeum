@@ -103,6 +103,7 @@ pub fn run() {
             commands::check_scan_root_availability,
             commands::check_all_scan_roots_availability,
             commands::check_missing_files_in_scan_root,
+            commands::get_imaging_locations,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

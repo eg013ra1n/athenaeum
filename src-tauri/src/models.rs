@@ -390,3 +390,19 @@ pub struct OrphanedFile {
     pub object: Option<String>,
     pub date_obs: Option<String>,
 }
+
+/// Sky atlas imaging location (for visualization)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagingLocation {
+    pub id: i64,
+    pub ra: f64,
+    pub dec: f64,
+    pub object_name: Option<String>,
+    pub frame_count: i32,
+    pub total_exposure: f64,  // in seconds
+    pub filters: Vec<String>,
+    pub date_range: (String, String),  // ISO date strings
+    pub frame_set_id: Option<i64>,
+    pub fov_width: Option<f64>,   // Field of view in degrees
+    pub fov_height: Option<f64>,  // Field of view in degrees
+}
