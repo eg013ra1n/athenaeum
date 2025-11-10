@@ -418,6 +418,7 @@ pub struct SelectionBounds {
 
 /// Result of a spatial selection query
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SelectionResult {
     pub frame_ids: Vec<i64>,
     pub count: usize,

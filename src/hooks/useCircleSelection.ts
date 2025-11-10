@@ -156,6 +156,12 @@ export function useCircleSelection(
 
         // Query backend for frames in circle
         try {
+          console.log('Querying frames with params:', {
+            ra: state.centerSky[0],
+            dec: state.centerSky[1],
+            radius_degrees: state.radiusDegrees
+          });
+
           const result = await invoke<SelectionResult>('query_frames_in_circle', {
             ra: state.centerSky[0],
             dec: state.centerSky[1],
