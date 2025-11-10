@@ -10,6 +10,7 @@ import { useCircleSelection } from '../hooks/useCircleSelection';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
+import '../styles/celestial-overrides.css';
 
 // Declare global Celestial from d3-celestial
 declare global {
@@ -415,19 +416,19 @@ export default function SkyAtlas() {
         </p>
       </div>
 
-      {/* Selection Toolbar */}
-      <SelectionToolbar
-        activeMode={drawingMode}
-        onModeChange={setDrawingMode}
-        isDisabled={!mapReady}
-      />
-
       {/* Sky Map - direct flex child, no wrapper */}
       <div
         id="celestial-map"
         ref={containerRef}
         className="flex-1 w-full overflow-hidden"
         style={{ minHeight: 0 }}
+      />
+
+      {/* Selection Toolbar */}
+      <SelectionToolbar
+        activeMode={drawingMode}
+        onModeChange={setDrawingMode}
+        isDisabled={!mapReady}
       />
 
       {/* Selection Results Dialog */}
