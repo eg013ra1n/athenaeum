@@ -2,10 +2,13 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react
 import { invoke } from '@tauri-apps/api/core';
 import { useNavigate } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
-import { DrawingMode } from '../types/selection';
+import { DrawingMode, SelectionResult } from '../types/selection';
 import { useSvgOverlay } from '../hooks/useSvgOverlay';
 import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
+import { useCircleSelection } from '../hooks/useCircleSelection';
+import { SelectionToolbar } from '../components/SelectionToolbar';
+import { SelectionDialog } from '../components/SelectionDialog';
 
 // Declare global Celestial from d3-celestial
 declare global {
@@ -25,12 +28,15 @@ export default function SkyAtlas() {
   const [mapReady, setMapReady] = useState(false);
 
   // Selection state
-  const [drawingMode] = useState<DrawingMode>('none');
+  const [drawingMode, setDrawingMode] = useState<DrawingMode>('none');
+  const [selectionResult, setSelectionResult] = useState<SelectionResult | null>(null);
+  const [showDialog, setShowDialog] = useState(false);
 
   // Custom hooks
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
   useCoordinateTransform();
   useD3MouseEvents();
+  const circleSelection = useCircleSelection();
 
   const navigate = useNavigate();
 
@@ -307,6 +313,21 @@ export default function SkyAtlas() {
     }
   }, [drawingMode, mapReady, svgOverlay]);
 
+  // Handle circle selection
+  useEffect(() => {
+    if (!mapReady || drawingMode !== 'circle') return;
+
+    circleSelection.startSelection((result) => {
+      setSelectionResult(result);
+      setShowDialog(true);
+      setDrawingMode('none');
+    });
+
+    return () => {
+      circleSelection.cancelSelection();
+    };
+  }, [drawingMode, mapReady, circleSelection]);
+
   if (loading) {
     return (
       <div className="h-screen flex items-center justify-center bg-gray-900">
@@ -361,12 +382,30 @@ export default function SkyAtlas() {
         </p>
       </div>
 
+      {/* Selection Toolbar */}
+      <SelectionToolbar
+        activeMode={drawingMode}
+        onModeChange={setDrawingMode}
+        isDisabled={!mapReady}
+      />
+
       {/* Sky Map - direct flex child, no wrapper */}
       <div
         id="celestial-map"
         ref={containerRef}
         className="flex-1 w-full overflow-hidden"
         style={{ minHeight: 0 }}
+      />
+
+      {/* Selection Results Dialog */}
+      <SelectionDialog
+        isOpen={showDialog}
+        result={selectionResult}
+        selectionType="circle"
+        onClose={() => {
+          setShowDialog(false);
+          setSelectionResult(null);
+        }}
       />
     </div>
   );
