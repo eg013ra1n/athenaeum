@@ -7,6 +7,7 @@ import { useSvgOverlay } from '../hooks/useSvgOverlay';
 import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useCircleSelection } from '../hooks/useCircleSelection';
+import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
 
@@ -37,6 +38,7 @@ export default function SkyAtlas() {
   const coordinateTransform = useCoordinateTransform();
   const mouseEvents = useD3MouseEvents();
   const circleSelection = useCircleSelection(svgOverlay, coordinateTransform, mouseEvents);
+  const rectangleSelection = useRectangleSelection(svgOverlay, coordinateTransform, mouseEvents);
 
   const navigate = useNavigate();
 
@@ -220,7 +222,8 @@ export default function SkyAtlas() {
         total_exposure: loc.total_exposure,
         filters: loc.filters.join(', '),
         date_range: loc.date_range,
-        frame_set_id: loc.frame_set_id
+        frame_set_id: loc.frame_set_id,
+        location_type: loc.location_type  // 'frameset' or 'cluster'
       },
       geometry: {
         type: 'Point',
@@ -252,10 +255,15 @@ export default function SkyAtlas() {
         container.selectAll('.imaging-marker')
           .data(data.features)
           .enter().append('path')
-          .attr('class', 'imaging-marker')
+          .attr('class', function(d: any) { return `imaging-marker imaging-${d.properties.location_type}`; })
           .attr('d', window.Celestial.symbol().type(window.Celestial.symbolType('square')).size(100))
-          .style('fill', '#3b82f6')
-          .style('stroke', '#60a5fa')
+          .style('fill', function(d: any) {
+            // Blue for organized frame sets, Orange for unorganized clusters
+            return d.properties.location_type === 'frameset' ? '#3b82f6' : '#f97316';
+          })
+          .style('stroke', function(d: any) {
+            return d.properties.location_type === 'frameset' ? '#60a5fa' : '#fb923c';
+          })
           .style('stroke-width', '1.5px')
           .style('cursor', 'pointer')
           .on('click', function(d: any) {
@@ -267,7 +275,8 @@ export default function SkyAtlas() {
           .append('title')
           .text(function(d: any) {
             const totalHours = (d.properties.total_exposure / 3600).toFixed(2);
-            return `${d.properties.name}\nFrames: ${d.properties.frame_count}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}`;
+            const typeLabel = d.properties.location_type === 'frameset' ? '[Frame Set]' : '[Unorganized]';
+            return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frame_count}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}`;
           });
       },
       redraw: function() {
@@ -332,6 +341,25 @@ export default function SkyAtlas() {
     };
   }, [drawingMode, mapReady, circleSelection]);
 
+  // Handle rectangle selection
+  useEffect(() => {
+    if (!mapReady || drawingMode !== 'rectangle') return;
+
+    console.log('Rectangle selection effect triggered');
+
+    rectangleSelection.startSelection((result) => {
+      console.log('Rectangle selection completed with result:', result);
+      setSelectionResult(result);
+      setShowDialog(true);
+      setDrawingMode('none');
+    });
+
+    return () => {
+      console.log('Rectangle selection effect cleanup');
+      rectangleSelection.cancelSelection();
+    };
+  }, [drawingMode, mapReady, rectangleSelection]);
+
   if (loading) {
     return (
       <div className="h-screen flex items-center justify-center bg-gray-900">
@@ -366,10 +394,11 @@ export default function SkyAtlas() {
         <div className="text-center max-w-md p-6">
           <h3 className="text-xl font-bold text-gray-100 mb-2">No Imaging Locations Found</h3>
           <p className="text-gray-400 text-sm mb-4">
-            You don't have any frame sets with coordinate data yet.
+            You don't have any LIGHT frames with RA/Dec coordinates yet.
           </p>
           <p className="text-gray-500 text-sm">
-            Go to the Objects page and use "Auto-Generate Frame Sets" to create frame sets from your LIGHT frames with RA/Dec coordinates.
+            Once you import FITS/XISF files with coordinate data, they will appear here.
+            You can then use the circle selection tool to organize them into frame sets, or go to the Objects page to use "Auto-Generate Frame Sets".
           </p>
         </div>
       </div>
@@ -405,7 +434,7 @@ export default function SkyAtlas() {
       <SelectionDialog
         isOpen={showDialog}
         result={selectionResult}
-        selectionType="circle"
+        selectionType={drawingMode as 'circle' | 'rectangle' | 'polygon' | null}
         onClose={() => {
           setShowDialog(false);
           setSelectionResult(null);
