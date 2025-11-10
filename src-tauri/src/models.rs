@@ -406,3 +406,20 @@ pub struct ImagingLocation {
     pub fov_width: Option<f64>,   // Field of view in degrees
     pub fov_height: Option<f64>,  // Field of view in degrees
 }
+
+/// Bounding box for rectangular region selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionBounds {
+    pub ra_min: f64,
+    pub ra_max: f64,
+    pub dec_min: f64,
+    pub dec_max: f64,
+}
+
+/// Result of a spatial selection query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectionResult {
+    pub frame_ids: Vec<i64>,
+    pub count: usize,
+    pub total_exposure_seconds: f64,
+}
