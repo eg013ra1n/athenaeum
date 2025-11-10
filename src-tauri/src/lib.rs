@@ -105,6 +105,10 @@ pub fn run() {
             commands::check_all_scan_roots_availability,
             commands::check_missing_files_in_scan_root,
             commands::get_imaging_locations,
+            commands::query_frames_in_circle,
+            commands::query_frames_in_bounds,
+            commands::query_frames_in_polygon,
+            commands::create_frame_set_from_selection,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

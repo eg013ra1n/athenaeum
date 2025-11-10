@@ -55,14 +55,30 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
         return null;
       }
 
-      const projection = window.Celestial.mapProjection;
+      // Try mapProjection first, fall back to map().projection()
+      let projection = window.Celestial.mapProjection;
+
       if (!projection || !projection.invert) {
-        console.warn('Projection not available');
+        // Try alternative way to get projection
+        const map = window.Celestial.map;
+        if (map && typeof map === 'function') {
+          const mapObj = map();
+          projection = mapObj?.projection?.();
+        }
+      }
+
+      if (!projection || typeof projection.invert !== 'function') {
+        console.warn('Projection not available or invert not a function', projection);
         return null;
       }
 
       // Convert pixel coordinates to sky coordinates
-      const [ra, dec] = projection.invert([x, y]);
+      const result = projection.invert([x, y]);
+      if (!result || !Array.isArray(result) || result.length < 2) {
+        console.warn('Invalid projection result:', result);
+        return null;
+      }
+      const [ra, dec] = result;
 
       // Normalize RA to 0-360 range
       let normalizedRa = ra % 360;
@@ -87,14 +103,30 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
         return null;
       }
 
-      const projection = window.Celestial.mapProjection;
-      if (!projection) {
-        console.warn('Projection not available');
+      // Try mapProjection first, fall back to map().projection()
+      let projection = window.Celestial.mapProjection;
+
+      if (!projection || typeof projection !== 'function') {
+        // Try alternative way to get projection
+        const map = window.Celestial.map;
+        if (map && typeof map === 'function') {
+          const mapObj = map();
+          projection = mapObj?.projection?.();
+        }
+      }
+
+      if (!projection || typeof projection !== 'function') {
+        console.warn('Projection not available or not callable', projection);
         return null;
       }
 
       // Convert sky coordinates to pixel coordinates
-      const [x, y] = projection([ra, dec]);
+      const result = projection([ra, dec]);
+      if (!result || !Array.isArray(result) || result.length < 2) {
+        console.warn('Invalid projection result:', result);
+        return null;
+      }
+      const [x, y] = result;
 
       return [x, y];
     } catch (err) {
