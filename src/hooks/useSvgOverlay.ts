@@ -30,13 +30,41 @@ export function useSvgOverlay(config: SVGOverlayConfig): SVGOverlayAPI {
     // Create SVG overlay layer
     const container = document.getElementById(config.containerId);
     if (!container) {
-      console.warn(`Container with id "${config.containerId}" not found`);
-      return;
+      console.warn(`Container with id "${config.containerId}" not found, will retry`);
+      // Retry after a short delay if container not found yet
+      const timer = setTimeout(() => {
+        const retryContainer = document.getElementById(config.containerId);
+        if (retryContainer) {
+          console.log(`Container found on retry: ${config.containerId}`);
+          // Create the overlay
+          const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+          svg.setAttribute('class', 'selection-overlay');
+          svg.setAttribute('preserveAspectRatio', 'none');
+          svg.style.position = 'absolute';
+          svg.style.top = '0';
+          svg.style.left = '0';
+          svg.style.width = '100%';
+          svg.style.height = '100%';
+          svg.style.pointerEvents = 'none';
+          svg.style.zIndex = '10';
+
+          if (getComputedStyle(retryContainer).position === 'static') {
+            retryContainer.style.position = 'relative';
+          }
+
+          retryContainer.appendChild(svg);
+          svgRef.current = svg;
+        }
+      }, 100);
+      return () => clearTimeout(timer);
     }
+
+    console.log(`SVG overlay container found: ${config.containerId}`);
 
     // Check if SVG already exists
     let svg = container.querySelector('.selection-overlay') as SVGSVGElement;
     if (svg) {
+      console.log('SVG overlay already exists, reusing');
       svgRef.current = svg;
       return;
     }
