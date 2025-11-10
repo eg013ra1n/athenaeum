@@ -2,6 +2,10 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react
 import { invoke } from '@tauri-apps/api/core';
 import { useNavigate } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
+import { DrawingMode } from '../types/selection';
+import { useSvgOverlay } from '../hooks/useSvgOverlay';
+import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
+import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 
 // Declare global Celestial from d3-celestial
 declare global {
@@ -19,6 +23,14 @@ export default function SkyAtlas() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [mapReady, setMapReady] = useState(false);
+
+  // Selection state
+  const [drawingMode, setDrawingMode] = useState<DrawingMode>('none');
+
+  // Custom hooks
+  const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
+  const coordinateTransform = useCoordinateTransform();
+  const mouseEvents = useD3MouseEvents();
 
   const navigate = useNavigate();
 
@@ -280,6 +292,20 @@ export default function SkyAtlas() {
       setTimeout(() => addImagingMarkers(locations), 100);
     }
   }, [locations, mapReady, loading, addImagingMarkers]);
+
+  // Manage SVG overlay visibility based on drawing mode
+  useEffect(() => {
+    if (!mapReady) return;
+
+    const overlay = svgOverlay.getSvg();
+    if (!overlay) return;
+
+    if (drawingMode !== 'none') {
+      svgOverlay.enable();
+    } else {
+      svgOverlay.disable();
+    }
+  }, [drawingMode, mapReady, svgOverlay]);
 
   if (loading) {
     return (
