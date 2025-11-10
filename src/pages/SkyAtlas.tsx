@@ -192,7 +192,21 @@ export default function SkyAtlas() {
 
         const rect = containerRef.current.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {
-          window.Celestial.resize({ width: Math.floor(rect.width) });
+          // Aitoff projection has a fixed 2:1 aspect ratio
+          const projectionRatio = 2.0;
+          const containerRatio = rect.width / rect.height;
+
+          // Calculate optimal width to maximize fill while maintaining aspect ratio
+          let targetWidth: number;
+          if (containerRatio > projectionRatio) {
+            // Container is wider than 2:1 - size to height
+            targetWidth = Math.floor(rect.height * projectionRatio);
+          } else {
+            // Container is taller than 2:1 - size to width
+            targetWidth = Math.floor(rect.width);
+          }
+
+          window.Celestial.resize({ width: targetWidth });
         }
       }, 250);
     };

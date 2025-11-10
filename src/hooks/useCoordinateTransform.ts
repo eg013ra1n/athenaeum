@@ -44,6 +44,25 @@ export interface CoordinateTransformAPI {
 }
 
 /**
+ * Pass-through for display to canvas coordinates
+ * d3-celestial's projection expects logical (CSS) pixel coordinates,
+ * not physical pixels. Canvas.width/height include devicePixelRatio scaling,
+ * but the projection works in CSS pixel space, so no conversion needed.
+ */
+function scaleDisplayToCanvas(x: number, y: number): [number, number] {
+  return [x, y];
+}
+
+/**
+ * Pass-through for canvas to display coordinates
+ * d3-celestial's projection returns logical (CSS) pixel coordinates
+ * that already match the display coordinate space.
+ */
+function scaleCanvasToDisplay(x: number, y: number): [number, number] {
+  return [x, y];
+}
+
+/**
  * Custom hook for coordinate transformation
  * Provides utilities for converting between pixel and sky coordinates
  */
@@ -72,8 +91,11 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
         return null;
       }
 
+      // Convert display coordinates to canvas space (pass-through on HiDPI displays)
+      const [canvasX, canvasY] = scaleDisplayToCanvas(x, y);
+
       // Convert pixel coordinates to sky coordinates
-      const result = projection.invert([x, y]);
+      const result = projection.invert([canvasX, canvasY]);
       if (!result || !Array.isArray(result) || result.length < 2) {
         console.warn('Invalid projection result:', result);
         return null;
@@ -126,7 +148,10 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
         console.warn('Invalid projection result:', result);
         return null;
       }
-      const [x, y] = result;
+      const [canvasX, canvasY] = result;
+
+      // Convert to display coordinates (pass-through on HiDPI displays)
+      const [x, y] = scaleCanvasToDisplay(canvasX, canvasY);
 
       return [x, y];
     } catch (err) {

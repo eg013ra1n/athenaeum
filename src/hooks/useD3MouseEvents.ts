@@ -38,6 +38,7 @@ export interface D3MouseEventAPI {
 /**
  * Get pointer coordinates relative to an SVG element
  * Mimics d3.pointer() behavior without requiring d3 dependency
+ * Returns display coordinates in CSS pixel space (no scaling needed for HiDPI)
  */
 function getPointerCoordinates(event: MouseEvent, svgElement?: SVGSVGElement): [number, number] {
   if (!svgElement) {
