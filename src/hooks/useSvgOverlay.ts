@@ -4,7 +4,6 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import * as d3 from 'd3';
 
 export interface SVGOverlayConfig {
   containerId: string;
@@ -12,7 +11,7 @@ export interface SVGOverlayConfig {
 }
 
 export interface SVGOverlayAPI {
-  getSvg: () => d3.Selection<SVGSVGElement, unknown, HTMLElement, unknown> | null;
+  getSvg: () => SVGSVGElement | null;
   enable: () => void;
   disable: () => void;
   clear: () => void;
@@ -24,7 +23,7 @@ export interface SVGOverlayAPI {
  * Creates and manages transparent SVG layer above d3-celestial canvas
  */
 export function useSvgOverlay(config: SVGOverlayConfig): SVGOverlayAPI {
-  const svgRef = useRef<d3.Selection<SVGSVGElement, unknown, HTMLElement, unknown> | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
   const [enabled, setEnabled] = useState(false);
 
   useEffect(() => {
@@ -36,25 +35,24 @@ export function useSvgOverlay(config: SVGOverlayConfig): SVGOverlayAPI {
     }
 
     // Check if SVG already exists
-    const existingSvg = container.querySelector('.selection-overlay');
-    if (existingSvg) {
-      svgRef.current = d3.select(existingSvg as SVGSVGElement);
+    let svg = container.querySelector('.selection-overlay') as SVGSVGElement;
+    if (svg) {
+      svgRef.current = svg;
       return;
     }
 
     // Create new SVG overlay
-    const svg = d3
-      .select(container)
-      .append('svg')
-      .attr('class', 'selection-overlay')
-      .style('position', 'absolute')
-      .style('top', '0')
-      .style('left', '0')
-      .style('width', '100%')
-      .style('height', '100%')
-      .style('pointer-events', config.pointerEvents || 'none')
-      .style('z-index', '10');
+    svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', 'selection-overlay');
+    svg.style.position = 'absolute';
+    svg.style.top = '0';
+    svg.style.left = '0';
+    svg.style.width = '100%';
+    svg.style.height = '100%';
+    svg.style.pointerEvents = config.pointerEvents || 'none';
+    svg.style.zIndex = '10';
 
+    container.appendChild(svg);
     svgRef.current = svg;
 
     // Cleanup function
@@ -62,7 +60,10 @@ export function useSvgOverlay(config: SVGOverlayConfig): SVGOverlayAPI {
       // Don't remove SVG on unmount - it should persist
       // Just clear event listeners
       if (svgRef.current) {
-        svgRef.current.on('mousedown', null).on('mousemove', null).on('mouseup', null).on('click', null);
+        svgRef.current.onmousedown = null;
+        svgRef.current.onmousemove = null;
+        svgRef.current.onmouseup = null;
+        svgRef.current.onclick = null;
       }
     };
   }, [config.containerId]);
@@ -71,21 +72,23 @@ export function useSvgOverlay(config: SVGOverlayConfig): SVGOverlayAPI {
 
   const enable = () => {
     if (svgRef.current) {
-      svgRef.current.style('pointer-events', 'all');
+      svgRef.current.style.pointerEvents = 'all';
       setEnabled(true);
     }
   };
 
   const disable = () => {
     if (svgRef.current) {
-      svgRef.current.style('pointer-events', 'none');
+      svgRef.current.style.pointerEvents = 'none';
       setEnabled(false);
     }
   };
 
   const clear = () => {
     if (svgRef.current) {
-      svgRef.current.selectAll('*').remove();
+      while (svgRef.current.firstChild) {
+        svgRef.current.removeChild(svgRef.current.firstChild);
+      }
     }
   };
 

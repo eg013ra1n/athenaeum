@@ -25,12 +25,12 @@ export default function SkyAtlas() {
   const [mapReady, setMapReady] = useState(false);
 
   // Selection state
-  const [drawingMode, setDrawingMode] = useState<DrawingMode>('none');
+  const [drawingMode] = useState<DrawingMode>('none');
 
   // Custom hooks
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
-  const coordinateTransform = useCoordinateTransform();
-  const mouseEvents = useD3MouseEvents();
+  useCoordinateTransform();
+  useD3MouseEvents();
 
   const navigate = useNavigate();
 
