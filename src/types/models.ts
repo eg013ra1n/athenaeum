@@ -332,4 +332,5 @@ export interface ImagingLocation {
   frame_set_id: number | null;
   fov_width: number | null;   // Field of view in degrees
   fov_height: number | null;  // Field of view in degrees
+  location_type: 'frameset' | 'cluster';  // 'frameset' for organized, 'cluster' for unorganized
 }

@@ -1405,9 +1405,11 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    // Query all LIGHT frames with coordinates, grouped by frame set
-    // Schema: frames_set -> imaging_nights -> sessions -> session_members -> frames
+    // Query both organized frame sets AND unorganized frames
+    // This enables users to see all frames with coordinates immediately,
+    // without needing to auto-generate frame sets first
     let mut stmt = conn.prepare("
+        -- Organized locations: Frames in frame sets
         SELECT
             fs.id as frame_set_id,
             fs.name as object_name,
@@ -1419,7 +1421,8 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             MIN(fr.date_obs) as first_date,
             MAX(fr.date_obs) as last_date,
             AVG(fr.xpixsz) as avg_xpixsz,
-            AVG(fr.focallen) as avg_focallen
+            AVG(fr.focallen) as avg_focallen,
+            'frameset' as location_type
         FROM frames_set fs
         JOIN imaging_nights ino ON ino.frames_set_id = fs.id
         JOIN sessions s ON s.imaging_night_id = ino.id
@@ -1430,10 +1433,36 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
           AND fr.imagetyp = 'Light'
         GROUP BY fs.id
         HAVING avg_ra IS NOT NULL AND avg_dec IS NOT NULL
+
+        UNION ALL
+
+        -- Unorganized locations: Frames NOT in any session, clustered by location
+        SELECT
+            NULL as frame_set_id,
+            COALESCE(fr.object, 'Unknown') as object_name,
+            AVG(fr.ra) as avg_ra,
+            AVG(fr.dec) as avg_dec,
+            COUNT(DISTINCT fr.id) as frame_count,
+            SUM(fr.exptime) as total_exposure,
+            GROUP_CONCAT(DISTINCT fr.filter) as filters,
+            MIN(fr.date_obs) as first_date,
+            MAX(fr.date_obs) as last_date,
+            AVG(fr.xpixsz) as avg_xpixsz,
+            AVG(fr.focallen) as avg_focallen,
+            'cluster' as location_type
+        FROM frames fr
+        WHERE fr.ra IS NOT NULL
+          AND fr.dec IS NOT NULL
+          AND fr.imagetyp = 'Light'
+          AND NOT EXISTS (
+              SELECT 1 FROM session_members sm WHERE sm.frame_id = fr.id
+          )
+        GROUP BY COALESCE(fr.object, 'Unknown'), ROUND(fr.ra, 1), ROUND(fr.dec, 1)
+        HAVING avg_ra IS NOT NULL AND avg_dec IS NOT NULL
     ").map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let locations = stmt.query_map([], |row| {
-        let frame_set_id: i64 = row.get(0)?;
+        let frame_set_id: Option<i64> = row.get(0)?;
         let object_name: Option<String> = row.get(1)?;
         let ra: f64 = row.get(2)?;
         let dec: f64 = row.get(3)?;
@@ -1444,6 +1473,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         let last_date: Option<String> = row.get(8)?;
         let avg_xpixsz: Option<f64> = row.get(9)?;
         let avg_focallen: Option<f64> = row.get(10)?;
+        let location_type: String = row.get(11)?;
 
         // Parse filters from comma-separated string
         let filters: Vec<String> = filters_str
@@ -1467,8 +1497,16 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             (None, None)
         };
 
+        // Use a deterministic ID based on location for clusters
+        let id = if let Some(fs_id) = frame_set_id {
+            fs_id
+        } else {
+            // Create a pseudo-ID for clusters based on coordinates
+            ((ra.to_bits() as i64) ^ (dec.to_bits() as i64)).abs()
+        };
+
         Ok(ImagingLocation {
-            id: frame_set_id,
+            id,
             ra,
             dec,
             object_name,
@@ -1479,9 +1517,10 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
                 first_date.unwrap_or_default(),
                 last_date.unwrap_or_default()
             ),
-            frame_set_id: Some(frame_set_id),
+            frame_set_id,
             fov_width,
             fov_height,
+            location_type,
         })
     }).map_err(|e| format!("Failed to query imaging locations: {}", e))?;
 
@@ -1489,7 +1528,11 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to collect results: {}", e))?;
 
-    println!("Found {} imaging locations", result.len());
+    println!("Found {} imaging locations ({} framesets, {} clusters)",
+        result.len(),
+        result.iter().filter(|l| l.location_type == "frameset").count(),
+        result.iter().filter(|l| l.location_type == "cluster").count()
+    );
 
     Ok(result)
 }
@@ -1573,15 +1616,35 @@ pub async fn query_frames_in_bounds(
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
+    println!(
+        "Querying frames in bounds: ra_min={}, ra_max={}, dec_min={}, dec_max={}",
+        bounds.ra_min, bounds.ra_max, bounds.dec_min, bounds.dec_max
+    );
+
+    // Handle RA wrap-around at 0°/360° boundary
+    // If ra_min > ra_max, it means the rectangle wraps around 0°
+    let ra_wrap_around = bounds.ra_min > bounds.ra_max;
+
+    let query = if ra_wrap_around {
+        // Wrap-around case: select frames where ra >= ra_min OR ra <= ra_max
+        "SELECT id FROM frames
+         WHERE ra IS NOT NULL
+         AND dec IS NOT NULL
+         AND imagetyp = 'Light'
+         AND (ra >= ?1 OR ra <= ?2)
+         AND dec BETWEEN ?3 AND ?4".to_string()
+    } else {
+        // Normal case: select frames where ra is between ra_min and ra_max
+        "SELECT id FROM frames
+         WHERE ra IS NOT NULL
+         AND dec IS NOT NULL
+         AND imagetyp = 'Light'
+         AND ra BETWEEN ?1 AND ?2
+         AND dec BETWEEN ?3 AND ?4".to_string()
+    };
+
     let mut stmt = conn
-        .prepare(
-            "SELECT id FROM frames
-             WHERE ra IS NOT NULL
-             AND dec IS NOT NULL
-             AND imagetyp = 'Light'
-             AND ra BETWEEN ?1 AND ?2
-             AND dec BETWEEN ?3 AND ?4",
-        )
+        .prepare(&query)
         .map_err(|e| e.to_string())?;
 
     let frame_ids: Vec<i64> = stmt
@@ -1592,6 +1655,12 @@ pub async fn query_frames_in_bounds(
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+
+    println!(
+        "Found {} frames (ra_wrap_around={})",
+        frame_ids.len(),
+        ra_wrap_around
+    );
 
     // Calculate total exposure
     let total_exposure: f64 = if !frame_ids.is_empty() {
@@ -1696,38 +1765,133 @@ pub async fn create_frame_set_from_selection(
     name: String,
     frame_ids: Vec<i64>,
     project_id: Option<i64>,
+    description: Option<String>,
 ) -> Result<i64, String> {
+    println!(
+        "Creating frame set from selection: name='{}', frame_count={}, project_id={:?}",
+        name,
+        frame_ids.len(),
+        project_id
+    );
+
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    // Create custom frame set
-    conn.execute(
-        "INSERT INTO frames_set (name, is_custom, project_id, created_at)
-         VALUES (?1, 1, ?2, datetime('now'))",
-        rusqlite::params![name, project_id],
-    )
-    .map_err(|e| e.to_string())?;
-
-    let frames_set_id = conn.last_insert_rowid();
-
-    // Add members
-    let frame_count = frame_ids.len();
-    let mut stmt = conn
-        .prepare("INSERT INTO frames_set_members (frames_set_id, frame_id) VALUES (?1, ?2)")
-        .map_err(|e| e.to_string())?;
-
-    for frame_id in frame_ids {
-        stmt.execute(rusqlite::params![frames_set_id, frame_id])
-            .map_err(|e| e.to_string())?;
+    // Verify frames exist
+    if frame_ids.is_empty() {
+        return Err("Cannot create frame set with no frames".to_string());
     }
 
-    println!(
-        "Created custom frame set {} with {} frames",
-        frames_set_id,
-        frame_count
-    );
+    // Get frames with file info to calculate aggregates
+    let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids)
+        .map_err(|e| format!("Failed to get frames: {}", e))?;
 
-    Ok(frames_set_id)
+    // Calculate aggregates
+    let mut total_exp_time: f64 = 0.0;
+    let mut earliest_date_obs: Option<String> = None;
+    let mut first_ra: Option<String> = None;
+    let mut first_dec: Option<String> = None;
+
+    for (_, _, frame) in &frames {
+        if let Some(exp) = frame.exptime {
+            total_exp_time += exp;
+        }
+
+        if let Some(date) = &frame.date_obs {
+            let date_str = date.to_rfc3339();
+            if earliest_date_obs.is_none() || date_str < earliest_date_obs.as_ref().unwrap().clone() {
+                earliest_date_obs = Some(date_str);
+            }
+        }
+
+        if first_ra.is_none() {
+            first_ra = frame.objctra.clone();
+        }
+        if first_dec.is_none() {
+            first_dec = frame.objctdec.clone();
+        }
+    }
+
+    // Create the custom frames_set using proper function
+    let set_id = db::create_frames_set(
+        &conn,
+        Some(&name),
+        true, // is_custom = true
+        earliest_date_obs.as_deref(),
+        first_ra.as_deref(),
+        first_dec.as_deref(),
+        Some(total_exp_time),
+        project_id,
+    ).map_err(|e| format!("Failed to create frames_set: {}", e))?;
+
+    println!("Created frames_set with id {}", set_id);
+
+    // Detect nights from selected frames using gap threshold
+    let gap_threshold_hours: f64 = state.settings
+        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
+        .map_err(|e| format!("Failed to get settings: {}", e))?
+        .parse()
+        .unwrap_or(6.0);
+
+    println!("Detecting nights from {} frames with gap threshold {} hours", frames.len(), gap_threshold_hours);
+
+    // Convert to format expected by detect_sessions
+    let frames_for_detection = frames.into_iter()
+        .map(|(frame_id, file, frame)| (frame_id, file, frame))
+        .collect();
+
+    let detected_nights = crate::sessions::detect_sessions(frames_for_detection, gap_threshold_hours)
+        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
+
+    println!("Detected {} nights", detected_nights.len());
+
+    if detected_nights.is_empty() {
+        // If no nights detected, create a single night/session with all frames
+        println!("No nights detected, creating single night with all frames");
+
+        let now = chrono::Utc::now();
+        let night_start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let night_end = (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let night_id = db::create_imaging_night(&conn, set_id, &night_start, &night_end)
+            .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
+
+        let session_id = db::create_session(&conn, night_id, "Unknown", frame_ids.len() as i32, Some(total_exp_time))
+            .map_err(|e| format!("Failed to create session: {}", e))?;
+
+        db::insert_session_members(&conn, session_id, &frame_ids)
+            .map_err(|e| format!("Failed to add frames to session: {}", e))?;
+
+        println!("✅ Created custom frame set '{}' (id {}) with {} frames", name, set_id, frame_ids.len());
+    } else {
+        // Create imaging nights and sessions for detected nights
+        for (night_idx, night) in detected_nights.iter().enumerate() {
+            println!("Processing night {}/{}: {} to {}", night_idx + 1, detected_nights.len(), night.start_time, night.end_time);
+
+            let night_id = db::create_imaging_night(&conn, set_id, &night.start_time, &night.end_time)
+                .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
+
+            println!("Created imaging_night with id {}", night_id);
+
+            // Process sessions within this night
+            for session in &night.sessions {
+                let session_id = db::create_session(
+                    &conn,
+                    night_id,
+                    &session.instrume,
+                    session.frame_ids.len() as i32,
+                    session.total_exp_time,
+                ).map_err(|e| format!("Failed to create session: {}", e))?;
+
+                db::insert_session_members(&conn, session_id, &session.frame_ids)
+                    .map_err(|e| format!("Failed to add frames to session: {}", e))?;
+            }
+        }
+
+        println!("✅ Created custom frame set '{}' (id {}) with {} nights and {} frames", name, set_id, detected_nights.len(), frame_ids.len());
+    }
+
+    Ok(set_id)
 }
 

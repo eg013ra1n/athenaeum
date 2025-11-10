@@ -43,11 +43,20 @@ export function SelectionDialog({
     setError(null);
 
     try {
-      await invoke('create_frame_set_from_selection', {
+      console.log('Creating frame set with params:', {
+        name: frameSetName,
+        frame_ids_count: result.frameIds.length,
+        frame_ids_sample: result.frameIds.slice(0, 5),
+        description: selectionDescription || ''
+      });
+
+      const frameSetId = await invoke<number>('create_frame_set_from_selection', {
         frame_ids: result.frameIds,
         name: frameSetName,
         description: selectionDescription || ''
       });
+
+      console.log('Frame set created successfully with ID:', frameSetId);
 
       setSuccess(true);
       setFrameSetName('');
@@ -60,7 +69,9 @@ export function SelectionDialog({
       // Call callback if provided
       onCreateFrameSet?.(frameSetName);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create frame set');
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error('Failed to create frame set:', errorMsg, err);
+      setError(errorMsg || 'Failed to create frame set');
     } finally {
       setIsCreating(false);
     }

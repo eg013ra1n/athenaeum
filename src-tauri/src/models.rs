@@ -393,6 +393,7 @@ pub struct OrphanedFile {
 
 /// Sky atlas imaging location (for visualization)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImagingLocation {
     pub id: i64,
     pub ra: f64,
@@ -405,6 +406,7 @@ pub struct ImagingLocation {
     pub frame_set_id: Option<i64>,
     pub fov_width: Option<f64>,   // Field of view in degrees
     pub fov_height: Option<f64>,  // Field of view in degrees
+    pub location_type: String,  // "frameset" or "cluster" for unorganized frames
 }
 
 /// Bounding box for rectangular region selection
