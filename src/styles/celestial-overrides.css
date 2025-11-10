@@ -1,0 +1,27 @@
+/**
+ * d3-celestial CSS Overrides
+ *
+ * Fixes layout issues with celestial-form taking up space
+ * and celestial-map not properly filling flex containers.
+ */
+
+/* Override celestial-map to work properly with flexbox */
+#celestial-map {
+  display: block !important;      /* Override inline-block */
+  min-width: 0 !important;        /* Remove 720px constraint for flex */
+  overflow: hidden !important;    /* Proper clipping */
+  height: 100% !important;        /* Fill flex parent */
+  width: 100% !important;         /* Fill flex parent */
+}
+
+/* Hide the form element completely */
+#celestial-form {
+  display: none !important;
+  position: absolute !important;
+  visibility: hidden !important;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  pointer-events: none !important;
+}
