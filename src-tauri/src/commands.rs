@@ -1495,7 +1495,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
 }
 
 /// Query frames within a circular region of the sky
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn query_frames_in_circle(
     state: State<'_, AppState>,
     ra: f64,
@@ -1564,7 +1564,7 @@ pub async fn query_frames_in_circle(
 }
 
 /// Query frames within a rectangular region of the sky
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn query_frames_in_bounds(
     state: State<'_, AppState>,
     bounds: SelectionBounds,
@@ -1621,7 +1621,7 @@ pub async fn query_frames_in_bounds(
 }
 
 /// Query frames within a polygonal region of the sky
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn query_frames_in_polygon(
     state: State<'_, AppState>,
     vertices: Vec<(f64, f64)>,
@@ -1690,7 +1690,7 @@ pub async fn query_frames_in_polygon(
 }
 
 /// Create a custom frame set from selected frames
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 pub async fn create_frame_set_from_selection(
     state: State<'_, AppState>,
     name: String,
