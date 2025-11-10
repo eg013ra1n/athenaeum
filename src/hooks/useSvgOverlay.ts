@@ -41,9 +41,15 @@ export function useSvgOverlay(config: SVGOverlayConfig): SVGOverlayAPI {
       return;
     }
 
+    // Ensure container has relative positioning for absolute SVG overlay
+    if (getComputedStyle(container).position === 'static') {
+      container.style.position = 'relative';
+    }
+
     // Create new SVG overlay
     svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('class', 'selection-overlay');
+    svg.setAttribute('preserveAspectRatio', 'none');
     svg.style.position = 'absolute';
     svg.style.top = '0';
     svg.style.left = '0';

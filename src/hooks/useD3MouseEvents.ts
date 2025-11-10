@@ -62,36 +62,48 @@ export function useD3MouseEvents(): D3MouseEventAPI {
     (selection: any, handlers: MouseEventHandlers) => {
       handlersRef.current = handlers;
 
-      // Get the SVG element from d3 selection
+      // Get the SVG element from d3 selection or use directly
       const svgElement = selection.node ? selection.node() : selection;
       svgElementRef.current = svgElement;
 
-      if (handlers.onMouseDown) {
-        selection.on('mousedown', function(event: MouseEvent) {
-          const [x, y] = getPointerCoordinates(event, svgElement);
-          handlers.onMouseDown?.(x, y, event);
-        });
-      }
+      // Use native event listeners for SVGSVGElement
+      if (svgElement && typeof svgElement.addEventListener === 'function') {
+        if (handlers.onMouseDown) {
+          const mouseDownListener = (event: MouseEvent) => {
+            const [x, y] = getPointerCoordinates(event, svgElement);
+            handlers.onMouseDown?.(x, y, event);
+          };
+          svgElement.addEventListener('mousedown', mouseDownListener);
+          // Store for cleanup
+          (svgElement as any).__mouseDownListener = mouseDownListener;
+        }
 
-      if (handlers.onMouseMove) {
-        selection.on('mousemove', function(event: MouseEvent) {
-          const [x, y] = getPointerCoordinates(event, svgElement);
-          handlers.onMouseMove?.(x, y, event);
-        });
-      }
+        if (handlers.onMouseMove) {
+          const mouseMoveListener = (event: MouseEvent) => {
+            const [x, y] = getPointerCoordinates(event, svgElement);
+            handlers.onMouseMove?.(x, y, event);
+          };
+          svgElement.addEventListener('mousemove', mouseMoveListener);
+          (svgElement as any).__mouseMoveListener = mouseMoveListener;
+        }
 
-      if (handlers.onMouseUp) {
-        selection.on('mouseup', function(event: MouseEvent) {
-          const [x, y] = getPointerCoordinates(event, svgElement);
-          handlers.onMouseUp?.(x, y, event);
-        });
-      }
+        if (handlers.onMouseUp) {
+          const mouseUpListener = (event: MouseEvent) => {
+            const [x, y] = getPointerCoordinates(event, svgElement);
+            handlers.onMouseUp?.(x, y, event);
+          };
+          svgElement.addEventListener('mouseup', mouseUpListener);
+          (svgElement as any).__mouseUpListener = mouseUpListener;
+        }
 
-      if (handlers.onDblClick) {
-        selection.on('dblclick', function(event: MouseEvent) {
-          const [x, y] = getPointerCoordinates(event, svgElement);
-          handlers.onDblClick?.(x, y, event);
-        });
+        if (handlers.onDblClick) {
+          const dblClickListener = (event: MouseEvent) => {
+            const [x, y] = getPointerCoordinates(event, svgElement);
+            handlers.onDblClick?.(x, y, event);
+          };
+          svgElement.addEventListener('dblclick', dblClickListener);
+          (svgElement as any).__dblClickListener = dblClickListener;
+        }
       }
     },
     []
@@ -112,7 +124,27 @@ export function useD3MouseEvents(): D3MouseEventAPI {
   );
 
   const detachMouseHandlers = useCallback((selection: any) => {
-    selection.on('mousedown', null).on('mousemove', null).on('mouseup', null).on('dblclick', null);
+    const svgElement = selection.node ? selection.node() : selection;
+
+    if (svgElement && typeof svgElement.removeEventListener === 'function') {
+      // Remove stored listeners
+      if ((svgElement as any).__mouseDownListener) {
+        svgElement.removeEventListener('mousedown', (svgElement as any).__mouseDownListener);
+        delete (svgElement as any).__mouseDownListener;
+      }
+      if ((svgElement as any).__mouseMoveListener) {
+        svgElement.removeEventListener('mousemove', (svgElement as any).__mouseMoveListener);
+        delete (svgElement as any).__mouseMoveListener;
+      }
+      if ((svgElement as any).__mouseUpListener) {
+        svgElement.removeEventListener('mouseup', (svgElement as any).__mouseUpListener);
+        delete (svgElement as any).__mouseUpListener;
+      }
+      if ((svgElement as any).__dblClickListener) {
+        svgElement.removeEventListener('dblclick', (svgElement as any).__dblClickListener);
+        delete (svgElement as any).__dblClickListener;
+      }
+    }
   }, []);
 
   return {
