@@ -5,11 +5,11 @@
 
 import { useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useSvgOverlay } from './useSvgOverlay';
-import { useCoordinateTransform } from './useCoordinateTransform';
-import { useD3MouseEvents } from './useD3MouseEvents';
 import { angularDistance } from '../utils/coordinates';
 import { SelectionResult } from '../types/selection';
+import { SVGOverlayAPI } from './useSvgOverlay';
+import { CoordinateTransformAPI } from './useCoordinateTransform';
+import { D3MouseEventAPI } from './useD3MouseEvents';
 
 export interface CircleSelectionAPI {
   /**
@@ -40,10 +40,11 @@ interface CircleState {
  * Custom hook for circle-based region selection
  * Manages drawing a circle and querying frames within it
  */
-export function useCircleSelection(): CircleSelectionAPI {
-  const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
-  const coordinateTransform = useCoordinateTransform();
-  const mouseEvents = useD3MouseEvents();
+export function useCircleSelection(
+  svgOverlay: SVGOverlayAPI,
+  coordinateTransform: CoordinateTransformAPI,
+  mouseEvents: D3MouseEventAPI
+): CircleSelectionAPI {
 
   const stateRef = useRef<CircleState>({
     centerPixel: null,
@@ -64,8 +65,11 @@ export function useCircleSelection(): CircleSelectionAPI {
       return;
     }
 
+    console.log('Circle selection started, SVG element:', svg);
+
     // Enable overlay for interaction
     svgOverlay.enable();
+    console.log('SVG overlay enabled');
 
     // Clear any previous circle
     svgOverlay.clear();
@@ -79,12 +83,16 @@ export function useCircleSelection(): CircleSelectionAPI {
     };
 
     // Attach mouse handlers for circle drawing
+    console.log('Attaching mouse handlers to SVG');
     mouseEvents.attachMouseHandlers(svg, {
       onMouseDown: (x: number, y: number) => {
+        console.log('Circle onMouseDown at:', x, y);
         const state = stateRef.current;
         state.centerPixel = [x, y];
         state.centerSky = coordinateTransform.pixelToSky(x, y);
         state.isDrawing = true;
+
+        console.log('Center sky coords:', state.centerSky);
 
         // Create circle element
         const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
@@ -98,6 +106,7 @@ export function useCircleSelection(): CircleSelectionAPI {
 
         svg.appendChild(circle);
         circleElementRef.current = circle;
+        console.log('Circle element created at:', x, y);
       },
 
       onMouseMove: (x: number, y: number) => {

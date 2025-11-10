@@ -34,9 +34,9 @@ export default function SkyAtlas() {
 
   // Custom hooks
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
-  useCoordinateTransform();
-  useD3MouseEvents();
-  const circleSelection = useCircleSelection();
+  const coordinateTransform = useCoordinateTransform();
+  const mouseEvents = useD3MouseEvents();
+  const circleSelection = useCircleSelection(svgOverlay, coordinateTransform, mouseEvents);
 
   const navigate = useNavigate();
 
@@ -317,13 +317,17 @@ export default function SkyAtlas() {
   useEffect(() => {
     if (!mapReady || drawingMode !== 'circle') return;
 
+    console.log('Circle selection effect triggered');
+
     circleSelection.startSelection((result) => {
+      console.log('Circle selection completed with result:', result);
       setSelectionResult(result);
       setShowDialog(true);
       setDrawingMode('none');
     });
 
     return () => {
+      console.log('Circle selection effect cleanup');
       circleSelection.cancelSelection();
     };
   }, [drawingMode, mapReady, circleSelection]);

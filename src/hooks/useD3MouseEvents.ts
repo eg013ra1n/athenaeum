@@ -66,14 +66,19 @@ export function useD3MouseEvents(): D3MouseEventAPI {
       const svgElement = selection.node ? selection.node() : selection;
       svgElementRef.current = svgElement;
 
+      console.log('Attaching handlers to element:', svgElement, 'Tag:', svgElement?.tagName);
+
       // Use native event listeners for SVGSVGElement
       if (svgElement && typeof svgElement.addEventListener === 'function') {
+        console.log('Element supports addEventListener, attaching events');
         if (handlers.onMouseDown) {
           const mouseDownListener = (event: MouseEvent) => {
+            console.log('mousedown event fired');
             const [x, y] = getPointerCoordinates(event, svgElement);
             handlers.onMouseDown?.(x, y, event);
           };
           svgElement.addEventListener('mousedown', mouseDownListener);
+          console.log('mousedown listener attached');
           // Store for cleanup
           (svgElement as any).__mouseDownListener = mouseDownListener;
         }
