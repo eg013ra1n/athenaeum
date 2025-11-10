@@ -1494,3 +1494,240 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
     Ok(result)
 }
 
+/// Query frames within a circular region of the sky
+#[tauri::command]
+pub async fn query_frames_in_circle(
+    state: State<'_, AppState>,
+    ra: f64,
+    dec: f64,
+    radius_degrees: f64,
+) -> Result<SelectionResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Query all LIGHT frames with coordinates
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, ra, dec, exptime FROM frames
+             WHERE ra IS NOT NULL
+             AND dec IS NOT NULL
+             AND imagetyp = 'Light'",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let frame_ids: Vec<i64> = stmt
+        .query_map([], |row| {
+            let frame_id: i64 = row.get(0)?;
+            let frame_ra: f64 = row.get(1)?;
+            let frame_dec: f64 = row.get(2)?;
+
+            Ok((frame_id, frame_ra, frame_dec))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|(_, frame_ra, frame_dec)| {
+            let distance = crate::selection::angular_distance(ra, dec, *frame_ra, *frame_dec);
+            distance <= radius_degrees
+        })
+        .map(|(id, _, _)| id)
+        .collect();
+
+    // Calculate total exposure
+    let total_exposure: f64 = if !frame_ids.is_empty() {
+        // Query total exposure by summing selected frames
+        let mut total: f64 = 0.0;
+        let mut stmt = conn
+            .prepare("SELECT COALESCE(exptime, 0) FROM frames WHERE id = ?1")
+            .map_err(|e| e.to_string())?;
+
+        for frame_id in &frame_ids {
+            let exp: f64 = stmt
+                .query_row(rusqlite::params![frame_id], |row| row.get::<_, f64>(0))
+                .unwrap_or(0.0);
+            total += exp;
+        }
+        total
+    } else {
+        0.0
+    };
+
+    let count = frame_ids.len();
+
+    Ok(SelectionResult {
+        frame_ids,
+        count,
+        total_exposure_seconds: total_exposure,
+    })
+}
+
+/// Query frames within a rectangular region of the sky
+#[tauri::command]
+pub async fn query_frames_in_bounds(
+    state: State<'_, AppState>,
+    bounds: SelectionBounds,
+) -> Result<SelectionResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM frames
+             WHERE ra IS NOT NULL
+             AND dec IS NOT NULL
+             AND imagetyp = 'Light'
+             AND ra BETWEEN ?1 AND ?2
+             AND dec BETWEEN ?3 AND ?4",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let frame_ids: Vec<i64> = stmt
+        .query_map(
+            rusqlite::params![bounds.ra_min, bounds.ra_max, bounds.dec_min, bounds.dec_max],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    // Calculate total exposure
+    let total_exposure: f64 = if !frame_ids.is_empty() {
+        let mut total: f64 = 0.0;
+        let mut stmt = conn
+            .prepare("SELECT COALESCE(exptime, 0) FROM frames WHERE id = ?1")
+            .map_err(|e| e.to_string())?;
+
+        for frame_id in &frame_ids {
+            let exp: f64 = stmt
+                .query_row(rusqlite::params![frame_id], |row| row.get::<_, f64>(0))
+                .unwrap_or(0.0);
+            total += exp;
+        }
+        total
+    } else {
+        0.0
+    };
+
+    let count = frame_ids.len();
+
+    Ok(SelectionResult {
+        frame_ids,
+        count,
+        total_exposure_seconds: total_exposure,
+    })
+}
+
+/// Query frames within a polygonal region of the sky
+#[tauri::command]
+pub async fn query_frames_in_polygon(
+    state: State<'_, AppState>,
+    vertices: Vec<(f64, f64)>,
+) -> Result<SelectionResult, String> {
+    if vertices.len() < 3 {
+        return Err("Polygon must have at least 3 vertices".to_string());
+    }
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Query all LIGHT frames with coordinates
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, ra, dec, exptime FROM frames
+             WHERE ra IS NOT NULL
+             AND dec IS NOT NULL
+             AND imagetyp = 'Light'",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let frame_ids: Vec<i64> = stmt
+        .query_map([], |row| {
+            let frame_id: i64 = row.get(0)?;
+            let frame_ra: f64 = row.get(1)?;
+            let frame_dec: f64 = row.get(2)?;
+
+            Ok((frame_id, frame_ra, frame_dec))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|(_, frame_ra, frame_dec)| {
+            crate::selection::point_in_polygon(*frame_ra, *frame_dec, &vertices)
+        })
+        .map(|(id, _, _)| id)
+        .collect();
+
+    // Calculate total exposure
+    let total_exposure: f64 = if !frame_ids.is_empty() {
+        let mut total: f64 = 0.0;
+        let mut stmt = conn
+            .prepare("SELECT COALESCE(exptime, 0) FROM frames WHERE id = ?1")
+            .map_err(|e| e.to_string())?;
+
+        for frame_id in &frame_ids {
+            let exp: f64 = stmt
+                .query_row(rusqlite::params![frame_id], |row| row.get::<_, f64>(0))
+                .unwrap_or(0.0);
+            total += exp;
+        }
+        total
+    } else {
+        0.0
+    };
+
+    let count = frame_ids.len();
+
+    Ok(SelectionResult {
+        frame_ids,
+        count,
+        total_exposure_seconds: total_exposure,
+    })
+}
+
+/// Create a custom frame set from selected frames
+#[tauri::command]
+pub async fn create_frame_set_from_selection(
+    state: State<'_, AppState>,
+    name: String,
+    frame_ids: Vec<i64>,
+    project_id: Option<i64>,
+) -> Result<i64, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Create custom frame set
+    conn.execute(
+        "INSERT INTO frames_set (name, is_custom, project_id, created_at)
+         VALUES (?1, 1, ?2, datetime('now'))",
+        rusqlite::params![name, project_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let frames_set_id = conn.last_insert_rowid();
+
+    // Add members
+    let frame_count = frame_ids.len();
+    let mut stmt = conn
+        .prepare("INSERT INTO frames_set_members (frames_set_id, frame_id) VALUES (?1, ?2)")
+        .map_err(|e| e.to_string())?;
+
+    for frame_id in frame_ids {
+        stmt.execute(rusqlite::params![frames_set_id, frame_id])
+            .map_err(|e| e.to_string())?;
+    }
+
+    println!(
+        "Created custom frame set {} with {} frames",
+        frames_set_id,
+        frame_count
+    );
+
+    Ok(frames_set_id)
+}
+

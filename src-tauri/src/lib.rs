@@ -14,6 +14,7 @@ mod cache;
 mod rustafits_processor;
 mod fingerprint;
 mod relinking;
+mod selection;
 
 // Commands (Tauri API endpoints)
 mod commands;
