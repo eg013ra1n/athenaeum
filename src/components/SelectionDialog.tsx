@@ -11,7 +11,7 @@ import { SelectionResult } from '../types/selection';
 export interface SelectionDialogProps {
   isOpen: boolean;
   result: SelectionResult | null;
-  selectionType: 'circle' | 'rectangle' | 'polygon' | null;
+  selectionType: 'rectangle' | null;
   selectionDescription?: string;
   onClose: () => void;
   onCreateFrameSet?: (frameSetName: string) => void;
@@ -87,11 +87,9 @@ export function SelectionDialog({
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b border-gray-700">
           <h2 className="text-lg font-semibold text-gray-100">
-            {selectionType === 'circle'
-              ? 'Circle Selection Results'
-              : selectionType === 'rectangle'
+            {selectionType === 'rectangle'
               ? 'Rectangle Selection Results'
-              : 'Polygon Selection Results'}
+              : 'Selection Results'}
           </h2>
           <button
             onClick={onClose}
