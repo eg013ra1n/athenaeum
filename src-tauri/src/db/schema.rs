@@ -39,6 +39,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             focallen REAL,
             xpixsz REAL,
             pixsz REAL,
+            naxis1 INTEGER,
+            naxis2 INTEGER,
             ra REAL,
             dec REAL,
             sitelat REAL,

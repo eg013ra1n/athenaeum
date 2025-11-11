@@ -105,6 +105,7 @@ pub fn run() {
             commands::check_all_scan_roots_availability,
             commands::check_missing_files_in_scan_root,
             commands::get_imaging_locations,
+            commands::get_frame_preview,
             commands::query_frames_in_circle,
             commands::query_frames_in_bounds,
             commands::query_frames_in_polygon,

@@ -44,6 +44,8 @@ pub struct Frame {
     pub focallen: Option<f64>,
     pub xpixsz: Option<f64>,
     pub pixsz: Option<f64>,
+    pub naxis1: Option<i32>,
+    pub naxis2: Option<i32>,
     pub ra: Option<f64>,
     pub dec: Option<f64>,
     pub sitelat: Option<f64>,

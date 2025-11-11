@@ -14,6 +14,42 @@ pub struct AppState {
     pub cache: Arc<Mutex<Option<CacheManager>>>,
 }
 
+/// Calculate field of view (FOV) from FITS metadata
+///
+/// # Arguments
+/// * `pixel_size_um` - Pixel size in micrometers (XPIXSZ)
+/// * `focal_length_mm` - Focal length in millimeters (FOCALLEN)
+/// * `naxis` - Sensor dimension in pixels (NAXIS1 or NAXIS2)
+/// * `binning` - Binning factor (XBINNING or YBINNING, defaults to 1)
+///
+/// # Returns
+/// FOV in degrees, or None if calculation not possible
+fn calculate_fov(
+    pixel_size_um: Option<f64>,
+    focal_length_mm: Option<f64>,
+    naxis: Option<i32>,
+    binning: Option<i32>,
+) -> Option<f64> {
+    match (pixel_size_um, focal_length_mm, naxis) {
+        (Some(pixel_size), Some(focal_len), Some(sensor_pixels)) if focal_len > 0.0 && sensor_pixels > 0 => {
+            let bin = binning.unwrap_or(1) as f64;
+
+            // Convert pixel size from micrometers to millimeters
+            let pixel_size_mm = pixel_size / 1000.0;
+
+            // Calculate sensor dimension in mm (accounting for binning)
+            let sensor_mm = pixel_size_mm * sensor_pixels as f64 * bin;
+
+            // FOV formula: FOV = 2 * arctan(sensor_mm / (2 * focal_length_mm)) * (180 / π)
+            let fov_radians = 2.0 * (sensor_mm / (2.0 * focal_len)).atan();
+            let fov_degrees = fov_radians.to_degrees();
+
+            Some(fov_degrees)
+        }
+        _ => None,
+    }
+}
+
 #[tauri::command]
 pub fn greet(name: &str) -> String {
     format!("Hello, {}! Welcome to Athenaeum!", name)
@@ -1422,6 +1458,10 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             MAX(fr.date_obs) as last_date,
             AVG(fr.xpixsz) as avg_xpixsz,
             AVG(fr.focallen) as avg_focallen,
+            AVG(fr.naxis1) as avg_naxis1,
+            AVG(fr.naxis2) as avg_naxis2,
+            AVG(fr.xbinning) as avg_xbinning,
+            AVG(fr.ybinning) as avg_ybinning,
             'frameset' as location_type
         FROM frames_set fs
         JOIN imaging_nights ino ON ino.frames_set_id = fs.id
@@ -1449,6 +1489,10 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             MAX(fr.date_obs) as last_date,
             AVG(fr.xpixsz) as avg_xpixsz,
             AVG(fr.focallen) as avg_focallen,
+            AVG(fr.naxis1) as avg_naxis1,
+            AVG(fr.naxis2) as avg_naxis2,
+            AVG(fr.xbinning) as avg_xbinning,
+            AVG(fr.ybinning) as avg_ybinning,
             'cluster' as location_type
         FROM frames fr
         WHERE fr.ra IS NOT NULL
@@ -1473,29 +1517,31 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         let last_date: Option<String> = row.get(8)?;
         let avg_xpixsz: Option<f64> = row.get(9)?;
         let avg_focallen: Option<f64> = row.get(10)?;
-        let location_type: String = row.get(11)?;
+        let avg_naxis1: Option<f64> = row.get(11)?;
+        let avg_naxis2: Option<f64> = row.get(12)?;
+        let avg_xbinning: Option<f64> = row.get(13)?;
+        let avg_ybinning: Option<f64> = row.get(14)?;
+        let location_type: String = row.get(15)?;
 
         // Parse filters from comma-separated string
         let filters: Vec<String> = filters_str
             .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
             .unwrap_or_default();
 
-        // Calculate FOV if we have the necessary metadata
-        let (fov_width, fov_height) = if let (Some(pixel_size), Some(focal_len)) = (avg_xpixsz, avg_focallen) {
-            if focal_len > 0.0 {
-                // Assuming typical sensor size or using a default
-                // FOV (degrees) = 2 * arctan(sensor_size / (2 * focal_length)) * (180 / π)
-                // For now, using a simplified calculation with assumed 4096x4096 sensor
-                let pixel_scale_arcsec = (pixel_size / focal_len) * 206.265;
-                let fov_w = (pixel_scale_arcsec * 4096.0) / 3600.0;
-                let fov_h = (pixel_scale_arcsec * 4096.0) / 3600.0;
-                (Some(fov_w), Some(fov_h))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
+        // Calculate FOV using actual sensor dimensions from FITS metadata
+        let fov_width = calculate_fov(
+            avg_xpixsz,
+            avg_focallen,
+            avg_naxis1.map(|n| n.round() as i32),
+            avg_xbinning.map(|b| b.round() as i32),
+        );
+
+        let fov_height = calculate_fov(
+            avg_xpixsz,
+            avg_focallen,
+            avg_naxis2.map(|n| n.round() as i32),
+            avg_ybinning.map(|b| b.round() as i32),
+        );
 
         // Use a deterministic ID based on location for clusters
         let id = if let Some(fs_id) = frame_set_id {
@@ -1535,6 +1581,46 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
     );
 
     Ok(result)
+}
+
+/// Get preview image for a frame by frame_id
+/// Returns JPEG data as base64-encoded string for embedding in SVG <image> tags
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_frame_preview(
+    state: State<'_, AppState>,
+    frame_id: i64,
+    resolution: Option<String>,
+) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    // Get file path for this frame
+    let file_path: String = {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+
+        conn.query_row(
+            "SELECT f.path FROM files f
+             JOIN frames fr ON f.id = fr.file_id
+             WHERE fr.id = ?1",
+            [frame_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to find frame {}: {}", frame_id, e))?
+    };
+
+    // Use the existing rustafits command to get preview
+    let jpeg_data = crate::commands_rustafits::read_fits_image_rustafits(
+        file_path,
+        resolution.or(Some("thumbnail".to_string())),
+        state,
+    )
+    .await
+    .map_err(|e| format!("Failed to generate preview: {}", e))?;
+
+    // Encode as base64 for SVG embedding
+    let base64_data = STANDARD.encode(&jpeg_data);
+    Ok(format!("data:image/jpeg;base64,{}", base64_data))
 }
 
 /// Query frames within a circular region of the sky
