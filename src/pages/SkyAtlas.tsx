@@ -9,7 +9,8 @@ import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useCircleSelection } from '../hooks/useCircleSelection';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { useZoomLevel } from '../hooks/useZoomLevel';
-import { useViewportBounds, isPointInBounds } from '../hooks/useViewportBounds';
+// import { useViewportBounds } from '../hooks/useViewportBounds';  // Not currently used
+// import { isPointInBounds } from '../hooks/useViewportBounds';  // Not currently used
 import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
 import '../styles/celestial-overrides.css';
@@ -45,7 +46,7 @@ export default function SkyAtlas() {
   const circleSelection = useCircleSelection(svgOverlay, coordinateTransform, mouseEvents);
   const rectangleSelection = useRectangleSelection(svgOverlay, coordinateTransform, mouseEvents);
   const zoomLevel = useZoomLevel(2.0); // Threshold: show FOV boxes when scale > 2.0
-  const viewportBounds = useViewportBounds();
+  // const viewportBounds = useViewportBounds();  // Not currently used
 
   const navigate = useNavigate();
 
@@ -230,10 +231,33 @@ export default function SkyAtlas() {
   const addImagingMarkers = useCallback((locs: ImagingLocation[], isZoomedIn: boolean) => {
     if (typeof window.Celestial === 'undefined') return;
 
-    // Convert RA from astronomical format (0-360°) to GeoJSON format (-180 to +180°)
+    // Convert RA to format expected by d3-celestial
+    // Testing: Use RA directly without conversion (Option A from guide)
     const raToGeoJsonLongitude = (ra: number): number => {
-      // RA > 180° becomes negative longitude
-      return ra > 180 ? ra - 360 : ra;
+      return ra;  // Use RA directly in 0-360° range
+    };
+
+    // Calculate scaling factors to account for canvas stretching
+    const getCanvasScaling = () => {
+      const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
+      if (!canvas) return { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
+
+      // Canvas natural (internal) dimensions - what d3-celestial renders to
+      const canvasWidth = canvas.width;
+      const canvasHeight = canvas.height;
+
+      // Canvas displayed dimensions - how CSS stretches it
+      const displayRect = canvas.getBoundingClientRect();
+      const displayWidth = displayRect.width;
+      const displayHeight = displayRect.height;
+
+      // Scaling factors: how much the canvas is stretched in each dimension
+      const scaleX = displayWidth / canvasWidth;
+      const scaleY = displayHeight / canvasHeight;
+
+      console.log(`Canvas scaling: natural=${canvasWidth}x${canvasHeight}, display=${displayWidth.toFixed(1)}x${displayHeight.toFixed(1)}, scale=${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`);
+
+      return { scaleX, scaleY, offsetX: displayRect.left, offsetY: displayRect.top };
     };
 
     // Filter out locations with invalid coordinates
@@ -251,28 +275,98 @@ export default function SkyAtlas() {
       return;
     }
 
-    // Convert to GeoJSON features with FOV data
-    const features = validLocs.map(loc => ({
-      type: 'Feature',
-      id: loc.id,
-      properties: {
-        name: loc.object_name || 'Unknown',
-        object_name: loc.object_name,
-        frame_count: loc.frame_count,
-        total_exposure: loc.total_exposure,
-        filters: loc.filters.join(', '),
-        date_range: loc.date_range,
-        frame_set_id: loc.frame_set_id,
-        location_type: loc.location_type,
-        fov_width: loc.fov_width,
-        fov_height: loc.fov_height,
-        original_ra: loc.ra  // Keep original RA for FOV calculations
+    // Add test markers for known celestial objects to verify positioning
+    const testMarkers = [
+      {
+        type: 'Feature',
+        id: 'test-m42',
+        properties: {
+          name: 'TEST: M42 Orion Nebula',
+          object_name: 'M42',
+          frame_count: 0,
+          total_exposure: 0,
+          filters: 'TEST',
+          date_range: '',
+          frame_set_id: null,
+          location_type: 'test',
+          fov_width: null,
+          fov_height: null,
+          original_ra: 83.82  // M42 RA: 5h 35m 17s
+        },
+        geometry: {
+          type: 'Point',
+          coordinates: [raToGeoJsonLongitude(83.82), -5.39]  // Dec: -5° 23' 28"
+        }
       },
-      geometry: {
-        type: 'Point',
-        coordinates: [raToGeoJsonLongitude(loc.ra), loc.dec]  // Convert RA to GeoJSON format
+      {
+        type: 'Feature',
+        id: 'test-m31',
+        properties: {
+          name: 'TEST: M31 Andromeda',
+          object_name: 'M31',
+          frame_count: 0,
+          total_exposure: 0,
+          filters: 'TEST',
+          date_range: '',
+          frame_set_id: null,
+          location_type: 'test',
+          fov_width: null,
+          fov_height: null,
+          original_ra: 10.68  // M31 RA: 0h 42m 44s
+        },
+        geometry: {
+          type: 'Point',
+          coordinates: [raToGeoJsonLongitude(10.68), 41.27]  // Dec: +41° 16' 9"
+        }
+      },
+      {
+        type: 'Feature',
+        id: 'test-m45',
+        properties: {
+          name: 'TEST: M45 Pleiades',
+          object_name: 'M45',
+          frame_count: 0,
+          total_exposure: 0,
+          filters: 'TEST',
+          date_range: '',
+          frame_set_id: null,
+          location_type: 'test',
+          fov_width: null,
+          fov_height: null,
+          original_ra: 56.75  // M45 RA: 3h 47m 0s
+        },
+        geometry: {
+          type: 'Point',
+          coordinates: [raToGeoJsonLongitude(56.75), 24.12]  // Dec: +24° 7' 0"
+        }
       }
-    }));
+    ];
+
+    // Convert to GeoJSON features with FOV data
+    const features = [
+      ...validLocs.map(loc => ({
+        type: 'Feature',
+        id: loc.id,
+        properties: {
+          name: loc.object_name || 'Unknown',
+          object_name: loc.object_name,
+          frame_count: loc.frame_count,
+          total_exposure: loc.total_exposure,
+          filters: loc.filters.join(', '),
+          date_range: loc.date_range,
+          frame_set_id: loc.frame_set_id,
+          location_type: loc.location_type,
+          fov_width: loc.fov_width,
+          fov_height: loc.fov_height,
+          original_ra: loc.ra  // Keep original RA for FOV calculations
+        },
+        geometry: {
+          type: 'Point',
+          coordinates: [raToGeoJsonLongitude(loc.ra), loc.dec]  // Convert RA to GeoJSON format
+        }
+      })),
+      ...testMarkers  // Add test markers for verification
+    ];
 
     const imagingData = {
       type: 'FeatureCollection',
@@ -310,7 +404,7 @@ export default function SkyAtlas() {
             return;
           }
 
-          const rect = canvas.getBoundingClientRect();
+          // const rect = canvas.getBoundingClientRect();  // Not currently used
           svg = d3.select('#celestial-map')
             .append('svg')
             .attr('class', 'imaging-markers-overlay')
@@ -346,6 +440,9 @@ export default function SkyAtlas() {
 
         if (isZoomedIn) {
           // Zoomed in: Draw FOV rectangles (or crosses if no FOV data)
+          // Get canvas scaling factors once for all markers
+          const scaling = getCanvasScaling();
+
           markersGroup.selectAll('.fov-box')
             .data(data.features)
             .enter().append('g')
@@ -353,11 +450,11 @@ export default function SkyAtlas() {
             .each(function(this: any, d: any) {
               const g = d3.select(this);
               const hasFov = d.properties.fov_width && d.properties.fov_height;
+              const fovW = d.properties.fov_width;
+              const fovH = d.properties.fov_height;
 
               if (hasFov) {
                 // Draw FOV rectangle
-                const fovW = d.properties.fov_width;
-                const fovH = d.properties.fov_height;
                 const originalRa = d.properties.original_ra;  // Use original RA (0-360°) for calculations
                 const dec = d.geometry.coordinates[1];
 
@@ -369,10 +466,12 @@ export default function SkyAtlas() {
                   [raToGeoJsonLongitude(originalRa - fovW/2), dec + fovH/2],
                 ];
 
-                // Project corners and create initial path
+                // Project corners and apply scaling
                 const projectedCorners = corners.map((c: any) => {
                   const pt = window.Celestial.map.projection()(c);
-                  return pt || [0, 0]; // Fallback if projection fails
+                  if (!pt) return [0, 0];
+                  // Apply canvas scaling
+                  return [pt[0] * scaling.scaleX, pt[1] * scaling.scaleY];
                 });
                 const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
 
@@ -390,9 +489,12 @@ export default function SkyAtlas() {
                 // No FOV data: draw green cross
                 const pt = window.Celestial.map.projection()(d.geometry.coordinates);
                 if (pt) {
+                  // Apply scaling to cross position
+                  const scaledX = pt[0] * scaling.scaleX;
+                  const scaledY = pt[1] * scaling.scaleY;
                   g.append('path')
                     .attr('d', 'M-10,0 L10,0 M0,-10 L0,10')
-                    .attr('transform', `translate(${pt[0]},${pt[1]})`)
+                    .attr('transform', `translate(${scaledX},${scaledY})`)
                     .style('stroke', '#22c55e')
                     .style('stroke-width', '2px')
                     .style('cursor', 'pointer');
@@ -425,6 +527,9 @@ export default function SkyAtlas() {
           console.log('===== ZOOMED OUT: Creating simple markers =====');
           console.log('Appending to markersGroup:', markersGroup.node());
 
+          // Get canvas scaling factors once for all markers
+          const scaling = getCanvasScaling();
+
           const markers = markersGroup.selectAll('.imaging-marker')
             .data(data.features)
             .enter().append('path')
@@ -433,11 +538,34 @@ export default function SkyAtlas() {
             .attr('transform', function(d: any, i: number) {
               const coords = d.geometry.coordinates;
               const pt = window.Celestial.map.projection()(coords);
-              if (i === 0) console.log(`Marker ${i}: coords=[${coords[0]}, ${coords[1]}] → projected to [${pt[0]},${pt[1]}]`);
-              return pt ? `translate(${pt[0]},${pt[1]})` : 'translate(0,0)';
+
+              if (!pt) return 'translate(0,0)';
+
+              // Apply scaling to account for canvas stretching
+              const scaledX = pt[0] * scaling.scaleX;
+              const scaledY = pt[1] * scaling.scaleY;
+
+              // Enhanced debug logging for coordinate verification
+              if (i === 0 || d.properties.location_type === 'test') {
+                console.log(`=== COORDINATE DEBUG (${d.properties.name}) ===`);
+                console.log('Original RA (0-360°):', d.properties.original_ra);
+                console.log('Original Dec:', coords[1]);
+                console.log('Converted coords [lon, lat]:', coords);
+                console.log('Projected pixel position [x, y]:', pt);
+                console.log('Scaled position [x, y]:', [scaledX, scaledY]);
+                console.log('Scaling factors:', scaling);
+              }
+
+              return `translate(${scaledX},${scaledY})`;
             })
-            .style('stroke', '#22c55e')
-            .style('stroke-width', '2px')
+            .style('stroke', function(d: any) {
+              // Make test markers red for easy identification
+              return d.properties.location_type === 'test' ? '#ef4444' : '#22c55e';
+            })
+            .style('stroke-width', function(d: any) {
+              // Make test markers thicker
+              return d.properties.location_type === 'test' ? '3px' : '2px';
+            })
             .style('cursor', 'pointer')
             .style('display', function(d: any) {
               const pt = window.Celestial.map.projection()(d.geometry.coordinates);
@@ -472,6 +600,9 @@ export default function SkyAtlas() {
         const markersGroup = svg.select('g.imaging-markers-layer');
         if (markersGroup.empty()) return;
 
+        // Get canvas scaling factors for redraw
+        const scaling = getCanvasScaling();
+
         if (isZoomedIn) {
           // Redraw FOV boxes
           markersGroup.selectAll('.fov-box').each(function(this: any, d: any) {
@@ -479,19 +610,22 @@ export default function SkyAtlas() {
             const corners = (this as any).__fovCorners;
 
             if (corners) {
-              // Project corners and draw path
+              // Project corners and apply scaling
               const projectedCorners = corners.map((c: any) => {
                 const pt = map.projection()(c);
-                return pt || [0, 0];
+                if (!pt) return [0, 0];
+                return [pt[0] * scaling.scaleX, pt[1] * scaling.scaleY];
               });
               const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
 
               d3.select(this).select('.fov-rect')
                 .attr('d', pathData);
             } else if (pt) {
-              // Update cross position
+              // Update cross position with scaling
+              const scaledX = pt[0] * scaling.scaleX;
+              const scaledY = pt[1] * scaling.scaleY;
               d3.select(this).select('path')
-                .attr('transform', `translate(${pt[0]},${pt[1]})`);
+                .attr('transform', `translate(${scaledX},${scaledY})`);
             }
 
             // Visibility check
@@ -500,13 +634,15 @@ export default function SkyAtlas() {
               .style('display', isVisible ? null : 'none');
           });
         } else {
-          // Redraw simple markers
+          // Redraw simple markers with scaling
           markersGroup.selectAll('.imaging-marker').each(function(this: any, d: any) {
             const pt = map.projection()(d.geometry.coordinates);
 
             if (pt) {
+              const scaledX = pt[0] * scaling.scaleX;
+              const scaledY = pt[1] * scaling.scaleY;
               d3.select(this)
-                .attr('transform', `translate(${pt[0]},${pt[1]})`);
+                .attr('transform', `translate(${scaledX},${scaledY})`);
             }
 
             const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
