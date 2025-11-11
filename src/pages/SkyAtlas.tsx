@@ -232,25 +232,31 @@ export default function SkyAtlas() {
       return ra;  // Use RA directly in 0-360° range
     };
 
-    // Calculate scaling factors to account for canvas stretching
+    // Calculate scaling factors to match projection space to display space
     const getCanvasScaling = () => {
       const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
       if (!canvas) return { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
 
-      // Canvas natural (internal) dimensions - what d3-celestial renders to
-      const canvasWidth = canvas.width;
-      const canvasHeight = canvas.height;
-
-      // Canvas displayed dimensions - how CSS stretches it
       const displayRect = canvas.getBoundingClientRect();
-      const displayWidth = displayRect.width;
-      const displayHeight = displayRect.height;
+      const dpr = window.devicePixelRatio || 1;
 
-      // Scaling factors: how much the canvas is stretched in each dimension
-      const scaleX = displayWidth / canvasWidth;
-      const scaleY = displayHeight / canvasHeight;
+      // d3-celestial uses Aitoff projection with 2:1 aspect ratio
+      // The projection coordinate system is based on the width we configured
+      // Get the Celestial configuration to find the projection width
+      const celestialConfig = (window as any).Celestial?.settings;
+      const projectionWidth = celestialConfig?.width || canvas.width / dpr;
+      const projectionHeight = projectionWidth / 2; // Aitoff is always 2:1
 
-      console.log(`Canvas scaling: natural=${canvasWidth}x${canvasHeight}, display=${displayWidth.toFixed(1)}x${displayHeight.toFixed(1)}, scale=${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`);
+      // The canvas may be stretched to fill the container
+      // We need to scale projection coords to match actual display size
+      const scaleX = displayRect.width / projectionWidth;
+      const scaleY = displayRect.height / projectionHeight;
+
+      console.log(`🔍 Canvas internal: ${canvas.width}x${canvas.height}`);
+      console.log(`🔍 Canvas display: ${displayRect.width.toFixed(1)}x${displayRect.height.toFixed(1)}`);
+      console.log(`🔍 Projection space: ${projectionWidth}x${projectionHeight}`);
+      console.log(`🔍 Device pixel ratio: ${dpr}`);
+      console.log(`🔍 Scale factors: ${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`);
 
       return { scaleX, scaleY, offsetX: displayRect.left, offsetY: displayRect.top };
     };

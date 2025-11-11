@@ -3,7 +3,7 @@
  * Provides button to activate rectangle selection mode
  */
 
-import { Square, X } from 'lucide-react';
+import { Square } from 'lucide-react';
 import { DrawingMode } from '../types/selection';
 
 export interface SelectionToolbarProps {
