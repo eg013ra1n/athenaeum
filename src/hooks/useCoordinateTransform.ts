@@ -44,9 +44,10 @@ export interface CoordinateTransformAPI {
 }
 
 /**
- * Get canvas scaling factors to account for CSS stretching
- * The canvas has a native size but is stretched to fill the display container
- * We need these factors to convert between display pixels and canvas coordinates
+ * Get projection scaling factors to account for aspect ratio changes
+ * d3-celestial uses Aitoff projection with fixed 2:1 aspect ratio
+ * The projection coordinate system is based on the configured width
+ * We need to scale between projection space and display space
  */
 function getCanvasScaling(): { scaleX: number; scaleY: number } {
   const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
@@ -54,21 +55,23 @@ function getCanvasScaling(): { scaleX: number; scaleY: number } {
     return { scaleX: 1, scaleY: 1 };
   }
 
-  const canvasWidth = canvas.width;
-  const canvasHeight = canvas.height;
   const displayRect = canvas.getBoundingClientRect();
-  const displayWidth = displayRect.width;
-  const displayHeight = displayRect.height;
+  const dpr = window.devicePixelRatio || 1;
+
+  // Get the projection dimensions from Celestial config
+  const celestialConfig = (window as any).Celestial?.settings;
+  const projectionWidth = celestialConfig?.width || canvas.width / dpr;
+  const projectionHeight = projectionWidth / 2; // Aitoff is always 2:1
 
   return {
-    scaleX: displayWidth / canvasWidth,
-    scaleY: displayHeight / canvasHeight
+    scaleX: displayRect.width / projectionWidth,
+    scaleY: displayRect.height / projectionHeight
   };
 }
 
 /**
- * Convert display coordinates to canvas coordinates
- * Divides by scaling factors to account for CSS stretching
+ * Convert display coordinates to projection coordinates
+ * Divides by scaling factors to account for aspect ratio differences
  */
 function scaleDisplayToCanvas(x: number, y: number): [number, number] {
   const scaling = getCanvasScaling();
@@ -76,8 +79,8 @@ function scaleDisplayToCanvas(x: number, y: number): [number, number] {
 }
 
 /**
- * Convert canvas coordinates to display coordinates
- * Multiplies by scaling factors to account for CSS stretching
+ * Convert projection coordinates to display coordinates
+ * Multiplies by scaling factors to account for aspect ratio differences
  */
 function scaleCanvasToDisplay(x: number, y: number): [number, number] {
   const scaling = getCanvasScaling();
@@ -113,15 +116,15 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
         return null;
       }
 
-      // Convert display coordinates to canvas space, accounting for CSS scaling
+      // Convert display coordinates to projection space, accounting for aspect ratio
       const [canvasX, canvasY] = scaleDisplayToCanvas(x, y);
 
       // Debug logging
       const scaling = getCanvasScaling();
       if (Math.abs(scaling.scaleX - 1.0) > 0.01 || Math.abs(scaling.scaleY - 1.0) > 0.01) {
-        console.log('📏 Canvas scaling applied:', {
+        console.log('📏 Projection scaling applied:', {
           display: [x, y],
-          canvas: [canvasX, canvasY],
+          projection: [canvasX, canvasY],
           scaleX: scaling.scaleX.toFixed(3),
           scaleY: scaling.scaleY.toFixed(3)
         });
