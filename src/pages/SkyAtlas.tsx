@@ -373,19 +373,15 @@ export default function SkyAtlas() {
       features: features
     };
 
-    // Add custom layer for imaging locations
-    window.Celestial.add({
-      type: 'raw',
-      callback: function(error: any) {
-        if (error) {
-          console.error('Error loading imaging data:', error);
-          return;
-        }
+    // Transform data using d3-celestial's coordinate system
+    const transformedData = window.Celestial.getData(imagingData, window.Celestial.settings().transform);
+    console.log('✨ Pre-transformed data features:', transformedData?.features?.length);
 
-        // Transform data to celestial coordinates
-        const data = window.Celestial.getData(imagingData, window.Celestial.settings().transform);
-
-        console.log('Transformed data features:', data?.features?.length);
+    // Instead of using Celestial.add() which has unreliable callback execution,
+    // we'll render the markers directly
+    const renderMarkers = () => {
+      console.log('🎨 Rendering markers directly (bypassing Celestial.add)');
+      const data = transformedData;
 
         // d3-celestial uses canvas, not SVG. We need to create our own SVG overlay
         const mapDiv = document.getElementById('celestial-map');
@@ -589,7 +585,15 @@ export default function SkyAtlas() {
           console.log('✅ SVG overlay in DOM:', document.querySelector('#celestial-map svg.imaging-markers-overlay'));
           console.log('✅ Markers in SVG:', markersGroup.selectAll('.imaging-marker').size());
         }
-      },
+      };
+
+    // Call the render function immediately
+    renderMarkers();
+
+    // Register with Celestial for pan/zoom updates
+    window.Celestial.add({
+      type: 'raw',
+      callback: renderMarkers,
       redraw: function() {
         const map = window.Celestial.map;
 
@@ -657,7 +661,8 @@ export default function SkyAtlas() {
   // Add markers when locations are loaded or zoom level changes
   useEffect(() => {
     if (mapReady && locations.length > 0 && !loading) {
-      setTimeout(() => addImagingMarkers(locations, zoomLevel.isZoomedIn), 100);
+      console.log('🎯 Marker useEffect triggered, calling addImagingMarkers');
+      addImagingMarkers(locations, zoomLevel.isZoomedIn);
     }
   }, [locations, mapReady, loading, zoomLevel.isZoomedIn, addImagingMarkers]);
 
