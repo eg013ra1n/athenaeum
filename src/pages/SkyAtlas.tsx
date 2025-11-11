@@ -6,11 +6,8 @@ import { DrawingMode, SelectionResult } from '../types/selection';
 import { useSvgOverlay } from '../hooks/useSvgOverlay';
 import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
-import { useCircleSelection } from '../hooks/useCircleSelection';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { useZoomLevel } from '../hooks/useZoomLevel';
-// import { useViewportBounds } from '../hooks/useViewportBounds';  // Not currently used
-// import { isPointInBounds } from '../hooks/useViewportBounds';  // Not currently used
 import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
 import '../styles/celestial-overrides.css';
@@ -43,10 +40,8 @@ export default function SkyAtlas() {
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
   const coordinateTransform = useCoordinateTransform();
   const mouseEvents = useD3MouseEvents();
-  const circleSelection = useCircleSelection(svgOverlay, coordinateTransform, mouseEvents);
   const rectangleSelection = useRectangleSelection(svgOverlay, coordinateTransform, mouseEvents);
   const zoomLevel = useZoomLevel(2.0); // Threshold: show FOV boxes when scale > 2.0
-  // const viewportBounds = useViewportBounds();  // Not currently used
 
   const navigate = useNavigate();
 
@@ -680,25 +675,6 @@ export default function SkyAtlas() {
     }
   }, [drawingMode, mapReady, svgOverlay]);
 
-  // Handle circle selection
-  useEffect(() => {
-    if (!mapReady || drawingMode !== 'circle') return;
-
-    console.log('Circle selection effect triggered');
-
-    circleSelection.startSelection((result) => {
-      console.log('Circle selection completed with result:', result);
-      setSelectionResult(result);
-      setShowDialog(true);
-      setDrawingMode('none');
-    });
-
-    return () => {
-      console.log('Circle selection effect cleanup');
-      circleSelection.cancelSelection();
-    };
-  }, [drawingMode, mapReady, circleSelection]);
-
   // Handle rectangle selection
   useEffect(() => {
     if (!mapReady || drawingMode !== 'rectangle') return;
@@ -717,6 +693,31 @@ export default function SkyAtlas() {
       rectangleSelection.cancelSelection();
     };
   }, [drawingMode, mapReady, rectangleSelection]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Ignore if user is typing in an input field
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      // 'S' key - toggle rectangle selection
+      if (event.key === 's' || event.key === 'S') {
+        event.preventDefault();
+        setDrawingMode(prev => prev === 'rectangle' ? 'none' : 'rectangle');
+      }
+
+      // 'Escape' key - cancel selection
+      if (event.key === 'Escape' && drawingMode !== 'none') {
+        event.preventDefault();
+        setDrawingMode('none');
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [drawingMode]);
 
   if (loading) {
     return (
@@ -756,7 +757,7 @@ export default function SkyAtlas() {
           </p>
           <p className="text-gray-500 text-sm">
             Once you import FITS/XISF files with coordinate data, they will appear here.
-            You can then use the circle selection tool to organize them into frame sets, or go to the Objects page to use "Auto-Generate Frame Sets".
+            You can then use the rectangle selection tool (press S) to organize them into frame sets, or go to the Objects page to use "Auto-Generate Frame Sets".
           </p>
         </div>
       </div>
@@ -777,22 +778,22 @@ export default function SkyAtlas() {
       <div
         id="celestial-map"
         ref={containerRef}
-        className="flex-1 w-full overflow-hidden"
+        className="flex-1 w-full overflow-hidden relative"
         style={{ minHeight: 0 }}
-      />
-
-      {/* Selection Toolbar */}
-      <SelectionToolbar
-        activeMode={drawingMode}
-        onModeChange={setDrawingMode}
-        isDisabled={!mapReady}
-      />
+      >
+        {/* Selection Toolbar - floating overlay */}
+        <SelectionToolbar
+          activeMode={drawingMode}
+          onModeChange={setDrawingMode}
+          isDisabled={!mapReady}
+        />
+      </div>
 
       {/* Selection Results Dialog */}
       <SelectionDialog
         isOpen={showDialog}
         result={selectionResult}
-        selectionType={drawingMode as 'circle' | 'rectangle' | 'polygon' | null}
+        selectionType={drawingMode === 'rectangle' ? 'rectangle' : null}
         onClose={() => {
           setShowDialog(false);
           setSelectionResult(null);

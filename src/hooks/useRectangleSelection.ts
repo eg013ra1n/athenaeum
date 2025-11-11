@@ -159,27 +159,36 @@ export function useRectangleSelection(
 
         state.isDrawing = false;
 
-        // Calculate bounds with wrap-around detection
-        // For RA, we need to determine if the rectangle wraps around 0°/360°
+        // Calculate bounds
         const startRA = state.startSky[0];
         const currentRA = state.currentSky[0];
 
-        // Calculate the distance in both directions around the celestial sphere
+        // Calculate both direct and wrap-around angular distances
         const directDistance = Math.abs(currentRA - startRA);
         const wrapDistance = 360 - directDistance;
 
-        // Determine if wrap-around is the shorter path
+        // Determine if selection crosses 0°/360° boundary
+        // If wrap distance is smaller, the selection crosses the boundary
+        const crossesBoundary = wrapDistance < directDistance;
+
         let raMin: number, raMax: number;
-        if (directDistance <= wrapDistance) {
-          // Normal case: no wrap-around
+
+        if (crossesBoundary) {
+          // Selection crosses 0°/360° boundary
+          // In this case, we want the larger values on one side and smaller on the other
+          // The "min" should be the larger value, "max" should be the smaller value
+          // This creates a range like [300, 360] + [0, 60] which wraps around
+          raMin = Math.max(startRA, currentRA);
+          raMax = Math.min(startRA, currentRA);
+          console.log('🔄 RA crosses boundary:', { startRA, currentRA, raMin, raMax });
+        } else {
+          // Normal case: selection doesn't cross boundary
           raMin = Math.min(startRA, currentRA);
           raMax = Math.max(startRA, currentRA);
-        } else {
-          // Wrap-around case: the rectangle crosses 0°/360°
-          raMin = Math.max(startRA, currentRA);  // Higher RA value (near 360)
-          raMax = Math.min(startRA, currentRA);  // Lower RA value (near 0)
+          console.log('✅ RA normal range:', { startRA, currentRA, raMin, raMax });
         }
 
+        // Dec: simple min/max (declination is -90 to +90, no wrap-around)
         const decMin = Math.min(state.startSky[1], state.currentSky[1]);
         const decMax = Math.max(state.startSky[1], state.currentSky[1]);
 
@@ -191,13 +200,7 @@ export function useRectangleSelection(
             dec_min: decMin,
             dec_max: decMax
           };
-          const raWrapAround = raMin > raMax;
-          console.log('Querying frames with params:', {
-            bounds,
-            raWrapAround,
-            startRA: state.startSky[0],
-            currentRA: state.currentSky[0]
-          });
+          console.log('Querying frames with bounds:', bounds);
 
           const result = await invoke<SelectionResult>('query_frames_in_bounds', {
             bounds: {
