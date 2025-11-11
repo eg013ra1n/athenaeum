@@ -8,15 +8,19 @@ import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useCircleSelection } from '../hooks/useCircleSelection';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
+import { useZoomLevel } from '../hooks/useZoomLevel';
+import { useViewportBounds, isPointInBounds } from '../hooks/useViewportBounds';
 import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
 import '../styles/celestial-overrides.css';
 
-// Declare global Celestial from d3-celestial
+// Declare global Celestial and d3 from d3-celestial
 declare global {
   interface Window {
     Celestial: any;
+    d3: any;
   }
+  const d3: any;
 }
 
 export default function SkyAtlas() {
@@ -40,6 +44,8 @@ export default function SkyAtlas() {
   const mouseEvents = useD3MouseEvents();
   const circleSelection = useCircleSelection(svgOverlay, coordinateTransform, mouseEvents);
   const rectangleSelection = useRectangleSelection(svgOverlay, coordinateTransform, mouseEvents);
+  const zoomLevel = useZoomLevel(2.0); // Threshold: show FOV boxes when scale > 2.0
+  const viewportBounds = useViewportBounds();
 
   const navigate = useNavigate();
 
@@ -220,14 +226,33 @@ export default function SkyAtlas() {
     };
   }, [mapReady]);
 
-  // Add imaging location markers
-  const addImagingMarkers = useCallback((locs: ImagingLocation[]) => {
+  // Add imaging location markers with FOV visualization
+  const addImagingMarkers = useCallback((locs: ImagingLocation[], isZoomedIn: boolean) => {
     if (typeof window.Celestial === 'undefined') return;
 
-    console.log(`Adding ${locs.length} imaging location markers`);
+    // Convert RA from astronomical format (0-360°) to GeoJSON format (-180 to +180°)
+    const raToGeoJsonLongitude = (ra: number): number => {
+      // RA > 180° becomes negative longitude
+      return ra > 180 ? ra - 360 : ra;
+    };
 
-    // Convert to GeoJSON features
-    const features = locs.map(loc => ({
+    // Filter out locations with invalid coordinates
+    const validLocs = locs.filter(loc =>
+      loc.ra !== null && loc.ra !== undefined &&
+      loc.dec !== null && loc.dec !== undefined &&
+      !isNaN(loc.ra) && !isNaN(loc.dec) &&
+      isFinite(loc.ra) && isFinite(loc.dec)
+    );
+
+    console.log(`Adding ${validLocs.length} imaging location markers (zoomed: ${isZoomedIn}) - filtered from ${locs.length}`);
+
+    if (validLocs.length === 0) {
+      console.warn('No valid imaging locations to display');
+      return;
+    }
+
+    // Convert to GeoJSON features with FOV data
+    const features = validLocs.map(loc => ({
       type: 'Feature',
       id: loc.id,
       properties: {
@@ -238,11 +263,14 @@ export default function SkyAtlas() {
         filters: loc.filters.join(', '),
         date_range: loc.date_range,
         frame_set_id: loc.frame_set_id,
-        location_type: loc.location_type  // 'frameset' or 'cluster'
+        location_type: loc.location_type,
+        fov_width: loc.fov_width,
+        fov_height: loc.fov_height,
+        original_ra: loc.ra  // Keep original RA for FOV calculations
       },
       geometry: {
         type: 'Point',
-        coordinates: [loc.ra, loc.dec]
+        coordinates: [raToGeoJsonLongitude(loc.ra), loc.dec]  // Convert RA to GeoJSON format
       }
     }));
 
@@ -261,67 +289,241 @@ export default function SkyAtlas() {
         }
 
         // Transform data to celestial coordinates
-        const container = window.Celestial.container;
         const data = window.Celestial.getData(imagingData, window.Celestial.settings().transform);
 
-        // Draw markers
-        container.selectAll('.imaging-marker').remove();
+        console.log('Transformed data features:', data?.features?.length);
 
-        container.selectAll('.imaging-marker')
-          .data(data.features)
-          .enter().append('path')
-          .attr('class', function(d: any) { return `imaging-marker imaging-${d.properties.location_type}`; })
-          .attr('d', window.Celestial.symbol().type(window.Celestial.symbolType('square')).size(100))
-          .style('fill', function(d: any) {
-            // Blue for organized frame sets, Orange for unorganized clusters
-            return d.properties.location_type === 'frameset' ? '#3b82f6' : '#f97316';
-          })
-          .style('stroke', function(d: any) {
-            return d.properties.location_type === 'frameset' ? '#60a5fa' : '#fb923c';
-          })
-          .style('stroke-width', '1.5px')
-          .style('cursor', 'pointer')
-          .on('click', function(d: any) {
-            const frameSetId = d.properties.frame_set_id;
-            if (frameSetId) {
-              navigate(`/objects/${frameSetId}`);
-            }
-          })
-          .append('title')
-          .text(function(d: any) {
-            const totalHours = (d.properties.total_exposure / 3600).toFixed(2);
-            const typeLabel = d.properties.location_type === 'frameset' ? '[Frame Set]' : '[Unorganized]';
-            return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frame_count}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}`;
-          });
+        // d3-celestial uses canvas, not SVG. We need to create our own SVG overlay
+        const mapDiv = document.getElementById('celestial-map');
+        if (!mapDiv) {
+          console.error('celestial-map div not found');
+          return;
+        }
+
+        // Find or create SVG overlay
+        let svg = d3.select('#celestial-map').select('svg.imaging-markers-overlay');
+        if (svg.empty()) {
+          // Create SVG overlay positioned absolutely over the canvas
+          const canvas = mapDiv.querySelector('canvas');
+          if (!canvas) {
+            console.error('Canvas not found');
+            return;
+          }
+
+          const rect = canvas.getBoundingClientRect();
+          svg = d3.select('#celestial-map')
+            .append('svg')
+            .attr('class', 'imaging-markers-overlay')
+            .style('position', 'absolute')
+            .style('top', '0')
+            .style('left', '0')
+            .style('width', '100%')
+            .style('height', '100%')
+            .style('pointer-events', 'none'); // Allow clicks to pass through to canvas
+
+          console.log('✅ Created SVG overlay:', svg.node());
+        } else {
+          console.log('✅ Using existing SVG overlay');
+        }
+
+        // Create or get markers group
+        let markersGroup = svg.select('g.imaging-markers-layer');
+        if (markersGroup.empty()) {
+          markersGroup = svg.append('g')
+            .attr('class', 'imaging-markers-layer')
+            .style('pointer-events', 'auto'); // Re-enable pointer events for markers
+          console.log('✅ Created markers group');
+        } else {
+          console.log('✅ Using existing markers group');
+        }
+
+        // Clear old markers
+        const removedMarkers = markersGroup.selectAll('.imaging-marker').size();
+        const removedBoxes = markersGroup.selectAll('.fov-box').size();
+        markersGroup.selectAll('.imaging-marker').remove();
+        markersGroup.selectAll('.fov-box').remove();
+        console.log(`Removed ${removedMarkers} markers and ${removedBoxes} boxes`);
+
+        if (isZoomedIn) {
+          // Zoomed in: Draw FOV rectangles (or crosses if no FOV data)
+          markersGroup.selectAll('.fov-box')
+            .data(data.features)
+            .enter().append('g')
+            .attr('class', 'fov-box')
+            .each(function(this: any, d: any) {
+              const g = d3.select(this);
+              const hasFov = d.properties.fov_width && d.properties.fov_height;
+
+              if (hasFov) {
+                // Draw FOV rectangle
+                const fovW = d.properties.fov_width;
+                const fovH = d.properties.fov_height;
+                const originalRa = d.properties.original_ra;  // Use original RA (0-360°) for calculations
+                const dec = d.geometry.coordinates[1];
+
+                // Rectangle corners in RA/Dec, converted to GeoJSON format
+                const corners = [
+                  [raToGeoJsonLongitude(originalRa - fovW/2), dec - fovH/2],
+                  [raToGeoJsonLongitude(originalRa + fovW/2), dec - fovH/2],
+                  [raToGeoJsonLongitude(originalRa + fovW/2), dec + fovH/2],
+                  [raToGeoJsonLongitude(originalRa - fovW/2), dec + fovH/2],
+                ];
+
+                // Project corners and create initial path
+                const projectedCorners = corners.map((c: any) => {
+                  const pt = window.Celestial.map.projection()(c);
+                  return pt || [0, 0]; // Fallback if projection fails
+                });
+                const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
+
+                g.append('path')
+                  .attr('class', 'fov-rect')
+                  .attr('d', pathData)
+                  .style('fill', 'rgba(34, 197, 94, 0.15)')
+                  .style('stroke', '#22c55e')
+                  .style('stroke-width', '2px')
+                  .style('cursor', 'pointer');
+
+                // Store corners for redraw
+                (this as any).__fovCorners = corners;
+              } else {
+                // No FOV data: draw green cross
+                const pt = window.Celestial.map.projection()(d.geometry.coordinates);
+                if (pt) {
+                  g.append('path')
+                    .attr('d', 'M-10,0 L10,0 M0,-10 L0,10')
+                    .attr('transform', `translate(${pt[0]},${pt[1]})`)
+                    .style('stroke', '#22c55e')
+                    .style('stroke-width', '2px')
+                    .style('cursor', 'pointer');
+                }
+              }
+
+              // Visibility check
+              const isVisible = window.Celestial.clip(d.geometry.coordinates);
+              g.style('display', isVisible ? null : 'none');
+
+              // Click handler
+              g.on('click', function() {
+                const frameSetId = d.properties.frame_set_id;
+                if (frameSetId) {
+                  navigate(`/objects/${frameSetId}`);
+                }
+              });
+
+              // Tooltip
+              g.append('title')
+                .text(function() {
+                  const totalHours = (d.properties.total_exposure / 3600).toFixed(2);
+                  const typeLabel = d.properties.location_type === 'frameset' ? '[Frame Set]' : '[Unorganized]';
+                  const fovInfo = hasFov ? `\nFOV: ${fovW.toFixed(2)}° × ${fovH.toFixed(2)}°` : '';
+                  return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frame_count}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${fovInfo}`;
+                });
+            });
+        } else {
+          // Zoomed out: Draw simple green crosses
+          console.log('===== ZOOMED OUT: Creating simple markers =====');
+          console.log('Appending to markersGroup:', markersGroup.node());
+
+          const markers = markersGroup.selectAll('.imaging-marker')
+            .data(data.features)
+            .enter().append('path')
+            .attr('class', 'imaging-marker')
+            .attr('d', 'M-8,0 L8,0 M0,-8 L0,8')
+            .attr('transform', function(d: any, i: number) {
+              const coords = d.geometry.coordinates;
+              const pt = window.Celestial.map.projection()(coords);
+              if (i === 0) console.log(`Marker ${i}: coords=[${coords[0]}, ${coords[1]}] → projected to [${pt[0]},${pt[1]}]`);
+              return pt ? `translate(${pt[0]},${pt[1]})` : 'translate(0,0)';
+            })
+            .style('stroke', '#22c55e')
+            .style('stroke-width', '2px')
+            .style('cursor', 'pointer')
+            .style('display', function(d: any) {
+              const pt = window.Celestial.map.projection()(d.geometry.coordinates);
+              const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
+              return isVisible ? null : 'none';
+            })
+            .on('click', function(d: any) {
+              const frameSetId = d.properties.frame_set_id;
+              if (frameSetId) {
+                navigate(`/objects/${frameSetId}`);
+              }
+            })
+            .append('title')
+            .text(function(d: any) {
+              const totalHours = (d.properties.total_exposure / 3600).toFixed(2);
+              const typeLabel = d.properties.location_type === 'frameset' ? '[Frame Set]' : '[Unorganized]';
+              return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frame_count}\nExposure: ${totalHours}h`;
+            });
+
+          console.log('✅ Created', markers.size(), 'marker elements');
+          console.log('✅ SVG overlay in DOM:', document.querySelector('#celestial-map svg.imaging-markers-overlay'));
+          console.log('✅ Markers in SVG:', markersGroup.selectAll('.imaging-marker').size());
+        }
       },
       redraw: function() {
-        // Redraw markers on zoom/pan
-        const container = window.Celestial.container;
         const map = window.Celestial.map;
 
-        container.selectAll('.imaging-marker').each(function(this: any, d: any) {
-          // Get projected coordinates
-          const pt = map.projection()(d.geometry.coordinates);
+        // Get our SVG overlay
+        const svg = d3.select('#celestial-map').select('svg.imaging-markers-overlay');
+        if (svg.empty()) return;
 
-          // Update position
-          window.Celestial.select(this)
-            .attr('transform', `translate(${pt[0]},${pt[1]})`);
+        const markersGroup = svg.select('g.imaging-markers-layer');
+        if (markersGroup.empty()) return;
 
-          // Check if point is visible
-          const isVisible = window.Celestial.clip(d.geometry.coordinates);
-          window.Celestial.select(this)
-            .style('display', isVisible ? null : 'none');
-        });
+        if (isZoomedIn) {
+          // Redraw FOV boxes
+          markersGroup.selectAll('.fov-box').each(function(this: any, d: any) {
+            const pt = map.projection()(d.geometry.coordinates);
+            const corners = (this as any).__fovCorners;
+
+            if (corners) {
+              // Project corners and draw path
+              const projectedCorners = corners.map((c: any) => {
+                const pt = map.projection()(c);
+                return pt || [0, 0];
+              });
+              const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
+
+              d3.select(this).select('.fov-rect')
+                .attr('d', pathData);
+            } else if (pt) {
+              // Update cross position
+              d3.select(this).select('path')
+                .attr('transform', `translate(${pt[0]},${pt[1]})`);
+            }
+
+            // Visibility check
+            const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
+            d3.select(this)
+              .style('display', isVisible ? null : 'none');
+          });
+        } else {
+          // Redraw simple markers
+          markersGroup.selectAll('.imaging-marker').each(function(this: any, d: any) {
+            const pt = map.projection()(d.geometry.coordinates);
+
+            if (pt) {
+              d3.select(this)
+                .attr('transform', `translate(${pt[0]},${pt[1]})`);
+            }
+
+            const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
+            d3.select(this)
+              .style('display', isVisible ? null : 'none');
+          });
+        }
       }
     });
   }, [navigate]);
 
-  // Add markers when locations are loaded
+  // Add markers when locations are loaded or zoom level changes
   useEffect(() => {
     if (mapReady && locations.length > 0 && !loading) {
-      setTimeout(() => addImagingMarkers(locations), 100);
+      setTimeout(() => addImagingMarkers(locations, zoomLevel.isZoomedIn), 100);
     }
-  }, [locations, mapReady, loading, addImagingMarkers]);
+  }, [locations, mapReady, loading, zoomLevel.isZoomedIn, addImagingMarkers]);
 
   // Manage SVG overlay visibility based on drawing mode
   useEffect(() => {

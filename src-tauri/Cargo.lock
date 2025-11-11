@@ -216,6 +216,7 @@ name = "athenaeum"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "fitsio",
  "quick-xml 0.36.2",

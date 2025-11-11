@@ -208,7 +208,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
@@ -264,15 +264,17 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 focallen: row.get(25).ok(),
                 xpixsz: row.get(26).ok(),
                 pixsz: row.get(27).ok(),
-                ra: row.get(28).ok(),
-                dec: row.get(29).ok(),
-                sitelat: row.get(30).ok(),
-                lat_obs: row.get(31).ok(),
-                sitelong: row.get(32).ok(),
-                long_obs: row.get(33).ok(),
-                objctra: row.get(34).ok(),
-                objctdec: row.get(35).ok(),
-                override_: row.get::<_, i32>(36).ok().map(|v| v == 1).unwrap_or(false),
+                naxis1: row.get(28).ok(),
+                naxis2: row.get(29).ok(),
+                ra: row.get(30).ok(),
+                dec: row.get(31).ok(),
+                sitelat: row.get(32).ok(),
+                lat_obs: row.get(33).ok(),
+                sitelong: row.get(34).ok(),
+                long_obs: row.get(35).ok(),
+                objctra: row.get(36).ok(),
+                objctdec: row.get(37).ok(),
+                override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
             })
         } else {
             None
@@ -360,15 +362,17 @@ pub fn get_files_by_directory(
                 focallen: row.get(25).ok(),
                 xpixsz: row.get(26).ok(),
                 pixsz: row.get(27).ok(),
-                ra: row.get(28).ok(),
-                dec: row.get(29).ok(),
-                sitelat: row.get(30).ok(),
-                lat_obs: row.get(31).ok(),
-                sitelong: row.get(32).ok(),
-                long_obs: row.get(33).ok(),
-                objctra: row.get(34).ok(),
-                objctdec: row.get(35).ok(),
-                override_: row.get::<_, i32>(36).ok().map(|v| v == 1).unwrap_or(false),
+                naxis1: row.get(28).ok(),
+                naxis2: row.get(29).ok(),
+                ra: row.get(30).ok(),
+                dec: row.get(31).ok(),
+                sitelat: row.get(32).ok(),
+                lat_obs: row.get(33).ok(),
+                sitelong: row.get(34).ok(),
+                long_obs: row.get(35).ok(),
+                objctra: row.get(36).ok(),
+                objctdec: row.get(37).ok(),
+                override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
             })
         } else {
             None
@@ -601,7 +605,7 @@ pub fn get_light_frames_for_project(
         "SELECT f.id, fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
@@ -641,15 +645,17 @@ pub fn get_light_frames_for_project(
             focallen: row.get(18)?,
             xpixsz: row.get(19)?,
             pixsz: row.get(20)?,
-            ra: row.get(21)?,
-            dec: row.get(22)?,
-            sitelat: row.get(23)?,
-            lat_obs: row.get(24)?,
-            sitelong: row.get(25)?,
-            long_obs: row.get(26)?,
-            objctra: row.get(27)?,
-            objctdec: row.get(28)?,
-            override_: row.get::<_, i32>(29)? == 1,
+            naxis1: row.get(21)?,
+            naxis2: row.get(22)?,
+            ra: row.get(23)?,
+            dec: row.get(24)?,
+            sitelat: row.get(25)?,
+            lat_obs: row.get(26)?,
+            sitelong: row.get(27)?,
+            long_obs: row.get(28)?,
+            objctra: row.get(29)?,
+            objctdec: row.get(30)?,
+            override_: row.get::<_, i32>(31)? == 1,
         };
 
         Ok((file_id, frame))
@@ -741,7 +747,7 @@ pub fn get_frames_with_files_for_set(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM session_members sm
          JOIN sessions s ON sm.session_id = s.id
@@ -796,15 +802,17 @@ pub fn get_frames_with_files_for_set(
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
             pixsz: row.get(28)?,
-            ra: row.get(29)?,
-            dec: row.get(30)?,
-            sitelat: row.get(31)?,
-            lat_obs: row.get(32)?,
-            sitelong: row.get(33)?,
-            long_obs: row.get(34)?,
-            objctra: row.get(35)?,
-            objctdec: row.get(36)?,
-            override_: row.get::<_, i32>(37)? == 1,
+            naxis1: row.get(29)?,
+            naxis2: row.get(30)?,
+            ra: row.get(31)?,
+            dec: row.get(32)?,
+            sitelat: row.get(33)?,
+            lat_obs: row.get(34)?,
+            sitelong: row.get(35)?,
+            long_obs: row.get(36)?,
+            objctra: row.get(37)?,
+            objctdec: row.get(38)?,
+            override_: row.get::<_, i32>(39)? == 1,
         };
 
         // Debug: Check date_obs in database
@@ -840,15 +848,17 @@ pub fn get_frames_with_files_for_set(
             focallen: row.get(25)?,
             xpixsz: row.get(26)?,
             pixsz: row.get(27)?,
-            ra: row.get(28)?,
-            dec: row.get(29)?,
-            sitelat: row.get(30)?,
-            lat_obs: row.get(31)?,
-            sitelong: row.get(32)?,
-            long_obs: row.get(33)?,
-            objctra: row.get(34)?,
-            objctdec: row.get(35)?,
-            override_: row.get::<_, i32>(36)? == 1,
+            naxis1: row.get(28)?,
+            naxis2: row.get(29)?,
+            ra: row.get(30)?,
+            dec: row.get(31)?,
+            sitelat: row.get(32)?,
+            lat_obs: row.get(33)?,
+            sitelong: row.get(34)?,
+            long_obs: row.get(35)?,
+            objctra: row.get(36)?,
+            objctdec: row.get(37)?,
+            override_: row.get::<_, i32>(38)? == 1,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -874,7 +884,7 @@ pub fn get_frames_with_files_by_ids(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM frames fr
          JOIN files f ON fr.file_id = f.id
@@ -937,15 +947,17 @@ pub fn get_frames_with_files_by_ids(
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
             pixsz: row.get(28)?,
-            ra: row.get(29)?,
-            dec: row.get(30)?,
-            sitelat: row.get(31)?,
-            lat_obs: row.get(32)?,
-            sitelong: row.get(33)?,
-            long_obs: row.get(34)?,
-            objctra: row.get(35)?,
-            objctdec: row.get(36)?,
-            override_: row.get::<_, i32>(37)? == 1,
+            naxis1: row.get(29)?,
+            naxis2: row.get(30)?,
+            ra: row.get(31)?,
+            dec: row.get(32)?,
+            sitelat: row.get(33)?,
+            lat_obs: row.get(34)?,
+            sitelong: row.get(35)?,
+            long_obs: row.get(36)?,
+            objctra: row.get(37)?,
+            objctdec: row.get(38)?,
+            override_: row.get::<_, i32>(39)? == 1,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -1019,7 +1031,7 @@ pub fn get_imaging_nights_with_sessions(
                         fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                         fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                         fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                        fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                        fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                         fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
                  FROM session_members sm
                  JOIN frames fr ON sm.frame_id = fr.id
@@ -1072,15 +1084,17 @@ pub fn get_imaging_nights_with_sessions(
                     focallen: row.get(26)?,
                     xpixsz: row.get(27)?,
                     pixsz: row.get(28)?,
-                    ra: row.get(29)?,
-                    dec: row.get(30)?,
-                    sitelat: row.get(31)?,
-                    lat_obs: row.get(32)?,
-                    sitelong: row.get(33)?,
-                    long_obs: row.get(34)?,
-                    objctra: row.get(35)?,
-                    objctdec: row.get(36)?,
-                    override_: row.get::<_, i32>(37)? == 1,
+                    naxis1: row.get(29)?,
+                    naxis2: row.get(30)?,
+                    ra: row.get(31)?,
+                    dec: row.get(32)?,
+                    sitelat: row.get(33)?,
+                    lat_obs: row.get(34)?,
+                    sitelong: row.get(35)?,
+                    long_obs: row.get(36)?,
+                    objctra: row.get(37)?,
+                    objctdec: row.get(38)?,
+                    override_: row.get::<_, i32>(39)? == 1,
                 };
 
                 Ok(crate::models::FileWithFrame {

@@ -173,6 +173,10 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let xpixsz = read_keyword_f64(&mut fitsfile, &hdu, "XPIXSZ").ok();
     let pixsz = read_keyword_f64(&mut fitsfile, &hdu, "PIXSZ").ok();
 
+    // Image dimensions
+    let naxis1 = read_keyword_i32(&mut fitsfile, &hdu, "NAXIS1").ok();
+    let naxis2 = read_keyword_i32(&mut fitsfile, &hdu, "NAXIS2").ok();
+
     // Astronomical coordinates
     let ra = read_keyword_f64(&mut fitsfile, &hdu, "RA").ok();
     let dec = read_keyword_f64(&mut fitsfile, &hdu, "DEC").ok();
@@ -252,6 +256,8 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         focallen,
         xpixsz,
         pixsz,
+        naxis1,
+        naxis2,
         ra,
         dec,
         sitelat,
@@ -379,6 +385,12 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let pixsz = fits_keywords.get("PIXSZ")
         .and_then(|s| s.parse::<f64>().ok());
 
+    // Image dimensions
+    let naxis1 = fits_keywords.get("NAXIS1")
+        .and_then(|s| s.parse::<i32>().ok());
+    let naxis2 = fits_keywords.get("NAXIS2")
+        .and_then(|s| s.parse::<i32>().ok());
+
     // Astronomical coordinates
     let ra = fits_keywords.get("RA")
         .and_then(|s| s.parse::<f64>().ok());
@@ -459,6 +471,8 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         focallen,
         xpixsz,
         pixsz,
+        naxis1,
+        naxis2,
         ra,
         dec,
         sitelat,

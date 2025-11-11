@@ -36,6 +36,7 @@ anyhow = "1"
 thiserror = "2"
 quick-xml = "0.36"
 rustafits = { git = "https://github.com/eg013ra1n/rustafits" }
+base64 = "0.22"
 
 [profile.release]
 lto = true           # Link-time optimization for cross-function inlining
