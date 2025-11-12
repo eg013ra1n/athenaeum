@@ -418,6 +418,8 @@ pub struct SelectionBounds {
     pub ra_max: f64,
     pub dec_min: f64,
     pub dec_max: f64,
+    #[serde(default)]
+    pub crosses_meridian: Option<bool>,
 }
 
 /// Result of a spatial selection query

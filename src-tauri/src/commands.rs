@@ -1702,14 +1702,14 @@ pub async fn query_frames_in_bounds(
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    println!(
-        "Querying frames in bounds: ra_min={}, ra_max={}, dec_min={}, dec_max={}",
-        bounds.ra_min, bounds.ra_max, bounds.dec_min, bounds.dec_max
-    );
-
     // Handle RA wrap-around at 0°/360° boundary
-    // If ra_min > ra_max, it means the rectangle wraps around 0°
-    let ra_wrap_around = bounds.ra_min > bounds.ra_max;
+    // Use explicit crosses_meridian flag if provided, otherwise detect from ra_min > ra_max
+    let ra_wrap_around = bounds.crosses_meridian.unwrap_or_else(|| bounds.ra_min > bounds.ra_max);
+
+    println!(
+        "Querying frames in bounds: ra_min={}, ra_max={}, dec_min={}, dec_max={}, crosses_meridian={}",
+        bounds.ra_min, bounds.ra_max, bounds.dec_min, bounds.dec_max, ra_wrap_around
+    );
 
     let query = if ra_wrap_around {
         // Wrap-around case: select frames where ra >= ra_min OR ra <= ra_max

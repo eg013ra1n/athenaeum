@@ -1,6 +1,6 @@
 /**
  * Custom hook for rectangle-based region selection on sky map
- * Handles drawing and querying frames within a rectangle
+ * Uses pixel-space approach for stable drawing, converts to sky coordinates only at completion
  */
 
 import { useRef } from 'react';
@@ -9,6 +9,11 @@ import { SelectionResult } from '../types/selection';
 import { SVGOverlayAPI } from './useSvgOverlay';
 import { CoordinateTransformAPI } from './useCoordinateTransform';
 import { D3MouseEventAPI } from './useD3MouseEvents';
+import { calculateSkyBounds, PixelRectangle } from '../utils/skyBoundsCalculator';
+import { clampRectangleToProjection } from '../utils/projectionBounds';
+
+// Pixel-based selection limits
+const MIN_SELECTION_SIZE = 10;  // Minimum 10x10 pixels
 
 export interface RectangleSelectionAPI {
   /**
@@ -30,10 +35,9 @@ export interface RectangleSelectionAPI {
 
 interface RectangleState {
   startPixel: [number, number] | null;
-  startSky: [number, number] | null;
   currentPixel: [number, number] | null;
-  currentSky: [number, number] | null;
   isDrawing: boolean;
+  hasShownBoundaryWarning: boolean;
 }
 
 /**
@@ -48,13 +52,13 @@ export function useRectangleSelection(
 
   const stateRef = useRef<RectangleState>({
     startPixel: null,
-    startSky: null,
     currentPixel: null,
-    currentSky: null,
-    isDrawing: false
+    isDrawing: false,
+    hasShownBoundaryWarning: false
   });
 
   const rectangleElementRef = useRef<SVGRectElement | null>(null);
+  const textElementRef = useRef<SVGTextElement | null>(null);
   const callbackRef = useRef<((result: SelectionResult) => void) | null>(null);
 
   const startSelection = (onComplete: (result: SelectionResult) => void) => {
@@ -78,10 +82,9 @@ export function useRectangleSelection(
     // Reset state
     stateRef.current = {
       startPixel: null,
-      startSky: null,
       currentPixel: null,
-      currentSky: null,
-      isDrawing: false
+      isDrawing: false,
+      hasShownBoundaryWarning: false
     };
 
     // Attach mouse handlers for rectangle drawing
@@ -91,12 +94,8 @@ export function useRectangleSelection(
         console.log('Rectangle onMouseDown at:', x, y);
         const state = stateRef.current;
         state.startPixel = [x, y];
-        state.startSky = coordinateTransform.pixelToSky(x, y);
         state.currentPixel = [x, y];
-        state.currentSky = coordinateTransform.pixelToSky(x, y);
         state.isDrawing = true;
-
-        console.log('Start sky coords:', state.startSky);
 
         // Create rectangle element
         const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
@@ -118,15 +117,45 @@ export function useRectangleSelection(
         const state = stateRef.current;
         if (!state.isDrawing || !state.startPixel) return;
 
-        // Update current position
-        state.currentPixel = [x, y];
-        state.currentSky = coordinateTransform.pixelToSky(x, y);
+        // Clamp rectangle so ALL corners and edges stay within projection
+        const [clampedX, clampedY] = clampRectangleToProjection(
+          x,
+          y,
+          state.startPixel[0],
+          state.startPixel[1],
+          coordinateTransform.pixelToSky,
+          5  // Sample 5 points per edge
+        );
 
-        // Calculate rectangle dimensions
-        const startX = Math.min(state.startPixel[0], x);
-        const startY = Math.min(state.startPixel[1], y);
-        const width = Math.abs(x - state.startPixel[0]);
-        const height = Math.abs(y - state.startPixel[1]);
+        const isClamped = (clampedX !== x || clampedY !== y);
+
+        // Update state
+        state.currentPixel = [clampedX, clampedY];
+
+        // Calculate dimensions
+        const width = Math.abs(clampedX - state.startPixel[0]);
+        const height = Math.abs(clampedY - state.startPixel[1]);
+
+        // Determine color - yellow/red if clamped to boundary
+        let strokeColor: string;
+        let fillColor: string;
+        if (isClamped) {
+          strokeColor = '#f59e0b'; // Yellow/Orange when at boundary
+          fillColor = 'rgba(245, 158, 11, 0.15)';
+        } else {
+          strokeColor = '#10b981'; // Green
+          fillColor = 'rgba(16, 185, 129, 0.15)';
+        }
+
+        // Show warning if clamped to boundary
+        if (isClamped && !state.hasShownBoundaryWarning) {
+          console.log('⚠️ Selection clamped to celestial map boundary');
+          state.hasShownBoundaryWarning = true;
+        }
+
+        // Calculate rectangle position (top-left corner)
+        const startX = Math.min(state.startPixel[0], clampedX);
+        const startY = Math.min(state.startPixel[1], clampedY);
 
         // Update rectangle visual
         if (rectangleElementRef.current) {
@@ -134,89 +163,85 @@ export function useRectangleSelection(
           rectangleElementRef.current.setAttribute('y', String(startY));
           rectangleElementRef.current.setAttribute('width', String(width));
           rectangleElementRef.current.setAttribute('height', String(height));
-
-          // Show bounds info in title
-          if (state.startSky && state.currentSky) {
-            const raMin = Math.min(state.startSky[0], state.currentSky[0]);
-            const raMax = Math.max(state.startSky[0], state.currentSky[0]);
-            const decMin = Math.min(state.startSky[1], state.currentSky[1]);
-            const decMax = Math.max(state.startSky[1], state.currentSky[1]);
-
-            rectangleElementRef.current.setAttribute(
-              'title',
-              `RA: ${raMin.toFixed(2)}° - ${raMax.toFixed(2)}°\nDec: ${decMin.toFixed(2)}° - ${decMax.toFixed(2)}°`
-            );
-          }
+          rectangleElementRef.current.style.stroke = strokeColor;
+          rectangleElementRef.current.style.fill = fillColor;
         }
       },
 
       onMouseUp: async () => {
         const state = stateRef.current;
-        if (!state.isDrawing || !state.startSky || !state.currentSky) {
+        if (!state.isDrawing || !state.startPixel || !state.currentPixel) {
           state.isDrawing = false;
           return;
         }
 
         state.isDrawing = false;
 
-        // Calculate bounds
-        const startRA = state.startSky[0];
-        const currentRA = state.currentSky[0];
+        // Check minimum size
+        const width = Math.abs(state.currentPixel[0] - state.startPixel[0]);
+        const height = Math.abs(state.currentPixel[1] - state.startPixel[1]);
 
-        // Calculate both direct and wrap-around angular distances
-        const directDistance = Math.abs(currentRA - startRA);
-        const wrapDistance = 360 - directDistance;
-
-        // Determine if selection crosses 0°/360° boundary
-        // If wrap distance is smaller, the selection crosses the boundary
-        const crossesBoundary = wrapDistance < directDistance;
-
-        let raMin: number, raMax: number;
-
-        if (crossesBoundary) {
-          // Selection crosses 0°/360° boundary
-          // In this case, we want the larger values on one side and smaller on the other
-          // The "min" should be the larger value, "max" should be the smaller value
-          // This creates a range like [300, 360] + [0, 60] which wraps around
-          raMin = Math.max(startRA, currentRA);
-          raMax = Math.min(startRA, currentRA);
-          console.log('🔄 RA crosses boundary:', { startRA, currentRA, raMin, raMax });
-        } else {
-          // Normal case: selection doesn't cross boundary
-          raMin = Math.min(startRA, currentRA);
-          raMax = Math.max(startRA, currentRA);
-          console.log('✅ RA normal range:', { startRA, currentRA, raMin, raMax });
+        if (width < MIN_SELECTION_SIZE || height < MIN_SELECTION_SIZE) {
+          console.log('⚠️ Selection too small, ignoring (minimum 10×10 pixels)');
+          // Clear the rectangle visual
+          svgOverlay.clear();
+          rectangleElementRef.current = null;
+          textElementRef.current = null;
+          return;
         }
 
-        // Dec: simple min/max (declination is -90 to +90, no wrap-around)
-        const decMin = Math.min(state.startSky[1], state.currentSky[1]);
-        const decMax = Math.max(state.startSky[1], state.currentSky[1]);
+        // Define pixel rectangle
+        const pixelRect: PixelRectangle = {
+          x1: Math.min(state.startPixel[0], state.currentPixel[0]),
+          y1: Math.min(state.startPixel[1], state.currentPixel[1]),
+          x2: Math.max(state.startPixel[0], state.currentPixel[0]),
+          y2: Math.max(state.startPixel[1], state.currentPixel[1])
+        };
+
+        console.log('📐 Pixel rectangle:', pixelRect);
+
+        // Convert to sky bounds using multi-point sampling
+        const skyBounds = calculateSkyBounds(
+          pixelRect,
+          coordinateTransform.pixelToSky
+        );
+
+        if (!skyBounds) {
+          console.error('❌ Failed to convert pixel rectangle to sky bounds');
+          // Clear the rectangle visual
+          svgOverlay.clear();
+          rectangleElementRef.current = null;
+          textElementRef.current = null;
+          return;
+        }
+
+        console.log('✅ Sky bounds:', skyBounds);
 
         // Query backend for frames in rectangle
         try {
-          const bounds = {
-            ra_min: raMin,
-            ra_max: raMax,
-            dec_min: decMin,
-            dec_max: decMax
-          };
-          console.log('Querying frames with bounds:', bounds);
-
           const result = await invoke<SelectionResult>('query_frames_in_bounds', {
             bounds: {
-              ra_min: raMin,
-              ra_max: raMax,
-              dec_min: decMin,
-              dec_max: decMax
+              ra_min: skyBounds.ra_min,
+              ra_max: skyBounds.ra_max,
+              dec_min: skyBounds.dec_min,
+              dec_max: skyBounds.dec_max,
+              crosses_meridian: skyBounds.crosses_meridian
             }
           });
+
+          console.log(`🎯 Found ${result.count} frames in selection`);
 
           // Call completion callback with results
           if (callbackRef.current) {
             callbackRef.current(result);
           }
         } catch (err) {
-          console.error('Error querying frames in rectangle:', err);
+          console.error('❌ Error querying frames in rectangle:', err);
+        } finally {
+          // Always clear the rectangle visual after query completes
+          svgOverlay.clear();
+          rectangleElementRef.current = null;
+          textElementRef.current = null;
         }
       }
     });
@@ -232,13 +257,13 @@ export function useRectangleSelection(
 
     stateRef.current = {
       startPixel: null,
-      startSky: null,
       currentPixel: null,
-      currentSky: null,
-      isDrawing: false
+      isDrawing: false,
+      hasShownBoundaryWarning: false
     };
 
     rectangleElementRef.current = null;
+    textElementRef.current = null;
     callbackRef.current = null;
   };
 
