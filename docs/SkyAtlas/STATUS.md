@@ -24,9 +24,7 @@ Athenaeum is implementing interactive region selection on the Sky Atlas (d3-cele
 - `src/utils/coordinates.ts` - JavaScript coordinate utilities
 
 **Features:**
-- Query frames in circle (center + radius)
 - Query frames in rectangle (bounds)
-- Query frames in polygon (vertices)
 - Create frame sets from selections
 - Angular distance calculation
 - Point-in-polygon detection
@@ -128,9 +126,6 @@ athenaeum/
 │   │   └── algorithms.rs (122 lines)
 │   ├── commands.rs (1700+ lines) [UPDATED]
 │   └── models.rs (500+ lines) [UPDATED]
-├── PHASE3_COMPLETE.md [NEW]
-├── PHASE2_BUILD_FIXED.md [NEW]
-└── PHASE2_COMPLETE.md
 ```
 
 ## API Reference
@@ -195,12 +190,9 @@ const setId = await invoke<number>('create_frame_set_from_selection', {
 
 ## Known Limitations & TODO
 
-### Current Phase 3
-- ✅ Circle selection tool fully implemented
-- ⏳ Rectangle and polygon tools (Phases 4-5)
-- ⏳ Keyboard shortcuts
-- ⏳ Selection persistence
-- ⏳ Multi-selection capabilities
+### Phase 3
+- ✅ Rectangle tool
+- ✅ Keyboard shortcuts
 - ⏳ FOV visualization overlay
 
 ### Testing Status
@@ -215,14 +207,6 @@ const setId = await invoke<number>('create_frame_set_from_selection', {
 - ⏳ API documentation
 - ⏳ Troubleshooting guide
 
-## Performance Metrics
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Circle drawing | <16ms | 60 FPS visual updates |
-| Coordinate transform | <0.1ms | Cached projection |
-| Backend query | ~100-500ms | Depends on frame count |
-| SVG overlay creation | <1ms | Single DOM operation |
 
 ## Next Steps (Phase 4+)
 
@@ -233,27 +217,15 @@ const setId = await invoke<number>('create_frame_set_from_selection', {
 - [ ] Reuse SelectionDialog
 - [ ] Estimated effort: 1-2 hours
 
-### Phase 5: Polygon Selection Tool
-- [ ] Create `usePolygonSelection` hook
-- [ ] Multi-click vertex placement
-- [ ] Double-click to finalize
-- [ ] `query_frames_in_polygon` backend query
-- [ ] Reuse SelectionDialog
-- [ ] Estimated effort: 2-3 hours
 
 ### Phase 6: UI/UX Enhancements
-- [ ] Keyboard shortcuts (C, R, P, Esc)
+- [x] Keyboard shortcuts (S)
 - [ ] Selection statistics display
 - [ ] Clear/reset buttons
 - [ ] Recent selections history
-- [ ] Estimated effort: 2-3 hours
 
 ### Phase 7: Advanced Features
-- [ ] Selection persistence (save/load)
-- [ ] Multi-selection combinations
 - [ ] FOV visualization
-- [ ] Selection undo/redo
-- [ ] Estimated effort: 4-5 hours
 
 ## Running the Application
 
@@ -278,33 +250,6 @@ npm run tauri build
 8. Review results in dialog
 9. Enter frame set name and click "Create Set"
 
-## Architecture Diagram
-
-```
-User Interactions (Mouse)
-         ↓
-SVG Overlay (DOM)
-    ↙          ↘
-Circle Tool    Other Tools (Phase 4-5)
-    ↓              ↓
-Coord Transform   Coord Transform
-    ↓              ↓
-Backend Query     Backend Query
-    ↓              ↓
-SelectionDialog (Results Display)
-    ↓
-Frame Set Creation
-```
-
-## Commit Log
-
-```
-694ad5e - Phase 3: Implement Circle Selection Tool
-c8848a5 - Fix Phase 2: Remove d3 dependency from hooks
-09d588f - Phase 2: SVG Overlay Infrastructure - Complete
-[earlier commits for Phase 1 and setup]
-```
-
 ## Key Technical Decisions
 
 1. **Native DOM SVG** - No d3 dependency, reduces bundle size
@@ -312,16 +257,6 @@ c8848a5 - Fix Phase 2: Remove d3 dependency from hooks
 3. **Callback Pattern** - Clean completion handling
 4. **Separate Dialog** - Reusable across all selection tools
 5. **Backend Integration** - Coordinate transformation at boundary
-
-## Testing Recommendations
-
-Before moving to Phase 4:
-1. Test circle drawing with various sizes
-2. Test at map edges and poles
-3. Test frame set creation
-4. Verify frame counts match visual
-5. Test with frames at various coordinates
-6. Test with empty selection areas
 
 ## Related Documentation
 
@@ -345,5 +280,3 @@ For issues or questions about the selection tool implementation:
 - Phase 1: ✅ Complete
 - Phase 2: ✅ Complete
 - Phase 3: ✅ Complete
-- Phase 4: ⏳ Ready to start
-- Overall Progress: 60% Complete (3/5 phases)
