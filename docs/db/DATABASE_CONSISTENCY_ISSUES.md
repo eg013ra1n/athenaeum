@@ -1,19 +1,21 @@
 # Database Consistency Issues in Athenaeum
 
 **Date:** 2025-11-13
-**Status:** Critical Bugs Identified
-**Priority:** CRITICAL - Immediate Fix Required
+**Status:** Critical Bugs FIXED (as of 2025-11-13)
+**Priority:** RESOLVED - Critical fixes implemented
 
 ## Executive Summary
 
+**RESOLUTION STATUS (2025-11-13):** The critical and high priority issues identified in this document have been **FIXED**. See `IMPLEMENTATION_STATUS.md` for detailed implementation status.
+
 This document details database consistency issues, query inconsistencies, and parser differences between FITS and XISF file handling in Athenaeum. The analysis identified:
 
-- **1 CRITICAL bug** causing data corruption (duplicate frame construction with wrong indexes)
-- **1 HIGH priority issue** causing missing data (naxis1/naxis2 fields missing in queries)
-- **2 MEDIUM priority inconsistencies** between FITS and XISF parsers
-- **1 LOW priority issue** with logging verbosity
+- **1 CRITICAL bug** causing data corruption (duplicate frame construction with wrong indexes) - ✅ FIXED
+- **1 HIGH priority issue** causing missing data (naxis1/naxis2 fields missing in queries) - ✅ FIXED
+- **2 MEDIUM priority inconsistencies** between FITS and XISF parsers - ⏸️ DEFERRED
+- **1 LOW priority issue** with logging verbosity - ⏸️ NOT IMPLEMENTED
 
-**URGENT:** The duplicate frame construction bug in `get_frames_with_files_for_set()` will cause crashes or data corruption when loading frame set details.
+**RESOLVED:** The duplicate frame construction bug in `get_frames_with_files_for_set()` has been fixed by deleting the duplicate code block. The missing naxis1/naxis2 fields have been added to directory queries.
 
 ---
 
