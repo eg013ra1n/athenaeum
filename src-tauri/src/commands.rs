@@ -1478,7 +1478,10 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             AVG(fr.naxis2) as avg_naxis2,
             AVG(fr.xbinning) as avg_xbinning,
             AVG(fr.ybinning) as avg_ybinning,
-            'frameset' as location_type
+            'frameset' as location_type,
+            GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
+            GROUP_CONCAT(DISTINCT CAST(fr.focallen AS TEXT)) as focal_lengths,
+            fs.is_custom as is_custom
         FROM frames_set fs
         JOIN imaging_nights ino ON ino.frames_set_id = fs.id
         JOIN sessions s ON s.imaging_night_id = ino.id
@@ -1509,7 +1512,10 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             AVG(fr.naxis2) as avg_naxis2,
             AVG(fr.xbinning) as avg_xbinning,
             AVG(fr.ybinning) as avg_ybinning,
-            'cluster' as location_type
+            'cluster' as location_type,
+            GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
+            GROUP_CONCAT(DISTINCT CAST(fr.focallen AS TEXT)) as focal_lengths,
+            0 as is_custom
         FROM frames fr
         WHERE fr.ra IS NOT NULL
           AND fr.dec IS NOT NULL
@@ -1538,6 +1544,9 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         let avg_xbinning: Option<f64> = row.get(13)?;
         let avg_ybinning: Option<f64> = row.get(14)?;
         let location_type: String = row.get(15)?;
+        let cameras_str: Option<String> = row.get(16)?;
+        let focal_lengths_str: Option<String> = row.get(17)?;
+        let is_custom: i64 = row.get(18)?;
 
         // Parse filters from comma-separated string
         let filters: Vec<String> = filters_str
@@ -1583,6 +1592,9 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             fov_width,
             fov_height,
             location_type,
+            cameras: cameras_str,
+            focal_lengths: focal_lengths_str,
+            is_custom: is_custom != 0,
         })
     }).map_err(|e| format!("Failed to query imaging locations: {}", e))?;
 
