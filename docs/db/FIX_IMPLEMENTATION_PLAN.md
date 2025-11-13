@@ -1,20 +1,28 @@
 # Database and Coordinate Fixes - Implementation Plan
 
 **Date:** 2025-11-13
-**Version:** 1.0
-**Status:** Ready for Implementation
+**Version:** 1.1
+**Status:** Partially Complete (6/10 fixes implemented)
 
 ## Executive Summary
 
 This document provides detailed implementation steps for fixing all database consistency and coordinate handling issues identified in Athenaeum. Fixes are organized by priority with specific code changes, testing requirements, and expected impact.
 
 **Total Issues:** 9 coordinate issues + 5 database issues = 14 issues
-**Critical Fixes:** 2 (must fix immediately)
-**High Priority:** 4 (should fix soon)
-**Medium Priority:** 5 (nice to have)
-**Low Priority:** 3 (future enhancements)
+**Critical Fixes:** 2 (must fix immediately) - ✅ COMPLETE
+**High Priority:** 4 (should fix soon) - ⏸️ PARTIAL (2/6 complete)
+**Medium Priority:** 5 (nice to have) - ⏸️ NOT IMPLEMENTED
+**Low Priority:** 3 (future enhancements) - ⏸️ NOT IMPLEMENTED
+
+**Implementation Status:** 6 of 10 planned fixes have been completed. The remaining 4 fixes have been deferred based on user decision and priority assessment. See `IMPLEMENTATION_STATUS.md` for detailed status.
 
 **Note:** This implementation plan assumes you will create a **new database from scratch** after applying fixes. No data migration is needed. The parser fixes will ensure all newly scanned files have correct coordinates.
+
+**Latest Update (2025-11-13):**
+- ✅ Phase 1 Critical Fixes: Complete
+- ⏸️ Phase 2 High Priority: Partially complete (naxis1/naxis2 added, coordinate validation deferred)
+- ⏸️ Phase 3-4: Not implemented (future work)
+- ✅ Additional: Manual frame set coordinate averaging fixed
 
 ---
 
@@ -1080,35 +1088,39 @@ If specific fix causes issues:
 
 ## Summary Checklist
 
-### Phase 1 (Critical)
-- [ ] Delete duplicate frame construction (operations.rs:828-862)
-- [ ] Add normalize_ra_from_fits() helper function
-- [ ] Add validate_dec() helper function
-- [ ] Update FITS parser to use helpers
-- [ ] Update XISF parser to use helpers
-- [ ] Add unit tests for coordinate conversion
-- [ ] Verify clustering still works
+### Phase 1 (Critical) - ✅ COMPLETE
+- [x] Delete duplicate frame construction (operations.rs:828-862)
+- [x] Add normalize_ra_from_fits() helper function
+- [x] Add validate_dec() helper function
+- [x] Update FITS parser to use helpers
+- [x] Update XISF parser to use helpers
+- [ ] Add unit tests for coordinate conversion (not implemented)
+- [x] Verify clustering still works (verified correct)
 
-### Phase 2 (High Priority)
-- [ ] Add naxis1/naxis2 to get_files_by_directory SELECT
-- [ ] Update row parsing indexes
-- [ ] Add OBJCTRA/OBJCTDEC conversion in FITS parser
-- [ ] Add OBJCTRA/OBJCTDEC conversion in XISF parser
-- [ ] Simplify clustering coordinate extraction
-- [ ] Add coordinate validation in insert_frame
-- [ ] Add integration tests
+### Phase 2 (High Priority) - ⏸️ PARTIAL (2/6 complete, 4 deferred)
+- [x] Add naxis1/naxis2 to get_files_by_directory SELECT
+- [x] Update row parsing indexes
+- [ ] Add OBJCTRA/OBJCTDEC conversion in FITS parser (deferred - low priority)
+- [ ] Add OBJCTRA/OBJCTDEC conversion in XISF parser (deferred - low priority)
+- [x] Simplify clustering coordinate extraction (verified already correct)
+- [ ] Add coordinate validation in insert_frame (deferred - user decision)
+- [ ] Add integration tests (not implemented)
 
-### Phase 3 (Medium Priority)
+### Phase 3 (Medium Priority) - ⏸️ NOT IMPLEMENTED
 - [ ] Add YPIXSZ fallback to FITS parser
 - [ ] Add PIXSZ final fallback to both parsers
 - [ ] Update clustering to use haversine
 - [ ] Remove duplicate angular_distance from coordinates module
 - [ ] Update documentation
 
-### Phase 4 (Low Priority)
+### Phase 4 (Low Priority) - ⏸️ NOT IMPLEMENTED
 - [ ] Migrate to proper logging framework
 - [ ] Add coordinate system metadata (optional)
 - [ ] Add precision tracking (optional)
+
+### Additional Improvements - ✅ COMPLETE
+- [x] Fix manual frame set coordinate averaging (spherical mean)
+- [x] Standardize coordinate format (colon-separated)
 
 ---
 
