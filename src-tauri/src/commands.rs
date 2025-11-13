@@ -754,8 +754,7 @@ pub async fn create_custom_frames_set(
     // Calculate aggregate values from all frames
     let mut total_exp_time: f64 = 0.0;
     let mut earliest_date_obs: Option<String> = None;
-    let mut ra_values: Vec<f64> = Vec::new();
-    let mut dec_values: Vec<f64> = Vec::new();
+    let mut coordinate_pairs: Vec<(f64, f64)> = Vec::new();
 
     for (_, frames) in &session_frame_map {
         for (_, _, frame) in frames {
@@ -772,30 +771,47 @@ pub async fn create_custom_frames_set(
                 }
             }
 
-            // Collect RA/Dec for averaging (use objctra/objctdec as strings)
-            // We'll just use the first frame's coordinates for simplicity
-            if ra_values.is_empty() {
-                if let Some(ra) = &frame.objctra {
-                    ra_values.push(0.0); // Placeholder, we'll use the string directly
+            // Collect coordinates for averaging
+            // Try numeric RA/DEC first, then fall back to parsing OBJCTRA/OBJCTDEC
+            let coord_pair = if let (Some(ra), Some(dec)) = (frame.ra, frame.dec) {
+                Some((ra, dec))
+            } else if let (Some(ra_str), Some(dec_str)) = (&frame.objctra, &frame.objctdec) {
+                match (
+                    crate::coordinates::parse_ra_sexagesimal(ra_str),
+                    crate::coordinates::parse_dec_sexagesimal(dec_str)
+                ) {
+                    (Ok(ra), Ok(dec)) => Some((ra, dec)),
+                    _ => None,
                 }
+            } else {
+                None
+            };
+
+            if let Some(coords) = coord_pair {
+                coordinate_pairs.push(coords);
             }
         }
     }
 
-    // Get first frame's coordinates (simpler than averaging coordinate strings)
-    let (first_ra, first_dec) = session_frame_map.values()
-        .flat_map(|frames| frames.iter())
-        .find_map(|(_, _, frame)| {
-            if let (Some(ra), Some(dec)) = (&frame.objctra, &frame.objctdec) {
-                Some((ra.clone(), dec.clone()))
-            } else {
-                None
+    // Calculate average coordinates using spherical mean
+    let (avg_ra, avg_dec) = if !coordinate_pairs.is_empty() {
+        match crate::coordinates::spherical_mean(&coordinate_pairs) {
+            Ok((ra, dec)) => (Some(ra), Some(dec)),
+            Err(e) => {
+                println!("Warning: Failed to calculate spherical mean: {}", e);
+                (None, None)
             }
-        })
-        .unwrap_or((String::new(), String::new()));
+        }
+    } else {
+        (None, None)
+    };
 
-    println!("Calculated aggregates: total_exp_time={}, earliest_date={:?}, coordinates={}/{}",
-             total_exp_time, earliest_date_obs, first_ra, first_dec);
+    // Format coordinates using standard colon-separated format
+    let formatted_ra = avg_ra.map(|ra| crate::coordinates::format_ra_sexagesimal(ra));
+    let formatted_dec = avg_dec.map(|dec| crate::coordinates::format_dec_sexagesimal(dec));
+
+    println!("Calculated aggregates: total_exp_time={}, earliest_date={:?}, coordinates={:?}/{:?}",
+             total_exp_time, earliest_date_obs, formatted_ra, formatted_dec);
 
     // Create the custom frames_set
     println!("Creating frames_set with name '{}'", name);
@@ -804,8 +820,8 @@ pub async fn create_custom_frames_set(
         Some(&name),
         true, // is_custom = true
         earliest_date_obs.as_deref(),
-        if first_ra.is_empty() { None } else { Some(&first_ra) },
-        if first_dec.is_empty() { None } else { Some(&first_dec) },
+        formatted_ra.as_deref(),
+        formatted_dec.as_deref(),
         Some(total_exp_time),
         project_id,
     ).map_err(|e| {
@@ -1876,8 +1892,7 @@ pub async fn create_frame_set_from_selection(
     // Calculate aggregates
     let mut total_exp_time: f64 = 0.0;
     let mut earliest_date_obs: Option<String> = None;
-    let mut first_ra: Option<String> = None;
-    let mut first_dec: Option<String> = None;
+    let mut coordinate_pairs: Vec<(f64, f64)> = Vec::new();
 
     for (_, _, frame) in &frames {
         if let Some(exp) = frame.exptime {
@@ -1891,13 +1906,43 @@ pub async fn create_frame_set_from_selection(
             }
         }
 
-        if first_ra.is_none() {
-            first_ra = frame.objctra.clone();
-        }
-        if first_dec.is_none() {
-            first_dec = frame.objctdec.clone();
+        // Collect coordinates for averaging
+        // Try numeric RA/DEC first, then fall back to parsing OBJCTRA/OBJCTDEC
+        let coord_pair = if let (Some(ra), Some(dec)) = (frame.ra, frame.dec) {
+            Some((ra, dec))
+        } else if let (Some(ra_str), Some(dec_str)) = (&frame.objctra, &frame.objctdec) {
+            match (
+                crate::coordinates::parse_ra_sexagesimal(ra_str),
+                crate::coordinates::parse_dec_sexagesimal(dec_str)
+            ) {
+                (Ok(ra), Ok(dec)) => Some((ra, dec)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(coords) = coord_pair {
+            coordinate_pairs.push(coords);
         }
     }
+
+    // Calculate average coordinates using spherical mean
+    let (avg_ra, avg_dec) = if !coordinate_pairs.is_empty() {
+        match crate::coordinates::spherical_mean(&coordinate_pairs) {
+            Ok((ra, dec)) => (Some(ra), Some(dec)),
+            Err(e) => {
+                println!("Warning: Failed to calculate spherical mean: {}", e);
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    // Format coordinates using standard colon-separated format
+    let formatted_ra = avg_ra.map(|ra| crate::coordinates::format_ra_sexagesimal(ra));
+    let formatted_dec = avg_dec.map(|dec| crate::coordinates::format_dec_sexagesimal(dec));
 
     // Create the custom frames_set using proper function
     let set_id = db::create_frames_set(
@@ -1905,8 +1950,8 @@ pub async fn create_frame_set_from_selection(
         Some(&name),
         true, // is_custom = true
         earliest_date_obs.as_deref(),
-        first_ra.as_deref(),
-        first_dec.as_deref(),
+        formatted_ra.as_deref(),
+        formatted_dec.as_deref(),
         Some(total_exp_time),
         project_id,
     ).map_err(|e| format!("Failed to create frames_set: {}", e))?;

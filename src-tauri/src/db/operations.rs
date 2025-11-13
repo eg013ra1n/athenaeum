@@ -303,7 +303,7 @@ pub fn get_files_by_directory(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
@@ -825,41 +825,8 @@ pub fn get_frames_with_files_for_set(
             println!("Frame has date_obs: {:?}", date_obs_raw);
         }
 
-        let frame = crate::models::Frame {
-            id: row.get(7)?,
-            file_id: row.get(8)?,
-            object: row.get(9)?,
-            date_obs: date_obs_raw.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-            }),
-            telescop: row.get(12)?,
-            instrume: row.get(13)?,
-            exptime: row.get(14)?,
-            filter: row.get(15)?,
-            imagetyp: row.get::<_, Option<String>>(16)?.and_then(|s| crate::models::ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(17)? == 1,
-            gain: row.get(18)?,
-            offset: row.get(19)?,
-            binning: row.get(20)?,
-            xbinning: row.get(21)?,
-            ybinning: row.get(22)?,
-            ccd_temp: row.get(23)?,
-            set_temp: row.get(24)?,
-            focallen: row.get(25)?,
-            xpixsz: row.get(26)?,
-            pixsz: row.get(27)?,
-            naxis1: row.get(28)?,
-            naxis2: row.get(29)?,
-            ra: row.get(30)?,
-            dec: row.get(31)?,
-            sitelat: row.get(32)?,
-            lat_obs: row.get(33)?,
-            sitelong: row.get(34)?,
-            long_obs: row.get(35)?,
-            objctra: row.get(36)?,
-            objctdec: row.get(37)?,
-            override_: row.get::<_, i32>(38)? == 1,
-        };
+        // NOTE: The correct frame construction with proper row indexes is at lines 782-816
+        // This duplicate block with wrong indexes has been deleted to fix data corruption bug
 
         let file_id: i64 = row.get(0)?;
         Ok((file_id, file, frame))
