@@ -179,14 +179,15 @@ export default function SkyAtlas() {
 
         // Restore zoom after display (center is handled by config with follow:"center")
         if (savedState.zoom !== null) {
+          const targetZoom = savedState.zoom; // Extract for closure
           requestAnimationFrame(() => {
             const projection = window.Celestial.mapProjection;
             if (projection && projection.scale) {
               const currentZoom = projection.scale();
-              const zoomFactor = savedState.zoom / currentZoom;
+              const zoomFactor = targetZoom / currentZoom;
               if (window.Celestial.zoomBy) {
                 window.Celestial.zoomBy(zoomFactor);
-                console.log('🔍 Restored zoom:', savedState.zoom);
+                console.log('🔍 Restored zoom:', targetZoom);
               }
             }
           });

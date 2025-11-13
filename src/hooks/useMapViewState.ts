@@ -7,27 +7,76 @@ export interface MapViewState {
   dec: number | null;
 }
 
+const STORAGE_KEY = 'skyatlas_view_state';
+
 /**
- * Custom hook to manage celestial map view state via URL parameters.
+ * Custom hook to manage celestial map view state via URL parameters with sessionStorage fallback.
  * This enables preserving zoom and position when navigating away and back.
+ *
+ * Persistence strategy:
+ * 1. Primary: URL parameters (for sharing, history, refreshes)
+ * 2. Fallback: sessionStorage (for sidebar navigation within session)
  */
 export function useMapViewState() {
   const [searchParams, setSearchParams] = useSearchParams();
 
   /**
-   * Get current view state from URL parameters
+   * Load view state from sessionStorage
+   */
+  const loadFromStorage = useCallback((): MapViewState | null => {
+    try {
+      const stored = sessionStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        return JSON.parse(stored) as MapViewState;
+      }
+    } catch (e) {
+      console.warn('Failed to load view state from sessionStorage:', e);
+    }
+    return null;
+  }, []);
+
+  /**
+   * Save view state to sessionStorage
+   */
+  const saveToStorage = useCallback((state: MapViewState) => {
+    try {
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch (e) {
+      console.warn('Failed to save view state to sessionStorage:', e);
+    }
+  }, []);
+
+  /**
+   * Get current view state from URL parameters, with sessionStorage fallback
    */
   const getViewState = useCallback((): MapViewState => {
     const zoom = searchParams.get('zoom');
     const ra = searchParams.get('ra');
     const dec = searchParams.get('dec');
 
+    // If URL has params, use them
+    if (zoom || ra || dec) {
+      return {
+        zoom: zoom ? parseFloat(zoom) : null,
+        ra: ra ? parseFloat(ra) : null,
+        dec: dec ? parseFloat(dec) : null,
+      };
+    }
+
+    // Otherwise, try sessionStorage as fallback
+    const stored = loadFromStorage();
+    if (stored) {
+      console.log('📦 Restored view state from sessionStorage:', stored);
+      return stored;
+    }
+
+    // No state available
     return {
-      zoom: zoom ? parseFloat(zoom) : null,
-      ra: ra ? parseFloat(ra) : null,
-      dec: dec ? parseFloat(dec) : null,
+      zoom: null,
+      ra: null,
+      dec: null,
     };
-  }, [searchParams]);
+  }, [searchParams, loadFromStorage]);
 
   /**
    * Validate view state values
@@ -48,7 +97,7 @@ export function useMapViewState() {
   }, []);
 
   /**
-   * Save view state to URL parameters
+   * Save view state to URL parameters and sessionStorage
    * @param state - The map view state to save
    * @param replace - If true, replaces current history entry instead of creating new one
    */
@@ -58,6 +107,9 @@ export function useMapViewState() {
       console.warn('Invalid view state, not saving:', state);
       return;
     }
+
+    // Save to sessionStorage for persistence across sidebar navigation
+    saveToStorage(state);
 
     const params = new URLSearchParams(searchParams);
 
@@ -77,7 +129,7 @@ export function useMapViewState() {
 
     // Use replace to avoid cluttering browser history
     setSearchParams(params, { replace });
-  }, [searchParams, setSearchParams, validateViewState]);
+  }, [searchParams, setSearchParams, validateViewState, saveToStorage]);
 
   /**
    * Clear view state from URL
