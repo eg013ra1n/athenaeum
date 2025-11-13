@@ -28,9 +28,12 @@ export function useZoomLevel(zoomThreshold: number = 1.5): ZoomState {
   useEffect(() => {
     // Function to check current zoom level from d3-celestial
     const updateZoom = () => {
-      if (window.Celestial && window.Celestial.scale) {
-        const currentScale = window.Celestial.scale();
-        setScale(currentScale);
+      if (window.Celestial && window.Celestial.mapProjection) {
+        const projection = window.Celestial.mapProjection;
+        if (projection && projection.scale) {
+          const currentScale = projection.scale();
+          setScale(currentScale);
+        }
       }
     };
 
