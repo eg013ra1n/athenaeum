@@ -8,6 +8,7 @@ import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { useZoomLevel } from '../hooks/useZoomLevel';
+import { useMapViewState } from '../hooks/useMapViewState';
 import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
 import '../styles/celestial-overrides.css';
@@ -42,6 +43,7 @@ export default function SkyAtlas() {
   const mouseEvents = useD3MouseEvents();
   const rectangleSelection = useRectangleSelection(svgOverlay, coordinateTransform, mouseEvents);
   const zoomLevel = useZoomLevel(2.0); // Threshold: show FOV boxes when scale > 2.0
+  const { getViewState, saveViewState } = useMapViewState();
 
   const navigate = useNavigate();
 
@@ -86,19 +88,27 @@ export default function SkyAtlas() {
 
       console.log(`Initializing sky map with dimensions: ${rect.width}x${rect.height}`);
 
+      // Get saved view state from URL before initializing
+      const savedState = getViewState();
+      if (savedState.zoom !== null || (savedState.ra !== null && savedState.dec !== null)) {
+        console.log('🔄 Will initialize with saved state:', savedState);
+      }
+
       try {
         const config = {
           container: 'celestial-map',
           width: Math.floor(rect.width),
           projection: 'aitoff',
           transform: 'equatorial',
-          center: null,
+          center: (savedState.ra !== null && savedState.dec !== null)
+            ? [savedState.ra, savedState.dec, 0]
+            : null,
           orientationfixed: false,
+          follow: "center",  // Prevents animation when setting initial center
           zoomlevel: null,
           zoomextend: 10,
           interactive: true,
           form: false,
-          location: false,
           controls: true,
           datapath: '/data/',
           stars: {
@@ -166,6 +176,22 @@ export default function SkyAtlas() {
 
         window.Celestial.display(config);
         mapInitialized.current = true;
+
+        // Restore zoom after display (center is handled by config with follow:"center")
+        if (savedState.zoom !== null) {
+          requestAnimationFrame(() => {
+            const projection = window.Celestial.mapProjection;
+            if (projection && projection.scale) {
+              const currentZoom = projection.scale();
+              const zoomFactor = savedState.zoom / currentZoom;
+              if (window.Celestial.zoomBy) {
+                window.Celestial.zoomBy(zoomFactor);
+                console.log('🔍 Restored zoom:', savedState.zoom);
+              }
+            }
+          });
+        }
+
         setMapReady(true);
 
         console.log('Sky map initialized successfully');
@@ -179,6 +205,81 @@ export default function SkyAtlas() {
       cancelAnimationFrame(rafId);
     };
   }, [loading]);
+
+  // Restore view state from URL after map initialization
+  useEffect(() => {
+    if (!mapReady || typeof window.Celestial === 'undefined') return;
+
+    const viewState = getViewState();
+    const { zoom, ra, dec } = viewState;
+
+    // Only restore if we have state to restore
+    if (zoom !== null || (ra !== null && dec !== null)) {
+      console.log('🔄 Restoring view state from URL:', viewState);
+
+      // Use requestAnimationFrame to ensure map is fully ready
+      requestAnimationFrame(() => {
+        // Restore center position
+        if (ra !== null && dec !== null && window.Celestial.rotate) {
+          window.Celestial.rotate({ center: [ra, dec, 0] });
+          console.log('📍 Restored center:', [ra, dec]);
+        }
+
+        // Restore zoom level
+        if (zoom !== null) {
+          const projection = window.Celestial.mapProjection;
+          if (projection && projection.scale) {
+            const currentZoom = projection.scale();
+            const zoomFactor = zoom / currentZoom;
+            if (window.Celestial.zoomBy) {
+              window.Celestial.zoomBy(zoomFactor);
+              console.log('🔍 Restored zoom:', zoom, '(factor:', zoomFactor, ')');
+            }
+          }
+        }
+      });
+    }
+  }, [mapReady, getViewState]);
+
+  // Save view state to URL on zoom/pan (debounced)
+  useEffect(() => {
+    if (!mapReady || typeof window.Celestial === 'undefined') return;
+
+    let saveTimeout: number;
+
+    const handleMapChange = () => {
+      // Debounce to avoid excessive URL updates during interaction
+      clearTimeout(saveTimeout);
+      saveTimeout = window.setTimeout(() => {
+        const projection = window.Celestial.mapProjection;
+        const currentZoom = projection && projection.scale ? projection.scale() : null;
+        const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
+
+        if (currentZoom !== null && currentCenter !== null) {
+          saveViewState({
+            zoom: currentZoom,
+            ra: currentCenter[0],
+            dec: currentCenter[1]
+          });
+
+          console.log('💾 Auto-saved view state:', { zoom: currentZoom, center: currentCenter });
+        }
+      }, 1000); // Save 1 second after user stops interacting
+    };
+
+    const container = document.getElementById('celestial-map');
+    if (container) {
+      // Listen for map interaction events
+      container.addEventListener('zoomend', handleMapChange);
+      container.addEventListener('redraw', handleMapChange);
+
+      return () => {
+        clearTimeout(saveTimeout);
+        container.removeEventListener('zoomend', handleMapChange);
+        container.removeEventListener('redraw', handleMapChange);
+      };
+    }
+  }, [mapReady, saveViewState]);
 
   // Handle window resize with debounce
   useEffect(() => {
@@ -281,12 +382,6 @@ export default function SkyAtlas() {
       const scaleX = displayRect.width / projectionWidth;
       const scaleY = displayRect.height / projectionHeight;
 
-      console.log(`🔍 Canvas internal: ${canvas.width}x${canvas.height}`);
-      console.log(`🔍 Canvas display: ${displayRect.width.toFixed(1)}x${displayRect.height.toFixed(1)}`);
-      console.log(`🔍 Projection space: ${projectionWidth}x${projectionHeight}`);
-      console.log(`🔍 Device pixel ratio: ${dpr}`);
-      console.log(`🔍 Scale factors: ${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`);
-
       return { scaleX, scaleY, offsetX: displayRect.left, offsetY: displayRect.top };
     };
 
@@ -297,19 +392,6 @@ export default function SkyAtlas() {
       !isNaN(loc.ra) && !isNaN(loc.dec) &&
       isFinite(loc.ra) && isFinite(loc.dec)
     );
-
-    console.log(`Adding ${validLocs.length} imaging location markers (zoomed: ${isZoomedIn}) - filtered from ${locs.length}`);
-
-    // Debug: Log the first location's properties
-    if (validLocs.length > 0) {
-      console.log('🔍 DEBUG: First location data:', {
-        locationType: validLocs[0].locationType,
-        isCustom: validLocs[0].isCustom,
-        cameras: validLocs[0].cameras,
-        focalLengths: validLocs[0].focalLengths,
-        frameSetId: validLocs[0].frameSetId
-      });
-    }
 
     if (validLocs.length === 0) {
       console.warn('No valid imaging locations to display');
@@ -351,12 +433,10 @@ export default function SkyAtlas() {
 
     // Transform data using d3-celestial's coordinate system
     const transformedData = window.Celestial.getData(imagingData, window.Celestial.settings().transform);
-    console.log('✨ Pre-transformed data features:', transformedData?.features?.length);
 
     // Instead of using Celestial.add() which has unreliable callback execution,
     // we'll render the markers directly
     const renderMarkers = () => {
-      console.log('🎨 Rendering markers directly (bypassing Celestial.add)');
       const data = transformedData;
 
         // d3-celestial uses canvas, not SVG. We need to create our own SVG overlay
@@ -386,10 +466,6 @@ export default function SkyAtlas() {
             .style('width', '100%')
             .style('height', '100%')
             .style('pointer-events', 'none'); // Allow clicks to pass through to canvas
-
-          console.log('✅ Created SVG overlay:', svg.node());
-        } else {
-          console.log('✅ Using existing SVG overlay');
         }
 
         // Create or get markers group
@@ -398,17 +474,11 @@ export default function SkyAtlas() {
           markersGroup = svg.append('g')
             .attr('class', 'imaging-markers-layer')
             .style('pointer-events', 'auto'); // Re-enable pointer events for markers
-          console.log('✅ Created markers group');
-        } else {
-          console.log('✅ Using existing markers group');
         }
 
         // Clear old markers
-        const removedMarkers = markersGroup.selectAll('.imaging-marker').size();
-        const removedBoxes = markersGroup.selectAll('.fov-box').size();
         markersGroup.selectAll('.imaging-marker').remove();
         markersGroup.selectAll('.fov-box').remove();
-        console.log(`Removed ${removedMarkers} markers and ${removedBoxes} boxes`);
 
         if (isZoomedIn) {
           // Zoomed in: Draw FOV rectangles (or crosses if no FOV data)
@@ -498,6 +568,21 @@ export default function SkyAtlas() {
                 const frameSetId = d.properties.frameSetId;
                 console.log('🖱️ Marker clicked:', d.properties.name, 'frameSetId:', frameSetId, 'locationType:', d.properties.locationType);
                 if (frameSetId) {
+                  // Capture current view state before navigating
+                  const projection = window.Celestial.mapProjection;
+                  const currentZoom = projection && projection.scale ? projection.scale() : null;
+                  const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
+
+                  console.log('📍 Saving view state:', { zoom: currentZoom, center: currentCenter });
+
+                  if (currentZoom !== null && currentCenter !== null) {
+                    saveViewState({
+                      zoom: currentZoom,
+                      ra: currentCenter[0],
+                      dec: currentCenter[1]
+                    });
+                  }
+
                   console.log('🚀 Navigating to /objects/' + frameSetId);
                   navigate(`/objects/${frameSetId}`);
                 } else {
@@ -524,9 +609,6 @@ export default function SkyAtlas() {
             });
         } else {
           // Zoomed out: Draw star/sparkle markers with color differentiation
-          console.log('===== ZOOMED OUT: Creating simple markers =====');
-          console.log('Appending to markersGroup:', markersGroup.node());
-
           // Get canvas scaling factors once for all markers
           const scaling = getCanvasScaling();
 
@@ -535,14 +617,10 @@ export default function SkyAtlas() {
             .enter().append('path')
             .attr('class', 'imaging-marker')
             .style('pointer-events', 'all')  // Enable pointer events for click handling
-            .attr('d', function(d: any, i: number) {
-              const path = getMarkerPath(d.properties.locationType);
-              if (i === 0) {
-                console.log('🎨 Marker shape for', d.properties.name, ':', d.properties.locationType, '→', path === sparkle ? 'sparkle' : 'star');
-              }
-              return path;
+            .attr('d', function(d: any) {
+              return getMarkerPath(d.properties.locationType);
             })
-            .attr('transform', function(d: any, i: number) {
+            .attr('transform', function(d: any) {
               const coords = d.geometry.coordinates;
               const pt = window.Celestial.map.projection()(coords);
 
@@ -551,17 +629,6 @@ export default function SkyAtlas() {
               // Apply scaling to account for canvas stretching
               const scaledX = pt[0] * scaling.scaleX;
               const scaledY = pt[1] * scaling.scaleY;
-
-              // Enhanced debug logging for coordinate verification
-              if (i === 0) {
-                console.log(`=== COORDINATE DEBUG (${d.properties.name}) ===`);
-                console.log('Original RA (0-360°):', d.properties.originalRa);
-                console.log('Original Dec:', coords[1]);
-                console.log('Converted coords [lon, lat]:', coords);
-                console.log('Projected pixel position [x, y]:', pt);
-                console.log('Scaled position [x, y]:', [scaledX, scaledY]);
-                console.log('Scaling factors:', scaling);
-              }
 
               return `translate(${scaledX},${scaledY})`;
             })
@@ -597,6 +664,21 @@ export default function SkyAtlas() {
                 const frameSetId = d.properties.frameSetId;
                 console.log('🖱️ Marker clicked:', d.properties.name, 'frameSetId:', frameSetId, 'locationType:', d.properties.locationType);
                 if (frameSetId) {
+                  // Capture current view state before navigating
+                  const projection = window.Celestial.mapProjection;
+                  const currentZoom = projection && projection.scale ? projection.scale() : null;
+                  const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
+
+                  console.log('📍 Saving view state:', { zoom: currentZoom, center: currentCenter });
+
+                  if (currentZoom !== null && currentCenter !== null) {
+                    saveViewState({
+                      zoom: currentZoom,
+                      ra: currentCenter[0],
+                      dec: currentCenter[1]
+                    });
+                  }
+
                   console.log('🚀 Navigating to /objects/' + frameSetId);
                   navigate(`/objects/${frameSetId}`);
                 } else {
