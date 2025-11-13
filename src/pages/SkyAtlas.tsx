@@ -232,6 +232,35 @@ export default function SkyAtlas() {
       return ra;  // Use RA directly in 0-360° range
     };
 
+    // Custom SVG path for 4-pointed star (✴)
+    const fourPointedStar = 'M0,-10 L2,-2 L10,0 L2,2 L0,10 L-2,2 L-10,0 L-2,-2 Z';
+
+    // Custom SVG path for sparkle (✧)
+    const sparkle = 'M0,-6 L1,-1 L6,0 L1,1 L0,6 L-1,1 L-6,0 L-1,-1 Z';
+
+    // Helper function to get marker color based on type
+    const getMarkerColor = (locationType: string, isCustom: boolean): string => {
+      if (locationType === 'cluster') {
+        return '#22c55e';  // GREEN for unorganized
+      }
+      // Frameset
+      return isCustom ? '#ef4444' : '#3b82f6';  // RED for custom, BLUE for auto
+    };
+
+    // Helper function to get marker stroke color
+    const getMarkerStroke = (locationType: string, isCustom: boolean): string => {
+      if (locationType === 'cluster') {
+        return '#16a34a';  // Dark green for unorganized
+      }
+      // Frameset
+      return isCustom ? '#dc2626' : '#2563eb';  // Dark red for custom, dark blue for auto
+    };
+
+    // Helper function to get marker path
+    const getMarkerPath = (locationType: string): string => {
+      return locationType === 'cluster' ? sparkle : fourPointedStar;
+    };
+
     // Calculate scaling factors to match projection space to display space
     const getCanvasScaling = () => {
       const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
@@ -271,77 +300,21 @@ export default function SkyAtlas() {
 
     console.log(`Adding ${validLocs.length} imaging location markers (zoomed: ${isZoomedIn}) - filtered from ${locs.length}`);
 
+    // Debug: Log the first location's properties
+    if (validLocs.length > 0) {
+      console.log('🔍 DEBUG: First location data:', {
+        locationType: validLocs[0].locationType,
+        isCustom: validLocs[0].isCustom,
+        cameras: validLocs[0].cameras,
+        focalLengths: validLocs[0].focalLengths,
+        frameSetId: validLocs[0].frameSetId
+      });
+    }
+
     if (validLocs.length === 0) {
       console.warn('No valid imaging locations to display');
       return;
     }
-
-    // Add test markers for known celestial objects to verify positioning
-    const testMarkers = [
-      {
-        type: 'Feature',
-        id: 'test-m42',
-        properties: {
-          name: 'TEST: M42 Orion Nebula',
-          object_name: 'M42',
-          frame_count: 0,
-          total_exposure: 0,
-          filters: 'TEST',
-          date_range: '',
-          frame_set_id: null,
-          location_type: 'test',
-          fov_width: null,
-          fov_height: null,
-          original_ra: 83.82  // M42 RA: 5h 35m 17s
-        },
-        geometry: {
-          type: 'Point',
-          coordinates: [raToGeoJsonLongitude(83.82), -5.39]  // Dec: -5° 23' 28"
-        }
-      },
-      {
-        type: 'Feature',
-        id: 'test-m31',
-        properties: {
-          name: 'TEST: M31 Andromeda',
-          object_name: 'M31',
-          frame_count: 0,
-          total_exposure: 0,
-          filters: 'TEST',
-          date_range: '',
-          frame_set_id: null,
-          location_type: 'test',
-          fov_width: null,
-          fov_height: null,
-          original_ra: 10.68  // M31 RA: 0h 42m 44s
-        },
-        geometry: {
-          type: 'Point',
-          coordinates: [raToGeoJsonLongitude(10.68), 41.27]  // Dec: +41° 16' 9"
-        }
-      },
-      {
-        type: 'Feature',
-        id: 'test-m45',
-        properties: {
-          name: 'TEST: M45 Pleiades',
-          object_name: 'M45',
-          frame_count: 0,
-          total_exposure: 0,
-          filters: 'TEST',
-          date_range: '',
-          frame_set_id: null,
-          location_type: 'test',
-          fov_width: null,
-          fov_height: null,
-          original_ra: 56.75  // M45 RA: 3h 47m 0s
-        },
-        geometry: {
-          type: 'Point',
-          coordinates: [raToGeoJsonLongitude(56.75), 24.12]  // Dec: +24° 7' 0"
-        }
-      }
-    ];
 
     // Convert to GeoJSON features with FOV data
     const features = [
@@ -349,24 +322,26 @@ export default function SkyAtlas() {
         type: 'Feature',
         id: loc.id,
         properties: {
-          name: loc.object_name || 'Unknown',
-          object_name: loc.object_name,
-          frame_count: loc.frame_count,
-          total_exposure: loc.total_exposure,
+          name: loc.objectName || 'Unknown',
+          objectName: loc.objectName,
+          frameCount: loc.frameCount,
+          totalExposure: loc.totalExposure,
           filters: loc.filters.join(', '),
-          date_range: loc.date_range,
-          frame_set_id: loc.frame_set_id,
-          location_type: loc.location_type,
-          fov_width: loc.fov_width,
-          fov_height: loc.fov_height,
-          original_ra: loc.ra  // Keep original RA for FOV calculations
+          dateRange: loc.dateRange,
+          frameSetId: loc.frameSetId,
+          locationType: loc.locationType,
+          fovWidth: loc.fovWidth,
+          fovHeight: loc.fovHeight,
+          originalRa: loc.ra,  // Keep original RA for FOV calculations
+          cameras: loc.cameras,
+          focalLengths: loc.focalLengths,
+          isCustom: loc.isCustom
         },
         geometry: {
           type: 'Point',
           coordinates: [raToGeoJsonLongitude(loc.ra), loc.dec]  // Convert RA to GeoJSON format
         }
-      })),
-      ...testMarkers  // Add test markers for verification
+      }))
     ];
 
     const imagingData = {
@@ -444,15 +419,20 @@ export default function SkyAtlas() {
             .data(data.features)
             .enter().append('g')
             .attr('class', 'fov-box')
+            .style('pointer-events', 'all')  // Enable pointer events for click handling
             .each(function(this: any, d: any) {
               const g = d3.select(this);
-              const hasFov = d.properties.fov_width && d.properties.fov_height;
-              const fovW = d.properties.fov_width;
-              const fovH = d.properties.fov_height;
+              const hasFov = d.properties.fovWidth && d.properties.fovHeight;
+              const fovW = d.properties.fovWidth;
+              const fovH = d.properties.fovHeight;
+
+              const markerColor = getMarkerColor(d.properties.locationType, d.properties.isCustom);
+              const markerStroke = getMarkerStroke(d.properties.locationType, d.properties.isCustom);
+              const markerPath = getMarkerPath(d.properties.locationType);
 
               if (hasFov) {
                 // Draw FOV rectangle
-                const originalRa = d.properties.original_ra;  // Use original RA (0-360°) for calculations
+                const originalRa = d.properties.originalRa;  // Use original RA (0-360°) for calculations
                 const dec = d.geometry.coordinates[1];
 
                 // Rectangle corners in RA/Dec, converted to GeoJSON format
@@ -472,29 +452,37 @@ export default function SkyAtlas() {
                 });
                 const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
 
+                // Create fill color with opacity
+                const fillColor = markerColor.replace('#', '');
+                const r = parseInt(fillColor.substring(0, 2), 16);
+                const g_rgb = parseInt(fillColor.substring(2, 4), 16);
+                const b = parseInt(fillColor.substring(4, 6), 16);
+                const fillStyle = `rgba(${r}, ${g_rgb}, ${b}, 0.15)`;
+
                 g.append('path')
                   .attr('class', 'fov-rect')
                   .attr('d', pathData)
-                  .style('fill', 'rgba(34, 197, 94, 0.15)')
-                  .style('stroke', '#22c55e')
+                  .style('fill', fillStyle)
+                  .style('stroke', markerColor)
                   .style('stroke-width', '2px')
-                  .style('cursor', 'pointer');
+                  .style('cursor', d.properties.frameSetId ? 'pointer' : 'default');
 
                 // Store corners for redraw
                 (this as any).__fovCorners = corners;
               } else {
-                // No FOV data: draw green cross
+                // No FOV data: draw star/sparkle marker
                 const pt = window.Celestial.map.projection()(d.geometry.coordinates);
                 if (pt) {
-                  // Apply scaling to cross position
+                  // Apply scaling to marker position
                   const scaledX = pt[0] * scaling.scaleX;
                   const scaledY = pt[1] * scaling.scaleY;
                   g.append('path')
-                    .attr('d', 'M-10,0 L10,0 M0,-10 L0,10')
+                    .attr('d', markerPath)
                     .attr('transform', `translate(${scaledX},${scaledY})`)
-                    .style('stroke', '#22c55e')
+                    .style('fill', markerColor)
+                    .style('stroke', markerStroke)
                     .style('stroke-width', '2px')
-                    .style('cursor', 'pointer');
+                    .style('cursor', d.properties.frameSetId ? 'pointer' : 'default');
                 }
               }
 
@@ -503,24 +491,39 @@ export default function SkyAtlas() {
               g.style('display', isVisible ? null : 'none');
 
               // Click handler
-              g.on('click', function() {
-                const frameSetId = d.properties.frame_set_id;
+              g.on('click', function(event: any) {
+                if (event && event.stopPropagation) {
+                  event.stopPropagation();  // Prevent event bubbling if available
+                }
+                const frameSetId = d.properties.frameSetId;
+                console.log('🖱️ Marker clicked:', d.properties.name, 'frameSetId:', frameSetId, 'locationType:', d.properties.locationType);
                 if (frameSetId) {
+                  console.log('🚀 Navigating to /objects/' + frameSetId);
                   navigate(`/objects/${frameSetId}`);
+                } else {
+                  console.log('⚠️ No frameSetId for this marker (unorganized cluster)');
                 }
               });
 
               // Tooltip
               g.append('title')
                 .text(function() {
-                  const totalHours = (d.properties.total_exposure / 3600).toFixed(2);
-                  const typeLabel = d.properties.location_type === 'frameset' ? '[Frame Set]' : '[Unorganized]';
+                  const totalHours = (d.properties.totalExposure / 3600).toFixed(2);
+                  let typeLabel = '[Unorganized]';
+                  if (d.properties.locationType === 'frameset') {
+                    typeLabel = d.properties.isCustom ? '[Custom Frame Set]' : '[Auto Frame Set]';
+                  }
+                  const cameras = d.properties.cameras ? `\nCameras: ${d.properties.cameras}` : '';
+                  const focalLengths = d.properties.focalLengths ? `\nFocal Lengths: ${d.properties.focalLengths}mm` : '';
+                  const dates = d.properties.dateRange && d.properties.dateRange[0] && d.properties.dateRange[1]
+                    ? `\nDates: ${d.properties.dateRange[0].split('T')[0]} to ${d.properties.dateRange[1].split('T')[0]}`
+                    : '';
                   const fovInfo = hasFov ? `\nFOV: ${fovW.toFixed(2)}° × ${fovH.toFixed(2)}°` : '';
-                  return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frame_count}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${fovInfo}`;
+                  return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}${fovInfo}`;
                 });
             });
         } else {
-          // Zoomed out: Draw simple green crosses
+          // Zoomed out: Draw star/sparkle markers with color differentiation
           console.log('===== ZOOMED OUT: Creating simple markers =====');
           console.log('Appending to markersGroup:', markersGroup.node());
 
@@ -531,7 +534,14 @@ export default function SkyAtlas() {
             .data(data.features)
             .enter().append('path')
             .attr('class', 'imaging-marker')
-            .attr('d', 'M-8,0 L8,0 M0,-8 L0,8')
+            .style('pointer-events', 'all')  // Enable pointer events for click handling
+            .attr('d', function(d: any, i: number) {
+              const path = getMarkerPath(d.properties.locationType);
+              if (i === 0) {
+                console.log('🎨 Marker shape for', d.properties.name, ':', d.properties.locationType, '→', path === sparkle ? 'sparkle' : 'star');
+              }
+              return path;
+            })
             .attr('transform', function(d: any, i: number) {
               const coords = d.geometry.coordinates;
               const pt = window.Celestial.map.projection()(coords);
@@ -543,9 +553,9 @@ export default function SkyAtlas() {
               const scaledY = pt[1] * scaling.scaleY;
 
               // Enhanced debug logging for coordinate verification
-              if (i === 0 || d.properties.location_type === 'test') {
+              if (i === 0) {
                 console.log(`=== COORDINATE DEBUG (${d.properties.name}) ===`);
-                console.log('Original RA (0-360°):', d.properties.original_ra);
+                console.log('Original RA (0-360°):', d.properties.originalRa);
                 console.log('Original Dec:', coords[1]);
                 console.log('Converted coords [lon, lat]:', coords);
                 console.log('Projected pixel position [x, y]:', pt);
@@ -555,31 +565,60 @@ export default function SkyAtlas() {
 
               return `translate(${scaledX},${scaledY})`;
             })
+            .style('fill', function(d: any, i: number) {
+              const color = getMarkerColor(d.properties.locationType, d.properties.isCustom);
+              if (i === 0) {
+                console.log('🎨 Marker fill for', d.properties.name, ':',
+                  'type:', d.properties.locationType,
+                  'isCustom:', d.properties.isCustom,
+                  '→ color:', color);
+              }
+              return color;
+            })
             .style('stroke', function(d: any) {
-              // Make test markers red for easy identification
-              return d.properties.location_type === 'test' ? '#ef4444' : '#22c55e';
+              return getMarkerStroke(d.properties.locationType, d.properties.isCustom);
             })
-            .style('stroke-width', function(d: any) {
-              // Make test markers thicker
-              return d.properties.location_type === 'test' ? '3px' : '2px';
+            .style('stroke-width', '2px')
+            .style('cursor', function(d: any) {
+              return d.properties.frameSetId ? 'pointer' : 'default';
             })
-            .style('cursor', 'pointer')
             .style('display', function(d: any) {
               const pt = window.Celestial.map.projection()(d.geometry.coordinates);
               const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
               return isVisible ? null : 'none';
             })
-            .on('click', function(d: any) {
-              const frameSetId = d.properties.frame_set_id;
-              if (frameSetId) {
-                navigate(`/objects/${frameSetId}`);
-              }
-            })
-            .append('title')
+            .each(function(this: any, d: any) {
+              // Use .each() to create closure for D3.js v7 compatibility
+              // Event handlers in D3.js v7 don't receive 'd' as a parameter
+              d3.select(this).on('click', function(event: any) {
+                if (event && event.stopPropagation) {
+                  event.stopPropagation();  // Prevent event bubbling if available
+                }
+                const frameSetId = d.properties.frameSetId;
+                console.log('🖱️ Marker clicked:', d.properties.name, 'frameSetId:', frameSetId, 'locationType:', d.properties.locationType);
+                if (frameSetId) {
+                  console.log('🚀 Navigating to /objects/' + frameSetId);
+                  navigate(`/objects/${frameSetId}`);
+                } else {
+                  console.log('⚠️ No frameSetId for this marker (unorganized cluster)');
+                }
+              });
+            });
+
+          // Add tooltips after setting up click handlers
+          markers.append('title')
             .text(function(d: any) {
-              const totalHours = (d.properties.total_exposure / 3600).toFixed(2);
-              const typeLabel = d.properties.location_type === 'frameset' ? '[Frame Set]' : '[Unorganized]';
-              return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frame_count}\nExposure: ${totalHours}h`;
+              const totalHours = (d.properties.totalExposure / 3600).toFixed(2);
+              let typeLabel = '[Unorganized]';
+              if (d.properties.locationType === 'frameset') {
+                typeLabel = d.properties.isCustom ? '[Custom Frame Set]' : '[Auto Frame Set]';
+              }
+              const cameras = d.properties.cameras ? `\nCameras: ${d.properties.cameras}` : '';
+              const focalLengths = d.properties.focalLengths ? `\nFocal Lengths: ${d.properties.focalLengths}mm` : '';
+              const dates = d.properties.dateRange && d.properties.dateRange[0] && d.properties.dateRange[1]
+                ? `\nDates: ${d.properties.dateRange[0].split('T')[0]} to ${d.properties.dateRange[1].split('T')[0]}`
+                : '';
+              return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}`;
             });
 
           console.log('✅ Created', markers.size(), 'marker elements');

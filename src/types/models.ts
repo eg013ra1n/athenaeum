@@ -324,13 +324,16 @@ export interface ImagingLocation {
   id: number;
   ra: number;
   dec: number;
-  object_name: string | null;
-  frame_count: number;
-  total_exposure: number;  // in seconds
+  objectName: string | null;
+  frameCount: number;
+  totalExposure: number;  // in seconds
   filters: string[];
-  date_range: [string, string];  // ISO date strings
-  frame_set_id: number | null;
-  fov_width: number | null;   // Field of view in degrees
-  fov_height: number | null;  // Field of view in degrees
-  location_type: 'frameset' | 'cluster';  // 'frameset' for organized, 'cluster' for unorganized
+  dateRange: [string, string];  // ISO date strings
+  frameSetId: number | null;
+  fovWidth: number | null;   // Field of view in degrees
+  fovHeight: number | null;  // Field of view in degrees
+  locationType: 'frameset' | 'cluster';  // 'frameset' for organized, 'cluster' for unorganized
+  cameras: string | null;  // Comma-separated list of camera/instrument names
+  focalLengths: string | null;  // Comma-separated list of focal lengths in mm
+  isCustom: boolean;  // true for custom frame sets, false for auto-generated or clusters
 }

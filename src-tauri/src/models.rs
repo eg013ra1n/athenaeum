@@ -409,6 +409,9 @@ pub struct ImagingLocation {
     pub fov_width: Option<f64>,   // Field of view in degrees
     pub fov_height: Option<f64>,  // Field of view in degrees
     pub location_type: String,  // "frameset" or "cluster" for unorganized frames
+    pub cameras: Option<String>,  // Comma-separated list of camera/instrument names
+    pub focal_lengths: Option<String>,  // Comma-separated list of focal lengths in mm
+    pub is_custom: bool,  // true for custom frame sets, false for auto-generated or clusters
 }
 
 /// Bounding box for rectangular region selection
