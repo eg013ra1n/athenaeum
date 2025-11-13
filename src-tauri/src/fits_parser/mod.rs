@@ -6,6 +6,94 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use fitsio::FitsFile;
 use std::path::Path;
 
+/// Detects if RA is in hours (0-24) or degrees (0-360) and normalizes to degrees
+///
+/// IMPROVED ALGORITHM: Uses OBJCTRA for verification when available to handle edge cases.
+///
+/// The FITS standard allows RA in both hours [0, 24) and degrees [0, 360).
+/// For values in [0, 24), this is ambiguous without additional context.
+///
+/// This function uses these strategies:
+/// 1. If OBJCTRA is available, parse it and compare with numeric RA to determine units
+/// 2. If numeric RA matches OBJCTRA (within 0.1°), it's already in degrees
+/// 3. If numeric RA * 15 matches OBJCTRA (within 0.1°), it's in hours → convert
+/// 4. If no OBJCTRA, use heuristics: RA < 24 with valid DEC → assume hours
+///
+/// # Arguments
+/// * `ra` - Raw RA value from FITS header
+/// * `dec` - Optional DEC value for validation
+/// * `objctra` - Optional OBJCTRA string for verification
+///
+/// # Returns
+/// RA in decimal degrees, normalized to [0, 360)
+///
+/// # Edge Cases
+/// - RA=0 works correctly in both hours and degrees (0h = 0°)
+/// - RA in [1, 24) is verified against OBJCTRA if available
+/// - Without OBJCTRA, assumes hours (common in astronomical FITS)
+fn normalize_ra_from_fits(ra: f64, dec: Option<f64>, objctra: Option<&str>) -> f64 {
+    // Handle RA >= 24: must be degrees
+    if ra >= 24.0 {
+        return crate::coordinates::normalize_ra(ra);
+    }
+
+    // Handle RA < 0: must be degrees, needs normalization
+    if ra < 0.0 {
+        return crate::coordinates::normalize_ra(ra);
+    }
+
+    // RA is in [0, 24): AMBIGUOUS - could be hours or degrees
+    // Use OBJCTRA for verification if available
+    if let Some(ra_str) = objctra {
+        if let Ok(ra_from_objctra) = crate::coordinates::parse_ra_sexagesimal(ra_str) {
+            // Compare numeric RA with parsed OBJCTRA
+            let diff_as_degrees = (ra - ra_from_objctra).abs();
+            let diff_as_hours = ((ra * 15.0) - ra_from_objctra).abs();
+
+            // If numeric RA already matches OBJCTRA (within 0.1°), it's in degrees
+            if diff_as_degrees < 0.1 {
+                println!("  Verified RA already in degrees: {:.4}° (matches OBJCTRA)", ra);
+                return crate::coordinates::normalize_ra(ra);
+            }
+
+            // If numeric RA * 15 matches OBJCTRA (within 0.1°), it's in hours
+            if diff_as_hours < 0.1 {
+                println!("  Detected RA in hours: {:.4}h → {:.4}° (verified with OBJCTRA)", ra, ra * 15.0);
+                return crate::coordinates::normalize_ra(ra * 15.0);
+            }
+
+            // Neither match well - use OBJCTRA as ground truth
+            println!("  WARNING: RA={:.4} doesn't match OBJCTRA. Using OBJCTRA value: {:.4}°", ra, ra_from_objctra);
+            return ra_from_objctra;
+        }
+    }
+
+    // No OBJCTRA available, use heuristics
+    if let Some(d) = dec {
+        if d >= -90.0 && d <= 90.0 {
+            // Valid DEC suggests these are coordinates, assume hours
+            println!("  RA={:.4} in ambiguous range [0,24). Assuming hours → {:.4}°", ra, ra * 15.0);
+            return crate::coordinates::normalize_ra(ra * 15.0);
+        }
+    }
+
+    // No context available, default to hours (astronomical convention)
+    println!("  WARNING: RA={:.4} is ambiguous. No verification available. Assuming hours.", ra);
+    crate::coordinates::normalize_ra(ra * 15.0)
+}
+
+/// Validates and normalizes DEC to [-90, 90] range
+fn validate_dec(dec: f64) -> Result<f64, String> {
+    if dec < -90.0 || dec > 90.0 {
+        // Clamp to valid range and warn
+        let clamped = crate::coordinates::normalize_dec(dec);
+        println!("  WARNING: Invalid DEC={:.4}° (outside [-90, 90]). Clamped to {:.4}°", dec, clamped);
+        Ok(clamped)
+    } else {
+        Ok(dec)
+    }
+}
+
 /// Extract full FITS header as text
 pub fn extract_fits_header(path: &Path) -> Result<String> {
     let mut fitsfile = FitsFile::open(path)
@@ -178,10 +266,16 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let naxis2 = read_keyword_i32(&mut fitsfile, &hdu, "NAXIS2").ok();
 
     // Astronomical coordinates
-    let ra = read_keyword_f64(&mut fitsfile, &hdu, "RA").ok();
-    let dec = read_keyword_f64(&mut fitsfile, &hdu, "DEC").ok();
+    // Read raw values first
+    let ra_raw = read_keyword_f64(&mut fitsfile, &hdu, "RA").ok();
+    let dec_raw = read_keyword_f64(&mut fitsfile, &hdu, "DEC").ok();
     let objctra = read_keyword_string(&mut fitsfile, &hdu, "OBJCTRA").ok();
     let objctdec = read_keyword_string(&mut fitsfile, &hdu, "OBJCTDEC").ok();
+
+    // Apply unit detection and validation
+    // Pass objctra for verification (handles RA=0 and [0,24) ambiguity correctly)
+    let ra = ra_raw.map(|r| normalize_ra_from_fits(r, dec_raw, objctra.as_deref()));
+    let dec = dec_raw.and_then(|d| validate_dec(d).ok());
 
     // Observatory location
     let sitelat = read_keyword_f64(&mut fitsfile, &hdu, "SITELAT").ok();
@@ -392,12 +486,18 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         .and_then(|s| s.parse::<i32>().ok());
 
     // Astronomical coordinates
-    let ra = fits_keywords.get("RA")
+    // Read raw values first
+    let ra_raw = fits_keywords.get("RA")
         .and_then(|s| s.parse::<f64>().ok());
-    let dec = fits_keywords.get("DEC")
+    let dec_raw = fits_keywords.get("DEC")
         .and_then(|s| s.parse::<f64>().ok());
     let objctra = fits_keywords.get("OBJCTRA").cloned();
     let objctdec = fits_keywords.get("OBJCTDEC").cloned();
+
+    // Apply unit detection and validation
+    // Pass objctra for verification (handles RA=0 and [0,24) ambiguity correctly)
+    let ra = ra_raw.map(|r| normalize_ra_from_fits(r, dec_raw, objctra.as_deref()));
+    let dec = dec_raw.and_then(|d| validate_dec(d).ok());
 
     // Observatory location
     let sitelat = fits_keywords.get("SITELAT")
