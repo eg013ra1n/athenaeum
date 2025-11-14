@@ -83,9 +83,9 @@ export function useMapViewState() {
    */
   const validateViewState = useCallback((state: MapViewState): boolean => {
     // Zoom should be positive and reasonable for projection.scale()
-    // projection.scale() typically ranges from ~150 (default) to ~2000 (max zoom)
+    // projection.scale() typically ranges from ~150 (default) to ~5000 (max zoom with zoomextend: 10)
     // This is different from d3-celestial's zoomlevel (0-10)
-    if (state.zoom !== null && (state.zoom <= 0 || state.zoom > 2000)) return false;
+    if (state.zoom !== null && (state.zoom <= 0 || state.zoom > 5000)) return false;
 
     // RA should be 0-360 degrees
     if (state.ra !== null && (state.ra < 0 || state.ra > 360)) return false;
