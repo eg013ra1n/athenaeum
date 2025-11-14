@@ -102,26 +102,37 @@ export function useMapViewState() {
    * @param replace - If true, replaces current history entry instead of creating new one
    */
   const saveViewState = useCallback((state: MapViewState, replace: boolean = true) => {
+    // Normalize RA to 0-360 range (d3-celestial can return negative or >360 values)
+    let normalizedRa = state.ra;
+    if (normalizedRa !== null) {
+      normalizedRa = ((normalizedRa % 360) + 360) % 360;
+    }
+
+    const normalizedState = {
+      ...state,
+      ra: normalizedRa
+    };
+
     // Validate before saving
-    if (!validateViewState(state)) {
-      console.warn('Invalid view state, not saving:', state);
+    if (!validateViewState(normalizedState)) {
+      console.warn('Invalid view state, not saving:', normalizedState);
       return;
     }
 
     // Save to sessionStorage for persistence across sidebar navigation
-    saveToStorage(state);
+    saveToStorage(normalizedState);
 
     const params = new URLSearchParams(searchParams);
 
-    if (state.zoom !== null) {
-      params.set('zoom', state.zoom.toFixed(6));
+    if (normalizedState.zoom !== null) {
+      params.set('zoom', normalizedState.zoom.toFixed(6));
     } else {
       params.delete('zoom');
     }
 
-    if (state.ra !== null && state.dec !== null) {
-      params.set('ra', state.ra.toFixed(6));
-      params.set('dec', state.dec.toFixed(6));
+    if (normalizedState.ra !== null && normalizedState.dec !== null) {
+      params.set('ra', normalizedState.ra.toFixed(6));
+      params.set('dec', normalizedState.dec.toFixed(6));
     } else {
       params.delete('ra');
       params.delete('dec');
