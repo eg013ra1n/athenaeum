@@ -26,6 +26,8 @@ export default function SkyAtlas() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapInitialized = useRef(false);
   const resizeTimeoutRef = useRef<number | undefined>(undefined);
+  const autoSaveTimeoutRef = useRef<number | undefined>(undefined);
+  const restorationDone = useRef(false);
 
   const [locations, setLocations] = useState<ImagingLocation[]>([]);
   const [loading, setLoading] = useState(true);
@@ -207,9 +209,10 @@ export default function SkyAtlas() {
     };
   }, [loading]);
 
-  // Restore view state from URL after map initialization
+  // Restore view state from URL after map initialization (runs once only)
   useEffect(() => {
     if (!mapReady || typeof window.Celestial === 'undefined') return;
+    if (restorationDone.current) return; // Only restore once to prevent feedback loop
 
     const viewState = getViewState();
     const { zoom, ra, dec } = viewState;
@@ -239,48 +242,11 @@ export default function SkyAtlas() {
           }
         }
       });
+
+      restorationDone.current = true; // Mark restoration as complete
     }
-  }, [mapReady, getViewState]);
+  }, [mapReady]); // Removed getViewState from dependencies to prevent loop
 
-  // Save view state to URL on zoom/pan (debounced)
-  useEffect(() => {
-    if (!mapReady || typeof window.Celestial === 'undefined') return;
-
-    let saveTimeout: number;
-
-    const handleMapChange = () => {
-      // Debounce to avoid excessive URL updates during interaction
-      clearTimeout(saveTimeout);
-      saveTimeout = window.setTimeout(() => {
-        const projection = window.Celestial.mapProjection;
-        const currentZoom = projection && projection.scale ? projection.scale() : null;
-        const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
-
-        if (currentZoom !== null && currentCenter !== null) {
-          saveViewState({
-            zoom: currentZoom,
-            ra: currentCenter[0],
-            dec: currentCenter[1]
-          });
-
-          console.log('💾 Auto-saved view state:', { zoom: currentZoom, center: currentCenter });
-        }
-      }, 1000); // Save 1 second after user stops interacting
-    };
-
-    const container = document.getElementById('celestial-map');
-    if (container) {
-      // Listen for map interaction events
-      container.addEventListener('zoomend', handleMapChange);
-      container.addEventListener('redraw', handleMapChange);
-
-      return () => {
-        clearTimeout(saveTimeout);
-        container.removeEventListener('zoomend', handleMapChange);
-        container.removeEventListener('redraw', handleMapChange);
-      };
-    }
-  }, [mapReady, saveViewState]);
 
   // Handle window resize with debounce
   useEffect(() => {
@@ -777,9 +743,27 @@ export default function SkyAtlas() {
               .style('display', isVisible ? null : 'none');
           });
         }
+
+        // Auto-save map state after pan/zoom (debounced)
+        clearTimeout(autoSaveTimeoutRef.current);
+        autoSaveTimeoutRef.current = window.setTimeout(() => {
+          const projection = window.Celestial.mapProjection;
+          const currentZoom = projection && projection.scale ? projection.scale() : null;
+          const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
+
+          if (currentZoom !== null && currentCenter !== null) {
+            saveViewState({
+              zoom: currentZoom,
+              ra: currentCenter[0],
+              dec: currentCenter[1]
+            });
+
+            console.log('💾 Auto-saved view state:', { zoom: currentZoom, center: currentCenter });
+          }
+        }, 1000); // Save 1 second after user stops interacting
       }
     });
-  }, [navigate]);
+  }, [navigate, saveViewState]);
 
   // Add markers when locations are loaded or zoom level changes
   useEffect(() => {
