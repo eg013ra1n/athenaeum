@@ -170,11 +170,11 @@ export interface FramesSet {
   id: number | null;
   name: string | null;
   is_custom: boolean;
-  date_obs: string | null;
+  date_obs_start: string | null;
+  date_obs_end: string | null;
   objctra: string | null;
   objctdec: string | null;
   total_exp_time: number | null;
-  project_id: number | null;
 }
 
 export interface FramesSetMember {
