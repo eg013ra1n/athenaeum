@@ -28,6 +28,8 @@ export default function SkyAtlas() {
   const resizeTimeoutRef = useRef<number | undefined>(undefined);
   const autoSaveTimeoutRef = useRef<number | undefined>(undefined);
   const restorationDone = useRef(false);
+  const saveViewStateRef = useRef<((state: any, replace?: boolean) => void) | null>(null);
+  const autoSaveRegistered = useRef(false);
 
   const [locations, setLocations] = useState<ImagingLocation[]>([]);
   const [loading, setLoading] = useState(true);
@@ -64,6 +66,43 @@ export default function SkyAtlas() {
     }
     loadLocations();
   }, []);
+
+  // Keep saveViewState ref up to date
+  useEffect(() => {
+    saveViewStateRef.current = saveViewState;
+  }, [saveViewState]);
+
+  // Auto-save map state on pan/zoom (separate from marker rendering to prevent duplicate registrations)
+  useEffect(() => {
+    if (!mapReady || typeof window.Celestial === 'undefined') return;
+    if (autoSaveRegistered.current) return; // Only register once
+
+    window.Celestial.add({
+      type: 'raw',
+      callback: () => {}, // Empty callback, we only need redraw
+      redraw: function() {
+        // Auto-save map state after pan/zoom (debounced)
+        clearTimeout(autoSaveTimeoutRef.current);
+        autoSaveTimeoutRef.current = window.setTimeout(() => {
+          const projection = window.Celestial.mapProjection;
+          const currentZoom = projection && projection.scale ? projection.scale() : null;
+          const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
+
+          if (currentZoom !== null && currentCenter !== null && saveViewStateRef.current) {
+            saveViewStateRef.current({
+              zoom: currentZoom,
+              ra: currentCenter[0],
+              dec: currentCenter[1]
+            });
+
+            console.log('💾 Auto-saved view state:', { zoom: currentZoom, center: currentCenter });
+          }
+        }, 300); // Save 300ms after user stops interacting
+      }
+    });
+
+    autoSaveRegistered.current = true; // Mark as registered
+  }, [mapReady]); // Only depends on mapReady, not saveViewState
 
   // Initialize d3-celestial using useLayoutEffect for synchronous DOM measurement
   useLayoutEffect(() => {
@@ -743,27 +782,9 @@ export default function SkyAtlas() {
               .style('display', isVisible ? null : 'none');
           });
         }
-
-        // Auto-save map state after pan/zoom (debounced)
-        clearTimeout(autoSaveTimeoutRef.current);
-        autoSaveTimeoutRef.current = window.setTimeout(() => {
-          const projection = window.Celestial.mapProjection;
-          const currentZoom = projection && projection.scale ? projection.scale() : null;
-          const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
-
-          if (currentZoom !== null && currentCenter !== null) {
-            saveViewState({
-              zoom: currentZoom,
-              ra: currentCenter[0],
-              dec: currentCenter[1]
-            });
-
-            console.log('💾 Auto-saved view state:', { zoom: currentZoom, center: currentCenter });
-          }
-        }, 1000); // Save 1 second after user stops interacting
       }
     });
-  }, [navigate, saveViewState]);
+  }, [navigate]);
 
   // Add markers when locations are loaded or zoom level changes
   useEffect(() => {
