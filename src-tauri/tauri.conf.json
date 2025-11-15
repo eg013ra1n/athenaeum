@@ -26,6 +26,7 @@
           "permissions": [
             "dialog:allow-open",
             "dialog:allow-save",
+            "dialog:allow-confirm",
             "fs:allow-read-dir",
             "fs:allow-read-file"
           ]

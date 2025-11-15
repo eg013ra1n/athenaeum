@@ -234,17 +234,17 @@ pub struct Project {
     pub name: String,
 }
 
-/// Frames set (imaging session within a project)
+/// Frames set (collection of related frames)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FramesSet {
     pub id: Option<i64>,
     pub name: Option<String>,
     pub is_custom: bool,
-    pub date_obs: Option<String>,
+    pub date_obs_start: Option<String>,
+    pub date_obs_end: Option<String>,
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
     pub total_exp_time: Option<f64>,
-    pub project_id: Option<i64>,
 }
 
 /// FITS header storage
@@ -432,4 +432,35 @@ pub struct SelectionResult {
     pub frame_ids: Vec<i64>,
     pub count: usize,
     pub total_exposure_seconds: f64,
+}
+
+/// Selection criteria for splitting frame sets
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum SplitSelection {
+    Nights { ids: Vec<i64> },
+    Sessions { ids: Vec<i64> },
+    Frames { ids: Vec<i64> },
+}
+
+/// Report of frames added to a specific frame set during refresh
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SetUpdateReport {
+    pub set_id: i64,
+    pub set_name: String,
+    pub frames_added: usize,
+    pub nights_created: usize,
+    pub nights_updated: usize,
+    pub frame_ids_added: Vec<i64>,
+    pub frame_names_added: Vec<String>,
+}
+
+/// Result of refreshing frame sets with new unassigned frames
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RefreshResult {
+    pub frames_added: usize,
+    pub sets_updated: Vec<SetUpdateReport>,
+    pub frames_unassigned: usize,
 }

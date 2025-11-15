@@ -4,6 +4,7 @@ import DarkLibrary from "./DarkLibrary";
 import MasterDarkLibrary from "./MasterDarkLibrary";
 import { invoke } from "@tauri-apps/api/core";
 import { DarkLibraryResult } from "../types/models";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface CameraDetailProps {
   instrume: string;
@@ -17,11 +18,14 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [showConfirm, setShowConfirm] = useState(false);
 
   const handleCreateBothLibraries = async () => {
-    if (!confirm("This will create both Dark Library (single frames) and Master Library (master frames) in one go. Continue?")) {
-      return;
-    }
+    setShowConfirm(true);
+  };
+
+  const confirmCreate = async () => {
+    setShowConfirm(false);
 
     try {
       setCreating(true);
@@ -127,6 +131,15 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           <MasterDarkLibrary instrume={instrume} isTabView={true} />
         )}
       </div>
+
+      {/* Confirm Dialog */}
+      <ConfirmDialog
+        isOpen={showConfirm}
+        title="Create Both Libraries"
+        message="This will create both Dark Library (single frames) and Master Library (master frames) in one go. Continue?"
+        onConfirm={confirmCreate}
+        onCancel={() => setShowConfirm(false)}
+      />
     </div>
   );
 }

@@ -3,6 +3,8 @@ import { Trash2, RotateCcw, AlertTriangle, Loader2, Filter } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core';
 import { format } from 'date-fns';
 import type { BlackHoleEntry } from '../types/models';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { AlertDialog } from '../components/AlertDialog';
 
 export default function BlackHole() {
   const [entries, setEntries] = useState<BlackHoleEntry[]>([]);
@@ -10,6 +12,38 @@ export default function BlackHole() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<Record<number, boolean>>({});
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    confirmDanger?: boolean;
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    onConfirm: () => {},
+    confirmDanger: false,
+  });
+  const [alertDialog, setAlertDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    variant: 'error' | 'warning' | 'info';
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    variant: 'info',
+  });
+
+  const showConfirm = (title: string, message: string, onConfirm: () => void, confirmDanger = false) => {
+    setConfirmDialog({ isOpen: true, title, message, onConfirm, confirmDanger });
+  };
+
+  const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
+    setAlertDialog({ isOpen: true, title, message, variant });
+  };
 
   // Load black hole entries
   const loadEntries = async () => {
@@ -32,53 +66,65 @@ export default function BlackHole() {
 
   // Restore a file from black hole
   const handleRestore = async (fileId: number) => {
-    if (!confirm('Restore this file from the black hole?')) return;
-
-    try {
-      setActionLoading(prev => ({ ...prev, [fileId]: true }));
-      await invoke('restore_from_black_hole', { fileId });
-      await loadEntries();
-    } catch (err) {
-      console.error('Failed to restore file:', err);
-      alert(`Failed to restore file: ${String(err)}`);
-    } finally {
-      setActionLoading(prev => ({ ...prev, [fileId]: false }));
-    }
+    showConfirm(
+      'Restore File',
+      'Restore this file from the black hole?',
+      async () => {
+        try {
+          setActionLoading(prev => ({ ...prev, [fileId]: true }));
+          await invoke('restore_from_black_hole', { fileId });
+          await loadEntries();
+        } catch (err) {
+          console.error('Failed to restore file:', err);
+          showAlert('Restore Failed', `Failed to restore file: ${String(err)}`, 'error');
+        } finally {
+          setActionLoading(prev => ({ ...prev, [fileId]: false }));
+        }
+      }
+    );
   };
 
   // Send a file to void (permanent deletion)
   const handleSendToVoid = async (fileId: number, filename: string) => {
-    if (!confirm(`Permanently delete "${filename}"? This action cannot be undone!`)) return;
-
-    try {
-      setActionLoading(prev => ({ ...prev, [fileId]: true }));
-      await invoke('send_to_void', { fileId });
-      await loadEntries();
-    } catch (err) {
-      console.error('Failed to send file to void:', err);
-      alert(`Failed to delete file: ${String(err)}`);
-    } finally {
-      setActionLoading(prev => ({ ...prev, [fileId]: false }));
-    }
+    showConfirm(
+      'Permanent Delete',
+      `Permanently delete "${filename}"?\n\nThis action cannot be undone!`,
+      async () => {
+        try {
+          setActionLoading(prev => ({ ...prev, [fileId]: true }));
+          await invoke('send_to_void', { fileId });
+          await loadEntries();
+        } catch (err) {
+          console.error('Failed to send file to void:', err);
+          showAlert('Delete Failed', `Failed to delete file: ${String(err)}`, 'error');
+        } finally {
+          setActionLoading(prev => ({ ...prev, [fileId]: false }));
+        }
+      },
+      true
+    );
   };
 
   // Send all files to void
   const handleSendAllToVoid = async () => {
-    if (!confirm(
-      `Permanently delete ALL ${entries.length} files in the black hole? This action cannot be undone!`
-    )) return;
-
-    try {
-      setLoading(true);
-      const count = await invoke<number>('send_all_to_void');
-      alert(`Successfully deleted ${count} files`);
-      await loadEntries();
-    } catch (err) {
-      console.error('Failed to send all to void:', err);
-      alert(`Failed to delete files: ${String(err)}`);
-    } finally {
-      setLoading(false);
-    }
+    showConfirm(
+      'Permanent Delete All',
+      `Permanently delete ALL ${entries.length} files in the black hole?\n\nThis action cannot be undone!`,
+      async () => {
+        try {
+          setLoading(true);
+          await invoke<number>('send_all_to_void');
+          // Success - silent update
+          await loadEntries();
+        } catch (err) {
+          console.error('Failed to send all to void:', err);
+          showAlert('Delete Failed', `Failed to delete files: ${String(err)}`, 'error');
+        } finally {
+          setLoading(false);
+        }
+      },
+      true
+    );
   };
 
   // Format file size
@@ -242,6 +288,28 @@ export default function BlackHole() {
           </div>
         </div>
       )}
+
+      {/* Confirm Dialog */}
+      <ConfirmDialog
+        isOpen={confirmDialog.isOpen}
+        title={confirmDialog.title}
+        message={confirmDialog.message}
+        onConfirm={() => {
+          setConfirmDialog({ ...confirmDialog, isOpen: false });
+          confirmDialog.onConfirm();
+        }}
+        onCancel={() => setConfirmDialog({ ...confirmDialog, isOpen: false })}
+        confirmDanger={confirmDialog.confirmDanger}
+      />
+
+      {/* Alert Dialog */}
+      <AlertDialog
+        isOpen={alertDialog.isOpen}
+        title={alertDialog.title}
+        message={alertDialog.message}
+        variant={alertDialog.variant}
+        onClose={() => setAlertDialog({ ...alertDialog, isOpen: false })}
+      />
     </div>
   );
 }

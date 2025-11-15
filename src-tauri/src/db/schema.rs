@@ -146,18 +146,17 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Frames set table - imaging sessions within a project
+    // Frames set table - imaging sessions
     conn.execute(
         "CREATE TABLE IF NOT EXISTS frames_set (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
             is_custom INTEGER NOT NULL DEFAULT 0,
-            date_obs TEXT,
+            date_obs_start TEXT,
+            date_obs_end TEXT,
             objctra TEXT,
             objctdec TEXT,
-            total_exp_time REAL,
-            project_id INTEGER,
-            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+            total_exp_time REAL
         )",
         [],
     )?;
@@ -350,6 +349,32 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_content_hash {
         conn.execute(
             "ALTER TABLE files ADD COLUMN content_hash TEXT",
+            [],
+        )?;
+    }
+
+    // Add date_obs_start to frames_set table (migration for existing databases)
+    let has_date_obs_start: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='date_obs_start'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_date_obs_start {
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN date_obs_start TEXT",
+            [],
+        )?;
+    }
+
+    // Add date_obs_end to frames_set table (migration for existing databases)
+    let has_date_obs_end: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='date_obs_end'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_date_obs_end {
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN date_obs_end TEXT",
             [],
         )?;
     }

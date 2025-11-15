@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus, Eye } from 'lucide-react';
+import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
 import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { AlertDialog } from '../components/AlertDialog';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -17,6 +19,21 @@ export default function FrameSetDetail() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [creating, setCreating] = useState(false);
   const [blinkFrames, setBlinkFrames] = useState<FileWithFrame[] | null>(null);
+  const [showSplitDialog, setShowSplitDialog] = useState(false);
+  const [splitName, setSplitName] = useState('');
+  const [splitting, setSplitting] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [alertDialog, setAlertDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    variant: 'error' | 'warning' | 'info';
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    variant: 'info',
+  });
 
   useEffect(() => {
     loadDetail();
@@ -37,6 +54,10 @@ export default function FrameSetDetail() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
+    setAlertDialog({ isOpen: true, title, message, variant });
   };
 
   const formatDate = (isoString: string) => {
@@ -113,7 +134,7 @@ export default function FrameSetDetail() {
     );
 
     if (lightFitsFrames.length === 0) {
-      alert('No LIGHT FITS frames found in this session');
+      showAlert('No LIGHT Frames', 'No LIGHT FITS frames found in this session', 'warning');
       return;
     }
 
@@ -160,12 +181,12 @@ export default function FrameSetDetail() {
 
   const handleCreateCustomSet = async () => {
     if (!customSetName.trim()) {
-      alert('Please enter a name for the custom set');
+      showAlert('Name Required', 'Please enter a name for the custom set', 'warning');
       return;
     }
 
     if (selectedSessionIds.size === 0) {
-      alert('Please select at least one session');
+      showAlert('No Selection', 'Please select at least one session', 'warning');
       return;
     }
 
@@ -177,15 +198,125 @@ export default function FrameSetDetail() {
         projectId: null, // No project assignment for now (can be added later)
       });
 
-      alert('Custom frames set created successfully!');
+      // Success - silent update
       setShowCreateDialog(false);
       setCustomSetName('');
       setSelectedSessionIds(new Set());
       navigate('/objects');
     } catch (err) {
-      alert('Failed to create custom set: ' + String(err));
+      showAlert('Creation Failed', 'Failed to create custom set: ' + String(err), 'error');
     } finally {
       setCreating(false);
+    }
+  };
+
+  const handleOpenSplitDialog = async () => {
+    if (!id || selectedSessionIds.size === 0) return;
+
+    // Determine selection type based on what's selected
+    // Check if entire nights are selected
+    const selectedNights = detail?.nights.filter(night => isNightFullySelected(night)) || [];
+
+    let selection: any;
+    if (selectedNights.length > 0) {
+      // Splitting by nights
+      selection = {
+        type: 'nights',
+        ids: selectedNights.map(n => n.imaging_night?.id).filter((id): id is number => id != null)
+      };
+    } else {
+      // Splitting by sessions
+      selection = {
+        type: 'sessions',
+        ids: Array.from(selectedSessionIds)
+      };
+    }
+
+    // Check if split is valid
+    try {
+      const canSplit = await invoke<boolean>('can_split', {
+        sourceSetId: parseInt(id),
+        selection
+      });
+
+      if (!canSplit) {
+        showAlert('Cannot Split', 'Cannot split: operation would leave the source frame set empty.\n\nYou must leave at least one night/session in the original set.', 'warning');
+        return;
+      }
+
+      // Pre-fill split name
+      const originalName = detail?.frames_set?.name || 'Untitled';
+      setSplitName(`${originalName} - Split 1`);
+      setShowSplitDialog(true);
+    } catch (err) {
+      showAlert('Validation Failed', 'Failed to validate split: ' + String(err), 'error');
+    }
+  };
+
+  const handleSplit = async () => {
+    if (!id || !splitName.trim()) {
+      showAlert('Name Required', 'Please enter a name for the new frame set', 'warning');
+      return;
+    }
+
+    if (selectedSessionIds.size === 0) {
+      showAlert('No Selection', 'Please select at least one session', 'warning');
+      return;
+    }
+
+    // Determine selection type
+    const selectedNights = detail?.nights.filter(night => isNightFullySelected(night)) || [];
+
+    let selection: any;
+    if (selectedNights.length > 0) {
+      selection = {
+        type: 'nights',
+        ids: selectedNights.map(n => n.imaging_night?.id).filter((id): id is number => id != null)
+      };
+    } else {
+      selection = {
+        type: 'sessions',
+        ids: Array.from(selectedSessionIds)
+      };
+    }
+
+    try {
+      setSplitting(true);
+      await invoke('split_frame_set', {
+        sourceSetId: parseInt(id),
+        selection,
+        newName: splitName.trim()
+      });
+
+      setShowSplitDialog(false);
+      setSplitName('');
+      setSelectedSessionIds(new Set());
+
+      // Reload the detail view to show updated data
+      await loadDetail();
+
+      // Success - silent update (no alert)
+    } catch (err) {
+      showAlert('Split Failed', 'Failed to split frame set: ' + String(err), 'error');
+    } finally {
+      setSplitting(false);
+    }
+  };
+
+  const handleDeleteClick = () => {
+    setShowDeleteConfirm(true);
+  };
+
+  const confirmDelete = async () => {
+    setShowDeleteConfirm(false);
+
+    if (!id) return;
+
+    try {
+      await invoke('delete_frames_set', { framesSetId: parseInt(id) });
+      navigate('/objects');
+    } catch (err) {
+      showAlert('Delete Failed', 'Failed to delete: ' + String(err), 'error');
     }
   };
 
@@ -269,6 +400,13 @@ export default function FrameSetDetail() {
               {selectedSessionIds.size} session{selectedSessionIds.size !== 1 ? 's' : ''} selected
             </span>
             <button
+              onClick={handleOpenSplitDialog}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition"
+            >
+              <Scissors size={18} />
+              Split
+            </button>
+            <button
               onClick={() => setShowCreateDialog(true)}
               className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition"
             >
@@ -334,16 +472,7 @@ export default function FrameSetDetail() {
                 Back to Objects
               </button>
               <button
-                onClick={async () => {
-                  if (confirm('Delete this frame set? You can recreate it using "Auto-Generate Sets".')) {
-                    try {
-                      await invoke('delete_frames_set', { framesSetId: parseInt(id!) });
-                      navigate('/objects');
-                    } catch (err) {
-                      alert('Failed to delete: ' + String(err));
-                    }
-                  }
-                }}
+                onClick={handleDeleteClick}
                 className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
               >
                 Delete Frame Set
@@ -557,6 +686,58 @@ export default function FrameSetDetail() {
         </div>
       )}
 
+      {/* Split Frame Set Dialog */}
+      {showSplitDialog && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg max-w-md w-full p-6 border border-gray-700">
+            <h3 className="text-xl font-bold mb-4 flex items-center gap-2">
+              <Scissors size={20} className="text-blue-400" />
+              Split Frame Set
+            </h3>
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                New Set Name
+              </label>
+              <input
+                type="text"
+                value={splitName}
+                onChange={(e) => setSplitName(e.target.value)}
+                placeholder="Enter name for split set"
+                className="w-full px-3 py-2 bg-gray-700 text-gray-100 rounded-lg border border-gray-600 focus:outline-none focus:border-blue-500"
+                autoFocus
+              />
+            </div>
+
+            <div className="mb-6 text-sm text-gray-400 space-y-2">
+              <p>{selectedSessionIds.size} session{selectedSessionIds.size !== 1 ? 's' : ''} will be split into the new set</p>
+              <p className="text-yellow-400">
+                The selected sessions will be removed from "{detail?.frames_set?.name || 'this set'}" and moved to the new set.
+              </p>
+            </div>
+
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => {
+                  setShowSplitDialog(false);
+                  setSplitName('');
+                }}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSplit}
+                disabled={splitting || !splitName.trim()}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition"
+              >
+                {splitting ? 'Splitting...' : 'Split'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Blink Viewer Modal */}
       {blinkFrames && (
         <BlinkViewer
@@ -565,6 +746,26 @@ export default function FrameSetDetail() {
           onClose={() => setBlinkFrames(null)}
         />
       )}
+
+      {/* Delete Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showDeleteConfirm}
+        title="Delete Frame Set"
+        message="Delete this frame set? You can recreate it using 'Auto-Generate Sets'."
+        onConfirm={confirmDelete}
+        onCancel={() => setShowDeleteConfirm(false)}
+        confirmText="Delete"
+        confirmDanger={true}
+      />
+
+      {/* Alert Dialog */}
+      <AlertDialog
+        isOpen={alertDialog.isOpen}
+        title={alertDialog.title}
+        message={alertDialog.message}
+        variant={alertDialog.variant}
+        onClose={() => setAlertDialog({ ...alertDialog, isOpen: false })}
+      />
     </div>
   );
 }

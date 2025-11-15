@@ -514,48 +514,47 @@ pub fn create_frames_set(
     conn: &Connection,
     name: Option<&str>,
     is_custom: bool,
-    date_obs: Option<&str>,
+    date_obs_start: Option<&str>,
+    date_obs_end: Option<&str>,
     objctra: Option<&str>,
     objctdec: Option<&str>,
     total_exp_time: Option<f64>,
-    project_id: Option<i64>,
 ) -> Result<i64> {
     let is_custom_int = if is_custom { 1 } else { 0 };
     conn.execute(
-        "INSERT INTO frames_set (name, is_custom, date_obs, objctra, objctdec, total_exp_time, project_id)
+        "INSERT INTO frames_set (name, is_custom, date_obs_start, date_obs_end, objctra, objctdec, total_exp_time)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![name, is_custom_int, date_obs, objctra, objctdec, total_exp_time, project_id],
+        params![name, is_custom_int, date_obs_start, date_obs_end, objctra, objctdec, total_exp_time],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-/// Get all frames sets for a project with member counts
+/// Get all frames sets with member counts
 pub fn get_frames_sets_by_project(
     conn: &Connection,
-    project_id: i64,
+    _project_id: i64,  // Kept for backwards compatibility, but ignored
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(
-        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs, fs.objctra, fs.objctdec, fs.total_exp_time, fs.project_id,
+        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time,
                 COUNT(DISTINCT sm.frame_id) as member_count
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
          LEFT JOIN session_members sm ON s.id = sm.session_id
-         WHERE fs.project_id = ?1 OR fs.project_id IS NULL
          GROUP BY fs.id
-         ORDER BY fs.date_obs DESC, fs.name ASC"
+         ORDER BY fs.date_obs_start DESC, fs.name ASC"
     )?;
 
-    let sets = stmt.query_map(params![project_id], |row| {
+    let sets = stmt.query_map(params![], |row| {
         let set = crate::models::FramesSet {
             id: Some(row.get(0)?),
             name: row.get(1)?,
             is_custom: row.get::<_, i32>(2)? == 1,
-            date_obs: row.get(3)?,
-            objctra: row.get(4)?,
-            objctdec: row.get(5)?,
-            total_exp_time: row.get(6)?,
-            project_id: row.get(7)?,
+            date_obs_start: row.get(3)?,
+            date_obs_end: row.get(4)?,
+            objctra: row.get(5)?,
+            objctdec: row.get(6)?,
+            total_exp_time: row.get(7)?,
         };
         let member_count: i32 = row.get(8)?;
         Ok((set, member_count as usize))
@@ -585,11 +584,39 @@ pub fn delete_frames_set(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Delete all auto-generated frames_sets (where is_custom = 0)
+pub fn delete_auto_generated_frame_sets(conn: &Connection) -> Result<usize> {
+    let count = conn.execute("DELETE FROM frames_set WHERE is_custom = 0", params![])?;
+    Ok(count)
+}
+
 /// Update frames_set name
 pub fn update_frames_set_name(conn: &Connection, id: i64, name: &str) -> Result<()> {
     conn.execute(
         "UPDATE frames_set SET name = ?1 WHERE id = ?2",
         params![name, id],
+    )?;
+    Ok(())
+}
+
+/// Update frames_set metadata
+pub fn update_frames_set_metadata(
+    conn: &Connection,
+    id: i64,
+    date_obs_start: Option<&str>,
+    date_obs_end: Option<&str>,
+    objctra: Option<&str>,
+    objctdec: Option<&str>,
+    total_exp_time: Option<f64>,
+    is_custom: bool,
+) -> Result<()> {
+    let is_custom_int = if is_custom { 1 } else { 0 };
+    conn.execute(
+        "UPDATE frames_set
+         SET date_obs_start = ?1, date_obs_end = ?2, objctra = ?3, objctdec = ?4,
+             total_exp_time = ?5, is_custom = ?6
+         WHERE id = ?7",
+        params![date_obs_start, date_obs_end, objctra, objctdec, total_exp_time, is_custom_int, id],
     )?;
     Ok(())
 }
@@ -735,6 +762,166 @@ pub fn delete_sessions_for_frame_set(conn: &Connection, frames_set_id: i64) -> R
         params![frames_set_id],
     )?;
     Ok(())
+}
+
+/// Reassign an imaging night to a different frame set
+pub fn reassign_imaging_night_to_frame_set(
+    conn: &Connection,
+    night_id: i64,
+    new_frames_set_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE imaging_nights SET frames_set_id = ?1 WHERE id = ?2",
+        params![new_frames_set_id, night_id],
+    )?;
+    Ok(())
+}
+
+/// Move sessions from one night to another
+pub fn move_sessions_to_night(
+    conn: &Connection,
+    session_ids: &[i64],
+    target_night_id: i64,
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    for session_id in session_ids {
+        conn.execute(
+            "UPDATE sessions SET imaging_night_id = ?1 WHERE id = ?2",
+            params![target_night_id, session_id],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// Update imaging night time range
+pub fn update_imaging_night_time_range(
+    conn: &Connection,
+    night_id: i64,
+    start_time: &str,
+    end_time: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE imaging_nights SET start_time = ?1, end_time = ?2 WHERE id = ?3",
+        params![start_time, end_time, night_id],
+    )?;
+    Ok(())
+}
+
+/// Deduplicate session members within a frame set
+/// Removes duplicate frame references from all sessions in a frame set
+pub fn deduplicate_session_members_in_set(
+    conn: &Connection,
+    frames_set_id: i64,
+) -> Result<usize> {
+    // Find all sessions in this frame set
+    let session_ids: Vec<i64> = conn
+        .prepare(
+            "SELECT s.id
+             FROM sessions s
+             JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
+             WHERE in_tbl.frames_set_id = ?1"
+        )?
+        .query_map(params![frames_set_id], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut total_removed = 0;
+
+    for session_id in session_ids {
+        // Find duplicate frame_ids in this session
+        let duplicates: Vec<(i64, i32)> = conn
+            .prepare(
+                "SELECT frame_id, COUNT(*) as count
+                 FROM session_members
+                 WHERE session_id = ?1
+                 GROUP BY frame_id
+                 HAVING count > 1"
+            )?
+            .query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // For each duplicate, keep only one and remove the rest
+        for (frame_id, count) in duplicates {
+            // Delete all instances
+            conn.execute(
+                "DELETE FROM session_members WHERE session_id = ?1 AND frame_id = ?2",
+                params![session_id, frame_id],
+            )?;
+
+            // Re-insert exactly one
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                params![session_id, frame_id],
+            )?;
+
+            total_removed += (count - 1) as usize;
+        }
+    }
+
+    Ok(total_removed)
+}
+
+/// Get all imaging nights for a frame set (simplified, just nights without sessions)
+pub fn get_imaging_nights_for_set(
+    conn: &Connection,
+    frames_set_id: i64,
+) -> Result<Vec<crate::models::ImagingNight>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, frames_set_id, start_time, end_time, created_at
+         FROM imaging_nights
+         WHERE frames_set_id = ?1
+         ORDER BY start_time ASC"
+    )?;
+
+    let nights = stmt.query_map(params![frames_set_id], |row| {
+        let created_at_str: Option<String> = row.get(4)?;
+        let created_at = created_at_str
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        Ok(crate::models::ImagingNight {
+            id: Some(row.get(0)?),
+            frames_set_id: row.get(1)?,
+            start_time: row.get(2)?,
+            end_time: row.get(3)?,
+            created_at,
+        })
+    })?;
+
+    nights.collect()
+}
+
+/// Get all sessions for an imaging night
+pub fn get_sessions_for_night(
+    conn: &Connection,
+    night_id: i64,
+) -> Result<Vec<crate::models::Session>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at
+         FROM sessions
+         WHERE imaging_night_id = ?1
+         ORDER BY created_at ASC"
+    )?;
+
+    let sessions = stmt.query_map(params![night_id], |row| {
+        let created_at_str: Option<String> = row.get(5)?;
+        let created_at = created_at_str
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        Ok(crate::models::Session {
+            id: Some(row.get(0)?),
+            imaging_night_id: row.get(1)?,
+            instrume: row.get(2)?,
+            frame_count: row.get(3)?,
+            total_exp_time: row.get(4)?,
+            created_at,
+        })
+    })?;
+
+    sessions.collect()
 }
 
 /// Get frames for a specific frames_set with file info (for session detection)

@@ -5,6 +5,7 @@ import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState } from "./DarkLibraryFilters";
 import QuickStats from "./QuickStats";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface MasterDarkLibraryProps {
   instrume: string;
@@ -18,6 +19,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [showConfirm, setShowConfirm] = useState(false);
   const [filters, setFilters] = useState<FilterState>({
     types: [],
     gains: [],
@@ -84,9 +86,11 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
   };
 
   const handleRegenerateLibrary = async () => {
-    if (!confirm("This will delete the existing master dark library and recreate it. Continue?")) {
-      return;
-    }
+    setShowConfirm(true);
+  };
+
+  const confirmRegenerate = async () => {
+    setShowConfirm(false);
     await handleCreateLibrary();
   };
 
@@ -272,6 +276,15 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
           )}
         </div>
       )}
+
+      {/* Confirm Dialog */}
+      <ConfirmDialog
+        isOpen={showConfirm}
+        title="Regenerate Master Library"
+        message="This will delete the existing master dark library and recreate it. Continue?"
+        onConfirm={confirmRegenerate}
+        onCancel={() => setShowConfirm(false)}
+      />
     </div>
   );
 }

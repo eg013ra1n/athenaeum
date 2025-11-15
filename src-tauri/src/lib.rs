@@ -15,6 +15,8 @@ mod rustafits_processor;
 mod fingerprint;
 mod relinking;
 mod selection;
+mod frames_set_metadata;
+mod frames_set_merge;
 
 // Commands (Tauri API endpoints)
 mod commands;
@@ -77,7 +79,13 @@ pub fn run() {
             commands::auto_generate_frame_sets,
             commands::get_frames_sets,
             commands::delete_frames_set,
+            commands::delete_auto_generated_frame_sets,
             commands::rename_frames_set,
+            commands::mark_frame_set_custom,
+            commands::recalculate_frame_set_metadata,
+            commands::merge_frame_sets,
+            commands::can_split,
+            commands::split_frame_set,
             commands::get_frame_set_detail,
             commands::create_custom_frames_set,
             commands::get_equipment_cameras,

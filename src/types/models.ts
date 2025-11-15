@@ -170,11 +170,11 @@ export interface FramesSet {
   id: number | null;
   name: string | null;
   is_custom: boolean;
-  date_obs: string | null;
+  date_obs_start: string | null;
+  date_obs_end: string | null;
   objctra: string | null;
   objctdec: string | null;
   total_exp_time: number | null;
-  project_id: number | null;
 }
 
 export interface FramesSetMember {
@@ -336,4 +336,21 @@ export interface ImagingLocation {
   cameras: string | null;  // Comma-separated list of camera/instrument names
   focalLengths: string | null;  // Comma-separated list of focal lengths in mm
   isCustom: boolean;  // true for custom frame sets, false for auto-generated or clusters
+}
+
+// Frame Set Refresh
+export interface SetUpdateReport {
+  set_id: number;
+  set_name: string;
+  frames_added: number;
+  nights_created: number;
+  nights_updated: number;
+  frame_ids_added: number[];
+  frame_names_added: string[];
+}
+
+export interface RefreshResult {
+  frames_added: number;
+  sets_updated: SetUpdateReport[];
+  frames_unassigned: number;
 }
