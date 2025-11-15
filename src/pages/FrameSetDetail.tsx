@@ -4,6 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
 import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { AlertDialog } from '../components/AlertDialog';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -20,6 +22,18 @@ export default function FrameSetDetail() {
   const [showSplitDialog, setShowSplitDialog] = useState(false);
   const [splitName, setSplitName] = useState('');
   const [splitting, setSplitting] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [alertDialog, setAlertDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    variant: 'error' | 'warning' | 'info';
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    variant: 'info',
+  });
 
   useEffect(() => {
     loadDetail();
@@ -40,6 +54,10 @@ export default function FrameSetDetail() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
+    setAlertDialog({ isOpen: true, title, message, variant });
   };
 
   const formatDate = (isoString: string) => {
@@ -116,7 +134,7 @@ export default function FrameSetDetail() {
     );
 
     if (lightFitsFrames.length === 0) {
-      alert('No LIGHT FITS frames found in this session');
+      showAlert('No LIGHT Frames', 'No LIGHT FITS frames found in this session', 'warning');
       return;
     }
 
@@ -163,12 +181,12 @@ export default function FrameSetDetail() {
 
   const handleCreateCustomSet = async () => {
     if (!customSetName.trim()) {
-      alert('Please enter a name for the custom set');
+      showAlert('Name Required', 'Please enter a name for the custom set', 'warning');
       return;
     }
 
     if (selectedSessionIds.size === 0) {
-      alert('Please select at least one session');
+      showAlert('No Selection', 'Please select at least one session', 'warning');
       return;
     }
 
@@ -180,13 +198,13 @@ export default function FrameSetDetail() {
         projectId: null, // No project assignment for now (can be added later)
       });
 
-      alert('Custom frames set created successfully!');
+      // Success - silent update
       setShowCreateDialog(false);
       setCustomSetName('');
       setSelectedSessionIds(new Set());
       navigate('/objects');
     } catch (err) {
-      alert('Failed to create custom set: ' + String(err));
+      showAlert('Creation Failed', 'Failed to create custom set: ' + String(err), 'error');
     } finally {
       setCreating(false);
     }
@@ -222,7 +240,7 @@ export default function FrameSetDetail() {
       });
 
       if (!canSplit) {
-        alert('Cannot split: operation would leave the source frame set empty.\n\nYou must leave at least one night/session in the original set.');
+        showAlert('Cannot Split', 'Cannot split: operation would leave the source frame set empty.\n\nYou must leave at least one night/session in the original set.', 'warning');
         return;
       }
 
@@ -231,18 +249,18 @@ export default function FrameSetDetail() {
       setSplitName(`${originalName} - Split 1`);
       setShowSplitDialog(true);
     } catch (err) {
-      alert('Failed to validate split: ' + String(err));
+      showAlert('Validation Failed', 'Failed to validate split: ' + String(err), 'error');
     }
   };
 
   const handleSplit = async () => {
     if (!id || !splitName.trim()) {
-      alert('Please enter a name for the new frame set');
+      showAlert('Name Required', 'Please enter a name for the new frame set', 'warning');
       return;
     }
 
     if (selectedSessionIds.size === 0) {
-      alert('Please select at least one session');
+      showAlert('No Selection', 'Please select at least one session', 'warning');
       return;
     }
 
@@ -277,11 +295,28 @@ export default function FrameSetDetail() {
       // Reload the detail view to show updated data
       await loadDetail();
 
-      alert('Frame set split successfully!');
+      // Success - silent update (no alert)
     } catch (err) {
-      alert('Failed to split frame set: ' + String(err));
+      showAlert('Split Failed', 'Failed to split frame set: ' + String(err), 'error');
     } finally {
       setSplitting(false);
+    }
+  };
+
+  const handleDeleteClick = () => {
+    setShowDeleteConfirm(true);
+  };
+
+  const confirmDelete = async () => {
+    setShowDeleteConfirm(false);
+
+    if (!id) return;
+
+    try {
+      await invoke('delete_frames_set', { framesSetId: parseInt(id) });
+      navigate('/objects');
+    } catch (err) {
+      showAlert('Delete Failed', 'Failed to delete: ' + String(err), 'error');
     }
   };
 
@@ -437,16 +472,7 @@ export default function FrameSetDetail() {
                 Back to Objects
               </button>
               <button
-                onClick={async () => {
-                  if (confirm('Delete this frame set? You can recreate it using "Auto-Generate Sets".')) {
-                    try {
-                      await invoke('delete_frames_set', { framesSetId: parseInt(id!) });
-                      navigate('/objects');
-                    } catch (err) {
-                      alert('Failed to delete: ' + String(err));
-                    }
-                  }
-                }}
+                onClick={handleDeleteClick}
                 className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
               >
                 Delete Frame Set
@@ -720,6 +746,26 @@ export default function FrameSetDetail() {
           onClose={() => setBlinkFrames(null)}
         />
       )}
+
+      {/* Delete Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showDeleteConfirm}
+        title="Delete Frame Set"
+        message="Delete this frame set? You can recreate it using 'Auto-Generate Sets'."
+        onConfirm={confirmDelete}
+        onCancel={() => setShowDeleteConfirm(false)}
+        confirmText="Delete"
+        confirmDanger={true}
+      />
+
+      {/* Alert Dialog */}
+      <AlertDialog
+        isOpen={alertDialog.isOpen}
+        title={alertDialog.title}
+        message={alertDialog.message}
+        variant={alertDialog.variant}
+        onClose={() => setAlertDialog({ ...alertDialog, isOpen: false })}
+      />
     </div>
   );
 }

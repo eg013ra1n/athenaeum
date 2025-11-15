@@ -3,6 +3,7 @@ use crate::db::{self, Database};
 use crate::models::*;
 use crate::scanner::scan_directory;
 use crate::settings::SettingsManager;
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
@@ -1093,6 +1094,25 @@ pub async fn split_frame_set(
 
     // Return the new frame set detail
     get_frame_set_detail(new_set_id, state).await
+}
+
+/// Helper function to calculate angular distance between two points on celestial sphere
+fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
+    let ra1 = ra1_deg.to_radians();
+    let dec1 = dec1_deg.to_radians();
+    let ra2 = ra2_deg.to_radians();
+    let dec2 = dec2_deg.to_radians();
+
+    let delta_ra = ra1 - ra2;
+
+    // Haversine formula
+    let a = (dec1 - dec2).sin() / 2.0;
+    let b = (delta_ra).sin() / 2.0;
+    let c = dec1.cos() * dec2.cos();
+
+    let angular_dist = 2.0 * ((a * a + c * b * b).sqrt()).asin();
+
+    angular_dist.to_degrees()
 }
 
 /// Get frame set detail with imaging nights and sessions

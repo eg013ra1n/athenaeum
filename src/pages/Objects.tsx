@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 
 export default function Objects() {
   const navigate = useNavigate();
@@ -27,6 +28,16 @@ export default function Objects() {
     targetName: string;
   } | null>(null);
   const [isMergeMode, setIsMergeMode] = useState(false);
+  const [suggestedMerges, setSuggestedMerges] = useState<Array<{
+    sourceId: number;
+    targetId: number;
+    sourceName: string;
+    targetName: string;
+    reason: string;
+  }>>([]);
+  const [showAutoGenerateConfirm, setShowAutoGenerateConfirm] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ id: number; name: string | null } | null>(null);
 
   // For now, using project_id = 1 as default
   const PROJECT_ID = 1;
@@ -51,15 +62,65 @@ export default function Objects() {
     }
   };
 
-  const handleAutoGenerate = async () => {
-    if (!confirm('Auto-generate frame sets from LIGHT frames? This will cluster frames by sky coordinates.')) {
-      return;
+  // Helper function to detect suggested merges between new and existing sets
+  const detectSuggestedMerges = (
+    oldSets: FramesSetWithCount[],
+    newSets: FramesSetWithCount[]
+  ) => {
+    const suggestions: Array<{
+      sourceId: number;
+      targetId: number;
+      sourceName: string;
+      targetName: string;
+      reason: string;
+    }> = [];
+
+    // Find sets that are in newSets but not in oldSets (newly created)
+    const oldSetIds = new Set(oldSets.map(s => s.frames_set.id));
+    const recentSets = newSets.filter(s => !oldSetIds.has(s.frames_set.id!));
+
+    // For each recently created set, find potential matches in existing sets
+    for (const recentSet of recentSets) {
+      const recentName = (recentSet.frames_set.name || '').toLowerCase();
+
+      for (const existingSet of oldSets) {
+        const existingName = (existingSet.frames_set.name || '').toLowerCase();
+
+        // Check if names match (case-insensitive, contains)
+        const nameMatch = recentName && existingName &&
+          (recentName.includes(existingName) || existingName.includes(recentName));
+
+        if (nameMatch && recentSet.frames_set.id && existingSet.frames_set.id) {
+          suggestions.push({
+            sourceId: recentSet.frames_set.id,
+            targetId: existingSet.frames_set.id,
+            sourceName: recentSet.frames_set.name || 'Untitled',
+            targetName: existingSet.frames_set.name || 'Untitled',
+            reason: `Same object: "${existingName}"`
+          });
+          break; // Only suggest one match per new set
+        }
+      }
     }
+
+    return suggestions;
+  };
+
+  const handleAutoGenerate = async () => {
+    setShowAutoGenerateConfirm(true);
+  };
+
+  const confirmAutoGenerate = async () => {
+    setShowAutoGenerateConfirm(false);
 
     try {
       setGenerating(true);
       setError(null);
       setGenerateResult(null);
+      setSuggestedMerges([]);
+
+      // Store current frame sets before auto-generate
+      const setsBeforeGenerate = frameSets;
 
       const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
         projectId: PROJECT_ID,
@@ -68,7 +129,15 @@ export default function Objects() {
       setGenerateResult(result);
 
       if (result.sets_created > 0) {
-        await loadFrameSets();
+        // Reload frame sets
+        const updatedSets = await invoke<FramesSetWithCount[]>('get_frames_sets', {
+          projectId: PROJECT_ID,
+        });
+        setFrameSets(updatedSets);
+
+        // Detect merge suggestions
+        const suggestions = detectSuggestedMerges(setsBeforeGenerate, updatedSets);
+        setSuggestedMerges(suggestions);
       }
     } catch (err) {
       setError(err as string);
@@ -79,16 +148,23 @@ export default function Objects() {
   };
 
   const handleDelete = async (setId: number, setName: string | null) => {
-    if (!confirm(`Delete frame set "${setName || 'Untitled'}"? This will not delete the frames themselves.`)) {
-      return;
-    }
+    setDeleteTarget({ id: setId, name: setName });
+    setShowDeleteConfirm(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+
+    setShowDeleteConfirm(false);
 
     try {
-      await invoke('delete_frames_set', { framesSetId: setId });
+      await invoke('delete_frames_set', { framesSetId: deleteTarget.id });
       await loadFrameSets();
     } catch (err) {
       setError(err as string);
       console.error('Failed to delete frame set:', err);
+    } finally {
+      setDeleteTarget(null);
     }
   };
 
@@ -251,6 +327,28 @@ export default function Objects() {
     setPendingMerge(null);
   };
 
+  const handleSuggestedMerge = async (sourceId: number, targetId: number) => {
+    try {
+      setMerging(true);
+      setError(null);
+      await invoke('merge_frame_sets', { sourceId, targetId });
+      await loadFrameSets();
+      // Remove this suggestion from the list
+      setSuggestedMerges(prev => prev.filter(s => s.sourceId !== sourceId));
+    } catch (err) {
+      setError(err as string);
+      console.error('Failed to merge suggested sets:', err);
+    } finally {
+      setMerging(false);
+    }
+  };
+
+  const handleMergeAllSuggestions = async () => {
+    for (const suggestion of suggestedMerges) {
+      await handleSuggestedMerge(suggestion.sourceId, suggestion.targetId);
+    }
+  };
+
   // Set up global mouse listeners for drag
   useEffect(() => {
     if (draggedSetId !== null) {
@@ -393,6 +491,42 @@ export default function Objects() {
               </div>
             </details>
           )}
+        </div>
+      )}
+
+      {suggestedMerges.length > 0 && (
+        <div className="mb-4 p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
+          <div className="flex items-center justify-between mb-3">
+            <p className="font-medium text-yellow-400">Suggested Merges</p>
+            <button
+              onClick={handleMergeAllSuggestions}
+              disabled={merging}
+              className="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
+            >
+              Merge All
+            </button>
+          </div>
+          <div className="space-y-2">
+            {suggestedMerges.map((suggestion, i) => (
+              <div key={i} className="flex items-center justify-between p-3 bg-gray-800/50 rounded">
+                <div className="flex-1">
+                  <p className="text-sm text-gray-300">
+                    Merge <span className="font-semibold text-blue-400">"{suggestion.sourceName}"</span>
+                    {' '}into{' '}
+                    <span className="font-semibold text-blue-400">"{suggestion.targetName}"</span>
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">{suggestion.reason}</p>
+                </div>
+                <button
+                  onClick={() => handleSuggestedMerge(suggestion.sourceId, suggestion.targetId)}
+                  disabled={merging}
+                  className="ml-3 px-3 py-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
+                >
+                  Merge
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -597,6 +731,30 @@ export default function Objects() {
           </div>
         </div>
       )}
+
+      {/* Auto-Generate Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showAutoGenerateConfirm}
+        title="Auto-Generate Frame Sets"
+        message="Auto-generate frame sets from LIGHT frames? This will cluster frames by sky coordinates."
+        onConfirm={confirmAutoGenerate}
+        onCancel={() => setShowAutoGenerateConfirm(false)}
+        confirmText="Generate"
+      />
+
+      {/* Delete Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showDeleteConfirm}
+        title="Delete Frame Set"
+        message={`Delete frame set "${deleteTarget?.name || 'Untitled'}"?\n\nThis will not delete the frames themselves.`}
+        onConfirm={confirmDelete}
+        onCancel={() => {
+          setShowDeleteConfirm(false);
+          setDeleteTarget(null);
+        }}
+        confirmText="Delete"
+        confirmDanger={true}
+      />
 
       {/* Drag preview that follows cursor */}
       {isDragging && draggedSetId !== null && (() => {

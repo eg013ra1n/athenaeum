@@ -6,6 +6,8 @@ import { useScanRootsWithAvailability, useScan, useInitializeDatabase, useDuplic
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
 import type { ScanResult, RelinkResult, OrphanedFile } from '../types/models';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { AlertDialog } from '../components/AlertDialog';
 
 type TabMode = 'directories' | 'browse' | 'duplicates';
 type DuplicatesViewMode = 'files' | 'folders';
@@ -28,6 +30,38 @@ export default function FileManager() {
   const [relinkResult, setRelinkResult] = useState<RelinkResult | null>(null);
   const [missingFilesMap, setMissingFilesMap] = useState<Record<number, OrphanedFile[]>>({});
   const [checkingMissingFiles, setCheckingMissingFiles] = useState<Record<number, boolean>>({});
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    confirmDanger?: boolean;
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    onConfirm: () => {},
+    confirmDanger: false,
+  });
+  const [alertDialog, setAlertDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    variant: 'error' | 'warning' | 'info';
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    variant: 'info',
+  });
+
+  const showConfirm = (title: string, message: string, onConfirm: () => void, confirmDanger = false) => {
+    setConfirmDialog({ isOpen: true, title, message, onConfirm, confirmDanger });
+  };
+
+  const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
+    setAlertDialog({ isOpen: true, title, message, variant });
+  };
 
   // Check for missing files in available scan roots
   const checkMissingFiles = async (rootId: number) => {
@@ -56,20 +90,25 @@ export default function FileManager() {
     const missingFiles = missingFilesMap[rootId];
     if (!missingFiles || missingFiles.length === 0) return;
 
-    if (confirm(`Are you sure you want to delete ${missingFiles.length} missing file records from the database?`)) {
-      try {
-        const fileIds = missingFiles.map(f => f.id);
-        await invoke('delete_orphaned_files', { fileIds });
+    showConfirm(
+      'Delete Missing Files',
+      `Are you sure you want to delete ${missingFiles.length} missing file records from the database?`,
+      async () => {
+        try {
+          const fileIds = missingFiles.map(f => f.id);
+          await invoke('delete_orphaned_files', { fileIds });
 
-        // Update the missing files map
-        setMissingFilesMap(prev => ({ ...prev, [rootId]: [] }));
+          // Update the missing files map
+          setMissingFilesMap(prev => ({ ...prev, [rootId]: [] }));
 
-        alert(`Deleted ${missingFiles.length} missing file records`);
-      } catch (error) {
-        console.error('Failed to delete missing files:', error);
-        alert(typeof error === 'string' ? error : 'Failed to delete missing files');
-      }
-    }
+          // Success - silent update (no alert)
+        } catch (error) {
+          console.error('Failed to delete missing files:', error);
+          showAlert('Delete Failed', typeof error === 'string' ? error : 'Failed to delete missing files', 'error');
+        }
+      },
+      true
+    );
   };
 
   // Handle adding a new directory
@@ -86,19 +125,24 @@ export default function FileManager() {
       }
     } catch (error) {
       console.error('Failed to add directory:', error);
-      alert(typeof error === 'string' ? error : 'Failed to add directory');
+      showAlert('Add Directory Failed', typeof error === 'string' ? error : 'Failed to add directory', 'error');
     }
   };
 
   // Handle removing a scan root
   const handleRemoveScanRoot = async (id: number) => {
-    if (confirm('Are you sure you want to remove this directory from monitoring?')) {
-      try {
-        await deleteScanRoot(id);
-      } catch (error) {
-        console.error('Failed to remove directory:', error);
-      }
-    }
+    showConfirm(
+      'Remove Directory',
+      'Are you sure you want to remove this directory from monitoring?',
+      async () => {
+        try {
+          await deleteScanRoot(id);
+        } catch (error) {
+          console.error('Failed to remove directory:', error);
+        }
+      },
+      true
+    );
   };
 
   // Handle starting a scan for a specific root
@@ -141,7 +185,7 @@ export default function FileManager() {
       setRelinkResult(result);
     } catch (error) {
       console.error('Relink failed:', error);
-      alert(typeof error === 'string' ? error : 'Relink failed');
+      showAlert('Relink Failed', typeof error === 'string' ? error : 'Relink failed', 'error');
     } finally {
       setRelinkingRootId(null);
     }
@@ -595,17 +639,23 @@ export default function FileManager() {
                                 </p>
                               </div>
                               <button
-                                onClick={async () => {
-                                  if (!confirm(`Move "${path}" to Black Hole?`)) return;
-                                  try {
-                                    setMovingToBlackHole(prev => ({ ...prev, [path]: true }));
-                                    await moveToBlackHole(fileId, 'duplicates');
-                                    await refreshDuplicates();
-                                  } catch (err) {
-                                    alert(`Failed: ${String(err)}`);
-                                  } finally {
-                                    setMovingToBlackHole(prev => ({ ...prev, [path]: false }));
-                                  }
+                                onClick={() => {
+                                  showConfirm(
+                                    'Move to Black Hole',
+                                    `Move "${path}" to Black Hole?`,
+                                    async () => {
+                                      try {
+                                        setMovingToBlackHole(prev => ({ ...prev, [path]: true }));
+                                        await moveToBlackHole(fileId, 'duplicates');
+                                        await refreshDuplicates();
+                                      } catch (err) {
+                                        showAlert('Move Failed', `Failed: ${String(err)}`, 'error');
+                                      } finally {
+                                        setMovingToBlackHole(prev => ({ ...prev, [path]: false }));
+                                      }
+                                    },
+                                    true
+                                  );
                                 }}
                                 disabled={movingToBlackHole[path]}
                                 title="Move to Black Hole"
@@ -705,28 +755,34 @@ export default function FileManager() {
                               <p className="text-xs text-gray-400 mt-1">{folder.unique_a} unique files</p>
                             </div>
                             <button
-                              onClick={async () => {
-                                if (!confirm(`Move all files in "${folder.folder_a}" to Black Hole?`)) return;
-                                try {
-                                  // Get all file IDs that belong to this folder
-                                  const folderFileIds: number[] = [];
-                                  duplicates.forEach(group => {
-                                    group.file_paths.forEach((path, idx) => {
-                                      if (path.startsWith(folder.folder_a)) {
-                                        folderFileIds.push(group.file_ids[idx]);
-                                      }
-                                    });
-                                  });
+                              onClick={() => {
+                                showConfirm(
+                                  'Move Folder to Black Hole',
+                                  `Move all files in "${folder.folder_a}" to Black Hole?`,
+                                  async () => {
+                                    try {
+                                      // Get all file IDs that belong to this folder
+                                      const folderFileIds: number[] = [];
+                                      duplicates.forEach(group => {
+                                        group.file_paths.forEach((path, idx) => {
+                                          if (path.startsWith(folder.folder_a)) {
+                                            folderFileIds.push(group.file_ids[idx]);
+                                          }
+                                        });
+                                      });
 
-                                  // Move all files to black hole
-                                  for (const fileId of folderFileIds) {
-                                    await moveToBlackHole(fileId, 'duplicates');
-                                  }
-                                  await refreshDuplicates();
-                                  await refreshFolders();
-                                } catch (err) {
-                                  alert(`Failed: ${String(err)}`);
-                                }
+                                      // Move all files to black hole
+                                      for (const fileId of folderFileIds) {
+                                        await moveToBlackHole(fileId, 'duplicates');
+                                      }
+                                      await refreshDuplicates();
+                                      await refreshFolders();
+                                    } catch (err) {
+                                      showAlert('Move Failed', `Failed: ${String(err)}`, 'error');
+                                    }
+                                  },
+                                  true
+                                );
                               }}
                               title="Delete this folder (move all files to Black Hole)"
                               className="p-2 text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded transition"
@@ -744,28 +800,34 @@ export default function FileManager() {
                               <p className="text-xs text-gray-400 mt-1">{folder.unique_b} unique files</p>
                             </div>
                             <button
-                              onClick={async () => {
-                                if (!confirm(`Move all files in "${folder.folder_b}" to Black Hole?`)) return;
-                                try {
-                                  // Get all file IDs that belong to this folder
-                                  const folderFileIds: number[] = [];
-                                  duplicates.forEach(group => {
-                                    group.file_paths.forEach((path, idx) => {
-                                      if (path.startsWith(folder.folder_b)) {
-                                        folderFileIds.push(group.file_ids[idx]);
-                                      }
-                                    });
-                                  });
+                              onClick={() => {
+                                showConfirm(
+                                  'Move Folder to Black Hole',
+                                  `Move all files in "${folder.folder_b}" to Black Hole?`,
+                                  async () => {
+                                    try {
+                                      // Get all file IDs that belong to this folder
+                                      const folderFileIds: number[] = [];
+                                      duplicates.forEach(group => {
+                                        group.file_paths.forEach((path, idx) => {
+                                          if (path.startsWith(folder.folder_b)) {
+                                            folderFileIds.push(group.file_ids[idx]);
+                                          }
+                                        });
+                                      });
 
-                                  // Move all files to black hole
-                                  for (const fileId of folderFileIds) {
-                                    await moveToBlackHole(fileId, 'duplicates');
-                                  }
-                                  await refreshDuplicates();
-                                  await refreshFolders();
-                                } catch (err) {
-                                  alert(`Failed: ${String(err)}`);
-                                }
+                                      // Move all files to black hole
+                                      for (const fileId of folderFileIds) {
+                                        await moveToBlackHole(fileId, 'duplicates');
+                                      }
+                                      await refreshDuplicates();
+                                      await refreshFolders();
+                                    } catch (err) {
+                                      showAlert('Move Failed', `Failed: ${String(err)}`, 'error');
+                                    }
+                                  },
+                                  true
+                                );
                               }}
                               title="Delete this folder (move all files to Black Hole)"
                               className="p-2 text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded transition"
@@ -796,6 +858,28 @@ export default function FileManager() {
           )}
         </div>
       )}
+
+      {/* Confirm Dialog */}
+      <ConfirmDialog
+        isOpen={confirmDialog.isOpen}
+        title={confirmDialog.title}
+        message={confirmDialog.message}
+        onConfirm={() => {
+          setConfirmDialog({ ...confirmDialog, isOpen: false });
+          confirmDialog.onConfirm();
+        }}
+        onCancel={() => setConfirmDialog({ ...confirmDialog, isOpen: false })}
+        confirmDanger={confirmDialog.confirmDanger}
+      />
+
+      {/* Alert Dialog */}
+      <AlertDialog
+        isOpen={alertDialog.isOpen}
+        title={alertDialog.title}
+        message={alertDialog.message}
+        variant={alertDialog.variant}
+        onClose={() => setAlertDialog({ ...alertDialog, isOpen: false })}
+      />
     </div>
   );
 }

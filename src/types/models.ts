@@ -337,3 +337,20 @@ export interface ImagingLocation {
   focalLengths: string | null;  // Comma-separated list of focal lengths in mm
   isCustom: boolean;  // true for custom frame sets, false for auto-generated or clusters
 }
+
+// Frame Set Refresh
+export interface SetUpdateReport {
+  set_id: number;
+  set_name: string;
+  frames_added: number;
+  nights_created: number;
+  nights_updated: number;
+  frame_ids_added: number[];
+  frame_names_added: string[];
+}
+
+export interface RefreshResult {
+  frames_added: number;
+  sets_updated: SetUpdateReport[];
+  frames_unassigned: number;
+}

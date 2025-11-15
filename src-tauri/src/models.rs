@@ -442,3 +442,25 @@ pub enum SplitSelection {
     Sessions { ids: Vec<i64> },
     Frames { ids: Vec<i64> },
 }
+
+/// Report of frames added to a specific frame set during refresh
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SetUpdateReport {
+    pub set_id: i64,
+    pub set_name: String,
+    pub frames_added: usize,
+    pub nights_created: usize,
+    pub nights_updated: usize,
+    pub frame_ids_added: Vec<i64>,
+    pub frame_names_added: Vec<String>,
+}
+
+/// Result of refreshing frame sets with new unassigned frames
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RefreshResult {
+    pub frames_added: usize,
+    pub sets_updated: Vec<SetUpdateReport>,
+    pub frames_unassigned: usize,
+}
