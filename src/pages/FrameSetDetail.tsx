@@ -2,10 +2,11 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
-import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame } from '../types/models';
+import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame, FrameCalibrationStatus } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
+import { CalibrationStatusBadges } from '../components/CalibrationStatusBadges';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -34,6 +35,8 @@ export default function FrameSetDetail() {
     message: '',
     variant: 'info',
   });
+  const [calibrationStatuses, setCalibrationStatuses] = useState<Map<number, FrameCalibrationStatus>>(new Map());
+  const [loadingStatuses, setLoadingStatuses] = useState<Set<number>>(new Set());
 
   useEffect(() => {
     loadDetail();
@@ -101,14 +104,45 @@ export default function FrameSetDetail() {
     return parseFloat(hours) >= 1 ? `${hours}h` : `${minutes}m`;
   };
 
-  const toggleSession = (sessionId: number | null | undefined) => {
+  const loadCalibrationStatus = async (frameId: number) => {
+    if (calibrationStatuses.has(frameId) || loadingStatuses.has(frameId)) {
+      return; // Already loaded or loading
+    }
+
+    try {
+      setLoadingStatuses(prev => new Set(prev).add(frameId));
+      const status = await invoke<FrameCalibrationStatus>('get_frame_status', { frameId });
+      setCalibrationStatuses(prev => new Map(prev).set(frameId, status));
+    } catch (err) {
+      console.error('Failed to load calibration status for frame', frameId, err);
+    } finally {
+      setLoadingStatuses(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(frameId);
+        return newSet;
+      });
+    }
+  };
+
+  const loadCalibrationStatusForSession = async (frames: FileWithFrame[]) => {
+    // Load calibration status for all LIGHT frames in the session
+    const lightFrames = frames.filter(f => f.frame?.imagetyp === 'Light' && f.frame?.id != null);
+    await Promise.all(lightFrames.map(f => loadCalibrationStatus(f.frame!.id!)));
+  };
+
+  const toggleSession = (sessionId: number | null | undefined, sessionFrames?: FileWithFrame[]) => {
     if (!sessionId) return;
     setExpandedSessions(prev => {
       const newSet = new Set(prev);
+
       if (newSet.has(sessionId)) {
         newSet.delete(sessionId);
       } else {
         newSet.add(sessionId);
+        // Load calibration status when expanding
+        if (sessionFrames) {
+          loadCalibrationStatusForSession(sessionFrames);
+        }
       }
       return newSet;
     });
@@ -531,7 +565,7 @@ export default function FrameSetDetail() {
                           className="w-4 h-4 cursor-pointer"
                         />
                         <button
-                          onClick={() => toggleSession(sessionId)}
+                          onClick={() => toggleSession(sessionId, sessionData.frames)}
                           className="flex-1 flex items-center gap-3 hover:bg-gray-700 transition-colors text-left -my-3 -mr-4 py-3 pr-4 rounded"
                         >
                           {isExpanded ? (
@@ -568,66 +602,83 @@ export default function FrameSetDetail() {
                       {/* Frames Table - Collapsible */}
                       {isExpanded && sessionData.frames && sessionData.frames.length > 0 && (
                       <div className="overflow-x-auto">
-                        <div className="grid grid-cols-12 gap-4 px-4 py-3 bg-gray-800 text-xs font-semibold text-gray-400 uppercase border-b border-gray-700">
-                          <div className="col-span-3">Filename</div>
-                          <div className="col-span-2">Time</div>
-                          <div className="col-span-2">Object</div>
-                          <div className="col-span-1">Filter</div>
-                          <div className="col-span-1 text-right">Exposure</div>
-                          <div className="col-span-1 text-right">Type</div>
-                          <div className="col-span-1 text-right">Focal Len</div>
-                          <div className="col-span-1 text-right">Temp</div>
+                        <div className="grid gap-4 px-4 py-3 bg-gray-800 text-xs font-semibold text-gray-400 uppercase border-b border-gray-700" style={{ gridTemplateColumns: '2fr 1.5fr 1.5fr 0.75fr 0.75fr 0.75fr 0.75fr 0.75fr 2.5fr' }}>
+                          <div>Filename</div>
+                          <div>Time</div>
+                          <div>Object</div>
+                          <div>Filter</div>
+                          <div className="text-right">Exposure</div>
+                          <div className="text-right">Type</div>
+                          <div className="text-right">Focal Len</div>
+                          <div className="text-right">Temp</div>
+                          <div>Calibration</div>
                         </div>
                         <div className="divide-y divide-gray-700">
-                          {sessionData.frames.map((item, idx) => (
-                            <div
-                              key={item.file?.id || idx}
-                              className="grid grid-cols-12 gap-4 px-4 py-3 hover:bg-gray-700 transition items-center"
-                            >
-                              <div className="col-span-3 flex items-center gap-2 min-w-0">
-                                <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
-                                <span className="font-mono text-sm truncate" title={item.file?.filename || ''}>
-                                  {item.file?.filename || '-'}
-                                </span>
-                              </div>
-                              <div className="col-span-2 text-sm text-gray-400">
-                                {item.frame?.date_obs
-                                  ? new Date(item.frame.date_obs).toLocaleTimeString('en-US', {
-                                      hour: '2-digit',
-                                      minute: '2-digit',
-                                    })
-                                  : '-'}
-                              </div>
-                              <div className="col-span-2 truncate text-sm text-gray-300">
-                                {item.frame?.object || '-'}
-                              </div>
-                              <div className="col-span-1 truncate text-sm text-gray-400">
-                                {item.frame?.filter || '-'}
-                              </div>
-                              <div className="col-span-1 text-right text-sm text-gray-400">
-                                {item.frame?.exptime ? `${item.frame.exptime}s` : '-'}
-                              </div>
-                              <div className="col-span-1 text-right">
-                                {item.frame?.imagetyp && (
-                                  <span
-                                    className={`px-2 py-0.5 rounded text-xs ${
-                                      item.frame.imagetyp === 'Light'
-                                        ? 'bg-blue-900 text-blue-200'
-                                        : 'bg-gray-700 text-gray-300'
-                                    }`}
-                                  >
-                                    {item.frame.imagetyp}
+                          {sessionData.frames.map((item, idx) => {
+                            const frameId = item.frame?.id;
+                            const calibrationStatus = frameId ? (calibrationStatuses.get(frameId) || null) : null;
+                            const isLoadingStatus = frameId ? loadingStatuses.has(frameId) : false;
+                            const isLightFrame = item.frame?.imagetyp === 'Light';
+
+                            return (
+                              <div
+                                key={item.file?.id || idx}
+                                className="grid gap-4 px-4 py-3 hover:bg-gray-700 transition items-center"
+                                style={{ gridTemplateColumns: '2fr 1.5fr 1.5fr 0.75fr 0.75fr 0.75fr 0.75fr 0.75fr 2.5fr' }}
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
+                                  <span className="font-mono text-sm truncate" title={item.file?.filename || ''}>
+                                    {item.file?.filename || '-'}
                                   </span>
-                                )}
+                                </div>
+                                <div className="text-sm text-gray-400">
+                                  {item.frame?.date_obs
+                                    ? new Date(item.frame.date_obs).toLocaleTimeString('en-US', {
+                                        hour: '2-digit',
+                                        minute: '2-digit',
+                                      })
+                                    : '-'}
+                                </div>
+                                <div className="truncate text-sm text-gray-300">
+                                  {item.frame?.object || '-'}
+                                </div>
+                                <div className="truncate text-sm text-gray-400">
+                                  {item.frame?.filter || '-'}
+                                </div>
+                                <div className="text-right text-sm text-gray-400">
+                                  {item.frame?.exptime ? `${item.frame.exptime}s` : '-'}
+                                </div>
+                                <div className="text-right">
+                                  {item.frame?.imagetyp && (
+                                    <span
+                                      className={`px-2 py-0.5 rounded text-xs ${
+                                        item.frame.imagetyp === 'Light'
+                                          ? 'bg-blue-900 text-blue-200'
+                                          : 'bg-gray-700 text-gray-300'
+                                      }`}
+                                    >
+                                      {item.frame.imagetyp}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-right text-sm text-gray-500">
+                                  {item.frame?.focallen ? `${item.frame.focallen}mm` : '-'}
+                                </div>
+                                <div className="text-right text-sm text-gray-500">
+                                  {item.frame?.ccd_temp ? `${item.frame.ccd_temp}°C` : '-'}
+                                </div>
+                                <div>
+                                  {isLightFrame && (
+                                    <CalibrationStatusBadges
+                                      status={calibrationStatus}
+                                      loading={isLoadingStatus}
+                                    />
+                                  )}
+                                </div>
                               </div>
-                              <div className="col-span-1 text-right text-sm text-gray-500">
-                                {item.frame?.focallen ? `${item.frame.focallen}mm` : '-'}
-                              </div>
-                              <div className="col-span-1 text-right text-sm text-gray-500">
-                                {item.frame?.ccd_temp ? `${item.frame.ccd_temp}°C` : '-'}
-                              </div>
-                            </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       </div>
                       )}

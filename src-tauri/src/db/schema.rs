@@ -236,6 +236,24 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Calibration set to frames - links frames/sets to their required calibration sets
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS calibration_set_to_frames (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL,
+            source_type TEXT NOT NULL CHECK(source_type IN ('frame', 'calibration_set')),
+            calibration_set_id INTEGER NOT NULL,
+            calibration_type TEXT NOT NULL CHECK(calibration_type IN ('Dark', 'Flat', 'Bias', 'DarkFlat')),
+            matched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            match_score REAL,
+            date_warning INTEGER DEFAULT 0,
+            temp_warning INTEGER DEFAULT 0,
+            FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE CASCADE,
+            UNIQUE(source_id, source_type, calibration_type)
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -311,6 +329,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fits_header_fingerprint ON fits_header(header_fingerprint)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calib_link_source ON calibration_set_to_frames(source_id, source_type)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calib_link_set ON calibration_set_to_frames(calibration_set_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calib_link_type ON calibration_set_to_frames(calibration_type)",
         [],
     )?;
 

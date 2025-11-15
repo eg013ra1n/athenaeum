@@ -464,3 +464,104 @@ pub struct RefreshResult {
     pub sets_updated: Vec<SetUpdateReport>,
     pub frames_unassigned: usize,
 }
+
+/// Link between a frame/calibration set and its required calibration set
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationLink {
+    pub id: Option<i64>,
+    pub source_id: i64,
+    pub source_type: String,  // 'frame' or 'calibration_set'
+    pub calibration_set_id: i64,
+    pub calibration_type: String,  // 'Dark', 'Flat', 'Bias', 'DarkFlat'
+    pub matched_at: String,  // ISO 8601
+    pub match_score: Option<f64>,  // 0.0-1.0 confidence
+    pub date_warning: bool,
+    pub temp_warning: bool,
+}
+
+/// Calibration status for a single frame
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameCalibrationStatus {
+    pub frame_id: i64,
+    pub has_flats: bool,
+    pub has_darks: bool,
+    pub has_bias: bool,
+    pub has_darkflats: bool,
+    pub flats_warning: bool,
+    pub darks_warning: bool,
+    pub bias_warning: bool,
+    pub flat_set_id: Option<i64>,
+    pub dark_set_id: Option<i64>,
+    pub bias_set_id: Option<i64>,
+    pub darkflat_set_id: Option<i64>,
+}
+
+/// Complete calibration hierarchy for a frame
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationHierarchy {
+    pub light_frame_id: i64,
+    pub flat_sets: Vec<CalibrationSetWithLinks>,
+    pub dark_sets: Vec<CalibrationSetWithLinks>,
+    pub missing_calibration: Vec<String>,  // List of missing calibration types
+    pub warnings: Vec<CalibrationWarning>,
+}
+
+/// Calibration set with its sub-calibration links
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSetWithLinks {
+    pub set: CalibrationSetDetail,
+    pub sub_calibration: Vec<CalibrationLink>,  // Links to Dark/Bias sets for this set
+}
+
+/// Warning about calibration quality
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationWarning {
+    pub warning_type: String,  // 'date' or 'temperature'
+    pub message: String,
+    pub calibration_type: String,  // 'Dark', 'Flat', 'Bias', 'DarkFlat'
+    pub set_id: i64,
+}
+
+/// Result of finding calibration for a frame set
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationMatchResult {
+    pub frames_processed: usize,
+    pub frames_with_calibration: usize,
+    pub frames_partial_calibration: usize,
+    pub frames_no_calibration: usize,
+    pub sets_linked: usize,
+    pub warnings_count: usize,
+    pub processing_time_ms: u64,
+    pub frame_statuses: Vec<FrameCalibrationStatus>,
+}
+
+/// Statistics about calibration for a frame set
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationStats {
+    pub total_frames: usize,
+    pub frames_with_flats: usize,
+    pub frames_with_darks: usize,
+    pub frames_with_bias: usize,
+    pub frames_complete: usize,  // All required calibration found
+    pub frames_partial: usize,    // Some calibration found
+    pub frames_none: usize,       // No calibration found
+    pub total_warnings: usize,
+}
+
+/// Tolerance configuration for calibration matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationTolerance {
+    pub temp_delta_celsius: f64,
+    pub flat_date_warning_days: i64,
+    pub dark_date_warning_days: i64,
+}
+
+impl Default for CalibrationTolerance {
+    fn default() -> Self {
+        Self {
+            temp_delta_celsius: 2.0,
+            flat_date_warning_days: 30,
+            dark_date_warning_days: 365,
+        }
+    }
+}

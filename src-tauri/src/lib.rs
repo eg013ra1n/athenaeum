@@ -118,6 +118,12 @@ pub fn run() {
             commands::query_frames_in_bounds,
             commands::query_frames_in_polygon,
             commands::create_frame_set_from_selection,
+            commands::find_calibration_for_frame_set,
+            commands::get_calibration_status,
+            commands::get_frame_calibration_hierarchy,
+            commands::clear_calibration_links,
+            commands::get_frame_calibration_links,
+            commands::get_frame_status,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

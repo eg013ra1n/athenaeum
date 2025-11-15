@@ -2474,3 +2474,202 @@ pub async fn create_frame_set_from_selection(
     Ok(set_id)
 }
 
+// ===== CALIBRATION FINDER COMMANDS =====
+
+/// Find and link calibration for all light frames in a frame set
+#[tauri::command]
+pub async fn find_calibration_for_frame_set(
+    frame_set_id: i64,
+    temp_delta_celsius: Option<f64>,
+    flat_date_warning_days: Option<i64>,
+    dark_date_warning_days: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<crate::calibration::processor::ProcessingStats, String> {
+    use crate::calibration::processor::process_frame_set;
+    use crate::models::CalibrationTolerance;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Build tolerance from parameters or use defaults
+    let tolerance = CalibrationTolerance {
+        temp_delta_celsius: temp_delta_celsius.unwrap_or(2.0),
+        flat_date_warning_days: flat_date_warning_days.unwrap_or(30),
+        dark_date_warning_days: dark_date_warning_days.unwrap_or(365),
+    };
+
+    println!(
+        "Finding calibration for frame set {} with tolerance: temp=±{}°C, flat_date={} days, dark_date={} days",
+        frame_set_id,
+        tolerance.temp_delta_celsius,
+        tolerance.flat_date_warning_days,
+        tolerance.dark_date_warning_days
+    );
+
+    let stats = process_frame_set(&conn, frame_set_id, &tolerance)
+        .map_err(|e| format!("Failed to process frame set: {}", e))?;
+
+    println!(
+        "✅ Calibration processing complete: {} frames, {} with full calibration",
+        stats.total_frames, stats.frames_with_full_calibration
+    );
+
+    Ok(stats)
+}
+
+/// Get calibration status/statistics for a frame set
+#[tauri::command]
+pub async fn get_calibration_status(
+    frame_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<crate::models::CalibrationStats, String> {
+    use crate::db::calibration_links::get_calibration_statistics;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    get_calibration_statistics(&conn, frame_set_id).map_err(|e| e.to_string())
+}
+
+/// Get complete calibration hierarchy for a specific frame
+#[tauri::command]
+pub async fn get_frame_calibration_hierarchy(
+    frame_id: i64,
+    temp_delta_celsius: Option<f64>,
+    flat_date_warning_days: Option<i64>,
+    dark_date_warning_days: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<crate::models::CalibrationHierarchy, String> {
+    use crate::calibration::hierarchy::build_complete_hierarchy;
+    use crate::models::CalibrationTolerance;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get frame data
+    let mut stmt = conn.prepare(
+        "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter,
+                imagetyp, is_master, ra, dec, objctra, objctdec, gain, offset,
+                xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, pixsz,
+                naxis1, naxis2, sitelat, lat_obs, sitelong, long_obs
+         FROM frames WHERE id = ?1"
+    ).map_err(|e| e.to_string())?;
+
+    let frame = stmt.query_row([frame_id], |row| {
+        let date_obs_str: Option<String> = row.get(3)?;
+        let date_obs = date_obs_str
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let imagetyp_str: Option<String> = row.get(8)?;
+        let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
+
+        let xbinning: Option<i32> = row.get(16)?;
+        let ybinning: Option<i32> = row.get(17)?;
+        let binning = match (xbinning, ybinning) {
+            (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
+            _ => None,
+        };
+
+        Ok(Frame {
+            id: Some(row.get(0)?),
+            file_id: row.get(1)?,
+            object: row.get(2)?,
+            date_obs,
+            telescop: row.get(4)?,
+            instrume: row.get(5)?,
+            exptime: row.get(6)?,
+            filter: row.get(7)?,
+            imagetyp,
+            is_master: row.get(9)?,
+            ra: row.get(10)?,
+            dec: row.get(11)?,
+            objctra: row.get(12)?,
+            objctdec: row.get(13)?,
+            gain: row.get(14)?,
+            offset: row.get(15)?,
+            xbinning,
+            ybinning,
+            binning,
+            ccd_temp: row.get(18)?,
+            set_temp: row.get(19)?,
+            focallen: row.get(20)?,
+            xpixsz: row.get(21)?,
+            pixsz: row.get(22)?,
+            naxis1: row.get(23)?,
+            naxis2: row.get(24)?,
+            sitelat: row.get(25)?,
+            lat_obs: row.get(26)?,
+            sitelong: row.get(27)?,
+            long_obs: row.get(28)?,
+            override_: false,
+        })
+    }).map_err(|e| format!("Frame not found: {}", e))?;
+
+    // Build tolerance
+    let tolerance = CalibrationTolerance {
+        temp_delta_celsius: temp_delta_celsius.unwrap_or(2.0),
+        flat_date_warning_days: flat_date_warning_days.unwrap_or(30),
+        dark_date_warning_days: dark_date_warning_days.unwrap_or(365),
+    };
+
+    // Build hierarchy
+    build_complete_hierarchy(&conn, &frame, &tolerance)
+        .map_err(|e| format!("Failed to build hierarchy: {}", e))
+}
+
+/// Clear all calibration links for a frame set
+#[tauri::command]
+pub async fn clear_calibration_links(
+    frame_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    use crate::calibration::processor::clear_calibration_links_for_frame_set;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    println!("Clearing calibration links for frame set {}", frame_set_id);
+
+    let deleted_count = clear_calibration_links_for_frame_set(&conn, frame_set_id)
+        .map_err(|e| format!("Failed to clear calibration links: {}", e))?;
+
+    println!("✅ Cleared {} calibration links", deleted_count);
+
+    Ok(deleted_count)
+}
+
+/// Get calibration links for a specific frame
+#[tauri::command]
+pub async fn get_frame_calibration_links(
+    frame_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::CalibrationLink>, String> {
+    use crate::db::calibration_links::get_links_for_frame;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    get_links_for_frame(&conn, frame_id).map_err(|e| e.to_string())
+}
+
+/// Get frame calibration status (which calibrations are linked)
+#[tauri::command]
+pub async fn get_frame_status(
+    frame_id: i64,
+    state: State<'_, AppState>,
+) -> Result<crate::models::FrameCalibrationStatus, String> {
+    use crate::db::calibration_links::get_frame_calibration_status;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    get_frame_calibration_status(&conn, frame_id).map_err(|e| e.to_string())
+}
+

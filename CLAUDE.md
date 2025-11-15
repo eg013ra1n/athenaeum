@@ -83,7 +83,10 @@ See `src-tauri/src/db/schema.rs` for full schema. Key tables:
 - `scan_roots` - Monitored directory paths
 - `calibration_set` + `calibration_set_frames` - Grouped calibration frames
 - `projects` - Top-level organization for imaging projects
-- `frames_set` + `frames_set_members` - Frame sets grouped by sky coordinates
+- `frames_set` - Top-level frame sets grouped by sky coordinates
+- `imaging_nights` - Imaging nights/sessions within a frame set (linked via `frames_set_id`)
+- `sessions` - Groups frames by instrument within an imaging night
+- `session_members` - Junction table linking frames to sessions (the actual many-to-many between frames and sessions)
 - `tags` + `frame_tags` - User tagging system
 - `export_templates` - Saved export path templates
 - `fits_header` - Complete original FITS header storage

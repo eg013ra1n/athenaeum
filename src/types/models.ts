@@ -354,3 +354,101 @@ export interface RefreshResult {
   sets_updated: SetUpdateReport[];
   frames_unassigned: number;
 }
+
+// Calibration Finder
+export interface CalibrationLink {
+  id: number | null;
+  source_id: number;
+  source_type: 'frame' | 'calibration_set';
+  calibration_set_id: number;
+  calibration_type: 'Dark' | 'Flat' | 'Bias' | 'DarkFlat';
+  matched_at: string;  // ISO 8601
+  match_score: number | null;  // 0.0-1.0 confidence
+  date_warning: boolean;
+  temp_warning: boolean;
+}
+
+export interface FrameCalibrationStatus {
+  frame_id: number;
+  has_flats: boolean;
+  has_darks: boolean;
+  has_bias: boolean;
+  has_darkflats: boolean;
+  flats_warning: boolean;
+  darks_warning: boolean;
+  bias_warning: boolean;
+  flat_set_id: number | null;
+  dark_set_id: number | null;
+  bias_set_id: number | null;
+  darkflat_set_id: number | null;
+}
+
+export interface CalibrationHierarchy {
+  light_frame_id: number;
+  flat_sets: CalibrationSetWithLinks[];
+  dark_sets: CalibrationSetWithLinks[];
+  missing_calibration: string[];  // List of missing calibration types
+  warnings: CalibrationWarning[];
+}
+
+export interface CalibrationSetWithLinks {
+  set: CalibrationSetDetail;
+  sub_calibration: CalibrationLink[];  // Links to Dark/Bias sets for this set
+}
+
+export interface CalibrationWarning {
+  warning_type: 'date' | 'temperature';
+  message: string;
+  calibration_type: 'Dark' | 'Flat' | 'Bias' | 'DarkFlat';
+  set_id: number;
+}
+
+export interface CalibrationMatchResult {
+  frames_processed: number;
+  frames_with_calibration: number;
+  frames_partial_calibration: number;
+  frames_no_calibration: number;
+  sets_linked: number;
+  warnings_count: number;
+  processing_time_ms: number;
+  frame_statuses: FrameCalibrationStatus[];
+}
+
+export interface CalibrationStats {
+  total_frames: number;
+  frames_with_flats: number;
+  frames_with_darks: number;
+  frames_with_bias: number;
+  frames_complete: number;  // All required calibration found
+  frames_partial: number;    // Some calibration found
+  frames_none: number;       // No calibration found
+  total_warnings: number;
+}
+
+export interface CalibrationTolerance {
+  temp_delta_celsius: number;
+  flat_date_warning_days: number;
+  dark_date_warning_days: number;
+}
+
+export interface ProcessingProgress {
+  total_frames: number;
+  processed_frames: number;
+  current_frame_id: number | null;
+  percent_complete: number;
+}
+
+export interface ProcessingStats {
+  total_frames: number;
+  frames_with_full_calibration: number;
+  frames_with_partial_calibration: number;
+  frames_with_no_calibration: number;
+  total_flat_sets_linked: number;
+  total_dark_sets_linked: number;
+  total_warnings: number;
+  date_warnings: number;
+  temp_warnings: number;
+  missing_flats: number;
+  missing_darks: number;
+  missing_bias: number;
+}

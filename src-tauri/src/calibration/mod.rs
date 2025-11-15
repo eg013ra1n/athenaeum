@@ -1,6 +1,11 @@
 // Calibration library module
 // Manages calibration frames and linking to days/setups
 
+pub mod finder;
+pub mod hierarchy;
+pub mod auto_create;
+pub mod processor;
+
 use crate::models::{CalibrationSet, Frame};
 use anyhow::Result;
 
