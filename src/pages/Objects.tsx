@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { confirm } from '@tauri-apps/plugin-dialog';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 
 export default function Objects() {
@@ -20,6 +19,14 @@ export default function Objects() {
   const [isDragging, setIsDragging] = useState(false);
   const [dragStartPos, setDragStartPos] = useState<{ x: number; y: number } | null>(null);
   const [mousePos, setMousePos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [showMergeDialog, setShowMergeDialog] = useState(false);
+  const [pendingMerge, setPendingMerge] = useState<{
+    sourceId: number;
+    targetId: number;
+    sourceName: string;
+    targetName: string;
+  } | null>(null);
+  const [isMergeMode, setIsMergeMode] = useState(false);
 
   // For now, using project_id = 1 as default
   const PROJECT_ID = 1;
@@ -126,6 +133,9 @@ export default function Objects() {
       return;
     }
 
+    // Prevent text selection during drag
+    e.preventDefault();
+
     console.log('[MouseDown] Starting drag for set:', setId);
     setDragStartPos({ x: e.clientX, y: e.clientY });
     setDraggedSetId(setId);
@@ -143,6 +153,11 @@ export default function Objects() {
     if (!isDragging && (Math.abs(dx) > 5 || Math.abs(dy) > 5)) {
       console.log('[MouseMove] Drag threshold exceeded, starting drag - visual feedback should now show');
       setIsDragging(true);
+
+      // Clear any text selection that might have occurred
+      if (window.getSelection) {
+        window.getSelection()?.removeAllRanges();
+      }
     }
 
     if (isDragging) {
@@ -172,47 +187,30 @@ export default function Objects() {
     }
   };
 
-  const handleMouseUp = async () => {
+  const handleMouseUp = () => {
     if (draggedSetId === null) return;
+
+    // Clear any text selection
+    if (window.getSelection) {
+      window.getSelection()?.removeAllRanges();
+    }
 
     console.log('[MouseUp]', 'draggedSetId:', draggedSetId, 'dropTargetId:', dropTargetId, 'isDragging:', isDragging);
 
     if (isDragging && dropTargetId !== null && dropTargetId !== draggedSetId) {
-      // Perform the merge
+      // Show merge confirmation dialog
       const sourceSet = frameSets.find(fs => fs.frames_set.id === draggedSetId);
       const targetSet = frameSets.find(fs => fs.frames_set.id === dropTargetId);
 
       if (sourceSet && targetSet) {
-        const sourceName = sourceSet.frames_set.name || 'Untitled';
-        const targetName = targetSet.frames_set.name || 'Untitled';
-
-        console.log('[MouseUp] Showing confirmation dialog');
-
-        const confirmed = await confirm(
-          `This will:\n• Combine all imaging nights and sessions\n• Deduplicate frames\n• Delete "${sourceName}"\n• Mark "${targetName}" as custom\n\nThis action cannot be undone.`,
-          { title: `Merge "${sourceName}" into "${targetName}"?`, kind: 'warning' }
-        );
-
-        if (confirmed) {
-          console.log('[MouseUp] User confirmed merge, executing...');
-          try {
-            setMerging(true);
-            setError(null);
-            await invoke('merge_frame_sets', {
-              sourceId: draggedSetId,
-              targetId: dropTargetId
-            });
-            await loadFrameSets();
-            console.log('[MouseUp] Merge completed successfully');
-          } catch (err) {
-            setError(err as string);
-            console.error('Failed to merge frame sets:', err);
-          } finally {
-            setMerging(false);
-          }
-        } else {
-          console.log('[MouseUp] User cancelled merge');
-        }
+        console.log('[MouseUp] Showing merge dialog');
+        setPendingMerge({
+          sourceId: draggedSetId,
+          targetId: dropTargetId,
+          sourceName: sourceSet.frames_set.name || 'Untitled',
+          targetName: targetSet.frames_set.name || 'Untitled',
+        });
+        setShowMergeDialog(true);
       }
     }
 
@@ -222,6 +220,35 @@ export default function Objects() {
     setDropTargetId(null);
     setIsDragging(false);
     setDragStartPos(null);
+  };
+
+  const handleConfirmMerge = async () => {
+    if (!pendingMerge) return;
+
+    console.log('[ConfirmMerge] User confirmed merge, executing...');
+    try {
+      setMerging(true);
+      setError(null);
+      await invoke('merge_frame_sets', {
+        sourceId: pendingMerge.sourceId,
+        targetId: pendingMerge.targetId
+      });
+      await loadFrameSets();
+      console.log('[ConfirmMerge] Merge completed successfully');
+      setShowMergeDialog(false);
+      setPendingMerge(null);
+    } catch (err) {
+      setError(err as string);
+      console.error('Failed to merge frame sets:', err);
+    } finally {
+      setMerging(false);
+    }
+  };
+
+  const handleCancelMerge = () => {
+    console.log('[CancelMerge] User cancelled merge');
+    setShowMergeDialog(false);
+    setPendingMerge(null);
   };
 
   // Set up global mouse listeners for drag
@@ -236,6 +263,26 @@ export default function Objects() {
       };
     }
   }, [draggedSetId, dropTargetId, isDragging, dragStartPos, frameSets]);
+
+  // Set up keyboard listener for merge mode toggle
+  useEffect(() => {
+    const handleKeyPress = (e: KeyboardEvent) => {
+      if (e.key === 'M' || e.key === 'm') {
+        // Don't toggle if user is typing in an input field
+        const target = e.target as HTMLElement;
+        if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+          return;
+        }
+        setIsMergeMode(prev => !prev);
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyPress);
+
+    return () => {
+      document.removeEventListener('keydown', handleKeyPress);
+    };
+  }, []);
 
   const formatExposureTime = (seconds: number | null) => {
     if (!seconds) return 'N/A';
@@ -253,16 +300,48 @@ export default function Objects() {
               Frame sets grouped by sky coordinates
             </p>
           </div>
-          <button
-            onClick={handleAutoGenerate}
-            disabled={generating}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-          >
-            <Sparkles size={18} />
-            {generating ? 'Generating...' : 'Auto-Generate Sets'}
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsMergeMode(prev => !prev)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                isMergeMode
+                  ? 'bg-green-600 hover:bg-green-700 text-white'
+                  : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+              }`}
+              title={`${isMergeMode ? 'Exit' : 'Enter'} Merge Mode (M)`}
+            >
+              <Grip size={18} />
+              {isMergeMode ? 'Exit Merge Mode' : 'Merge Mode'}
+            </button>
+            <button
+              onClick={handleAutoGenerate}
+              disabled={generating}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+            >
+              <Sparkles size={18} />
+              {generating ? 'Generating...' : 'Auto-Generate Sets'}
+            </button>
+          </div>
         </div>
       </div>
+
+      {isMergeMode && (
+        <div className="mb-4 p-3 bg-green-900/20 border border-green-800 rounded-lg flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Grip className="text-green-500" size={20} />
+            <div>
+              <p className="font-medium text-green-400">Merge Mode Active</p>
+              <p className="text-sm text-green-300">Drag and drop frame sets to merge them</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setIsMergeMode(false)}
+            className="text-green-400 hover:text-green-300 text-sm underline"
+          >
+            Exit (M)
+          </button>
+        </div>
+      )}
 
       {merging && (
         <div className="mb-4 p-4 bg-blue-900/20 border border-blue-800 rounded-lg flex items-start gap-3">
@@ -330,19 +409,19 @@ export default function Objects() {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className={`grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
           {frameSets.map(({ frames_set, member_count }) => (
             <div
               key={frames_set.id}
               data-set-id={frames_set.id}
-              onMouseDown={(e) => !editingSetId && handleMouseDown(e, frames_set.id!)}
+              onMouseDown={(e) => !editingSetId && isMergeMode && handleMouseDown(e, frames_set.id!)}
               className={`bg-gray-800 rounded-lg p-4 border-2 transition-all duration-200 group ${
                 isDragging && draggedSetId === frames_set.id
                   ? 'opacity-40 border-blue-500 shadow-lg shadow-blue-500/50 cursor-grabbing select-none'
                   : dropTargetId === frames_set.id
                   ? 'border-green-500 bg-green-900/30 scale-105 shadow-lg shadow-green-500/50'
                   : 'border-gray-700 hover:border-gray-600'
-              } ${!editingSetId && !isDragging ? 'cursor-grab' : ''}`}
+              } ${!editingSetId && isMergeMode && !isDragging ? 'cursor-grab' : ''} ${isDragging ? 'select-none' : ''}`}
             >
               <div className="flex items-start justify-between mb-3">
                 <div className="flex-1 min-w-0">
@@ -460,6 +539,62 @@ export default function Objects() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Merge Confirmation Dialog */}
+      {showMergeDialog && pendingMerge && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-lg max-w-md w-full p-6 border border-gray-700">
+            <h3 className="text-xl font-bold mb-4 flex items-center gap-2">
+              <AlertTriangle size={20} className="text-yellow-500" />
+              Merge Frame Sets?
+            </h3>
+
+            <div className="mb-4 text-gray-300">
+              <p className="mb-3">
+                Merge <span className="font-semibold text-blue-400">"{pendingMerge.sourceName}"</span> into <span className="font-semibold text-blue-400">"{pendingMerge.targetName}"</span>?
+              </p>
+
+              <div className="text-sm space-y-1 mb-3">
+                <p>This will:</p>
+                <ul className="list-disc list-inside space-y-1 text-gray-400">
+                  <li>Combine all imaging nights and sessions</li>
+                  <li>Deduplicate frames</li>
+                  <li>Delete "{pendingMerge.sourceName}"</li>
+                  <li>Mark "{pendingMerge.targetName}" as custom</li>
+                </ul>
+              </div>
+
+              <p className="text-sm text-yellow-400 font-medium">
+                This action cannot be undone.
+              </p>
+            </div>
+
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={handleCancelMerge}
+                disabled={merging}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmMerge}
+                disabled={merging}
+                className="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition flex items-center gap-2"
+              >
+                {merging ? (
+                  <>
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                    Merging...
+                  </>
+                ) : (
+                  'Merge'
+                )}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
