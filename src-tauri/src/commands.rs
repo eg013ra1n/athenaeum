@@ -638,6 +638,18 @@ pub async fn delete_frames_set(
     db::delete_frames_set(&conn, frames_set_id).map_err(|e| e.to_string())
 }
 
+/// Delete all auto-generated frames_sets (is_custom = false)
+#[tauri::command]
+pub async fn delete_auto_generated_frame_sets(
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::delete_auto_generated_frame_sets(&conn).map_err(|e| e.to_string())
+}
+
 /// Rename a frames_set
 #[tauri::command]
 pub async fn rename_frames_set(

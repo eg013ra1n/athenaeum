@@ -584,6 +584,12 @@ pub fn delete_frames_set(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Delete all auto-generated frames_sets (where is_custom = 0)
+pub fn delete_auto_generated_frame_sets(conn: &Connection) -> Result<usize> {
+    let count = conn.execute("DELETE FROM frames_set WHERE is_custom = 0", params![])?;
+    Ok(count)
+}
+
 /// Update frames_set name
 pub fn update_frames_set_name(conn: &Connection, id: i64, name: &str) -> Result<()> {
     conn.execute(

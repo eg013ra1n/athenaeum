@@ -79,6 +79,7 @@ pub fn run() {
             commands::auto_generate_frame_sets,
             commands::get_frames_sets,
             commands::delete_frames_set,
+            commands::delete_auto_generated_frame_sets,
             commands::rename_frames_set,
             commands::mark_frame_set_custom,
             commands::recalculate_frame_set_metadata,
