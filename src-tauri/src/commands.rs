@@ -475,16 +475,21 @@ pub async fn get_grouping_threshold_deg(state: State<'_, AppState>) -> Result<f6
 #[tauri::command]
 pub async fn auto_generate_frame_sets(
     project_id: i64,
+    threshold_deg: Option<f64>,
     state: State<'_, AppState>,
 ) -> Result<AutoGenerateResult, String> {
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    // Get threshold from settings
-    let threshold_deg = state.settings
-        .get_grouping_threshold_deg(&conn)
-        .map_err(|e| e.to_string())?;
+    // Use provided threshold or get from settings
+    let threshold_deg = if let Some(custom_threshold) = threshold_deg {
+        custom_threshold
+    } else {
+        state.settings
+            .get_grouping_threshold_deg(&conn)
+            .map_err(|e| e.to_string())?
+    };
 
     // Fetch all LIGHT frames
     let all_frames = db::get_light_frames_for_project(&conn, project_id)
@@ -645,6 +650,45 @@ pub async fn rename_frames_set(
     let conn = db.conn();
 
     db::update_frames_set_name(&conn, frames_set_id, &new_name).map_err(|e| e.to_string())
+}
+
+/// Mark a frames_set as custom (one-way conversion from auto-generated to custom)
+#[tauri::command]
+pub async fn mark_frame_set_custom(
+    frames_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<FramesSet, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get current metadata to preserve it
+    let metadata = crate::frames_set_metadata::calculate_metadata_for_frame_set(frames_set_id, &conn)
+        .map_err(|e| format!("Failed to calculate metadata: {}", e))?;
+
+    // Update frame set to mark as custom
+    db::update_frames_set_metadata(
+        &conn,
+        frames_set_id,
+        metadata.date_obs_start.as_deref(),
+        metadata.date_obs_end.as_deref(),
+        metadata.objctra.as_deref(),
+        metadata.objctdec.as_deref(),
+        metadata.total_exp_time,
+        true, // Mark as custom
+    ).map_err(|e| format!("Failed to update frame set: {}", e))?;
+
+    // Return the updated frame set
+    let sets = db::get_frames_sets_by_project(&conn, 1)
+        .map_err(|e| e.to_string())?;
+
+    let frames_set = sets
+        .into_iter()
+        .find(|(set, _)| set.id == Some(frames_set_id))
+        .ok_or("Frame set not found")?
+        .0;
+
+    Ok(frames_set)
 }
 
 /// Recalculate frame set metadata from all member frames

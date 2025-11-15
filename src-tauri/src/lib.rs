@@ -80,6 +80,7 @@ pub fn run() {
             commands::get_frames_sets,
             commands::delete_frames_set,
             commands::rename_frames_set,
+            commands::mark_frame_set_custom,
             commands::recalculate_frame_set_metadata,
             commands::merge_frame_sets,
             commands::can_split,

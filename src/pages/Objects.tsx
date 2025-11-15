@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 
@@ -38,13 +38,57 @@ export default function Objects() {
   const [showAutoGenerateConfirm, setShowAutoGenerateConfirm] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: number; name: string | null } | null>(null);
+  const [showThresholdPanel, setShowThresholdPanel] = useState(false);
+  const [customThreshold, setCustomThreshold] = useState<string>('');
+  const [defaultThreshold, setDefaultThreshold] = useState<number>(3.0);
 
   // For now, using project_id = 1 as default
   const PROJECT_ID = 1;
 
   useEffect(() => {
     loadFrameSets();
+    loadDefaultThreshold();
   }, []);
+
+  const loadDefaultThreshold = async () => {
+    try {
+      const valueStr = await invoke<string>('get_setting', {
+        key: 'grouping.threshold.value',
+        defaultValue: '3.0'
+      });
+      const unit = await invoke<string>('get_setting', {
+        key: 'grouping.threshold.unit',
+        defaultValue: 'deg'
+      });
+
+      const value = parseFloat(valueStr);
+      if (isNaN(value)) {
+        setDefaultThreshold(3.0);
+        return;
+      }
+
+      // Convert to degrees based on unit
+      let thresholdDeg = value;
+      switch (unit) {
+        case 'arcsec':
+          thresholdDeg = value / 3600;
+          break;
+        case 'arcmin':
+          thresholdDeg = value / 60;
+          break;
+        case 'deg':
+          thresholdDeg = value;
+          break;
+      }
+
+      setDefaultThreshold(thresholdDeg);
+      setCustomThreshold(thresholdDeg.toFixed(2));
+    } catch (err) {
+      console.error('Failed to load threshold settings:', err);
+      setDefaultThreshold(3.0);
+      setCustomThreshold('3.00');
+    }
+  };
 
   const loadFrameSets = async () => {
     try {
@@ -122,8 +166,16 @@ export default function Objects() {
       // Store current frame sets before auto-generate
       const setsBeforeGenerate = frameSets;
 
+      // Prepare threshold parameter - only pass if different from default
+      let thresholdDeg: number | null = null;
+      const parsed = parseFloat(customThreshold);
+      if (!isNaN(parsed) && parsed > 0 && Math.abs(parsed - defaultThreshold) > 0.001) {
+        thresholdDeg = parsed;
+      }
+
       const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
         projectId: PROJECT_ID,
+        thresholdDeg,
       });
 
       setGenerateResult(result);
@@ -195,6 +247,18 @@ export default function Objects() {
     } catch (err) {
       setError(err as string);
       console.error('Failed to rename frame set:', err);
+    }
+  };
+
+  const handleMarkAsCustom = async (setId: number) => {
+    try {
+      await invoke('mark_frame_set_custom', {
+        framesSetId: setId
+      });
+      await loadFrameSets();
+    } catch (err) {
+      setError(err as string);
+      console.error('Failed to mark frame set as custom:', err);
     }
   };
 
@@ -419,8 +483,56 @@ export default function Objects() {
               <Sparkles size={18} />
               {generating ? 'Generating...' : 'Auto-Generate Sets'}
             </button>
+            <button
+              onClick={() => setShowThresholdPanel(prev => !prev)}
+              className={`flex items-center justify-center py-2 px-2 rounded-lg transition-colors ${
+                showThresholdPanel
+                  ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                  : 'bg-gray-700 hover:bg-gray-600 text-gray-400'
+              }`}
+              title="Grouping threshold settings"
+            >
+              <Sliders size={18} />
+            </button>
           </div>
         </div>
+
+        {/* Threshold Settings Panel */}
+        {showThresholdPanel && (
+          <div className="mt-4 p-4 bg-gray-800 border border-gray-700 rounded-lg">
+            <div className="flex items-start justify-between">
+              <div className="flex-1">
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Grouping Threshold
+                </label>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    value={customThreshold}
+                    onChange={(e) => setCustomThreshold(e.target.value)}
+                    step="0.1"
+                    min="0"
+                    className="w-32 px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <span className="text-sm text-gray-400">degrees</span>
+                </div>
+                <p className="mt-2 text-xs text-gray-400">
+                  {!isNaN(parseFloat(customThreshold))
+                    ? `${parseFloat(customThreshold).toFixed(2)}° = ${(parseFloat(customThreshold) * 60).toFixed(1)} arcmin`
+                    : `${defaultThreshold.toFixed(2)}° = ${(defaultThreshold * 60).toFixed(1)} arcmin`
+                  }
+                </p>
+              </div>
+              <button
+                onClick={() => setCustomThreshold(defaultThreshold.toFixed(2))}
+                className="px-3 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm rounded transition-colors"
+                title="Reset to default"
+              >
+                Reset to Default
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {isMergeMode && (
@@ -463,7 +575,16 @@ export default function Objects() {
 
       {generateResult && (
         <div className="mb-4 p-4 bg-green-900/20 border border-green-800 rounded-lg">
-          <p className="font-medium text-green-400 mb-2">Generation Complete</p>
+          <div className="flex items-start justify-between mb-2">
+            <p className="font-medium text-green-400">Generation Complete</p>
+            <button
+              onClick={() => setGenerateResult(null)}
+              className="p-1 text-green-400 hover:text-green-300 transition-colors"
+              title="Dismiss"
+            >
+              <X size={18} />
+            </button>
+          </div>
           <div className="text-sm text-green-300 space-y-1">
             <p>Sets created: {generateResult.sets_created}</p>
             <p>Frames clustered: {generateResult.frames_clustered}</p>
@@ -498,13 +619,22 @@ export default function Objects() {
         <div className="mb-4 p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
           <div className="flex items-center justify-between mb-3">
             <p className="font-medium text-yellow-400">Suggested Merges</p>
-            <button
-              onClick={handleMergeAllSuggestions}
-              disabled={merging}
-              className="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
-            >
-              Merge All
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setSuggestedMerges([])}
+                className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm rounded transition-colors"
+                title="Dismiss all suggestions"
+              >
+                Dismiss
+              </button>
+              <button
+                onClick={handleMergeAllSuggestions}
+                disabled={merging}
+                className="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
+              >
+                Merge All
+              </button>
+            </div>
           </div>
           <div className="space-y-2">
             {suggestedMerges.map((suggestion, i) => (
@@ -592,10 +722,21 @@ export default function Objects() {
                     </div>
                   ) : (
                     <div className="flex items-center gap-2">
-                      {frames_set.is_custom && (
+                      {frames_set.is_custom ? (
                         <span title="Custom Set">
                           <Star size={16} className="text-orange-500 fill-orange-500 flex-shrink-0" />
                         </span>
+                      ) : (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleMarkAsCustom(frames_set.id!);
+                          }}
+                          className="p-0 text-gray-400 hover:text-orange-400 transition-colors"
+                          title="Mark as Custom Set"
+                        >
+                          <Star size={16} className="flex-shrink-0" />
+                        </button>
                       )}
                       <h3 className="text-lg font-semibold text-gray-100 truncate">
                         {frames_set.name || 'Untitled'}
@@ -776,9 +917,13 @@ export default function Objects() {
               <div className="flex items-start justify-between mb-3">
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    {frames_set.is_custom && (
+                    {frames_set.is_custom ? (
                       <span title="Custom Set">
                         <Star size={16} className="text-orange-500 fill-orange-500 flex-shrink-0" />
+                      </span>
+                    ) : (
+                      <span title="Auto-Generated Set">
+                        <Star size={16} className="text-gray-400 flex-shrink-0" />
                       </span>
                     )}
                     <h3 className="text-lg font-semibold text-gray-100 truncate">
