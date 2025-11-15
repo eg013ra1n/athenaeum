@@ -109,7 +109,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             temp_max REAL,
             offset REAL,
             frame_count INTEGER DEFAULT 0,
-            is_master_library INTEGER NOT NULL DEFAULT 0
+            is_master_library INTEGER NOT NULL DEFAULT 0,
+            focallen REAL
         )",
         [],
     )?;
