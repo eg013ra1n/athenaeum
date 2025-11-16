@@ -23,6 +23,7 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
   const [frameSet, setFrameSet] = useState<FramesSet | null>(null);
   const [flatGroupOptions, setFlatGroupOptions] = useState<Record<string, FlatGroup[]>>({});
   const [selectedPattern, setSelectedPattern] = useState<FlatPattern | null>(null);
+  const [completedStats, setCompletedStats] = useState<ProcessingStats | null>(null);
 
   // Load frame set data when component mounts
   useEffect(() => {
@@ -32,8 +33,8 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
   const loadFrameSet = async () => {
     try {
       // Get frame set details to check if flat_pattern is set
-      const sets = await invoke<Array<{ frames_set: FramesSet; member_count: number }>>('get_frames_sets_by_project', {
-        projectId: 1 // Using default project
+      const sets = await invoke<Array<{ frames_set: FramesSet; member_count: number }>>('get_frames_sets', {
+        projectId: 1 // Using default project (parameter ignored but kept for compatibility)
       });
       const currentSet = sets.find(s => s.frames_set.id === frameSetId);
       if (currentSet) {
@@ -113,10 +114,13 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
   };
 
   const runCalibrationFinder = async (pattern: string | FlatPattern, manualSelections: Record<string, number> | null) => {
-    try {
-      setIsProcessing(true);
-      setShowProcessModal(true);
+    // Clear previous state before starting
+    setShowProcessModal(true);
+    setIsProcessing(true);
+    setError(null);
+    setStats(null);
 
+    try {
       const result = await invoke<ProcessingStats>('find_calibration_for_frame_set', {
         frameSetId,
         // Use default tolerances
@@ -128,14 +132,14 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
       });
 
       setStats(result);
-
-      if (onComplete) {
-        onComplete(result);
-      }
+      setError(null); // Ensure error is cleared on success
+      setCompletedStats(result); // Save for onComplete callback when modal closes
 
     } catch (err) {
       console.error('Failed to find calibration:', err);
       setError(String(err));
+      setStats(null); // Clear stats on error
+      setCompletedStats(null);
     } finally {
       setIsProcessing(false);
     }
@@ -145,6 +149,13 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
     setShowProcessModal(false);
     setStats(null);
     setError(null);
+
+    // Call onComplete after modal closes (not immediately after calibration)
+    // This prevents parent re-renders from interfering with modal display
+    if (completedStats && onComplete) {
+      onComplete(completedStats);
+    }
+    setCompletedStats(null);
   };
 
   return (

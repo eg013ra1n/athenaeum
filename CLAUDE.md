@@ -82,8 +82,8 @@ See `src-tauri/src/db/schema.rs` for full schema. Key tables:
   - Coordinates: RA, DEC, OBJCTRA, OBJCTDEC, SITELAT, SITELONG
 - `scan_roots` - Monitored directory paths
 - `calibration_set` + `calibration_set_frames` - Grouped calibration frames
-- `projects` - Top-level organization for imaging projects
-- `frames_set` - Top-level frame sets grouped by sky coordinates
+- `projects` - Exists but currently not used (vestigial table; frame sets are global and not scoped to projects)
+- `frames_set` - Top-level frame sets grouped by sky coordinates (NO project_id column - frame sets are global)
 - `imaging_nights` - Imaging nights/sessions within a frame set (linked via `frames_set_id`)
 - `sessions` - Groups frames by instrument within an imaging night
 - `session_members` - Junction table linking frames to sessions (the actual many-to-many between frames and sessions)
@@ -202,10 +202,12 @@ const result = await invoke<ReturnType>('command_name', {
 ```typescript
 // From frontend
 const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
-  projectId: 1
+  projectId: 1  // NOTE: projectId parameter is kept for backwards compatibility but is currently ignored
 });
 console.log(`Created ${result.sets_created} sets with ${result.frames_clustered} frames`);
 ```
+
+**Note on Projects**: The `projects` table exists in the database but is not currently linked to frame sets. The `project_id` parameter in commands like `get_frames_sets` and `auto_generate_frame_sets` is accepted for backwards compatibility but is ignored in the implementation. Frame sets are currently global and not scoped to any project.
 
 **Working with Settings**:
 ```typescript
