@@ -5,6 +5,9 @@ pub mod finder;
 pub mod hierarchy;
 pub mod auto_create;
 pub mod processor;
+pub mod flat_groups;
+pub mod flat_matcher;
+pub mod dark_bias_groups;
 
 use crate::models::{CalibrationSet, Frame};
 use anyhow::Result;

@@ -744,6 +744,23 @@ pub async fn recalculate_frame_set_metadata(
     Ok(frames_set)
 }
 
+/// Update the flat_pattern preference for a frame set
+#[tauri::command]
+pub async fn update_frame_set_flat_pattern(
+    frame_set_id: i64,
+    flat_pattern: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::update_frames_set_flat_pattern(&conn, frame_set_id, Some(&flat_pattern))
+        .map_err(|e| format!("Failed to update flat pattern: {}", e))?;
+
+    Ok(())
+}
+
 /// Merge source frame set into target frame set
 /// Dragged frame set (source) is merged into drop target (target)
 /// Source frame set is deleted after merge
@@ -2483,14 +2500,46 @@ pub async fn find_calibration_for_frame_set(
     temp_delta_celsius: Option<f64>,
     flat_date_warning_days: Option<i64>,
     dark_date_warning_days: Option<i64>,
+    flat_pattern: Option<String>,
+    manual_flat_selections: Option<std::collections::HashMap<String, i64>>,
     state: State<'_, AppState>,
 ) -> Result<crate::calibration::processor::ProcessingStats, String> {
     use crate::calibration::processor::process_frame_set;
     use crate::models::CalibrationTolerance;
+    use chrono::{DateTime, Utc};
 
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
+
+    // Get frame set metadata (flat_pattern, date ranges)
+    let mut stmt = conn.prepare(
+        "SELECT flat_pattern, date_obs_start, date_obs_end FROM frames_set WHERE id = ?1"
+    ).map_err(|e| e.to_string())?;
+
+    let (stored_flat_pattern, date_obs_start, date_obs_end): (Option<String>, Option<String>, Option<String>) =
+        stmt.query_row([frame_set_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }).map_err(|e| format!("Frame set not found: {}", e))?;
+
+    // Use provided flat_pattern or fall back to stored pattern
+    let final_flat_pattern = flat_pattern.or(stored_flat_pattern);
+
+    // Parse session dates
+    let session_start = date_obs_start
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    let session_end = date_obs_end
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    // Get flat calibration settings
+    let max_age_days = state.settings.get_flats_max_age_days(&conn)
+        .map_err(|e| format!("Failed to get flats max age: {}", e))?;
+    let time_cluster_minutes = state.settings.get_flats_time_cluster_minutes(&conn)
+        .map_err(|e| format!("Failed to get time cluster threshold: {}", e))?;
+    let temp_weight = state.settings.get_temperature_match_weight(&conn)
+        .map_err(|e| format!("Failed to get temperature match weight: {}", e))?;
 
     // Build tolerance from parameters or use defaults
     let tolerance = CalibrationTolerance {
@@ -2506,9 +2555,24 @@ pub async fn find_calibration_for_frame_set(
         tolerance.flat_date_warning_days,
         tolerance.dark_date_warning_days
     );
+    println!(
+        "Flat settings: pattern={:?}, max_age={} days, time_cluster={} min, temp_weight={}",
+        final_flat_pattern, max_age_days, time_cluster_minutes, temp_weight
+    );
 
-    let stats = process_frame_set(&conn, frame_set_id, &tolerance)
-        .map_err(|e| format!("Failed to process frame set: {}", e))?;
+    let stats = process_frame_set(
+        &conn,
+        frame_set_id,
+        &tolerance,
+        final_flat_pattern.as_deref(),
+        manual_flat_selections.as_ref(),
+        max_age_days,
+        time_cluster_minutes,
+        temp_weight,
+        session_start,
+        session_end,
+        &state,
+    ).map_err(|e| format!("Failed to process frame set: {}", e))?;
 
     println!(
         "✅ Calibration processing complete: {} frames, {} with full calibration",
@@ -2616,9 +2680,115 @@ pub async fn get_frame_calibration_hierarchy(
         dark_date_warning_days: dark_date_warning_days.unwrap_or(365),
     };
 
-    // Build hierarchy
-    build_complete_hierarchy(&conn, &frame, &tolerance)
-        .map_err(|e| format!("Failed to build hierarchy: {}", e))
+    // Get flat calibration settings
+    let max_age_days = state.settings.get_flats_max_age_days(&conn)
+        .map_err(|e| format!("Failed to get flats max age: {}", e))?;
+    let time_cluster_minutes = state.settings.get_flats_time_cluster_minutes(&conn)
+        .map_err(|e| format!("Failed to get time cluster threshold: {}", e))?;
+    let temp_weight = state.settings.get_temperature_match_weight(&conn)
+        .map_err(|e| format!("Failed to get temperature match weight: {}", e))?;
+
+    // Build hierarchy (no pattern or manual selection for single frame view)
+    build_complete_hierarchy(
+        &conn,
+        &frame,
+        &tolerance,
+        None,  // flat_pattern
+        None,  // manual_flat_set_id
+        max_age_days,
+        time_cluster_minutes,
+        temp_weight,
+        None,  // session_start
+        None,  // session_end
+        &state, // AppState for on-demand calibration creation
+    ).map_err(|e| format!("Failed to build hierarchy: {}", e))
+}
+
+/// Get available flat group options for a frame set (for manual selection)
+///
+/// Returns a map of filter -> Vec<FlatGroup>, where each FlatGroup represents a group of flats
+/// that were taken in temporal proximity.
+#[tauri::command]
+pub async fn get_flat_group_options_for_frame_set(
+    frame_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, Vec<crate::calibration::flat_groups::FlatGroup>>, String> {
+    use crate::calibration::flat_groups::detect_flat_groups;
+    use crate::calibration::processor::get_light_frames_from_frame_set;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get flat calibration settings
+    let max_age_days = state.settings.get_flats_max_age_days(&conn)
+        .map_err(|e| format!("Failed to get flats max age: {}", e))?;
+    let time_cluster_minutes = state.settings.get_flats_time_cluster_minutes(&conn)
+        .map_err(|e| format!("Failed to get time cluster threshold: {}", e))?;
+
+    // Get all light frames from the frame set to determine unique filters
+    let frames = get_light_frames_from_frame_set(&conn, frame_set_id)
+        .map_err(|e| format!("Failed to get light frames: {}", e))?;
+
+    if frames.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    // Get unique camera/binning combinations from frames
+    let first_frame = &frames[0];
+    let instrume = first_frame.instrume.as_ref()
+        .ok_or("Light frames missing instrume")?;
+    let binning = first_frame.binning.as_ref()
+        .ok_or("Light frames missing binning")?;
+    let gain = first_frame.gain;
+    let focal_length = first_frame.focallen;
+
+    // Calculate date range (±max_age_days from frame set dates)
+    let dates: Vec<chrono::DateTime<chrono::Utc>> = frames
+        .iter()
+        .filter_map(|f| f.date_obs)
+        .collect();
+
+    let date_range = if !dates.is_empty() {
+        let earliest = *dates.iter().min().unwrap();
+        let latest = *dates.iter().max().unwrap();
+        let start = earliest - chrono::Duration::days(max_age_days);
+        let end = latest + chrono::Duration::days(max_age_days);
+        Some((start, end))
+    } else {
+        None
+    };
+
+    // Get unique filters from light frames
+    let mut filters: Vec<Option<String>> = frames
+        .iter()
+        .map(|f| f.filter.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    filters.sort();
+
+    // Detect flat groups for each filter
+    let mut results = std::collections::HashMap::new();
+
+    for filter in filters {
+        let flat_groups = detect_flat_groups(
+            &conn,
+            instrume,
+            filter.as_deref(),
+            binning,
+            gain,
+            focal_length,
+            time_cluster_minutes,
+            date_range,
+        ).map_err(|e| format!("Failed to detect flat groups: {}", e))?;
+
+        // Use filter name or "No Filter" as key
+        let key = filter.unwrap_or_else(|| "No Filter".to_string());
+        results.insert(key, flat_groups);
+    }
+
+    Ok(results)
 }
 
 /// Clear all calibration links for a frame set

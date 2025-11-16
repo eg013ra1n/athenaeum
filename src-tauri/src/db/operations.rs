@@ -535,7 +535,7 @@ pub fn get_frames_sets_by_project(
     _project_id: i64,  // Kept for backwards compatibility, but ignored
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(
-        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time,
+        "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
                 COUNT(DISTINCT sm.frame_id) as member_count
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
@@ -555,8 +555,9 @@ pub fn get_frames_sets_by_project(
             objctra: row.get(5)?,
             objctdec: row.get(6)?,
             total_exp_time: row.get(7)?,
+            flat_pattern: row.get(8)?,
         };
-        let member_count: i32 = row.get(8)?;
+        let member_count: i32 = row.get(9)?;
         Ok((set, member_count as usize))
     })?;
 
@@ -617,6 +618,18 @@ pub fn update_frames_set_metadata(
              total_exp_time = ?5, is_custom = ?6
          WHERE id = ?7",
         params![date_obs_start, date_obs_end, objctra, objctdec, total_exp_time, is_custom_int, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_frames_set_flat_pattern(
+    conn: &Connection,
+    id: i64,
+    flat_pattern: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE frames_set SET flat_pattern = ?1 WHERE id = ?2",
+        params![flat_pattern, id],
     )?;
     Ok(())
 }

@@ -1,16 +1,26 @@
 // Calibration hierarchy builder - constructs complete calibration trees
 use crate::calibration::finder::{
-    find_flat_sets_for_light_frame, find_dark_sets_for_light_frame,
+    find_dark_sets_for_light_frame,
     find_bias_sets_for_frame, rank_calibration_candidates, CalibrationCandidate,
+};
+use crate::calibration::flat_matcher::{
+    find_flat_groups_for_light_frame, apply_pattern_selection, FlatPattern,
+};
+use crate::calibration::flat_groups::create_flat_calibration_set;
+use crate::calibration::dark_bias_groups::{
+    detect_dark_groups, detect_bias_groups,
+    create_dark_calibration_set, create_bias_calibration_set,
 };
 use crate::db::calibration_links::insert_calibration_link;
 use crate::models::{
     CalibrationTolerance, Frame, CalibrationLink, CalibrationWarning,
     CalibrationHierarchy, CalibrationSetWithLinks, CalibrationSetDetail, ImageType,
 };
+use crate::commands::AppState;
 use rusqlite::Connection;
 use anyhow::{Result, Context};
-use chrono::{Utc, DateTime};
+use chrono::{Utc, DateTime, Duration};
+use tauri::State;
 
 /// Get frame metadata by ID
 fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
@@ -104,10 +114,12 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
 
 /// Find Dark or Bias calibration for a Flat calibration set
 /// First tries to find Dark sets, falls back to Bias if not found
+/// Creates sets on-demand if not found
 pub fn find_calibration_for_flat_set(
     conn: &Connection,
     flat_set_id: i64,
     tolerance: &CalibrationTolerance,
+    state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
     // Get a representative frame from the flat set to use for matching
     let mut stmt = conn.prepare(
@@ -120,22 +132,49 @@ pub fn find_calibration_for_flat_set(
     let frame = get_frame_by_id(conn, frame_id)?;
 
     // Try to find Dark sets first
-    let dark_candidates = find_dark_sets_for_light_frame(conn, &frame, tolerance)?;
+    let mut dark_candidates = find_dark_sets_for_light_frame(conn, &frame, tolerance)?;
+
+    if dark_candidates.is_empty() {
+        println!("  🔍 No existing Dark sets found for Flat, attempting on-demand creation...");
+
+        // Try to create Dark on-demand
+        if let Some(created_dark_id) = try_create_dark_for_frame(conn, &frame, state)? {
+            println!("  ✅ Created Dark set {} for Flat", created_dark_id);
+
+            // Re-query to get the candidate with proper scoring
+            dark_candidates = find_dark_sets_for_light_frame(conn, &frame, tolerance)?;
+        }
+    }
 
     if !dark_candidates.is_empty() {
         return Ok(rank_calibration_candidates(dark_candidates));
     }
 
     // Fallback to Bias sets
-    let bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+    let mut bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+
+    if bias_candidates.is_empty() {
+        println!("  🔍 No existing Bias sets found for Flat, attempting on-demand creation...");
+
+        // Try to create Bias on-demand
+        if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame, state)? {
+            println!("  ✅ Created Bias set {} for Flat", created_bias_id);
+
+            // Re-query to get the candidate with proper scoring
+            bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+        }
+    }
+
     Ok(rank_calibration_candidates(bias_candidates))
 }
 
 /// Find Bias calibration for a Dark calibration set
+/// Creates Bias on-demand if not found
 pub fn find_calibration_for_dark_set(
     conn: &Connection,
     dark_set_id: i64,
     tolerance: &CalibrationTolerance,
+    state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
     // Get a representative frame from the dark set
     let mut stmt = conn.prepare(
@@ -148,16 +187,50 @@ pub fn find_calibration_for_dark_set(
     let frame = get_frame_by_id(conn, frame_id)?;
 
     // Find Bias sets
-    let bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+    let mut bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+
+    if bias_candidates.is_empty() {
+        println!("  🔍 No existing Bias sets found for Dark, attempting on-demand creation...");
+
+        // Try to create Bias on-demand
+        if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame, state)? {
+            println!("  ✅ Created Bias set {} for Dark", created_bias_id);
+
+            // Re-query to get the candidate with proper scoring
+            bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+        }
+    }
+
     Ok(rank_calibration_candidates(bias_candidates))
 }
 
 /// Build complete calibration hierarchy for a light frame
 /// Returns hierarchy including all flats, darks, and their sub-calibrations
+///
+/// # Arguments
+/// * `conn` - Database connection
+/// * `light_frame` - The light frame to find calibration for
+/// * `tolerance` - Tolerance settings for calibration matching
+/// * `flat_pattern` - Optional flat pattern preference (e.g., "before_session")
+/// * `manual_flat_set_id` - Optional manually selected flat set ID for this specific frame
+/// * `max_age_days` - Maximum age of flats to consider (from settings)
+/// * `time_cluster_minutes` - Time threshold for grouping flats (from settings)
+/// * `temp_weight` - Weight for temperature matching (from settings)
+/// * `session_start` - Optional session start time for pattern matching
+/// * `session_end` - Optional session end time for pattern matching
+/// * `state` - AppState for accessing settings
 pub fn build_complete_hierarchy(
     conn: &Connection,
     light_frame: &Frame,
     tolerance: &CalibrationTolerance,
+    flat_pattern: Option<&str>,
+    manual_flat_set_id: Option<i64>,
+    max_age_days: i64,
+    time_cluster_minutes: i64,
+    temp_weight: f64,
+    session_start: Option<DateTime<Utc>>,
+    session_end: Option<DateTime<Utc>>,
+    state: &State<'_, AppState>,
 ) -> Result<CalibrationHierarchy> {
     let frame_id = light_frame.id.context("Frame must have an ID")?;
 
@@ -166,99 +239,164 @@ pub fn build_complete_hierarchy(
     let mut missing_calibration = Vec::new();
     let mut warnings = Vec::new();
 
-    // Find Flat sets for the light frame
-    let flat_candidates = find_flat_sets_for_light_frame(conn, light_frame, tolerance)?;
-    let ranked_flats = rank_calibration_candidates(flat_candidates);
-
-    if ranked_flats.is_empty() {
-        missing_calibration.push("Flat".to_string());
+    // Find Flat sets for the light frame using new pattern-based system
+    let flat_set_id = if let Some(set_id) = manual_flat_set_id {
+        // Manual selection - use the provided set ID directly
+        Some(set_id)
     } else {
-        // Take the best flat match
-        if let Some(best_flat) = ranked_flats.first() {
-            let flat_set = get_calibration_set_by_id(conn, best_flat.set_id)?;
+        // Auto-detect using pattern-based matching
+        let flat_matches = find_flat_groups_for_light_frame(
+            conn,
+            light_frame,
+            max_age_days,
+            time_cluster_minutes,
+            temp_weight,
+        )?;
 
-            // Add warnings for the flat
-            if best_flat.date_warning {
+        if flat_matches.is_empty() {
+            println!("  ⚠️  No flat groups found for frame {:?}", frame_id);
+            None
+        } else {
+            println!("  ✅ Found {} flat group matches", flat_matches.len());
+            for (i, m) in flat_matches.iter().enumerate() {
+                println!("    Match {}: score={:.3}, age={}d, timing={:?}, frames={}",
+                    i, m.match_score, m.age_days, m.timing, m.group.frame_count);
+            }
+
+            // Apply pattern-based selection
+            let pattern = flat_pattern
+                .and_then(|p| FlatPattern::from_str(p))
+                .unwrap_or(FlatPattern::Manual); // Default to manual if not specified
+
+            println!("  🎯 Applying pattern: {:?}", pattern);
+            println!("  📅 Session start: {:?}, end: {:?}", session_start, session_end);
+
+            let selected_match = apply_pattern_selection(
+                flat_matches,
+                &pattern,
+                session_start,
+                session_end,
+            );
+
+            if let Some(flat_match) = selected_match {
+                println!("  ✅ Pattern selected match: age={}d, timing={:?}, frames={}",
+                    flat_match.age_days, flat_match.timing, flat_match.group.frame_count);
+
+                // Create calibration set from the flat group
+                let set_id = create_flat_calibration_set(conn, &flat_match.group)?;
+
+                // Add age warning if needed
+                if flat_match.age_days > tolerance.flat_date_warning_days {
+                    warnings.push(CalibrationWarning {
+                        warning_type: "date".to_string(),
+                        message: format!(
+                            "Flat calibration is {} days old (>{} days recommended)",
+                            flat_match.age_days,
+                            tolerance.flat_date_warning_days
+                        ),
+                        calibration_type: "Flat".to_string(),
+                        set_id,
+                    });
+                }
+
+                // Add temperature warning if temp diff exists and is significant
+                if let Some(temp_diff) = flat_match.temp_diff {
+                    if temp_diff > tolerance.temp_delta_celsius {
+                        warnings.push(CalibrationWarning {
+                            warning_type: "temperature".to_string(),
+                            message: format!(
+                                "Flat temperature differs by {:.1}°C",
+                                temp_diff
+                            ),
+                            calibration_type: "Flat".to_string(),
+                            set_id,
+                        });
+                    }
+                }
+
+                Some(set_id)
+            } else {
+                println!("  ⚠️  Pattern selection returned no match");
+                None
+            }
+        }
+    };
+
+    // Process the flat set if found
+    if let Some(set_id) = flat_set_id {
+        let flat_set = get_calibration_set_by_id(conn, set_id)?;
+
+        // Find calibration for the Flat set (Dark or Bias)
+        let flat_calib = find_calibration_for_flat_set(conn, set_id, tolerance, state)?;
+
+        let mut flat_sub_calibration = Vec::new();
+        if let Some(best_flat_calib) = flat_calib.first() {
+            // Store the calibration link
+            flat_sub_calibration.push(CalibrationLink {
+                id: None,
+                source_id: set_id,
+                source_type: "calibration_set".to_string(),
+                calibration_set_id: best_flat_calib.set_id,
+                calibration_type: match best_flat_calib.imagetyp {
+                    ImageType::Dark => "Dark".to_string(),
+                    ImageType::Bias => "Bias".to_string(),
+                    _ => "Unknown".to_string(),
+                },
+                matched_at: Utc::now().to_rfc3339(),
+                match_score: Some(best_flat_calib.match_score),
+                date_warning: best_flat_calib.date_warning,
+                temp_warning: best_flat_calib.temp_warning,
+            });
+
+            // Add warnings
+            if best_flat_calib.date_warning {
                 warnings.push(CalibrationWarning {
                     warning_type: "date".to_string(),
                     message: format!(
-                        "Flat calibration is {} days old (>{} days recommended)",
-                        best_flat.date_diff_days,
-                        tolerance.flat_date_warning_days
+                        "{} for Flat is {} days old",
+                        match best_flat_calib.imagetyp {
+                            ImageType::Dark => "Dark",
+                            ImageType::Bias => "Bias",
+                            _ => "Calibration",
+                        },
+                        best_flat_calib.date_diff_days
                     ),
-                    calibration_type: "Flat".to_string(),
-                    set_id: best_flat.set_id,
-                });
-            }
-            if best_flat.temp_warning {
-                warnings.push(CalibrationWarning {
-                    warning_type: "temperature".to_string(),
-                    message: format!(
-                        "Flat temperature differs by {:.1}°C",
-                        best_flat.temp_diff.unwrap_or(0.0)
-                    ),
-                    calibration_type: "Flat".to_string(),
-                    set_id: best_flat.set_id,
-                });
-            }
-
-            // Find calibration for the Flat set (Dark or Bias)
-            let flat_calib = find_calibration_for_flat_set(conn, best_flat.set_id, tolerance)?;
-
-            let mut flat_sub_calibration = Vec::new();
-            if let Some(best_flat_calib) = flat_calib.first() {
-                // Store the calibration link
-                flat_sub_calibration.push(CalibrationLink {
-                    id: None,
-                    source_id: best_flat.set_id,
-                    source_type: "calibration_set".to_string(),
-                    calibration_set_id: best_flat_calib.set_id,
                     calibration_type: match best_flat_calib.imagetyp {
                         ImageType::Dark => "Dark".to_string(),
                         ImageType::Bias => "Bias".to_string(),
                         _ => "Unknown".to_string(),
                     },
-                    matched_at: Utc::now().to_rfc3339(),
-                    match_score: Some(best_flat_calib.match_score),
-                    date_warning: best_flat_calib.date_warning,
-                    temp_warning: best_flat_calib.temp_warning,
+                    set_id: best_flat_calib.set_id,
                 });
-
-                // Add warnings
-                if best_flat_calib.date_warning {
-                    warnings.push(CalibrationWarning {
-                        warning_type: "date".to_string(),
-                        message: format!(
-                            "{} for Flat is {} days old",
-                            match best_flat_calib.imagetyp {
-                                ImageType::Dark => "Dark",
-                                ImageType::Bias => "Bias",
-                                _ => "Calibration",
-                            },
-                            best_flat_calib.date_diff_days
-                        ),
-                        calibration_type: match best_flat_calib.imagetyp {
-                            ImageType::Dark => "Dark".to_string(),
-                            ImageType::Bias => "Bias".to_string(),
-                            _ => "Unknown".to_string(),
-                        },
-                        set_id: best_flat_calib.set_id,
-                    });
-                }
-            } else {
-                missing_calibration.push("Dark/Bias for Flat".to_string());
             }
-
-            flat_sets_with_links.push(CalibrationSetWithLinks {
-                set: flat_set,
-                sub_calibration: flat_sub_calibration,
-            });
+        } else {
+            missing_calibration.push("Dark/Bias for Flat".to_string());
         }
+
+        flat_sets_with_links.push(CalibrationSetWithLinks {
+            set: flat_set,
+            sub_calibration: flat_sub_calibration,
+        });
+    } else {
+        missing_calibration.push("Flat".to_string());
     }
 
     // Find Dark sets for the light frame
     let dark_candidates = find_dark_sets_for_light_frame(conn, light_frame, tolerance)?;
-    let ranked_darks = rank_calibration_candidates(dark_candidates);
+    let mut ranked_darks = rank_calibration_candidates(dark_candidates);
+
+    // Location 1: Try to create Dark on-demand if not found
+    if ranked_darks.is_empty() {
+        println!("  🔍 No existing Dark sets found for Light frame, attempting on-demand creation...");
+
+        if let Some(created_dark_id) = try_create_dark_for_frame(conn, light_frame, state)? {
+            println!("  ✅ Created Dark set {} for Light frame", created_dark_id);
+
+            // Re-query to get the candidate with proper scoring
+            let dark_candidates = find_dark_sets_for_light_frame(conn, light_frame, tolerance)?;
+            ranked_darks = rank_calibration_candidates(dark_candidates);
+        }
+    }
 
     if ranked_darks.is_empty() {
         missing_calibration.push("Dark".to_string());
@@ -292,8 +430,8 @@ pub fn build_complete_hierarchy(
                 });
             }
 
-            // Find Bias for the Dark set
-            let bias_candidates = find_calibration_for_dark_set(conn, best_dark.set_id, tolerance)?;
+            // Find Bias for the Dark set (Location 2: with on-demand creation)
+            let bias_candidates = find_calibration_for_dark_set(conn, best_dark.set_id, tolerance, state)?;
 
             let mut dark_sub_calibration = Vec::new();
             if let Some(best_bias) = bias_candidates.first() {
@@ -402,6 +540,163 @@ pub fn store_calibration_hierarchy(
     }
 
     Ok(())
+}
+
+/// Try to create a Dark calibration set on-demand for a given frame
+/// Returns the created set ID if successful, None otherwise
+fn try_create_dark_for_frame(
+    conn: &Connection,
+    frame: &Frame,
+    state: &State<'_, AppState>,
+) -> Result<Option<i64>> {
+    // Extract frame parameters
+    let instrume = match &frame.instrume {
+        Some(i) => i.as_str(),
+        None => {
+            println!("    ⚠️  Frame missing instrume, cannot create Dark");
+            return Ok(None);
+        }
+    };
+
+    let binning = match &frame.binning {
+        Some(b) => b.as_str(),
+        None => {
+            println!("    ⚠️  Frame missing binning, cannot create Dark");
+            return Ok(None);
+        }
+    };
+
+    let exptime = frame.exptime;
+    if exptime.is_none() {
+        println!("    ⚠️  Frame missing exptime, cannot create Dark");
+        return Ok(None);
+    }
+
+    let date_obs = match &frame.date_obs {
+        Some(d) => d,
+        None => {
+            println!("    ⚠️  Frame missing date_obs, cannot create Dark");
+            return Ok(None);
+        }
+    };
+
+    // Get settings
+    let max_age_days = state.settings.get_darks_max_age_days(conn)
+        .unwrap_or(30);
+    let time_cluster_minutes = state.settings.get_darks_time_cluster_minutes(conn)
+        .unwrap_or(30);
+
+    println!("    📋 Dark search parameters: max_age_days={}, time_cluster_minutes={}",
+        max_age_days, time_cluster_minutes);
+
+    // Calculate date range: ±max_age_days from frame date
+    let start_date = *date_obs - Duration::days(max_age_days);
+    let end_date = *date_obs + Duration::days(max_age_days);
+
+    println!("    📅 Dark date range: {} to {}", start_date, end_date);
+
+    // Detect dark groups
+    let dark_groups = detect_dark_groups(
+        conn,
+        instrume,
+        binning,
+        frame.gain,
+        frame.offset,
+        exptime,
+        frame.focallen,
+        time_cluster_minutes,
+        Some((start_date, end_date)),
+    )?;
+
+    if dark_groups.is_empty() {
+        println!("    ⚠️  No dark groups found for on-demand creation");
+        return Ok(None);
+    }
+
+    // Select best group (first one - they're sorted newest first)
+    let best_group = &dark_groups[0];
+    println!("    🎯 Selected best dark group: {} frames, from {} to {}",
+        best_group.frame_count, best_group.start_time, best_group.end_time);
+
+    // Create calibration set from best group
+    let set_id = create_dark_calibration_set(conn, best_group)?;
+
+    Ok(Some(set_id))
+}
+
+/// Try to create a Bias calibration set on-demand for a given frame
+/// Returns the created set ID if successful, None otherwise
+fn try_create_bias_for_frame(
+    conn: &Connection,
+    frame: &Frame,
+    state: &State<'_, AppState>,
+) -> Result<Option<i64>> {
+    // Extract frame parameters
+    let instrume = match &frame.instrume {
+        Some(i) => i.as_str(),
+        None => {
+            println!("    ⚠️  Frame missing instrume, cannot create Bias");
+            return Ok(None);
+        }
+    };
+
+    let binning = match &frame.binning {
+        Some(b) => b.as_str(),
+        None => {
+            println!("    ⚠️  Frame missing binning, cannot create Bias");
+            return Ok(None);
+        }
+    };
+
+    let date_obs = match &frame.date_obs {
+        Some(d) => d,
+        None => {
+            println!("    ⚠️  Frame missing date_obs, cannot create Bias");
+            return Ok(None);
+        }
+    };
+
+    // Get settings
+    let max_age_days = state.settings.get_bias_max_age_days(conn)
+        .unwrap_or(30);
+    let time_cluster_minutes = state.settings.get_bias_time_cluster_minutes(conn)
+        .unwrap_or(30);
+
+    println!("    📋 Bias search parameters: max_age_days={}, time_cluster_minutes={}",
+        max_age_days, time_cluster_minutes);
+
+    // Calculate date range: ±max_age_days from frame date
+    let start_date = *date_obs - Duration::days(max_age_days);
+    let end_date = *date_obs + Duration::days(max_age_days);
+
+    println!("    📅 Bias date range: {} to {}", start_date, end_date);
+
+    // Detect bias groups
+    let bias_groups = detect_bias_groups(
+        conn,
+        instrume,
+        binning,
+        frame.gain,
+        frame.offset,
+        frame.focallen,
+        time_cluster_minutes,
+        Some((start_date, end_date)),
+    )?;
+
+    if bias_groups.is_empty() {
+        println!("    ⚠️  No bias groups found for on-demand creation");
+        return Ok(None);
+    }
+
+    // Select best group (first one - they're sorted newest first)
+    let best_group = &bias_groups[0];
+    println!("    🎯 Selected best bias group: {} frames, from {} to {}",
+        best_group.frame_count, best_group.start_time, best_group.end_time);
+
+    // Create calibration set from best group
+    let set_id = create_bias_calibration_set(conn, best_group)?;
+
+    Ok(Some(set_id))
 }
 
 #[cfg(test)]

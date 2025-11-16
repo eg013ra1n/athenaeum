@@ -16,6 +16,19 @@ pub mod defaults {
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "1.0";
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "false";
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "false";
+
+    // Flat calibration defaults
+    pub const FLATS_MAX_AGE_DAYS: &str = "30";
+    pub const FLATS_TIME_CLUSTER_MINUTES: &str = "30";
+    pub const TEMPERATURE_MATCH_WEIGHT: &str = "0.3";
+
+    // Dark calibration defaults
+    pub const DARKS_MAX_AGE_DAYS: &str = "30";
+    pub const DARKS_TIME_CLUSTER_MINUTES: &str = "30";
+
+    // Bias calibration defaults
+    pub const BIAS_MAX_AGE_DAYS: &str = "30";
+    pub const BIAS_TIME_CLUSTER_MINUTES: &str = "30";
 }
 
 /// Setting keys used throughout the application
@@ -28,6 +41,19 @@ pub mod keys {
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "dark_library.temp_threshold_celsius";
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "duplicates.use_content_hash";
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "duplicates.content_hash_rescanned";
+
+    // Flat calibration keys
+    pub const FLATS_MAX_AGE_DAYS: &str = "flats.max_age_days";
+    pub const FLATS_TIME_CLUSTER_MINUTES: &str = "flats.time_cluster_minutes";
+    pub const TEMPERATURE_MATCH_WEIGHT: &str = "temperature.match_weight";
+
+    // Dark calibration keys
+    pub const DARKS_MAX_AGE_DAYS: &str = "darks.max_age_days";
+    pub const DARKS_TIME_CLUSTER_MINUTES: &str = "darks.time_cluster_minutes";
+
+    // Bias calibration keys
+    pub const BIAS_MAX_AGE_DAYS: &str = "bias.max_age_days";
+    pub const BIAS_TIME_CLUSTER_MINUTES: &str = "bias.time_cluster_minutes";
 }
 
 /// Runtime overrides for settings (session-specific)
@@ -196,6 +222,76 @@ impl SettingsManager {
             defaults::DUPLICATES_CONTENT_HASH_RESCANNED,
         )?;
         Ok(value.to_lowercase() == "true")
+    }
+
+    /// Get the maximum age of flats to consider (in days)
+    pub fn get_flats_max_age_days(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::FLATS_MAX_AGE_DAYS,
+            defaults::FLATS_MAX_AGE_DAYS,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the time clustering threshold for flat frames (in minutes)
+    pub fn get_flats_time_cluster_minutes(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::FLATS_TIME_CLUSTER_MINUTES,
+            defaults::FLATS_TIME_CLUSTER_MINUTES,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the temperature match weight for flat selection (0.0-1.0)
+    pub fn get_temperature_match_weight(&self, conn: &Connection) -> Result<f64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::TEMPERATURE_MATCH_WEIGHT,
+            defaults::TEMPERATURE_MATCH_WEIGHT,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the maximum age of darks to consider (in days)
+    pub fn get_darks_max_age_days(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::DARKS_MAX_AGE_DAYS,
+            defaults::DARKS_MAX_AGE_DAYS,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the time clustering threshold for dark frames (in minutes)
+    pub fn get_darks_time_cluster_minutes(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::DARKS_TIME_CLUSTER_MINUTES,
+            defaults::DARKS_TIME_CLUSTER_MINUTES,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the maximum age of bias to consider (in days)
+    pub fn get_bias_max_age_days(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::BIAS_MAX_AGE_DAYS,
+            defaults::BIAS_MAX_AGE_DAYS,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the time clustering threshold for bias frames (in minutes)
+    pub fn get_bias_time_cluster_minutes(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::BIAS_TIME_CLUSTER_MINUTES,
+            defaults::BIAS_TIME_CLUSTER_MINUTES,
+        )?;
+        Ok(value.parse()?)
     }
 }
 

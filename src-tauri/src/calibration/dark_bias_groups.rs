@@ -1,0 +1,1079 @@
+/// Dark and Bias Calibration Group Detection
+///
+/// This module provides functionality for detecting and grouping dark and bias frames
+/// based on time proximity. Dark and Bias frames are typically captured in bursts
+/// (consecutive exposures with minimal time gaps), and this module clusters
+/// them into natural groupings.
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+
+use crate::models::Frame;
+
+/// Represents a group of dark frames captured in close temporal proximity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DarkGroup {
+    /// IDs of frames in this group
+    pub frame_ids: Vec<i64>,
+
+    /// Timestamp of first frame in group
+    pub start_time: DateTime<Utc>,
+
+    /// Timestamp of last frame in group
+    pub end_time: DateTime<Utc>,
+
+    /// Average CCD temperature across all frames (if available)
+    pub avg_temp: Option<f64>,
+
+    /// Number of frames in group
+    pub frame_count: usize,
+
+    /// Camera/instrument name
+    pub instrume: String,
+
+    /// Binning pattern (e.g., "1x1", "2x2")
+    pub binning: String,
+
+    /// Gain setting
+    pub gain: Option<f64>,
+
+    /// Offset setting
+    pub offset: Option<f64>,
+
+    /// Exposure time (seconds)
+    pub exptime: Option<f64>,
+
+    /// Focal length
+    pub focal_length: Option<f64>,
+}
+
+/// Represents a group of bias frames captured in close temporal proximity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BiasGroup {
+    /// IDs of frames in this group
+    pub frame_ids: Vec<i64>,
+
+    /// Timestamp of first frame in group
+    pub start_time: DateTime<Utc>,
+
+    /// Timestamp of last frame in group
+    pub end_time: DateTime<Utc>,
+
+    /// Average CCD temperature across all frames (if available)
+    pub avg_temp: Option<f64>,
+
+    /// Number of frames in group
+    pub frame_count: usize,
+
+    /// Camera/instrument name
+    pub instrume: String,
+
+    /// Binning pattern (e.g., "1x1", "2x2")
+    pub binning: String,
+
+    /// Gain setting
+    pub gain: Option<f64>,
+
+    /// Offset setting
+    pub offset: Option<f64>,
+
+    /// Focal length
+    pub focal_length: Option<f64>,
+}
+
+/// Detects dark groups by clustering frames with close temporal proximity
+///
+/// # Arguments
+/// * `conn` - Database connection
+/// * `instrume` - Camera/instrument name (exact match)
+/// * `binning` - Binning pattern (exact match)
+/// * `gain` - Gain setting (exact match if Some)
+/// * `offset` - Offset setting (exact match if Some)
+/// * `exptime` - Exposure time (exact match if Some)
+/// * `focal_length` - Focal length (exact match if Some)
+/// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
+/// * `date_range` - Optional date range to limit search (start, end)
+///
+/// # Returns
+/// Vector of DarkGroup objects, sorted by start_time (newest first)
+pub fn detect_dark_groups(
+    conn: &Connection,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    exptime: Option<f64>,
+    focal_length: Option<f64>,
+    time_cluster_minutes: i64,
+    date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<Vec<DarkGroup>> {
+    // Build query with parameter matching
+    let mut query = String::from(
+        "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
+                is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
+                ccd_temp, set_temp, focallen, xpixsz, pixsz, naxis1, naxis2,
+                sitelat, lat_obs, sitelong, long_obs
+         FROM frames
+         WHERE imagetyp = 'Dark' AND instrume = ?1 AND binning = ?2"
+    );
+
+    let mut param_count = 2;
+
+    // Gain parameter (exact match if provided)
+    if gain.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND gain = ?{}", param_count));
+    }
+
+    // Offset parameter (exact match if provided)
+    if offset.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND offset = ?{}", param_count));
+    }
+
+    // Exposure time parameter (exact match if provided) - REQUIRED for darks
+    if exptime.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND exptime = ?{}", param_count));
+    }
+
+    // Focal length parameter (exact match if provided)
+    if focal_length.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND focallen = ?{}", param_count));
+    }
+
+    // Date range filter (optional)
+    if date_range.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND date_obs >= ?{}", param_count));
+        param_count += 1;
+        query.push_str(&format!(" AND date_obs <= ?{}", param_count));
+    }
+
+    query.push_str(" ORDER BY date_obs ASC");
+
+    // Log the complete SQL query
+    println!("    🔍 Executing Dark SQL query:");
+    println!("       instrume={}, binning={}, gain={:?}, offset={:?}, exptime={:?}, focallen={:?}",
+        instrume, binning, gain, offset, exptime, focal_length);
+    if let Some((start, end)) = date_range {
+        println!("       date_range: {} to {}", start, end);
+    }
+
+    // Execute query with parameter binding
+    let frames = execute_dark_query(conn, &query, instrume, binning, gain, offset, exptime, focal_length, date_range)?;
+
+    println!("    📊 SQL query found {} dark frames", frames.len());
+
+    // Cluster frames by time proximity
+    let groups = cluster_dark_frames_by_time(
+        frames,
+        time_cluster_minutes,
+        instrume,
+        binning,
+        gain,
+        offset,
+        exptime,
+        focal_length,
+    );
+
+    println!("    🗂️  Clustered into {} dark groups", groups.len());
+
+    Ok(groups)
+}
+
+/// Detects bias groups by clustering frames with close temporal proximity
+///
+/// # Arguments
+/// * `conn` - Database connection
+/// * `instrume` - Camera/instrument name (exact match)
+/// * `binning` - Binning pattern (exact match)
+/// * `gain` - Gain setting (exact match if Some)
+/// * `offset` - Offset setting (exact match if Some)
+/// * `focal_length` - Focal length (exact match if Some)
+/// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
+/// * `date_range` - Optional date range to limit search (start, end)
+///
+/// # Returns
+/// Vector of BiasGroup objects, sorted by start_time (newest first)
+pub fn detect_bias_groups(
+    conn: &Connection,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    focal_length: Option<f64>,
+    time_cluster_minutes: i64,
+    date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<Vec<BiasGroup>> {
+    // Build query with parameter matching (NO exptime for bias)
+    let mut query = String::from(
+        "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
+                is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
+                ccd_temp, set_temp, focallen, xpixsz, pixsz, naxis1, naxis2,
+                sitelat, lat_obs, sitelong, long_obs
+         FROM frames
+         WHERE imagetyp = 'Bias' AND instrume = ?1 AND binning = ?2"
+    );
+
+    let mut param_count = 2;
+
+    // Gain parameter (exact match if provided)
+    if gain.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND gain = ?{}", param_count));
+    }
+
+    // Offset parameter (exact match if provided)
+    if offset.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND offset = ?{}", param_count));
+    }
+
+    // Focal length parameter (exact match if provided)
+    if focal_length.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND focallen = ?{}", param_count));
+    }
+
+    // Date range filter (optional)
+    if date_range.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND date_obs >= ?{}", param_count));
+        param_count += 1;
+        query.push_str(&format!(" AND date_obs <= ?{}", param_count));
+    }
+
+    query.push_str(" ORDER BY date_obs ASC");
+
+    // Log the complete SQL query
+    println!("    🔍 Executing Bias SQL query:");
+    println!("       instrume={}, binning={}, gain={:?}, offset={:?}, focallen={:?}",
+        instrume, binning, gain, offset, focal_length);
+    if let Some((start, end)) = date_range {
+        println!("       date_range: {} to {}", start, end);
+    }
+
+    // Execute query with parameter binding
+    let frames = execute_bias_query(conn, &query, instrume, binning, gain, offset, focal_length, date_range)?;
+
+    println!("    📊 SQL query found {} bias frames", frames.len());
+
+    // Cluster frames by time proximity
+    let groups = cluster_bias_frames_by_time(
+        frames,
+        time_cluster_minutes,
+        instrume,
+        binning,
+        gain,
+        offset,
+        focal_length,
+    );
+
+    println!("    🗂️  Clustered into {} bias groups", groups.len());
+
+    Ok(groups)
+}
+
+/// Execute Dark query with parameter binding
+fn execute_dark_query(
+    conn: &Connection,
+    query: &str,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    exptime: Option<f64>,
+    focal_length: Option<f64>,
+    date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<Vec<Frame>> {
+    let mut stmt = conn.prepare(query)?;
+
+    let mut param_idx = 1;
+    stmt.raw_bind_parameter(param_idx, instrume)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, binning)?;
+    param_idx += 1;
+
+    if let Some(g) = gain {
+        stmt.raw_bind_parameter(param_idx, g)?;
+        param_idx += 1;
+    }
+
+    if let Some(o) = offset {
+        stmt.raw_bind_parameter(param_idx, o)?;
+        param_idx += 1;
+    }
+
+    if let Some(e) = exptime {
+        stmt.raw_bind_parameter(param_idx, e)?;
+        param_idx += 1;
+    }
+
+    if let Some(fl) = focal_length {
+        stmt.raw_bind_parameter(param_idx, fl)?;
+        param_idx += 1;
+    }
+
+    if let Some((start, end)) = date_range {
+        stmt.raw_bind_parameter(param_idx, start.to_rfc3339())?;
+        param_idx += 1;
+        stmt.raw_bind_parameter(param_idx, end.to_rfc3339())?;
+    }
+
+    let mut frames = Vec::new();
+    let mut rows = stmt.raw_query();
+
+    while let Some(row) = rows.next()? {
+        use crate::models::ImageType;
+
+        // Parse date_obs
+        let date_obs_str: Option<String> = row.get(3)?;
+        let date_obs = date_obs_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        // Parse imagetyp
+        let imagetyp_str: Option<String> = row.get(8)?;
+        let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
+
+        // Calculate binning
+        let xbinning: Option<i32> = row.get(16)?;
+        let ybinning: Option<i32> = row.get(17)?;
+        let binning = match (xbinning, ybinning) {
+            (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
+            _ => None,
+        };
+
+        // Convert is_master from SQL INTEGER to bool
+        let is_master_int: i32 = row.get(9)?;
+        let is_master = is_master_int != 0;
+
+        let frame = Frame {
+            id: Some(row.get(0)?),
+            file_id: row.get(1)?,
+            object: row.get(2)?,
+            date_obs,
+            telescop: row.get(4)?,
+            instrume: row.get(5)?,
+            exptime: row.get(6)?,
+            filter: row.get(7)?,
+            imagetyp,
+            is_master,
+            gain: row.get(14)?,
+            offset: row.get(15)?,
+            binning,
+            xbinning,
+            ybinning,
+            ccd_temp: row.get(18)?,
+            set_temp: row.get(19)?,
+            focallen: row.get(20)?,
+            xpixsz: row.get(21)?,
+            pixsz: row.get(22)?,
+            naxis1: row.get(23)?,
+            naxis2: row.get(24)?,
+            ra: row.get(10)?,
+            dec: row.get(11)?,
+            sitelat: row.get(25)?,
+            lat_obs: row.get(26)?,
+            sitelong: row.get(27)?,
+            long_obs: row.get(28)?,
+            objctra: row.get(12)?,
+            objctdec: row.get(13)?,
+            override_: false,
+        };
+
+        frames.push(frame);
+    }
+
+    Ok(frames)
+}
+
+/// Execute Bias query with parameter binding
+fn execute_bias_query(
+    conn: &Connection,
+    query: &str,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    focal_length: Option<f64>,
+    date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<Vec<Frame>> {
+    let mut stmt = conn.prepare(query)?;
+
+    let mut param_idx = 1;
+    stmt.raw_bind_parameter(param_idx, instrume)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, binning)?;
+    param_idx += 1;
+
+    if let Some(g) = gain {
+        stmt.raw_bind_parameter(param_idx, g)?;
+        param_idx += 1;
+    }
+
+    if let Some(o) = offset {
+        stmt.raw_bind_parameter(param_idx, o)?;
+        param_idx += 1;
+    }
+
+    if let Some(fl) = focal_length {
+        stmt.raw_bind_parameter(param_idx, fl)?;
+        param_idx += 1;
+    }
+
+    if let Some((start, end)) = date_range {
+        stmt.raw_bind_parameter(param_idx, start.to_rfc3339())?;
+        param_idx += 1;
+        stmt.raw_bind_parameter(param_idx, end.to_rfc3339())?;
+    }
+
+    let mut frames = Vec::new();
+    let mut rows = stmt.raw_query();
+
+    while let Some(row) = rows.next()? {
+        use crate::models::ImageType;
+
+        // Parse date_obs
+        let date_obs_str: Option<String> = row.get(3)?;
+        let date_obs = date_obs_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        // Parse imagetyp
+        let imagetyp_str: Option<String> = row.get(8)?;
+        let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
+
+        // Calculate binning
+        let xbinning: Option<i32> = row.get(16)?;
+        let ybinning: Option<i32> = row.get(17)?;
+        let binning = match (xbinning, ybinning) {
+            (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
+            _ => None,
+        };
+
+        // Convert is_master from SQL INTEGER to bool
+        let is_master_int: i32 = row.get(9)?;
+        let is_master = is_master_int != 0;
+
+        let frame = Frame {
+            id: Some(row.get(0)?),
+            file_id: row.get(1)?,
+            object: row.get(2)?,
+            date_obs,
+            telescop: row.get(4)?,
+            instrume: row.get(5)?,
+            exptime: row.get(6)?,
+            filter: row.get(7)?,
+            imagetyp,
+            is_master,
+            gain: row.get(14)?,
+            offset: row.get(15)?,
+            binning,
+            xbinning,
+            ybinning,
+            ccd_temp: row.get(18)?,
+            set_temp: row.get(19)?,
+            focallen: row.get(20)?,
+            xpixsz: row.get(21)?,
+            pixsz: row.get(22)?,
+            naxis1: row.get(23)?,
+            naxis2: row.get(24)?,
+            ra: row.get(10)?,
+            dec: row.get(11)?,
+            sitelat: row.get(25)?,
+            lat_obs: row.get(26)?,
+            sitelong: row.get(27)?,
+            long_obs: row.get(28)?,
+            objctra: row.get(12)?,
+            objctdec: row.get(13)?,
+            override_: false,
+        };
+
+        frames.push(frame);
+    }
+
+    Ok(frames)
+}
+
+/// Clusters dark frames into groups based on time proximity
+fn cluster_dark_frames_by_time(
+    frames: Vec<Frame>,
+    time_cluster_minutes: i64,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    exptime: Option<f64>,
+    focal_length: Option<f64>,
+) -> Vec<DarkGroup> {
+    if frames.is_empty() {
+        return Vec::new();
+    }
+
+    let threshold_seconds = time_cluster_minutes * 60;
+    let mut groups = Vec::new();
+    let mut current_group: Vec<Frame> = Vec::new();
+
+    for frame in frames {
+        if current_group.is_empty() {
+            // Start first group
+            current_group.push(frame);
+        } else {
+            // Check time gap from last frame in current group
+            let last_frame = current_group.last().unwrap();
+
+            if let (Some(last_date), Some(curr_date)) = (&last_frame.date_obs, &frame.date_obs) {
+                let gap_seconds = (*curr_date - *last_date).num_seconds();
+
+                if gap_seconds <= threshold_seconds {
+                    // Within threshold - add to current group
+                    current_group.push(frame);
+                } else {
+                    // Gap too large - close current group and start new one
+                    if !current_group.is_empty() {
+                        groups.push(create_dark_group(
+                            current_group,
+                            instrume,
+                            binning,
+                            gain,
+                            offset,
+                            exptime,
+                            focal_length,
+                        ));
+                    }
+                    current_group = vec![frame];
+                }
+            } else {
+                // Missing date - add to current group anyway
+                current_group.push(frame);
+            }
+        }
+    }
+
+    // Don't forget last group
+    if !current_group.is_empty() {
+        groups.push(create_dark_group(
+            current_group,
+            instrume,
+            binning,
+            gain,
+            offset,
+            exptime,
+            focal_length,
+        ));
+    }
+
+    // Sort groups by start_time (newest first)
+    groups.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+
+    groups
+}
+
+/// Clusters bias frames into groups based on time proximity
+fn cluster_bias_frames_by_time(
+    frames: Vec<Frame>,
+    time_cluster_minutes: i64,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    focal_length: Option<f64>,
+) -> Vec<BiasGroup> {
+    if frames.is_empty() {
+        return Vec::new();
+    }
+
+    let threshold_seconds = time_cluster_minutes * 60;
+    let mut groups = Vec::new();
+    let mut current_group: Vec<Frame> = Vec::new();
+
+    for frame in frames {
+        if current_group.is_empty() {
+            // Start first group
+            current_group.push(frame);
+        } else {
+            // Check time gap from last frame in current group
+            let last_frame = current_group.last().unwrap();
+
+            if let (Some(last_date), Some(curr_date)) = (&last_frame.date_obs, &frame.date_obs) {
+                let gap_seconds = (*curr_date - *last_date).num_seconds();
+
+                if gap_seconds <= threshold_seconds {
+                    // Within threshold - add to current group
+                    current_group.push(frame);
+                } else {
+                    // Gap too large - close current group and start new one
+                    if !current_group.is_empty() {
+                        groups.push(create_bias_group(
+                            current_group,
+                            instrume,
+                            binning,
+                            gain,
+                            offset,
+                            focal_length,
+                        ));
+                    }
+                    current_group = vec![frame];
+                }
+            } else {
+                // Missing date - add to current group anyway
+                current_group.push(frame);
+            }
+        }
+    }
+
+    // Don't forget last group
+    if !current_group.is_empty() {
+        groups.push(create_bias_group(
+            current_group,
+            instrume,
+            binning,
+            gain,
+            offset,
+            focal_length,
+        ));
+    }
+
+    // Sort groups by start_time (newest first)
+    groups.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+
+    groups
+}
+
+/// Creates a DarkGroup from a vector of frames
+fn create_dark_group(
+    frames: Vec<Frame>,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    exptime: Option<f64>,
+    focal_length: Option<f64>,
+) -> DarkGroup {
+    let frame_count = frames.len();
+    let frame_ids: Vec<i64> = frames.iter().filter_map(|f| f.id).collect();
+
+    // Get first and last timestamps
+    let start_time = frames.first()
+        .and_then(|f| f.date_obs)
+        .unwrap_or_else(Utc::now);
+
+    let end_time = frames.last()
+        .and_then(|f| f.date_obs)
+        .unwrap_or_else(Utc::now);
+
+    // Calculate average temperature (if available)
+    let temps: Vec<f64> = frames.iter()
+        .filter_map(|f| f.ccd_temp)
+        .collect();
+
+    let avg_temp = if !temps.is_empty() {
+        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    } else {
+        None
+    };
+
+    DarkGroup {
+        frame_ids,
+        start_time,
+        end_time,
+        avg_temp,
+        frame_count,
+        instrume: instrume.to_string(),
+        binning: binning.to_string(),
+        gain,
+        offset,
+        exptime,
+        focal_length,
+    }
+}
+
+/// Creates a BiasGroup from a vector of frames
+fn create_bias_group(
+    frames: Vec<Frame>,
+    instrume: &str,
+    binning: &str,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    focal_length: Option<f64>,
+) -> BiasGroup {
+    let frame_count = frames.len();
+    let frame_ids: Vec<i64> = frames.iter().filter_map(|f| f.id).collect();
+
+    // Get first and last timestamps
+    let start_time = frames.first()
+        .and_then(|f| f.date_obs)
+        .unwrap_or_else(Utc::now);
+
+    let end_time = frames.last()
+        .and_then(|f| f.date_obs)
+        .unwrap_or_else(Utc::now);
+
+    // Calculate average temperature (if available)
+    let temps: Vec<f64> = frames.iter()
+        .filter_map(|f| f.ccd_temp)
+        .collect();
+
+    let avg_temp = if !temps.is_empty() {
+        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    } else {
+        None
+    };
+
+    BiasGroup {
+        frame_ids,
+        start_time,
+        end_time,
+        avg_temp,
+        frame_count,
+        instrume: instrume.to_string(),
+        binning: binning.to_string(),
+        gain,
+        offset,
+        focal_length,
+    }
+}
+
+/// Creates a dark calibration set from a DarkGroup
+///
+/// # Arguments
+/// * `conn` - Database connection
+/// * `dark_group` - The dark group to convert to a calibration set
+///
+/// # Returns
+/// The ID of the created (or existing) calibration set
+pub fn create_dark_calibration_set(
+    conn: &Connection,
+    dark_group: &DarkGroup,
+) -> Result<i64> {
+    // Check if set already exists with same parameters
+    let existing_set_id = check_for_existing_dark_set(conn, dark_group)?;
+    println!("    🔍 Existing dark set check: {:?}", existing_set_id);
+
+    if let Some(set_id) = existing_set_id {
+        // Set already exists, return its ID
+        println!("    ♻️  Reusing existing dark calibration set ID: {}", set_id);
+        return Ok(set_id);
+    }
+
+    // Create new calibration set
+    let date = dark_group.start_time.format("%Y-%m-%d").to_string();
+    let date_start = dark_group.start_time.to_rfc3339();
+    let date_end = dark_group.end_time.to_rfc3339();
+    let frame_count = dark_group.frame_ids.len() as i64;
+
+    // For dark groups, temp_min and temp_max are the same as avg_temp
+    let temp_min = dark_group.avg_temp;
+    let temp_max = dark_group.avg_temp;
+
+    println!("    📝 Creating new dark calibration set:");
+    println!("       date={}, exptime={:?}, gain={:?}, offset={:?}, binning={}, instrume={}",
+        date, dark_group.exptime, dark_group.gain, dark_group.offset, dark_group.binning, dark_group.instrume);
+    println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
+
+    conn.execute(
+        "INSERT INTO calibration_set
+         (imagetyp, exptime, filter, ccd_temp, gain, offset, binning, instrume, date,
+          date_start, date_end, temp_min, temp_max, frame_count, focallen)
+         VALUES ('Dark', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        (
+            &dark_group.exptime,
+            &dark_group.avg_temp,
+            &dark_group.gain,
+            &dark_group.offset,
+            &dark_group.binning,
+            &dark_group.instrume,
+            &date,
+            &date_start,
+            &date_end,
+            &temp_min,
+            &temp_max,
+            &frame_count,
+            &dark_group.focal_length,
+        ),
+    )?;
+
+    let set_id = conn.last_insert_rowid();
+    println!("    ✅ Created dark calibration set with ID: {}", set_id);
+
+    // Link frames to set
+    println!("    🔗 Linking {} frames to set {}", dark_group.frame_ids.len(), set_id);
+    for (idx, frame_id) in dark_group.frame_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            (set_id, frame_id),
+        ).map_err(|e| {
+            eprintln!("    ❌ Failed to link frame {} (index {}/{}): {}",
+                frame_id, idx + 1, dark_group.frame_ids.len(), e);
+            e
+        })?;
+    }
+    println!("    ✅ Linked all {} frames successfully", dark_group.frame_ids.len());
+
+    Ok(set_id)
+}
+
+/// Creates a bias calibration set from a BiasGroup
+///
+/// # Arguments
+/// * `conn` - Database connection
+/// * `bias_group` - The bias group to convert to a calibration set
+///
+/// # Returns
+/// The ID of the created (or existing) calibration set
+pub fn create_bias_calibration_set(
+    conn: &Connection,
+    bias_group: &BiasGroup,
+) -> Result<i64> {
+    // Check if set already exists with same parameters
+    let existing_set_id = check_for_existing_bias_set(conn, bias_group)?;
+    println!("    🔍 Existing bias set check: {:?}", existing_set_id);
+
+    if let Some(set_id) = existing_set_id {
+        // Set already exists, return its ID
+        println!("    ♻️  Reusing existing bias calibration set ID: {}", set_id);
+        return Ok(set_id);
+    }
+
+    // Create new calibration set
+    let date = bias_group.start_time.format("%Y-%m-%d").to_string();
+    let date_start = bias_group.start_time.to_rfc3339();
+    let date_end = bias_group.end_time.to_rfc3339();
+    let frame_count = bias_group.frame_ids.len() as i64;
+
+    // For bias groups, temp_min and temp_max are the same as avg_temp
+    let temp_min = bias_group.avg_temp;
+    let temp_max = bias_group.avg_temp;
+
+    println!("    📝 Creating new bias calibration set:");
+    println!("       date={}, gain={:?}, offset={:?}, binning={}, instrume={}",
+        date, bias_group.gain, bias_group.offset, bias_group.binning, bias_group.instrume);
+    println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
+
+    conn.execute(
+        "INSERT INTO calibration_set
+         (imagetyp, exptime, filter, ccd_temp, gain, offset, binning, instrume, date,
+          date_start, date_end, temp_min, temp_max, frame_count, focallen)
+         VALUES ('Bias', NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        (
+            &bias_group.avg_temp,
+            &bias_group.gain,
+            &bias_group.offset,
+            &bias_group.binning,
+            &bias_group.instrume,
+            &date,
+            &date_start,
+            &date_end,
+            &temp_min,
+            &temp_max,
+            &frame_count,
+            &bias_group.focal_length,
+        ),
+    )?;
+
+    let set_id = conn.last_insert_rowid();
+    println!("    ✅ Created bias calibration set with ID: {}", set_id);
+
+    // Link frames to set
+    println!("    🔗 Linking {} frames to set {}", bias_group.frame_ids.len(), set_id);
+    for (idx, frame_id) in bias_group.frame_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            (set_id, frame_id),
+        ).map_err(|e| {
+            eprintln!("    ❌ Failed to link frame {} (index {}/{}): {}",
+                frame_id, idx + 1, bias_group.frame_ids.len(), e);
+            e
+        })?;
+    }
+    println!("    ✅ Linked all {} frames successfully", bias_group.frame_ids.len());
+
+    Ok(set_id)
+}
+
+/// Checks if a calibration set already exists for this dark group
+fn check_for_existing_dark_set(
+    conn: &Connection,
+    dark_group: &DarkGroup,
+) -> Result<Option<i64>> {
+    let date = dark_group.start_time.format("%Y-%m-%d").to_string();
+
+    let mut query = String::from(
+        "SELECT cs.id
+         FROM calibration_set cs
+         WHERE cs.imagetyp = 'Dark'
+           AND cs.binning = ?1
+           AND cs.instrume = ?2
+           AND cs.date = ?3
+           AND cs.frame_count > 0
+           AND cs.date_start IS NOT NULL
+           AND cs.date_end IS NOT NULL"
+    );
+
+    let mut param_count = 3;
+
+    if dark_group.gain.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.gain = ?{}", param_count));
+    }
+
+    if dark_group.offset.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.offset = ?{}", param_count));
+    }
+
+    if dark_group.exptime.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.exptime = ?{}", param_count));
+    }
+
+    if dark_group.focal_length.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.focallen = ?{}", param_count));
+    }
+
+    query.push_str(" LIMIT 1");
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let mut param_idx = 1;
+    stmt.raw_bind_parameter(param_idx, &dark_group.binning)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &dark_group.instrume)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &date)?;
+    param_idx += 1;
+
+    if let Some(gain) = dark_group.gain {
+        stmt.raw_bind_parameter(param_idx, gain)?;
+        param_idx += 1;
+    }
+
+    if let Some(offset) = dark_group.offset {
+        stmt.raw_bind_parameter(param_idx, offset)?;
+        param_idx += 1;
+    }
+
+    if let Some(exptime) = dark_group.exptime {
+        stmt.raw_bind_parameter(param_idx, exptime)?;
+        param_idx += 1;
+    }
+
+    if let Some(focal_length) = dark_group.focal_length {
+        stmt.raw_bind_parameter(param_idx, focal_length)?;
+    }
+
+    let mut rows = stmt.raw_query();
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get::<_, i64>(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Checks if a calibration set already exists for this bias group
+fn check_for_existing_bias_set(
+    conn: &Connection,
+    bias_group: &BiasGroup,
+) -> Result<Option<i64>> {
+    let date = bias_group.start_time.format("%Y-%m-%d").to_string();
+
+    let mut query = String::from(
+        "SELECT cs.id
+         FROM calibration_set cs
+         WHERE cs.imagetyp = 'Bias'
+           AND cs.binning = ?1
+           AND cs.instrume = ?2
+           AND cs.date = ?3
+           AND cs.frame_count > 0
+           AND cs.date_start IS NOT NULL
+           AND cs.date_end IS NOT NULL"
+    );
+
+    let mut param_count = 3;
+
+    if bias_group.gain.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.gain = ?{}", param_count));
+    }
+
+    if bias_group.offset.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.offset = ?{}", param_count));
+    }
+
+    if bias_group.focal_length.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.focallen = ?{}", param_count));
+    }
+
+    query.push_str(" LIMIT 1");
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let mut param_idx = 1;
+    stmt.raw_bind_parameter(param_idx, &bias_group.binning)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &bias_group.instrume)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &date)?;
+    param_idx += 1;
+
+    if let Some(gain) = bias_group.gain {
+        stmt.raw_bind_parameter(param_idx, gain)?;
+        param_idx += 1;
+    }
+
+    if let Some(offset) = bias_group.offset {
+        stmt.raw_bind_parameter(param_idx, offset)?;
+        param_idx += 1;
+    }
+
+    if let Some(focal_length) = bias_group.focal_length {
+        stmt.raw_bind_parameter(param_idx, focal_length)?;
+    }
+
+    let mut rows = stmt.raw_query();
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get::<_, i64>(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_dark_frames() {
+        let groups = cluster_dark_frames_by_time(
+            Vec::new(),
+            30,
+            "TestCamera",
+            "1x1",
+            None,
+            None,
+            Some(300.0),
+            None,
+        );
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_empty_bias_frames() {
+        let groups = cluster_bias_frames_by_time(
+            Vec::new(),
+            30,
+            "TestCamera",
+            "1x1",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(groups.len(), 0);
+    }
+}

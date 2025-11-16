@@ -1,10 +1,12 @@
 // Frame set processor - processes all light frames in a frame set
 use crate::models::{Frame, CalibrationTolerance, CalibrationHierarchy, ImageType};
 use crate::calibration::hierarchy::{build_complete_hierarchy, store_calibration_hierarchy};
+use crate::commands::AppState;
 use rusqlite::Connection;
 use anyhow::{Result, Context};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
+use tauri::State;
 
 /// Progress report for frame set processing
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,10 +174,31 @@ pub fn get_light_frames_from_frame_set(
 }
 
 /// Process all light frames in a frame set and find calibration for each
+///
+/// # Arguments
+/// * `conn` - Database connection
+/// * `frame_set_id` - ID of the frame set to process
+/// * `tolerance` - Calibration matching tolerance
+/// * `flat_pattern` - Optional flat pattern preference
+/// * `manual_flat_selections` - Optional manual flat selections per filter
+/// * `max_age_days` - Maximum age of flats to consider
+/// * `time_cluster_minutes` - Time threshold for grouping flats
+/// * `temp_weight` - Weight for temperature matching
+/// * `session_start` - Optional session start time
+/// * `session_end` - Optional session end time
+/// * `state` - AppState for accessing settings and on-demand calibration creation
 pub fn process_frame_set(
     conn: &Connection,
     frame_set_id: i64,
     tolerance: &CalibrationTolerance,
+    flat_pattern: Option<&str>,
+    manual_flat_selections: Option<&std::collections::HashMap<String, i64>>,
+    max_age_days: i64,
+    time_cluster_minutes: i64,
+    temp_weight: f64,
+    session_start: Option<DateTime<Utc>>,
+    session_end: Option<DateTime<Utc>>,
+    state: &State<'_, AppState>,
 ) -> Result<ProcessingStats> {
     // Get all light frames from the frame set
     let frames = get_light_frames_from_frame_set(conn, frame_set_id)
@@ -186,9 +209,27 @@ pub fn process_frame_set(
 
     // Process each frame
     for (index, frame) in frames.iter().enumerate() {
+        // Get manual flat selection for this frame's filter (if any)
+        let manual_flat_set_id = manual_flat_selections
+            .and_then(|selections| {
+                frame.filter.as_ref()
+                    .and_then(|filter| selections.get(filter).copied())
+            });
+
         // Build calibration hierarchy for this frame
-        let hierarchy = build_complete_hierarchy(conn, frame, tolerance)
-            .context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
+        let hierarchy = build_complete_hierarchy(
+            conn,
+            frame,
+            tolerance,
+            flat_pattern,
+            manual_flat_set_id,
+            max_age_days,
+            time_cluster_minutes,
+            temp_weight,
+            session_start,
+            session_end,
+            state,
+        ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
 
         // Store hierarchy in database
         store_calibration_hierarchy(conn, &hierarchy)
@@ -222,6 +263,14 @@ pub fn process_frame_set_with_progress<F>(
     conn: &Connection,
     frame_set_id: i64,
     tolerance: &CalibrationTolerance,
+    flat_pattern: Option<&str>,
+    manual_flat_selections: Option<&std::collections::HashMap<String, i64>>,
+    max_age_days: i64,
+    time_cluster_minutes: i64,
+    temp_weight: f64,
+    session_start: Option<DateTime<Utc>>,
+    session_end: Option<DateTime<Utc>>,
+    state: &State<'_, AppState>,
     mut progress_callback: F,
 ) -> Result<ProcessingStats>
 where
@@ -236,9 +285,27 @@ where
 
     // Process each frame
     for (index, frame) in frames.iter().enumerate() {
+        // Get manual flat selection for this frame's filter (if any)
+        let manual_flat_set_id = manual_flat_selections
+            .and_then(|selections| {
+                frame.filter.as_ref()
+                    .and_then(|filter| selections.get(filter).copied())
+            });
+
         // Build calibration hierarchy for this frame
-        let hierarchy = build_complete_hierarchy(conn, frame, tolerance)
-            .context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
+        let hierarchy = build_complete_hierarchy(
+            conn,
+            frame,
+            tolerance,
+            flat_pattern,
+            manual_flat_set_id,
+            max_age_days,
+            time_cluster_minutes,
+            temp_weight,
+            session_start,
+            session_end,
+            state,
+        ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
 
         // Store hierarchy in database
         store_calibration_hierarchy(conn, &hierarchy)

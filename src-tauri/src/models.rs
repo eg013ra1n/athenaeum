@@ -245,6 +245,7 @@ pub struct FramesSet {
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
     pub total_exp_time: Option<f64>,
+    pub flat_pattern: Option<String>,
 }
 
 /// FITS header storage

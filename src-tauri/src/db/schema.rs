@@ -410,5 +410,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add flat_pattern to frames_set table (migration for existing databases)
+    let has_flat_pattern: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='flat_pattern'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_flat_pattern {
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN flat_pattern TEXT",
+            [],
+        )?;
+    }
+
     Ok(())
 }

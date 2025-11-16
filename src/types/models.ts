@@ -175,6 +175,7 @@ export interface FramesSet {
   objctra: string | null;
   objctdec: string | null;
   total_exp_time: number | null;
+  flat_pattern: string | null;  // e.g., "before_session", "after_session", "manual"
 }
 
 export interface FramesSetMember {
@@ -451,4 +452,49 @@ export interface ProcessingStats {
   missing_flats: number;
   missing_darks: number;
   missing_bias: number;
+}
+
+// Flat Calibration System
+export enum FlatTiming {
+  Before = "Before",
+  After = "After",
+  During = "During",
+}
+
+export enum FlatPattern {
+  BeforeSession = "before_session",
+  AfterSession = "after_session",
+  BeforeFilterChange = "before_filter_change",
+  LongTerm = "long_term",
+  Manual = "manual",
+}
+
+export interface FlatGroup {
+  frame_ids: number[];
+  start_time: string;  // ISO 8601 datetime
+  end_time: string;    // ISO 8601 datetime
+  avg_temp: number | null;
+  frame_count: number;
+  filter: string | null;
+  instrume: string;
+  binning: string;
+  gain: number | null;
+  offset: number | null;
+  exptime: number | null;
+  focal_length: number | null;
+}
+
+export interface FlatGroupMatch {
+  group: FlatGroup;
+  match_score: number;  // 0.0-1.0, higher is better
+  age_days: number;
+  temp_diff: number | null;
+  timing: FlatTiming;
+}
+
+export interface FilterPeriod {
+  filter: string | null;
+  start_time: string;  // ISO 8601 datetime
+  end_time: string;    // ISO 8601 datetime
+  frame_count: number;
 }
