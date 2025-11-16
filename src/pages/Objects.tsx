@@ -4,7 +4,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
-import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 
 export default function Objects() {
   const navigate = useNavigate();
@@ -856,16 +855,6 @@ export default function Objects() {
                   >
                     <Trash2 size={16} />
                   </button>
-                </div>
-                <div onClick={(e) => e.stopPropagation()}>
-                  <CalibrationFinderButton
-                    frameSetId={frames_set.id!}
-                    frameSetName={frames_set.name}
-                    onComplete={() => {
-                      // Optionally refresh the frame sets to show updated calibration status
-                      loadFrameSets();
-                    }}
-                  />
                 </div>
               </div>
             </div>

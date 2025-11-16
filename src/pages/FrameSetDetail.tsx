@@ -7,6 +7,7 @@ import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationStatusBadges } from '../components/CalibrationStatusBadges';
+import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -453,7 +454,14 @@ export default function FrameSetDetail() {
 
       {/* Frame Set Header */}
       <div className="bg-gray-800 rounded-lg p-6 mb-6 border border-gray-700">
-        <h1 className="text-3xl font-bold mb-4">{detail.frames_set?.name || 'Untitled'}</h1>
+        <div className="flex items-start justify-between mb-4">
+          <h1 className="text-3xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
+          <CalibrationFinderButton
+            frameSetId={parseInt(id!)}
+            frameSetName={detail.frames_set?.name || 'Untitled'}
+            onComplete={() => loadDetail()}
+          />
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="bg-gray-900/50 rounded p-4">
