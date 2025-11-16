@@ -1,9 +1,9 @@
 // Equipment-related database operations
 
-use crate::models::{CameraStats, CalibrationSetDetail, ImageType};
+use crate::models::{CameraStats, CalibrationSetDetail, FileWithFrame, ImageType};
 use anyhow::Result;
-use chrono::DateTime;
-use rusqlite::Connection;
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, params};
 
 /// Get all cameras with statistics
 pub fn get_all_cameras(conn: &Connection) -> Result<Vec<CameraStats>> {
@@ -201,4 +201,89 @@ pub fn has_master_dark_library(conn: &Connection, instrume: &str) -> Result<bool
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1")?;
     let count: i64 = stmt.query_row([instrume], |row| row.get(0))?;
     Ok(count > 0)
+}
+
+/// Get frames for a specific calibration set
+pub fn get_frames_for_calibration_set(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<Vec<FileWithFrame>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+                fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
+                fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
+                fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
+                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
+         FROM calibration_set_frames csf
+         JOIN frames fr ON csf.frame_id = fr.id
+         JOIN files f ON fr.file_id = f.id
+         WHERE csf.set_id = ?1
+         ORDER BY fr.date_obs ASC",
+    )?;
+
+    let frames = stmt.query_map(params![set_id], |row| {
+        let file = crate::models::File {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            size: row.get(3)?,
+            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            format: if row.get::<_, String>(5)? == "FITS" {
+                crate::models::FileFormat::FITS
+            } else {
+                crate::models::FileFormat::XISF
+            },
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            metadata_hash: row.get(7)?,
+            content_hash: row.get(8)?,
+        };
+
+        let frame = crate::models::Frame {
+            id: row.get(9)?,
+            file_id: row.get(10)?,
+            object: row.get(11)?,
+            date_obs: row.get::<_, Option<String>>(12)?.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            }),
+            telescop: row.get(13)?,
+            instrume: row.get(14)?,
+            exptime: row.get(15)?,
+            filter: row.get(16)?,
+            imagetyp: row.get::<_, Option<String>>(17)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+            is_master: row.get::<_, i32>(18)? == 1,
+            gain: row.get(19)?,
+            offset: row.get(20)?,
+            binning: row.get(21)?,
+            xbinning: row.get(22)?,
+            ybinning: row.get(23)?,
+            ccd_temp: row.get(24)?,
+            set_temp: row.get(25)?,
+            focallen: row.get(26)?,
+            xpixsz: row.get(27)?,
+            pixsz: row.get(28)?,
+            naxis1: row.get(29)?,
+            naxis2: row.get(30)?,
+            ra: row.get(31)?,
+            dec: row.get(32)?,
+            sitelat: row.get(33)?,
+            lat_obs: row.get(34)?,
+            sitelong: row.get(35)?,
+            long_obs: row.get(36)?,
+            objctra: row.get(37)?,
+            objctdec: row.get(38)?,
+            override_: row.get::<_, i32>(39)? == 1,
+        };
+
+        Ok(FileWithFrame {
+            file,
+            frame: Some(frame),
+        })
+    })?;
+
+    frames.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
 }

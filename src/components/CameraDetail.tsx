@@ -1,9 +1,8 @@
 import { useState } from "react";
 import { ArrowLeft, Zap } from "lucide-react";
 import DarkLibrary from "./DarkLibrary";
-import MasterDarkLibrary from "./MasterDarkLibrary";
 import { invoke } from "@tauri-apps/api/core";
-import { DarkLibraryResult } from "../types/models";
+import { DarkLibraryResult, ImageType } from "../types/models";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 interface CameraDetailProps {
@@ -11,10 +10,10 @@ interface CameraDetailProps {
   onClose: () => void;
 }
 
-type TabType = "dark" | "master";
+type TabType = "darks" | "flats";
 
 export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
-  const [activeTab, setActiveTab] = useState<TabType>("dark");
+  const [activeTab, setActiveTab] = useState<TabType>("darks");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -98,37 +97,45 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
       <div className="border-b border-gray-700 mb-6">
         <div className="flex gap-4">
           <button
-            onClick={() => setActiveTab("dark")}
+            onClick={() => setActiveTab("darks")}
             className={`px-4 py-2 border-b-2 transition-colors ${
-              activeTab === "dark"
+              activeTab === "darks"
                 ? "border-blue-500 text-blue-400"
                 : "border-transparent text-gray-400 hover:text-gray-200"
             }`}
           >
-            Dark Library
-            <span className="text-xs ml-2 text-gray-500">(Single Frames)</span>
+            Darks
+            <span className="text-xs ml-2 text-gray-500">(Dark/Bias/DarkFlat)</span>
           </button>
           <button
-            onClick={() => setActiveTab("master")}
+            onClick={() => setActiveTab("flats")}
             className={`px-4 py-2 border-b-2 transition-colors ${
-              activeTab === "master"
+              activeTab === "flats"
                 ? "border-blue-500 text-blue-400"
                 : "border-transparent text-gray-400 hover:text-gray-200"
             }`}
           >
-            Master Library
-            <span className="text-xs ml-2 text-gray-500">(Master Frames)</span>
+            Flats
+            <span className="text-xs ml-2 text-gray-500">(Flat Calibration)</span>
           </button>
         </div>
       </div>
 
       {/* Tab Content */}
       <div>
-        {activeTab === "dark" && (
-          <DarkLibrary instrume={instrume} isTabView={true} />
+        {activeTab === "darks" && (
+          <DarkLibrary
+            instrume={instrume}
+            isTabView={true}
+            imageTypeFilter={[ImageType.Dark, ImageType.Bias, ImageType.DarkFlat]}
+          />
         )}
-        {activeTab === "master" && (
-          <MasterDarkLibrary instrume={instrume} isTabView={true} />
+        {activeTab === "flats" && (
+          <DarkLibrary
+            instrume={instrume}
+            isTabView={true}
+            imageTypeFilter={[ImageType.Flat]}
+          />
         )}
       </div>
 

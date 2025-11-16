@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, Plus, RefreshCw } from "lucide-react";
-import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
+import { CalibrationSetDetail, DarkLibraryResult, ImageType } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState } from "./DarkLibraryFilters";
 import QuickStats from "./QuickStats";
@@ -11,9 +11,10 @@ interface DarkLibraryProps {
   instrume: string;
   onClose?: () => void;
   isTabView?: boolean;
+  imageTypeFilter?: ImageType[];
 }
 
-export default function DarkLibrary({ instrume, onClose, isTabView = false }: DarkLibraryProps) {
+export default function DarkLibrary({ instrume, onClose, isTabView = false, imageTypeFilter }: DarkLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -101,7 +102,12 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false }: Da
   // Apply filters to sets
   const filteredSets = useMemo(() => {
     return sets.filter(set => {
-      // Type filter
+      // Apply imageTypeFilter first (from props)
+      if (imageTypeFilter && imageTypeFilter.length > 0 && !imageTypeFilter.includes(set.imagetyp)) {
+        return false;
+      }
+
+      // Type filter (from user selection)
       if (filters.types.length > 0 && !filters.types.includes(set.imagetyp)) {
         return false;
       }
@@ -150,7 +156,7 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false }: Da
 
       return true;
     });
-  }, [sets, filters]);
+  }, [sets, filters, imageTypeFilter]);
 
   return (
     <div className={isTabView ? "" : "p-6"}>

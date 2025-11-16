@@ -1539,6 +1539,18 @@ pub async fn has_master_dark_library(
     db::has_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_calibration_set_frames(
+    state: State<'_, AppState>,
+    set_id: i64,
+) -> Result<Vec<crate::models::FileWithFrame>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_frames_for_calibration_set(&conn, set_id).map_err(|e| e.to_string())
+}
+
 /// Helper function to format bytes in human-readable format
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
