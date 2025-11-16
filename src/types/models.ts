@@ -426,6 +426,25 @@ export interface CalibrationStats {
   total_warnings: number;
 }
 
+export interface CalibrationGroup {
+  flat_set_id: number | null;
+  dark_set_id: number | null;
+  bias_set_id: number | null;
+  flat_set_detail: CalibrationSetDetail | null;
+  dark_set_detail: CalibrationSetDetail | null;
+  bias_set_detail: CalibrationSetDetail | null;
+  frame_count: number;
+  frame_ids: number[];
+  has_warnings: boolean;
+}
+
+export interface FrameSetCalibrationGroups {
+  groups: CalibrationGroup[];
+  uncalibrated_frame_count: number;
+  uncalibrated_frame_ids: number[];
+  total_frames: number;
+}
+
 export interface CalibrationTolerance {
   temp_delta_celsius: number;
   flat_date_warning_days: number;

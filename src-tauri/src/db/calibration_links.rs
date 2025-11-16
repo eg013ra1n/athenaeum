@@ -1,5 +1,6 @@
 use rusqlite::{Connection, Result, params};
-use crate::models::{CalibrationLink, CalibrationStats, FrameCalibrationStatus};
+use crate::models::{CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup, FrameSetCalibrationGroups, CalibrationSetDetail, ImageType};
+use std::collections::HashMap;
 
 /// Insert a new calibration link
 pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Result<i64> {
@@ -266,6 +267,173 @@ pub fn link_exists(
         params![source_id, source_type, calibration_type],
         |row| row.get(0),
     )?;
+    Ok(count > 0)
+}
+
+/// Get frames grouped by their calibration set combinations for a frame set
+pub fn get_calibration_groups_for_frame_set(
+    conn: &Connection,
+    frame_set_id: i64
+) -> Result<FrameSetCalibrationGroups> {
+    // Step 1: Get all LIGHT frame IDs in the frame set
+    // Navigate: frames_set → imaging_nights → sessions → session_members → frames
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT sm.frame_id
+         FROM session_members sm
+         JOIN sessions s ON s.id = sm.session_id
+         JOIN imaging_nights ino ON ino.id = s.imaging_night_id
+         JOIN frames f ON f.id = sm.frame_id
+         WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
+         ORDER BY sm.frame_id"
+    )?;
+
+    let frame_ids: Vec<i64> = stmt
+        .query_map([frame_set_id], |row| row.get(0))?
+        .collect::<Result<Vec<i64>>>()?;
+
+    let total_frames = frame_ids.len();
+
+    // Step 2: For each frame, get its calibration set IDs
+    type CalibKey = (Option<i64>, Option<i64>, Option<i64>); // (flat_set_id, dark_set_id, bias_set_id)
+    let mut groups_map: HashMap<CalibKey, Vec<i64>> = HashMap::new();
+    let mut uncalibrated_frames: Vec<i64> = Vec::new();
+
+    for frame_id in &frame_ids {
+        let mut flat_set_id: Option<i64> = None;
+        let mut dark_set_id: Option<i64> = None;
+        let mut bias_set_id: Option<i64> = None;
+
+        // Get calibration links for this frame
+        let mut link_stmt = conn.prepare(
+            "SELECT calibration_type, calibration_set_id
+             FROM calibration_set_to_frames
+             WHERE source_id = ?1 AND source_type = 'frame'"
+        )?;
+
+        let links = link_stmt.query_map([frame_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        for link_result in links {
+            let (cal_type, cal_set_id) = link_result?;
+            match cal_type.as_str() {
+                "Flat" => flat_set_id = Some(cal_set_id),
+                "Dark" => dark_set_id = Some(cal_set_id),
+                "Bias" => bias_set_id = Some(cal_set_id),
+                _ => {}
+            }
+        }
+
+        // Group by calibration combination
+        let key = (flat_set_id, dark_set_id, bias_set_id);
+
+        // Track uncalibrated frames (no calibration at all)
+        if flat_set_id.is_none() && dark_set_id.is_none() && bias_set_id.is_none() {
+            uncalibrated_frames.push(*frame_id);
+        } else {
+            groups_map.entry(key).or_insert_with(Vec::new).push(*frame_id);
+        }
+    }
+
+    // Step 3: Build CalibrationGroup objects with full set details
+    let mut groups: Vec<CalibrationGroup> = Vec::new();
+
+    for ((flat_set_id, dark_set_id, bias_set_id), frame_ids_in_group) in groups_map {
+        let flat_set_detail = if let Some(set_id) = flat_set_id {
+            get_calibration_set_detail(conn, set_id).ok()
+        } else {
+            None
+        };
+
+        let dark_set_detail = if let Some(set_id) = dark_set_id {
+            get_calibration_set_detail(conn, set_id).ok()
+        } else {
+            None
+        };
+
+        let bias_set_detail = if let Some(set_id) = bias_set_id {
+            get_calibration_set_detail(conn, set_id).ok()
+        } else {
+            None
+        };
+
+        // Check if any frames in this group have warnings
+        let has_warnings = check_group_warnings(conn, &frame_ids_in_group)?;
+
+        groups.push(CalibrationGroup {
+            flat_set_id,
+            dark_set_id,
+            bias_set_id,
+            flat_set_detail,
+            dark_set_detail,
+            bias_set_detail,
+            frame_count: frame_ids_in_group.len(),
+            frame_ids: frame_ids_in_group,
+            has_warnings,
+        });
+    }
+
+    // Sort groups by frame count (largest first)
+    groups.sort_by(|a, b| b.frame_count.cmp(&a.frame_count));
+
+    Ok(FrameSetCalibrationGroups {
+        groups,
+        uncalibrated_frame_count: uncalibrated_frames.len(),
+        uncalibrated_frame_ids: uncalibrated_frames,
+        total_frames,
+    })
+}
+
+/// Helper: Get detailed info for a calibration set
+fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<CalibrationSetDetail> {
+    let mut stmt = conn.prepare(
+        "SELECT id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
+                binning, instrume, date_start, date_end, date, frame_count
+         FROM calibration_set
+         WHERE id = ?1"
+    )?;
+
+    stmt.query_row([set_id], |row| {
+        let imagetyp_str: String = row.get(1)?;
+        let imagetyp = ImageType::from_str(&imagetyp_str).unwrap_or(ImageType::Light);
+
+        Ok(CalibrationSetDetail {
+            id: Some(row.get(0)?),
+            imagetyp,
+            exptime: row.get(2)?,
+            ccd_temp: row.get(3)?,
+            temp_min: row.get(4)?,
+            temp_max: row.get(5)?,
+            gain: row.get(6)?,
+            offset: row.get(7)?,
+            binning: row.get(8)?,
+            instrume: row.get(9)?,
+            date_start: row.get(10)?,
+            date_end: row.get(11)?,
+            date_display: row.get(12)?,
+            frame_count: row.get(13)?,
+        })
+    })
+}
+
+/// Helper: Check if any frames in the group have calibration warnings
+fn check_group_warnings(conn: &Connection, frame_ids: &[i64]) -> Result<bool> {
+    if frame_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+    let query = format!(
+        "SELECT COUNT(*) FROM calibration_set_to_frames
+         WHERE source_id IN ({}) AND source_type = 'frame'
+         AND (date_warning = 1 OR temp_warning = 1)",
+        placeholders.join(",")
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+    let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
     Ok(count > 0)
 }
 

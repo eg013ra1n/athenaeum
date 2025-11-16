@@ -2,12 +2,13 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
-import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame, FrameCalibrationStatus } from '../types/models';
+import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame, FrameCalibrationStatus, FrameSetCalibrationGroups } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationStatusBadges } from '../components/CalibrationStatusBadges';
 import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
+import { CalibrationGroupsView } from '../components/CalibrationGroupsView';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -39,6 +40,11 @@ export default function FrameSetDetail() {
   const [calibrationStatuses, setCalibrationStatuses] = useState<Map<number, FrameCalibrationStatus>>(new Map());
   const [loadingStatuses, setLoadingStatuses] = useState<Set<number>>(new Set());
 
+  // Tab system state
+  const [activeTab, setActiveTab] = useState<'sessions' | 'calibration'>('sessions');
+  const [calibrationGroups, setCalibrationGroups] = useState<FrameSetCalibrationGroups | null>(null);
+  const [loadingCalibration, setLoadingCalibration] = useState(false);
+
   useEffect(() => {
     loadDetail();
   }, [id]);
@@ -59,6 +65,30 @@ export default function FrameSetDetail() {
       setLoading(false);
     }
   };
+
+  const loadCalibrationGroups = async () => {
+    if (!id) return;
+
+    try {
+      setLoadingCalibration(true);
+      const result = await invoke<FrameSetCalibrationGroups>('get_frame_set_calibration_groups', {
+        frameSetId: parseInt(id),
+      });
+      setCalibrationGroups(result);
+    } catch (err) {
+      console.error('Failed to load calibration groups:', err);
+      showAlert('Error', `Failed to load calibration groups: ${err}`, 'error');
+    } finally {
+      setLoadingCalibration(false);
+    }
+  };
+
+  // Load calibration groups when Calibration tab is selected
+  useEffect(() => {
+    if (activeTab === 'calibration' && !calibrationGroups) {
+      loadCalibrationGroups();
+    }
+  }, [activeTab]);
 
   const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
     setAlertDialog({ isOpen: true, title, message, variant });
@@ -497,8 +527,36 @@ export default function FrameSetDetail() {
 
       {/* Imaging Nights */}
       <div>
-        <h2 className="text-2xl font-bold mb-4">Imaging Sessions</h2>
-        {!detail.nights || detail.nights.length === 0 ? (
+        {/* Tab Navigation */}
+        <div className="mb-6">
+          <div className="flex gap-4 border-b border-gray-700">
+            <button
+              className={`px-4 py-2 font-medium transition-colors ${
+                activeTab === 'sessions'
+                  ? 'text-blue-400 border-b-2 border-blue-400'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
+              onClick={() => setActiveTab('sessions')}
+            >
+              Sessions
+            </button>
+            <button
+              className={`px-4 py-2 font-medium transition-colors ${
+                activeTab === 'calibration'
+                  ? 'text-blue-400 border-b-2 border-blue-400'
+                  : 'text-gray-400 hover:text-gray-200'
+              }`}
+              onClick={() => setActiveTab('calibration')}
+            >
+              Calibration
+            </button>
+          </div>
+        </div>
+
+        {/* Sessions Tab Content */}
+        {activeTab === 'sessions' && (
+          <>
+            {!detail.nights || detail.nights.length === 0 ? (
           <div className="bg-yellow-900/20 border border-yellow-800 rounded-lg p-8 text-center">
             <AlertCircle size={48} className="mx-auto mb-4 text-yellow-500" />
             <h3 className="text-xl font-semibold text-yellow-400 mb-2">No Sessions Available</h3>
@@ -695,6 +753,26 @@ export default function FrameSetDetail() {
                 })}
               </div>
             ))}
+          </div>
+        )}
+          </>
+        )}
+
+        {/* Calibration Tab Content */}
+        {activeTab === 'calibration' && (
+          <div>
+            {loadingCalibration ? (
+              <div className="text-center py-12">
+                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+                <p className="text-gray-400">Loading calibration groups...</p>
+              </div>
+            ) : calibrationGroups ? (
+              <CalibrationGroupsView data={calibrationGroups} />
+            ) : (
+              <div className="text-center py-12 text-gray-400">
+                <p>Failed to load calibration data.</p>
+              </div>
+            )}
           </div>
         )}
       </div>

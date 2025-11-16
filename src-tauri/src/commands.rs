@@ -2603,6 +2603,21 @@ pub async fn get_calibration_status(
     get_calibration_statistics(&conn, frame_set_id).map_err(|e| e.to_string())
 }
 
+/// Get frames grouped by their calibration set combinations for a frame set
+#[tauri::command]
+pub async fn get_frame_set_calibration_groups(
+    frame_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<crate::models::FrameSetCalibrationGroups, String> {
+    use crate::db::calibration_links::get_calibration_groups_for_frame_set;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    get_calibration_groups_for_frame_set(&conn, frame_set_id).map_err(|e| e.to_string())
+}
+
 /// Get complete calibration hierarchy for a specific frame
 #[tauri::command]
 pub async fn get_frame_calibration_hierarchy(

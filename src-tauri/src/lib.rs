@@ -121,6 +121,7 @@ pub fn run() {
             commands::create_frame_set_from_selection,
             commands::find_calibration_for_frame_set,
             commands::get_calibration_status,
+            commands::get_frame_set_calibration_groups,
             commands::get_frame_calibration_hierarchy,
             commands::get_flat_group_options_for_frame_set,
             commands::clear_calibration_links,

@@ -549,6 +549,29 @@ pub struct CalibrationStats {
     pub total_warnings: usize,
 }
 
+/// Group of frames sharing the same calibration set combination
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationGroup {
+    pub flat_set_id: Option<i64>,
+    pub dark_set_id: Option<i64>,
+    pub bias_set_id: Option<i64>,
+    pub flat_set_detail: Option<CalibrationSetDetail>,
+    pub dark_set_detail: Option<CalibrationSetDetail>,
+    pub bias_set_detail: Option<CalibrationSetDetail>,
+    pub frame_count: usize,
+    pub frame_ids: Vec<i64>,
+    pub has_warnings: bool,
+}
+
+/// Complete calibration grouping for a frame set
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameSetCalibrationGroups {
+    pub groups: Vec<CalibrationGroup>,
+    pub uncalibrated_frame_count: usize,
+    pub uncalibrated_frame_ids: Vec<i64>,
+    pub total_frames: usize,
+}
+
 /// Tolerance configuration for calibration matching
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationTolerance {
