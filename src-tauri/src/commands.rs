@@ -2541,11 +2541,17 @@ pub async fn find_calibration_for_frame_set(
     let temp_weight = state.settings.get_temperature_match_weight(&conn)
         .map_err(|e| format!("Failed to get temperature match weight: {}", e))?;
 
-    // Build tolerance from parameters or use defaults
+    // Build tolerance from parameters, settings, or defaults
     let tolerance = CalibrationTolerance {
-        temp_delta_celsius: temp_delta_celsius.unwrap_or(2.0),
-        flat_date_warning_days: flat_date_warning_days.unwrap_or(30),
-        dark_date_warning_days: dark_date_warning_days.unwrap_or(365),
+        temp_delta_celsius: temp_delta_celsius.unwrap_or_else(||
+            state.settings.get_calibration_temp_delta_celsius(&conn).unwrap_or(2.0)
+        ),
+        flat_date_warning_days: flat_date_warning_days.unwrap_or_else(||
+            state.settings.get_calibration_flat_date_warning_days(&conn).unwrap_or(30)
+        ),
+        dark_date_warning_days: dark_date_warning_days.unwrap_or_else(||
+            state.settings.get_calibration_dark_date_warning_days(&conn).unwrap_or(365)
+        ),
     };
 
     println!(

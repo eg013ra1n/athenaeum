@@ -29,6 +29,11 @@ pub mod defaults {
     // Bias calibration defaults
     pub const BIAS_MAX_AGE_DAYS: &str = "30";
     pub const BIAS_TIME_CLUSTER_MINUTES: &str = "30";
+
+    // Calibration tolerance/warning defaults
+    pub const CALIBRATION_TEMP_DELTA_CELSIUS: &str = "2.0";
+    pub const CALIBRATION_FLAT_DATE_WARNING_DAYS: &str = "30";
+    pub const CALIBRATION_DARK_DATE_WARNING_DAYS: &str = "365";
 }
 
 /// Setting keys used throughout the application
@@ -54,6 +59,11 @@ pub mod keys {
     // Bias calibration keys
     pub const BIAS_MAX_AGE_DAYS: &str = "bias.max_age_days";
     pub const BIAS_TIME_CLUSTER_MINUTES: &str = "bias.time_cluster_minutes";
+
+    // Calibration tolerance/warning keys
+    pub const CALIBRATION_TEMP_DELTA_CELSIUS: &str = "calibration.temp_delta_celsius";
+    pub const CALIBRATION_FLAT_DATE_WARNING_DAYS: &str = "calibration.flat_date_warning_days";
+    pub const CALIBRATION_DARK_DATE_WARNING_DAYS: &str = "calibration.dark_date_warning_days";
 }
 
 /// Runtime overrides for settings (session-specific)
@@ -290,6 +300,36 @@ impl SettingsManager {
             conn,
             keys::BIAS_TIME_CLUSTER_MINUTES,
             defaults::BIAS_TIME_CLUSTER_MINUTES,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the temperature delta tolerance for calibration warnings (in Celsius)
+    pub fn get_calibration_temp_delta_celsius(&self, conn: &Connection) -> Result<f64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::CALIBRATION_TEMP_DELTA_CELSIUS,
+            defaults::CALIBRATION_TEMP_DELTA_CELSIUS,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the flat calibration date warning threshold (in days)
+    pub fn get_calibration_flat_date_warning_days(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::CALIBRATION_FLAT_DATE_WARNING_DAYS,
+            defaults::CALIBRATION_FLAT_DATE_WARNING_DAYS,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the dark calibration date warning threshold (in days)
+    pub fn get_calibration_dark_date_warning_days(&self, conn: &Connection) -> Result<i64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::CALIBRATION_DARK_DATE_WARNING_DAYS,
+            defaults::CALIBRATION_DARK_DATE_WARNING_DAYS,
         )?;
         Ok(value.parse()?)
     }

@@ -123,10 +123,7 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
     try {
       const result = await invoke<ProcessingStats>('find_calibration_for_frame_set', {
         frameSetId,
-        // Use default tolerances
-        tempDeltaCelsius: 2.0,
-        flatDateWarningDays: 30,
-        darkDateWarningDays: 365,
+        // Tolerance parameters now pulled from Settings (backend will use configured values)
         flatPattern: pattern,
         manualFlatSelections: manualSelections
       });
