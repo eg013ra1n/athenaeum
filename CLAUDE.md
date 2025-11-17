@@ -67,9 +67,26 @@ The SQLite database is created in the user's app data directory by Tauri. Schema
   - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
   - `settings/` - Settings management with runtime and database persistence
   - `export/` - Path template resolution and file copying
-  - `commands.rs` - Tauri commands exposed to frontend
+  - `commands/` - **Modular Tauri commands** organized by domain (see below)
+  - `commands_rustafits.rs` - Specialized FITS image rendering commands
 
-- **Tauri Commands**: Functions marked with `#[tauri::command]` in `commands.rs` are callable from React via `invoke()`
+- **Commands Module Structure** (Refactored 2025-11-17):
+  The Tauri commands are organized into focused modules by domain. All 68 commands are in `src-tauri/src/commands/`:
+  - `mod.rs` - Module exports, AppState definition, and re-exports
+  - `core.rs` - 2 commands: App initialization (greet, initialize_database)
+  - `scan_roots.rs` - 9 commands: Directory scanning and monitoring
+  - `files.rs` - 7 commands: File operations and browsing
+  - `settings.rs` - 5 commands: Application configuration
+  - `frame_sets.rs` - 14 commands: Frame set management and operations
+  - `calibration.rs` - 17 commands: Calibration frame matching and library management
+  - `duplicates.rs` - 8 commands: Black hole & duplicate detection
+  - `cache.rs` - 2 commands: Cache management
+  - `spatial.rs` - 4 commands: Sky coordinate queries and spatial operations
+  - `utils.rs` - Shared helper functions (calculate_fov, angular_distance, format_bytes)
+
+  See `src-tauri/REFACTORING.md` for complete command migration map and details.
+
+- **Tauri Commands**: Functions marked with `#[tauri::command]` in `commands/` modules are callable from React via `invoke()`. All commands are re-exported through `commands/mod.rs` for backward compatibility.
 
 ### Database Schema
 
@@ -136,9 +153,34 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 ## Development Workflow
 
 1. **Adding New Tauri Commands**:
-   - Define function in `src-tauri/src/commands.rs` with `#[tauri::command]`
-   - Add to `invoke_handler` in `src-tauri/src/lib.rs`
+   - Determine the appropriate module in `src-tauri/src/commands/` based on functionality:
+     - `core.rs` - App initialization and basic operations
+     - `scan_roots.rs` - Scanning directories for FITS files
+     - `files.rs` - File browsing, searching, previewing
+     - `settings.rs` - Application configuration
+     - `frame_sets.rs` - Grouping frames into sets
+     - `calibration.rs` - Calibration frame matching and library
+     - `duplicates.rs` - Duplicate detection and black hole management
+     - `cache.rs` - Image cache operations
+     - `spatial.rs` - Sky coordinate queries and spatial operations
+   - Add command function to the appropriate module with `#[tauri::command]`
+   - Ensure it's exported in `commands/mod.rs` (use `pub use module_name::*;`)
+   - Add to `invoke_handler` in `src-tauri/src/lib.rs` as `commands::command_name`
    - Call from React with `invoke('command_name', { args })`
+
+   **Example**:
+   ```rust
+   // In src-tauri/src/commands/settings.rs
+   #[tauri::command]
+   pub async fn get_my_setting(state: State<'_, AppState>) -> Result<String, String> {
+       // implementation
+   }
+
+   // Already re-exported in commands/mod.rs via: pub use settings::*;
+
+   // In src-tauri/src/lib.rs, add to invoke_handler:
+   commands::get_my_setting,
+   ```
 
 2. **Database Schema Changes**:
    - Update `src-tauri/src/db/schema.rs::init_db()`
@@ -270,3 +312,4 @@ let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
 - [XISF 1.0 Specification](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html)
 - [xxHash](https://xxhash.com/)
 - Technical Specification: `TS.md` in repository root
+- Commands Refactoring: `src-tauri/REFACTORING.md` - Complete documentation of the 2025-11-17 modular refactoring
