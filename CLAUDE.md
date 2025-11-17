@@ -91,6 +91,7 @@ The SQLite database is created in the user's app data directory by Tauri. Schema
 ### Database Schema
 
 See `src-tauri/src/db/schema.rs` for full schema. Key tables:
+
 - `files` - Physical files (path, filename, size, format, modified_at)
 - `frames` - Metadata extracted from FITS/XISF with astronomical coordinates
   - Basic: OBJECT, DATE-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP
@@ -116,11 +117,13 @@ Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, ex
 **Frame Set Clustering**: Uses DBSCAN algorithm to group LIGHT frames by sky coordinates (RA/Dec). Frames within a configurable threshold distance are automatically grouped into frame sets. This enables organizing frames by target object without manual tagging.
 
 **Coordinate Parsing**: Supports multiple RA/Dec formats:
+
 - Decimal degrees (e.g., `123.456`, `-45.678`)
 - HMS/DMS strings (e.g., `12h34m56.7s`, `-45d40m30s`)
 - Colon-separated (e.g., `12:34:56.7`, `-45:40:30`)
 
 **Settings System**: Three-tier precedence for configuration:
+
 1. Runtime overrides (in-memory)
 2. Database persisted settings
 3. Default values
@@ -128,6 +131,7 @@ Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, ex
 Common settings include `grouping_threshold_arcmin` for frame set clustering.
 
 **Auto-Generate Frame Sets**:
+
 - Excludes frames already in any set to prevent duplicates
 - Clusters by sky coordinates with configurable threshold
 - Reports excluded frames with reasons (missing coordinates, etc.)
@@ -142,6 +146,7 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 **Duplicate Detection**: xxHash XXH3_64 computation available for identifying duplicate files (implementation in `duplicates/` module).
 
 **IMAGETYP to FRAME_FOLDER Mapping**:
+
 - LIGHT → `Lights`
 - DARK → `Calibration/Darks`
 - FLAT → `Calibration/Flats`
@@ -169,6 +174,7 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
    - Call from React with `invoke('command_name', { args })`
 
    **Example**:
+
    ```rust
    // In src-tauri/src/commands/settings.rs
    #[tauri::command]
@@ -231,6 +237,7 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 ## Common Patterns
 
 **Invoking Tauri Commands from React**:
+
 ```typescript
 import { invoke } from '@tauri-apps/api/core';
 
@@ -241,6 +248,7 @@ const result = await invoke<ReturnType>('command_name', {
 ```
 
 **Auto-Generating Frame Sets**:
+
 ```typescript
 // From frontend
 const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
@@ -252,6 +260,7 @@ console.log(`Created ${result.sets_created} sets with ${result.frames_clustered}
 **Note on Projects**: The `projects` table exists in the database but is not currently linked to frame sets. The `project_id` parameter in commands like `get_frames_sets` and `auto_generate_frame_sets` is accepted for backwards compatibility but is ignored in the implementation. Frame sets are currently global and not scoped to any project.
 
 **Working with Settings**:
+
 ```typescript
 // Get a setting with default
 const threshold = await invoke<string>('get_setting', {
@@ -267,6 +276,7 @@ await invoke('set_setting', {
 ```
 
 **Querying Database in Rust**:
+
 ```rust
 let conn = db.conn();
 let mut stmt = conn.prepare("SELECT * FROM frames WHERE object = ?1")?;
@@ -276,6 +286,7 @@ let frames = stmt.query_map([object], |row| {
 ```
 
 **Accessing Settings in Rust Commands**:
+
 ```rust
 #[tauri::command]
 pub async fn my_command(state: State<'_, AppState>) -> Result<f64, String> {
@@ -311,5 +322,4 @@ let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
 - [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html)
 - [XISF 1.0 Specification](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html)
 - [xxHash](https://xxhash.com/)
-- Technical Specification: `TS.md` in repository root
 - Commands Refactoring: `src-tauri/REFACTORING.md` - Complete documentation of the 2025-11-17 modular refactoring
