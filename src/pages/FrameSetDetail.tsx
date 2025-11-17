@@ -9,6 +9,7 @@ import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationStatusBadges } from '../components/CalibrationStatusBadges';
 import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 import { CalibrationGroupsView } from '../components/CalibrationGroupsView';
+import SortableColumnHeader from '../components/SortableColumnHeader';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -39,6 +40,12 @@ export default function FrameSetDetail() {
   });
   const [calibrationStatuses, setCalibrationStatuses] = useState<Map<number, FrameCalibrationStatus>>(new Map());
   const [loadingStatuses, setLoadingStatuses] = useState<Set<number>>(new Set());
+
+  // Sorting and expansion state for frames
+  type SortField = "filename" | "time" | "object" | "filter" | "exptime" | "focallen" | "ccd_temp";
+  const [sortField, setSortField] = useState<SortField | null>(null);
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+  const [expandedFrames, setExpandedFrames] = useState<Set<number>>(new Set());
 
   // Tab system state
   const [activeTab, setActiveTab] = useState<'sessions' | 'calibration'>('sessions');
@@ -385,6 +392,85 @@ export default function FrameSetDetail() {
     }
   };
 
+  const handleSort = (field: string) => {
+    if (sortField === field) {
+      // Toggle direction
+      setSortDirection(sortDirection === "asc" ? "desc" : "asc");
+    } else {
+      // New field, default to ascending
+      setSortField(field as SortField);
+      setSortDirection("asc");
+    }
+  };
+
+  const toggleFrameExpansion = (fileId: number) => {
+    setExpandedFrames(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(fileId)) {
+        newSet.delete(fileId);
+      } else {
+        newSet.add(fileId);
+      }
+      return newSet;
+    });
+  };
+
+  const sortFrames = (frames: FileWithFrame[]) => {
+    if (!sortField) return frames;
+
+    return [...frames].sort((a, b) => {
+      let aVal: any;
+      let bVal: any;
+
+      switch (sortField) {
+        case "filename":
+          aVal = a.file?.filename || "";
+          bVal = b.file?.filename || "";
+          break;
+        case "time":
+          aVal = a.frame?.date_obs || "";
+          bVal = b.frame?.date_obs || "";
+          break;
+        case "object":
+          aVal = a.frame?.object || "";
+          bVal = b.frame?.object || "";
+          break;
+        case "filter":
+          aVal = a.frame?.filter || "";
+          bVal = b.frame?.filter || "";
+          break;
+        case "exptime":
+          aVal = a.frame?.exptime || 0;
+          bVal = b.frame?.exptime || 0;
+          break;
+        case "focallen":
+          aVal = a.frame?.focallen || 0;
+          bVal = b.frame?.focallen || 0;
+          break;
+        case "ccd_temp":
+          aVal = a.frame?.ccd_temp || 0;
+          bVal = b.frame?.ccd_temp || 0;
+          break;
+        default:
+          return 0;
+      }
+
+      // Handle null values
+      if (aVal === null || aVal === undefined || aVal === "") return 1;
+      if (bVal === null || bVal === undefined || bVal === "") return -1;
+
+      // String comparison
+      if (typeof aVal === "string") {
+        return sortDirection === "asc"
+          ? aVal.localeCompare(bVal)
+          : bVal.localeCompare(aVal);
+      }
+
+      // Numeric comparison
+      return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
+    });
+  };
+
   if (loading) {
     return (
       <div className="p-6">
@@ -667,86 +753,254 @@ export default function FrameSetDetail() {
 
                       {/* Frames Table - Collapsible */}
                       {isExpanded && sessionData.frames && sessionData.frames.length > 0 && (
-                      <div className="overflow-x-auto">
-                        <div className="grid gap-4 px-4 py-3 bg-gray-800 text-xs font-semibold text-gray-400 uppercase border-b border-gray-700" style={{ gridTemplateColumns: '2fr 1.5fr 1.5fr 0.75fr 0.75fr 0.75fr 0.75fr 0.75fr 2.5fr' }}>
-                          <div>Filename</div>
-                          <div>Time</div>
-                          <div>Object</div>
-                          <div>Filter</div>
-                          <div className="text-right">Exposure</div>
-                          <div className="text-right">Type</div>
-                          <div className="text-right">Focal Len</div>
-                          <div className="text-right">Temp</div>
-                          <div>Calibration</div>
-                        </div>
-                        <div className="divide-y divide-gray-700">
-                          {sessionData.frames.map((item, idx) => {
-                            const frameId = item.frame?.id;
-                            const calibrationStatus = frameId ? (calibrationStatuses.get(frameId) || null) : null;
-                            const isLoadingStatus = frameId ? loadingStatuses.has(frameId) : false;
-                            const isLightFrame = item.frame?.imagetyp === 'Light';
+                        <div className="overflow-x-auto">
+                          <table className="w-full">
+                            <thead className="bg-gray-900 sticky top-0">
+                              <tr>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  <SortableColumnHeader
+                                    field="filename"
+                                    label="Filename"
+                                    currentSortField={sortField}
+                                    sortDirection={sortDirection}
+                                    onSort={handleSort}
+                                  />
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  <SortableColumnHeader
+                                    field="time"
+                                    label="Time"
+                                    currentSortField={sortField}
+                                    sortDirection={sortDirection}
+                                    onSort={handleSort}
+                                  />
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  <SortableColumnHeader
+                                    field="object"
+                                    label="Object"
+                                    currentSortField={sortField}
+                                    sortDirection={sortDirection}
+                                    onSort={handleSort}
+                                  />
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  <SortableColumnHeader
+                                    field="filter"
+                                    label="Filter"
+                                    currentSortField={sortField}
+                                    sortDirection={sortDirection}
+                                    onSort={handleSort}
+                                  />
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  <SortableColumnHeader
+                                    field="exptime"
+                                    label="Exposure"
+                                    currentSortField={sortField}
+                                    sortDirection={sortDirection}
+                                    onSort={handleSort}
+                                    align="right"
+                                  />
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  Type
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  <SortableColumnHeader
+                                    field="focallen"
+                                    label="Focal Len"
+                                    currentSortField={sortField}
+                                    sortDirection={sortDirection}
+                                    onSort={handleSort}
+                                    align="right"
+                                  />
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  <SortableColumnHeader
+                                    field="ccd_temp"
+                                    label="Temp"
+                                    currentSortField={sortField}
+                                    sortDirection={sortDirection}
+                                    onSort={handleSort}
+                                    align="right"
+                                  />
+                                </th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                  Calibration
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-700">
+                              {sortFrames(sessionData.frames).map((item, idx) => {
+                                const frameId = item.frame?.id;
+                                const fileId = item.file?.id;
+                                const calibrationStatus = frameId ? (calibrationStatuses.get(frameId) || null) : null;
+                                const isLoadingStatus = frameId ? loadingStatuses.has(frameId) : false;
+                                const isLightFrame = item.frame?.imagetyp === 'Light';
+                                const isFrameExpanded = fileId ? expandedFrames.has(fileId) : false;
 
-                            return (
-                              <div
-                                key={item.file?.id || idx}
-                                className="grid gap-4 px-4 py-3 hover:bg-gray-700 transition items-center"
-                                style={{ gridTemplateColumns: '2fr 1.5fr 1.5fr 0.75fr 0.75fr 0.75fr 0.75fr 0.75fr 2.5fr' }}
-                              >
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
-                                  <span className="font-mono text-sm truncate" title={item.file?.filename || ''}>
-                                    {item.file?.filename || '-'}
-                                  </span>
-                                </div>
-                                <div className="text-sm text-gray-400">
-                                  {item.frame?.date_obs
-                                    ? new Date(item.frame.date_obs).toLocaleTimeString('en-US', {
-                                        hour: '2-digit',
-                                        minute: '2-digit',
-                                      })
-                                    : '-'}
-                                </div>
-                                <div className="truncate text-sm text-gray-300">
-                                  {item.frame?.object || '-'}
-                                </div>
-                                <div className="truncate text-sm text-gray-400">
-                                  {item.frame?.filter || '-'}
-                                </div>
-                                <div className="text-right text-sm text-gray-400">
-                                  {item.frame?.exptime ? `${item.frame.exptime}s` : '-'}
-                                </div>
-                                <div className="text-right">
-                                  {item.frame?.imagetyp && (
-                                    <span
-                                      className={`px-2 py-0.5 rounded text-xs ${
-                                        item.frame.imagetyp === 'Light'
-                                          ? 'bg-blue-900 text-blue-200'
-                                          : 'bg-gray-700 text-gray-300'
-                                      }`}
+                                return (
+                                  <>
+                                    <tr
+                                      key={fileId || idx}
+                                      onClick={() => fileId && toggleFrameExpansion(fileId)}
+                                      className={`${
+                                        idx % 2 === 0 ? "bg-gray-800" : "bg-gray-850"
+                                      } hover:bg-gray-750 cursor-pointer transition-colors`}
                                     >
-                                      {item.frame.imagetyp}
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="text-right text-sm text-gray-500">
-                                  {item.frame?.focallen ? `${item.frame.focallen}mm` : '-'}
-                                </div>
-                                <div className="text-right text-sm text-gray-500">
-                                  {item.frame?.ccd_temp ? `${item.frame.ccd_temp}°C` : '-'}
-                                </div>
-                                <div>
-                                  {isLightFrame && (
-                                    <CalibrationStatusBadges
-                                      status={calibrationStatus}
-                                      loading={isLoadingStatus}
-                                    />
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
+                                      <td className="px-4 py-3">
+                                        <div className="flex items-center gap-2 min-w-0">
+                                          <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
+                                          <span className="font-mono text-sm truncate" title={item.file?.filename || ''}>
+                                            {item.file?.filename || '-'}
+                                          </span>
+                                        </div>
+                                      </td>
+                                      <td className="px-4 py-3 text-sm text-gray-400">
+                                        {item.frame?.date_obs
+                                          ? new Date(item.frame.date_obs).toLocaleTimeString('en-US', {
+                                              hour: '2-digit',
+                                              minute: '2-digit',
+                                            })
+                                          : '-'}
+                                      </td>
+                                      <td className="px-4 py-3 text-sm text-gray-300 truncate">
+                                        {item.frame?.object || '-'}
+                                      </td>
+                                      <td className="px-4 py-3 text-sm text-gray-400 truncate">
+                                        {item.frame?.filter || '-'}
+                                      </td>
+                                      <td className="px-4 py-3 text-sm text-gray-400 text-right">
+                                        {item.frame?.exptime ? `${item.frame.exptime}s` : '-'}
+                                      </td>
+                                      <td className="px-4 py-3">
+                                        {item.frame?.imagetyp && (
+                                          <span
+                                            className={`px-2 py-0.5 rounded text-xs ${
+                                              item.frame.imagetyp === 'Light'
+                                                ? 'bg-blue-900 text-blue-200'
+                                                : 'bg-gray-700 text-gray-300'
+                                            }`}
+                                          >
+                                            {item.frame.imagetyp}
+                                          </span>
+                                        )}
+                                      </td>
+                                      <td className="px-4 py-3 text-sm text-gray-500 text-right">
+                                        {item.frame?.focallen ? `${item.frame.focallen}mm` : '-'}
+                                      </td>
+                                      <td className="px-4 py-3 text-sm text-gray-500 text-right">
+                                        {item.frame?.ccd_temp ? `${item.frame.ccd_temp}°C` : '-'}
+                                      </td>
+                                      <td className="px-4 py-3">
+                                        {isLightFrame && (
+                                          <CalibrationStatusBadges
+                                            status={calibrationStatus}
+                                            loading={isLoadingStatus}
+                                          />
+                                        )}
+                                      </td>
+                                    </tr>
+
+                                    {/* Expanded Frame Details Row */}
+                                    {isFrameExpanded && (
+                                      <tr
+                                        key={`${fileId}-expanded`}
+                                        className="bg-gray-900 border-t border-gray-700"
+                                      >
+                                        <td colSpan={9} className="px-4 py-4">
+                                          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 text-sm">
+                                            <div>
+                                              <span className="text-gray-400">File Path:</span>
+                                              <span className="ml-2 text-gray-100 font-mono text-xs break-all">
+                                                {item.file?.path || 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Date/Time:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.frame?.date_obs
+                                                  ? formatDate(item.frame.date_obs)
+                                                  : 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Binning:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.frame?.xbinning && item.frame?.ybinning
+                                                  ? `${item.frame.xbinning}x${item.frame.ybinning}`
+                                                  : 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Gain:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.frame?.gain !== null && item.frame?.gain !== undefined
+                                                  ? item.frame.gain
+                                                  : 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Offset:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.frame?.offset !== null && item.frame?.offset !== undefined
+                                                  ? item.frame.offset
+                                                  : 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Set Temp:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.frame?.set_temp !== null && item.frame?.set_temp !== undefined
+                                                  ? `${item.frame.set_temp}°C`
+                                                  : 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Telescope:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.frame?.telescop || 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Instrument:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.frame?.instrume || 'N/A'}
+                                              </span>
+                                            </div>
+                                            {(item.frame?.ra || item.frame?.dec) && (
+                                              <div className="col-span-2">
+                                                <span className="text-gray-400">Coordinates:</span>
+                                                <span className="ml-2 text-gray-100 font-mono">
+                                                  RA: {item.frame?.ra || 'N/A'}, Dec: {item.frame?.dec || 'N/A'}
+                                                </span>
+                                              </div>
+                                            )}
+                                            <div>
+                                              <span className="text-gray-400">File Size:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.file?.size
+                                                  ? `${(item.file.size / 1024 / 1024).toFixed(2)} MB`
+                                                  : 'N/A'}
+                                              </span>
+                                            </div>
+                                            <div>
+                                              <span className="text-gray-400">Format:</span>
+                                              <span className="ml-2 text-gray-100">
+                                                {item.file?.format || 'N/A'}
+                                              </span>
+                                            </div>
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </>
+                                );
+                              })}
+                            </tbody>
+                          </table>
                         </div>
-                      </div>
                       )}
                     </div>
                   );
