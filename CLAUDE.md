@@ -62,7 +62,7 @@ The SQLite database is created in the user's app data directory by Tauri. Schema
   - `fits_parser/` - FITS/XISF metadata extraction
   - `scanner/` - Multi-threaded directory traversal with walkdir + rayon
   - `duplicates/` - xxHash XXH3_64 computation and duplicate detection
-  - `calibration/` - Calibration frame matching algorithms
+  - `calibration/` - Calibration frame matching algorithms (see Calibration Matching System below)
   - `clustering/` - Sky coordinate-based frame set clustering with DBSCAN
   - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
   - `settings/` - Settings management with runtime and database persistence
@@ -155,6 +155,49 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 
 **Export Path Templating**: Supports tokens like `{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`, `{TELESCOP}`, `{INSTRUME}`, `{EXPTIME}`, `{FILTER}`, `{IMAGETYP}`, `{FRAME_FOLDER}`, with fallbacks (`{OBJECT|Unknown}`) and transforms (`:slug` for slugification).
 
+### Calibration Matching System
+
+The calibration matching system is fully configurable via UI (Settings → Calibration Matching tab). Configuration is stored as JSON in the `settings` table under key `calibration.matching_config`.
+
+**Source Types** (frames that need calibration):
+- **Lights** → can link to Flat, Dark, Bias
+- **Flats** → can link to DarkFlat, Dark, Bias (with fallback chain: DarkFlat → Dark → Bias)
+- **Darks** → can link to Bias (when "BIAS for Dark Optimization" is enabled)
+
+**Configurable Parameters** (8 parameters per source→calibration pair):
+- `instrume` - Camera/instrument name
+- `binning` - Binning mode (e.g., "1x1", "2x2")
+- `gain` - Sensor gain value
+- `offset` - Sensor offset value
+- `exptime` - Exposure time
+- `focallen` - Focal length
+- `filter` - Filter name (only matched for Lights→Flat)
+- `ccd_temp` - CCD temperature
+
+**Match Modes**:
+- `Exact` - Must match exactly (with small tolerance for floats)
+- `Warning` - Match but warn if threshold exceeded (e.g., temperature delta > 2°C)
+- `Ignore` - Don't check this parameter
+
+**Key Files**:
+- `src-tauri/src/calibration/config.rs` - Configuration data structures (`CalibrationMatchingConfig`, `ParameterConfig`, `MatchMode`, etc.)
+- `src-tauri/src/calibration/configurable_matcher.rs` - Config-driven matching engine (`find_calibration_sets`, `load_config`, etc.)
+- `src-tauri/src/calibration/hierarchy.rs` - Calibration hierarchy builder (uses configurable matcher)
+- `src/types/calibration-config.ts` - TypeScript interfaces
+- `src/components/calibration/` - UI components (`CalibrationMatchingConfig.tsx`, `MatchingMatrixTable.tsx`, etc.)
+
+**Tauri Commands**:
+- `get_calibration_matching_config` - Load config (returns default if not set)
+- `set_calibration_matching_config` - Save config to database
+- `reset_calibration_matching_config` - Reset to defaults
+
+**Default Behavior**: The default configuration matches the original hardcoded behavior:
+- Lights→Flat: Exact match on instrume, binning, gain, offset, focallen, filter
+- Lights→Dark: Exact match on instrume, binning, gain, offset, exptime; Warning on ccd_temp (2°C threshold)
+- Lights→Bias: Exact match on instrume, binning, gain, offset; Warning on ccd_temp
+- Flats→DarkFlat/Dark: Same as Lights→Dark (no filter matching)
+- Flats→Bias: Same as Lights→Bias
+
 ## Development Workflow
 
 1. **Adding New Tauri Commands**:
@@ -217,6 +260,13 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
    - Coordinate conversion handled by `src-tauri/src/coordinates/` module
    - Always check if frames are already in sets before adding to prevent duplicates
 
+7. **Working with Calibration Matching Config**:
+   - Configuration is managed through `src-tauri/src/calibration/config.rs`
+   - Use `get_calibration_matching_config` and `set_calibration_matching_config` Tauri commands
+   - Load config in Rust with `configurable_matcher::load_config(conn)`
+   - UI components are in `src/components/calibration/`
+   - TypeScript interfaces in `src/types/calibration-config.ts`
+
 ## Testing Approach
 
 - **Backend**: Use `cargo test` with mock file systems and in-memory SQLite
@@ -226,6 +276,7 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 - **Settings System**: Test precedence (runtime > DB > default) and persistence
 - **Export Templates**: Test token resolution with edge cases (missing values, special chars)
 - **Duplicate Detection**: Verify hash consistency (when implemented)
+- **Calibration Matching**: Test config loading, parameter matching modes, fallback chains
 
 ## File Organization Conventions
 
@@ -308,6 +359,28 @@ use crate::coordinates::{parse_ra_to_degrees, parse_dec_to_degrees};
 
 let ra_deg = parse_ra_to_degrees("12h34m56.7s")?;
 let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
+```
+
+**Working with Calibration Matching Config**:
+
+```typescript
+// From frontend - get current config
+const config = await invoke<CalibrationMatchingConfig>('get_calibration_matching_config');
+
+// Modify and save
+config.lights.dark.ccd_temp.warning_threshold = 3.0;
+await invoke('set_calibration_matching_config', { config });
+
+// Reset to defaults
+const defaultConfig = await invoke<CalibrationMatchingConfig>('reset_calibration_matching_config');
+```
+
+```rust
+// In Rust - load and use config for matching
+use crate::calibration::configurable_matcher::{load_config, find_calibration_sets};
+
+let config = load_config(conn);
+let candidates = find_calibration_sets(conn, &frame, "lights", "dark", &config)?;
 ```
 
 ## Dependencies
