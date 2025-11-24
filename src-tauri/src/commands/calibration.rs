@@ -519,3 +519,68 @@ pub async fn get_frame_status(
 
     get_frame_calibration_status(&conn, frame_id).map_err(|e| e.to_string())
 }
+
+// ========== Calibration Matching Config Commands ==========
+
+const CALIBRATION_CONFIG_KEY: &str = "calibration.matching_config";
+
+/// Get the current calibration matching configuration
+#[tauri::command]
+pub async fn get_calibration_matching_config(
+    state: State<'_, AppState>,
+) -> Result<crate::calibration::CalibrationMatchingConfig, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Try to get from settings
+    let config_json = crate::db::get_setting(&conn, CALIBRATION_CONFIG_KEY)
+        .map_err(|e| e.to_string())?;
+
+    match config_json {
+        Some(json) => {
+            crate::calibration::CalibrationMatchingConfig::from_json(&json)
+                .map_err(|e| format!("Failed to parse calibration config: {}", e))
+        }
+        None => {
+            // Return default config if not set
+            Ok(crate::calibration::CalibrationMatchingConfig::default())
+        }
+    }
+}
+
+/// Set the calibration matching configuration
+#[tauri::command]
+pub async fn set_calibration_matching_config(
+    config: crate::calibration::CalibrationMatchingConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let json = config.to_json()
+        .map_err(|e| format!("Failed to serialize calibration config: {}", e))?;
+
+    crate::db::set_setting(&conn, CALIBRATION_CONFIG_KEY, &json)
+        .map_err(|e| e.to_string())
+}
+
+/// Reset calibration matching configuration to defaults
+#[tauri::command]
+pub async fn reset_calibration_matching_config(
+    state: State<'_, AppState>,
+) -> Result<crate::calibration::CalibrationMatchingConfig, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let default_config = crate::calibration::CalibrationMatchingConfig::default();
+    let json = default_config.to_json()
+        .map_err(|e| format!("Failed to serialize default config: {}", e))?;
+
+    crate::db::set_setting(&conn, CALIBRATION_CONFIG_KEY, &json)
+        .map_err(|e| e.to_string())?;
+
+    Ok(default_config)
+}

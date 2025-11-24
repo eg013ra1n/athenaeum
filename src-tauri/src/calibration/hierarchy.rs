@@ -1,7 +1,7 @@
 // Calibration hierarchy builder - constructs complete calibration trees
-use crate::calibration::finder::{
-    find_dark_sets_for_light_frame,
-    find_bias_sets_for_frame, rank_calibration_candidates, CalibrationCandidate,
+use crate::calibration::finder::CalibrationCandidate;
+use crate::calibration::configurable_matcher::{
+    load_config, find_dark_for_light, find_calibration_for_flat, find_calibration_for_dark,
 };
 use crate::calibration::flat_matcher::{
     find_flat_groups_for_light_frame, apply_pattern_selection, FlatPattern,
@@ -113,7 +113,7 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
 }
 
 /// Find Dark or Bias calibration for a Flat calibration set
-/// First tries to find Dark sets, falls back to Bias if not found
+/// Uses configurable matching rules with fallback chain (DarkFlat → Dark → Bias)
 /// Creates sets on-demand if not found
 pub fn find_calibration_for_flat_set(
     conn: &Connection,
@@ -131,49 +131,44 @@ pub fn find_calibration_for_flat_set(
 
     let frame = get_frame_by_id(conn, frame_id)?;
 
-    // Try to find Dark sets first
-    let mut dark_candidates = find_dark_sets_for_light_frame(conn, &frame, tolerance)?;
+    // Load configurable matching config
+    let config = load_config(conn);
 
-    if dark_candidates.is_empty() {
-        println!("  🔍 No existing Dark sets found for Flat, attempting on-demand creation...");
+    // Use configurable matcher with fallback chain (DarkFlat → Dark → Bias)
+    let mut candidates = find_calibration_for_flat(conn, &frame, &config)?;
 
-        // Try to create Dark on-demand
+    if candidates.is_empty() {
+        println!("  🔍 No existing calibration sets found for Flat via config matcher, trying on-demand creation...");
+
+        // Try to create Dark on-demand (fallback to old behavior)
         if let Some(created_dark_id) = try_create_dark_for_frame(conn, &frame, state)? {
             println!("  ✅ Created Dark set {} for Flat", created_dark_id);
 
-            // Re-query to get the candidate with proper scoring
-            dark_candidates = find_dark_sets_for_light_frame(conn, &frame, tolerance)?;
+            // Re-query using configurable matcher
+            candidates = find_calibration_for_flat(conn, &frame, &config)?;
         }
     }
 
-    if !dark_candidates.is_empty() {
-        return Ok(rank_calibration_candidates(dark_candidates));
-    }
-
-    // Fallback to Bias sets
-    let mut bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
-
-    if bias_candidates.is_empty() {
-        println!("  🔍 No existing Bias sets found for Flat, attempting on-demand creation...");
-
-        // Try to create Bias on-demand
+    if candidates.is_empty() {
+        // Try to create Bias on-demand as last resort
         if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame, state)? {
             println!("  ✅ Created Bias set {} for Flat", created_bias_id);
 
-            // Re-query to get the candidate with proper scoring
-            bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+            // Re-query using configurable matcher
+            candidates = find_calibration_for_flat(conn, &frame, &config)?;
         }
     }
 
-    Ok(rank_calibration_candidates(bias_candidates))
+    Ok(candidates)
 }
 
 /// Find Bias calibration for a Dark calibration set
+/// Only returns Bias if "use_bias_for_dark_optimization" is enabled in config
 /// Creates Bias on-demand if not found
 pub fn find_calibration_for_dark_set(
     conn: &Connection,
     dark_set_id: i64,
-    tolerance: &CalibrationTolerance,
+    _tolerance: &CalibrationTolerance,
     state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
     // Get a representative frame from the dark set
@@ -186,22 +181,30 @@ pub fn find_calibration_for_dark_set(
 
     let frame = get_frame_by_id(conn, frame_id)?;
 
-    // Find Bias sets
-    let mut bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+    // Load configurable matching config
+    let config = load_config(conn);
 
-    if bias_candidates.is_empty() {
-        println!("  🔍 No existing Bias sets found for Dark, attempting on-demand creation...");
+    // Use configurable matcher - only returns Bias if enabled in config
+    let mut candidates = find_calibration_for_dark(conn, &frame, &config)?;
 
-        // Try to create Bias on-demand
-        if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame, state)? {
-            println!("  ✅ Created Bias set {} for Dark", created_bias_id);
+    if candidates.is_empty() {
+        // Check if bias for dark optimization is enabled before trying on-demand creation
+        if let Some(opts) = config.get_behavioral_options("darks") {
+            if opts.use_bias_for_dark_optimization {
+                println!("  🔍 No existing Bias sets found for Dark, attempting on-demand creation...");
 
-            // Re-query to get the candidate with proper scoring
-            bias_candidates = find_bias_sets_for_frame(conn, &frame, tolerance)?;
+                // Try to create Bias on-demand
+                if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame, state)? {
+                    println!("  ✅ Created Bias set {} for Dark", created_bias_id);
+
+                    // Re-query using configurable matcher
+                    candidates = find_calibration_for_dark(conn, &frame, &config)?;
+                }
+            }
         }
     }
 
-    Ok(rank_calibration_candidates(bias_candidates))
+    Ok(candidates)
 }
 
 /// Build complete calibration hierarchy for a light frame
@@ -381,20 +384,19 @@ pub fn build_complete_hierarchy(
         missing_calibration.push("Flat".to_string());
     }
 
-    // Find Dark sets for the light frame
-    let dark_candidates = find_dark_sets_for_light_frame(conn, light_frame, tolerance)?;
-    let mut ranked_darks = rank_calibration_candidates(dark_candidates);
+    // Find Dark sets for the light frame using configurable matcher
+    let config = load_config(conn);
+    let mut ranked_darks = find_dark_for_light(conn, light_frame, &config)?;
 
-    // Location 1: Try to create Dark on-demand if not found
+    // Try to create Dark on-demand if not found
     if ranked_darks.is_empty() {
         println!("  🔍 No existing Dark sets found for Light frame, attempting on-demand creation...");
 
         if let Some(created_dark_id) = try_create_dark_for_frame(conn, light_frame, state)? {
             println!("  ✅ Created Dark set {} for Light frame", created_dark_id);
 
-            // Re-query to get the candidate with proper scoring
-            let dark_candidates = find_dark_sets_for_light_frame(conn, light_frame, tolerance)?;
-            ranked_darks = rank_calibration_candidates(dark_candidates);
+            // Re-query using configurable matcher
+            ranked_darks = find_dark_for_light(conn, light_frame, &config)?;
         }
     }
 
@@ -430,42 +432,11 @@ pub fn build_complete_hierarchy(
                 });
             }
 
-            // Find Bias for the Dark set (Location 2: with on-demand creation)
-            let bias_candidates = find_calibration_for_dark_set(conn, best_dark.set_id, tolerance, state)?;
-
-            let mut dark_sub_calibration = Vec::new();
-            if let Some(best_bias) = bias_candidates.first() {
-                dark_sub_calibration.push(CalibrationLink {
-                    id: None,
-                    source_id: best_dark.set_id,
-                    source_type: "calibration_set".to_string(),
-                    calibration_set_id: best_bias.set_id,
-                    calibration_type: "Bias".to_string(),
-                    matched_at: Utc::now().to_rfc3339(),
-                    match_score: Some(best_bias.match_score),
-                    date_warning: best_bias.date_warning,
-                    temp_warning: best_bias.temp_warning,
-                });
-
-                // Bias doesn't have date warnings, but might have temp warnings
-                if best_bias.temp_warning {
-                    warnings.push(CalibrationWarning {
-                        warning_type: "temperature".to_string(),
-                        message: format!(
-                            "Bias for Dark temperature differs by {:.1}°C",
-                            best_bias.temp_diff.unwrap_or(0.0)
-                        ),
-                        calibration_type: "Bias".to_string(),
-                        set_id: best_bias.set_id,
-                    });
-                }
-            } else {
-                missing_calibration.push("Bias for Dark".to_string());
-            }
-
+            // Dark frames don't need sub-calibration
+            // (Bias is only used as fallback for calibrating Flats, not Darks)
             dark_sets_with_links.push(CalibrationSetWithLinks {
                 set: dark_set,
-                sub_calibration: dark_sub_calibration,
+                sub_calibration: Vec::new(),
             });
         }
     }
@@ -596,6 +567,7 @@ fn try_create_dark_for_frame(
     println!("    📅 Dark date range: {} to {}", start_date, end_date);
 
     // Detect dark groups
+    // Note: focal_length is NOT used for Dark matching - Darks are sensor-only calibrations
     let dark_groups = detect_dark_groups(
         conn,
         instrume,
@@ -603,7 +575,7 @@ fn try_create_dark_for_frame(
         frame.gain,
         frame.offset,
         exptime,
-        frame.focallen,
+        None, // focal_length not relevant for Dark calibration
         time_cluster_minutes,
         Some((start_date, end_date)),
     )?;
@@ -672,13 +644,14 @@ fn try_create_bias_for_frame(
     println!("    📅 Bias date range: {} to {}", start_date, end_date);
 
     // Detect bias groups
+    // Note: focal_length is NOT used for Bias matching - Bias frames are sensor-only calibrations
     let bias_groups = detect_bias_groups(
         conn,
         instrume,
         binning,
         frame.gain,
         frame.offset,
-        frame.focallen,
+        None, // focal_length not relevant for Bias calibration
         time_cluster_minutes,
         Some((start_date, end_date)),
     )?;

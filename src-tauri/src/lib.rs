@@ -128,6 +128,9 @@ pub fn run() {
             commands::clear_calibration_links,
             commands::get_frame_calibration_links,
             commands::get_frame_status,
+            commands::get_calibration_matching_config,
+            commands::set_calibration_matching_config,
+            commands::reset_calibration_matching_config,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

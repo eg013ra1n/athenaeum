@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
+import { CalibrationMatchingConfig } from '../components/calibration';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
@@ -53,6 +54,9 @@ export default function Settings() {
   // Content hash rescan state
   const [rescanningContentHash, setRescanningContentHash] = useState(false);
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
+
+  // Tab state
+  const [activeTab, setActiveTab] = useState<'general' | 'calibration'>('general');
 
   useEffect(() => {
     loadSettings();
@@ -510,29 +514,70 @@ export default function Settings() {
     <div className="p-6 max-w-4xl">
       <div className="mb-6">
         <h2 className="text-3xl font-bold">Settings</h2>
-        <p className="text-gray-400">Configure frame set grouping parameters</p>
+        <p className="text-gray-400">Configure application settings</p>
       </div>
 
-      {error && (
-        <div className="mb-4 p-4 bg-red-900/20 border border-red-800 rounded-lg flex items-start gap-3">
-          <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
-          <div className="flex-1">
-            <p className="font-medium text-red-400">Error</p>
-            <p className="text-sm text-red-300">{String(error)}</p>
-          </div>
+      {/* Tab Navigation */}
+      <div className="flex gap-1 mb-6 border-b border-gray-700">
+        <button
+          onClick={() => setActiveTab('general')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'general'
+              ? 'bg-gray-800 text-white border-b-2 border-blue-500'
+              : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+          }`}
+        >
+          <SettingsIcon size={18} />
+          General
+        </button>
+        <button
+          onClick={() => setActiveTab('calibration')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'calibration'
+              ? 'bg-gray-800 text-white border-b-2 border-blue-500'
+              : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+          }`}
+        >
+          <Crosshair size={18} />
+          Calibration Matching
+        </button>
+      </div>
+
+      {/* Calibration Matching Tab */}
+      {activeTab === 'calibration' && (
+        <div className="bg-gray-800 rounded-lg p-6">
+          <h3 className="text-xl font-semibold mb-4">Calibration Matching Configuration</h3>
+          <p className="text-gray-400 mb-6">
+            Configure how calibration frames (Flats, Darks, Bias) are matched to source frames.
+            Define which parameters must match exactly, warn on threshold, or be ignored.
+          </p>
+          <CalibrationMatchingConfig />
         </div>
       )}
 
-      {success && (
-        <div className="mb-4 p-4 bg-green-900/20 border border-green-800 rounded-lg flex items-start gap-3">
-          <CheckCircle className="text-green-500 flex-shrink-0 mt-0.5" size={20} />
-          <div className="flex-1">
-            <p className="font-medium text-green-400">Settings saved successfully</p>
-          </div>
-        </div>
-      )}
+      {/* General Tab */}
+      {activeTab === 'general' && (
+        <>
+          {error && (
+            <div className="mb-4 p-4 bg-red-900/20 border border-red-800 rounded-lg flex items-start gap-3">
+              <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
+              <div className="flex-1">
+                <p className="font-medium text-red-400">Error</p>
+                <p className="text-sm text-red-300">{String(error)}</p>
+              </div>
+            </div>
+          )}
 
-      <div className="bg-gray-800 rounded-lg p-6 space-y-6">
+          {success && (
+            <div className="mb-4 p-4 bg-green-900/20 border border-green-800 rounded-lg flex items-start gap-3">
+              <CheckCircle className="text-green-500 flex-shrink-0 mt-0.5" size={20} />
+              <div className="flex-1">
+                <p className="font-medium text-green-400">Settings saved successfully</p>
+              </div>
+            </div>
+          )}
+
+          <div className="bg-gray-800 rounded-lg p-6 space-y-6">
         <div>
           <h3 className="text-lg font-semibold mb-4">Clustering Parameters</h3>
 
@@ -1060,6 +1105,8 @@ export default function Settings() {
           </p>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }

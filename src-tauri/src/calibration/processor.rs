@@ -83,14 +83,18 @@ impl ProcessingStats {
         }
 
         // Count missing calibration
+        // Use exact matches to avoid counting sub-calibration messages incorrectly
+        // e.g., "Dark/Bias for Flat" should not count as missing Flat
         for missing in &hierarchy.missing_calibration {
-            if missing.contains("Flat") {
+            if missing == "Flat" {
                 self.missing_flats += 1;
             }
-            if missing.contains("Dark") && !missing.contains("for Flat") {
+            if missing == "Dark" {
                 self.missing_darks += 1;
             }
-            if missing.contains("Bias") {
+            // "Dark/Bias for Flat" means Flat's sub-calibration is missing
+            // (Bias is only used as fallback for calibrating Flats when Dark isn't available)
+            if missing == "Dark/Bias for Flat" {
                 self.missing_bias += 1;
             }
         }

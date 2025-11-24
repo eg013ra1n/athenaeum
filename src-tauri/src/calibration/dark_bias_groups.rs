@@ -87,17 +87,18 @@ pub struct BiasGroup {
 ///
 /// # Arguments
 /// * `conn` - Database connection
-/// * `instrume` - Camera/instrument name (exact match)
-/// * `binning` - Binning pattern (exact match)
-/// * `gain` - Gain setting (exact match if Some)
-/// * `offset` - Offset setting (exact match if Some)
-/// * `exptime` - Exposure time (exact match if Some)
-/// * `focal_length` - Focal length (exact match if Some)
+/// * `instrume` - Camera/instrument name (REQUIRED - exact match)
+/// * `binning` - Binning pattern (REQUIRED - exact match)
+/// * `gain` - Gain setting (REQUIRED - exact match)
+/// * `offset` - Offset setting (REQUIRED - exact match)
+/// * `exptime` - Exposure time (REQUIRED - exact match)
+/// * `_focal_length` - Not used for Dark matching (sensor-only calibration)
 /// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
 /// * `date_range` - Optional date range to limit search (start, end)
 ///
 /// # Returns
 /// Vector of DarkGroup objects, sorted by start_time (newest first)
+/// Returns empty vector if gain or offset is None (required parameters)
 pub fn detect_dark_groups(
     conn: &Connection,
     instrume: &str,
@@ -105,45 +106,47 @@ pub fn detect_dark_groups(
     gain: Option<f64>,
     offset: Option<f64>,
     exptime: Option<f64>,
-    focal_length: Option<f64>,
+    _focal_length: Option<f64>, // Not used for Dark matching (sensor-only calibration)
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<DarkGroup>> {
+    // Gain and offset are REQUIRED for Dark matching - return empty if not provided
+    let gain_val = match gain {
+        Some(g) => g,
+        None => {
+            println!("    ⚠️  Dark detection skipped: gain is required but not provided");
+            return Ok(Vec::new());
+        }
+    };
+    let offset_val = match offset {
+        Some(o) => o,
+        None => {
+            println!("    ⚠️  Dark detection skipped: offset is required but not provided");
+            return Ok(Vec::new());
+        }
+    };
+
     // Build query with parameter matching
+    // Dark matching requires: instrume, binning, gain, offset, exptime
+    // Focal length is NOT used (Dark is sensor-only, not optical)
     let mut query = String::from(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
                 is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
                 ccd_temp, set_temp, focallen, xpixsz, pixsz, naxis1, naxis2,
                 sitelat, lat_obs, sitelong, long_obs
          FROM frames
-         WHERE imagetyp = 'Dark' AND instrume = ?1 AND binning = ?2"
+         WHERE imagetyp = 'Dark' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4"
     );
 
-    let mut param_count = 2;
+    let mut param_count = 4;
 
-    // Gain parameter (exact match if provided)
-    if gain.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND gain = ?{}", param_count));
-    }
-
-    // Offset parameter (exact match if provided)
-    if offset.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND offset = ?{}", param_count));
-    }
-
-    // Exposure time parameter (exact match if provided) - REQUIRED for darks
+    // Exposure time parameter - REQUIRED for Dark matching
     if exptime.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND exptime = ?{}", param_count));
     }
 
-    // Focal length parameter (exact match if provided)
-    if focal_length.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND focallen = ?{}", param_count));
-    }
+    // Focal length is NOT checked for Dark frames (sensor-only calibration)
 
     // Date range filter (optional)
     if date_range.is_some() {
@@ -157,14 +160,14 @@ pub fn detect_dark_groups(
 
     // Log the complete SQL query
     println!("    🔍 Executing Dark SQL query:");
-    println!("       instrume={}, binning={}, gain={:?}, offset={:?}, exptime={:?}, focallen={:?}",
-        instrume, binning, gain, offset, exptime, focal_length);
+    println!("       instrume={}, binning={}, gain={}, offset={}, exptime={:?}",
+        instrume, binning, gain_val, offset_val, exptime);
     if let Some((start, end)) = date_range {
         println!("       date_range: {} to {}", start, end);
     }
 
     // Execute query with parameter binding
-    let frames = execute_dark_query(conn, &query, instrume, binning, gain, offset, exptime, focal_length, date_range)?;
+    let frames = execute_dark_query(conn, &query, instrume, binning, gain_val, offset_val, exptime, date_range)?;
 
     println!("    📊 SQL query found {} dark frames", frames.len());
 
@@ -177,7 +180,7 @@ pub fn detect_dark_groups(
         gain,
         offset,
         exptime,
-        focal_length,
+        None, // focal_length not used for Dark
     );
 
     println!("    🗂️  Clustered into {} dark groups", groups.len());
@@ -189,55 +192,57 @@ pub fn detect_dark_groups(
 ///
 /// # Arguments
 /// * `conn` - Database connection
-/// * `instrume` - Camera/instrument name (exact match)
-/// * `binning` - Binning pattern (exact match)
-/// * `gain` - Gain setting (exact match if Some)
-/// * `offset` - Offset setting (exact match if Some)
-/// * `focal_length` - Focal length (exact match if Some)
+/// * `instrume` - Camera/instrument name (REQUIRED - exact match)
+/// * `binning` - Binning pattern (REQUIRED - exact match)
+/// * `gain` - Gain setting (REQUIRED - exact match)
+/// * `offset` - Offset setting (REQUIRED - exact match)
+/// * `_focal_length` - Not used for Bias matching (sensor-only calibration)
 /// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
 /// * `date_range` - Optional date range to limit search (start, end)
 ///
 /// # Returns
 /// Vector of BiasGroup objects, sorted by start_time (newest first)
+/// Returns empty vector if gain or offset is None (required parameters)
 pub fn detect_bias_groups(
     conn: &Connection,
     instrume: &str,
     binning: &str,
     gain: Option<f64>,
     offset: Option<f64>,
-    focal_length: Option<f64>,
+    _focal_length: Option<f64>, // Not used for Bias matching (sensor-only calibration)
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<BiasGroup>> {
-    // Build query with parameter matching (NO exptime for bias)
+    // Gain and offset are REQUIRED for Bias matching - return empty if not provided
+    let gain_val = match gain {
+        Some(g) => g,
+        None => {
+            println!("    ⚠️  Bias detection skipped: gain is required but not provided");
+            return Ok(Vec::new());
+        }
+    };
+    let offset_val = match offset {
+        Some(o) => o,
+        None => {
+            println!("    ⚠️  Bias detection skipped: offset is required but not provided");
+            return Ok(Vec::new());
+        }
+    };
+
+    // Build query with parameter matching
+    // Bias matching requires: instrume, binning, gain, offset
+    // NO exptime (bias frames have ~0 exposure)
+    // NO focal_length (Bias is sensor-only, not optical)
     let mut query = String::from(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
                 is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
                 ccd_temp, set_temp, focallen, xpixsz, pixsz, naxis1, naxis2,
                 sitelat, lat_obs, sitelong, long_obs
          FROM frames
-         WHERE imagetyp = 'Bias' AND instrume = ?1 AND binning = ?2"
+         WHERE imagetyp = 'Bias' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4"
     );
 
-    let mut param_count = 2;
-
-    // Gain parameter (exact match if provided)
-    if gain.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND gain = ?{}", param_count));
-    }
-
-    // Offset parameter (exact match if provided)
-    if offset.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND offset = ?{}", param_count));
-    }
-
-    // Focal length parameter (exact match if provided)
-    if focal_length.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND focallen = ?{}", param_count));
-    }
+    let mut param_count = 4;
 
     // Date range filter (optional)
     if date_range.is_some() {
@@ -251,14 +256,14 @@ pub fn detect_bias_groups(
 
     // Log the complete SQL query
     println!("    🔍 Executing Bias SQL query:");
-    println!("       instrume={}, binning={}, gain={:?}, offset={:?}, focallen={:?}",
-        instrume, binning, gain, offset, focal_length);
+    println!("       instrume={}, binning={}, gain={}, offset={}",
+        instrume, binning, gain_val, offset_val);
     if let Some((start, end)) = date_range {
         println!("       date_range: {} to {}", start, end);
     }
 
     // Execute query with parameter binding
-    let frames = execute_bias_query(conn, &query, instrume, binning, gain, offset, focal_length, date_range)?;
+    let frames = execute_bias_query(conn, &query, instrume, binning, gain_val, offset_val, date_range)?;
 
     println!("    📊 SQL query found {} bias frames", frames.len());
 
@@ -270,7 +275,7 @@ pub fn detect_bias_groups(
         binning,
         gain,
         offset,
-        focal_length,
+        None, // focal_length not used for Bias
     );
 
     println!("    🗂️  Clustered into {} bias groups", groups.len());
@@ -279,15 +284,15 @@ pub fn detect_bias_groups(
 }
 
 /// Execute Dark query with parameter binding
+/// gain and offset are REQUIRED for Dark matching
 fn execute_dark_query(
     conn: &Connection,
     query: &str,
     instrume: &str,
     binning: &str,
-    gain: Option<f64>,
-    offset: Option<f64>,
+    gain: f64,    // REQUIRED
+    offset: f64,  // REQUIRED
     exptime: Option<f64>,
-    focal_length: Option<f64>,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(query)?;
@@ -298,25 +303,18 @@ fn execute_dark_query(
     stmt.raw_bind_parameter(param_idx, binning)?;
     param_idx += 1;
 
-    if let Some(g) = gain {
-        stmt.raw_bind_parameter(param_idx, g)?;
-        param_idx += 1;
-    }
-
-    if let Some(o) = offset {
-        stmt.raw_bind_parameter(param_idx, o)?;
-        param_idx += 1;
-    }
+    // Gain and offset are always bound (required parameters)
+    stmt.raw_bind_parameter(param_idx, gain)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, offset)?;
+    param_idx += 1;
 
     if let Some(e) = exptime {
         stmt.raw_bind_parameter(param_idx, e)?;
         param_idx += 1;
     }
 
-    if let Some(fl) = focal_length {
-        stmt.raw_bind_parameter(param_idx, fl)?;
-        param_idx += 1;
-    }
+    // focal_length is NOT used for Dark matching (sensor-only calibration)
 
     if let Some((start, end)) = date_range {
         stmt.raw_bind_parameter(param_idx, start.to_rfc3339())?;
@@ -392,14 +390,14 @@ fn execute_dark_query(
 }
 
 /// Execute Bias query with parameter binding
+/// gain and offset are REQUIRED for Bias matching
 fn execute_bias_query(
     conn: &Connection,
     query: &str,
     instrume: &str,
     binning: &str,
-    gain: Option<f64>,
-    offset: Option<f64>,
-    focal_length: Option<f64>,
+    gain: f64,    // REQUIRED
+    offset: f64,  // REQUIRED
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(query)?;
@@ -410,20 +408,13 @@ fn execute_bias_query(
     stmt.raw_bind_parameter(param_idx, binning)?;
     param_idx += 1;
 
-    if let Some(g) = gain {
-        stmt.raw_bind_parameter(param_idx, g)?;
-        param_idx += 1;
-    }
+    // Gain and offset are always bound (required parameters)
+    stmt.raw_bind_parameter(param_idx, gain)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, offset)?;
+    param_idx += 1;
 
-    if let Some(o) = offset {
-        stmt.raw_bind_parameter(param_idx, o)?;
-        param_idx += 1;
-    }
-
-    if let Some(fl) = focal_length {
-        stmt.raw_bind_parameter(param_idx, fl)?;
-        param_idx += 1;
-    }
+    // focal_length is NOT used for Bias matching (sensor-only calibration)
 
     if let Some((start, end)) = date_range {
         stmt.raw_bind_parameter(param_idx, start.to_rfc3339())?;
