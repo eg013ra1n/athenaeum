@@ -551,10 +551,13 @@ fn try_create_dark_for_frame(
         }
     };
 
-    // Get settings
-    let max_age_days = state.settings.get_darks_max_age_days(conn)
+    // Get settings from config
+    let config = crate::calibration::configurable_matcher::load_config(conn);
+    let max_age_days = config.clustering.get("dark")
+        .map(|c| c.max_age_days)
         .unwrap_or(30);
-    let time_cluster_minutes = state.settings.get_darks_time_cluster_minutes(conn)
+    let time_cluster_minutes = config.clustering.get("dark")
+        .map(|c| c.time_cluster_minutes)
         .unwrap_or(30);
 
     println!("    📋 Dark search parameters: max_age_days={}, time_cluster_minutes={}",
@@ -628,10 +631,13 @@ fn try_create_bias_for_frame(
         }
     };
 
-    // Get settings
-    let max_age_days = state.settings.get_bias_max_age_days(conn)
+    // Get settings from config
+    let config = crate::calibration::configurable_matcher::load_config(conn);
+    let max_age_days = config.clustering.get("bias")
+        .map(|c| c.max_age_days)
         .unwrap_or(30);
-    let time_cluster_minutes = state.settings.get_bias_time_cluster_minutes(conn)
+    let time_cluster_minutes = config.clustering.get("bias")
+        .map(|c| c.time_cluster_minutes)
         .unwrap_or(30);
 
     println!("    📋 Bias search parameters: max_age_days={}, time_cluster_minutes={}",

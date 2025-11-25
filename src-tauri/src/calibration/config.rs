@@ -197,6 +197,30 @@ impl Default for ScoringConfig {
     }
 }
 
+/// Warning thresholds for calibration matching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarningConfig {
+    /// Temperature delta tolerance in Celsius
+    pub temp_delta_celsius: f64,
+    /// Flat calibration date warning threshold in days
+    pub flat_date_warning_days: i64,
+    /// Dark calibration date warning threshold in days
+    pub dark_date_warning_days: i64,
+    /// DarkFlat calibration date warning threshold in days
+    pub darkflat_date_warning_days: i64,
+}
+
+impl Default for WarningConfig {
+    fn default() -> Self {
+        Self {
+            temp_delta_celsius: 2.0,
+            flat_date_warning_days: 30,
+            dark_date_warning_days: 365,
+            darkflat_date_warning_days: 365,
+        }
+    }
+}
+
 /// Complete calibration matching configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationMatchingConfig {
@@ -216,6 +240,8 @@ pub struct CalibrationMatchingConfig {
     pub clustering: HashMap<String, ClusteringConfig>,
     /// Scoring configuration
     pub scoring: ScoringConfig,
+    /// Warning thresholds
+    pub warnings: WarningConfig,
 }
 
 impl Default for CalibrationMatchingConfig {
@@ -230,6 +256,7 @@ impl Default for CalibrationMatchingConfig {
             master_preferences: HashMap::new(),
             clustering: HashMap::new(),
             scoring: ScoringConfig::default(),
+            warnings: WarningConfig::default(),
         };
 
         // Configure Lights → Flat (with filter matching)

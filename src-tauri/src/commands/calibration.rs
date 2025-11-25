@@ -189,25 +189,23 @@ pub async fn find_calibration_for_frame_set(
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    // Get flat calibration settings
-    let max_age_days = state.settings.get_flats_max_age_days(&conn)
-        .map_err(|e| format!("Failed to get flats max age: {}", e))?;
-    let time_cluster_minutes = state.settings.get_flats_time_cluster_minutes(&conn)
-        .map_err(|e| format!("Failed to get time cluster threshold: {}", e))?;
-    let temp_weight = state.settings.get_temperature_match_weight(&conn)
-        .map_err(|e| format!("Failed to get temperature match weight: {}", e))?;
+    // Load calibration config
+    let config = crate::calibration::configurable_matcher::load_config(&conn);
 
-    // Build tolerance from parameters, settings, or defaults
+    // Get flat calibration settings from config
+    let max_age_days = config.clustering.get("flat")
+        .map(|c| c.max_age_days)
+        .unwrap_or(30);
+    let time_cluster_minutes = config.clustering.get("flat")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(30);
+    let temp_weight = config.scoring.temperature_match_weight;
+
+    // Build tolerance from parameters, config warnings, or defaults
     let tolerance = CalibrationTolerance {
-        temp_delta_celsius: temp_delta_celsius.unwrap_or_else(||
-            state.settings.get_calibration_temp_delta_celsius(&conn).unwrap_or(2.0)
-        ),
-        flat_date_warning_days: flat_date_warning_days.unwrap_or_else(||
-            state.settings.get_calibration_flat_date_warning_days(&conn).unwrap_or(30)
-        ),
-        dark_date_warning_days: dark_date_warning_days.unwrap_or_else(||
-            state.settings.get_calibration_dark_date_warning_days(&conn).unwrap_or(365)
-        ),
+        temp_delta_celsius: temp_delta_celsius.unwrap_or(config.warnings.temp_delta_celsius),
+        flat_date_warning_days: flat_date_warning_days.unwrap_or(config.warnings.flat_date_warning_days),
+        dark_date_warning_days: dark_date_warning_days.unwrap_or(config.warnings.dark_date_warning_days),
     };
 
     println!(
@@ -350,20 +348,24 @@ pub async fn get_frame_calibration_hierarchy(
         })
     }).map_err(|e| format!("Frame not found: {}", e))?;
 
-    // Build tolerance
+    // Load calibration config
+    let config = crate::calibration::configurable_matcher::load_config(&conn);
+
+    // Build tolerance from parameters, config warnings, or defaults
     let tolerance = CalibrationTolerance {
-        temp_delta_celsius: temp_delta_celsius.unwrap_or(2.0),
-        flat_date_warning_days: flat_date_warning_days.unwrap_or(30),
-        dark_date_warning_days: dark_date_warning_days.unwrap_or(365),
+        temp_delta_celsius: temp_delta_celsius.unwrap_or(config.warnings.temp_delta_celsius),
+        flat_date_warning_days: flat_date_warning_days.unwrap_or(config.warnings.flat_date_warning_days),
+        dark_date_warning_days: dark_date_warning_days.unwrap_or(config.warnings.dark_date_warning_days),
     };
 
-    // Get flat calibration settings
-    let max_age_days = state.settings.get_flats_max_age_days(&conn)
-        .map_err(|e| format!("Failed to get flats max age: {}", e))?;
-    let time_cluster_minutes = state.settings.get_flats_time_cluster_minutes(&conn)
-        .map_err(|e| format!("Failed to get time cluster threshold: {}", e))?;
-    let temp_weight = state.settings.get_temperature_match_weight(&conn)
-        .map_err(|e| format!("Failed to get temperature match weight: {}", e))?;
+    // Get flat calibration settings from config
+    let max_age_days = config.clustering.get("flat")
+        .map(|c| c.max_age_days)
+        .unwrap_or(30);
+    let time_cluster_minutes = config.clustering.get("flat")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(30);
+    let temp_weight = config.scoring.temperature_match_weight;
 
     // Build hierarchy (no pattern or manual selection for single frame view)
     build_complete_hierarchy(
@@ -397,11 +399,16 @@ pub async fn get_flat_group_options_for_frame_set(
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    // Get flat calibration settings
-    let max_age_days = state.settings.get_flats_max_age_days(&conn)
-        .map_err(|e| format!("Failed to get flats max age: {}", e))?;
-    let time_cluster_minutes = state.settings.get_flats_time_cluster_minutes(&conn)
-        .map_err(|e| format!("Failed to get time cluster threshold: {}", e))?;
+    // Load calibration config
+    let config = crate::calibration::configurable_matcher::load_config(&conn);
+
+    // Get flat calibration settings from config
+    let max_age_days = config.clustering.get("flat")
+        .map(|c| c.max_age_days)
+        .unwrap_or(30);
+    let time_cluster_minutes = config.clustering.get("flat")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(30);
 
     // Get all light frames from the frame set to determine unique filters
     let frames = get_light_frames_from_frame_set(&conn, frame_set_id)

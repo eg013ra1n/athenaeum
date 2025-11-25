@@ -33,6 +33,7 @@ export default function CalibrationMatchingConfig() {
     flats: false,
     darks: false,
     clustering: false,
+    warnings: false,
     preferences: false,
   });
 
@@ -222,6 +223,22 @@ export default function CalibrationMatchingConfig() {
     });
   };
 
+  const updateWarningConfig = (field: string, value: number) => {
+    if (!config) return;
+
+    setConfig((prev) => {
+      if (!prev) return prev;
+
+      return {
+        ...prev,
+        warnings: {
+          ...prev.warnings,
+          [field]: value,
+        },
+      };
+    });
+  };
+
   if (loading) {
     return (
       <div className="text-center py-8 text-gray-400">
@@ -376,6 +393,114 @@ export default function CalibrationMatchingConfig() {
               onClusteringUpdate={updateClusteringConfig}
               onScoringUpdate={updateScoringConfig}
             />
+          </div>
+        )}
+      </div>
+
+      {/* Warning Thresholds */}
+      <div className="bg-gray-750 rounded-lg border border-gray-700">
+        <button
+          onClick={() => toggleSection("warnings")}
+          className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
+        >
+          <span className="font-semibold text-lg">Warning Thresholds</span>
+          {expandedSections.warnings ? (
+            <ChevronDown size={20} />
+          ) : (
+            <ChevronRight size={20} />
+          )}
+        </button>
+        {expandedSections.warnings && (
+          <div className="px-4 pb-4">
+            <p className="text-sm text-gray-400 mb-4">
+              Configure warning thresholds for calibration frame matching.
+            </p>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Temperature Delta (°C)
+                </label>
+                <input
+                  type="number"
+                  value={config.warnings.temp_delta_celsius}
+                  onChange={(e) =>
+                    updateWarningConfig(
+                      "temp_delta_celsius",
+                      parseFloat(e.target.value) || 2.0
+                    )
+                  }
+                  step="0.1"
+                  min="0"
+                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
+                />
+                <p className="text-xs text-gray-500 mt-2">
+                  Maximum temperature difference for calibration matching warning
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Flat Date Warning (days)
+                </label>
+                <input
+                  type="number"
+                  value={config.warnings.flat_date_warning_days}
+                  onChange={(e) =>
+                    updateWarningConfig(
+                      "flat_date_warning_days",
+                      parseInt(e.target.value) || 30
+                    )
+                  }
+                  min="1"
+                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
+                />
+                <p className="text-xs text-gray-500 mt-2">
+                  Warn if flat frames are older than this many days
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Dark Date Warning (days)
+                </label>
+                <input
+                  type="number"
+                  value={config.warnings.dark_date_warning_days}
+                  onChange={(e) =>
+                    updateWarningConfig(
+                      "dark_date_warning_days",
+                      parseInt(e.target.value) || 365
+                    )
+                  }
+                  min="1"
+                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
+                />
+                <p className="text-xs text-gray-500 mt-2">
+                  Warn if dark frames are older than this many days
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  DarkFlat Date Warning (days)
+                </label>
+                <input
+                  type="number"
+                  value={config.warnings.darkflat_date_warning_days}
+                  onChange={(e) =>
+                    updateWarningConfig(
+                      "darkflat_date_warning_days",
+                      parseInt(e.target.value) || 365
+                    )
+                  }
+                  min="1"
+                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
+                />
+                <p className="text-xs text-gray-500 mt-2">
+                  Warn if darkflat frames are older than this many days
+                </p>
+              </div>
+            </div>
           </div>
         )}
       </div>

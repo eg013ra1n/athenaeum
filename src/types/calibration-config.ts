@@ -84,6 +84,18 @@ export interface ScoringConfig {
   temperature_match_weight: number;
 }
 
+/** Warning thresholds for calibration matching */
+export interface WarningConfig {
+  /** Temperature delta tolerance in Celsius */
+  temp_delta_celsius: number;
+  /** Flat calibration date warning threshold in days */
+  flat_date_warning_days: number;
+  /** Dark calibration date warning threshold in days */
+  dark_date_warning_days: number;
+  /** DarkFlat calibration date warning threshold in days */
+  darkflat_date_warning_days: number;
+}
+
 /** Complete calibration matching configuration */
 export interface CalibrationMatchingConfig {
   /** Schema version for migration support */
@@ -102,6 +114,8 @@ export interface CalibrationMatchingConfig {
   clustering: Record<string, ClusteringConfig>;
   /** Scoring configuration */
   scoring: ScoringConfig;
+  /** Warning thresholds */
+  warnings: WarningConfig;
 }
 
 /** Helper to create a default ParameterConfig */

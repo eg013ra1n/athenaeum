@@ -157,7 +157,14 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 
 ### Calibration Matching System
 
-The calibration matching system is fully configurable via UI (Settings → Calibration Matching tab). Configuration is stored as JSON in the `settings` table under key `calibration.matching_config`.
+The calibration matching system is fully configurable via UI (Settings → Calibration Matching tab). All calibration-related settings are stored in a unified `CalibrationMatchingConfig` JSON structure in the `settings` table under key `calibration.matching_config`.
+
+**Configuration Components**:
+- **Parameter Matching Rules**: Configure which parameters must match exactly, warn on threshold, or be ignored
+- **Clustering Settings**: Max age and time clustering thresholds per calibration type (flat, dark, bias, darkflat)
+- **Scoring Config**: Temperature match weight for calibration candidate scoring
+- **Warning Thresholds**: Temperature delta tolerance and date warning thresholds
+- **Master Preferences**: Prefer master frames or frame sets when both available
 
 **Source Types** (frames that need calibration):
 - **Lights** → can link to Flat, Dark, Bias
@@ -367,8 +374,21 @@ let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
 // From frontend - get current config
 const config = await invoke<CalibrationMatchingConfig>('get_calibration_matching_config');
 
-// Modify and save
+// Modify parameter matching rules
 config.lights.dark.ccd_temp.warning_threshold = 3.0;
+
+// Modify clustering settings
+config.clustering.flat.max_age_days = 60;
+config.clustering.flat.time_cluster_minutes = 45;
+
+// Modify scoring config
+config.scoring.temperature_match_weight = 0.5;
+
+// Modify warning thresholds
+config.warnings.temp_delta_celsius = 3.0;
+config.warnings.flat_date_warning_days = 60;
+
+// Save changes
 await invoke('set_calibration_matching_config', { config });
 
 // Reset to defaults
@@ -380,7 +400,20 @@ const defaultConfig = await invoke<CalibrationMatchingConfig>('reset_calibration
 use crate::calibration::configurable_matcher::{load_config, find_calibration_sets};
 
 let config = load_config(conn);
+
+// Use parameter matching rules
 let candidates = find_calibration_sets(conn, &frame, "lights", "dark", &config)?;
+
+// Access clustering settings
+let max_age = config.clustering.get("flat")
+    .map(|c| c.max_age_days)
+    .unwrap_or(30);
+
+// Access warning thresholds
+let temp_delta = config.warnings.temp_delta_celsius;
+
+// Access scoring config
+let temp_weight = config.scoring.temperature_match_weight;
 ```
 
 ## Dependencies

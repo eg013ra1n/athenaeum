@@ -17,8 +17,6 @@ interface CacheStats {
 export default function Settings() {
   const [thresholdValue, setThresholdValue] = useState('5.0');
   const [thresholdUnit, setThresholdUnit] = useState<ThresholdUnit>('arcmin');
-  const [coordFrame, setCoordFrame] = useState('ICRS');
-  const [nameMode, setNameMode] = useState('majority-object');
   const [sessionGapHours, setSessionGapHours] = useState('6.0');
   const [qualityThumbnail, setQualityThumbnail] = useState('70');
   const [qualityPreview, setQualityPreview] = useState('85');
@@ -26,18 +24,6 @@ export default function Settings() {
   const [blinkResolution, setBlinkResolution] = useState('preview');
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
-
-  // Calibration settings
-  const [calibTempDelta, setCalibTempDelta] = useState('2.0');
-  const [calibFlatDateWarning, setCalibFlatDateWarning] = useState('30');
-  const [calibDarkDateWarning, setCalibDarkDateWarning] = useState('365');
-  const [flatsMaxAge, setFlatsMaxAge] = useState('30');
-  const [flatsTimeCluster, setFlatsTimeCluster] = useState('30');
-  const [tempMatchWeight, setTempMatchWeight] = useState('0.3');
-  const [darksMaxAge, setDarksMaxAge] = useState('30');
-  const [darksTimeCluster, setDarksTimeCluster] = useState('30');
-  const [biasMaxAge, setBiasMaxAge] = useState('30');
-  const [biasTimeCluster, setBiasTimeCluster] = useState('30');
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -69,8 +55,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, frame, mode, sessionGap, qThumbnail, qPreview, qFull, resolution, contentHash, contentHashRescanned,
-        tempDelta, flatDateWarn, darkDateWarn, flatsAge, flatsCluster, tempWeight, darksAge, darksCluster, biasAge, biasCluster
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, contentHash, contentHashRescanned
       ] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -79,14 +64,6 @@ export default function Settings() {
         invoke<string>('get_setting', {
           key: 'grouping.threshold.unit',
           defaultValue: 'deg',
-        }),
-        invoke<string>('get_setting', {
-          key: 'grouping.coord.frame',
-          defaultValue: 'ICRS',
-        }),
-        invoke<string>('get_setting', {
-          key: 'ui.objects.auto_name_mode',
-          defaultValue: 'majority-object',
         }),
         invoke<string>('get_setting', {
           key: 'session_gap_threshold_hours',
@@ -116,53 +93,10 @@ export default function Settings() {
           key: 'duplicates.content_hash_rescanned',
           defaultValue: 'false',
         }),
-        // Calibration settings
-        invoke<string>('get_setting', {
-          key: 'calibration.temp_delta_celsius',
-          defaultValue: '2.0',
-        }),
-        invoke<string>('get_setting', {
-          key: 'calibration.flat_date_warning_days',
-          defaultValue: '30',
-        }),
-        invoke<string>('get_setting', {
-          key: 'calibration.dark_date_warning_days',
-          defaultValue: '365',
-        }),
-        invoke<string>('get_setting', {
-          key: 'flats.max_age_days',
-          defaultValue: '30',
-        }),
-        invoke<string>('get_setting', {
-          key: 'flats.time_cluster_minutes',
-          defaultValue: '30',
-        }),
-        invoke<string>('get_setting', {
-          key: 'temperature.match_weight',
-          defaultValue: '0.3',
-        }),
-        invoke<string>('get_setting', {
-          key: 'darks.max_age_days',
-          defaultValue: '30',
-        }),
-        invoke<string>('get_setting', {
-          key: 'darks.time_cluster_minutes',
-          defaultValue: '30',
-        }),
-        invoke<string>('get_setting', {
-          key: 'bias.max_age_days',
-          defaultValue: '30',
-        }),
-        invoke<string>('get_setting', {
-          key: 'bias.time_cluster_minutes',
-          defaultValue: '30',
-        }),
       ]);
 
       setThresholdValue(value);
       setThresholdUnit(unit as ThresholdUnit);
-      setCoordFrame(frame);
-      setNameMode(mode);
       setSessionGapHours(sessionGap);
       setQualityThumbnail(qThumbnail);
       setQualityPreview(qPreview);
@@ -170,18 +104,6 @@ export default function Settings() {
       setBlinkResolution(resolution);
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
-
-      // Calibration settings
-      setCalibTempDelta(tempDelta);
-      setCalibFlatDateWarning(flatDateWarn);
-      setCalibDarkDateWarning(darkDateWarn);
-      setFlatsMaxAge(flatsAge);
-      setFlatsTimeCluster(flatsCluster);
-      setTempMatchWeight(tempWeight);
-      setDarksMaxAge(darksAge);
-      setDarksTimeCluster(darksCluster);
-      setBiasMaxAge(biasAge);
-      setBiasTimeCluster(biasCluster);
     } catch (err) {
       setError(err as string);
       console.error('Failed to load settings:', err);
@@ -229,67 +151,6 @@ export default function Settings() {
         return;
       }
 
-      // Validate calibration settings
-      const tempDeltaValue = parseFloat(calibTempDelta);
-      if (isNaN(tempDeltaValue) || tempDeltaValue <= 0) {
-        setError('Temperature delta must be a positive number');
-        return;
-      }
-
-      const flatDateWarnValue = parseInt(calibFlatDateWarning);
-      if (isNaN(flatDateWarnValue) || flatDateWarnValue <= 0) {
-        setError('Flat date warning must be a positive number');
-        return;
-      }
-
-      const darkDateWarnValue = parseInt(calibDarkDateWarning);
-      if (isNaN(darkDateWarnValue) || darkDateWarnValue <= 0) {
-        setError('Dark date warning must be a positive number');
-        return;
-      }
-
-      const flatsMaxAgeValue = parseInt(flatsMaxAge);
-      if (isNaN(flatsMaxAgeValue) || flatsMaxAgeValue <= 0) {
-        setError('Flats maximum age must be a positive number');
-        return;
-      }
-
-      const flatsTimeClusterValue = parseInt(flatsTimeCluster);
-      if (isNaN(flatsTimeClusterValue) || flatsTimeClusterValue <= 0) {
-        setError('Flats time clustering must be a positive number');
-        return;
-      }
-
-      const tempWeightValue = parseFloat(tempMatchWeight);
-      if (isNaN(tempWeightValue) || tempWeightValue < 0 || tempWeightValue > 1) {
-        setError('Temperature match weight must be between 0.0 and 1.0');
-        return;
-      }
-
-      const darksMaxAgeValue = parseInt(darksMaxAge);
-      if (isNaN(darksMaxAgeValue) || darksMaxAgeValue <= 0) {
-        setError('Darks maximum age must be a positive number');
-        return;
-      }
-
-      const darksTimeClusterValue = parseInt(darksTimeCluster);
-      if (isNaN(darksTimeClusterValue) || darksTimeClusterValue <= 0) {
-        setError('Darks time clustering must be a positive number');
-        return;
-      }
-
-      const biasMaxAgeValue = parseInt(biasMaxAge);
-      if (isNaN(biasMaxAgeValue) || biasMaxAgeValue <= 0) {
-        setError('Bias maximum age must be a positive number');
-        return;
-      }
-
-      const biasTimeClusterValue = parseInt(biasTimeCluster);
-      if (isNaN(biasTimeClusterValue) || biasTimeClusterValue <= 0) {
-        setError('Bias time clustering must be a positive number');
-        return;
-      }
-
       await Promise.all([
         invoke('set_setting', {
           key: 'grouping.threshold.value',
@@ -298,14 +159,6 @@ export default function Settings() {
         invoke('set_setting', {
           key: 'grouping.threshold.unit',
           value: thresholdUnit,
-        }),
-        invoke('set_setting', {
-          key: 'grouping.coord.frame',
-          value: coordFrame,
-        }),
-        invoke('set_setting', {
-          key: 'ui.objects.auto_name_mode',
-          value: nameMode,
         }),
         invoke('set_setting', {
           key: 'session_gap_threshold_hours',
@@ -335,47 +188,6 @@ export default function Settings() {
         invoke('set_setting', {
           key: 'duplicates.content_hash_rescanned',
           value: useContentHash ? 'false' : 'false',
-        }),
-        // Calibration settings
-        invoke('set_setting', {
-          key: 'calibration.temp_delta_celsius',
-          value: calibTempDelta,
-        }),
-        invoke('set_setting', {
-          key: 'calibration.flat_date_warning_days',
-          value: calibFlatDateWarning,
-        }),
-        invoke('set_setting', {
-          key: 'calibration.dark_date_warning_days',
-          value: calibDarkDateWarning,
-        }),
-        invoke('set_setting', {
-          key: 'flats.max_age_days',
-          value: flatsMaxAge,
-        }),
-        invoke('set_setting', {
-          key: 'flats.time_cluster_minutes',
-          value: flatsTimeCluster,
-        }),
-        invoke('set_setting', {
-          key: 'temperature.match_weight',
-          value: tempMatchWeight,
-        }),
-        invoke('set_setting', {
-          key: 'darks.max_age_days',
-          value: darksMaxAge,
-        }),
-        invoke('set_setting', {
-          key: 'darks.time_cluster_minutes',
-          value: darksTimeCluster,
-        }),
-        invoke('set_setting', {
-          key: 'bias.max_age_days',
-          value: biasMaxAge,
-        }),
-        invoke('set_setting', {
-          key: 'bias.time_cluster_minutes',
-          value: biasTimeCluster,
         }),
       ]);
 
@@ -611,44 +423,6 @@ export default function Settings() {
                 Current value: {getThresholdInDegrees()}° (decimal degrees)
               </p>
             </div>
-
-            {/* Coordinate Frame */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Coordinate Frame
-              </label>
-              <select
-                value={coordFrame}
-                onChange={(e) => setCoordFrame(e.target.value)}
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-              >
-                <option value="ICRS">ICRS (J2000)</option>
-                <option value="FK5">FK5</option>
-                <option value="FK4">FK4</option>
-              </select>
-              <p className="text-xs text-gray-500 mt-2">
-                Reference frame for coordinate normalization. ICRS (J2000) is recommended.
-              </p>
-            </div>
-
-            {/* Naming Mode */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Auto-Naming Mode
-              </label>
-              <select
-                value={nameMode}
-                onChange={(e) => setNameMode(e.target.value)}
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-              >
-                <option value="majority-object">Majority OBJECT value</option>
-                <option value="ra-dec">RA/Dec coordinates</option>
-              </select>
-              <p className="text-xs text-gray-500 mt-2">
-                How to name auto-generated frame sets. "Majority OBJECT" uses the most common
-                OBJECT value; falls back to RA/Dec if no majority exists.
-              </p>
-            </div>
           </div>
         </div>
 
@@ -675,207 +449,6 @@ export default function Settings() {
                 sessions can span midnight (e.g., 19:00 Day 1 → 03:00 Day 2 = one night). Default
                 is 6 hours.
               </p>
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <h3 className="text-lg font-semibold mb-4">Calibration</h3>
-
-          <div className="space-y-6">
-            {/* Warning Thresholds */}
-            <div>
-              <h4 className="text-md font-medium text-gray-200 mb-3">Warning Thresholds</h4>
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Temperature Warning Threshold (°C)
-                  </label>
-                  <input
-                    type="number"
-                    value={calibTempDelta}
-                    onChange={(e) => setCalibTempDelta(e.target.value)}
-                    step="0.1"
-                    min="0"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Maximum allowed temperature difference (±) between light frames and calibration frames before issuing a warning. Lower values are stricter.
-                  </p>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Flat Date Warning Threshold (days)
-                  </label>
-                  <input
-                    type="number"
-                    value={calibFlatDateWarning}
-                    onChange={(e) => setCalibFlatDateWarning(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Issue a warning if flat calibration frames are older than this many days. Flats should typically be captured frequently (weekly or per session).
-                  </p>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Dark Date Warning Threshold (days)
-                  </label>
-                  <input
-                    type="number"
-                    value={calibDarkDateWarning}
-                    onChange={(e) => setCalibDarkDateWarning(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Issue a warning if dark/bias calibration frames are older than this many days. Darks can typically be reused for longer periods than flats.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Flat Calibration */}
-            <div>
-              <h4 className="text-md font-medium text-gray-200 mb-3">Flat Calibration</h4>
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Maximum Age (days)
-                  </label>
-                  <input
-                    type="number"
-                    value={flatsMaxAge}
-                    onChange={(e) => setFlatsMaxAge(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Only consider flat frames captured within this many days when searching for calibration. Older flats will be excluded from matching.
-                  </p>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Time Clustering (minutes)
-                  </label>
-                  <input
-                    type="number"
-                    value={flatsTimeCluster}
-                    onChange={(e) => setFlatsTimeCluster(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Group flat frames into sets if they are within this time window. Flats are typically shot in bursts during a session.
-                  </p>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Temperature Match Weight (0.0-1.0)
-                  </label>
-                  <input
-                    type="number"
-                    value={tempMatchWeight}
-                    onChange={(e) => setTempMatchWeight(e.target.value)}
-                    step="0.1"
-                    min="0"
-                    max="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Weight given to temperature matching when scoring flat candidates (0.0 = ignore temperature, 1.0 = only temperature matters). Typical value is 0.3.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Dark Calibration */}
-            <div>
-              <h4 className="text-md font-medium text-gray-200 mb-3">Dark Calibration</h4>
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Maximum Age (days)
-                  </label>
-                  <input
-                    type="number"
-                    value={darksMaxAge}
-                    onChange={(e) => setDarksMaxAge(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Only consider dark frames captured within this many days. Darks can typically be reused for longer than flats.
-                  </p>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Time Clustering (minutes)
-                  </label>
-                  <input
-                    type="number"
-                    value={darksTimeCluster}
-                    onChange={(e) => setDarksTimeCluster(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Group dark frames into sets if they are within this time window.
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Bias Calibration */}
-            <div>
-              <h4 className="text-md font-medium text-gray-200 mb-3">Bias Calibration</h4>
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Maximum Age (days)
-                  </label>
-                  <input
-                    type="number"
-                    value={biasMaxAge}
-                    onChange={(e) => setBiasMaxAge(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Only consider bias frames captured within this many days. Bias frames are very stable and can be reused for extended periods.
-                  </p>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Time Clustering (minutes)
-                  </label>
-                  <input
-                    type="number"
-                    value={biasTimeCluster}
-                    onChange={(e) => setBiasTimeCluster(e.target.value)}
-                    step="1"
-                    min="1"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-                  />
-                  <p className="text-xs text-gray-500 mt-2">
-                    Group bias frames into sets if they are within this time window.
-                  </p>
-                </div>
-              </div>
             </div>
           </div>
         </div>
