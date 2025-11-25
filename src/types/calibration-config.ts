@@ -82,6 +82,8 @@ export interface ClusteringConfig {
 export interface ScoringConfig {
   /** Weight for temperature proximity in scoring (0.0-1.0) */
   temperature_match_weight: number;
+  /** Temperature scaling factor for scoring formula (default 2.0) */
+  temperature_scale: number;
 }
 
 /** Warning thresholds for calibration matching */

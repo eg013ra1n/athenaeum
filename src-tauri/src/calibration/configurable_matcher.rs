@@ -321,8 +321,8 @@ pub fn find_calibration_sets(
             _ => None,
         };
 
-        // Score the match using temperature weight from config
-        let score = score_match(date_diff, temp_diff, config.scoring.temperature_match_weight);
+        // Score the match using temperature weight and scale from config
+        let score = score_match(date_diff, temp_diff, config.scoring.temperature_match_weight, config.scoring.temperature_scale);
 
         // Determine warnings
         let temp_warning = !match_result.warnings.is_empty() &&
@@ -389,6 +389,7 @@ fn score_match(
     date_diff_days: Option<i64>,
     temp_diff: Option<f64>,
     temp_weight: f64,
+    temp_scale: f64,
 ) -> f64 {
     let mut score = 1.0;
 
@@ -398,9 +399,9 @@ fn score_match(
         score *= date_score;
     }
 
-    // Temperature scoring with configurable weight
+    // Temperature scoring with configurable weight and scale
     if let Some(temp) = temp_diff {
-        let temp_score = 1.0 / (1.0 + (temp.abs() / 2.0));
+        let temp_score = 1.0 / (1.0 + (temp.abs() / temp_scale));
         // Apply weight: weighted average between 1.0 and temp_score
         let weighted_temp = 1.0 * (1.0 - temp_weight) + temp_score * temp_weight;
         score *= weighted_temp;
@@ -645,12 +646,12 @@ mod tests {
     #[test]
     fn test_score_match() {
         // Perfect match
-        let score = score_match(Some(0), Some(0.0), 0.3);
+        let score = score_match(Some(0), Some(0.0), 0.3, 2.0);
         assert!(score > 0.99);
 
         // With temperature weight
-        let score_low_weight = score_match(Some(10), Some(5.0), 0.1);
-        let score_high_weight = score_match(Some(10), Some(5.0), 0.5);
+        let score_low_weight = score_match(Some(10), Some(5.0), 0.1, 2.0);
+        let score_high_weight = score_match(Some(10), Some(5.0), 0.5, 2.0);
 
         // Higher weight should amplify the temperature effect
         // Both should be valid scores

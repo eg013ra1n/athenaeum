@@ -1,6 +1,6 @@
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { useState } from 'react';
-import type { CalibrationSetDetail, FrameSetCalibrationGroups } from '../types/models';
+import type { CalibrationSetDetail, FrameSetCalibrationGroups, CalibrationWarning } from '../types/models';
 
 interface CalibrationGroupsViewProps {
   data: FrameSetCalibrationGroups;
@@ -30,11 +30,13 @@ export function CalibrationGroupsView({ data }: CalibrationGroupsViewProps) {
   const CalibrationSetCard = ({
     title,
     set,
-    type
+    type,
+    warnings
   }: {
     title: string;
     set: CalibrationSetDetail | null;
     type: 'flat' | 'dark' | 'bias';
+    warnings: CalibrationWarning[];
   }) => {
     if (!set) return null;
 
@@ -86,6 +88,18 @@ export function CalibrationGroupsView({ data }: CalibrationGroupsViewProps) {
             <span className="text-gray-200">{set.frame_count}</span>
           </div>
         </div>
+
+        {/* Warning display */}
+        {warnings.length > 0 && (
+          <div className="mt-3 pt-3 border-t border-yellow-700/30 space-y-1">
+            {warnings.map((warning, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs">
+                <AlertTriangle size={14} className="text-yellow-400 flex-shrink-0 mt-0.5" />
+                <span className="text-yellow-200">{warning.message}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   };
@@ -178,6 +192,7 @@ export function CalibrationGroupsView({ data }: CalibrationGroupsViewProps) {
                           title="Flat Calibration"
                           set={group.flat_set_detail}
                           type="flat"
+                          warnings={group.flat_warnings}
                         />
                       )}
                       {hasDark && (
@@ -185,6 +200,7 @@ export function CalibrationGroupsView({ data }: CalibrationGroupsViewProps) {
                           title="Dark Calibration"
                           set={group.dark_set_detail}
                           type="dark"
+                          warnings={group.dark_warnings}
                         />
                       )}
                       {hasBias && (
@@ -192,6 +208,7 @@ export function CalibrationGroupsView({ data }: CalibrationGroupsViewProps) {
                           title="Bias Calibration"
                           set={group.bias_set_detail}
                           type="bias"
+                          warnings={group.bias_warnings}
                         />
                       )}
                     </div>

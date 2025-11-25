@@ -436,6 +436,10 @@ export interface CalibrationGroup {
   frame_count: number;
   frame_ids: number[];
   has_warnings: boolean;
+  // Per-calibration warnings with contextual messages
+  flat_warnings: CalibrationWarning[];
+  dark_warnings: CalibrationWarning[];
+  bias_warnings: CalibrationWarning[];
 }
 
 export interface FrameSetCalibrationGroups {

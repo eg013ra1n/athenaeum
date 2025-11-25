@@ -561,6 +561,10 @@ pub struct CalibrationGroup {
     pub frame_count: usize,
     pub frame_ids: Vec<i64>,
     pub has_warnings: bool,
+    // Per-calibration warnings with contextual messages
+    pub flat_warnings: Vec<CalibrationWarning>,
+    pub dark_warnings: Vec<CalibrationWarning>,
+    pub bias_warnings: Vec<CalibrationWarning>,
 }
 
 /// Complete calibration grouping for a frame set

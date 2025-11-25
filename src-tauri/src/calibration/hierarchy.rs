@@ -242,6 +242,9 @@ pub fn build_complete_hierarchy(
     let mut missing_calibration = Vec::new();
     let mut warnings = Vec::new();
 
+    // Load configurable matching config for threshold checks
+    let config = load_config(conn);
+
     // Find Flat sets for the light frame using new pattern-based system
     let flat_set_id = if let Some(set_id) = manual_flat_set_id {
         // Manual selection - use the provided set ID directly
@@ -304,7 +307,12 @@ pub fn build_complete_hierarchy(
 
                 // Add temperature warning if temp diff exists and is significant
                 if let Some(temp_diff) = flat_match.temp_diff {
-                    if temp_diff > tolerance.temp_delta_celsius {
+                    // Get threshold from config (Lights→Flat ccd_temp warning threshold)
+                    let threshold = config.lights.flat.as_ref()
+                        .and_then(|c| c.ccd_temp.warning_threshold)
+                        .unwrap_or(tolerance.temp_delta_celsius);
+
+                    if temp_diff > threshold {
                         warnings.push(CalibrationWarning {
                             warning_type: "temperature".to_string(),
                             message: format!(

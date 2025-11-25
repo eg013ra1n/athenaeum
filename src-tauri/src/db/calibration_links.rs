@@ -1,5 +1,5 @@
 use rusqlite::{Connection, Result, params};
-use crate::models::{CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup, FrameSetCalibrationGroups, CalibrationSetDetail, ImageType};
+use crate::models::{CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup, FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning};
 use std::collections::HashMap;
 
 /// Insert a new calibration link
@@ -360,6 +360,10 @@ pub fn get_calibration_groups_for_frame_set(
         // Check if any frames in this group have warnings
         let has_warnings = check_group_warnings(conn, &frame_ids_in_group)?;
 
+        // Collect detailed warnings for each calibration type
+        let (flat_warnings, dark_warnings, bias_warnings) =
+            get_calibration_warnings_for_group(conn, &frame_ids_in_group, flat_set_id, dark_set_id, bias_set_id)?;
+
         groups.push(CalibrationGroup {
             flat_set_id,
             dark_set_id,
@@ -370,6 +374,9 @@ pub fn get_calibration_groups_for_frame_set(
             frame_count: frame_ids_in_group.len(),
             frame_ids: frame_ids_in_group,
             has_warnings,
+            flat_warnings,
+            dark_warnings,
+            bias_warnings,
         });
     }
 
@@ -414,6 +421,83 @@ fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<Calibrat
             frame_count: row.get(13)?,
         })
     })
+}
+
+/// Helper: Collect detailed calibration warnings for a group
+fn get_calibration_warnings_for_group(
+    conn: &Connection,
+    frame_ids: &[i64],
+    flat_set_id: Option<i64>,
+    dark_set_id: Option<i64>,
+    bias_set_id: Option<i64>,
+) -> Result<(Vec<CalibrationWarning>, Vec<CalibrationWarning>, Vec<CalibrationWarning>)> {
+    let mut flat_warnings = Vec::new();
+    let mut dark_warnings = Vec::new();
+    let mut bias_warnings = Vec::new();
+
+    if frame_ids.is_empty() {
+        return Ok((flat_warnings, dark_warnings, bias_warnings));
+    }
+
+    // Query for calibration links with warnings
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+    let query = format!(
+        "SELECT calibration_type, date_warning, temp_warning, calibration_set_id
+         FROM calibration_set_to_frames
+         WHERE source_id IN ({}) AND source_type = 'frame'
+         AND (date_warning = 1 OR temp_warning = 1)",
+        placeholders.join(",")
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+    let warnings_data: Vec<(String, bool, bool, i64)> = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,  // calibration_type
+                row.get::<_, i64>(1)? == 1,  // date_warning
+                row.get::<_, i64>(2)? == 1,  // temp_warning
+                row.get::<_, i64>(3)?,  // calibration_set_id
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+
+    // Group warnings by calibration type and build warning messages
+    for (cal_type, has_date_warning, has_temp_warning, set_id) in warnings_data {
+        let warnings_vec = match cal_type.as_str() {
+            "Flat" => &mut flat_warnings,
+            "Dark" => &mut dark_warnings,
+            "Bias" => &mut bias_warnings,
+            _ => continue,
+        };
+
+        // Create contextual warning messages
+        if has_temp_warning {
+            warnings_vec.push(CalibrationWarning {
+                warning_type: "temperature".to_string(),
+                message: format!("{} temperature for light calibration differs significantly", cal_type),
+                calibration_type: cal_type.clone(),
+                set_id,
+            });
+        }
+
+        if has_date_warning {
+            warnings_vec.push(CalibrationWarning {
+                warning_type: "date".to_string(),
+                message: format!("{} calibration may be outdated", cal_type),
+                calibration_type: cal_type.clone(),
+                set_id,
+            });
+        }
+    }
+
+    // Deduplicate warnings (same set_id + warning_type)
+    flat_warnings.dedup_by(|a, b| a.set_id == b.set_id && a.warning_type == b.warning_type);
+    dark_warnings.dedup_by(|a, b| a.set_id == b.set_id && a.warning_type == b.warning_type);
+    bias_warnings.dedup_by(|a, b| a.set_id == b.set_id && a.warning_type == b.warning_type);
+
+    Ok((flat_warnings, dark_warnings, bias_warnings))
 }
 
 /// Helper: Check if any frames in the group have calibration warnings

@@ -187,12 +187,15 @@ impl Default for ClusteringConfig {
 pub struct ScoringConfig {
     /// Weight for temperature proximity in scoring (0.0-1.0)
     pub temperature_match_weight: f64,
+    /// Temperature scaling factor for scoring formula (default 2.0)
+    pub temperature_scale: f64,
 }
 
 impl Default for ScoringConfig {
     fn default() -> Self {
         Self {
             temperature_match_weight: 0.3,
+            temperature_scale: 2.0,
         }
     }
 }
