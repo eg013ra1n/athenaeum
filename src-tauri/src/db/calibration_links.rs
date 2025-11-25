@@ -1,5 +1,7 @@
 use rusqlite::{Connection, Result, params};
 use crate::models::{CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup, FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning};
+use crate::calibration::configurable_matcher::load_config;
+use crate::calibration::config::{MatchMode, CalibrationMatchingConfig};
 use std::collections::HashMap;
 
 /// Insert a new calibration link
@@ -423,6 +425,57 @@ fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<Calibrat
     })
 }
 
+/// Helper: Check if temperature warnings are enabled for a given calibration path
+fn is_temp_warning_enabled(config: &CalibrationMatchingConfig, cal_type: &str) -> bool {
+    match cal_type {
+        "Flat" => {
+            config.lights.flat.as_ref()
+                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+                .unwrap_or(false)
+        }
+        "Dark" => {
+            config.lights.dark.as_ref()
+                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+                .unwrap_or(false)
+        }
+        "Bias" => {
+            config.lights.bias.as_ref()
+                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+                .unwrap_or(false)
+        }
+        "DarkFlat" => {
+            config.flats.darkflat.as_ref()
+                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Helper: Check if date warnings are enabled (threshold > 0 and reasonable)
+fn is_date_warning_enabled(config: &CalibrationMatchingConfig, cal_type: &str) -> bool {
+    match cal_type {
+        "Flat" => {
+            let threshold = config.warnings.flat_date_warning_days;
+            threshold > 0 && threshold < 10000  // Reasonable threshold
+        }
+        "Dark" => {
+            let threshold = config.warnings.dark_date_warning_days;
+            threshold > 0 && threshold < 10000
+        }
+        "Bias" => {
+            // Bias warnings typically use dark threshold
+            let threshold = config.warnings.dark_date_warning_days;
+            threshold > 0 && threshold < 10000
+        }
+        "DarkFlat" => {
+            let threshold = config.warnings.darkflat_date_warning_days;
+            threshold > 0 && threshold < 10000
+        }
+        _ => false,
+    }
+}
+
 /// Helper: Collect detailed calibration warnings for a group
 fn get_calibration_warnings_for_group(
     conn: &Connection,
@@ -438,6 +491,9 @@ fn get_calibration_warnings_for_group(
     if frame_ids.is_empty() {
         return Ok((flat_warnings, dark_warnings, bias_warnings));
     }
+
+    // Load current configuration to check if warnings are enabled
+    let config = load_config(conn);
 
     // Query for calibration links with warnings
     let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
@@ -472,8 +528,8 @@ fn get_calibration_warnings_for_group(
             _ => continue,
         };
 
-        // Create contextual warning messages
-        if has_temp_warning {
+        // Create contextual warning messages ONLY if enabled in current config
+        if has_temp_warning && is_temp_warning_enabled(&config, &cal_type) {
             warnings_vec.push(CalibrationWarning {
                 warning_type: "temperature".to_string(),
                 message: format!("{} temperature for light calibration differs significantly", cal_type),
@@ -482,7 +538,7 @@ fn get_calibration_warnings_for_group(
             });
         }
 
-        if has_date_warning {
+        if has_date_warning && is_date_warning_enabled(&config, &cal_type) {
             warnings_vec.push(CalibrationWarning {
                 warning_type: "date".to_string(),
                 message: format!("{} calibration may be outdated", cal_type),
