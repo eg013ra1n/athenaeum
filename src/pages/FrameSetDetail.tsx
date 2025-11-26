@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, File as FileIcon, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
+import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
 import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame, FrameCalibrationStatus, FrameSetCalibrationGroups } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -759,15 +759,6 @@ export default function FrameSetDetail() {
                               <tr>
                                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
                                   <SortableColumnHeader
-                                    field="filename"
-                                    label="Filename"
-                                    currentSortField={sortField}
-                                    sortDirection={sortDirection}
-                                    onSort={handleSort}
-                                  />
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  <SortableColumnHeader
                                     field="time"
                                     label="Time"
                                     currentSortField={sortField}
@@ -849,19 +840,13 @@ export default function FrameSetDetail() {
                                         idx % 2 === 0 ? "bg-gray-800" : "bg-gray-850"
                                       } hover:bg-gray-750 cursor-pointer transition-colors`}
                                     >
-                                      <td className="px-4 py-3">
-                                        <div className="flex items-center gap-2 min-w-0">
-                                          <FileIcon size={14} className="text-gray-500 flex-shrink-0" />
-                                          <span className="font-mono text-sm truncate" title={item.file?.filename || ''}>
-                                            {item.file?.filename || '-'}
-                                          </span>
-                                        </div>
-                                      </td>
                                       <td className="px-4 py-3 text-sm text-gray-400">
                                         {item.frame?.date_obs
                                           ? new Date(item.frame.date_obs).toLocaleTimeString('en-US', {
                                               hour: '2-digit',
                                               minute: '2-digit',
+                                              second: '2-digit',
+                                              hour12: false,
                                             })
                                           : '-'}
                                       </td>
@@ -909,7 +894,7 @@ export default function FrameSetDetail() {
                                         key={`${fileId}-expanded`}
                                         className="bg-gray-900 border-t border-gray-700"
                                       >
-                                        <td colSpan={9} className="px-4 py-4">
+                                        <td colSpan={8} className="px-4 py-4">
                                           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 text-sm">
                                             <div>
                                               <span className="text-gray-400">File Path:</span>
