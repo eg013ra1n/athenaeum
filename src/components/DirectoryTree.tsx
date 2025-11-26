@@ -436,7 +436,15 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                         <div>
                           <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Date</div>
                           <div className="text-sm text-gray-200">
-                            {new Date(hoveredFile.frame.date_obs).toLocaleString()}
+                            {new Date(hoveredFile.frame.date_obs).toLocaleString('en-US', {
+                              year: 'numeric',
+                              month: 'short',
+                              day: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit',
+                              hour12: false,
+                            })}
                           </div>
                         </div>
                       )}

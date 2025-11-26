@@ -390,7 +390,7 @@ export default function FileManager() {
                         </div>
                         {root.last_scan && (
                           <span className="text-xs text-gray-400">
-                            Last scan: {format(new Date(root.last_scan), 'PPpp')}
+                            Last scan: {format(new Date(root.last_scan), 'MMM d, yyyy HH:mm')}
                           </span>
                         )}
                       </div>
