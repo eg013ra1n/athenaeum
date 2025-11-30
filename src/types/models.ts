@@ -550,17 +550,22 @@ export interface CalibrationCameraGroup {
   has_warnings: boolean;
 }
 
+/** A calibration set with the count of frames that use it */
+export interface CalibrationSetWithFrameCount {
+  set: CalibrationSetDetail;
+  frame_count: number;        // How many frames in this group use this set
+  frame_ids: number[];        // Which frames use this set
+  warnings: CalibrationWarning[];
+}
+
 /** Group of frames for a single filter within a camera */
 export interface CalibrationFilterGroup {
   filter: string | null;          // null = "No Filter"
   filter_display: string;          // "Ha", "OIII", "No Filter"
   light_frames: LightFrameWithCalibration[];
-  flat_set: CalibrationSetDetail | null;
-  dark_set: CalibrationSetDetail | null;
-  bias_set: CalibrationSetDetail | null;
-  flat_warnings: CalibrationWarning[];
-  dark_warnings: CalibrationWarning[];
-  bias_warnings: CalibrationWarning[];
+  flat_sets: CalibrationSetWithFrameCount[];   // All unique flat sets used by frames in this group
+  dark_sets: CalibrationSetWithFrameCount[];   // All unique dark sets used by frames in this group
+  bias_sets: CalibrationSetWithFrameCount[];   // All unique bias sets used by frames in this group
   has_warnings: boolean;
   frame_count: number;
 }

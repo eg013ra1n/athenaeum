@@ -625,18 +625,24 @@ pub struct CalibrationCameraGroup {
     pub has_warnings: bool,
 }
 
+/// A calibration set with the count of frames that use it
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSetWithFrameCount {
+    pub set: CalibrationSetDetail,
+    pub frame_count: i64,              // How many frames in this group use this set
+    pub frame_ids: Vec<i64>,           // Which frames use this set
+    pub warnings: Vec<CalibrationWarning>,
+}
+
 /// Group of frames for a single filter within a camera
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationFilterGroup {
     pub filter: Option<String>,          // None = "No Filter"
     pub filter_display: String,          // "Ha", "OIII", "No Filter"
     pub light_frames: Vec<LightFrameWithCalibration>,
-    pub flat_set: Option<CalibrationSetDetail>,
-    pub dark_set: Option<CalibrationSetDetail>,
-    pub bias_set: Option<CalibrationSetDetail>,
-    pub flat_warnings: Vec<CalibrationWarning>,
-    pub dark_warnings: Vec<CalibrationWarning>,
-    pub bias_warnings: Vec<CalibrationWarning>,
+    pub flat_sets: Vec<CalibrationSetWithFrameCount>,   // All unique flat sets used by frames in this group
+    pub dark_sets: Vec<CalibrationSetWithFrameCount>,   // All unique dark sets used by frames in this group
+    pub bias_sets: Vec<CalibrationSetWithFrameCount>,   // All unique bias sets used by frames in this group
     pub has_warnings: bool,
     pub frame_count: usize,
 }

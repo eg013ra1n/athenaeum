@@ -41,15 +41,15 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
     title,
     set,
     type,
-    warnings
+    warnings,
+    linkedFrameCount
   }: {
     title: string;
-    set: CalibrationSetDetail | null;
+    set: CalibrationSetDetail;
     type: 'flat' | 'dark' | 'bias';
     warnings: CalibrationWarning[];
+    linkedFrameCount: number;  // Number of light frames using this calibration set
   }) => {
-    if (!set) return null;
-
     const bgColor = type === 'flat'
       ? 'bg-blue-900/20 border-blue-700/30'
       : type === 'dark'
@@ -58,7 +58,12 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
 
     return (
       <div className={`border rounded p-3 ${bgColor}`}>
-        <h4 className="font-medium text-sm mb-2">{title}</h4>
+        <h4 className="font-medium text-sm mb-2">
+          {title}
+          <span className="text-gray-400 font-normal ml-2">
+            ({linkedFrameCount} light{linkedFrameCount !== 1 ? 's' : ''})
+          </span>
+        </h4>
         <div className="grid grid-cols-2 gap-2 text-xs">
           {set.exptime !== null && (
             <div>
@@ -100,7 +105,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
             <span className="text-gray-200">{set.date_display}</span>
           </div>
           <div>
-            <span className="text-gray-400">Frames:</span>{' '}
+            <span className="text-gray-400">Set Frames:</span>{' '}
             <span className="text-gray-200">{set.frame_count}</span>
           </div>
         </div>
@@ -182,7 +187,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
     const framesKey = `${key}:frames`;
     const isExpanded = expandedItems.has(key);
     const isFramesExpanded = expandedItems.has(framesKey);
-    const hasCalibration = filterGroup.flat_set || filterGroup.dark_set || filterGroup.bias_set;
+    const hasCalibration = filterGroup.flat_sets.length > 0 || filterGroup.dark_sets.length > 0 || filterGroup.bias_sets.length > 0;
 
     return (
       <div className="ml-8 border-l border-gray-700">
@@ -214,30 +219,39 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
             {/* Calibration Set Cards */}
             {hasCalibration && (
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
-                {filterGroup.flat_set && (
+                {/* Flat calibration sets */}
+                {filterGroup.flat_sets.map((flatWithCount, idx) => (
                   <CalibrationSetCard
-                    title="Flat Calibration"
-                    set={filterGroup.flat_set}
+                    key={`flat-${flatWithCount.set.id ?? idx}`}
+                    title={`Flat${flatWithCount.set.filter ? ` (${flatWithCount.set.filter})` : ''}`}
+                    set={flatWithCount.set}
                     type="flat"
-                    warnings={filterGroup.flat_warnings}
+                    warnings={flatWithCount.warnings}
+                    linkedFrameCount={flatWithCount.frame_count}
                   />
-                )}
-                {filterGroup.dark_set && (
+                ))}
+                {/* Dark calibration sets */}
+                {filterGroup.dark_sets.map((darkWithCount, idx) => (
                   <CalibrationSetCard
-                    title="Dark Calibration"
-                    set={filterGroup.dark_set}
+                    key={`dark-${darkWithCount.set.id ?? idx}`}
+                    title={`Dark${darkWithCount.set.exptime !== null ? ` (${darkWithCount.set.exptime}s)` : ''}`}
+                    set={darkWithCount.set}
                     type="dark"
-                    warnings={filterGroup.dark_warnings}
+                    warnings={darkWithCount.warnings}
+                    linkedFrameCount={darkWithCount.frame_count}
                   />
-                )}
-                {filterGroup.bias_set && (
+                ))}
+                {/* Bias calibration sets */}
+                {filterGroup.bias_sets.map((biasWithCount, idx) => (
                   <CalibrationSetCard
-                    title="Bias Calibration"
-                    set={filterGroup.bias_set}
+                    key={`bias-${biasWithCount.set.id ?? idx}`}
+                    title="Bias"
+                    set={biasWithCount.set}
                     type="bias"
-                    warnings={filterGroup.bias_warnings}
+                    warnings={biasWithCount.warnings}
+                    linkedFrameCount={biasWithCount.frame_count}
                   />
-                )}
+                ))}
               </div>
             )}
 

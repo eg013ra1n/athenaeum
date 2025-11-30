@@ -3,7 +3,7 @@ use crate::models::{
     CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup,
     FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning,
     CalibrationHierarchyView, CalibrationDateGroup, CalibrationCameraGroup,
-    CalibrationFilterGroup, LightFrameWithCalibration,
+    CalibrationFilterGroup, LightFrameWithCalibration, CalibrationSetWithFrameCount,
 };
 use crate::calibration::configurable_matcher::load_config;
 use crate::calibration::config::{MatchMode, CalibrationMatchingConfig};
@@ -563,6 +563,74 @@ fn get_calibration_warnings_for_group(
     Ok((flat_warnings, dark_warnings, bias_warnings))
 }
 
+/// Helper: Get warnings for a specific calibration set and its associated frames
+fn get_warnings_for_calibration_set(
+    conn: &Connection,
+    set_id: i64,
+    frame_ids: &[i64],
+    calibration_type: &str,
+) -> Vec<CalibrationWarning> {
+    let mut warnings = Vec::new();
+
+    if frame_ids.is_empty() {
+        return warnings;
+    }
+
+    // Load current configuration to check if warnings are enabled
+    let config = load_config(conn);
+
+    // Query for calibration links with warnings for this specific set
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+    let query = format!(
+        "SELECT DISTINCT date_warning, temp_warning
+         FROM calibration_set_to_frames
+         WHERE source_id IN ({}) AND source_type = 'frame'
+         AND calibration_set_id = ?
+         AND (date_warning = 1 OR temp_warning = 1)",
+        placeholders.join(",")
+    );
+
+    if let Ok(mut stmt) = conn.prepare(&query) {
+        let mut params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        params.push(&set_id);
+
+        if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)? == 1,  // date_warning
+                row.get::<_, i64>(1)? == 1,  // temp_warning
+            ))
+        }) {
+            for row_result in rows {
+                if let Ok((has_date_warning, has_temp_warning)) = row_result {
+                    // Create contextual warning messages ONLY if enabled in current config
+                    if has_temp_warning && is_temp_warning_enabled(&config, calibration_type) {
+                        warnings.push(CalibrationWarning {
+                            warning_type: "temperature".to_string(),
+                            message: format!("{} temperature differs significantly", calibration_type),
+                            calibration_type: calibration_type.to_string(),
+                            set_id,
+                        });
+                    }
+
+                    if has_date_warning && is_date_warning_enabled(&config, calibration_type) {
+                        warnings.push(CalibrationWarning {
+                            warning_type: "date".to_string(),
+                            message: format!("{} calibration may be outdated", calibration_type),
+                            calibration_type: calibration_type.to_string(),
+                            set_id,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate warnings (same warning_type)
+    warnings.dedup_by(|a, b| a.warning_type == b.warning_type);
+
+    warnings
+}
+
 /// Helper: Check if any frames in the group have calibration warnings
 fn check_group_warnings(conn: &Connection, frame_ids: &[i64]) -> Result<bool> {
     if frame_ids.is_empty() {
@@ -700,14 +768,13 @@ pub fn get_calibration_hierarchy_for_frame_set(
                 camera_frame_count += filter_frame_count;
 
                 // Get calibration status for all frames in this filter group
-                let frame_ids: Vec<i64> = raw_frames.iter().map(|f| f.id).collect();
                 let mut light_frames: Vec<LightFrameWithCalibration> = Vec::new();
                 let mut filter_has_warnings = false;
 
-                // Collect calibration set IDs for the group
-                let mut flat_set_id: Option<i64> = None;
-                let mut dark_set_id: Option<i64> = None;
-                let mut bias_set_id: Option<i64> = None;
+                // Collect ALL unique calibration set IDs with their frame lists
+                let mut flat_set_frames: HashMap<i64, Vec<i64>> = HashMap::new();
+                let mut dark_set_frames: HashMap<i64, Vec<i64>> = HashMap::new();
+                let mut bias_set_frames: HashMap<i64, Vec<i64>> = HashMap::new();
 
                 for raw_frame in raw_frames {
                     let status = get_frame_calibration_status(conn, raw_frame.id)?;
@@ -725,15 +792,15 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         filter_has_warnings = true;
                     }
 
-                    // Capture calibration set IDs (use first frame's sets as representative)
-                    if flat_set_id.is_none() && status.flat_set_id.is_some() {
-                        flat_set_id = status.flat_set_id;
+                    // Collect ALL unique calibration set IDs (not just the first one)
+                    if let Some(set_id) = status.flat_set_id {
+                        flat_set_frames.entry(set_id).or_default().push(raw_frame.id);
                     }
-                    if dark_set_id.is_none() && status.dark_set_id.is_some() {
-                        dark_set_id = status.dark_set_id;
+                    if let Some(set_id) = status.dark_set_id {
+                        dark_set_frames.entry(set_id).or_default().push(raw_frame.id);
                     }
-                    if bias_set_id.is_none() && status.bias_set_id.is_some() {
-                        bias_set_id = status.bias_set_id;
+                    if let Some(set_id) = status.bias_set_id {
+                        bias_set_frames.entry(set_id).or_default().push(raw_frame.id);
                     }
 
                     light_frames.push(LightFrameWithCalibration {
@@ -745,28 +812,50 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     });
                 }
 
-                // Get calibration set details
-                let flat_set = if let Some(set_id) = flat_set_id {
-                    get_calibration_set_detail(conn, set_id).ok()
-                } else {
-                    None
-                };
+                // Build CalibrationSetWithFrameCount for each unique flat set
+                let flat_sets: Vec<CalibrationSetWithFrameCount> = flat_set_frames
+                    .into_iter()
+                    .filter_map(|(set_id, frame_ids)| {
+                        let set = get_calibration_set_detail(conn, set_id).ok()?;
+                        let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Flat");
+                        Some(CalibrationSetWithFrameCount {
+                            set,
+                            frame_count: frame_ids.len() as i64,
+                            frame_ids,
+                            warnings,
+                        })
+                    })
+                    .collect();
 
-                let dark_set = if let Some(set_id) = dark_set_id {
-                    get_calibration_set_detail(conn, set_id).ok()
-                } else {
-                    None
-                };
+                // Build CalibrationSetWithFrameCount for each unique dark set
+                let dark_sets: Vec<CalibrationSetWithFrameCount> = dark_set_frames
+                    .into_iter()
+                    .filter_map(|(set_id, frame_ids)| {
+                        let set = get_calibration_set_detail(conn, set_id).ok()?;
+                        let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Dark");
+                        Some(CalibrationSetWithFrameCount {
+                            set,
+                            frame_count: frame_ids.len() as i64,
+                            frame_ids,
+                            warnings,
+                        })
+                    })
+                    .collect();
 
-                let bias_set = if let Some(set_id) = bias_set_id {
-                    get_calibration_set_detail(conn, set_id).ok()
-                } else {
-                    None
-                };
-
-                // Collect warnings
-                let (flat_warnings, dark_warnings, bias_warnings) =
-                    get_calibration_warnings_for_group(conn, &frame_ids, flat_set_id, dark_set_id, bias_set_id)?;
+                // Build CalibrationSetWithFrameCount for each unique bias set
+                let bias_sets: Vec<CalibrationSetWithFrameCount> = bias_set_frames
+                    .into_iter()
+                    .filter_map(|(set_id, frame_ids)| {
+                        let set = get_calibration_set_detail(conn, set_id).ok()?;
+                        let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Bias");
+                        Some(CalibrationSetWithFrameCount {
+                            set,
+                            frame_count: frame_ids.len() as i64,
+                            frame_ids,
+                            warnings,
+                        })
+                    })
+                    .collect();
 
                 if filter_has_warnings {
                     camera_has_warnings = true;
@@ -779,12 +868,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     filter: filter.clone(),
                     filter_display,
                     light_frames,
-                    flat_set,
-                    dark_set,
-                    bias_set,
-                    flat_warnings,
-                    dark_warnings,
-                    bias_warnings,
+                    flat_sets,
+                    dark_sets,
+                    bias_sets,
                     has_warnings: filter_has_warnings,
                     frame_count: filter_frame_count,
                 });
