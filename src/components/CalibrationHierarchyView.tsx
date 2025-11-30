@@ -1,4 +1,4 @@
-import { AlertTriangle, Calendar, Camera, ChevronDown, ChevronRight, Filter, CheckCircle, XCircle } from 'lucide-react';
+import { AlertTriangle, Calendar, Camera, ChevronDown, ChevronRight, Aperture, CheckCircle, XCircle } from 'lucide-react';
 import { useState } from 'react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -201,7 +201,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
           ) : (
             <ChevronRight className="w-4 h-4 text-gray-400" />
           )}
-          <Filter size={16} className="text-cyan-400" />
+          <Aperture size={16} className="text-cyan-400" />
           <div className="flex-1">
             <span className="text-gray-200">{filterGroup.filter_display}</span>
             {filterGroup.has_warnings && (
