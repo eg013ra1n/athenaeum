@@ -1,8 +1,14 @@
 use rusqlite::{Connection, Result, params};
-use crate::models::{CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup, FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning};
+use crate::models::{
+    CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup,
+    FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning,
+    CalibrationHierarchyView, CalibrationDateGroup, CalibrationCameraGroup,
+    CalibrationFilterGroup, LightFrameWithCalibration,
+};
 use crate::calibration::configurable_matcher::load_config;
 use crate::calibration::config::{MatchMode, CalibrationMatchingConfig};
 use std::collections::HashMap;
+use chrono::NaiveDate;
 
 /// Insert a new calibration link
 pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Result<i64> {
@@ -397,7 +403,7 @@ pub fn get_calibration_groups_for_frame_set(
 fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<CalibrationSetDetail> {
     let mut stmt = conn.prepare(
         "SELECT id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
-                binning, instrume, date_start, date_end, date, frame_count
+                binning, instrume, filter, date_start, date_end, date, frame_count
          FROM calibration_set
          WHERE id = ?1"
     )?;
@@ -417,10 +423,11 @@ fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<Calibrat
             offset: row.get(7)?,
             binning: row.get(8)?,
             instrume: row.get(9)?,
-            date_start: row.get(10)?,
-            date_end: row.get(11)?,
-            date_display: row.get(12)?,
-            frame_count: row.get(13)?,
+            filter: row.get(10)?,
+            date_start: row.get(11)?,
+            date_end: row.get(12)?,
+            date_display: row.get(13)?,
+            frame_count: row.get(14)?,
         })
     })
 }
@@ -575,6 +582,256 @@ fn check_group_warnings(conn: &Connection, frame_ids: &[i64]) -> Result<bool> {
 
     let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
     Ok(count > 0)
+}
+
+/// Get calibration hierarchy organized by Date → Camera → Filter for a frame set
+pub fn get_calibration_hierarchy_for_frame_set(
+    conn: &Connection,
+    frame_set_id: i64
+) -> Result<CalibrationHierarchyView> {
+    // Step 1: Get all LIGHT frames in the frame set with metadata
+    let mut stmt = conn.prepare(
+        "SELECT
+            f.id,
+            f.date_obs,
+            f.instrume,
+            f.filter,
+            f.exptime,
+            fi.filename,
+            DATE(f.date_obs) as session_date
+         FROM frames f
+         JOIN files fi ON f.file_id = fi.id
+         JOIN session_members sm ON f.id = sm.frame_id
+         JOIN sessions s ON s.id = sm.session_id
+         JOIN imaging_nights n ON n.id = s.imaging_night_id
+         WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
+         ORDER BY DATE(f.date_obs) DESC, f.instrume, COALESCE(f.filter, ''), f.date_obs"
+    )?;
+
+    // Collect raw frame data
+    struct RawFrame {
+        id: i64,
+        date_obs: Option<String>,
+        instrume: Option<String>,
+        filter: Option<String>,
+        exptime: Option<f64>,
+        filename: String,
+        session_date: Option<String>,
+    }
+
+    let frames: Vec<RawFrame> = stmt
+        .query_map([frame_set_id], |row| {
+            Ok(RawFrame {
+                id: row.get(0)?,
+                date_obs: row.get(1)?,
+                instrume: row.get(2)?,
+                filter: row.get(3)?,
+                exptime: row.get(4)?,
+                filename: row.get(5)?,
+                session_date: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+
+    let total_frames = frames.len();
+
+    // Step 2: Build hierarchy using nested HashMaps
+    // date -> camera -> filter -> frames
+    type FilterMap = HashMap<Option<String>, Vec<RawFrame>>;
+    type CameraMap = HashMap<String, FilterMap>;
+    type DateMap = HashMap<String, CameraMap>;
+
+    let mut date_map: DateMap = HashMap::new();
+
+    for frame in frames {
+        let date_key = frame.session_date.clone().unwrap_or_else(|| "Unknown Date".to_string());
+        let camera_key = frame.instrume.clone().unwrap_or_else(|| "Unknown Camera".to_string());
+        let filter_key = frame.filter.clone();
+
+        date_map
+            .entry(date_key)
+            .or_insert_with(HashMap::new)
+            .entry(camera_key)
+            .or_insert_with(HashMap::new)
+            .entry(filter_key)
+            .or_insert_with(Vec::new)
+            .push(frame);
+    }
+
+    // Step 3: Build CalibrationHierarchyView from the nested maps
+    let mut calibrated_frames = 0;
+    let mut uncalibrated_frames = 0;
+    let mut date_groups: Vec<CalibrationDateGroup> = Vec::new();
+
+    // Sort dates in descending order (most recent first)
+    let mut dates: Vec<&String> = date_map.keys().collect();
+    dates.sort_by(|a, b| b.cmp(a));
+
+    for date_str in dates {
+        let camera_map = &date_map[date_str];
+        let mut camera_groups: Vec<CalibrationCameraGroup> = Vec::new();
+        let mut date_frame_count = 0;
+        let mut date_has_warnings = false;
+
+        // Sort cameras alphabetically
+        let mut cameras: Vec<&String> = camera_map.keys().collect();
+        cameras.sort();
+
+        for camera in cameras {
+            let filter_map = &camera_map[camera];
+            let mut filter_groups: Vec<CalibrationFilterGroup> = Vec::new();
+            let mut camera_frame_count = 0;
+            let mut camera_has_warnings = false;
+
+            // Sort filters (None/"No Filter" first, then alphabetically)
+            let mut filters: Vec<&Option<String>> = filter_map.keys().collect();
+            filters.sort_by(|a, b| {
+                match (a, b) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(a), Some(b)) => a.cmp(b),
+                }
+            });
+
+            for filter in filters {
+                let raw_frames = &filter_map[filter];
+                let filter_frame_count = raw_frames.len();
+                camera_frame_count += filter_frame_count;
+
+                // Get calibration status for all frames in this filter group
+                let frame_ids: Vec<i64> = raw_frames.iter().map(|f| f.id).collect();
+                let mut light_frames: Vec<LightFrameWithCalibration> = Vec::new();
+                let mut filter_has_warnings = false;
+
+                // Collect calibration set IDs for the group
+                let mut flat_set_id: Option<i64> = None;
+                let mut dark_set_id: Option<i64> = None;
+                let mut bias_set_id: Option<i64> = None;
+
+                for raw_frame in raw_frames {
+                    let status = get_frame_calibration_status(conn, raw_frame.id)?;
+
+                    // Track if we have calibration
+                    let has_any_calibration = status.has_flats || status.has_darks || status.has_bias;
+                    if has_any_calibration {
+                        calibrated_frames += 1;
+                    } else {
+                        uncalibrated_frames += 1;
+                    }
+
+                    // Track warnings
+                    if status.flats_warning || status.darks_warning || status.bias_warning {
+                        filter_has_warnings = true;
+                    }
+
+                    // Capture calibration set IDs (use first frame's sets as representative)
+                    if flat_set_id.is_none() && status.flat_set_id.is_some() {
+                        flat_set_id = status.flat_set_id;
+                    }
+                    if dark_set_id.is_none() && status.dark_set_id.is_some() {
+                        dark_set_id = status.dark_set_id;
+                    }
+                    if bias_set_id.is_none() && status.bias_set_id.is_some() {
+                        bias_set_id = status.bias_set_id;
+                    }
+
+                    light_frames.push(LightFrameWithCalibration {
+                        frame_id: raw_frame.id,
+                        filename: raw_frame.filename.clone(),
+                        date_obs: raw_frame.date_obs.clone(),
+                        exptime: raw_frame.exptime,
+                        calibration_status: status,
+                    });
+                }
+
+                // Get calibration set details
+                let flat_set = if let Some(set_id) = flat_set_id {
+                    get_calibration_set_detail(conn, set_id).ok()
+                } else {
+                    None
+                };
+
+                let dark_set = if let Some(set_id) = dark_set_id {
+                    get_calibration_set_detail(conn, set_id).ok()
+                } else {
+                    None
+                };
+
+                let bias_set = if let Some(set_id) = bias_set_id {
+                    get_calibration_set_detail(conn, set_id).ok()
+                } else {
+                    None
+                };
+
+                // Collect warnings
+                let (flat_warnings, dark_warnings, bias_warnings) =
+                    get_calibration_warnings_for_group(conn, &frame_ids, flat_set_id, dark_set_id, bias_set_id)?;
+
+                if filter_has_warnings {
+                    camera_has_warnings = true;
+                }
+
+                // Build filter display string
+                let filter_display = filter.clone().unwrap_or_else(|| "No Filter".to_string());
+
+                filter_groups.push(CalibrationFilterGroup {
+                    filter: filter.clone(),
+                    filter_display,
+                    light_frames,
+                    flat_set,
+                    dark_set,
+                    bias_set,
+                    flat_warnings,
+                    dark_warnings,
+                    bias_warnings,
+                    has_warnings: filter_has_warnings,
+                    frame_count: filter_frame_count,
+                });
+            }
+
+            if camera_has_warnings {
+                date_has_warnings = true;
+            }
+
+            date_frame_count += camera_frame_count;
+
+            camera_groups.push(CalibrationCameraGroup {
+                instrume: camera.clone(),
+                filter_groups,
+                frame_count: camera_frame_count,
+                has_warnings: camera_has_warnings,
+            });
+        }
+
+        // Format date display
+        let date_display = format_date_display(date_str);
+
+        date_groups.push(CalibrationDateGroup {
+            date: date_str.clone(),
+            date_display,
+            camera_groups,
+            frame_count: date_frame_count,
+            has_warnings: date_has_warnings,
+        });
+    }
+
+    Ok(CalibrationHierarchyView {
+        date_groups,
+        total_frames,
+        calibrated_frames,
+        uncalibrated_frames,
+    })
+}
+
+/// Helper: Format date string to human-readable display
+fn format_date_display(date_str: &str) -> String {
+    // Try to parse as YYYY-MM-DD and format nicely
+    if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+        date.format("%B %d, %Y").to_string()
+    } else {
+        date_str.to_string()
+    }
 }
 
 #[cfg(test)]

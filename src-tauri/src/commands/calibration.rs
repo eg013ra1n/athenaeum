@@ -272,6 +272,21 @@ pub async fn get_frame_set_calibration_groups(
     get_calibration_groups_for_frame_set(&conn, frame_set_id).map_err(|e| e.to_string())
 }
 
+/// Get calibration hierarchy organized by Date → Camera → Filter for a frame set
+#[tauri::command]
+pub async fn get_calibration_hierarchy_for_frame_set(
+    frame_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<crate::models::CalibrationHierarchyView, String> {
+    use crate::db::calibration_links::get_calibration_hierarchy_for_frame_set as get_hierarchy;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    get_hierarchy(&conn, frame_set_id).map_err(|e| e.to_string())
+}
+
 /// Get complete calibration hierarchy for a specific frame
 #[tauri::command]
 pub async fn get_frame_calibration_hierarchy(

@@ -358,6 +358,7 @@ pub struct CalibrationSetDetail {
     pub offset: Option<f64>,
     pub binning: Option<String>,
     pub instrume: Option<String>,
+    pub filter: Option<String>,  // Filter (for flats)
     pub date_start: String,      // ISO 8601
     pub date_end: String,        // ISO 8601
     pub date_display: String,    // e.g., "2025-10"
@@ -592,4 +593,60 @@ impl Default for CalibrationTolerance {
             dark_date_warning_days: 365,
         }
     }
+}
+
+// ========== Calibration Hierarchy View Structures ==========
+
+/// Hierarchical calibration view organized by Date → Camera → Filter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationHierarchyView {
+    pub date_groups: Vec<CalibrationDateGroup>,
+    pub total_frames: usize,
+    pub calibrated_frames: usize,
+    pub uncalibrated_frames: usize,
+}
+
+/// Group of frames for a single session date
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationDateGroup {
+    pub date: String,                    // e.g., "2024-01-15"
+    pub date_display: String,            // e.g., "January 15, 2024"
+    pub camera_groups: Vec<CalibrationCameraGroup>,
+    pub frame_count: usize,
+    pub has_warnings: bool,
+}
+
+/// Group of frames for a single camera within a date
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationCameraGroup {
+    pub instrume: String,                // Camera name
+    pub filter_groups: Vec<CalibrationFilterGroup>,
+    pub frame_count: usize,
+    pub has_warnings: bool,
+}
+
+/// Group of frames for a single filter within a camera
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationFilterGroup {
+    pub filter: Option<String>,          // None = "No Filter"
+    pub filter_display: String,          // "Ha", "OIII", "No Filter"
+    pub light_frames: Vec<LightFrameWithCalibration>,
+    pub flat_set: Option<CalibrationSetDetail>,
+    pub dark_set: Option<CalibrationSetDetail>,
+    pub bias_set: Option<CalibrationSetDetail>,
+    pub flat_warnings: Vec<CalibrationWarning>,
+    pub dark_warnings: Vec<CalibrationWarning>,
+    pub bias_warnings: Vec<CalibrationWarning>,
+    pub has_warnings: bool,
+    pub frame_count: usize,
+}
+
+/// A light frame with its calibration status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightFrameWithCalibration {
+    pub frame_id: i64,
+    pub filename: String,
+    pub date_obs: Option<String>,
+    pub exptime: Option<f64>,
+    pub calibration_status: FrameCalibrationStatus,
 }

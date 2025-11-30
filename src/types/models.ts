@@ -280,6 +280,7 @@ export interface CalibrationSetDetail {
   offset: number | null;
   binning: string | null;
   instrume: string | null;
+  filter: string | null;  // Filter (for flats)
   date_start: string;
   date_end: string;
   date_display: string;
@@ -520,4 +521,55 @@ export interface FilterPeriod {
   start_time: string;  // ISO 8601 datetime
   end_time: string;    // ISO 8601 datetime
   frame_count: number;
+}
+
+// ========== Calibration Hierarchy View ==========
+
+/** Hierarchical calibration view organized by Date → Camera → Filter */
+export interface CalibrationHierarchyView {
+  date_groups: CalibrationDateGroup[];
+  total_frames: number;
+  calibrated_frames: number;
+  uncalibrated_frames: number;
+}
+
+/** Group of frames for a single session date */
+export interface CalibrationDateGroup {
+  date: string;                    // e.g., "2024-01-15"
+  date_display: string;            // e.g., "January 15, 2024"
+  camera_groups: CalibrationCameraGroup[];
+  frame_count: number;
+  has_warnings: boolean;
+}
+
+/** Group of frames for a single camera within a date */
+export interface CalibrationCameraGroup {
+  instrume: string;                // Camera name
+  filter_groups: CalibrationFilterGroup[];
+  frame_count: number;
+  has_warnings: boolean;
+}
+
+/** Group of frames for a single filter within a camera */
+export interface CalibrationFilterGroup {
+  filter: string | null;          // null = "No Filter"
+  filter_display: string;          // "Ha", "OIII", "No Filter"
+  light_frames: LightFrameWithCalibration[];
+  flat_set: CalibrationSetDetail | null;
+  dark_set: CalibrationSetDetail | null;
+  bias_set: CalibrationSetDetail | null;
+  flat_warnings: CalibrationWarning[];
+  dark_warnings: CalibrationWarning[];
+  bias_warnings: CalibrationWarning[];
+  has_warnings: boolean;
+  frame_count: number;
+}
+
+/** A light frame with its calibration status */
+export interface LightFrameWithCalibration {
+  frame_id: number;
+  filename: string;
+  date_obs: string | null;
+  exptime: number | null;
+  calibration_status: FrameCalibrationStatus;
 }

@@ -2,13 +2,13 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
-import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame, FrameCalibrationStatus, FrameSetCalibrationGroups } from '../types/models';
+import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame, FrameCalibrationStatus, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationStatusBadges } from '../components/CalibrationStatusBadges';
 import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
-import { CalibrationGroupsView } from '../components/CalibrationGroupsView';
+import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import SortableColumnHeader from '../components/SortableColumnHeader';
 
 export default function FrameSetDetail() {
@@ -49,7 +49,7 @@ export default function FrameSetDetail() {
 
   // Tab system state
   const [activeTab, setActiveTab] = useState<'sessions' | 'calibration'>('sessions');
-  const [calibrationGroups, setCalibrationGroups] = useState<FrameSetCalibrationGroups | null>(null);
+  const [calibrationHierarchy, setCalibrationHierarchy] = useState<CalibrationHierarchyView | null>(null);
   const [loadingCalibration, setLoadingCalibration] = useState(false);
 
   useEffect(() => {
@@ -73,27 +73,27 @@ export default function FrameSetDetail() {
     }
   };
 
-  const loadCalibrationGroups = async () => {
+  const loadCalibrationHierarchy = async () => {
     if (!id) return;
 
     try {
       setLoadingCalibration(true);
-      const result = await invoke<FrameSetCalibrationGroups>('get_frame_set_calibration_groups', {
+      const result = await invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
         frameSetId: parseInt(id),
       });
-      setCalibrationGroups(result);
+      setCalibrationHierarchy(result);
     } catch (err) {
-      console.error('Failed to load calibration groups:', err);
-      showAlert('Error', `Failed to load calibration groups: ${err}`, 'error');
+      console.error('Failed to load calibration hierarchy:', err);
+      showAlert('Error', `Failed to load calibration data: ${err}`, 'error');
     } finally {
       setLoadingCalibration(false);
     }
   };
 
-  // Load calibration groups when Calibration tab is selected
+  // Load calibration hierarchy when Calibration tab is selected
   useEffect(() => {
-    if (activeTab === 'calibration' && !calibrationGroups) {
-      loadCalibrationGroups();
+    if (activeTab === 'calibration' && !calibrationHierarchy) {
+      loadCalibrationHierarchy();
     }
   }, [activeTab]);
 
@@ -1005,10 +1005,10 @@ export default function FrameSetDetail() {
             {loadingCalibration ? (
               <div className="text-center py-12">
                 <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
-                <p className="text-gray-400">Loading calibration groups...</p>
+                <p className="text-gray-400">Loading calibration data...</p>
               </div>
-            ) : calibrationGroups ? (
-              <CalibrationGroupsView data={calibrationGroups} />
+            ) : calibrationHierarchy ? (
+              <CalibrationHierarchyViewComponent data={calibrationHierarchy} />
             ) : (
               <div className="text-center py-12 text-gray-400">
                 <p>Failed to load calibration data.</p>

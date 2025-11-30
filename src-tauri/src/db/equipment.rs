@@ -52,6 +52,7 @@ pub fn get_camera_dark_library(
             offset,
             binning,
             instrume,
+            filter,
             date_start,
             date_end,
             date,
@@ -68,8 +69,8 @@ pub fn get_camera_dark_library(
             let imagetyp = ImageType::from_str(&imagetyp_str)
                 .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
-            let date_start: String = row.get(10)?;
-            let date_end: String = row.get(11)?;
+            let date_start: String = row.get(11)?;
+            let date_end: String = row.get(12)?;
 
             // Generate date_display from date_start (YYYY-MM format)
             let date_display = if let Ok(dt) = DateTime::parse_from_rfc3339(&date_start) {
@@ -90,10 +91,11 @@ pub fn get_camera_dark_library(
                 offset: row.get(7)?,
                 binning: row.get(8)?,
                 instrume: row.get(9)?,
+                filter: row.get(10)?,
                 date_start,
                 date_end,
                 date_display,
-                frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -147,6 +149,7 @@ pub fn get_camera_master_dark_library(
             offset,
             binning,
             instrume,
+            filter,
             date_start,
             date_end,
             date,
@@ -163,8 +166,8 @@ pub fn get_camera_master_dark_library(
             let imagetyp = ImageType::from_str(&imagetyp_str)
                 .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
-            let date_start: String = row.get(10)?;
-            let date_end: String = row.get(11)?;
+            let date_start: String = row.get(11)?;
+            let date_end: String = row.get(12)?;
 
             // Generate date_display from date_start (YYYY-MM format)
             let date_display = if let Ok(dt) = DateTime::parse_from_rfc3339(&date_start) {
@@ -185,10 +188,11 @@ pub fn get_camera_master_dark_library(
                 offset: row.get(7)?,
                 binning: row.get(8)?,
                 instrume: row.get(9)?,
+                filter: row.get(10)?,
                 date_start,
                 date_end,
                 date_display,
-                frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
