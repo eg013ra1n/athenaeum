@@ -327,7 +327,7 @@ pub fn find_calibration_sets(
         // Determine warnings
         let temp_warning = !match_result.warnings.is_empty() &&
             match_result.warnings.iter().any(|w| w.contains("ccd_temp"));
-        let date_warning = check_date_warning_days(date_diff, calibration_type);
+        let date_warning = check_date_warning_days(date_diff, calibration_type, config);
 
         candidates.push(CalibrationCandidate {
             set_id,
@@ -369,16 +369,19 @@ fn calculate_date_diff(
     Some(diff_from_start.min(diff_from_end))
 }
 
-/// Check if date difference should trigger a warning (hardcoded defaults for now)
-fn check_date_warning_days(date_diff: Option<i64>, calibration_type: &str) -> bool {
+/// Check if date difference should trigger a warning using config thresholds
+fn check_date_warning_days(date_diff: Option<i64>, calibration_type: &str, config: &CalibrationMatchingConfig) -> bool {
     match date_diff {
         Some(days) => {
-            match calibration_type {
-                "flat" => days > 30,
-                "dark" | "darkflat" => days > 365,
-                "bias" => false, // No date warning for bias
-                _ => false,
-            }
+            let threshold = match calibration_type {
+                "flat" => config.warnings.flat_date_warning_days,
+                "dark" => config.warnings.dark_date_warning_days,
+                "darkflat" => config.warnings.darkflat_date_warning_days,
+                "bias" => return false, // No date warning for bias
+                _ => return false,
+            };
+            // Only trigger warning if threshold is enabled (>0 and reasonable)
+            threshold > 0 && threshold < 10000 && days > threshold
         }
         None => false,
     }

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
@@ -834,9 +834,8 @@ export default function FrameSetDetail() {
                                 const isFrameExpanded = fileId ? expandedFrames.has(fileId) : false;
 
                                 return (
-                                  <>
+                                  <React.Fragment key={fileId || idx}>
                                     <tr
-                                      key={fileId || idx}
                                       onClick={() => fileId && toggleFrameExpansion(fileId)}
                                       className={`${
                                         idx % 2 === 0 ? "bg-gray-800" : "bg-gray-850"
@@ -892,10 +891,7 @@ export default function FrameSetDetail() {
 
                                     {/* Expanded Frame Details Row */}
                                     {isFrameExpanded && (
-                                      <tr
-                                        key={`${fileId}-expanded`}
-                                        className="bg-gray-900 border-t border-gray-700"
-                                      >
+                                      <tr className="bg-gray-900 border-t border-gray-700">
                                         <td colSpan={8} className="px-4 py-4">
                                           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 text-sm">
                                             <div>
@@ -982,7 +978,7 @@ export default function FrameSetDetail() {
                                         </td>
                                       </tr>
                                     )}
-                                  </>
+                                  </React.Fragment>
                                 );
                               })}
                             </tbody>

@@ -96,6 +96,7 @@ pub fn get_links_for_calibration_set(conn: &Connection, set_id: i64) -> Result<V
 }
 
 /// Get calibration status for a specific frame
+/// Warnings are calculated dynamically based on current config (not stored values)
 pub fn get_frame_calibration_status(conn: &Connection, frame_id: i64) -> Result<FrameCalibrationStatus> {
     let links = get_links_for_frame(conn, frame_id)?;
 
@@ -114,21 +115,19 @@ pub fn get_frame_calibration_status(conn: &Connection, frame_id: i64) -> Result<
         darkflat_set_id: None,
     };
 
-    for link in links {
+    // First pass: collect set IDs
+    for link in &links {
         match link.calibration_type.as_str() {
             "Flat" => {
                 status.has_flats = true;
-                status.flats_warning = link.date_warning || link.temp_warning;
                 status.flat_set_id = Some(link.calibration_set_id);
             }
             "Dark" => {
                 status.has_darks = true;
-                status.darks_warning = link.date_warning || link.temp_warning;
                 status.dark_set_id = Some(link.calibration_set_id);
             }
             "Bias" => {
                 status.has_bias = true;
-                status.bias_warning = link.date_warning || link.temp_warning;
                 status.bias_set_id = Some(link.calibration_set_id);
             }
             "DarkFlat" => {
@@ -138,6 +137,11 @@ pub fn get_frame_calibration_status(conn: &Connection, frame_id: i64) -> Result<
             _ => {}
         }
     }
+
+    // Second pass: calculate warnings dynamically based on current config
+    status.flats_warning = has_calibration_warning(conn, frame_id, status.flat_set_id, "Flat");
+    status.darks_warning = has_calibration_warning(conn, frame_id, status.dark_set_id, "Dark");
+    status.bias_warning = has_calibration_warning(conn, frame_id, status.bias_set_id, "Bias");
 
     Ok(status)
 }
@@ -483,7 +487,223 @@ fn is_date_warning_enabled(config: &CalibrationMatchingConfig, cal_type: &str) -
     }
 }
 
+// ============================================================================
+// Dynamic Warning Calculation Functions
+// ============================================================================
+
+/// Get frame temperature from database
+fn get_frame_temp(conn: &Connection, frame_id: i64) -> Option<f64> {
+    conn.query_row(
+        "SELECT ccd_temp FROM frames WHERE id = ?1",
+        [frame_id],
+        |row| row.get(0),
+    ).ok()
+}
+
+/// Get frame date from database
+fn get_frame_date(conn: &Connection, frame_id: i64) -> Option<NaiveDate> {
+    conn.query_row(
+        "SELECT date(date_obs) FROM frames WHERE id = ?1",
+        [frame_id],
+        |row| {
+            let date_str: Option<String> = row.get(0)?;
+            Ok(date_str.and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()))
+        },
+    ).ok().flatten()
+}
+
+/// Get calibration set average temperature
+fn get_calibration_set_temp(conn: &Connection, set_id: i64) -> Option<f64> {
+    // Use the average temperature of frames in the calibration set
+    conn.query_row(
+        "SELECT AVG(f.ccd_temp)
+         FROM frames f
+         JOIN calibration_set_frames csf ON f.id = csf.frame_id
+         WHERE csf.set_id = ?1",
+        [set_id],
+        |row| row.get(0),
+    ).ok()
+}
+
+/// Get calibration set date (average date of frames)
+fn get_calibration_set_date(conn: &Connection, set_id: i64) -> Option<NaiveDate> {
+    // Get the middle date of the calibration set frames
+    conn.query_row(
+        "SELECT date(MIN(date_obs)) FROM frames f
+         JOIN calibration_set_frames csf ON f.id = csf.frame_id
+         WHERE csf.set_id = ?1",
+        [set_id],
+        |row| {
+            let date_str: Option<String> = row.get(0)?;
+            Ok(date_str.and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()))
+        },
+    ).ok().flatten()
+}
+
+/// Get temperature warning threshold from config for a specific calibration path
+fn get_temp_warning_threshold(config: &CalibrationMatchingConfig, cal_type: &str) -> Option<f64> {
+    match cal_type {
+        "Flat" => config.lights.flat.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
+        "Dark" => config.lights.dark.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
+        "Bias" => config.lights.bias.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
+        "DarkFlat" => config.flats.darkflat.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
+        _ => None,
+    }
+}
+
+/// Get date warning threshold from config for a specific calibration type
+fn get_date_warning_threshold(config: &CalibrationMatchingConfig, cal_type: &str) -> i64 {
+    match cal_type {
+        "Flat" => config.warnings.flat_date_warning_days,
+        "Dark" => config.warnings.dark_date_warning_days,
+        "Bias" => config.warnings.dark_date_warning_days,  // Use dark threshold for bias
+        "DarkFlat" => config.warnings.darkflat_date_warning_days,
+        _ => 0,
+    }
+}
+
+/// Calculate if there should be a temperature warning for a frame-to-calibration-set link
+/// Returns true if mode is "Warning" AND temp diff exceeds threshold
+fn calculate_temp_warning(
+    conn: &Connection,
+    frame_id: i64,
+    set_id: i64,
+    cal_type: &str,
+    config: &CalibrationMatchingConfig,
+) -> (bool, Option<f64>) {
+    // Check if mode is "Warning" (not Ignore or Exact)
+    let temp_mode_enabled = is_temp_warning_enabled(config, cal_type);
+    if !temp_mode_enabled {
+        println!("  🔇 Temp warning DISABLED by config for {} (mode != Warning)", cal_type);
+        return (false, None);
+    }
+
+    let frame_temp = match get_frame_temp(conn, frame_id) {
+        Some(t) => t,
+        None => {
+            println!("  ⚠️ Frame {} has NO ccd_temp data", frame_id);
+            return (false, None);
+        }
+    };
+
+    let set_temp = match get_calibration_set_temp(conn, set_id) {
+        Some(t) => t,
+        None => {
+            println!("  ⚠️ Cal set {} has NO ccd_temp data", set_id);
+            return (false, None);
+        }
+    };
+
+    let temp_diff = (frame_temp - set_temp).abs();
+    let threshold = get_temp_warning_threshold(config, cal_type)
+        .unwrap_or(config.warnings.temp_delta_celsius);
+
+    let has_warning = temp_diff > threshold;
+    println!("  🌡️ Temp check for {} set {}: frame={:.1}°C, set={:.1}°C, diff={:.1}°C, threshold={:.1}°C -> warning={}",
+        cal_type, set_id, frame_temp, set_temp, temp_diff, threshold, has_warning);
+
+    (has_warning, Some(temp_diff))
+}
+
+/// Calculate if there should be a date warning for a frame-to-calibration-set link
+/// Returns true if date diff exceeds threshold and warnings are enabled
+fn calculate_date_warning(
+    conn: &Connection,
+    frame_id: i64,
+    set_id: i64,
+    cal_type: &str,
+    config: &CalibrationMatchingConfig,
+) -> (bool, Option<i64>) {
+    let date_warning_enabled = is_date_warning_enabled(config, cal_type);
+    if !date_warning_enabled {
+        println!("  🔇 Date warning DISABLED by config for {} (threshold=0 or >10000)", cal_type);
+        return (false, None);
+    }
+
+    let frame_date = match get_frame_date(conn, frame_id) {
+        Some(d) => d,
+        None => {
+            println!("  ⚠️ Frame {} has NO date_obs data", frame_id);
+            return (false, None);
+        }
+    };
+
+    let set_date = match get_calibration_set_date(conn, set_id) {
+        Some(d) => d,
+        None => {
+            println!("  ⚠️ Cal set {} has NO date data", set_id);
+            return (false, None);
+        }
+    };
+
+    let date_diff = (frame_date - set_date).num_days().abs();
+    let threshold = get_date_warning_threshold(config, cal_type);
+
+    let has_warning = date_diff > threshold;
+    println!("  📅 Date check for {} set {}: diff={} days, threshold={} days -> warning={}",
+        cal_type, set_id, date_diff, threshold, has_warning);
+
+    (has_warning, Some(date_diff))
+}
+
+/// Calculate calibration warnings dynamically for a frame-to-set link
+/// This is the main function for dynamic warning calculation
+pub fn calculate_calibration_warnings(
+    conn: &Connection,
+    frame_id: i64,
+    set_id: i64,
+    cal_type: &str,
+) -> Vec<CalibrationWarning> {
+    println!("📊 calculate_calibration_warnings: frame {} -> {} set {}", frame_id, cal_type, set_id);
+    let config = load_config(conn);
+    let mut warnings = Vec::new();
+
+    // Check temperature warning
+    let (has_temp_warning, temp_diff) = calculate_temp_warning(conn, frame_id, set_id, cal_type, &config);
+    if has_temp_warning {
+        if let Some(diff) = temp_diff {
+            warnings.push(CalibrationWarning {
+                warning_type: "temperature".to_string(),
+                message: format!("{} temperature differs by {:.1}°C", cal_type, diff),
+                calibration_type: cal_type.to_string(),
+                set_id,
+            });
+        }
+    }
+
+    // Check date warning
+    let (has_date_warning, date_diff) = calculate_date_warning(conn, frame_id, set_id, cal_type, &config);
+    if has_date_warning {
+        if let Some(diff) = date_diff {
+            let threshold = get_date_warning_threshold(&config, cal_type);
+            warnings.push(CalibrationWarning {
+                warning_type: "date".to_string(),
+                message: format!("{} calibration is {} days old (>{} days recommended)", cal_type, diff, threshold),
+                calibration_type: cal_type.to_string(),
+                set_id,
+            });
+        }
+    }
+
+    println!("  ✅ Generated {} warnings for frame {} -> {} set {}", warnings.len(), frame_id, cal_type, set_id);
+    warnings
+}
+
+/// Check if a frame has any warnings for a specific calibration set (used for status flags)
+fn has_calibration_warning(
+    conn: &Connection,
+    frame_id: i64,
+    set_id: Option<i64>,
+    cal_type: &str,
+) -> bool {
+    match set_id {
+        Some(id) => !calculate_calibration_warnings(conn, frame_id, id, cal_type).is_empty(),
+        None => false,
+    }
+}
+
 /// Helper: Collect detailed calibration warnings for a group
+/// Warnings are calculated dynamically based on current config (not stored values)
 fn get_calibration_warnings_for_group(
     conn: &Connection,
     frame_ids: &[i64],
@@ -499,71 +719,57 @@ fn get_calibration_warnings_for_group(
         return Ok((flat_warnings, dark_warnings, bias_warnings));
     }
 
-    // Load current configuration to check if warnings are enabled
-    let config = load_config(conn);
-
-    // Query for calibration links with warnings
-    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
-    let query = format!(
-        "SELECT calibration_type, date_warning, temp_warning, calibration_set_id
-         FROM calibration_set_to_frames
-         WHERE source_id IN ({}) AND source_type = 'frame'
-         AND (date_warning = 1 OR temp_warning = 1)",
-        placeholders.join(",")
-    );
-
-    let mut stmt = conn.prepare(&query)?;
-    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-
-    let warnings_data: Vec<(String, bool, bool, i64)> = stmt
-        .query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,  // calibration_type
-                row.get::<_, i64>(1)? == 1,  // date_warning
-                row.get::<_, i64>(2)? == 1,  // temp_warning
-                row.get::<_, i64>(3)?,  // calibration_set_id
-            ))
-        })?
-        .collect::<Result<Vec<_>>>()?;
-
-    // Group warnings by calibration type and build warning messages
-    for (cal_type, has_date_warning, has_temp_warning, set_id) in warnings_data {
-        let warnings_vec = match cal_type.as_str() {
-            "Flat" => &mut flat_warnings,
-            "Dark" => &mut dark_warnings,
-            "Bias" => &mut bias_warnings,
-            _ => continue,
-        };
-
-        // Create contextual warning messages ONLY if enabled in current config
-        if has_temp_warning && is_temp_warning_enabled(&config, &cal_type) {
-            warnings_vec.push(CalibrationWarning {
-                warning_type: "temperature".to_string(),
-                message: format!("{} temperature for light calibration differs significantly", cal_type),
-                calibration_type: cal_type.clone(),
-                set_id,
-            });
-        }
-
-        if has_date_warning && is_date_warning_enabled(&config, &cal_type) {
-            warnings_vec.push(CalibrationWarning {
-                warning_type: "date".to_string(),
-                message: format!("{} calibration may be outdated", cal_type),
-                calibration_type: cal_type.clone(),
-                set_id,
-            });
+    // Calculate warnings dynamically for each calibration type
+    // Check flat warnings
+    if let Some(set_id) = flat_set_id {
+        for &frame_id in frame_ids {
+            let warnings = calculate_calibration_warnings(conn, frame_id, set_id, "Flat");
+            for warning in warnings {
+                if !flat_warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+                    flat_warnings.push(warning);
+                }
+            }
+            if flat_warnings.len() >= 2 {
+                break;
+            }
         }
     }
 
-    // Deduplicate warnings (same set_id + warning_type)
-    flat_warnings.dedup_by(|a, b| a.set_id == b.set_id && a.warning_type == b.warning_type);
-    dark_warnings.dedup_by(|a, b| a.set_id == b.set_id && a.warning_type == b.warning_type);
-    bias_warnings.dedup_by(|a, b| a.set_id == b.set_id && a.warning_type == b.warning_type);
+    // Check dark warnings
+    if let Some(set_id) = dark_set_id {
+        for &frame_id in frame_ids {
+            let warnings = calculate_calibration_warnings(conn, frame_id, set_id, "Dark");
+            for warning in warnings {
+                if !dark_warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+                    dark_warnings.push(warning);
+                }
+            }
+            if dark_warnings.len() >= 2 {
+                break;
+            }
+        }
+    }
+
+    // Check bias warnings
+    if let Some(set_id) = bias_set_id {
+        for &frame_id in frame_ids {
+            let warnings = calculate_calibration_warnings(conn, frame_id, set_id, "Bias");
+            for warning in warnings {
+                if !bias_warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+                    bias_warnings.push(warning);
+                }
+            }
+            if bias_warnings.len() >= 2 {
+                break;
+            }
+        }
+    }
 
     Ok((flat_warnings, dark_warnings, bias_warnings))
 }
 
 /// Helper: Get warnings for a specific calibration set and its associated frames
+/// Warnings are calculated dynamically based on current config (not stored values)
 fn get_warnings_for_calibration_set(
     conn: &Connection,
     set_id: i64,
@@ -576,80 +782,41 @@ fn get_warnings_for_calibration_set(
         return warnings;
     }
 
-    // Load current configuration to check if warnings are enabled
-    let config = load_config(conn);
-
-    // Query for calibration links with warnings for this specific set
-    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
-    let query = format!(
-        "SELECT DISTINCT date_warning, temp_warning
-         FROM calibration_set_to_frames
-         WHERE source_id IN ({}) AND source_type = 'frame'
-         AND calibration_set_id = ?
-         AND (date_warning = 1 OR temp_warning = 1)",
-        placeholders.join(",")
-    );
-
-    if let Ok(mut stmt) = conn.prepare(&query) {
-        let mut params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-        params.push(&set_id);
-
-        if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)? == 1,  // date_warning
-                row.get::<_, i64>(1)? == 1,  // temp_warning
-            ))
-        }) {
-            for row_result in rows {
-                if let Ok((has_date_warning, has_temp_warning)) = row_result {
-                    // Create contextual warning messages ONLY if enabled in current config
-                    if has_temp_warning && is_temp_warning_enabled(&config, calibration_type) {
-                        warnings.push(CalibrationWarning {
-                            warning_type: "temperature".to_string(),
-                            message: format!("{} temperature differs significantly", calibration_type),
-                            calibration_type: calibration_type.to_string(),
-                            set_id,
-                        });
-                    }
-
-                    if has_date_warning && is_date_warning_enabled(&config, calibration_type) {
-                        warnings.push(CalibrationWarning {
-                            warning_type: "date".to_string(),
-                            message: format!("{} calibration may be outdated", calibration_type),
-                            calibration_type: calibration_type.to_string(),
-                            set_id,
-                        });
-                    }
-                }
+    // Calculate warnings dynamically for each frame
+    // We only need to find ONE frame that triggers a warning for this set
+    for &frame_id in frame_ids {
+        let frame_warnings = calculate_calibration_warnings(conn, frame_id, set_id, calibration_type);
+        for warning in frame_warnings {
+            // Check if we already have this warning type
+            if !warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+                warnings.push(warning);
             }
         }
+        // Once we have both warning types, we can stop checking
+        if warnings.len() >= 2 {
+            break;
+        }
     }
-
-    // Deduplicate warnings (same warning_type)
-    warnings.dedup_by(|a, b| a.warning_type == b.warning_type);
 
     warnings
 }
 
 /// Helper: Check if any frames in the group have calibration warnings
+/// Warnings are calculated dynamically based on current config (not stored values)
 fn check_group_warnings(conn: &Connection, frame_ids: &[i64]) -> Result<bool> {
     if frame_ids.is_empty() {
         return Ok(false);
     }
 
-    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
-    let query = format!(
-        "SELECT COUNT(*) FROM calibration_set_to_frames
-         WHERE source_id IN ({}) AND source_type = 'frame'
-         AND (date_warning = 1 OR temp_warning = 1)",
-        placeholders.join(",")
-    );
+    // Check each frame for any warnings using dynamic calculation
+    for &frame_id in frame_ids {
+        let status = get_frame_calibration_status(conn, frame_id)?;
+        if status.flats_warning || status.darks_warning || status.bias_warning {
+            return Ok(true);
+        }
+    }
 
-    let mut stmt = conn.prepare(&query)?;
-    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-
-    let count: i64 = stmt.query_row(params.as_slice(), |row| row.get(0))?;
-    Ok(count > 0)
+    Ok(false)
 }
 
 /// Get calibration hierarchy organized by Date → Camera → Filter for a frame set

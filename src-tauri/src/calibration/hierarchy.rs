@@ -3,6 +3,7 @@ use crate::calibration::finder::CalibrationCandidate;
 use crate::calibration::configurable_matcher::{
     load_config, find_dark_for_light, find_calibration_for_flat, find_calibration_for_dark,
 };
+use crate::calibration::config::{CalibrationMatchingConfig, MatchMode};
 use crate::calibration::flat_matcher::{
     find_flat_groups_for_light_frame, apply_pattern_selection, FlatPattern,
 };
@@ -21,6 +22,35 @@ use rusqlite::Connection;
 use anyhow::{Result, Context};
 use chrono::{Utc, DateTime, Duration};
 use tauri::State;
+
+// ============================================================================
+// Helper functions for checking if warnings are enabled based on config mode
+// ============================================================================
+
+/// Check if temperature warnings are enabled for a calibration path
+/// Returns true only if the mode is explicitly set to "Warning"
+fn is_temp_warning_mode_enabled(config: &CalibrationMatchingConfig, source: &str, cal_type: &str) -> bool {
+    match (source, cal_type) {
+        ("lights", "flat") => config.lights.flat.as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning).unwrap_or(false),
+        ("lights", "dark") => config.lights.dark.as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning).unwrap_or(false),
+        ("lights", "bias") => config.lights.bias.as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning).unwrap_or(false),
+        ("flats", "darkflat") => config.flats.darkflat.as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning).unwrap_or(false),
+        ("flats", "dark") => config.flats.dark.as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning).unwrap_or(false),
+        ("flats", "bias") => config.flats.bias.as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Check if date warnings should be shown (threshold is reasonable)
+fn is_date_warning_enabled(threshold: i64) -> bool {
+    threshold > 0 && threshold < 10000
+}
 
 /// Get frame metadata by ID
 fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
@@ -292,37 +322,42 @@ pub fn build_complete_hierarchy(
                 // Create calibration set from the flat group
                 let set_id = create_flat_calibration_set(conn, &flat_match.group)?;
 
-                // Add age warning if needed
-                if flat_match.age_days > tolerance.flat_date_warning_days {
+                // Add age warning if needed (only if threshold is reasonable)
+                // Use config directly for consistency with UI
+                let flat_date_threshold = config.warnings.flat_date_warning_days;
+                if is_date_warning_enabled(flat_date_threshold)
+                    && flat_match.age_days > flat_date_threshold {
                     warnings.push(CalibrationWarning {
                         warning_type: "date".to_string(),
                         message: format!(
                             "Flat calibration is {} days old (>{} days recommended)",
                             flat_match.age_days,
-                            tolerance.flat_date_warning_days
+                            flat_date_threshold
                         ),
                         calibration_type: "Flat".to_string(),
                         set_id,
                     });
                 }
 
-                // Add temperature warning if temp diff exists and is significant
+                // Add temperature warning if temp diff exists, mode is "Warning", and threshold exceeded
                 if let Some(temp_diff) = flat_match.temp_diff {
-                    // Get threshold from config (Lights→Flat ccd_temp warning threshold)
-                    let threshold = config.lights.flat.as_ref()
-                        .and_then(|c| c.ccd_temp.warning_threshold)
-                        .unwrap_or(tolerance.temp_delta_celsius);
+                    // Only generate warning if mode is "Warning" (not Ignore or Exact)
+                    if is_temp_warning_mode_enabled(&config, "lights", "flat") {
+                        let threshold = config.lights.flat.as_ref()
+                            .and_then(|c| c.ccd_temp.warning_threshold)
+                            .unwrap_or(tolerance.temp_delta_celsius);
 
-                    if temp_diff > threshold {
-                        warnings.push(CalibrationWarning {
-                            warning_type: "temperature".to_string(),
-                            message: format!(
-                                "Flat temperature differs by {:.1}°C",
-                                temp_diff
-                            ),
-                            calibration_type: "Flat".to_string(),
-                            set_id,
-                        });
+                        if temp_diff > threshold {
+                            warnings.push(CalibrationWarning {
+                                warning_type: "temperature".to_string(),
+                                message: format!(
+                                    "Flat temperature differs by {:.1}°C",
+                                    temp_diff
+                                ),
+                                calibration_type: "Flat".to_string(),
+                                set_id,
+                            });
+                        }
                     }
                 }
 
@@ -360,26 +395,59 @@ pub fn build_complete_hierarchy(
                 temp_warning: best_flat_calib.temp_warning,
             });
 
-            // Add warnings
+            // Add date warning for sub-calibration (Dark/Bias for Flat)
             if best_flat_calib.date_warning {
-                warnings.push(CalibrationWarning {
-                    warning_type: "date".to_string(),
-                    message: format!(
-                        "{} for Flat is {} days old",
-                        match best_flat_calib.imagetyp {
-                            ImageType::Dark => "Dark",
-                            ImageType::Bias => "Bias",
-                            _ => "Calibration",
+                // Use dark date threshold from config for sub-calibration (Dark/Bias for Flats)
+                let dark_date_threshold = config.warnings.dark_date_warning_days;
+                if is_date_warning_enabled(dark_date_threshold) {
+                    warnings.push(CalibrationWarning {
+                        warning_type: "date".to_string(),
+                        message: format!(
+                            "{} for Flat is {} days old",
+                            match best_flat_calib.imagetyp {
+                                ImageType::Dark => "Dark",
+                                ImageType::Bias => "Bias",
+                                _ => "Calibration",
+                            },
+                            best_flat_calib.date_diff_days
+                        ),
+                        calibration_type: match best_flat_calib.imagetyp {
+                            ImageType::Dark => "Dark".to_string(),
+                            ImageType::Bias => "Bias".to_string(),
+                            _ => "Unknown".to_string(),
                         },
-                        best_flat_calib.date_diff_days
-                    ),
-                    calibration_type: match best_flat_calib.imagetyp {
-                        ImageType::Dark => "Dark".to_string(),
-                        ImageType::Bias => "Bias".to_string(),
-                        _ => "Unknown".to_string(),
-                    },
-                    set_id: best_flat_calib.set_id,
-                });
+                        set_id: best_flat_calib.set_id,
+                    });
+                }
+            }
+            // Add temp warning for sub-calibration (only if mode is "Warning")
+            if best_flat_calib.temp_warning {
+                let cal_type = match best_flat_calib.imagetyp {
+                    ImageType::Dark => "dark",
+                    ImageType::DarkFlat => "darkflat",
+                    ImageType::Bias => "bias",
+                    _ => "dark",
+                };
+                if is_temp_warning_mode_enabled(&config, "flats", cal_type) {
+                    warnings.push(CalibrationWarning {
+                        warning_type: "temperature".to_string(),
+                        message: format!(
+                            "{} for Flat temperature differs by {:.1}°C",
+                            match best_flat_calib.imagetyp {
+                                ImageType::Dark => "Dark",
+                                ImageType::Bias => "Bias",
+                                _ => "Calibration",
+                            },
+                            best_flat_calib.temp_diff.unwrap_or(0.0)
+                        ),
+                        calibration_type: match best_flat_calib.imagetyp {
+                            ImageType::Dark => "Dark".to_string(),
+                            ImageType::Bias => "Bias".to_string(),
+                            _ => "Unknown".to_string(),
+                        },
+                        set_id: best_flat_calib.set_id,
+                    });
+                }
             }
         } else {
             missing_calibration.push("Dark/Bias for Flat".to_string());
@@ -416,20 +484,23 @@ pub fn build_complete_hierarchy(
         if let Some(best_dark) = ranked_darks.first() {
             let dark_set = get_calibration_set_by_id(conn, best_dark.set_id)?;
 
-            // Add warnings for the dark
-            if best_dark.date_warning {
+            // Add warnings for the dark (only if enabled in config)
+            // Use config directly for consistency with UI
+            let dark_date_threshold = config.warnings.dark_date_warning_days;
+            if best_dark.date_warning && is_date_warning_enabled(dark_date_threshold) {
                 warnings.push(CalibrationWarning {
                     warning_type: "date".to_string(),
                     message: format!(
                         "Dark calibration is {} days old (>{} days recommended)",
                         best_dark.date_diff_days,
-                        tolerance.dark_date_warning_days
+                        dark_date_threshold
                     ),
                     calibration_type: "Dark".to_string(),
                     set_id: best_dark.set_id,
                 });
             }
-            if best_dark.temp_warning {
+            // Only show temp warning if mode is "Warning" (not Ignore or Exact)
+            if best_dark.temp_warning && is_temp_warning_mode_enabled(&config, "lights", "dark") {
                 warnings.push(CalibrationWarning {
                     warning_type: "temperature".to_string(),
                     message: format!(
@@ -461,6 +532,7 @@ pub fn build_complete_hierarchy(
 
 /// Store calibration hierarchy in database
 /// Creates all necessary calibration links
+/// Note: Warnings are NOT stored - they are calculated dynamically at display time
 pub fn store_calibration_hierarchy(
     conn: &Connection,
     hierarchy: &CalibrationHierarchy,
@@ -476,18 +548,21 @@ pub fn store_calibration_hierarchy(
                 calibration_type: "Flat".to_string(),
                 matched_at: Utc::now().to_rfc3339(),
                 match_score: Some(1.0), // Best match was selected
-                date_warning: hierarchy.warnings.iter().any(|w|
-                    w.calibration_type == "Flat" && w.warning_type == "date"
-                ),
-                temp_warning: hierarchy.warnings.iter().any(|w|
-                    w.calibration_type == "Flat" && w.warning_type == "temperature"
-                ),
+                // Warnings are calculated dynamically - not stored
+                date_warning: false,
+                temp_warning: false,
             };
             insert_calibration_link(conn, &link)?;
 
             // Store sub-calibration links (Flat → Dark/Bias)
             for sub_link in &flat_set_with_links.sub_calibration {
-                insert_calibration_link(conn, sub_link)?;
+                // Create a new link with warnings set to false
+                let clean_sub_link = CalibrationLink {
+                    date_warning: false,
+                    temp_warning: false,
+                    ..sub_link.clone()
+                };
+                insert_calibration_link(conn, &clean_sub_link)?;
             }
         }
     }
@@ -503,18 +578,21 @@ pub fn store_calibration_hierarchy(
                 calibration_type: "Dark".to_string(),
                 matched_at: Utc::now().to_rfc3339(),
                 match_score: Some(1.0),
-                date_warning: hierarchy.warnings.iter().any(|w|
-                    w.calibration_type == "Dark" && w.warning_type == "date"
-                ),
-                temp_warning: hierarchy.warnings.iter().any(|w|
-                    w.calibration_type == "Dark" && w.warning_type == "temperature"
-                ),
+                // Warnings are calculated dynamically - not stored
+                date_warning: false,
+                temp_warning: false,
             };
             insert_calibration_link(conn, &link)?;
 
             // Store sub-calibration links (Dark → Bias)
             for sub_link in &dark_set_with_links.sub_calibration {
-                insert_calibration_link(conn, sub_link)?;
+                // Create a new link with warnings set to false
+                let clean_sub_link = CalibrationLink {
+                    date_warning: false,
+                    temp_warning: false,
+                    ..sub_link.clone()
+                };
+                insert_calibration_link(conn, &clean_sub_link)?;
             }
         }
     }
