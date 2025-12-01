@@ -819,7 +819,7 @@ export default function FrameSetDetail() {
                                     align="right"
                                   />
                                 </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 tracking-wider">
                                   Calibration
                                 </th>
                               </tr>
