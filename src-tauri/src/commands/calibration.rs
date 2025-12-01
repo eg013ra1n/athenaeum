@@ -181,14 +181,6 @@ pub async fn find_calibration_for_frame_set(
     // Use provided flat_pattern or fall back to stored pattern
     let final_flat_pattern = flat_pattern.or(stored_flat_pattern);
 
-    // Parse session dates
-    let session_start = date_obs_start
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
-    let session_end = date_obs_end
-        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
-
     // Load calibration config
     let config = crate::calibration::configurable_matcher::load_config(&conn);
 
@@ -229,8 +221,6 @@ pub async fn find_calibration_for_frame_set(
         max_age_days,
         time_cluster_minutes,
         temp_weight,
-        session_start,
-        session_end,
         &state,
     ).map_err(|e| format!("Failed to process frame set: {}", e))?;
 
@@ -387,14 +377,12 @@ pub async fn get_frame_calibration_hierarchy(
         &conn,
         &frame,
         &tolerance,
-        None,  // flat_pattern
+        None,  // flat_pattern (defaults to Automatic)
         None,  // manual_flat_set_id
         max_age_days,
         time_cluster_minutes,
         temp_weight,
-        None,  // session_start
-        None,  // session_end
-        &state, // AppState for on-demand calibration creation
+        &state,
     ).map_err(|e| format!("Failed to build hierarchy: {}", e))
 }
 

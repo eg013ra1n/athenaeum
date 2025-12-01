@@ -45,35 +45,31 @@ pub enum FlatTiming {
 /// User's flat-taking pattern preference
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FlatPattern {
-    /// Flats taken before imaging session starts
-    BeforeSession,
-    /// Flats taken after imaging session ends
-    AfterSession,
-    /// Flats taken before each filter change
-    BeforeFilterChange,
-    /// Long-term flats (reuse for weeks/months)
+    /// Automatic: Find flat group nearest in time to each light frame (default)
+    Automatic,
+    /// Long-term: Prefer oldest valid flat group (for stable reuse over weeks/months)
     LongTerm,
-    /// Manual selection by user
+    /// Manual: User selects specific flat set per filter
     Manual,
 }
 
 impl FlatPattern {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "before_session" => Some(Self::BeforeSession),
-            "after_session" => Some(Self::AfterSession),
-            "before_filter_change" => Some(Self::BeforeFilterChange),
+            "automatic" => Some(Self::Automatic),
             "long_term" => Some(Self::LongTerm),
             "manual" => Some(Self::Manual),
+            // MIGRATION: Map old patterns to Automatic
+            "before_session" | "after_session" | "before_filter_change" => {
+                Some(Self::Automatic)
+            }
             _ => None,
         }
     }
 
     pub fn to_string(&self) -> &str {
         match self {
-            Self::BeforeSession => "before_session",
-            Self::AfterSession => "after_session",
-            Self::BeforeFilterChange => "before_filter_change",
+            Self::Automatic => "automatic",
             Self::LongTerm => "long_term",
             Self::Manual => "manual",
         }
@@ -220,89 +216,44 @@ pub fn find_flat_groups_for_light_frame(
 /// # Arguments
 /// * `matches` - Available flat group matches (should be sorted by score)
 /// * `pattern` - User's imaging pattern
-/// * `session_start` - Start time of imaging session (optional)
-/// * `session_end` - End time of imaging session (optional)
+/// * `light_frame_date` - Date of the light frame (needed for Automatic pattern)
 ///
 /// # Returns
 /// The selected FlatGroupMatch, or None if no suitable match
 pub fn apply_pattern_selection(
     matches: Vec<FlatGroupMatch>,
     pattern: &FlatPattern,
-    session_start: Option<DateTime<Utc>>,
-    session_end: Option<DateTime<Utc>>,
+    light_frame_date: Option<DateTime<Utc>>,
 ) -> Option<FlatGroupMatch> {
     if matches.is_empty() {
         return None;
     }
 
     match pattern {
-        FlatPattern::BeforeSession => {
-            // Prefer flats taken BEFORE session start
-            if let Some(start) = session_start {
-                // Find best match taken before session
-                let before_matches: Vec<_> = matches
-                    .iter()
-                    .filter(|m| m.group.end_time < start)
-                    .collect();
-
-                if let Some(best) = before_matches.first() {
-                    Some((*best).clone())
-                } else {
-                    // Fallback: use best overall match
-                    matches.into_iter().next()
-                }
+        FlatPattern::Automatic => {
+            // Find flat group nearest in time to the light frame
+            if let Some(frame_date) = light_frame_date {
+                matches.into_iter().min_by_key(|m| {
+                    // Calculate midpoint of flat group
+                    let duration = m.group.end_time - m.group.start_time;
+                    let flat_midpoint = m.group.start_time + duration / 2;
+                    // Return absolute time difference in seconds
+                    (frame_date - flat_midpoint).num_seconds().abs()
+                })
             } else {
-                // No session time - use best match with Before timing
-                let before_matches: Vec<_> = matches
-                    .iter()
-                    .filter(|m| m.timing == FlatTiming::Before)
-                    .collect();
-
-                if let Some(best) = before_matches.first() {
-                    Some((*best).clone())
-                } else {
-                    matches.into_iter().next()
-                }
-            }
-        }
-
-        FlatPattern::AfterSession => {
-            // Prefer flats taken AFTER session end
-            if let Some(end) = session_end {
-                let after_matches: Vec<_> = matches
-                    .iter()
-                    .filter(|m| m.group.start_time > end)
-                    .collect();
-
-                if let Some(best) = after_matches.first() {
-                    Some((*best).clone())
-                } else {
-                    matches.into_iter().next()
-                }
-            } else {
-                let after_matches: Vec<_> = matches
-                    .iter()
-                    .filter(|m| m.timing == FlatTiming::After)
-                    .collect();
-
-                if let Some(best) = after_matches.first() {
-                    Some((*best).clone())
-                } else {
-                    matches.into_iter().next()
-                }
+                // Fallback: return best scored match (first in sorted list)
+                matches.into_iter().next()
             }
         }
 
         FlatPattern::LongTerm => {
-            // Prefer oldest valid flat group (stability)
-            let mut sorted = matches;
-            sorted.sort_by(|a, b| a.group.start_time.cmp(&b.group.start_time));
-            sorted.into_iter().next()
+            // Prefer oldest valid flat group (for stable/long-term reuse)
+            matches.into_iter()
+                .min_by_key(|m| m.group.start_time)
         }
 
-        FlatPattern::Manual | FlatPattern::BeforeFilterChange => {
-            // For manual and filter change patterns, return best overall match
-            // Actual selection will be done by user or filter change detection
+        FlatPattern::Manual => {
+            // Return best scored match - user will override via ManualFlatSelectionModal
             matches.into_iter().next()
         }
     }
@@ -373,26 +324,351 @@ pub fn detect_filter_changes(frames: &[Frame]) -> Vec<FilterPeriod> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibration::flat_groups::FlatGroup;
+
+    // Helper to create a FlatGroupMatch for testing
+    fn make_match(
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        match_score: f64,
+        timing: FlatTiming,
+    ) -> FlatGroupMatch {
+        FlatGroupMatch {
+            group: FlatGroup {
+                frame_ids: vec![1, 2, 3],
+                start_time,
+                end_time,
+                avg_temp: Some(-10.0),
+                frame_count: 3,
+                filter: Some("L".to_string()),
+                instrume: "ASI2600MM".to_string(),
+                binning: "1x1".to_string(),
+                gain: Some(100.0),
+                offset: Some(10.0),
+                exptime: Some(1.0),
+                focal_length: Some(600.0),
+            },
+            match_score,
+            age_days: 1,
+            temp_diff: Some(0.5),
+            timing,
+        }
+    }
+
+    // ========== FlatPattern::from_str tests ==========
 
     #[test]
-    fn test_flat_pattern_from_str() {
+    fn test_flat_pattern_from_str_automatic() {
         assert_eq!(
-            FlatPattern::from_str("before_session"),
-            Some(FlatPattern::BeforeSession)
-        );
-        assert_eq!(
-            FlatPattern::from_str("after_session"),
-            Some(FlatPattern::AfterSession)
-        );
-        assert_eq!(
-            FlatPattern::from_str("invalid"),
-            None
+            FlatPattern::from_str("automatic"),
+            Some(FlatPattern::Automatic)
         );
     }
 
     #[test]
-    fn test_flat_timing() {
+    fn test_flat_pattern_from_str_long_term() {
+        assert_eq!(
+            FlatPattern::from_str("long_term"),
+            Some(FlatPattern::LongTerm)
+        );
+    }
+
+    #[test]
+    fn test_flat_pattern_from_str_manual() {
+        assert_eq!(
+            FlatPattern::from_str("manual"),
+            Some(FlatPattern::Manual)
+        );
+    }
+
+    #[test]
+    fn test_flat_pattern_from_str_invalid() {
+        assert_eq!(
+            FlatPattern::from_str("invalid"),
+            None
+        );
+        assert_eq!(
+            FlatPattern::from_str(""),
+            None
+        );
+    }
+
+    // ========== Migration from old pattern values ==========
+
+    #[test]
+    fn test_flat_pattern_migration_before_session() {
+        // Old "before_session" should migrate to Automatic
+        assert_eq!(
+            FlatPattern::from_str("before_session"),
+            Some(FlatPattern::Automatic)
+        );
+    }
+
+    #[test]
+    fn test_flat_pattern_migration_after_session() {
+        // Old "after_session" should migrate to Automatic
+        assert_eq!(
+            FlatPattern::from_str("after_session"),
+            Some(FlatPattern::Automatic)
+        );
+    }
+
+    #[test]
+    fn test_flat_pattern_migration_before_filter_change() {
+        // Old "before_filter_change" should migrate to Automatic
+        assert_eq!(
+            FlatPattern::from_str("before_filter_change"),
+            Some(FlatPattern::Automatic)
+        );
+    }
+
+    // ========== FlatPattern::to_string tests ==========
+
+    #[test]
+    fn test_flat_pattern_to_string() {
+        assert_eq!(FlatPattern::Automatic.to_string(), "automatic");
+        assert_eq!(FlatPattern::LongTerm.to_string(), "long_term");
+        assert_eq!(FlatPattern::Manual.to_string(), "manual");
+    }
+
+    // ========== apply_pattern_selection tests ==========
+
+    #[test]
+    fn test_apply_pattern_empty_matches_returns_none() {
+        let matches: Vec<FlatGroupMatch> = vec![];
+        let result = apply_pattern_selection(matches, &FlatPattern::Automatic, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_automatic_selects_nearest_flat_group() {
+        // Light frame taken at 20:00
+        let light_date = DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Flat group A: 18:00-18:30 (midpoint 18:15, 1h45m before light)
+        let match_a = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T18:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T18:30:00Z").unwrap().with_timezone(&Utc),
+            0.9,
+            FlatTiming::Before,
+        );
+
+        // Flat group B: 21:00-21:30 (midpoint 21:15, 1h15m after light) - CLOSER
+        let match_b = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T21:30:00Z").unwrap().with_timezone(&Utc),
+            0.8,
+            FlatTiming::After,
+        );
+
+        let matches = vec![match_a.clone(), match_b.clone()];
+        let result = apply_pattern_selection(matches, &FlatPattern::Automatic, Some(light_date));
+
+        assert!(result.is_some());
+        // Should select match_b because it's closer in time (1h15m vs 1h45m)
+        let selected = result.unwrap();
+        assert_eq!(selected.timing, FlatTiming::After);
+    }
+
+    #[test]
+    fn test_automatic_prefers_before_when_equidistant() {
+        // Light frame taken at 20:00
+        let light_date = DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Flat group A: 19:00-19:00 (exactly 1h before)
+        let match_a = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T19:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T19:00:00Z").unwrap().with_timezone(&Utc),
+            0.9,
+            FlatTiming::Before,
+        );
+
+        // Flat group B: 21:00-21:00 (exactly 1h after)
+        let match_b = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            0.8,
+            FlatTiming::After,
+        );
+
+        // When equidistant, min_by_key returns first encountered
+        let matches = vec![match_a.clone(), match_b.clone()];
+        let result = apply_pattern_selection(matches, &FlatPattern::Automatic, Some(light_date));
+
+        assert!(result.is_some());
+        // First match in iterator should be returned when equal
+        assert_eq!(result.unwrap().timing, FlatTiming::Before);
+    }
+
+    #[test]
+    fn test_automatic_fallback_without_date() {
+        // No light frame date provided
+        let match_a = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T18:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T18:30:00Z").unwrap().with_timezone(&Utc),
+            0.9, // Higher score
+            FlatTiming::Before,
+        );
+
+        let match_b = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T21:30:00Z").unwrap().with_timezone(&Utc),
+            0.8,
+            FlatTiming::After,
+        );
+
+        let matches = vec![match_a.clone(), match_b.clone()];
+        let result = apply_pattern_selection(matches, &FlatPattern::Automatic, None);
+
+        assert!(result.is_some());
+        // Should fall back to first match (best scored, as list is pre-sorted)
+        assert_eq!(result.unwrap().match_score, 0.9);
+    }
+
+    #[test]
+    fn test_long_term_selects_oldest_flat_group() {
+        // Flat group A: January 10 (older)
+        let match_a = make_match(
+            DateTime::parse_from_rfc3339("2025-01-10T18:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-10T18:30:00Z").unwrap().with_timezone(&Utc),
+            0.7, // Lower score but older
+            FlatTiming::Before,
+        );
+
+        // Flat group B: January 15 (newer, higher score)
+        let match_b = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T21:30:00Z").unwrap().with_timezone(&Utc),
+            0.95,
+            FlatTiming::After,
+        );
+
+        let light_date = DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let matches = vec![match_b.clone(), match_a.clone()]; // B first (higher score)
+        let result = apply_pattern_selection(matches, &FlatPattern::LongTerm, Some(light_date));
+
+        assert!(result.is_some());
+        // Should select match_a because it's oldest (Jan 10 vs Jan 15)
+        let selected = result.unwrap();
+        assert_eq!(selected.match_score, 0.7);
+    }
+
+    #[test]
+    fn test_manual_returns_best_scored_match() {
+        let match_a = make_match(
+            DateTime::parse_from_rfc3339("2025-01-10T18:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-10T18:30:00Z").unwrap().with_timezone(&Utc),
+            0.95, // Highest score - first in list
+            FlatTiming::Before,
+        );
+
+        let match_b = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T21:30:00Z").unwrap().with_timezone(&Utc),
+            0.8,
+            FlatTiming::After,
+        );
+
+        // Matches are pre-sorted by score (best first)
+        let matches = vec![match_a.clone(), match_b.clone()];
+        let result = apply_pattern_selection(matches, &FlatPattern::Manual, None);
+
+        assert!(result.is_some());
+        // Should return first match (best scored)
+        assert_eq!(result.unwrap().match_score, 0.95);
+    }
+
+    // ========== FlatTiming tests ==========
+
+    #[test]
+    fn test_flat_timing_equality() {
         assert_eq!(FlatTiming::Before, FlatTiming::Before);
+        assert_eq!(FlatTiming::After, FlatTiming::After);
+        assert_eq!(FlatTiming::During, FlatTiming::During);
         assert_ne!(FlatTiming::Before, FlatTiming::After);
+        assert_ne!(FlatTiming::Before, FlatTiming::During);
+        assert_ne!(FlatTiming::After, FlatTiming::During);
+    }
+
+    // ========== detect_filter_changes tests ==========
+
+    #[test]
+    fn test_detect_filter_changes_empty_frames() {
+        let frames: Vec<Frame> = vec![];
+        let periods = detect_filter_changes(&frames);
+        assert!(periods.is_empty());
+    }
+
+    #[test]
+    fn test_detect_filter_changes_single_filter() {
+        let frames = vec![
+            Frame {
+                id: Some(1),
+                file_id: 1,
+                filter: Some("L".to_string()),
+                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z").unwrap().with_timezone(&Utc)),
+                ..Default::default()
+            },
+            Frame {
+                id: Some(2),
+                file_id: 2,
+                filter: Some("L".to_string()),
+                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:05:00Z").unwrap().with_timezone(&Utc)),
+                ..Default::default()
+            },
+        ];
+
+        let periods = detect_filter_changes(&frames);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].filter, Some("L".to_string()));
+        assert_eq!(periods[0].frame_count, 2);
+    }
+
+    #[test]
+    fn test_detect_filter_changes_multiple_filters() {
+        let frames = vec![
+            Frame {
+                id: Some(1),
+                file_id: 1,
+                filter: Some("L".to_string()),
+                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z").unwrap().with_timezone(&Utc)),
+                ..Default::default()
+            },
+            Frame {
+                id: Some(2),
+                file_id: 2,
+                filter: Some("L".to_string()),
+                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:05:00Z").unwrap().with_timezone(&Utc)),
+                ..Default::default()
+            },
+            Frame {
+                id: Some(3),
+                file_id: 3,
+                filter: Some("Ha".to_string()),
+                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc)),
+                ..Default::default()
+            },
+            Frame {
+                id: Some(4),
+                file_id: 4,
+                filter: Some("Ha".to_string()),
+                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T21:05:00Z").unwrap().with_timezone(&Utc)),
+                ..Default::default()
+            },
+        ];
+
+        let periods = detect_filter_changes(&frames);
+        assert_eq!(periods.len(), 2);
+        assert_eq!(periods[0].filter, Some("L".to_string()));
+        assert_eq!(periods[0].frame_count, 2);
+        assert_eq!(periods[1].filter, Some("Ha".to_string()));
+        assert_eq!(periods[1].frame_count, 2);
     }
 }

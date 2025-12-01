@@ -22,7 +22,7 @@ pub enum FileFormat {
 }
 
 /// Represents a FITS/XISF frame with metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Frame {
     pub id: Option<i64>,
     pub file_id: i64,

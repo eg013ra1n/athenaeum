@@ -12,7 +12,7 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
   onSelect,
   onCancel,
 }) => {
-  const [selectedPattern, setSelectedPattern] = useState<FlatPattern>(FlatPattern.BeforeSession);
+  const [selectedPattern, setSelectedPattern] = useState<FlatPattern>(FlatPattern.Automatic);
   const [rememberChoice, setRememberChoice] = useState(false);
 
   if (!isOpen) return null;
@@ -23,29 +23,20 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
 
   const patterns = [
     {
-      value: FlatPattern.BeforeSession,
-      label: 'Before Session',
-      description: 'I take flats before starting imaging (e.g., during dusk)',
-    },
-    {
-      value: FlatPattern.AfterSession,
-      label: 'After Session',
-      description: 'I take flats after finishing imaging (e.g., during dawn)',
-    },
-    {
-      value: FlatPattern.BeforeFilterChange,
-      label: 'Before Filter Change',
-      description: 'I take flats before each filter change during the session',
+      value: FlatPattern.Automatic,
+      label: 'Automatic',
+      description: 'Find best matching flats automatically based on timing and parameters (recommended)',
+      recommended: true,
     },
     {
       value: FlatPattern.LongTerm,
       label: 'Long-term Reuse',
-      description: 'I reuse the same flats for weeks/months (most stable/oldest)',
+      description: 'Use the same flats over weeks/months (prefers oldest valid flat set)',
     },
     {
       value: FlatPattern.Manual,
       label: 'Manual Selection',
-      description: 'I want to manually choose which flats to use for each filter',
+      description: 'Choose which flat set to use for each filter',
     },
   ];
 

@@ -486,9 +486,7 @@ export enum FlatTiming {
 }
 
 export enum FlatPattern {
-  BeforeSession = "before_session",
-  AfterSession = "after_session",
-  BeforeFilterChange = "before_filter_change",
+  Automatic = "automatic",
   LongTerm = "long_term",
   Manual = "manual",
 }

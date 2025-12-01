@@ -183,13 +183,11 @@ pub fn get_light_frames_from_frame_set(
 /// * `conn` - Database connection
 /// * `frame_set_id` - ID of the frame set to process
 /// * `tolerance` - Calibration matching tolerance
-/// * `flat_pattern` - Optional flat pattern preference
+/// * `flat_pattern` - Optional flat pattern preference (e.g., "automatic", "long_term", "manual")
 /// * `manual_flat_selections` - Optional manual flat selections per filter
 /// * `max_age_days` - Maximum age of flats to consider
 /// * `time_cluster_minutes` - Time threshold for grouping flats
 /// * `temp_weight` - Weight for temperature matching
-/// * `session_start` - Optional session start time
-/// * `session_end` - Optional session end time
 /// * `state` - AppState for accessing settings and on-demand calibration creation
 pub fn process_frame_set(
     conn: &Connection,
@@ -200,8 +198,6 @@ pub fn process_frame_set(
     max_age_days: i64,
     time_cluster_minutes: i64,
     temp_weight: f64,
-    session_start: Option<DateTime<Utc>>,
-    session_end: Option<DateTime<Utc>>,
     state: &State<'_, AppState>,
 ) -> Result<ProcessingStats> {
     // Get all light frames from the frame set
@@ -230,8 +226,6 @@ pub fn process_frame_set(
             max_age_days,
             time_cluster_minutes,
             temp_weight,
-            session_start,
-            session_end,
             state,
         ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
 
@@ -272,8 +266,6 @@ pub fn process_frame_set_with_progress<F>(
     max_age_days: i64,
     time_cluster_minutes: i64,
     temp_weight: f64,
-    session_start: Option<DateTime<Utc>>,
-    session_end: Option<DateTime<Utc>>,
     state: &State<'_, AppState>,
     mut progress_callback: F,
 ) -> Result<ProcessingStats>
@@ -306,8 +298,6 @@ where
             max_age_days,
             time_cluster_minutes,
             temp_weight,
-            session_start,
-            session_end,
             state,
         ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
 
@@ -403,18 +393,17 @@ mod tests {
                     imagetyp: crate::models::ImageType::Flat,
                     exptime: None,
                     filter: Some("L".to_string()),
-                    ccd_temp: Some(-10.0),
+                    ccd_temp: -10.0,
                     gain: Some(100.0),
                     offset: Some(10.0),
                     binning: Some("1x1".to_string()),
                     instrume: Some("ASI2600MM".to_string()),
-                    date: "2025-01".to_string(),
-                    date_start: Some("2025-01-15T00:00:00Z".to_string()),
-                    date_end: Some("2025-01-15T23:59:59Z".to_string()),
-                    temp_min: Some(-10.5),
-                    temp_max: Some(-9.5),
+                    date_display: "2025-01".to_string(),
+                    date_start: "2025-01-15T00:00:00Z".to_string(),
+                    date_end: "2025-01-15T23:59:59Z".to_string(),
+                    temp_min: -10.5,
+                    temp_max: -9.5,
                     frame_count: 10,
-                    focallen: Some(600.0),
                 },
                 sub_calibration: vec![],
             }],
@@ -424,18 +413,17 @@ mod tests {
                     imagetyp: crate::models::ImageType::Dark,
                     exptime: Some(300.0),
                     filter: None,
-                    ccd_temp: Some(-10.0),
+                    ccd_temp: -10.0,
                     gain: Some(100.0),
                     offset: Some(10.0),
                     binning: Some("1x1".to_string()),
                     instrume: Some("ASI2600MM".to_string()),
-                    date: "2025-01".to_string(),
-                    date_start: Some("2025-01-15T00:00:00Z".to_string()),
-                    date_end: Some("2025-01-15T23:59:59Z".to_string()),
-                    temp_min: Some(-10.5),
-                    temp_max: Some(-9.5),
+                    date_display: "2025-01".to_string(),
+                    date_start: "2025-01-15T00:00:00Z".to_string(),
+                    date_end: "2025-01-15T23:59:59Z".to_string(),
+                    temp_min: -10.5,
+                    temp_max: -9.5,
                     frame_count: 20,
-                    focallen: None,
                 },
                 sub_calibration: vec![],
             }],

@@ -245,13 +245,11 @@ pub fn find_calibration_for_dark_set(
 /// * `conn` - Database connection
 /// * `light_frame` - The light frame to find calibration for
 /// * `tolerance` - Tolerance settings for calibration matching
-/// * `flat_pattern` - Optional flat pattern preference (e.g., "before_session")
+/// * `flat_pattern` - Optional flat pattern preference (e.g., "automatic", "long_term", "manual")
 /// * `manual_flat_set_id` - Optional manually selected flat set ID for this specific frame
 /// * `max_age_days` - Maximum age of flats to consider (from settings)
 /// * `time_cluster_minutes` - Time threshold for grouping flats (from settings)
 /// * `temp_weight` - Weight for temperature matching (from settings)
-/// * `session_start` - Optional session start time for pattern matching
-/// * `session_end` - Optional session end time for pattern matching
 /// * `state` - AppState for accessing settings
 pub fn build_complete_hierarchy(
     conn: &Connection,
@@ -262,8 +260,6 @@ pub fn build_complete_hierarchy(
     max_age_days: i64,
     time_cluster_minutes: i64,
     temp_weight: f64,
-    session_start: Option<DateTime<Utc>>,
-    session_end: Option<DateTime<Utc>>,
     state: &State<'_, AppState>,
 ) -> Result<CalibrationHierarchy> {
     let frame_id = light_frame.id.context("Frame must have an ID")?;
@@ -303,16 +299,17 @@ pub fn build_complete_hierarchy(
             // Apply pattern-based selection
             let pattern = flat_pattern
                 .and_then(|p| FlatPattern::from_str(p))
-                .unwrap_or(FlatPattern::Manual); // Default to manual if not specified
+                .unwrap_or(FlatPattern::Automatic); // Default to Automatic (nearest by time)
 
             println!("  🎯 Applying pattern: {:?}", pattern);
-            println!("  📅 Session start: {:?}, end: {:?}", session_start, session_end);
+
+            // Pass light frame date for temporal proximity calculation
+            let light_frame_date = light_frame.date_obs;
 
             let selected_match = apply_pattern_selection(
                 flat_matches,
                 &pattern,
-                session_start,
-                session_end,
+                light_frame_date,
             );
 
             if let Some(flat_match) = selected_match {

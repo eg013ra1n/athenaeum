@@ -185,6 +185,8 @@ mod tests {
             created_at: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
+            metadata_hash: None,
+            content_hash: None,
         };
 
         let frame = Frame {
@@ -199,6 +201,7 @@ mod tests {
             exptime: Some(exptime),
             filter: None,
             imagetyp: None,
+            is_master: false,
             gain: None,
             offset: None,
             binning: None,
@@ -209,6 +212,8 @@ mod tests {
             focallen: None,
             xpixsz: None,
             pixsz: None,
+            naxis1: None,
+            naxis2: None,
             ra: None,
             dec: None,
             sitelat: None,
