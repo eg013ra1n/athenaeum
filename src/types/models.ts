@@ -459,7 +459,6 @@ export interface FrameSetCalibrationGroups {
 }
 
 export interface CalibrationTolerance {
-  temp_delta_celsius: number;
   flat_date_warning_days: number;
   dark_date_warning_days: number;
 }

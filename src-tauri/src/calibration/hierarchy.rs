@@ -339,21 +339,21 @@ pub fn build_complete_hierarchy(
                 // Add temperature warning if temp diff exists, mode is "Warning", and threshold exceeded
                 if let Some(temp_diff) = flat_match.temp_diff {
                     // Only generate warning if mode is "Warning" (not Ignore or Exact)
+                    // and threshold is explicitly set in the config
                     if is_temp_warning_mode_enabled(&config, "lights", "flat") {
-                        let threshold = config.lights.flat.as_ref()
-                            .and_then(|c| c.ccd_temp.warning_threshold)
-                            .unwrap_or(tolerance.temp_delta_celsius);
-
-                        if temp_diff > threshold {
-                            warnings.push(CalibrationWarning {
-                                warning_type: "temperature".to_string(),
-                                message: format!(
-                                    "Flat temperature differs by {:.1}°C",
-                                    temp_diff
-                                ),
-                                calibration_type: "Flat".to_string(),
-                                set_id,
-                            });
+                        if let Some(threshold) = config.lights.flat.as_ref()
+                            .and_then(|c| c.ccd_temp.warning_threshold) {
+                            if temp_diff > threshold {
+                                warnings.push(CalibrationWarning {
+                                    warning_type: "temperature".to_string(),
+                                    message: format!(
+                                        "Flat temperature differs by {:.1}°C",
+                                        temp_diff
+                                    ),
+                                    calibration_type: "Flat".to_string(),
+                                    set_id,
+                                });
+                            }
                         }
                     }
                 }

@@ -399,13 +399,13 @@ export default function CalibrationMatchingConfig() {
         )}
       </div>
 
-      {/* Warning Thresholds */}
+      {/* Date Warning Thresholds */}
       <div className="bg-gray-750 rounded-lg border border-gray-700">
         <button
           onClick={() => toggleSection("warnings")}
           className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
         >
-          <span className="font-semibold text-lg">Warning Thresholds</span>
+          <span className="font-semibold text-lg">Date Warning Thresholds</span>
           {expandedSections.warnings ? (
             <ChevronDown size={20} />
           ) : (
@@ -415,31 +415,9 @@ export default function CalibrationMatchingConfig() {
         {expandedSections.warnings && (
           <div className="px-4 pb-4">
             <p className="text-sm text-gray-400 mb-4">
-              Configure warning thresholds for calibration frame matching.
+              Warn when calibration frames are older than these thresholds.
             </p>
             <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Temperature Delta (°C)
-                </label>
-                <input
-                  type="number"
-                  value={config.warnings.temp_delta_celsius}
-                  onChange={(e) =>
-                    updateWarningConfig(
-                      "temp_delta_celsius",
-                      parseFloat(e.target.value) || 2.0
-                    )
-                  }
-                  step="0.1"
-                  min="0"
-                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
-                />
-                <p className="text-xs text-gray-500 mt-2">
-                  Maximum temperature difference for calibration matching warning
-                </p>
-              </div>
-
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
                   Flat Date Warning (days)

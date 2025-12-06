@@ -211,8 +211,6 @@ impl Default for ScoringConfig {
 /// Warning thresholds for calibration matching
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WarningConfig {
-    /// Temperature delta tolerance in Celsius
-    pub temp_delta_celsius: f64,
     /// Flat calibration date warning threshold in days
     pub flat_date_warning_days: i64,
     /// Dark calibration date warning threshold in days
@@ -224,7 +222,6 @@ pub struct WarningConfig {
 impl Default for WarningConfig {
     fn default() -> Self {
         Self {
-            temp_delta_celsius: 2.0,
             flat_date_warning_days: 30,
             dark_date_warning_days: 365,
             darkflat_date_warning_days: 365,

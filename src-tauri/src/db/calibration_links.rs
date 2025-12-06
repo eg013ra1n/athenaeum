@@ -595,8 +595,15 @@ fn calculate_temp_warning(
     };
 
     let temp_diff = (frame_temp - set_temp).abs();
-    let threshold = get_temp_warning_threshold(config, cal_type)
-        .unwrap_or(config.warnings.temp_delta_celsius);
+
+    // Only warn if threshold is explicitly set in the config
+    let threshold = match get_temp_warning_threshold(config, cal_type) {
+        Some(t) => t,
+        None => {
+            println!("  🔇 Temp warning DISABLED for {} (no threshold set)", cal_type);
+            return (false, Some(temp_diff));
+        }
+    };
 
     let has_warning = temp_diff > threshold;
     println!("  🌡️ Temp check for {} set {}: frame={:.1}°C, set={:.1}°C, diff={:.1}°C, threshold={:.1}°C -> warning={}",

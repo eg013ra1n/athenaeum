@@ -580,7 +580,6 @@ pub struct FrameSetCalibrationGroups {
 /// Tolerance configuration for calibration matching
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationTolerance {
-    pub temp_delta_celsius: f64,
     pub flat_date_warning_days: i64,
     pub dark_date_warning_days: i64,
 }
@@ -588,7 +587,6 @@ pub struct CalibrationTolerance {
 impl Default for CalibrationTolerance {
     fn default() -> Self {
         Self {
-            temp_delta_celsius: 2.0,
             flat_date_warning_days: 30,
             dark_date_warning_days: 365,
         }

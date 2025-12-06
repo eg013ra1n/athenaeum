@@ -90,8 +90,6 @@ export interface ScoringConfig {
 
 /** Warning thresholds for calibration matching */
 export interface WarningConfig {
-  /** Temperature delta tolerance in Celsius */
-  temp_delta_celsius: number;
   /** Flat calibration date warning threshold in days */
   flat_date_warning_days: number;
   /** Dark calibration date warning threshold in days */

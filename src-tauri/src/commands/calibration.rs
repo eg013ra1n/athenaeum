@@ -153,7 +153,6 @@ pub async fn get_calibration_set_frames(
 #[tauri::command]
 pub async fn find_calibration_for_frame_set(
     frame_set_id: i64,
-    temp_delta_celsius: Option<f64>,
     flat_date_warning_days: Option<i64>,
     dark_date_warning_days: Option<i64>,
     flat_pattern: Option<String>,
@@ -162,7 +161,6 @@ pub async fn find_calibration_for_frame_set(
 ) -> Result<crate::calibration::processor::ProcessingStats, String> {
     use crate::calibration::processor::process_frame_set;
     use crate::models::CalibrationTolerance;
-    use chrono::{DateTime, Utc};
 
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
@@ -173,7 +171,7 @@ pub async fn find_calibration_for_frame_set(
         "SELECT flat_pattern, date_obs_start, date_obs_end FROM frames_set WHERE id = ?1"
     ).map_err(|e| e.to_string())?;
 
-    let (stored_flat_pattern, date_obs_start, date_obs_end): (Option<String>, Option<String>, Option<String>) =
+    let (stored_flat_pattern, _date_obs_start, _date_obs_end): (Option<String>, Option<String>, Option<String>) =
         stmt.query_row([frame_set_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         }).map_err(|e| format!("Frame set not found: {}", e))?;
@@ -195,15 +193,13 @@ pub async fn find_calibration_for_frame_set(
 
     // Build tolerance from parameters, config warnings, or defaults
     let tolerance = CalibrationTolerance {
-        temp_delta_celsius: temp_delta_celsius.unwrap_or(config.warnings.temp_delta_celsius),
         flat_date_warning_days: flat_date_warning_days.unwrap_or(config.warnings.flat_date_warning_days),
         dark_date_warning_days: dark_date_warning_days.unwrap_or(config.warnings.dark_date_warning_days),
     };
 
     println!(
-        "Finding calibration for frame set {} with tolerance: temp=±{}°C, flat_date={} days, dark_date={} days",
+        "Finding calibration for frame set {} with tolerance: flat_date={} days, dark_date={} days",
         frame_set_id,
-        tolerance.temp_delta_celsius,
         tolerance.flat_date_warning_days,
         tolerance.dark_date_warning_days
     );
@@ -281,7 +277,6 @@ pub async fn get_calibration_hierarchy_for_frame_set(
 #[tauri::command]
 pub async fn get_frame_calibration_hierarchy(
     frame_id: i64,
-    temp_delta_celsius: Option<f64>,
     flat_date_warning_days: Option<i64>,
     dark_date_warning_days: Option<i64>,
     state: State<'_, AppState>,
@@ -358,7 +353,6 @@ pub async fn get_frame_calibration_hierarchy(
 
     // Build tolerance from parameters, config warnings, or defaults
     let tolerance = CalibrationTolerance {
-        temp_delta_celsius: temp_delta_celsius.unwrap_or(config.warnings.temp_delta_celsius),
         flat_date_warning_days: flat_date_warning_days.unwrap_or(config.warnings.flat_date_warning_days),
         dark_date_warning_days: dark_date_warning_days.unwrap_or(config.warnings.dark_date_warning_days),
     };

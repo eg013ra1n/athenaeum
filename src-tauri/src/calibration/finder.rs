@@ -114,17 +114,18 @@ pub fn matches_bias_parameters(
 }
 
 /// Check if temperature is within tolerance
+/// Note: temp_threshold is now passed explicitly instead of from CalibrationTolerance
 pub fn check_temperature_tolerance(
     frame_temp: Option<f64>,
     set_temp_min: Option<f64>,
     set_temp_max: Option<f64>,
-    tolerance: &CalibrationTolerance,
+    temp_threshold: f64,
 ) -> (bool, bool) {
     match (frame_temp, set_temp_min, set_temp_max) {
         (Some(f_temp), Some(min_temp), Some(max_temp)) => {
             let avg_temp = (min_temp + max_temp) / 2.0;
             let diff = (f_temp - avg_temp).abs();
-            let within_tolerance = diff <= tolerance.temp_delta_celsius;
+            let within_tolerance = diff <= temp_threshold;
             (within_tolerance, !within_tolerance)  // (matches, warning)
         }
         _ => (true, false),  // No temperature data, allow match without warning
@@ -242,7 +243,7 @@ pub fn find_flat_sets_for_light_frame(
             frame.ccd_temp,
             temp_min,
             temp_max,
-            tolerance,
+            2.0,  // Default threshold (this code path is deprecated)
         );
 
         if !temp_match {
@@ -325,7 +326,7 @@ pub fn find_dark_sets_for_light_frame(
             frame.ccd_temp,
             temp_min,
             temp_max,
-            tolerance,
+            2.0,  // Default threshold (this code path is deprecated)
         );
 
         if !temp_match {
@@ -407,7 +408,7 @@ pub fn find_bias_sets_for_frame(
             frame.ccd_temp,
             temp_min,
             temp_max,
-            tolerance,
+            2.0,  // Default threshold (this code path is deprecated)
         );
 
         if !temp_match {
@@ -504,18 +505,14 @@ mod tests {
 
     #[test]
     fn test_temperature_tolerance() {
-        let tolerance = CalibrationTolerance {
-            temp_delta_celsius: 2.0,
-            flat_date_warning_days: 30,
-            dark_date_warning_days: 365,
-        };
+        let temp_threshold = 2.0;
 
         // Within tolerance
         let (matches, warning) = check_temperature_tolerance(
             Some(-10.0),
             Some(-11.0),
             Some(-9.0),
-            &tolerance,
+            temp_threshold,
         );
         assert!(matches);
         assert!(!warning);
@@ -525,7 +522,7 @@ mod tests {
             Some(-10.0),
             Some(-5.0),
             Some(-3.0),
-            &tolerance,
+            temp_threshold,
         );
         assert!(!matches);
         assert!(warning);
@@ -553,7 +550,6 @@ mod tests {
     #[test]
     fn test_date_warning() {
         let tolerance = CalibrationTolerance {
-            temp_delta_celsius: 2.0,
             flat_date_warning_days: 30,
             dark_date_warning_days: 365,
         };
