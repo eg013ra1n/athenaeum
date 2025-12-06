@@ -392,8 +392,25 @@ pub fn create_flat_calibration_set(
     println!("    🔍 Existing set check: {:?}", existing_set_id);
 
     if let Some(set_id) = existing_set_id {
-        // Set already exists, return its ID
+        // Set already exists - link new frames to it
         println!("    ♻️  Reusing existing calibration set ID: {}", set_id);
+
+        // Link new frames to existing set (using INSERT OR IGNORE to avoid duplicates)
+        for frame_id in &flat_group.frame_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                (set_id, frame_id),
+            )?;
+        }
+
+        // Update frame_count to reflect actual linked frames
+        conn.execute(
+            "UPDATE calibration_set SET frame_count = (
+                SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1
+            ) WHERE id = ?1",
+            [set_id],
+        )?;
+
         return Ok(set_id);
     }
 

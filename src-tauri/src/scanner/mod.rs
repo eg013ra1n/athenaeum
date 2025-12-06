@@ -4,7 +4,7 @@
 use crate::db::{file_exists, insert_file, insert_frame, insert_fits_header};
 use crate::fits_parser::{parse_fits, parse_xisf, extract_fits_header, extract_xisf_header};
 use crate::duplicates::compute_metadata_hash;
-use crate::models::{File, FileFormat};
+use crate::models::{File, FileFormat, ImageType};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -57,6 +57,12 @@ pub fn scan_directory(
     let processed = Arc::new(Mutex::new(0usize));
     let skipped = Arc::new(Mutex::new(0usize));
 
+    // Track calibration frame IDs for automatic set creation
+    let mut flat_frame_ids: Vec<i64> = Vec::new();
+    let mut dark_frame_ids: Vec<i64> = Vec::new();
+    let mut bias_frame_ids: Vec<i64> = Vec::new();
+    let mut darkflat_frame_ids: Vec<i64> = Vec::new();
+
     for (idx, file_path) in files.iter().enumerate() {
         if let Some(ref cb) = progress_callback {
             cb(ScanProgress {
@@ -73,8 +79,19 @@ pub fn scan_directory(
         }
 
         match process_file(file_path, conn, use_content_hash) {
-            Ok(_) => {
+            Ok(frame_info) => {
                 *processed.lock().unwrap() += 1;
+
+                // Collect calibration frame IDs by type
+                if let Some((frame_id, imagetyp)) = frame_info {
+                    match imagetyp {
+                        ImageType::Flat => flat_frame_ids.push(frame_id),
+                        ImageType::Dark => dark_frame_ids.push(frame_id),
+                        ImageType::Bias => bias_frame_ids.push(frame_id),
+                        ImageType::DarkFlat => darkflat_frame_ids.push(frame_id),
+                        _ => {} // Light frames and others - no calibration set creation
+                    }
+                }
             }
             Err(e) => {
                 errors
@@ -89,11 +106,36 @@ pub fn scan_directory(
     result.files_skipped = *skipped.lock().unwrap();
     result.errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
 
+    // Create calibration sets from newly scanned calibration frames
+    let has_calibration_frames = !flat_frame_ids.is_empty()
+        || !dark_frame_ids.is_empty()
+        || !bias_frame_ids.is_empty()
+        || !darkflat_frame_ids.is_empty();
+
+    if has_calibration_frames {
+        match crate::calibration::scan_integration::create_calibration_sets_from_scan(
+            conn,
+            flat_frame_ids,
+            dark_frame_ids,
+            bias_frame_ids,
+            darkflat_frame_ids,
+        ) {
+            Ok(cal_result) => {
+                println!("Auto-created {} calibration sets from scan", cal_result.sets_created);
+            }
+            Err(e) => {
+                println!("Warning: Failed to auto-create calibration sets: {}", e);
+                // Non-fatal - frames are still in database
+            }
+        }
+    }
+
     result
 }
 
 /// Process a single file: hash, parse metadata, insert into database
-fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> anyhow::Result<()> {
+/// Returns Some((frame_id, imagetyp)) for successfully processed frames with known imagetyp
+fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> anyhow::Result<Option<(i64, ImageType)>> {
     // Get file metadata
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len() as i64;
@@ -124,7 +166,7 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> an
     // Check if file already exists at this exact path
     if file_exists(conn, &current_path)? {
         // File already indexed at this path - skip
-        return Ok(());
+        return Ok(None);
     }
 
     // Extract header early to check for moved files
@@ -161,7 +203,7 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> an
                 )?;
 
                 // File metadata and header already exist, no need to re-insert
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -205,7 +247,8 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> an
         FileFormat::XISF => parse_xisf(path, file_id)?,
     };
 
-    insert_frame(conn, &frame)?;
+    let frame_id = insert_frame(conn, &frame)?;
+    let imagetyp = frame.imagetyp.clone();
 
     // Store full FITS header for future reference
     if format == FileFormat::FITS {
@@ -239,7 +282,8 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> an
         }
     }
 
-    Ok(())
+    // Return frame info if imagetyp is known
+    Ok(imagetyp.map(|it| (frame_id, it)))
 }
 
 pub struct ScanResult {
