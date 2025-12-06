@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning } from 'lucide-react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning, Info } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { useScanRootsWithAvailability, useScan, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
@@ -8,6 +8,7 @@ import DirectoryTree from '../components/DirectoryTree';
 import type { ScanResult, RelinkResult, OrphanedFile } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
+import { ScanSummaryModal } from '../components/ScanSummaryModal';
 
 type TabMode = 'directories' | 'browse' | 'duplicates';
 type DuplicatesViewMode = 'files' | 'folders';
@@ -30,6 +31,15 @@ export default function FileManager() {
   const [relinkResult, setRelinkResult] = useState<RelinkResult | null>(null);
   const [missingFilesMap, setMissingFilesMap] = useState<Record<number, OrphanedFile[]>>({});
   const [checkingMissingFiles, setCheckingMissingFiles] = useState<Record<number, boolean>>({});
+  const [scanSummaryModal, setScanSummaryModal] = useState<{
+    isOpen: boolean;
+    rootId: number | null;
+    rootPath: string;
+  }>({
+    isOpen: false,
+    rootId: null,
+    rootPath: '',
+  });
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -147,6 +157,10 @@ export default function FileManager() {
 
   // Handle starting a scan for a specific root
   const handleStartScan = async (rootId: number) => {
+    // Find the root path for the modal
+    const root = scanRoots.find(r => r.id === rootId);
+    const rootPath = root?.path || '';
+
     try {
       setScanningMap(prev => ({ ...prev, [rootId]: true }));
       setScanError(null);
@@ -156,6 +170,13 @@ export default function FileManager() {
 
       // Re-check for missing files after scan completes
       await checkMissingFiles(rootId);
+
+      // Open the scan summary modal
+      setScanSummaryModal({
+        isOpen: true,
+        rootId,
+        rootPath,
+      });
     } catch (error) {
       console.error('Scan failed:', error);
       setScanError(typeof error === 'string' ? error : 'Scan failed');
@@ -428,27 +449,41 @@ export default function FileManager() {
                     {/* Scan Result */}
                     {scanResult && (
                       <div className="mt-3 p-3 bg-green-900/30 border border-green-700 rounded">
-                        <div className="flex items-start gap-2">
-                          <CheckCircle2 className="text-green-400 flex-shrink-0 mt-0.5" size={16} />
-                          <div className="flex-1 text-sm">
-                            <p className="text-green-400 font-semibold mb-1">Scan Complete</p>
-                            <div className="text-gray-300 space-y-0.5">
-                              <p>Found: {scanResult.files_found} files</p>
-                              <p>Processed: {scanResult.files_processed} files</p>
-                              <p>Skipped: {scanResult.files_skipped} files</p>
-                            </div>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 className="text-green-400 flex-shrink-0" size={16} />
+                            <span className="text-green-400 font-semibold text-sm">Scan Complete</span>
+                          </div>
+                          <div className="flex items-center gap-4 text-sm">
+                            <span className="text-gray-300">
+                              <span className="font-semibold text-green-400">{scanResult.files_processed}</span> processed
+                              {scanResult.lights_count > 0 && (
+                                <span className="text-yellow-400 ml-2">
+                                  ({scanResult.lights_count} lights)
+                                </span>
+                              )}
+                              {(scanResult.darks_count + scanResult.flats_count + scanResult.bias_count + scanResult.darkflats_count) > 0 && (
+                                <span className="text-blue-400 ml-1">
+                                  + {scanResult.darks_count + scanResult.flats_count + scanResult.bias_count + scanResult.darkflats_count} cal
+                                </span>
+                              )}
+                            </span>
                             {scanResult.errors.length > 0 && (
-                              <details className="mt-2">
-                                <summary className="cursor-pointer text-red-400 text-xs">
-                                  {scanResult.errors.length} errors
-                                </summary>
-                                <ul className="mt-1 space-y-0.5 text-xs">
-                                  {scanResult.errors.map((error, idx) => (
-                                    <li key={idx} className="text-red-300">{String(error)}</li>
-                                  ))}
-                                </ul>
-                              </details>
+                              <span className="text-red-400 text-xs">
+                                {scanResult.errors.length} errors
+                              </span>
                             )}
+                            <button
+                              onClick={() => root.id && setScanSummaryModal({
+                                isOpen: true,
+                                rootId: root.id,
+                                rootPath: root.path,
+                              })}
+                              className="p-1.5 hover:bg-gray-700 rounded transition"
+                              title="View scan details"
+                            >
+                              <Info size={16} className="text-gray-400 hover:text-blue-400" />
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -880,6 +915,16 @@ export default function FileManager() {
         variant={alertDialog.variant}
         onClose={() => setAlertDialog({ ...alertDialog, isOpen: false })}
       />
+
+      {/* Scan Summary Modal */}
+      {scanSummaryModal.rootId && scanResultMap[scanSummaryModal.rootId] && (
+        <ScanSummaryModal
+          isOpen={scanSummaryModal.isOpen}
+          onClose={() => setScanSummaryModal({ ...scanSummaryModal, isOpen: false })}
+          scanResult={scanResultMap[scanSummaryModal.rootId]}
+          rootPath={scanSummaryModal.rootPath}
+        />
+      )}
     </div>
   );
 }

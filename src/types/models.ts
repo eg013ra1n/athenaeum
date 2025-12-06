@@ -149,6 +149,14 @@ export interface ScanResult {
   files_processed: number;
   files_skipped: number;
   errors: string[];
+  // Frame type counts
+  lights_count: number;
+  darks_count: number;
+  flats_count: number;
+  bias_count: number;
+  darkflats_count: number;
+  // Calibration sets created
+  calibration_sets_created: number;
 }
 
 export interface FileWithFrame {

@@ -23,6 +23,12 @@ pub fn scan_directory(
         files_processed: 0,
         files_skipped: 0,
         errors: Vec::new(),
+        lights_count: 0,
+        darks_count: 0,
+        flats_count: 0,
+        bias_count: 0,
+        darkflats_count: 0,
+        calibration_sets_created: 0,
     };
 
     // Find all FITS/XISF files
@@ -62,6 +68,7 @@ pub fn scan_directory(
     let mut dark_frame_ids: Vec<i64> = Vec::new();
     let mut bias_frame_ids: Vec<i64> = Vec::new();
     let mut darkflat_frame_ids: Vec<i64> = Vec::new();
+    let mut lights_count: usize = 0;
 
     for (idx, file_path) in files.iter().enumerate() {
         if let Some(ref cb) = progress_callback {
@@ -82,14 +89,15 @@ pub fn scan_directory(
             Ok(frame_info) => {
                 *processed.lock().unwrap() += 1;
 
-                // Collect calibration frame IDs by type
+                // Collect frame IDs by type
                 if let Some((frame_id, imagetyp)) = frame_info {
                     match imagetyp {
+                        ImageType::Light => lights_count += 1,
                         ImageType::Flat => flat_frame_ids.push(frame_id),
                         ImageType::Dark => dark_frame_ids.push(frame_id),
                         ImageType::Bias => bias_frame_ids.push(frame_id),
                         ImageType::DarkFlat => darkflat_frame_ids.push(frame_id),
-                        _ => {} // Light frames and others - no calibration set creation
+                        _ => {} // Unknown types - no tracking
                     }
                 }
             }
@@ -106,6 +114,13 @@ pub fn scan_directory(
     result.files_skipped = *skipped.lock().unwrap();
     result.errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
 
+    // Populate frame type counts
+    result.lights_count = lights_count;
+    result.flats_count = flat_frame_ids.len();
+    result.darks_count = dark_frame_ids.len();
+    result.bias_count = bias_frame_ids.len();
+    result.darkflats_count = darkflat_frame_ids.len();
+
     // Create calibration sets from newly scanned calibration frames
     let has_calibration_frames = !flat_frame_ids.is_empty()
         || !dark_frame_ids.is_empty()
@@ -121,6 +136,7 @@ pub fn scan_directory(
             darkflat_frame_ids,
         ) {
             Ok(cal_result) => {
+                result.calibration_sets_created = cal_result.sets_created as usize;
                 println!("Auto-created {} calibration sets from scan", cal_result.sets_created);
             }
             Err(e) => {
@@ -291,6 +307,14 @@ pub struct ScanResult {
     pub files_processed: usize,
     pub files_skipped: usize,
     pub errors: Vec<String>,
+    // Frame type counts
+    pub lights_count: usize,
+    pub darks_count: usize,
+    pub flats_count: usize,
+    pub bias_count: usize,
+    pub darkflats_count: usize,
+    // Calibration sets created
+    pub calibration_sets_created: usize,
 }
 
 pub struct ScanProgress {

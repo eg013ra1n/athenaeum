@@ -119,6 +119,12 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
         files_processed: result.files_processed,
         files_skipped: result.files_skipped,
         errors: result.errors,
+        lights_count: result.lights_count,
+        darks_count: result.darks_count,
+        flats_count: result.flats_count,
+        bias_count: result.bias_count,
+        darkflats_count: result.darkflats_count,
+        calibration_sets_created: result.calibration_sets_created,
     })
 }
 
@@ -354,6 +360,14 @@ pub struct ScanResultDto {
     pub files_processed: usize,
     pub files_skipped: usize,
     pub errors: Vec<String>,
+    // Frame type counts
+    pub lights_count: usize,
+    pub darks_count: usize,
+    pub flats_count: usize,
+    pub bias_count: usize,
+    pub darkflats_count: usize,
+    // Calibration sets created
+    pub calibration_sets_created: usize,
 }
 
 #[derive(serde::Serialize)]
