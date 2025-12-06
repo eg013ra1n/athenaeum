@@ -161,6 +161,26 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         params![path],
     )?;
 
+    // Delete orphaned calibration sets (sets with no remaining linked frames)
+    conn.execute(
+        "DELETE FROM calibration_set WHERE id NOT IN (
+            SELECT DISTINCT set_id FROM calibration_set_frames
+        )",
+        [],
+    )?;
+
+    // Delete orphaned frame sets (sets with no remaining linked frames)
+    conn.execute(
+        "DELETE FROM frames_set WHERE id NOT IN (
+            SELECT DISTINCT fs.id
+            FROM frames_set fs
+            INNER JOIN imaging_nights inn ON inn.frames_set_id = fs.id
+            INNER JOIN sessions s ON s.imaging_night_id = inn.id
+            INNER JOIN session_members sm ON sm.session_id = s.id
+        )",
+        [],
+    )?;
+
     // Delete the scan root
     conn.execute("DELETE FROM scan_roots WHERE id = ?1", params![id])?;
 
