@@ -14,6 +14,101 @@ interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
 }
 
+// Aggregated warning with context
+interface AggregatedWarning {
+  message: string;
+  type: 'missing_calibration' | 'date' | 'temperature';
+  filter?: string;
+  camera?: string;
+}
+
+// Collect all warnings from a filter group
+function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup, includeContext: boolean = true): AggregatedWarning[] {
+  const warnings: AggregatedWarning[] = [];
+  const filterDisplay = filterGroup.filter_display;
+
+  // Check for missing calibration
+  const hasCalibration = filterGroup.flat_sets.length > 0 ||
+                         filterGroup.dark_sets.length > 0 ||
+                         filterGroup.bias_sets.length > 0;
+
+  if (!hasCalibration) {
+    warnings.push({
+      message: includeContext
+        ? `No calibration linked for ${filterDisplay} (${filterGroup.frame_count} frame${filterGroup.frame_count !== 1 ? 's' : ''})`
+        : `No calibration linked (${filterGroup.frame_count} frame${filterGroup.frame_count !== 1 ? 's' : ''})`,
+      type: 'missing_calibration',
+      filter: filterGroup.filter ?? undefined,
+    });
+  }
+
+  // Collect warnings from calibration sets
+  const addSetWarnings = (sets: typeof filterGroup.flat_sets, setType: string) => {
+    for (const setWithCount of sets) {
+      for (const warning of setWithCount.warnings) {
+        warnings.push({
+          message: includeContext
+            ? `${filterDisplay} ${setType}: ${warning.message}`
+            : `${setType}: ${warning.message}`,
+          type: warning.warning_type as 'date' | 'temperature',
+          filter: filterGroup.filter ?? undefined,
+        });
+      }
+    }
+  };
+
+  addSetWarnings(filterGroup.flat_sets, 'Flat');
+  addSetWarnings(filterGroup.dark_sets, 'Dark');
+  addSetWarnings(filterGroup.bias_sets, 'Bias');
+
+  return warnings;
+}
+
+// Collect all warnings from a camera group
+function collectCameraGroupWarnings(cameraGroup: CalibrationCameraGroup, includeContext: boolean = true): AggregatedWarning[] {
+  const warnings: AggregatedWarning[] = [];
+
+  for (const filterGroup of cameraGroup.filter_groups) {
+    const filterWarnings = collectFilterGroupWarnings(filterGroup, includeContext);
+    for (const warning of filterWarnings) {
+      warnings.push({
+        ...warning,
+        camera: cameraGroup.instrume,
+      });
+    }
+  }
+
+  return warnings;
+}
+
+// Collect all warnings from a date group
+function collectDateGroupWarnings(dateGroup: CalibrationDateGroup): AggregatedWarning[] {
+  const warnings: AggregatedWarning[] = [];
+
+  for (const cameraGroup of dateGroup.camera_groups) {
+    const cameraWarnings = collectCameraGroupWarnings(cameraGroup, true);
+    warnings.push(...cameraWarnings);
+  }
+
+  return warnings;
+}
+
+// Stacked warnings display component
+function WarningsList({ warnings, className = '' }: { warnings: AggregatedWarning[]; className?: string }) {
+  if (warnings.length === 0) return null;
+
+  return (
+    <div className={`space-y-1 ${className}`}>
+      {warnings.map((warning, i) => (
+        <div key={i} className="flex items-start gap-2 text-xs">
+          <AlertTriangle size={14} className="text-orange-400 flex-shrink-0 mt-0.5" />
+          <span className="text-orange-200">{warning.message}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps) {
   // Track expanded state for each level
   // Keys: date, date:camera, date:camera:filter, date:camera:filter:frames
@@ -188,6 +283,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
     const isExpanded = expandedItems.has(key);
     const isFramesExpanded = expandedItems.has(framesKey);
     const hasCalibration = filterGroup.flat_sets.length > 0 || filterGroup.dark_sets.length > 0 || filterGroup.bias_sets.length > 0;
+    const filterWarnings = collectFilterGroupWarnings(filterGroup, false); // false = no filter context (we're at filter level)
 
     return (
       <div className="ml-8 border-l border-gray-700">
@@ -204,8 +300,11 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
           <Aperture size={16} className="text-cyan-400" />
           <div className="flex-1">
             <span className="text-gray-200">{filterGroup.filter_display}</span>
-            {filterGroup.has_warnings && (
-              <AlertTriangle className="inline w-4 h-4 text-orange-400 ml-2" />
+            {filterWarnings.length > 0 && (
+              <span className="inline-flex items-center gap-1 ml-2">
+                <AlertTriangle className="w-4 h-4 text-orange-400" />
+                <span className="text-xs text-orange-400">({filterWarnings.length})</span>
+              </span>
             )}
           </div>
           <span className="text-sm text-gray-500">
@@ -216,6 +315,13 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
         {/* Filter Expanded Content */}
         {isExpanded && (
           <div className="px-4 pb-4 space-y-4 bg-gray-850 ml-4">
+            {/* Stacked Warnings at Filter Level */}
+            {filterWarnings.length > 0 && (
+              <div className="py-2 px-3 rounded bg-orange-900/10 border border-orange-700/30 mt-3">
+                <WarningsList warnings={filterWarnings} />
+              </div>
+            )}
+
             {/* Calibration Set Cards */}
             {hasCalibration && (
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
@@ -226,7 +332,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
                     title={`Flat${flatWithCount.set.filter ? ` (${flatWithCount.set.filter})` : ''}`}
                     set={flatWithCount.set}
                     type="flat"
-                    warnings={flatWithCount.warnings}
+                    warnings={[]} // Warnings now shown at filter level
                     linkedFrameCount={flatWithCount.frame_count}
                   />
                 ))}
@@ -237,7 +343,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
                     title={`Dark${darkWithCount.set.exptime !== null ? ` (${darkWithCount.set.exptime}s)` : ''}`}
                     set={darkWithCount.set}
                     type="dark"
-                    warnings={darkWithCount.warnings}
+                    warnings={[]} // Warnings now shown at filter level
                     linkedFrameCount={darkWithCount.frame_count}
                   />
                 ))}
@@ -248,17 +354,10 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
                     title="Bias"
                     set={biasWithCount.set}
                     type="bias"
-                    warnings={biasWithCount.warnings}
+                    warnings={[]} // Warnings now shown at filter level
                     linkedFrameCount={biasWithCount.frame_count}
                   />
                 ))}
-              </div>
-            )}
-
-            {!hasCalibration && (
-              <div className="text-sm text-orange-400 flex items-center gap-2 mt-3">
-                <AlertTriangle size={16} />
-                No calibration linked for these frames
               </div>
             )}
 
@@ -301,6 +400,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
     const cameraKey = cameraGroup.instrume;
     const key = `${dateKey}:${cameraKey}`;
     const isExpanded = expandedItems.has(key);
+    const cameraWarnings = collectCameraGroupWarnings(cameraGroup, true);
 
     return (
       <div className="ml-4 border-l border-gray-700">
@@ -317,8 +417,11 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
           <Camera size={16} className="text-blue-400" />
           <div className="flex-1">
             <span className="text-gray-200 font-medium">{cameraGroup.instrume}</span>
-            {cameraGroup.has_warnings && (
-              <AlertTriangle className="inline w-4 h-4 text-orange-400 ml-2" />
+            {cameraWarnings.length > 0 && (
+              <span className="inline-flex items-center gap-1 ml-2">
+                <AlertTriangle className="w-4 h-4 text-orange-400" />
+                <span className="text-xs text-orange-400">({cameraWarnings.length})</span>
+              </span>
             )}
           </div>
           <span className="text-sm text-gray-500">
@@ -326,9 +429,17 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
           </span>
         </button>
 
-        {/* Camera Expanded Content - Filter Groups */}
+        {/* Camera Expanded Content */}
         {isExpanded && (
           <div className="pb-2">
+            {/* Stacked Warnings at Camera Level */}
+            {cameraWarnings.length > 0 && (
+              <div className="ml-8 px-4 py-2 border-l border-gray-700 bg-orange-900/10">
+                <WarningsList warnings={cameraWarnings} />
+              </div>
+            )}
+
+            {/* Filter Groups */}
             {cameraGroup.filter_groups.map((filterGroup) => (
               <FilterGroupContent
                 key={filterGroup.filter ?? '__no_filter__'}
@@ -347,6 +458,7 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
   const DateGroupContent = ({ dateGroup }: { dateGroup: CalibrationDateGroup }) => {
     const dateKey = dateGroup.date;
     const isExpanded = expandedItems.has(dateKey);
+    const dateWarnings = collectDateGroupWarnings(dateGroup);
 
     return (
       <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden mb-3">
@@ -363,8 +475,11 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
           <Calendar size={18} className="text-purple-400" />
           <div className="flex-1">
             <span className="text-gray-100 font-semibold">{dateGroup.date_display}</span>
-            {dateGroup.has_warnings && (
-              <AlertTriangle className="inline w-4 h-4 text-orange-400 ml-2" />
+            {dateWarnings.length > 0 && (
+              <span className="inline-flex items-center gap-1 ml-2">
+                <AlertTriangle className="w-4 h-4 text-orange-400" />
+                <span className="text-xs text-orange-400">({dateWarnings.length})</span>
+              </span>
             )}
           </div>
           <span className="text-sm text-gray-500">
@@ -372,9 +487,17 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
           </span>
         </button>
 
-        {/* Date Expanded Content - Camera Groups */}
+        {/* Date Expanded Content */}
         {isExpanded && (
           <div className="pb-2 bg-gray-850">
+            {/* Stacked Warnings at Date Level */}
+            {dateWarnings.length > 0 && (
+              <div className="px-4 py-3 border-b border-gray-700 bg-orange-900/10">
+                <WarningsList warnings={dateWarnings} />
+              </div>
+            )}
+
+            {/* Camera Groups */}
             {dateGroup.camera_groups.map((cameraGroup) => (
               <CameraGroupContent
                 key={cameraGroup.instrume}

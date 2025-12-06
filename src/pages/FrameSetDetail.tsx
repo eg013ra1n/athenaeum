@@ -577,7 +577,10 @@ export default function FrameSetDetail() {
           <CalibrationFinderButton
             frameSetId={parseInt(id!)}
             frameSetName={detail.frames_set?.name || 'Untitled'}
-            onComplete={() => loadDetail()}
+            onComplete={() => {
+              loadDetail();
+              loadCalibrationHierarchy();
+            }}
           />
         </div>
 
