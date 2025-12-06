@@ -274,8 +274,15 @@ fn cluster_frames_by_time(
             if let (Some(last_date), Some(curr_date)) = (&last_frame.date_obs, &frame.date_obs) {
                 let gap_seconds = (*curr_date - *last_date).num_seconds();
 
-                if gap_seconds <= threshold_seconds {
-                    // Within threshold - add to current group
+                // Check if exposure time matches (with small tolerance for floating point)
+                let exptime_matches = match (last_frame.exptime, frame.exptime) {
+                    (Some(last_exp), Some(curr_exp)) => (last_exp - curr_exp).abs() < 0.1,
+                    (None, None) => true,
+                    _ => false, // One has exptime, other doesn't - treat as different
+                };
+
+                if gap_seconds <= threshold_seconds && exptime_matches {
+                    // Within threshold AND same exposure time - add to current group
                     current_group.push(frame);
                 } else {
                     // Gap too large - close current group and start new one
