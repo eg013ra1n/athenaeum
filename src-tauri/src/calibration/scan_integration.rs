@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use super::flat_groups::{create_flat_calibration_set, FlatGroup};
 use super::dark_bias_groups::{create_bias_calibration_set, DarkGroup, BiasGroup};
+use super::configurable_matcher::load_config;
 
 /// Result of calibration set creation during scan
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +91,41 @@ pub fn create_calibration_sets_from_scan(
     println!("   Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
         flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
 
+    // Load clustering settings from user config
+    let config = load_config(conn);
+
+    // Get per-type clustering thresholds (in minutes)
+    let flat_cluster_mins = config.clustering.get("flat")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(DEFAULT_TIME_CLUSTER_MINUTES);
+    let dark_cluster_mins = config.clustering.get("dark")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(DEFAULT_TIME_CLUSTER_MINUTES);
+    let bias_cluster_mins = config.clustering.get("bias")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(DEFAULT_TIME_CLUSTER_MINUTES);
+    let darkflat_cluster_mins = config.clustering.get("darkflat")
+        .map(|c| c.time_cluster_minutes)
+        .unwrap_or(DEFAULT_TIME_CLUSTER_MINUTES);
+
+    // Get per-type temperature thresholds
+    let flat_temp_threshold = config.clustering.get("flat")
+        .map(|c| c.temp_threshold_celsius)
+        .unwrap_or(DEFAULT_TEMP_THRESHOLD);
+    let dark_temp_threshold = config.clustering.get("dark")
+        .map(|c| c.temp_threshold_celsius)
+        .unwrap_or(DEFAULT_TEMP_THRESHOLD);
+    let bias_temp_threshold = config.clustering.get("bias")
+        .map(|c| c.temp_threshold_celsius)
+        .unwrap_or(DEFAULT_TEMP_THRESHOLD);
+    let darkflat_temp_threshold = config.clustering.get("darkflat")
+        .map(|c| c.temp_threshold_celsius)
+        .unwrap_or(DEFAULT_TEMP_THRESHOLD);
+
+    println!("   Clustering thresholds: flat={}min/{}°C, dark={}min/{}°C, bias={}min/{}°C, darkflat={}min/{}°C",
+        flat_cluster_mins, flat_temp_threshold, dark_cluster_mins, dark_temp_threshold,
+        bias_cluster_mins, bias_temp_threshold, darkflat_cluster_mins, darkflat_temp_threshold);
+
     let mut result = CalibrationScanResult {
         sets_created: 0,
         flat_sets_created: 0,
@@ -98,24 +134,24 @@ pub fn create_calibration_sets_from_scan(
         darkflat_sets_created: 0,
     };
 
-    // Process each calibration type
+    // Process each calibration type with its specific clustering threshold
     if !flat_frame_ids.is_empty() {
-        result.flat_sets_created = create_flat_sets_from_frames(conn, &flat_frame_ids)?;
+        result.flat_sets_created = create_flat_sets_from_frames(conn, &flat_frame_ids, flat_cluster_mins, flat_temp_threshold)?;
         result.sets_created += result.flat_sets_created;
     }
 
     if !dark_frame_ids.is_empty() {
-        result.dark_sets_created = create_dark_sets_from_frames(conn, &dark_frame_ids, "Dark")?;
+        result.dark_sets_created = create_dark_sets_from_frames(conn, &dark_frame_ids, "Dark", dark_cluster_mins, dark_temp_threshold)?;
         result.sets_created += result.dark_sets_created;
     }
 
     if !bias_frame_ids.is_empty() {
-        result.bias_sets_created = create_bias_sets_from_frames(conn, &bias_frame_ids)?;
+        result.bias_sets_created = create_bias_sets_from_frames(conn, &bias_frame_ids, bias_cluster_mins, bias_temp_threshold)?;
         result.sets_created += result.bias_sets_created;
     }
 
     if !darkflat_frame_ids.is_empty() {
-        result.darkflat_sets_created = create_dark_sets_from_frames(conn, &darkflat_frame_ids, "DarkFlat")?;
+        result.darkflat_sets_created = create_dark_sets_from_frames(conn, &darkflat_frame_ids, "DarkFlat", darkflat_cluster_mins, darkflat_temp_threshold)?;
         result.sets_created += result.darkflat_sets_created;
     }
 
@@ -171,7 +207,7 @@ fn query_frame_data(conn: &Connection, frame_ids: &[i64]) -> Result<Vec<Calibrat
 }
 
 /// Create flat calibration sets from frame IDs
-fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64]) -> Result<i64> {
+fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_cluster_minutes: i64, temp_threshold: f64) -> Result<i64> {
     let frames = query_frame_data(conn, frame_ids)?;
     if frames.is_empty() {
         return Ok(0);
@@ -202,8 +238,8 @@ fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64]) -> Result<
     for (key, group_frames) in groups {
         let clusters = cluster_frames_by_time_and_temp(
             group_frames,
-            DEFAULT_TIME_CLUSTER_MINUTES,
-            DEFAULT_TEMP_THRESHOLD,
+            time_cluster_minutes,
+            temp_threshold,
         );
 
         for cluster in clusters {
@@ -224,7 +260,7 @@ fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64]) -> Result<
 }
 
 /// Create dark calibration sets from frame IDs
-fn create_dark_sets_from_frames(conn: &Connection, frame_ids: &[i64], imagetyp: &str) -> Result<i64> {
+fn create_dark_sets_from_frames(conn: &Connection, frame_ids: &[i64], imagetyp: &str, time_cluster_minutes: i64, temp_threshold: f64) -> Result<i64> {
     let frames = query_frame_data(conn, frame_ids)?;
     if frames.is_empty() {
         return Ok(0);
@@ -253,8 +289,8 @@ fn create_dark_sets_from_frames(conn: &Connection, frame_ids: &[i64], imagetyp: 
     for (key, group_frames) in groups {
         let clusters = cluster_frames_by_time_and_temp(
             group_frames,
-            DEFAULT_TIME_CLUSTER_MINUTES,
-            DEFAULT_TEMP_THRESHOLD,
+            time_cluster_minutes,
+            temp_threshold,
         );
 
         for cluster in clusters {
@@ -275,7 +311,7 @@ fn create_dark_sets_from_frames(conn: &Connection, frame_ids: &[i64], imagetyp: 
 }
 
 /// Create bias calibration sets from frame IDs
-fn create_bias_sets_from_frames(conn: &Connection, frame_ids: &[i64]) -> Result<i64> {
+fn create_bias_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_cluster_minutes: i64, temp_threshold: f64) -> Result<i64> {
     let frames = query_frame_data(conn, frame_ids)?;
     if frames.is_empty() {
         return Ok(0);
@@ -303,8 +339,8 @@ fn create_bias_sets_from_frames(conn: &Connection, frame_ids: &[i64]) -> Result<
     for (key, group_frames) in groups {
         let clusters = cluster_frames_by_time_and_temp(
             group_frames,
-            DEFAULT_TIME_CLUSTER_MINUTES,
-            DEFAULT_TEMP_THRESHOLD,
+            time_cluster_minutes,
+            temp_threshold,
         );
 
         for cluster in clusters {

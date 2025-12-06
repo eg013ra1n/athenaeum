@@ -171,6 +171,13 @@ pub struct ClusteringConfig {
     pub max_age_days: i64,
     /// Time threshold for clustering frames (in minutes)
     pub time_cluster_minutes: i64,
+    /// Temperature threshold for clustering frames (in degrees Celsius)
+    #[serde(default = "default_temp_threshold")]
+    pub temp_threshold_celsius: f64,
+}
+
+fn default_temp_threshold() -> f64 {
+    2.0
 }
 
 impl Default for ClusteringConfig {
@@ -178,6 +185,7 @@ impl Default for ClusteringConfig {
         Self {
             max_age_days: 30,
             time_cluster_minutes: 30,
+            temp_threshold_celsius: 2.0,
         }
     }
 }

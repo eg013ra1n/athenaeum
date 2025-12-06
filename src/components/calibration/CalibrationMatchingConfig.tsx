@@ -174,6 +174,7 @@ export default function CalibrationMatchingConfig() {
         newClustering[calibrationType] = {
           max_age_days: 30,
           time_cluster_minutes: 30,
+          temp_threshold_celsius: 2.0,
         };
       }
 

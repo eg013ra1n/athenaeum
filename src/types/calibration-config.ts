@@ -76,6 +76,8 @@ export interface ClusteringConfig {
   max_age_days: number;
   /** Time threshold for clustering frames (in minutes) */
   time_cluster_minutes: number;
+  /** Temperature threshold for clustering frames (in degrees Celsius) */
+  temp_threshold_celsius: number;
 }
 
 /** Scoring configuration for calibration matching */

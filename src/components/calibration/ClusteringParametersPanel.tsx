@@ -13,6 +13,10 @@ interface ClusteringParametersPanelProps {
 
 const calibrationTypes = ["flat", "dark", "bias", "darkflat"];
 
+// Flats cluster by minutes (session-based), others cluster by days
+const usesDaysForTimeCluster = (type: string) => type !== "flat";
+const MINUTES_PER_DAY = 1440;
+
 export default function ClusteringParametersPanel({
   clustering,
   scoring,
@@ -20,7 +24,7 @@ export default function ClusteringParametersPanel({
   onScoringUpdate,
 }: ClusteringParametersPanelProps) {
   const getClusteringConfig = (type: string): ClusteringConfig => {
-    return clustering[type] || { max_age_days: 30, time_cluster_minutes: 30 };
+    return clustering[type] || { max_age_days: 30, time_cluster_minutes: 30, temp_threshold_celsius: 2.0 };
   };
 
   return (
@@ -41,7 +45,10 @@ export default function ClusteringParametersPanel({
                   Max Age (days)
                 </th>
                 <th className="p-3 border border-gray-700 text-center font-medium">
-                  Time Cluster (minutes)
+                  Time Cluster
+                </th>
+                <th className="p-3 border border-gray-700 text-center font-medium">
+                  Temp Threshold (°C)
                 </th>
               </tr>
             </thead>
@@ -69,17 +76,42 @@ export default function ClusteringParametersPanel({
                       />
                     </td>
                     <td className="p-3 border border-gray-700">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          value={
+                            usesDaysForTimeCluster(type)
+                              ? Math.round(config.time_cluster_minutes / MINUTES_PER_DAY)
+                              : config.time_cluster_minutes
+                          }
+                          onChange={(e) => {
+                            const inputValue = parseInt(e.target.value) || 1;
+                            const minutes = usesDaysForTimeCluster(type)
+                              ? inputValue * MINUTES_PER_DAY
+                              : inputValue;
+                            onClusteringUpdate(type, "time_cluster_minutes", minutes);
+                          }}
+                          min="1"
+                          className="flex-1 px-3 py-1 bg-gray-700 border border-gray-600 rounded text-gray-100 text-center"
+                        />
+                        <span className="text-xs text-gray-400 w-12">
+                          {usesDaysForTimeCluster(type) ? "days" : "min"}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="p-3 border border-gray-700">
                       <input
                         type="number"
-                        value={config.time_cluster_minutes}
+                        value={config.temp_threshold_celsius}
                         onChange={(e) =>
                           onClusteringUpdate(
                             type,
-                            "time_cluster_minutes",
-                            parseInt(e.target.value) || 30
+                            "temp_threshold_celsius",
+                            parseFloat(e.target.value) || 2.0
                           )
                         }
-                        min="1"
+                        min="0.1"
+                        step="0.1"
                         className="w-full px-3 py-1 bg-gray-700 border border-gray-600 rounded text-gray-100 text-center"
                       />
                     </td>
@@ -93,7 +125,9 @@ export default function ClusteringParametersPanel({
           <strong>Max Age</strong> = Only consider frames within this many days
           |{" "}
           <strong>Time Cluster</strong> = Group frames captured within this time
-          window
+          window (minutes for Flats, days for Darks/Bias/DarkFlats)
+          |{" "}
+          <strong>Temp Threshold</strong> = Split cluster if temperature differs by more than this value
         </p>
       </div>
 
