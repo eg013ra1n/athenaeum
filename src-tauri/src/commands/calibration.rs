@@ -1043,6 +1043,25 @@ fn calculate_match_details(
         _ => false,
     };
 
+    // Offset match (with small tolerance)
+    let offset_match = match (params.offset, set.offset) {
+        (Some(p), Some(s)) => (p - s).abs() < 0.01,
+        (None, None) => true,
+        _ => false,
+    };
+
+    // Exposure time match - CRITICAL for darks! (with 0.1s tolerance)
+    // For bias, exptime doesn't matter (they're typically 0s or very short)
+    let exptime_match = if calibration_type.to_lowercase() == "bias" {
+        true  // Bias frames don't need exptime match
+    } else {
+        match (params.avg_exptime, set.exptime) {
+            (Some(p), Some(s)) => (p - s).abs() < 0.1,
+            (None, None) => true,
+            _ => false,
+        }
+    };
+
     // Filter match (only relevant for flats)
     let filter_match = if calibration_type.to_lowercase() == "flat" {
         match (&params.filter, &set.filter) {
@@ -1067,6 +1086,8 @@ fn calculate_match_details(
         instrume_match,
         binning_match,
         gain_match,
+        offset_match,
+        exptime_match,
         filter_match,
         temp_diff,
         date_diff_days,
@@ -1118,6 +1139,7 @@ fn calculate_date_diff_days(
 fn calculate_match_score(details: &MatchDetails, calibration_type: &str) -> f64 {
     // Base score starts at 1.0 and is reduced for mismatches
     let mut score: f64 = 1.0;
+    let cal_type_lower = calibration_type.to_lowercase();
 
     // Critical parameters (must match for any score)
     if !details.instrume_match {
@@ -1129,10 +1151,20 @@ fn calculate_match_score(details: &MatchDetails, calibration_type: &str) -> f64 
     if !details.gain_match {
         score -= 0.2;
     }
+    if !details.offset_match {
+        score -= 0.2;
+    }
 
-    // Filter matching only matters for flats
-    if calibration_type.to_lowercase() == "flat" && !details.filter_match {
-        score -= 0.4;  // Major penalty for wrong filter
+    // CRITICAL: Exposure time MUST match for darks and darkflats!
+    // A dark with wrong exposure time is COMPLETELY USELESS for calibration
+    if (cal_type_lower == "dark" || cal_type_lower == "darkflat") && !details.exptime_match {
+        score -= 1.0;  // Complete disqualification - score will be 0 or negative
+    }
+
+    // CRITICAL: Filter MUST match for flats!
+    // A flat with the wrong filter is COMPLETELY USELESS for calibration
+    if cal_type_lower == "flat" && !details.filter_match {
+        score -= 1.0;  // Complete disqualification - score will be 0 or negative
     }
 
     // Temperature penalty (smaller penalty for close temps)

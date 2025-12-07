@@ -155,6 +155,8 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
           calibrationSetId: flatSetId,
           calibrationType: 'Flat',
         });
+        // Update local state to reflect the new assignment
+        setManualModalCurrentFlat(flatSetId);
       }
       if (darkSetId !== null && darkSetId !== manualModalCurrentDark) {
         await invoke('manual_assign_calibration', {
@@ -162,6 +164,8 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
           calibrationSetId: darkSetId,
           calibrationType: 'Dark',
         });
+        // Update local state to reflect the new assignment
+        setManualModalCurrentDark(darkSetId);
       }
       if (biasSetId !== null && biasSetId !== manualModalCurrentBias) {
         await invoke('manual_assign_calibration', {
@@ -169,6 +173,8 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
           calibrationSetId: biasSetId,
           calibrationType: 'Bias',
         });
+        // Update local state to reflect the new assignment
+        setManualModalCurrentBias(biasSetId);
       }
 
       setManualModalOpen(false);

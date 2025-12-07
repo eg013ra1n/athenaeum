@@ -647,6 +647,8 @@ pub struct MatchDetails {
     pub instrume_match: bool,          // Camera matches
     pub binning_match: bool,           // Binning matches
     pub gain_match: bool,              // Gain matches (or both null)
+    pub offset_match: bool,            // Offset matches (or both null)
+    pub exptime_match: bool,           // Exposure time matches (CRITICAL for darks!)
     pub filter_match: bool,            // Filter matches (only relevant for flats)
     pub temp_diff: Option<f64>,        // Temperature difference in Celsius
     pub date_diff_days: i64,           // Days between calibration and light frames

@@ -65,14 +65,15 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     }
   }, [isOpen, frameIds, showAll]);
 
-  // Reset selections when modal opens with new data
+  // Reset selections when data loads from backend (use backend data as source of truth)
   useEffect(() => {
-    if (isOpen) {
-      setSelectedFlatId(currentFlatSetId ?? null);
-      setSelectedDarkId(currentDarkSetId ?? null);
-      setSelectedBiasId(currentBiasSetId ?? null);
+    if (isOpen && lightParams) {
+      // Use backend data as source of truth for current selections
+      setSelectedFlatId(lightParams.current_flat_set_id ?? null);
+      setSelectedDarkId(lightParams.current_dark_set_id ?? null);
+      setSelectedBiasId(lightParams.current_bias_set_id ?? null);
     }
-  }, [isOpen, currentFlatSetId, currentDarkSetId, currentBiasSetId]);
+  }, [isOpen, lightParams]);
 
   const loadData = async () => {
     setLoading(true);
@@ -120,10 +121,15 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     onApply(selectedFlatId, selectedDarkId, selectedBiasId);
   };
 
+  // Use backend data as source of truth for detecting changes
+  const currentFlatFromBackend = lightParams?.current_flat_set_id ?? currentFlatSetId;
+  const currentDarkFromBackend = lightParams?.current_dark_set_id ?? currentDarkSetId;
+  const currentBiasFromBackend = lightParams?.current_bias_set_id ?? currentBiasSetId;
+
   const hasChanges =
-    selectedFlatId !== currentFlatSetId ||
-    selectedDarkId !== currentDarkSetId ||
-    selectedBiasId !== currentBiasSetId;
+    selectedFlatId !== currentFlatFromBackend ||
+    selectedDarkId !== currentDarkFromBackend ||
+    selectedBiasId !== currentBiasFromBackend;
 
   if (!isOpen) return null;
 
@@ -266,13 +272,14 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
   };
 
   const getCurrentId = () => {
+    // Use backend data as source of truth
     switch (activeTab) {
       case 'flat':
-        return currentFlatSetId;
+        return lightParams?.current_flat_set_id ?? currentFlatSetId;
       case 'dark':
-        return currentDarkSetId;
+        return lightParams?.current_dark_set_id ?? currentDarkSetId;
       case 'bias':
-        return currentBiasSetId;
+        return lightParams?.current_bias_set_id ?? currentBiasSetId;
     }
   };
 
@@ -378,42 +385,42 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
                   <span className="text-gray-200">{lightParams.frame_count}</span>
                 </div>
 
-                {/* Current Selections */}
+                {/* Current Selections - use backend data as source of truth */}
                 <div className="pt-4 border-t border-gray-700 mt-4">
                   <h4 className="text-gray-400 text-xs uppercase mb-2">Current Links</h4>
                   <div className="space-y-1 text-xs">
                     <div className="flex items-center gap-2">
-                      {currentFlatSetId ? (
+                      {currentFlatFromBackend ? (
                         <CheckCircle className="w-3 h-3 text-green-400" />
                       ) : (
                         <AlertTriangle className="w-3 h-3 text-orange-400" />
                       )}
                       <span className="text-gray-400">Flat:</span>
                       <span className="text-gray-200">
-                        {currentFlatSetId ? `Set #${currentFlatSetId}` : 'None'}
+                        {currentFlatFromBackend ? `Set #${currentFlatFromBackend}` : 'None'}
                       </span>
                     </div>
                     <div className="flex items-center gap-2">
-                      {currentDarkSetId ? (
+                      {currentDarkFromBackend ? (
                         <CheckCircle className="w-3 h-3 text-green-400" />
                       ) : (
                         <AlertTriangle className="w-3 h-3 text-orange-400" />
                       )}
                       <span className="text-gray-400">Dark:</span>
                       <span className="text-gray-200">
-                        {currentDarkSetId ? `Set #${currentDarkSetId}` : 'None'}
+                        {currentDarkFromBackend ? `Set #${currentDarkFromBackend}` : 'None'}
                       </span>
                     </div>
                     {useBiasForDarkOptimization && (
                       <div className="flex items-center gap-2">
-                        {currentBiasSetId ? (
+                        {currentBiasFromBackend ? (
                           <CheckCircle className="w-3 h-3 text-green-400" />
                         ) : (
                           <AlertTriangle className="w-3 h-3 text-orange-400" />
                         )}
                         <span className="text-gray-400">Bias:</span>
                         <span className="text-gray-200">
-                          {currentBiasSetId ? `Set #${currentBiasSetId}` : 'None'}
+                          {currentBiasFromBackend ? `Set #${currentBiasFromBackend}` : 'None'}
                         </span>
                       </div>
                     )}
