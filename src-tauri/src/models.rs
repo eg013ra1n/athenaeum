@@ -676,7 +676,8 @@ pub struct LightFrameParameters {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationFilterGroup {
     pub filter: Option<String>,          // None = "No Filter"
-    pub filter_display: String,          // "Ha", "OIII", "No Filter"
+    pub filter_display: String,          // "Ha", "OIII", "No Filter", or "Ha (60s)" when split by exptime
+    pub exptime: Option<f64>,            // When split by exposure time, this is the exptime for this sub-group
     pub light_frames: Vec<LightFrameWithCalibration>,
     pub flat_sets: Vec<CalibrationSetWithFrameCount>,   // All unique flat sets used by frames in this group
     pub dark_sets: Vec<CalibrationSetWithFrameCount>,   // All unique dark sets used by frames in this group

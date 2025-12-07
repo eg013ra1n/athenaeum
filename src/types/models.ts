@@ -601,7 +601,8 @@ export interface LightFrameParameters {
 /** Group of frames for a single filter within a camera */
 export interface CalibrationFilterGroup {
   filter: string | null;          // null = "No Filter"
-  filter_display: string;          // "Ha", "OIII", "No Filter"
+  filter_display: string;          // "Ha", "OIII", "No Filter", or "Ha (60s)" when split by exptime
+  exptime: number | null;         // When split by exposure time, this is the exptime for this sub-group
   light_frames: LightFrameWithCalibration[];
   flat_sets: CalibrationSetWithFrameCount[];   // All unique flat sets used by frames in this group
   dark_sets: CalibrationSetWithFrameCount[];   // All unique dark sets used by frames in this group
