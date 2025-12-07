@@ -226,8 +226,14 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
           <div className="flex items-center gap-2 text-gray-400">
             <Calendar className="w-3 h-3" />
             <span className={match_details.date_diff_days > 30 ? 'text-orange-400' : 'text-gray-300'}>
-              {set.date_display}
+              {set.date_start ? new Date(set.date_start).toLocaleDateString() : set.date_display}
               {match_details.date_diff_days > 0 && ` (${match_details.date_diff_days}d)`}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 text-gray-400">
+            <Clock className="w-3 h-3" />
+            <span className="text-gray-300">
+              {set.date_start ? new Date(set.date_start).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'N/A'}
             </span>
           </div>
           {set.gain !== null && (

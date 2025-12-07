@@ -269,9 +269,17 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
               <span className="text-gray-200">{set.filter}</span>
             </div>
           )}
-          <div className="col-span-2">
+          <div>
             <span className="text-gray-400">Date:</span>{' '}
-            <span className="text-gray-200">{set.date_display}</span>
+            <span className="text-gray-200">
+              {set.date_start ? new Date(set.date_start).toLocaleDateString() : set.date_display}
+            </span>
+          </div>
+          <div>
+            <span className="text-gray-400">Time:</span>{' '}
+            <span className="text-gray-200">
+              {set.date_start ? new Date(set.date_start).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'N/A'}
+            </span>
           </div>
           <div>
             <span className="text-gray-400">Set Frames:</span>{' '}
