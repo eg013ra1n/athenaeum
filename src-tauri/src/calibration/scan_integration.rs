@@ -430,7 +430,7 @@ fn cluster_frames_by_time_and_temp(
 }
 
 /// Create a FlatGroup from a cluster of frames
-fn create_flat_group_from_cluster(key: &FlatGroupKey, frames: &[CalibrationFrameData]) -> FlatGroup {
+fn create_flat_group_from_cluster(_key: &FlatGroupKey, frames: &[CalibrationFrameData]) -> FlatGroup {
     let frame_ids: Vec<i64> = frames.iter().map(|f| f.id).collect();
     let frame_count = frames.len();
 
@@ -451,12 +451,15 @@ fn create_flat_group_from_cluster(key: &FlatGroupKey, frames: &[CalibrationFrame
         None
     };
 
-    let gain = frames.first().and_then(|f| f.gain);
-    let offset = frames.first().and_then(|f| f.offset);
-    let exptime = frames.first().and_then(|f| f.exptime);
-    let focal_length = frames.first().and_then(|f| f.focallen);
-
-    let filter = if key.filter.is_empty() { None } else { Some(key.filter.clone()) };
+    // Get values from first frame to preserve Option<T> (NULL) semantics
+    let first_frame = frames.first();
+    let gain = first_frame.and_then(|f| f.gain);
+    let offset = first_frame.and_then(|f| f.offset);
+    let exptime = first_frame.and_then(|f| f.exptime);
+    let focal_length = first_frame.and_then(|f| f.focallen);
+    let filter = first_frame.and_then(|f| f.filter.clone());
+    let instrume = first_frame.and_then(|f| f.instrume.clone());
+    let binning = first_frame.and_then(|f| f.binning.clone());
 
     FlatGroup {
         frame_ids,
@@ -465,8 +468,8 @@ fn create_flat_group_from_cluster(key: &FlatGroupKey, frames: &[CalibrationFrame
         avg_temp,
         frame_count,
         filter,
-        instrume: key.instrume.clone(),
-        binning: key.binning.clone(),
+        instrume,
+        binning,
         gain,
         offset,
         exptime,
@@ -475,7 +478,7 @@ fn create_flat_group_from_cluster(key: &FlatGroupKey, frames: &[CalibrationFrame
 }
 
 /// Create a DarkGroup from a cluster of frames
-fn create_dark_group_from_cluster(key: &DarkGroupKey, frames: &[CalibrationFrameData]) -> DarkGroup {
+fn create_dark_group_from_cluster(_key: &DarkGroupKey, frames: &[CalibrationFrameData]) -> DarkGroup {
     let frame_ids: Vec<i64> = frames.iter().map(|f| f.id).collect();
     let frame_count = frames.len();
 
@@ -496,9 +499,13 @@ fn create_dark_group_from_cluster(key: &DarkGroupKey, frames: &[CalibrationFrame
         None
     };
 
-    let gain = frames.first().and_then(|f| f.gain);
-    let offset = frames.first().and_then(|f| f.offset);
-    let exptime = frames.first().and_then(|f| f.exptime);
+    // Get values from first frame to preserve Option<T> (NULL) semantics
+    let first_frame = frames.first();
+    let gain = first_frame.and_then(|f| f.gain);
+    let offset = first_frame.and_then(|f| f.offset);
+    let exptime = first_frame.and_then(|f| f.exptime);
+    let instrume = first_frame.and_then(|f| f.instrume.clone());
+    let binning = first_frame.and_then(|f| f.binning.clone());
 
     DarkGroup {
         frame_ids,
@@ -506,8 +513,8 @@ fn create_dark_group_from_cluster(key: &DarkGroupKey, frames: &[CalibrationFrame
         end_time,
         avg_temp,
         frame_count,
-        instrume: key.instrume.clone(),
-        binning: key.binning.clone(),
+        instrume,
+        binning,
         gain,
         offset,
         exptime,
@@ -516,7 +523,7 @@ fn create_dark_group_from_cluster(key: &DarkGroupKey, frames: &[CalibrationFrame
 }
 
 /// Create a BiasGroup from a cluster of frames
-fn create_bias_group_from_cluster(key: &BiasGroupKey, frames: &[CalibrationFrameData]) -> BiasGroup {
+fn create_bias_group_from_cluster(_key: &BiasGroupKey, frames: &[CalibrationFrameData]) -> BiasGroup {
     let frame_ids: Vec<i64> = frames.iter().map(|f| f.id).collect();
     let frame_count = frames.len();
 
@@ -537,8 +544,12 @@ fn create_bias_group_from_cluster(key: &BiasGroupKey, frames: &[CalibrationFrame
         None
     };
 
-    let gain = frames.first().and_then(|f| f.gain);
-    let offset = frames.first().and_then(|f| f.offset);
+    // Get values from first frame to preserve Option<T> (NULL) semantics
+    let first_frame = frames.first();
+    let gain = first_frame.and_then(|f| f.gain);
+    let offset = first_frame.and_then(|f| f.offset);
+    let instrume = first_frame.and_then(|f| f.instrume.clone());
+    let binning = first_frame.and_then(|f| f.binning.clone());
 
     BiasGroup {
         frame_ids,
@@ -546,8 +557,8 @@ fn create_bias_group_from_cluster(key: &BiasGroupKey, frames: &[CalibrationFrame
         end_time,
         avg_temp,
         frame_count,
-        instrume: key.instrume.clone(),
-        binning: key.binning.clone(),
+        instrume,
+        binning,
         gain,
         offset,
         focal_length: None, // Not used for bias
@@ -563,13 +574,97 @@ fn create_dark_calibration_set_with_type(
     // Check if set already exists with same parameters
     let date = dark_group.start_time.format("%Y-%m-%d").to_string();
 
+    // Build query with NULL-aware comparisons for ALL parameters
+    // This is critical - must check exptime, gain, offset in addition to binning/instrume
     let existing_set_id: Option<i64> = {
-        let query = format!(
+        let mut query = String::from(
             "SELECT id FROM calibration_set
-             WHERE imagetyp = ?1 AND binning = ?2 AND instrume = ?3 AND date = ?4
-             AND frame_count > 0 LIMIT 1"
+             WHERE imagetyp = ?1 AND date = ?2 AND frame_count > 0"
         );
-        conn.query_row(&query, rusqlite::params![imagetyp, &dark_group.binning, &dark_group.instrume, &date], |row| row.get(0)).ok()
+
+        let mut param_count = 2;
+
+        // NULL-aware comparison for binning
+        if dark_group.binning.is_some() {
+            param_count += 1;
+            query.push_str(&format!(" AND binning = ?{}", param_count));
+        } else {
+            query.push_str(" AND binning IS NULL");
+        }
+
+        // NULL-aware comparison for instrume
+        if dark_group.instrume.is_some() {
+            param_count += 1;
+            query.push_str(&format!(" AND instrume = ?{}", param_count));
+        } else {
+            query.push_str(" AND instrume IS NULL");
+        }
+
+        // NULL-aware comparison for exptime - CRITICAL for Dark matching!
+        if dark_group.exptime.is_some() {
+            param_count += 1;
+            query.push_str(&format!(" AND exptime = ?{}", param_count));
+        } else {
+            query.push_str(" AND exptime IS NULL");
+        }
+
+        // NULL-aware comparison for gain
+        if dark_group.gain.is_some() {
+            param_count += 1;
+            query.push_str(&format!(" AND gain = ?{}", param_count));
+        } else {
+            query.push_str(" AND gain IS NULL");
+        }
+
+        // NULL-aware comparison for offset
+        if dark_group.offset.is_some() {
+            param_count += 1;
+            query.push_str(&format!(" AND offset = ?{}", param_count));
+        } else {
+            query.push_str(" AND offset IS NULL");
+        }
+
+        query.push_str(" LIMIT 1");
+
+        // Execute query with dynamic parameter binding
+        // On any error, we'll just create a new set (None result triggers new set creation)
+        (|| -> Option<i64> {
+            let mut stmt = conn.prepare(&query).ok()?;
+
+            let mut param_idx = 1;
+            stmt.raw_bind_parameter(param_idx, imagetyp).ok()?;
+            param_idx += 1;
+            stmt.raw_bind_parameter(param_idx, &date).ok()?;
+            param_idx += 1;
+
+            if let Some(ref binning) = dark_group.binning {
+                stmt.raw_bind_parameter(param_idx, binning).ok()?;
+                param_idx += 1;
+            }
+
+            if let Some(ref instrume) = dark_group.instrume {
+                stmt.raw_bind_parameter(param_idx, instrume).ok()?;
+                param_idx += 1;
+            }
+
+            if let Some(exptime) = dark_group.exptime {
+                stmt.raw_bind_parameter(param_idx, exptime).ok()?;
+                param_idx += 1;
+            }
+
+            if let Some(gain) = dark_group.gain {
+                stmt.raw_bind_parameter(param_idx, gain).ok()?;
+                param_idx += 1;
+            }
+
+            if let Some(offset) = dark_group.offset {
+                stmt.raw_bind_parameter(param_idx, offset).ok()?;
+            }
+
+            let mut rows = stmt.raw_query();
+            let row = rows.next().ok()??;
+            row.get::<_, i64>(0).ok()
+        })()
     };
 
     if let Some(set_id) = existing_set_id {

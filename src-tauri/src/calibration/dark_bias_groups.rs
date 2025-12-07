@@ -30,11 +30,11 @@ pub struct DarkGroup {
     /// Number of frames in group
     pub frame_count: usize,
 
-    /// Camera/instrument name
-    pub instrume: String,
+    /// Camera/instrument name (None if missing from frame headers)
+    pub instrume: Option<String>,
 
-    /// Binning pattern (e.g., "1x1", "2x2")
-    pub binning: String,
+    /// Binning pattern (e.g., "1x1", "2x2") (None if missing from frame headers)
+    pub binning: Option<String>,
 
     /// Gain setting
     pub gain: Option<f64>,
@@ -67,11 +67,11 @@ pub struct BiasGroup {
     /// Number of frames in group
     pub frame_count: usize,
 
-    /// Camera/instrument name
-    pub instrume: String,
+    /// Camera/instrument name (None if missing from frame headers)
+    pub instrume: Option<String>,
 
-    /// Binning pattern (e.g., "1x1", "2x2")
-    pub binning: String,
+    /// Binning pattern (e.g., "1x1", "2x2") (None if missing from frame headers)
+    pub binning: Option<String>,
 
     /// Gain setting
     pub gain: Option<f64>,
@@ -667,14 +667,18 @@ fn create_dark_group(
         None
     };
 
+    // Convert empty strings to None for proper NULL handling
+    let instrume_opt = if instrume.is_empty() { None } else { Some(instrume.to_string()) };
+    let binning_opt = if binning.is_empty() { None } else { Some(binning.to_string()) };
+
     DarkGroup {
         frame_ids,
         start_time,
         end_time,
         avg_temp,
         frame_count,
-        instrume: instrume.to_string(),
-        binning: binning.to_string(),
+        instrume: instrume_opt,
+        binning: binning_opt,
         gain,
         offset,
         exptime,
@@ -714,14 +718,18 @@ fn create_bias_group(
         None
     };
 
+    // Convert empty strings to None for proper NULL handling
+    let instrume_opt = if instrume.is_empty() { None } else { Some(instrume.to_string()) };
+    let binning_opt = if binning.is_empty() { None } else { Some(binning.to_string()) };
+
     BiasGroup {
         frame_ids,
         start_time,
         end_time,
         avg_temp,
         frame_count,
-        instrume: instrume.to_string(),
-        binning: binning.to_string(),
+        instrume: instrume_opt,
+        binning: binning_opt,
         gain,
         offset,
         focal_length,
@@ -778,7 +786,7 @@ pub fn create_dark_calibration_set(
     let temp_max = dark_group.avg_temp;
 
     println!("    📝 Creating new dark calibration set:");
-    println!("       date={}, exptime={:?}, gain={:?}, offset={:?}, binning={}, instrume={}",
+    println!("       date={}, exptime={:?}, gain={:?}, offset={:?}, binning={:?}, instrume={:?}",
         date, dark_group.exptime, dark_group.gain, dark_group.offset, dark_group.binning, dark_group.instrume);
     println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
 
@@ -874,7 +882,7 @@ pub fn create_bias_calibration_set(
     let temp_max = bias_group.avg_temp;
 
     println!("    📝 Creating new bias calibration set:");
-    println!("       date={}, gain={:?}, offset={:?}, binning={}, instrume={}",
+    println!("       date={}, gain={:?}, offset={:?}, binning={:?}, instrume={:?}",
         date, bias_group.gain, bias_group.offset, bias_group.binning, bias_group.instrume);
     println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
 
@@ -926,38 +934,61 @@ fn check_for_existing_dark_set(
 ) -> Result<Option<i64>> {
     let date = dark_group.start_time.format("%Y-%m-%d").to_string();
 
+    // Build query with NULL-aware comparisons for nullable fields
     let mut query = String::from(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Dark'
-           AND cs.binning = ?1
-           AND cs.instrume = ?2
-           AND cs.date = ?3
+           AND cs.date = ?1
            AND cs.frame_count > 0
            AND cs.date_start IS NOT NULL
            AND cs.date_end IS NOT NULL"
     );
 
-    let mut param_count = 3;
+    let mut param_count = 1;
+
+    // NULL-aware comparison for binning
+    if dark_group.binning.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.binning = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.binning IS NULL");
+    }
+
+    // NULL-aware comparison for instrume
+    if dark_group.instrume.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.instrume = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.instrume IS NULL");
+    }
 
     if dark_group.gain.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.gain = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.gain IS NULL");
     }
 
     if dark_group.offset.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.offset = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.offset IS NULL");
     }
 
     if dark_group.exptime.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.exptime = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.exptime IS NULL");
     }
 
     if dark_group.focal_length.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.focallen = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.focallen IS NULL");
     }
 
     query.push_str(" LIMIT 1");
@@ -965,12 +996,18 @@ fn check_for_existing_dark_set(
     let mut stmt = conn.prepare(&query)?;
 
     let mut param_idx = 1;
-    stmt.raw_bind_parameter(param_idx, &dark_group.binning)?;
-    param_idx += 1;
-    stmt.raw_bind_parameter(param_idx, &dark_group.instrume)?;
-    param_idx += 1;
     stmt.raw_bind_parameter(param_idx, &date)?;
     param_idx += 1;
+
+    if let Some(ref binning) = dark_group.binning {
+        stmt.raw_bind_parameter(param_idx, binning)?;
+        param_idx += 1;
+    }
+
+    if let Some(ref instrume) = dark_group.instrume {
+        stmt.raw_bind_parameter(param_idx, instrume)?;
+        param_idx += 1;
+    }
 
     if let Some(gain) = dark_group.gain {
         stmt.raw_bind_parameter(param_idx, gain)?;
@@ -1006,33 +1043,54 @@ fn check_for_existing_bias_set(
 ) -> Result<Option<i64>> {
     let date = bias_group.start_time.format("%Y-%m-%d").to_string();
 
+    // Build query with NULL-aware comparisons for nullable fields
     let mut query = String::from(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Bias'
-           AND cs.binning = ?1
-           AND cs.instrume = ?2
-           AND cs.date = ?3
+           AND cs.date = ?1
            AND cs.frame_count > 0
            AND cs.date_start IS NOT NULL
            AND cs.date_end IS NOT NULL"
     );
 
-    let mut param_count = 3;
+    let mut param_count = 1;
+
+    // NULL-aware comparison for binning
+    if bias_group.binning.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.binning = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.binning IS NULL");
+    }
+
+    // NULL-aware comparison for instrume
+    if bias_group.instrume.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.instrume = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.instrume IS NULL");
+    }
 
     if bias_group.gain.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.gain = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.gain IS NULL");
     }
 
     if bias_group.offset.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.offset = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.offset IS NULL");
     }
 
     if bias_group.focal_length.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.focallen = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.focallen IS NULL");
     }
 
     query.push_str(" LIMIT 1");
@@ -1040,12 +1098,18 @@ fn check_for_existing_bias_set(
     let mut stmt = conn.prepare(&query)?;
 
     let mut param_idx = 1;
-    stmt.raw_bind_parameter(param_idx, &bias_group.binning)?;
-    param_idx += 1;
-    stmt.raw_bind_parameter(param_idx, &bias_group.instrume)?;
-    param_idx += 1;
     stmt.raw_bind_parameter(param_idx, &date)?;
     param_idx += 1;
+
+    if let Some(ref binning) = bias_group.binning {
+        stmt.raw_bind_parameter(param_idx, binning)?;
+        param_idx += 1;
+    }
+
+    if let Some(ref instrume) = bias_group.instrume {
+        stmt.raw_bind_parameter(param_idx, instrume)?;
+        param_idx += 1;
+    }
 
     if let Some(gain) = bias_group.gain {
         stmt.raw_bind_parameter(param_idx, gain)?;

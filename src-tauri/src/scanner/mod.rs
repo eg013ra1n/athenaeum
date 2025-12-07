@@ -140,8 +140,9 @@ pub fn scan_directory(
                 println!("Auto-created {} calibration sets from scan", cal_result.sets_created);
             }
             Err(e) => {
+                // Surface errors to user instead of just logging
+                result.errors.push(format!("Failed to auto-create calibration sets: {}", e));
                 println!("Warning: Failed to auto-create calibration sets: {}", e);
-                // Non-fatal - frames are still in database
             }
         }
     }

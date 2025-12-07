@@ -33,11 +33,11 @@ pub struct FlatGroup {
     /// Filter used (if any)
     pub filter: Option<String>,
 
-    /// Camera/instrument name
-    pub instrume: String,
+    /// Camera/instrument name (None if unknown)
+    pub instrume: Option<String>,
 
-    /// Binning pattern (e.g., "1x1", "2x2")
-    pub binning: String,
+    /// Binning pattern (e.g., "1x1", "2x2") (None if unknown)
+    pub binning: Option<String>,
 
     /// Gain setting
     pub gain: Option<f64>,
@@ -359,6 +359,10 @@ fn create_flat_group(
     let offset = frames.first().and_then(|f| f.offset);
     let exptime = frames.first().and_then(|f| f.exptime);
 
+    // Convert empty strings to None for proper NULL handling
+    let instrume_opt = if instrume.is_empty() { None } else { Some(instrume.to_string()) };
+    let binning_opt = if binning.is_empty() { None } else { Some(binning.to_string()) };
+
     FlatGroup {
         frame_ids,
         start_time,
@@ -366,8 +370,8 @@ fn create_flat_group(
         avg_temp,
         frame_count,
         filter: filter.map(String::from),
-        instrume: instrume.to_string(),
-        binning: binning.to_string(),
+        instrume: instrume_opt,
+        binning: binning_opt,
         gain,
         offset,
         exptime,
@@ -425,7 +429,7 @@ pub fn create_flat_calibration_set(
     let temp_max = flat_group.avg_temp;
 
     println!("    📝 Creating new flat calibration set:");
-    println!("       date={}, filter={:?}, gain={:?}, offset={:?}, exptime={:?}, binning={}, instrume={}",
+    println!("       date={}, filter={:?}, gain={:?}, offset={:?}, exptime={:?}, binning={:?}, instrume={:?}",
         date, flat_group.filter, flat_group.gain, flat_group.offset, flat_group.exptime, flat_group.binning, flat_group.instrume);
     println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
 
@@ -479,20 +483,36 @@ fn check_for_existing_flat_set(
 ) -> Result<Option<i64>> {
     let date = flat_group.start_time.format("%Y-%m-%d").to_string();
 
+    // Build query with NULL-aware comparisons for binning and instrume
     let mut query = String::from(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Flat'
-           AND cs.binning = ?1
-           AND cs.instrume = ?2
-           AND cs.date = ?3
+           AND cs.date = ?1
            AND cs.frame_count > 0
            AND cs.date_start IS NOT NULL
            AND cs.date_end IS NOT NULL"
     );
 
-    let mut param_count = 3;
+    let mut param_count = 1;
 
+    // NULL-aware comparison for binning
+    if flat_group.binning.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.binning = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.binning IS NULL");
+    }
+
+    // NULL-aware comparison for instrume
+    if flat_group.instrume.is_some() {
+        param_count += 1;
+        query.push_str(&format!(" AND cs.instrume = ?{}", param_count));
+    } else {
+        query.push_str(" AND cs.instrume IS NULL");
+    }
+
+    // NULL-aware comparison for filter
     if flat_group.filter.is_some() {
         param_count += 1;
         query.push_str(&format!(" AND cs.filter = ?{}", param_count));
@@ -525,12 +545,18 @@ fn check_for_existing_flat_set(
     let mut stmt = conn.prepare(&query)?;
 
     let mut param_idx = 1;
-    stmt.raw_bind_parameter(param_idx, &flat_group.binning)?;
-    param_idx += 1;
-    stmt.raw_bind_parameter(param_idx, &flat_group.instrume)?;
-    param_idx += 1;
     stmt.raw_bind_parameter(param_idx, &date)?;
     param_idx += 1;
+
+    if let Some(ref binning) = flat_group.binning {
+        stmt.raw_bind_parameter(param_idx, binning)?;
+        param_idx += 1;
+    }
+
+    if let Some(ref instrume) = flat_group.instrume {
+        stmt.raw_bind_parameter(param_idx, instrume)?;
+        param_idx += 1;
+    }
 
     if let Some(ref filter) = flat_group.filter {
         stmt.raw_bind_parameter(param_idx, filter)?;
