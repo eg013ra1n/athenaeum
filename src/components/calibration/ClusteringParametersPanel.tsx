@@ -136,33 +136,68 @@ export default function ClusteringParametersPanel({
         <h4 className="text-sm font-medium text-gray-300 mb-4">
           Scoring Parameters
         </h4>
-        <div className="bg-gray-800/50 rounded-lg p-4">
-          <div className="flex items-center gap-4">
-            <label className="text-sm text-gray-300 min-w-48">
-              Temperature Match Weight
-            </label>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.1"
-              value={scoring.temperature_match_weight}
-              onChange={(e) =>
-                onScoringUpdate(
-                  "temperature_match_weight",
-                  parseFloat(e.target.value)
-                )
-              }
-              className="flex-1"
-            />
-            <span className="text-sm text-gray-100 w-12 text-right">
-              {scoring.temperature_match_weight.toFixed(1)}
-            </span>
+        <p className="text-xs text-gray-500 mb-4">
+          When linking calibration sets to frames, candidates are scored based on date proximity and temperature match.
+          These settings control how temperature affects the scoring (mainly for Dark→Light and Dark→Flat matching).
+        </p>
+        <div className="bg-gray-800/50 rounded-lg p-4 space-y-4">
+          {/* Temperature Match Weight */}
+          <div>
+            <div className="flex items-center gap-4">
+              <label className="text-sm text-gray-300 min-w-48">
+                Temperature Match Weight
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.1"
+                value={scoring.temperature_match_weight}
+                onChange={(e) =>
+                  onScoringUpdate(
+                    "temperature_match_weight",
+                    parseFloat(e.target.value)
+                  )
+                }
+                className="flex-1"
+              />
+              <span className="text-sm text-gray-100 w-12 text-right">
+                {scoring.temperature_match_weight.toFixed(1)}
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              How much temperature affects the score (0 = ignore temperature, 1 = full weight). Default: 0.3
+            </p>
           </div>
-          <p className="text-xs text-gray-500 mt-2">
-            Weight given to temperature proximity when scoring calibration
-            matches (0.0 = ignore, 1.0 = full weight). Typical value is 0.3.
-          </p>
+
+          {/* Temperature Scale */}
+          <div>
+            <div className="flex items-center gap-4">
+              <label className="text-sm text-gray-300 min-w-48">
+                Temperature Sensitivity (°C)
+              </label>
+              <input
+                type="range"
+                min="1"
+                max="10"
+                step="0.5"
+                value={scoring.temperature_scale}
+                onChange={(e) =>
+                  onScoringUpdate(
+                    "temperature_scale",
+                    parseFloat(e.target.value)
+                  )
+                }
+                className="flex-1"
+              />
+              <span className="text-sm text-gray-100 w-12 text-right">
+                {scoring.temperature_scale.toFixed(1)}
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">
+              At this temperature difference, the temp score drops to 50%. Higher = more tolerant. Default: 2.0°C
+            </p>
+          </div>
         </div>
       </div>
     </div>
