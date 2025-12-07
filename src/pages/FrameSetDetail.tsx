@@ -73,11 +73,15 @@ export default function FrameSetDetail() {
     }
   };
 
-  const loadCalibrationHierarchy = async () => {
+  const loadCalibrationHierarchy = async (showLoading: boolean = true) => {
     if (!id) return;
 
     try {
-      setLoadingCalibration(true);
+      // Only show loading spinner on initial load, not on refresh
+      // This prevents the component from unmounting and losing expanded state
+      if (showLoading) {
+        setLoadingCalibration(true);
+      }
       const result = await invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
         frameSetId: parseInt(id),
       });
@@ -86,9 +90,14 @@ export default function FrameSetDetail() {
       console.error('Failed to load calibration hierarchy:', err);
       showAlert('Error', `Failed to load calibration data: ${err}`, 'error');
     } finally {
-      setLoadingCalibration(false);
+      if (showLoading) {
+        setLoadingCalibration(false);
+      }
     }
   };
+
+  // Refresh without showing loading spinner (keeps expanded state)
+  const refreshCalibrationHierarchy = () => loadCalibrationHierarchy(false);
 
   // Load calibration hierarchy when Calibration tab is selected
   useEffect(() => {
@@ -1007,7 +1016,10 @@ export default function FrameSetDetail() {
                 <p className="text-gray-400">Loading calibration data...</p>
               </div>
             ) : calibrationHierarchy ? (
-              <CalibrationHierarchyViewComponent data={calibrationHierarchy} />
+              <CalibrationHierarchyViewComponent
+                data={calibrationHierarchy}
+                onRefresh={refreshCalibrationHierarchy}
+              />
             ) : (
               <div className="text-center py-12 text-gray-400">
                 <p>Failed to load calibration data.</p>
