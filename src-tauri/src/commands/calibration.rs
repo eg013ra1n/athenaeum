@@ -588,3 +588,602 @@ pub async fn reset_calibration_matching_config(
 
     Ok(default_config)
 }
+
+// ========== Manual Calibration Selection Commands ==========
+
+/// Get average parameters of light frames for manual selection display
+#[tauri::command]
+pub async fn get_light_frame_parameters(
+    frame_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<LightFrameParameters, String> {
+    use crate::db::calibration_links::get_links_for_frame;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    if frame_ids.is_empty() {
+        return Err("No frame IDs provided".to_string());
+    }
+
+    // Query frames
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT id, instrume, binning, gain, offset, filter, ccd_temp, exptime, date_obs
+         FROM frames WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+
+    let mut rows = stmt.query(params.as_slice()).map_err(|e| e.to_string())?;
+
+    let mut instrumes: Vec<Option<String>> = Vec::new();
+    let mut binnings: Vec<Option<String>> = Vec::new();
+    let mut gains: Vec<Option<f64>> = Vec::new();
+    let mut offsets: Vec<Option<f64>> = Vec::new();
+    let mut filters: Vec<Option<String>> = Vec::new();
+    let mut temps: Vec<f64> = Vec::new();
+    let mut exptimes: Vec<f64> = Vec::new();
+    let mut dates: Vec<String> = Vec::new();
+    let mut frame_count = 0;
+
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        frame_count += 1;
+        instrumes.push(row.get(1).ok());
+        binnings.push(row.get(2).ok());
+        gains.push(row.get(3).ok());
+        offsets.push(row.get(4).ok());
+        filters.push(row.get(5).ok());
+        if let Ok(Some(temp)) = row.get::<_, Option<f64>>(6) {
+            temps.push(temp);
+        }
+        if let Ok(Some(exp)) = row.get::<_, Option<f64>>(7) {
+            exptimes.push(exp);
+        }
+        if let Ok(Some(date)) = row.get::<_, Option<String>>(8) {
+            dates.push(date);
+        }
+    }
+
+    // Get most common values
+    let instrume = most_common_option(&instrumes);
+    let binning = most_common_option(&binnings);
+    let gain = most_common_f64(&gains);
+    let offset = most_common_f64(&offsets);
+    let filter = most_common_option(&filters);
+
+    // Calculate averages and ranges
+    let avg_ccd_temp = if temps.is_empty() { None } else {
+        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    };
+
+    let avg_exptime = if exptimes.is_empty() { None } else {
+        Some(exptimes.iter().sum::<f64>() / exptimes.len() as f64)
+    };
+
+    let exptime_range = if exptimes.is_empty() { None } else {
+        let min = exptimes.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = exptimes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        Some((min, max))
+    };
+
+    let date_range = if dates.is_empty() { None } else {
+        let mut sorted = dates.clone();
+        sorted.sort();
+        Some((sorted.first().unwrap().clone(), sorted.last().unwrap().clone()))
+    };
+
+    // Get current calibration links for first frame (representative)
+    let first_frame_id = frame_ids[0];
+    let links = get_links_for_frame(&conn, first_frame_id).map_err(|e| e.to_string())?;
+
+    let current_flat_set_id = links.iter()
+        .find(|l| l.calibration_type == "Flat")
+        .map(|l| l.calibration_set_id);
+    let current_dark_set_id = links.iter()
+        .find(|l| l.calibration_type == "Dark")
+        .map(|l| l.calibration_set_id);
+    let current_bias_set_id = links.iter()
+        .find(|l| l.calibration_type == "Bias")
+        .map(|l| l.calibration_set_id);
+
+    Ok(LightFrameParameters {
+        instrume,
+        binning,
+        gain,
+        offset,
+        filter,
+        avg_ccd_temp,
+        avg_exptime,
+        exptime_range,
+        frame_count,
+        date_range,
+        current_flat_set_id,
+        current_dark_set_id,
+        current_bias_set_id,
+    })
+}
+
+/// Get calibration sets with match scores for manual selection
+#[tauri::command]
+pub async fn get_calibration_sets_for_manual_selection(
+    frame_ids: Vec<i64>,
+    calibration_type: String,  // "flat", "dark", "bias"
+    show_all: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<CalibrationSetWithScore>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    if frame_ids.is_empty() {
+        return Err("No frame IDs provided".to_string());
+    }
+
+    // Get light frame parameters first
+    let params = get_light_params_internal(&conn, &frame_ids)?;
+
+    // Get all calibration sets of the specified type
+    let imagetyp = match calibration_type.to_lowercase().as_str() {
+        "flat" => "FLAT",
+        "dark" => "DARK",
+        "bias" => "BIAS",
+        "darkflat" => "DARKFLAT",
+        _ => return Err(format!("Invalid calibration type: {}", calibration_type)),
+    };
+
+    // Query all sets of this type
+    let mut stmt = conn.prepare(
+        "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
+                cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen
+         FROM calibration_set cs
+         WHERE UPPER(cs.imagetyp) = ?1
+         ORDER BY cs.date_start DESC"
+    ).map_err(|e| e.to_string())?;
+
+    let sets_iter = stmt.query_map([imagetyp], |row| {
+        Ok(CalibrationSetDetail {
+            id: row.get(0)?,
+            imagetyp: ImageType::from_str(row.get::<_, String>(1)?.as_str())
+                .unwrap_or(ImageType::Flat),
+            exptime: row.get(2)?,
+            ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            gain: row.get(4)?,
+            offset: row.get(5)?,
+            binning: row.get(6)?,
+            instrume: row.get(7)?,
+            filter: row.get(8)?,
+            date_start: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            date_end: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+            temp_min: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+            temp_max: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+            frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+            date_display: "".to_string(),  // Will be calculated
+        })
+    }).map_err(|e| e.to_string())?;
+
+    let sets: Vec<CalibrationSetDetail> = sets_iter
+        .filter_map(|r| r.ok())
+        .map(|mut set| {
+            // Calculate date display
+            if set.date_start == set.date_end {
+                set.date_display = set.date_start.chars().take(10).collect();
+            } else {
+                let start: String = set.date_start.chars().take(10).collect();
+                let end: String = set.date_end.chars().take(10).collect();
+                set.date_display = format!("{} - {}", start, end);
+            }
+            set
+        })
+        .collect();
+
+    // Calculate match score for each set
+    let mut scored_sets: Vec<CalibrationSetWithScore> = Vec::new();
+
+    for set in sets {
+        let match_details = calculate_match_details(&params, &set, &calibration_type);
+        let match_score = calculate_match_score(&match_details, &calibration_type);
+
+        // Skip non-matching sets unless show_all is true
+        if !show_all && match_score < 0.1 {
+            continue;
+        }
+
+        scored_sets.push(CalibrationSetWithScore {
+            set,
+            match_score,
+            match_details,
+        });
+    }
+
+    // Sort by match score (highest first)
+    scored_sets.sort_by(|a, b| b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(scored_sets)
+}
+
+/// Manually assign a calibration set to light frames
+#[tauri::command]
+pub async fn manual_assign_calibration(
+    frame_ids: Vec<i64>,
+    calibration_set_id: i64,
+    calibration_type: String,  // "Flat", "Dark", "Bias"
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    use crate::db::calibration_links::insert_calibration_link;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    if frame_ids.is_empty() {
+        return Err("No frame IDs provided".to_string());
+    }
+
+    // Validate calibration_type
+    let valid_types = ["Flat", "Dark", "Bias", "DarkFlat"];
+    if !valid_types.contains(&calibration_type.as_str()) {
+        return Err(format!("Invalid calibration type: {}", calibration_type));
+    }
+
+    let mut assigned_count = 0;
+
+    for frame_id in &frame_ids {
+        // Create the calibration link with is_manual_override = true
+        let link = CalibrationLink {
+            id: None,
+            source_id: *frame_id,
+            source_type: "frame".to_string(),
+            calibration_set_id,
+            calibration_type: calibration_type.clone(),
+            matched_at: Utc::now().to_rfc3339(),
+            match_score: Some(1.0),  // Manual assignment gets perfect score
+            date_warning: false,
+            temp_warning: false,
+            is_manual_override: true,
+        };
+
+        match insert_calibration_link(&conn, &link) {
+            Ok(_) => assigned_count += 1,
+            Err(e) => {
+                eprintln!("Failed to assign calibration to frame {}: {}", frame_id, e);
+            }
+        }
+    }
+
+    println!(
+        "✅ Manually assigned {} set {} to {} frames ({} of type {})",
+        calibration_type, calibration_set_id, assigned_count, frame_ids.len(), calibration_type
+    );
+
+    Ok(assigned_count)
+}
+
+/// Remove manual calibration override and allow auto-find to reassign
+#[tauri::command]
+pub async fn clear_manual_calibration_override(
+    frame_ids: Vec<i64>,
+    calibration_type: Option<String>,  // None = clear all types
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    if frame_ids.is_empty() {
+        return Err("No frame IDs provided".to_string());
+    }
+
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+
+    let sql = match &calibration_type {
+        Some(ct) => format!(
+            "DELETE FROM calibration_set_to_frames
+             WHERE source_id IN ({}) AND source_type = 'frame'
+             AND calibration_type = ?{} AND is_manual_override = 1",
+            placeholders.join(", "),
+            frame_ids.len() + 1
+        ),
+        None => format!(
+            "DELETE FROM calibration_set_to_frames
+             WHERE source_id IN ({}) AND source_type = 'frame' AND is_manual_override = 1",
+            placeholders.join(", ")
+        ),
+    };
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = frame_ids.iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+
+    if let Some(ct) = &calibration_type {
+        params.push(Box::new(ct.clone()));
+    }
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter()
+        .map(|p| p.as_ref())
+        .collect();
+
+    let deleted = conn.execute(&sql, param_refs.as_slice())
+        .map_err(|e| e.to_string())?;
+
+    println!(
+        "✅ Cleared {} manual calibration override(s) from {} frames",
+        deleted, frame_ids.len()
+    );
+
+    Ok(deleted)
+}
+
+// Helper functions for manual selection
+
+fn get_light_params_internal(
+    conn: &rusqlite::Connection,
+    frame_ids: &[i64],
+) -> Result<LightFrameParameters, String> {
+    if frame_ids.is_empty() {
+        return Err("No frame IDs provided".to_string());
+    }
+
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT id, instrume, binning, gain, offset, filter, ccd_temp, exptime, date_obs
+         FROM frames WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+
+    let mut rows = stmt.query(params.as_slice()).map_err(|e| e.to_string())?;
+
+    let mut instrumes: Vec<Option<String>> = Vec::new();
+    let mut binnings: Vec<Option<String>> = Vec::new();
+    let mut gains: Vec<Option<f64>> = Vec::new();
+    let mut offsets: Vec<Option<f64>> = Vec::new();
+    let mut filters: Vec<Option<String>> = Vec::new();
+    let mut temps: Vec<f64> = Vec::new();
+    let mut exptimes: Vec<f64> = Vec::new();
+    let mut dates: Vec<String> = Vec::new();
+    let mut frame_count = 0;
+
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        frame_count += 1;
+        instrumes.push(row.get(1).ok());
+        binnings.push(row.get(2).ok());
+        gains.push(row.get(3).ok());
+        offsets.push(row.get(4).ok());
+        filters.push(row.get(5).ok());
+        if let Ok(Some(temp)) = row.get::<_, Option<f64>>(6) {
+            temps.push(temp);
+        }
+        if let Ok(Some(exp)) = row.get::<_, Option<f64>>(7) {
+            exptimes.push(exp);
+        }
+        if let Ok(Some(date)) = row.get::<_, Option<String>>(8) {
+            dates.push(date);
+        }
+    }
+
+    let instrume = most_common_option(&instrumes);
+    let binning = most_common_option(&binnings);
+    let gain = most_common_f64(&gains);
+    let offset = most_common_f64(&offsets);
+    let filter = most_common_option(&filters);
+
+    let avg_ccd_temp = if temps.is_empty() { None } else {
+        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    };
+
+    let avg_exptime = if exptimes.is_empty() { None } else {
+        Some(exptimes.iter().sum::<f64>() / exptimes.len() as f64)
+    };
+
+    let exptime_range = if exptimes.is_empty() { None } else {
+        let min = exptimes.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = exptimes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        Some((min, max))
+    };
+
+    let date_range = if dates.is_empty() { None } else {
+        let mut sorted = dates.clone();
+        sorted.sort();
+        Some((sorted.first().unwrap().clone(), sorted.last().unwrap().clone()))
+    };
+
+    Ok(LightFrameParameters {
+        instrume,
+        binning,
+        gain,
+        offset,
+        filter,
+        avg_ccd_temp,
+        avg_exptime,
+        exptime_range,
+        frame_count,
+        date_range,
+        current_flat_set_id: None,
+        current_dark_set_id: None,
+        current_bias_set_id: None,
+    })
+}
+
+fn calculate_match_details(
+    params: &LightFrameParameters,
+    set: &CalibrationSetDetail,
+    calibration_type: &str,
+) -> MatchDetails {
+    // Instrume match
+    let instrume_match = match (&params.instrume, &set.instrume) {
+        (Some(p), Some(s)) => p.to_lowercase() == s.to_lowercase(),
+        (None, None) => true,
+        _ => false,
+    };
+
+    // Binning match
+    let binning_match = match (&params.binning, &set.binning) {
+        (Some(p), Some(s)) => p == s,
+        (None, None) => true,
+        _ => false,
+    };
+
+    // Gain match (with small tolerance)
+    let gain_match = match (params.gain, set.gain) {
+        (Some(p), Some(s)) => (p - s).abs() < 0.01,
+        (None, None) => true,
+        _ => false,
+    };
+
+    // Filter match (only relevant for flats)
+    let filter_match = if calibration_type.to_lowercase() == "flat" {
+        match (&params.filter, &set.filter) {
+            (Some(p), Some(s)) => p.to_lowercase() == s.to_lowercase(),
+            (None, None) => true,
+            _ => false,
+        }
+    } else {
+        true  // Non-flat types don't need filter match
+    };
+
+    // Temperature difference
+    let temp_diff = match (params.avg_ccd_temp, set.ccd_temp) {
+        (Some(p), c) if c != 0.0 => Some((p - c).abs()),
+        _ => None,
+    };
+
+    // Date difference (calculate from date ranges)
+    let date_diff_days = calculate_date_diff_days(params, set);
+
+    MatchDetails {
+        instrume_match,
+        binning_match,
+        gain_match,
+        filter_match,
+        temp_diff,
+        date_diff_days,
+    }
+}
+
+fn calculate_date_diff_days(
+    params: &LightFrameParameters,
+    set: &CalibrationSetDetail,
+) -> i64 {
+    use chrono::NaiveDate;
+
+    let parse_date = |s: &str| -> Option<NaiveDate> {
+        // Try parsing as full datetime first, then just date
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some(dt.date_naive());
+        }
+        NaiveDate::parse_from_str(&s.chars().take(10).collect::<String>(), "%Y-%m-%d").ok()
+    };
+
+    // Get light frame date range
+    let light_dates = match &params.date_range {
+        Some((start, end)) => (parse_date(start), parse_date(end)),
+        None => return 365 * 10,  // No date info = very large diff
+    };
+
+    // Get calibration set dates
+    let set_start = parse_date(&set.date_start);
+    let set_end = parse_date(&set.date_end);
+
+    match (light_dates, set_start, set_end) {
+        ((Some(l_start), Some(l_end)), Some(s_start), Some(s_end)) => {
+            // Calculate minimum distance between ranges
+            if l_end < s_start {
+                // Light frames are before calibration
+                (s_start - l_end).num_days()
+            } else if l_start > s_end {
+                // Light frames are after calibration
+                (l_start - s_end).num_days()
+            } else {
+                // Ranges overlap
+                0
+            }
+        }
+        _ => 365 * 10,  // Missing dates = very large diff
+    }
+}
+
+fn calculate_match_score(details: &MatchDetails, calibration_type: &str) -> f64 {
+    // Base score starts at 1.0 and is reduced for mismatches
+    let mut score: f64 = 1.0;
+
+    // Critical parameters (must match for any score)
+    if !details.instrume_match {
+        score -= 0.5;  // Major penalty
+    }
+    if !details.binning_match {
+        score -= 0.3;
+    }
+    if !details.gain_match {
+        score -= 0.2;
+    }
+
+    // Filter matching only matters for flats
+    if calibration_type.to_lowercase() == "flat" && !details.filter_match {
+        score -= 0.4;  // Major penalty for wrong filter
+    }
+
+    // Temperature penalty (smaller penalty for close temps)
+    if let Some(temp_diff) = details.temp_diff {
+        if temp_diff > 10.0 {
+            score -= 0.15;
+        } else if temp_diff > 5.0 {
+            score -= 0.1;
+        } else if temp_diff > 2.0 {
+            score -= 0.05;
+        }
+    }
+
+    // Date penalty (prefer recent calibrations)
+    if details.date_diff_days > 365 {
+        score -= 0.15;
+    } else if details.date_diff_days > 90 {
+        score -= 0.1;
+    } else if details.date_diff_days > 30 {
+        score -= 0.05;
+    }
+
+    // Clamp to 0.0-1.0
+    score.max(0.0).min(1.0)
+}
+
+fn most_common_option(values: &[Option<String>]) -> Option<String> {
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<&String, usize> = HashMap::new();
+    for v in values.iter().flatten() {
+        *counts.entry(v).or_insert(0) += 1;
+    }
+
+    counts.into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(v, _)| v.clone())
+}
+
+fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
+    use std::collections::HashMap;
+
+    // Round to 2 decimal places for comparison
+    let mut counts: HashMap<i64, (f64, usize)> = HashMap::new();
+    for v in values.iter().flatten() {
+        let key = (*v * 100.0).round() as i64;
+        let entry = counts.entry(key).or_insert((*v, 0));
+        entry.1 += 1;
+    }
+
+    counts.into_iter()
+        .max_by_key(|(_, (_, count))| *count)
+        .map(|(_, (v, _))| v)
+}

@@ -11,21 +11,43 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 
 /// Insert a new calibration link
+///
+/// If `is_manual_override = false` (auto-find), this will skip updating existing manual overrides.
+/// If `is_manual_override = true` (manual assignment), this will always update.
 pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Result<i64> {
     let matched_at = link.matched_at.clone();
     let date_warning = if link.date_warning { 1 } else { 0 };
     let temp_warning = if link.temp_warning { 1 } else { 0 };
+    let is_manual_override = if link.is_manual_override { 1 } else { 0 };
+
+    // If this is an automatic assignment, check if there's a manual override we should preserve
+    if !link.is_manual_override {
+        let has_manual_override: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_to_frames
+             WHERE source_id = ?1 AND source_type = ?2 AND calibration_type = ?3 AND is_manual_override = 1",
+            params![link.source_id, &link.source_type, &link.calibration_type],
+            |row| row.get(0),
+        )?;
+
+        if has_manual_override > 0 {
+            // Skip - don't overwrite manual override with auto-find result
+            println!("⚠️ Skipping auto-find for frame {} {} - manual override exists",
+                link.source_id, link.calibration_type);
+            return Ok(0);
+        }
+    }
 
     conn.execute(
         "INSERT INTO calibration_set_to_frames
-         (source_id, source_type, calibration_set_id, calibration_type, matched_at, match_score, date_warning, temp_warning)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         (source_id, source_type, calibration_set_id, calibration_type, matched_at, match_score, date_warning, temp_warning, is_manual_override)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(source_id, source_type, calibration_type) DO UPDATE SET
          calibration_set_id = excluded.calibration_set_id,
          match_score = excluded.match_score,
          date_warning = excluded.date_warning,
          temp_warning = excluded.temp_warning,
-         matched_at = excluded.matched_at",
+         matched_at = excluded.matched_at,
+         is_manual_override = excluded.is_manual_override",
         params![
             link.source_id,
             &link.source_type,
@@ -34,7 +56,8 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
             &matched_at,
             link.match_score,
             date_warning,
-            temp_warning
+            temp_warning,
+            is_manual_override
         ],
     )?;
 
@@ -45,7 +68,7 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
 pub fn get_links_for_frame(conn: &Connection, frame_id: i64) -> Result<Vec<CalibrationLink>> {
     let mut stmt = conn.prepare(
         "SELECT id, source_id, source_type, calibration_set_id, calibration_type,
-                matched_at, match_score, date_warning, temp_warning
+                matched_at, match_score, date_warning, temp_warning, is_manual_override
          FROM calibration_set_to_frames
          WHERE source_id = ?1 AND source_type = 'frame'
          ORDER BY calibration_type"
@@ -62,6 +85,7 @@ pub fn get_links_for_frame(conn: &Connection, frame_id: i64) -> Result<Vec<Calib
             match_score: row.get(6)?,
             date_warning: row.get::<_, i32>(7)? == 1,
             temp_warning: row.get::<_, i32>(8)? == 1,
+            is_manual_override: row.get::<_, i32>(9)? == 1,
         })
     })?;
 
@@ -72,7 +96,7 @@ pub fn get_links_for_frame(conn: &Connection, frame_id: i64) -> Result<Vec<Calib
 pub fn get_links_for_calibration_set(conn: &Connection, set_id: i64) -> Result<Vec<CalibrationLink>> {
     let mut stmt = conn.prepare(
         "SELECT id, source_id, source_type, calibration_set_id, calibration_type,
-                matched_at, match_score, date_warning, temp_warning
+                matched_at, match_score, date_warning, temp_warning, is_manual_override
          FROM calibration_set_to_frames
          WHERE source_id = ?1 AND source_type = 'calibration_set'
          ORDER BY calibration_type"
@@ -89,6 +113,7 @@ pub fn get_links_for_calibration_set(conn: &Connection, set_id: i64) -> Result<V
             match_score: row.get(6)?,
             date_warning: row.get::<_, i32>(7)? == 1,
             temp_warning: row.get::<_, i32>(8)? == 1,
+            is_manual_override: row.get::<_, i32>(9)? == 1,
         })
     })?;
 
@@ -1120,6 +1145,7 @@ mod tests {
             match_score: Some(0.95),
             date_warning: false,
             temp_warning: false,
+            is_manual_override: false,
         };
 
         let link_id = insert_calibration_link(&conn, &link).unwrap();
@@ -1144,6 +1170,7 @@ mod tests {
             match_score: Some(0.95),
             date_warning: false,
             temp_warning: false,
+            is_manual_override: false,
         };
 
         insert_calibration_link(&conn, &link1).unwrap();
@@ -1175,6 +1202,7 @@ mod tests {
             match_score: Some(0.95),
             date_warning: false,
             temp_warning: false,
+            is_manual_override: false,
         };
 
         assert!(!link_exists(&conn, 1, "frame", "Dark").unwrap());

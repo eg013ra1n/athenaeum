@@ -1,5 +1,6 @@
-import { AlertTriangle, Calendar, Camera, ChevronDown, ChevronRight, Aperture, CheckCircle, XCircle } from 'lucide-react';
+import { AlertTriangle, Calendar, Camera, ChevronDown, ChevronRight, Aperture, CheckCircle, XCircle, Settings } from 'lucide-react';
 import { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   CalibrationDateGroup,
@@ -9,9 +10,12 @@ import type {
   CalibrationCameraGroup,
   CalibrationFilterGroup,
 } from '../types/models';
+import { ManualCalibrationModal } from './ManualCalibrationModal';
 
 interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
+  useBiasForDarkOptimization?: boolean;
+  onRefresh?: () => void;
 }
 
 // Aggregated warning with context
@@ -109,10 +113,74 @@ function WarningsList({ warnings, className = '' }: { warnings: AggregatedWarnin
   );
 }
 
-export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps) {
+export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = false, onRefresh }: CalibrationHierarchyViewProps) {
   // Track expanded state for each level
   // Keys: date, date:camera, date:camera:filter, date:camera:filter:frames
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
+
+  // Manual calibration modal state
+  const [manualModalOpen, setManualModalOpen] = useState(false);
+  const [manualModalFrameIds, setManualModalFrameIds] = useState<number[]>([]);
+  const [manualModalFilterDisplay, setManualModalFilterDisplay] = useState('');
+  const [manualModalCurrentFlat, setManualModalCurrentFlat] = useState<number | null>(null);
+  const [manualModalCurrentDark, setManualModalCurrentDark] = useState<number | null>(null);
+  const [manualModalCurrentBias, setManualModalCurrentBias] = useState<number | null>(null);
+
+  // Open manual calibration modal for a filter group
+  const openManualCalibrationModal = (filterGroup: CalibrationFilterGroup) => {
+    const frameIds = filterGroup.light_frames.map((f) => f.frame_id);
+    const currentFlat = filterGroup.flat_sets.length > 0 ? filterGroup.flat_sets[0].set.id ?? null : null;
+    const currentDark = filterGroup.dark_sets.length > 0 ? filterGroup.dark_sets[0].set.id ?? null : null;
+    const currentBias = filterGroup.bias_sets.length > 0 ? filterGroup.bias_sets[0].set.id ?? null : null;
+
+    setManualModalFrameIds(frameIds);
+    setManualModalFilterDisplay(filterGroup.filter_display);
+    setManualModalCurrentFlat(currentFlat);
+    setManualModalCurrentDark(currentDark);
+    setManualModalCurrentBias(currentBias);
+    setManualModalOpen(true);
+  };
+
+  // Handle manual calibration apply
+  const handleManualCalibrationApply = async (
+    flatSetId: number | null,
+    darkSetId: number | null,
+    biasSetId: number | null
+  ) => {
+    try {
+      // Apply each calibration type that was selected
+      if (flatSetId !== null && flatSetId !== manualModalCurrentFlat) {
+        await invoke('manual_assign_calibration', {
+          frameIds: manualModalFrameIds,
+          calibrationSetId: flatSetId,
+          calibrationType: 'Flat',
+        });
+      }
+      if (darkSetId !== null && darkSetId !== manualModalCurrentDark) {
+        await invoke('manual_assign_calibration', {
+          frameIds: manualModalFrameIds,
+          calibrationSetId: darkSetId,
+          calibrationType: 'Dark',
+        });
+      }
+      if (biasSetId !== null && biasSetId !== manualModalCurrentBias) {
+        await invoke('manual_assign_calibration', {
+          frameIds: manualModalFrameIds,
+          calibrationSetId: biasSetId,
+          calibrationType: 'Bias',
+        });
+      }
+
+      setManualModalOpen(false);
+
+      // Trigger refresh of parent data
+      if (onRefresh) {
+        onRefresh();
+      }
+    } catch (error) {
+      console.error('Failed to apply manual calibration:', error);
+    }
+  };
 
   const toggleItem = (key: string) => {
     setExpandedItems((prev) => {
@@ -288,29 +356,43 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
     return (
       <div className="ml-8 border-l border-gray-700">
         {/* Filter Header */}
-        <button
-          onClick={() => toggleItem(key)}
-          className="w-full px-4 py-2 flex items-center gap-3 hover:bg-gray-750 transition-colors text-left"
-        >
-          {isExpanded ? (
-            <ChevronDown className="w-4 h-4 text-gray-400" />
-          ) : (
-            <ChevronRight className="w-4 h-4 text-gray-400" />
-          )}
-          <Aperture size={16} className="text-cyan-400" />
-          <div className="flex-1">
-            <span className="text-gray-200">{filterGroup.filter_display}</span>
-            {filterWarnings.length > 0 && (
-              <span className="inline-flex items-center gap-1 ml-2">
-                <AlertTriangle className="w-4 h-4 text-orange-400" />
-                <span className="text-xs text-orange-400">({filterWarnings.length})</span>
-              </span>
+        <div className="flex items-center">
+          <button
+            onClick={() => toggleItem(key)}
+            className="flex-1 px-4 py-2 flex items-center gap-3 hover:bg-gray-750 transition-colors text-left"
+          >
+            {isExpanded ? (
+              <ChevronDown className="w-4 h-4 text-gray-400" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-gray-400" />
             )}
-          </div>
-          <span className="text-sm text-gray-500">
-            {filterGroup.frame_count} frame{filterGroup.frame_count !== 1 ? 's' : ''}
-          </span>
-        </button>
+            <Aperture size={16} className="text-cyan-400" />
+            <div className="flex-1">
+              <span className="text-gray-200">{filterGroup.filter_display}</span>
+              {filterWarnings.length > 0 && (
+                <span className="inline-flex items-center gap-1 ml-2">
+                  <AlertTriangle className="w-4 h-4 text-orange-400" />
+                  <span className="text-xs text-orange-400">({filterWarnings.length})</span>
+                </span>
+              )}
+            </div>
+            <span className="text-sm text-gray-500">
+              {filterGroup.frame_count} frame{filterGroup.frame_count !== 1 ? 's' : ''}
+            </span>
+          </button>
+          {/* Manual Calibration Button */}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              openManualCalibrationModal(filterGroup);
+            }}
+            className="px-3 py-1.5 mr-2 text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 rounded flex items-center gap-1.5 transition-colors"
+            title="Manual Calibration Selection"
+          >
+            <Settings className="w-3 h-3" />
+            Manual
+          </button>
+        </div>
 
         {/* Filter Expanded Content */}
         {isExpanded && (
@@ -551,6 +633,19 @@ export function CalibrationHierarchyView({ data }: CalibrationHierarchyViewProps
           <p>No frames found in this frame set.</p>
         </div>
       )}
+
+      {/* Manual Calibration Modal */}
+      <ManualCalibrationModal
+        isOpen={manualModalOpen}
+        frameIds={manualModalFrameIds}
+        filterDisplay={manualModalFilterDisplay}
+        currentFlatSetId={manualModalCurrentFlat}
+        currentDarkSetId={manualModalCurrentDark}
+        currentBiasSetId={manualModalCurrentBias}
+        useBiasForDarkOptimization={useBiasForDarkOptimization}
+        onApply={handleManualCalibrationApply}
+        onClose={() => setManualModalOpen(false)}
+      />
     </div>
   );
 }

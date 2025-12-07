@@ -1,11 +1,10 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Zap } from 'lucide-react';
-import type { ProcessingStats, FramesSet, FlatGroup } from '../types/models';
+import type { ProcessingStats, FramesSet } from '../types/models';
 import { FlatPattern } from '../types/models';
 import { CalibrationProcessModal } from './CalibrationProcessModal';
 import { FlatPatternModal } from './FlatPatternModal';
-import { ManualFlatSelectionModal } from './ManualFlatSelectionModal';
 
 interface CalibrationFinderButtonProps {
   frameSetId: number;
@@ -17,12 +16,9 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
   const [isProcessing, setIsProcessing] = useState(false);
   const [showProcessModal, setShowProcessModal] = useState(false);
   const [showPatternModal, setShowPatternModal] = useState(false);
-  const [showManualSelectionModal, setShowManualSelectionModal] = useState(false);
   const [stats, setStats] = useState<ProcessingStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [frameSet, setFrameSet] = useState<FramesSet | null>(null);
-  const [flatGroupOptions, setFlatGroupOptions] = useState<Record<string, FlatGroup[]>>({});
-  const [selectedPattern, setSelectedPattern] = useState<FlatPattern | null>(null);
   const [completedStats, setCompletedStats] = useState<ProcessingStats | null>(null);
 
   // Load frame set data when component mounts
@@ -67,7 +63,6 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
 
   const handlePatternSelected = async (pattern: FlatPattern, remember: boolean) => {
     setShowPatternModal(false);
-    setSelectedPattern(pattern);
 
     // Save pattern to frame set if remember is checked
     if (remember && frameSet) {
@@ -83,34 +78,8 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
       }
     }
 
-    // If manual pattern, show manual selection modal
-    if (pattern === FlatPattern.Manual) {
-      await loadFlatGroupOptions();
-      setShowManualSelectionModal(true);
-    } else {
-      // Auto pattern - proceed with calibration
-      await runCalibrationFinder(pattern, null);
-    }
-  };
-
-  const loadFlatGroupOptions = async () => {
-    try {
-      const options = await invoke<Record<string, FlatGroup[]>>('get_flat_group_options_for_frame_set', {
-        frameSetId
-      });
-      setFlatGroupOptions(options);
-    } catch (err) {
-      console.error('Failed to load flat group options:', err);
-      setError('Failed to load available flat groups');
-    }
-  };
-
-  const handleManualSelection = async (selections: Record<string, number>) => {
-    setShowManualSelectionModal(false);
-
-    // TODO: This needs to be updated to create calibration sets from the selected groups
-    // For now, we'll pass the selections directly and let the backend handle it
-    await runCalibrationFinder(selectedPattern || FlatPattern.Manual, selections);
+    // Proceed with calibration
+    await runCalibrationFinder(pattern, null);
   };
 
   const runCalibrationFinder = async (pattern: string | FlatPattern, manualSelections: Record<string, number> | null) => {
@@ -172,15 +141,6 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
           isOpen={showPatternModal}
           onSelect={handlePatternSelected}
           onCancel={() => setShowPatternModal(false)}
-        />
-      )}
-
-      {showManualSelectionModal && (
-        <ManualFlatSelectionModal
-          isOpen={showManualSelectionModal}
-          flatGroupOptions={flatGroupOptions}
-          onSelect={handleManualSelection}
-          onCancel={() => setShowManualSelectionModal(false)}
         />
       )}
 

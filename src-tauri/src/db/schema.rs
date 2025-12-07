@@ -248,6 +248,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             match_score REAL,
             date_warning INTEGER DEFAULT 0,
             temp_warning INTEGER DEFAULT 0,
+            is_manual_override INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE CASCADE,
             UNIQUE(source_id, source_type, calibration_type)
         )",
@@ -419,6 +420,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_flat_pattern {
         conn.execute(
             "ALTER TABLE frames_set ADD COLUMN flat_pattern TEXT",
+            [],
+        )?;
+    }
+
+    // Add is_manual_override to calibration_set_to_frames table (migration for existing databases)
+    let has_is_manual_override: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('calibration_set_to_frames') WHERE name='is_manual_override'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_is_manual_override {
+        conn.execute(
+            "ALTER TABLE calibration_set_to_frames ADD COLUMN is_manual_override INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

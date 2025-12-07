@@ -323,9 +323,24 @@ where
 }
 
 /// Clear all calibration links for a frame set
+///
+/// By default, this preserves manual overrides. Set `preserve_manual_overrides = false`
+/// to clear all links including manual ones.
 pub fn clear_calibration_links_for_frame_set(
     conn: &Connection,
     frame_set_id: i64,
+) -> Result<usize> {
+    clear_calibration_links_for_frame_set_with_options(conn, frame_set_id, true)
+}
+
+/// Clear calibration links for a frame set with options
+///
+/// # Arguments
+/// * `preserve_manual_overrides` - If true, manual overrides are kept
+pub fn clear_calibration_links_for_frame_set_with_options(
+    conn: &Connection,
+    frame_set_id: i64,
+    preserve_manual_overrides: bool,
 ) -> Result<usize> {
     // Get all frame IDs in the frame set
     let mut stmt = conn.prepare(
@@ -343,12 +358,28 @@ pub fn clear_calibration_links_for_frame_set(
     // Delete calibration links for each frame
     let mut total_deleted = 0;
     for frame_id in frame_ids {
-        let deleted = conn.execute(
-            "DELETE FROM calibration_set_to_frames
-             WHERE source_id = ?1 AND source_type = 'frame'",
-            [frame_id],
-        )?;
+        let deleted = if preserve_manual_overrides {
+            // Only delete non-manual links
+            conn.execute(
+                "DELETE FROM calibration_set_to_frames
+                 WHERE source_id = ?1 AND source_type = 'frame' AND is_manual_override = 0",
+                [frame_id],
+            )?
+        } else {
+            // Delete all links
+            conn.execute(
+                "DELETE FROM calibration_set_to_frames
+                 WHERE source_id = ?1 AND source_type = 'frame'",
+                [frame_id],
+            )?
+        };
         total_deleted += deleted;
+    }
+
+    if preserve_manual_overrides {
+        println!("✅ Cleared {} auto-find links (manual overrides preserved)", total_deleted);
+    } else {
+        println!("✅ Cleared {} calibration links (including manual)", total_deleted);
     }
 
     Ok(total_deleted)

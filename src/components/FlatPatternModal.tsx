@@ -33,11 +33,6 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
       label: 'Long-term Reuse',
       description: 'Use the same flats over weeks/months (prefers oldest valid flat set)',
     },
-    {
-      value: FlatPattern.Manual,
-      label: 'Manual Selection',
-      description: 'Choose which flat set to use for each filter',
-    },
   ];
 
   return (

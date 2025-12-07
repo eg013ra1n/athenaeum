@@ -376,6 +376,7 @@ export interface CalibrationLink {
   match_score: number | null;  // 0.0-1.0 confidence
   date_warning: boolean;
   temp_warning: boolean;
+  is_manual_override: boolean;  // true if manually assigned by user
 }
 
 export interface FrameCalibrationStatus {
@@ -561,6 +562,40 @@ export interface CalibrationSetWithFrameCount {
   frame_count: number;        // How many frames in this group use this set
   frame_ids: number[];        // Which frames use this set
   warnings: CalibrationWarning[];
+}
+
+/** A calibration set with match score for manual selection */
+export interface CalibrationSetWithScore {
+  set: CalibrationSetDetail;
+  match_score: number;        // 0.0-1.0, higher is better match
+  match_details: MatchDetails;
+}
+
+/** Details about how well a calibration set matches light frame parameters */
+export interface MatchDetails {
+  instrume_match: boolean;    // Camera matches
+  binning_match: boolean;     // Binning matches
+  gain_match: boolean;        // Gain matches (or both null)
+  filter_match: boolean;      // Filter matches (only relevant for flats)
+  temp_diff: number | null;   // Temperature difference in Celsius
+  date_diff_days: number;     // Days between calibration and light frames
+}
+
+/** Average parameters of light frames for manual selection display */
+export interface LightFrameParameters {
+  instrume: string | null;
+  binning: string | null;
+  gain: number | null;
+  offset: number | null;
+  filter: string | null;
+  avg_ccd_temp: number | null;
+  avg_exptime: number | null;
+  exptime_range: [number, number] | null;  // [min, max]
+  frame_count: number;
+  date_range: [string, string] | null;     // [start, end]
+  current_flat_set_id: number | null;
+  current_dark_set_id: number | null;
+  current_bias_set_id: number | null;
 }
 
 /** Group of frames for a single filter within a camera */

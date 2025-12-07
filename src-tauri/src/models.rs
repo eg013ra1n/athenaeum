@@ -479,6 +479,7 @@ pub struct CalibrationLink {
     pub match_score: Option<f64>,  // 0.0-1.0 confidence
     pub date_warning: bool,
     pub temp_warning: bool,
+    pub is_manual_override: bool,  // true if manually assigned by user
 }
 
 /// Calibration status for a single frame
@@ -630,6 +631,43 @@ pub struct CalibrationSetWithFrameCount {
     pub frame_count: i64,              // How many frames in this group use this set
     pub frame_ids: Vec<i64>,           // Which frames use this set
     pub warnings: Vec<CalibrationWarning>,
+}
+
+/// A calibration set with match score for manual selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSetWithScore {
+    pub set: CalibrationSetDetail,
+    pub match_score: f64,              // 0.0-1.0, higher is better match
+    pub match_details: MatchDetails,
+}
+
+/// Details about how well a calibration set matches light frame parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchDetails {
+    pub instrume_match: bool,          // Camera matches
+    pub binning_match: bool,           // Binning matches
+    pub gain_match: bool,              // Gain matches (or both null)
+    pub filter_match: bool,            // Filter matches (only relevant for flats)
+    pub temp_diff: Option<f64>,        // Temperature difference in Celsius
+    pub date_diff_days: i64,           // Days between calibration and light frames
+}
+
+/// Average parameters of light frames for manual selection display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightFrameParameters {
+    pub instrume: Option<String>,
+    pub binning: Option<String>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    pub filter: Option<String>,
+    pub avg_ccd_temp: Option<f64>,
+    pub avg_exptime: Option<f64>,
+    pub exptime_range: Option<(f64, f64)>,  // min, max
+    pub frame_count: usize,
+    pub date_range: Option<(String, String)>,  // start, end
+    pub current_flat_set_id: Option<i64>,
+    pub current_dark_set_id: Option<i64>,
+    pub current_bias_set_id: Option<i64>,
 }
 
 /// Group of frames for a single filter within a camera

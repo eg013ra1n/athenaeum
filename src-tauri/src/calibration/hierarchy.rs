@@ -390,6 +390,7 @@ pub fn build_complete_hierarchy(
                 match_score: Some(best_flat_calib.match_score),
                 date_warning: best_flat_calib.date_warning,
                 temp_warning: best_flat_calib.temp_warning,
+                is_manual_override: false,
             });
 
             // Add date warning for sub-calibration (Dark/Bias for Flat)
@@ -548,6 +549,7 @@ pub fn store_calibration_hierarchy(
                 // Warnings are calculated dynamically - not stored
                 date_warning: false,
                 temp_warning: false,
+                is_manual_override: false,
             };
             insert_calibration_link(conn, &link)?;
 
@@ -557,6 +559,7 @@ pub fn store_calibration_hierarchy(
                 let clean_sub_link = CalibrationLink {
                     date_warning: false,
                     temp_warning: false,
+                    is_manual_override: false,
                     ..sub_link.clone()
                 };
                 insert_calibration_link(conn, &clean_sub_link)?;
@@ -578,6 +581,7 @@ pub fn store_calibration_hierarchy(
                 // Warnings are calculated dynamically - not stored
                 date_warning: false,
                 temp_warning: false,
+                is_manual_override: false,
             };
             insert_calibration_link(conn, &link)?;
 
@@ -587,6 +591,7 @@ pub fn store_calibration_hierarchy(
                 let clean_sub_link = CalibrationLink {
                     date_warning: false,
                     temp_warning: false,
+                    is_manual_override: false,
                     ..sub_link.clone()
                 };
                 insert_calibration_link(conn, &clean_sub_link)?;

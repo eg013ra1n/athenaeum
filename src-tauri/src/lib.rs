@@ -132,6 +132,10 @@ pub fn run() {
             commands::get_calibration_matching_config,
             commands::set_calibration_matching_config,
             commands::reset_calibration_matching_config,
+            commands::get_light_frame_parameters,
+            commands::get_calibration_sets_for_manual_selection,
+            commands::manual_assign_calibration,
+            commands::clear_manual_calibration_override,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())
