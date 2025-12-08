@@ -272,7 +272,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
           <div>
             <span className="text-gray-400">Date:</span>{' '}
             <span className="text-gray-200">
-              {set.date_start ? new Date(set.date_start).toLocaleDateString() : set.date_display}
+              {set.date_start ? new Date(set.date_start).toLocaleDateString('en-GB') : set.date_display}
             </span>
           </div>
           <div>

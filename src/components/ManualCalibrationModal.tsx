@@ -53,6 +53,10 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Date range filter (only used when showAll is true)
+  const [filterDateFrom, setFilterDateFrom] = useState<string>('');
+  const [filterDateTo, setFilterDateTo] = useState<string>('');
+
   // Selections
   const [selectedFlatId, setSelectedFlatId] = useState<number | null>(currentFlatSetId ?? null);
   const [selectedDarkId, setSelectedDarkId] = useState<number | null>(currentDarkSetId ?? null);
@@ -226,7 +230,7 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
           <div className="flex items-center gap-2 text-gray-400">
             <Calendar className="w-3 h-3" />
             <span className={match_details.date_diff_days > 30 ? 'text-orange-400' : 'text-gray-300'}>
-              {set.date_start ? new Date(set.date_start).toLocaleDateString() : set.date_display}
+              {set.date_start ? new Date(set.date_start).toLocaleDateString('en-GB') : set.date_display}
               {match_details.date_diff_days > 0 && ` (${match_details.date_diff_days}d)`}
             </span>
           </div>
@@ -303,9 +307,24 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     }
   };
 
-  const sets = getCurrentSets();
+  const rawSets = getCurrentSets();
   const selectedId = getSelectedId();
   const currentId = getCurrentId();
+
+  // Apply date filter when showAll is enabled
+  const filterSetsByDate = (sets: CalibrationSetWithScore[]) => {
+    if (!showAll || (!filterDateFrom && !filterDateTo)) return sets;
+    return sets.filter(s => {
+      if (!s.set.date_start) return true;
+      const setDate = new Date(s.set.date_start);
+      if (filterDateFrom && setDate < new Date(filterDateFrom)) return false;
+      if (filterDateTo && setDate > new Date(filterDateTo + 'T23:59:59')) return false;
+      return true;
+    });
+  };
+
+  const sets = filterSetsByDate(rawSets);
+  const isFiltered = showAll && (filterDateFrom || filterDateTo) && sets.length !== rawSets.length;
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 overflow-y-auto">
@@ -488,8 +507,36 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
                 </button>
               )}
 
-              {/* Show All Toggle */}
-              <div className="ml-auto flex items-center px-4">
+              {/* Show All Toggle and Date Filter */}
+              <div className="ml-auto flex items-center gap-3 px-4">
+                {/* Date filter (only when showAll is enabled) */}
+                {showAll && (
+                  <div className="flex items-center gap-2 text-sm">
+                    <span className="text-gray-400">From:</span>
+                    <input
+                      type="date"
+                      value={filterDateFrom}
+                      onChange={(e) => setFilterDateFrom(e.target.value)}
+                      className="bg-gray-700 text-gray-200 rounded px-2 py-1 text-xs border border-gray-600 focus:border-blue-500 focus:outline-none"
+                    />
+                    <span className="text-gray-400">To:</span>
+                    <input
+                      type="date"
+                      value={filterDateTo}
+                      onChange={(e) => setFilterDateTo(e.target.value)}
+                      className="bg-gray-700 text-gray-200 rounded px-2 py-1 text-xs border border-gray-600 focus:border-blue-500 focus:outline-none"
+                    />
+                    {(filterDateFrom || filterDateTo) && (
+                      <button
+                        onClick={() => { setFilterDateFrom(''); setFilterDateTo(''); }}
+                        className="text-gray-400 hover:text-gray-200 text-xs px-1"
+                        title="Clear date filter"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                )}
                 <button
                   onClick={() => setShowAll(!showAll)}
                   className={`flex items-center gap-2 px-3 py-1.5 rounded text-sm transition-colors ${
@@ -525,6 +572,12 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
                 </div>
               ) : (
                 <div className="space-y-3">
+                  {/* Show filter count when filtering is active */}
+                  {isFiltered && (
+                    <div className="text-xs text-gray-400 mb-2">
+                      Showing {sets.length} of {rawSets.length} sets
+                    </div>
+                  )}
                   {sets.map((setWithScore) => (
                     <CalibrationSetRow
                       key={setWithScore.set.id}
