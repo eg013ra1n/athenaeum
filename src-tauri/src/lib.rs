@@ -69,6 +69,7 @@ pub fn run() {
             commands::rescan_all_for_content_hash,
             commands::get_files,
             commands::get_files_by_directory,
+            commands::get_frames_with_missing_metadata,
             commands::get_duplicates,
             commands::get_directory_contents,
             commands::get_setting,

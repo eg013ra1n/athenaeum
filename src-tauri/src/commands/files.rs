@@ -45,6 +45,25 @@ pub async fn get_files_by_directory(
         .collect())
 }
 
+/// Get frames with missing metadata
+/// category: "all", "coordinates", "object", "datetime", "instrument"
+#[tauri::command]
+pub async fn get_frames_with_missing_metadata(
+    category: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<FileWithFrame>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let files = db::get_frames_with_missing_metadata(&conn, &category).map_err(|e| e.to_string())?;
+
+    Ok(files
+        .into_iter()
+        .map(|(file, frame)| FileWithFrame { file: file, frame: Some(frame) })
+        .collect())
+}
+
 /// Get duplicate file groups
 #[tauri::command]
 pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateGroup>, String> {

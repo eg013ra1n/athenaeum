@@ -404,6 +404,98 @@ pub fn get_files_by_directory(
     results.collect()
 }
 
+/// Get Light frames with missing metadata
+/// category: "all", "coordinates", "object", "datetime", "instrument"
+pub fn get_frames_with_missing_metadata(
+    conn: &Connection,
+    category: &str,
+) -> Result<Vec<(File, Frame)>> {
+    let missing_clause = match category {
+        "coordinates" => "(fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)",
+        "object" => "fr.object IS NULL OR fr.object = ''",
+        "datetime" => "fr.date_obs IS NULL",
+        "instrument" => "fr.instrume IS NULL OR fr.instrume = ''",
+        _ => "((fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)) OR (fr.object IS NULL OR fr.object = '') OR fr.date_obs IS NULL OR (fr.instrume IS NULL OR fr.instrume = '')",
+    };
+
+    let query = format!(
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
+                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
+                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override
+         FROM files f
+         INNER JOIN frames fr ON f.id = fr.file_id
+         WHERE UPPER(fr.imagetyp) = 'LIGHT' AND ({})
+         ORDER BY f.modified_at DESC",
+        missing_clause
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let results = stmt.query_map([], |row| {
+        let file = File {
+            id: Some(row.get(0)?),
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            size: row.get(3)?,
+            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            format: if row.get::<_, String>(5)? == "FITS" {
+                FileFormat::FITS
+            } else {
+                FileFormat::XISF
+            },
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            metadata_hash: row.get(7)?,
+            content_hash: row.get(8)?,
+        };
+
+        let frame = Frame {
+            id: Some(row.get(9)?),
+            file_id: file.id.unwrap(),
+            object: row.get(10).ok(),
+            date_obs: row.get::<_, Option<String>>(11).ok().flatten().and_then(|s| {
+                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            }),
+            telescop: row.get(12).ok(),
+            instrume: row.get(13).ok(),
+            exptime: row.get(14).ok(),
+            filter: row.get(15).ok(),
+            imagetyp: row.get::<_, Option<String>>(16).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+            is_master: row.get::<_, i32>(17).ok().map(|v| v == 1).unwrap_or(false),
+            gain: row.get(18).ok(),
+            offset: row.get(19).ok(),
+            binning: row.get(20).ok(),
+            xbinning: row.get(21).ok(),
+            ybinning: row.get(22).ok(),
+            ccd_temp: row.get(23).ok(),
+            set_temp: row.get(24).ok(),
+            focallen: row.get(25).ok(),
+            xpixsz: row.get(26).ok(),
+            pixsz: row.get(27).ok(),
+            naxis1: row.get(28).ok(),
+            naxis2: row.get(29).ok(),
+            ra: row.get(30).ok(),
+            dec: row.get(31).ok(),
+            sitelat: row.get(32).ok(),
+            lat_obs: row.get(33).ok(),
+            sitelong: row.get(34).ok(),
+            long_obs: row.get(35).ok(),
+            objctra: row.get(36).ok(),
+            objctdec: row.get(37).ok(),
+            override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
+        };
+
+        Ok((file, frame))
+    })?;
+
+    results.collect()
+}
+
 /// Find duplicates by filename and metadata, or by content hash
 /// Only includes files from scan roots where find_duplicates = 1
 ///
