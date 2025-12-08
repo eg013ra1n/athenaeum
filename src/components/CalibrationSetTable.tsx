@@ -7,12 +7,13 @@ import BlinkViewer from "./BlinkViewer";
 
 interface CalibrationSetTableProps {
   sets: CalibrationSetDetail[];
+  showFilterColumn?: boolean;
 }
 
-type SortField = "imagetyp" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
+type SortField = "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
 type SortDirection = "asc" | "desc";
 
-export default function CalibrationSetTable({ sets }: CalibrationSetTableProps) {
+export default function CalibrationSetTable({ sets, showFilterColumn = false }: CalibrationSetTableProps) {
   const [sortField, setSortField] = useState<SortField>("exptime");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
@@ -119,6 +120,17 @@ export default function CalibrationSetTable({ sets }: CalibrationSetTableProps) 
                 <SortIcon field="imagetyp" />
               </button>
             </th>
+            {showFilterColumn && (
+              <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
+                <button
+                  onClick={() => handleSort("filter")}
+                  className="flex items-center gap-1 hover:text-gray-200 transition-colors"
+                >
+                  Filter
+                  <SortIcon field="filter" />
+                </button>
+              </th>
+            )}
             <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
               <button
                 onClick={() => handleSort("exptime")}
@@ -207,12 +219,21 @@ export default function CalibrationSetTable({ sets }: CalibrationSetTableProps) 
                       className={`px-2 py-1 rounded text-xs font-medium ${
                         set.imagetyp === "Dark"
                           ? "bg-purple-900/30 text-purple-400 border border-purple-700"
+                          : set.imagetyp === "Flat"
+                          ? "bg-yellow-900/30 text-yellow-400 border border-yellow-700"
                           : "bg-blue-900/30 text-blue-400 border border-blue-700"
                       }`}
                     >
                       {set.imagetyp}
                     </span>
                   </td>
+
+                  {/* Filter (for flats) */}
+                  {showFilterColumn && (
+                    <td className="px-4 py-3 text-sm text-gray-100">
+                      {set.filter || "—"}
+                    </td>
+                  )}
 
                   {/* Exposure */}
                   <td className="px-4 py-3 text-sm text-gray-100">
@@ -283,12 +304,18 @@ export default function CalibrationSetTable({ sets }: CalibrationSetTableProps) 
                     key={`${rowId}-expanded`}
                     className="bg-gray-900 border-t border-gray-700"
                   >
-                    <td colSpan={9} className="px-4 py-4">
+                    <td colSpan={showFilterColumn ? 10 : 9} className="px-4 py-4">
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                         <div>
                           <span className="text-gray-400">Set ID:</span>
                           <span className="ml-2 text-gray-100">{set.id}</span>
                         </div>
+                        {showFilterColumn && set.filter && (
+                          <div>
+                            <span className="text-gray-400">Filter:</span>
+                            <span className="ml-2 text-gray-100">{set.filter}</span>
+                          </div>
+                        )}
                         <div>
                           <span className="text-gray-400">Avg Temp:</span>
                           <span className="ml-2 text-gray-100">

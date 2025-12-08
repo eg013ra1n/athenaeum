@@ -1,9 +1,17 @@
 import { useState } from "react";
-import { ArrowLeft, Zap } from "lucide-react";
-import DarkLibrary from "./DarkLibrary";
+import { ArrowLeft, RefreshCw, Package, Calendar } from "lucide-react";
+import DarkLibrary, { LibraryStats } from "./DarkLibrary";
 import { invoke } from "@tauri-apps/api/core";
-import { DarkLibraryResult, ImageType } from "../types/models";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { ImageType } from "../types/models";
+import { format } from "date-fns";
+
+interface CalibrationScanResult {
+  sets_created: number;
+  flat_sets_created: number;
+  dark_sets_created: number;
+  bias_sets_created: number;
+  darkflat_sets_created: number;
+}
 
 interface CameraDetailProps {
   instrume: string;
@@ -14,40 +22,29 @@ type TabType = "darks" | "flats";
 
 export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
   const [activeTab, setActiveTab] = useState<TabType>("darks");
-  const [creating, setCreating] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [showConfirm, setShowConfirm] = useState(false);
+  const [currentStats, setCurrentStats] = useState<LibraryStats | null>(null);
 
-  const handleCreateBothLibraries = async () => {
-    setShowConfirm(true);
-  };
-
-  const confirmCreate = async () => {
-    setShowConfirm(false);
-
+  const handleRefreshLibrary = async () => {
     try {
-      setCreating(true);
+      setRefreshing(true);
       setError(null);
       setSuccessMessage(null);
 
-      // Create dark library (single frames)
-      const darkResult = await invoke<DarkLibraryResult>("create_dark_library", { instrume });
-
-      // Create master library (master frames)
-      const masterResult = await invoke<DarkLibraryResult>("create_master_dark_library", { instrume });
+      const result = await invoke<CalibrationScanResult>("refresh_calibration_library_for_camera", { instrume });
 
       setSuccessMessage(
-        `Created ${darkResult.sets_created} dark sets (${darkResult.frames_grouped} frames) and ${masterResult.sets_created} master sets (${masterResult.frames_grouped} frames)`
+        `Refreshed library: ${result.sets_created} sets created (${result.flat_sets_created} flat, ${result.dark_sets_created} dark, ${result.bias_sets_created} bias, ${result.darkflat_sets_created} darkflat)`
       );
 
-      // Trigger refresh in child components by forcing re-render
-      // The child components will reload when they detect the change
+      // Trigger refresh in child components
       window.dispatchEvent(new CustomEvent("library-updated"));
     } catch (err) {
       setError(err as string);
     } finally {
-      setCreating(false);
+      setRefreshing(false);
     }
   };
 
@@ -66,16 +63,36 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-3xl font-bold mb-2">Calibration Library</h2>
-            <p className="text-gray-400">{instrume}</p>
+            <div className="flex items-center gap-4">
+              <span className="text-gray-400">{instrume}</span>
+              {currentStats && currentStats.totalSets > 0 && (
+                <>
+                  <div className="flex items-center gap-1.5 text-sm">
+                    <Package className="text-blue-400" size={14} />
+                    <span className="text-gray-400">Sets:</span>
+                    <span className="text-gray-100 font-medium">{currentStats.totalSets}</span>
+                  </div>
+                  {currentStats.dateFrom && currentStats.dateTo && (
+                    <div className="flex items-center gap-1.5 text-sm">
+                      <Calendar className="text-orange-400" size={14} />
+                      <span className="text-gray-400">Coverage:</span>
+                      <span className="text-gray-100 font-medium">
+                        {format(new Date(currentStats.dateFrom), "MMM yyyy")} - {format(new Date(currentStats.dateTo), "MMM yyyy")}
+                      </span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           </div>
 
           <button
-            onClick={handleCreateBothLibraries}
-            disabled={creating}
+            onClick={handleRefreshLibrary}
+            disabled={refreshing}
             className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <Zap size={16} className={creating ? "animate-pulse" : ""} />
-            {creating ? "Creating..." : "Create Both Libraries"}
+            <RefreshCw size={16} className={refreshing ? "animate-spin" : ""} />
+            {refreshing ? "Refreshing..." : "Refresh"}
           </button>
         </div>
       </div>
@@ -128,6 +145,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
             instrume={instrume}
             isTabView={true}
             imageTypeFilter={[ImageType.Dark, ImageType.Bias, ImageType.DarkFlat]}
+            onStatsChange={setCurrentStats}
           />
         )}
         {activeTab === "flats" && (
@@ -135,18 +153,11 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
             instrume={instrume}
             isTabView={true}
             imageTypeFilter={[ImageType.Flat]}
+            onStatsChange={setCurrentStats}
           />
         )}
       </div>
 
-      {/* Confirm Dialog */}
-      <ConfirmDialog
-        isOpen={showConfirm}
-        title="Create Both Libraries"
-        message="This will create both Dark Library (single frames) and Master Library (master frames) in one go. Continue?"
-        onConfirm={confirmCreate}
-        onCancel={() => setShowConfirm(false)}
-      />
     </div>
   );
 }

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, Plus, RefreshCw } from "lucide-react";
 import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
-import DarkLibraryFilters, { FilterState } from "./DarkLibraryFilters";
+import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
 import QuickStats from "./QuickStats";
 import { ConfirmDialog } from "./ConfirmDialog";
 
@@ -20,14 +20,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [showConfirm, setShowConfirm] = useState(false);
-  const [filters, setFilters] = useState<FilterState>({
-    types: [],
-    gains: [],
-    offsets: [],
-    binnings: [],
-    tempBands: [],
-    exposures: [],
-  });
+  const [filters, setFilters] = useState<FilterState>(emptyFilters);
 
   useEffect(() => {
     checkAndLoadLibrary();
@@ -98,52 +91,46 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
     setFilters(newFilters);
   };
 
+  // Master library is always darks mode
+  const filterMode: FilterMode = "darks";
+
   // Apply filters to sets
   const filteredSets = useMemo(() => {
     return sets.filter(set => {
       // Type filter
-      if (filters.types.length > 0 && !filters.types.includes(set.imagetyp)) {
-        return false;
-      }
-
-      // Gain filter
-      if (filters.gains.length > 0 && !filters.gains.includes(set.gain!)) {
-        return false;
-      }
-
-      // Offset filter
-      if (filters.offsets.length > 0 && !filters.offsets.includes(set.offset!)) {
-        return false;
-      }
-
-      // Binning filter
-      if (filters.binnings.length > 0 && !filters.binnings.includes(set.binning!)) {
+      if (filters.type !== null && set.imagetyp !== filters.type) {
         return false;
       }
 
       // Exposure filter
-      if (filters.exposures.length > 0 && !filters.exposures.includes(set.exptime!)) {
+      if (filters.exposure !== null && set.exptime !== filters.exposure) {
         return false;
       }
 
       // Temperature band filter
-      if (filters.tempBands.length > 0) {
+      if (filters.tempBand !== null) {
         const temp = set.ccd_temp;
-        let matchesBand = false;
-
-        for (const band of filters.tempBands) {
-          const match = band.match(/(-?\d+) to (-?\d+)/);
-          if (match) {
-            const min = parseInt(match[1]);
-            const max = parseInt(match[2]);
-            if (temp >= min && temp < max) {
-              matchesBand = true;
-              break;
-            }
+        const match = filters.tempBand.match(/(-?\d+) to (-?\d+)/);
+        if (match) {
+          const min = parseInt(match[1]);
+          const max = parseInt(match[2]);
+          if (temp < min || temp >= max) {
+            return false;
           }
         }
+      }
 
-        if (!matchesBand) {
+      // Date range filter
+      if (filters.dateFrom !== null) {
+        const setDate = set.date_start.split('T')[0];
+        if (setDate < filters.dateFrom) {
+          return false;
+        }
+      }
+
+      if (filters.dateTo !== null) {
+        const setDate = set.date_end.split('T')[0];
+        if (setDate > filters.dateTo) {
           return false;
         }
       }
@@ -241,7 +228,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
       {!loading && sets.length > 0 && (
         <div>
           {/* Filters */}
-          <DarkLibraryFilters sets={sets} onFilterChange={handleFilterChange} />
+          <DarkLibraryFilters sets={sets} filters={filters} onFilterChange={handleFilterChange} mode={filterMode} />
 
           {/* Quick Stats */}
           <QuickStats sets={filteredSets} />
@@ -260,14 +247,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
                 No master calibration sets match your filters
               </p>
               <button
-                onClick={() => setFilters({
-                  types: [],
-                  gains: [],
-                  offsets: [],
-                  binnings: [],
-                  tempBands: [],
-                  exposures: [],
-                })}
+                onClick={() => setFilters(emptyFilters)}
                 className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors"
               >
                 Clear Filters

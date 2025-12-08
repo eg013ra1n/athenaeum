@@ -1,34 +1,29 @@
 import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Plus, RefreshCw } from "lucide-react";
-import { CalibrationSetDetail, DarkLibraryResult, ImageType } from "../types/models";
+import { ArrowLeft } from "lucide-react";
+import { CalibrationSetDetail, ImageType } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
-import DarkLibraryFilters, { FilterState } from "./DarkLibraryFilters";
-import QuickStats from "./QuickStats";
-import { ConfirmDialog } from "./ConfirmDialog";
+import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
+
+export interface LibraryStats {
+  totalSets: number;
+  dateFrom: string | null;
+  dateTo: string | null;
+}
 
 interface DarkLibraryProps {
   instrume: string;
   onClose?: () => void;
   isTabView?: boolean;
   imageTypeFilter?: ImageType[];
+  onStatsChange?: (stats: LibraryStats) => void;
 }
 
-export default function DarkLibrary({ instrume, onClose, isTabView = false, imageTypeFilter }: DarkLibraryProps) {
+export default function DarkLibrary({ instrume, onClose, isTabView = false, imageTypeFilter, onStatsChange }: DarkLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
-  const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [showConfirm, setShowConfirm] = useState(false);
-  const [filters, setFilters] = useState<FilterState>({
-    types: [],
-    gains: [],
-    offsets: [],
-    binnings: [],
-    tempBands: [],
-    exposures: [],
-  });
+  const [filters, setFilters] = useState<FilterState>(emptyFilters);
 
   useEffect(() => {
     checkAndLoadLibrary();
@@ -65,98 +60,93 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
     }
   };
 
-  const handleCreateLibrary = async () => {
-    try {
-      setCreating(true);
-      setError(null);
-      setSuccessMessage(null);
-
-      const result = await invoke<DarkLibraryResult>("create_dark_library", { instrume });
-
-      setSuccessMessage(
-        `Created ${result.sets_created} calibration sets with ${result.frames_grouped} frames`
-      );
-
-      // Reload the library
-      await checkAndLoadLibrary();
-    } catch (err) {
-      setError(err as string);
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  const handleRegenerateLibrary = async () => {
-    setShowConfirm(true);
-  };
-
-  const confirmRegenerate = async () => {
-    setShowConfirm(false);
-    await handleCreateLibrary();
-  };
-
   const handleFilterChange = (newFilters: FilterState) => {
     setFilters(newFilters);
   };
 
-  // Apply filters to sets
+  // Determine filter mode based on imageTypeFilter
+  const filterMode: FilterMode = imageTypeFilter?.length === 1 && imageTypeFilter[0] === "Flat" ? "flats" : "darks";
+
+  // Pre-filter sets by imageTypeFilter (for filter dropdown options)
+  const tabFilteredSets = useMemo(() => {
+    if (!imageTypeFilter || imageTypeFilter.length === 0) {
+      return sets;
+    }
+    return sets.filter(set => imageTypeFilter.includes(set.imagetyp));
+  }, [sets, imageTypeFilter]);
+
+  // Apply user filters to sets
   const filteredSets = useMemo(() => {
-    return sets.filter(set => {
-      // Apply imageTypeFilter first (from props)
-      if (imageTypeFilter && imageTypeFilter.length > 0 && !imageTypeFilter.includes(set.imagetyp)) {
+    return tabFilteredSets.filter(set => {
+      // Type filter (from user selection) - darks mode only
+      if (filters.type !== null && set.imagetyp !== filters.type) {
         return false;
       }
 
-      // Type filter (from user selection)
-      if (filters.types.length > 0 && !filters.types.includes(set.imagetyp)) {
+      // Optical filter (for flats)
+      if (filters.filter !== null && set.filter !== filters.filter) {
         return false;
       }
 
-      // Gain filter
-      if (filters.gains.length > 0 && !filters.gains.includes(set.gain!)) {
+      // Exposure filter (exact match - darks mode)
+      if (filters.exposure !== null && set.exptime !== filters.exposure) {
         return false;
       }
 
-      // Offset filter
-      if (filters.offsets.length > 0 && !filters.offsets.includes(set.offset!)) {
+      // Exposure range filter (flats mode)
+      if (filters.expFrom !== null && set.exptime !== null && set.exptime < filters.expFrom) {
         return false;
       }
-
-      // Binning filter
-      if (filters.binnings.length > 0 && !filters.binnings.includes(set.binning!)) {
-        return false;
-      }
-
-      // Exposure filter
-      if (filters.exposures.length > 0 && !filters.exposures.includes(set.exptime!)) {
+      if (filters.expTo !== null && set.exptime !== null && set.exptime > filters.expTo) {
         return false;
       }
 
       // Temperature band filter
-      if (filters.tempBands.length > 0) {
+      if (filters.tempBand !== null) {
         const temp = set.ccd_temp;
-        let matchesBand = false;
-
-        for (const band of filters.tempBands) {
-          const match = band.match(/(-?\d+) to (-?\d+)/);
-          if (match) {
-            const min = parseInt(match[1]);
-            const max = parseInt(match[2]);
-            if (temp >= min && temp < max) {
-              matchesBand = true;
-              break;
-            }
+        const match = filters.tempBand.match(/(-?\d+) to (-?\d+)/);
+        if (match) {
+          const min = parseInt(match[1]);
+          const max = parseInt(match[2]);
+          if (temp < min || temp >= max) {
+            return false;
           }
         }
+      }
 
-        if (!matchesBand) {
+      // Date range filter
+      if (filters.dateFrom !== null) {
+        const setDate = set.date_start.split('T')[0];
+        if (setDate < filters.dateFrom) {
+          return false;
+        }
+      }
+
+      if (filters.dateTo !== null) {
+        const setDate = set.date_end.split('T')[0];
+        if (setDate > filters.dateTo) {
           return false;
         }
       }
 
       return true;
     });
-  }, [sets, filters, imageTypeFilter]);
+  }, [tabFilteredSets, filters]);
+
+  // Report stats to parent when filtered sets change
+  useEffect(() => {
+    if (onStatsChange && filteredSets.length > 0) {
+      const allDates = filteredSets.flatMap(set => [set.date_start, set.date_end]).filter(d => d);
+      const sortedDates = allDates.sort();
+      onStatsChange({
+        totalSets: filteredSets.length,
+        dateFrom: sortedDates.length > 0 ? sortedDates[0] : null,
+        dateTo: sortedDates.length > 0 ? sortedDates[sortedDates.length - 1] : null,
+      });
+    } else if (onStatsChange) {
+      onStatsChange({ totalSets: 0, dateFrom: null, dateTo: null });
+    }
+  }, [filteredSets, onStatsChange]);
 
   return (
     <div className={isTabView ? "" : "p-6"}>
@@ -171,50 +161,17 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
             Back to Equipment
           </button>
 
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-3xl font-bold mb-2">Dark Library</h2>
-              <p className="text-gray-400">{instrume}</p>
-            </div>
-
-            {sets.length > 0 && (
-              <button
-                onClick={handleRegenerateLibrary}
-                disabled={creating}
-                className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
-                Regenerate
-              </button>
-            )}
+          <div>
+            <h2 className="text-3xl font-bold mb-2">Dark Library</h2>
+            <p className="text-gray-400">{instrume}</p>
           </div>
         </div>
       )}
 
-      {/* In tab view, show regenerate button at the top */}
-      {isTabView && sets.length > 0 && (
-        <div className="mb-4 flex justify-end">
-          <button
-            onClick={handleRegenerateLibrary}
-            disabled={creating}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
-            Regenerate Dark Library
-          </button>
-        </div>
-      )}
-
-      {/* Messages */}
+      {/* Error Message */}
       {error && (
         <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-4">
           <p className="text-red-400">{error}</p>
-        </div>
-      )}
-
-      {successMessage && (
-        <div className="bg-green-900/20 border border-green-700 rounded-lg p-4 mb-4">
-          <p className="text-green-400">{successMessage}</p>
         </div>
       )}
 
@@ -228,18 +185,9 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
       {/* Empty state */}
       {!loading && sets.length === 0 && (
         <div className="bg-gray-800 rounded-lg p-12 text-center">
-          <p className="text-gray-400 mb-6">
-            No dark library created yet. Create one to organize your calibration frames
-            by date, temperature, gain, offset, and binning.
+          <p className="text-gray-400">
+            No calibration sets found. Use the Refresh button above to scan for calibration frames.
           </p>
-          <button
-            onClick={handleCreateLibrary}
-            disabled={creating}
-            className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg font-medium"
-          >
-            <Plus size={20} />
-            {creating ? "Creating..." : "Create Dark Library"}
-          </button>
         </div>
       )}
 
@@ -247,33 +195,26 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
       {!loading && sets.length > 0 && (
         <div>
           {/* Filters */}
-          <DarkLibraryFilters sets={sets} onFilterChange={handleFilterChange} />
-
-          {/* Quick Stats */}
-          <QuickStats sets={filteredSets} />
+          <DarkLibraryFilters sets={tabFilteredSets} filters={filters} onFilterChange={handleFilterChange} mode={filterMode} />
 
           {/* Result count */}
           <div className="mb-4 text-sm text-gray-400">
-            Showing {filteredSets.length} of {sets.length} calibration sets
+            Showing {filteredSets.length} of {tabFilteredSets.length} calibration sets
           </div>
 
           {/* Table */}
           {filteredSets.length > 0 ? (
-            <CalibrationSetTable sets={filteredSets} />
+            <CalibrationSetTable
+              sets={filteredSets}
+              showFilterColumn={imageTypeFilter?.length === 1 && imageTypeFilter[0] === "Flat"}
+            />
           ) : (
             <div className="text-center py-12 bg-gray-800 rounded-lg">
               <p className="text-gray-400 mb-4">
                 No calibration sets match your filters
               </p>
               <button
-                onClick={() => setFilters({
-                  types: [],
-                  gains: [],
-                  offsets: [],
-                  binnings: [],
-                  tempBands: [],
-                  exposures: [],
-                })}
+                onClick={() => setFilters(emptyFilters)}
                 className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors"
               >
                 Clear Filters
@@ -283,14 +224,6 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
         </div>
       )}
 
-      {/* Confirm Dialog */}
-      <ConfirmDialog
-        isOpen={showConfirm}
-        title="Regenerate Dark Library"
-        message="This will delete the existing dark library and recreate it. Continue?"
-        onConfirm={confirmRegenerate}
-        onCancel={() => setShowConfirm(false)}
-      />
     </div>
   );
 }

@@ -1,5 +1,6 @@
 // Calibration commands - calibration frame matching and library management
 
+use crate::calibration::scan_integration::{create_calibration_sets_from_scan, CalibrationScanResult};
 use crate::db::{self, Database};
 use crate::models::*;
 use chrono::{DateTime, Utc};
@@ -1218,4 +1219,77 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
     counts.into_iter()
         .max_by_key(|(_, (_, count))| *count)
         .map(|(_, (v, _))| v)
+}
+
+// ========== Refresh Calibration Library Command ==========
+
+/// Refresh calibration library for a specific camera
+///
+/// This command:
+/// 1. Deletes all existing calibration sets for the camera
+/// 2. Queries all calibration frame IDs for the camera (Flat, Dark, Bias, DarkFlat)
+/// 3. Recreates calibration sets using the same algorithm as folder scanning
+#[tauri::command]
+pub async fn refresh_calibration_library_for_camera(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<CalibrationScanResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    println!("🔄 Refreshing calibration library for camera: {}", instrume);
+
+    // Step 1: Delete all existing calibration sets for this camera
+    db::delete_all_calibration_sets_for_camera(&conn, &instrume)
+        .map_err(|e| format!("Failed to delete existing sets: {}", e))?;
+
+    println!("   ✅ Deleted existing calibration sets");
+
+    // Step 2: Query all calibration frame IDs for this camera
+    let flat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "FLAT")
+        .map_err(|e| format!("Failed to query flat frames: {}", e))?;
+
+    let dark_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARK")
+        .map_err(|e| format!("Failed to query dark frames: {}", e))?;
+
+    let bias_frame_ids = query_frame_ids_by_type(&conn, &instrume, "BIAS")
+        .map_err(|e| format!("Failed to query bias frames: {}", e))?;
+
+    let darkflat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARKFLAT")
+        .map_err(|e| format!("Failed to query darkflat frames: {}", e))?;
+
+    println!("   📊 Found frames - Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
+        flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
+
+    // Step 3: Recreate calibration sets using the same algorithm as folder scanning
+    let result = create_calibration_sets_from_scan(
+        &conn,
+        flat_frame_ids,
+        dark_frame_ids,
+        bias_frame_ids,
+        darkflat_frame_ids,
+    ).map_err(|e| format!("Failed to create calibration sets: {}", e))?;
+
+    println!("🎉 Refresh complete - created {} calibration sets", result.sets_created);
+
+    Ok(result)
+}
+
+/// Query frame IDs for a specific camera and image type
+fn query_frame_ids_by_type(
+    conn: &rusqlite::Connection,
+    instrume: &str,
+    imagetyp: &str,
+) -> Result<Vec<i64>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM frames
+         WHERE instrume = ?1 AND UPPER(imagetyp) = UPPER(?2)"
+    )?;
+
+    let ids: Vec<i64> = stmt
+        .query_map([instrume, imagetyp], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ids)
 }

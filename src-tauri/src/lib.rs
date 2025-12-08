@@ -97,6 +97,7 @@ pub fn run() {
             commands::create_master_dark_library,
             commands::get_master_dark_library,
             commands::has_master_dark_library,
+            commands::refresh_calibration_library_for_camera,
             commands::get_calibration_set_frames,
             commands::get_cache_stats,
             commands::clear_image_cache,

@@ -134,6 +134,35 @@ pub fn delete_camera_dark_library(conn: &Connection, instrume: &str) -> Result<(
     Ok(())
 }
 
+/// Delete ALL calibration sets for a camera (including Flats)
+pub fn delete_all_calibration_sets_for_camera(conn: &Connection, instrume: &str) -> Result<()> {
+    // First, get all set IDs for this camera (all types)
+    let mut stmt = conn.prepare(
+        "SELECT id FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 0"
+    )?;
+    let set_ids: Vec<i64> = stmt
+        .query_map([instrume], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Delete all calibration_set_frames entries for these sets
+    for set_id in &set_ids {
+        conn.execute(
+            "DELETE FROM calibration_set_frames WHERE set_id = ?1",
+            [set_id],
+        )?;
+    }
+
+    // Delete all calibration_set entries for this camera
+    conn.execute(
+        "DELETE FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 0",
+        [instrume]
+    )?;
+
+    Ok(())
+}
+
 /// Check if dark library exists for camera
 pub fn has_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0")?;
