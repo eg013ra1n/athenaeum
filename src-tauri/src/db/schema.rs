@@ -109,7 +109,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             temp_max REAL,
             offset REAL,
             frame_count INTEGER DEFAULT 0,
-            is_master_library INTEGER NOT NULL DEFAULT 0
+            is_master_library INTEGER NOT NULL DEFAULT 0,
+            focallen REAL
         )",
         [],
     )?;
@@ -235,6 +236,25 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Calibration set to frames - links frames/sets to their required calibration sets
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS calibration_set_to_frames (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL,
+            source_type TEXT NOT NULL CHECK(source_type IN ('frame', 'calibration_set')),
+            calibration_set_id INTEGER NOT NULL,
+            calibration_type TEXT NOT NULL CHECK(calibration_type IN ('Dark', 'Flat', 'Bias', 'DarkFlat')),
+            matched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            match_score REAL,
+            date_warning INTEGER DEFAULT 0,
+            temp_warning INTEGER DEFAULT 0,
+            is_manual_override INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE CASCADE,
+            UNIQUE(source_id, source_type, calibration_type)
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -312,6 +332,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_fits_header_fingerprint ON fits_header(header_fingerprint)",
         [],
     )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calib_link_source ON calibration_set_to_frames(source_id, source_type)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calib_link_set ON calibration_set_to_frames(calibration_set_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calib_link_type ON calibration_set_to_frames(calibration_type)",
+        [],
+    )?;
 
     // Migrations - add columns to existing tables if they don't exist
     // Add find_duplicates to scan_roots table (migration for existing databases)
@@ -375,6 +407,32 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_date_obs_end {
         conn.execute(
             "ALTER TABLE frames_set ADD COLUMN date_obs_end TEXT",
+            [],
+        )?;
+    }
+
+    // Add flat_pattern to frames_set table (migration for existing databases)
+    let has_flat_pattern: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='flat_pattern'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_flat_pattern {
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN flat_pattern TEXT",
+            [],
+        )?;
+    }
+
+    // Add is_manual_override to calibration_set_to_frames table (migration for existing databases)
+    let has_is_manual_override: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('calibration_set_to_frames') WHERE name='is_manual_override'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_is_manual_override {
+        conn.execute(
+            "ALTER TABLE calibration_set_to_frames ADD COLUMN is_manual_override INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

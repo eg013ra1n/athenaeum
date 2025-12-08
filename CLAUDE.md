@@ -62,18 +62,36 @@ The SQLite database is created in the user's app data directory by Tauri. Schema
   - `fits_parser/` - FITS/XISF metadata extraction
   - `scanner/` - Multi-threaded directory traversal with walkdir + rayon
   - `duplicates/` - xxHash XXH3_64 computation and duplicate detection
-  - `calibration/` - Calibration frame matching algorithms
+  - `calibration/` - Calibration frame matching algorithms (see Calibration Matching System below)
   - `clustering/` - Sky coordinate-based frame set clustering with DBSCAN
   - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
   - `settings/` - Settings management with runtime and database persistence
   - `export/` - Path template resolution and file copying
-  - `commands.rs` - Tauri commands exposed to frontend
+  - `commands/` - **Modular Tauri commands** organized by domain (see below)
+  - `commands_rustafits.rs` - Specialized FITS image rendering commands
 
-- **Tauri Commands**: Functions marked with `#[tauri::command]` in `commands.rs` are callable from React via `invoke()`
+- **Commands Module Structure** (Refactored 2025-11-17):
+  The Tauri commands are organized into focused modules by domain. All 68 commands are in `src-tauri/src/commands/`:
+  - `mod.rs` - Module exports, AppState definition, and re-exports
+  - `core.rs` - 2 commands: App initialization (greet, initialize_database)
+  - `scan_roots.rs` - 9 commands: Directory scanning and monitoring
+  - `files.rs` - 7 commands: File operations and browsing
+  - `settings.rs` - 5 commands: Application configuration
+  - `frame_sets.rs` - 14 commands: Frame set management and operations
+  - `calibration.rs` - 17 commands: Calibration frame matching and library management
+  - `duplicates.rs` - 8 commands: Black hole & duplicate detection
+  - `cache.rs` - 2 commands: Cache management
+  - `spatial.rs` - 4 commands: Sky coordinate queries and spatial operations
+  - `utils.rs` - Shared helper functions (calculate_fov, angular_distance, format_bytes)
+
+  See `src-tauri/REFACTORING.md` for complete command migration map and details.
+
+- **Tauri Commands**: Functions marked with `#[tauri::command]` in `commands/` modules are callable from React via `invoke()`. All commands are re-exported through `commands/mod.rs` for backward compatibility.
 
 ### Database Schema
 
 See `src-tauri/src/db/schema.rs` for full schema. Key tables:
+
 - `files` - Physical files (path, filename, size, format, modified_at)
 - `frames` - Metadata extracted from FITS/XISF with astronomical coordinates
   - Basic: OBJECT, DATE-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP
@@ -82,8 +100,11 @@ See `src-tauri/src/db/schema.rs` for full schema. Key tables:
   - Coordinates: RA, DEC, OBJCTRA, OBJCTDEC, SITELAT, SITELONG
 - `scan_roots` - Monitored directory paths
 - `calibration_set` + `calibration_set_frames` - Grouped calibration frames
-- `projects` - Top-level organization for imaging projects
-- `frames_set` + `frames_set_members` - Frame sets grouped by sky coordinates
+- `projects` - Exists but currently not used (vestigial table; frame sets are global and not scoped to projects)
+- `frames_set` - Top-level frame sets grouped by sky coordinates (NO project_id column - frame sets are global)
+- `imaging_nights` - Imaging nights/sessions within a frame set (linked via `frames_set_id`)
+- `sessions` - Groups frames by instrument within an imaging night
+- `session_members` - Junction table linking frames to sessions (the actual many-to-many between frames and sessions)
 - `tags` + `frame_tags` - User tagging system
 - `export_templates` - Saved export path templates
 - `fits_header` - Complete original FITS header storage
@@ -96,11 +117,13 @@ Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, ex
 **Frame Set Clustering**: Uses DBSCAN algorithm to group LIGHT frames by sky coordinates (RA/Dec). Frames within a configurable threshold distance are automatically grouped into frame sets. This enables organizing frames by target object without manual tagging.
 
 **Coordinate Parsing**: Supports multiple RA/Dec formats:
+
 - Decimal degrees (e.g., `123.456`, `-45.678`)
 - HMS/DMS strings (e.g., `12h34m56.7s`, `-45d40m30s`)
 - Colon-separated (e.g., `12:34:56.7`, `-45:40:30`)
 
 **Settings System**: Three-tier precedence for configuration:
+
 1. Runtime overrides (in-memory)
 2. Database persisted settings
 3. Default values
@@ -108,6 +131,7 @@ Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, ex
 Common settings include `grouping_threshold_arcmin` for frame set clustering.
 
 **Auto-Generate Frame Sets**:
+
 - Excludes frames already in any set to prevent duplicates
 - Clusters by sky coordinates with configurable threshold
 - Reports excluded frames with reasons (missing coordinates, etc.)
@@ -122,6 +146,7 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 **Duplicate Detection**: xxHash XXH3_64 computation available for identifying duplicate files (implementation in `duplicates/` module).
 
 **IMAGETYP to FRAME_FOLDER Mapping**:
+
 - LIGHT → `Lights`
 - DARK → `Calibration/Darks`
 - FLAT → `Calibration/Flats`
@@ -130,12 +155,88 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 
 **Export Path Templating**: Supports tokens like `{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`, `{TELESCOP}`, `{INSTRUME}`, `{EXPTIME}`, `{FILTER}`, `{IMAGETYP}`, `{FRAME_FOLDER}`, with fallbacks (`{OBJECT|Unknown}`) and transforms (`:slug` for slugification).
 
+### Calibration Matching System
+
+The calibration matching system is fully configurable via UI (Settings → Calibration Matching tab). All calibration-related settings are stored in a unified `CalibrationMatchingConfig` JSON structure in the `settings` table under key `calibration.matching_config`.
+
+**Configuration Components**:
+- **Parameter Matching Rules**: Configure which parameters must match exactly, warn on threshold, or be ignored
+- **Clustering Settings**: Max age and time clustering thresholds per calibration type (flat, dark, bias, darkflat)
+- **Scoring Config**: Temperature match weight for calibration candidate scoring
+- **Warning Thresholds**: Temperature delta tolerance and date warning thresholds
+- **Master Preferences**: Prefer master frames or frame sets when both available
+
+**Source Types** (frames that need calibration):
+- **Lights** → can link to Flat, Dark, Bias
+- **Flats** → can link to DarkFlat, Dark, Bias (with fallback chain: DarkFlat → Dark → Bias)
+- **Darks** → can link to Bias (when "BIAS for Dark Optimization" is enabled)
+
+**Configurable Parameters** (8 parameters per source→calibration pair):
+- `instrume` - Camera/instrument name
+- `binning` - Binning mode (e.g., "1x1", "2x2")
+- `gain` - Sensor gain value
+- `offset` - Sensor offset value
+- `exptime` - Exposure time
+- `focallen` - Focal length
+- `filter` - Filter name (only matched for Lights→Flat)
+- `ccd_temp` - CCD temperature
+
+**Match Modes**:
+- `Exact` - Must match exactly (with small tolerance for floats)
+- `Warning` - Match but warn if threshold exceeded (e.g., temperature delta > 2°C)
+- `Ignore` - Don't check this parameter
+
+**Key Files**:
+- `src-tauri/src/calibration/config.rs` - Configuration data structures (`CalibrationMatchingConfig`, `ParameterConfig`, `MatchMode`, etc.)
+- `src-tauri/src/calibration/configurable_matcher.rs` - Config-driven matching engine (`find_calibration_sets`, `load_config`, etc.)
+- `src-tauri/src/calibration/hierarchy.rs` - Calibration hierarchy builder (uses configurable matcher)
+- `src/types/calibration-config.ts` - TypeScript interfaces
+- `src/components/calibration/` - UI components (`CalibrationMatchingConfig.tsx`, `MatchingMatrixTable.tsx`, etc.)
+
+**Tauri Commands**:
+- `get_calibration_matching_config` - Load config (returns default if not set)
+- `set_calibration_matching_config` - Save config to database
+- `reset_calibration_matching_config` - Reset to defaults
+
+**Default Behavior**: The default configuration matches the original hardcoded behavior:
+- Lights→Flat: Exact match on instrume, binning, gain, offset, focallen, filter
+- Lights→Dark: Exact match on instrume, binning, gain, offset, exptime; Warning on ccd_temp (2°C threshold)
+- Lights→Bias: Exact match on instrume, binning, gain, offset; Warning on ccd_temp
+- Flats→DarkFlat/Dark: Same as Lights→Dark (no filter matching)
+- Flats→Bias: Same as Lights→Bias
+
 ## Development Workflow
 
 1. **Adding New Tauri Commands**:
-   - Define function in `src-tauri/src/commands.rs` with `#[tauri::command]`
-   - Add to `invoke_handler` in `src-tauri/src/lib.rs`
+   - Determine the appropriate module in `src-tauri/src/commands/` based on functionality:
+     - `core.rs` - App initialization and basic operations
+     - `scan_roots.rs` - Scanning directories for FITS files
+     - `files.rs` - File browsing, searching, previewing
+     - `settings.rs` - Application configuration
+     - `frame_sets.rs` - Grouping frames into sets
+     - `calibration.rs` - Calibration frame matching and library
+     - `duplicates.rs` - Duplicate detection and black hole management
+     - `cache.rs` - Image cache operations
+     - `spatial.rs` - Sky coordinate queries and spatial operations
+   - Add command function to the appropriate module with `#[tauri::command]`
+   - Ensure it's exported in `commands/mod.rs` (use `pub use module_name::*;`)
+   - Add to `invoke_handler` in `src-tauri/src/lib.rs` as `commands::command_name`
    - Call from React with `invoke('command_name', { args })`
+
+   **Example**:
+
+   ```rust
+   // In src-tauri/src/commands/settings.rs
+   #[tauri::command]
+   pub async fn get_my_setting(state: State<'_, AppState>) -> Result<String, String> {
+       // implementation
+   }
+
+   // Already re-exported in commands/mod.rs via: pub use settings::*;
+
+   // In src-tauri/src/lib.rs, add to invoke_handler:
+   commands::get_my_setting,
+   ```
 
 2. **Database Schema Changes**:
    - Update `src-tauri/src/db/schema.rs::init_db()`
@@ -166,6 +267,13 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
    - Coordinate conversion handled by `src-tauri/src/coordinates/` module
    - Always check if frames are already in sets before adding to prevent duplicates
 
+7. **Working with Calibration Matching Config**:
+   - Configuration is managed through `src-tauri/src/calibration/config.rs`
+   - Use `get_calibration_matching_config` and `set_calibration_matching_config` Tauri commands
+   - Load config in Rust with `configurable_matcher::load_config(conn)`
+   - UI components are in `src/components/calibration/`
+   - TypeScript interfaces in `src/types/calibration-config.ts`
+
 ## Testing Approach
 
 - **Backend**: Use `cargo test` with mock file systems and in-memory SQLite
@@ -175,6 +283,7 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 - **Settings System**: Test precedence (runtime > DB > default) and persistence
 - **Export Templates**: Test token resolution with edge cases (missing values, special chars)
 - **Duplicate Detection**: Verify hash consistency (when implemented)
+- **Calibration Matching**: Test config loading, parameter matching modes, fallback chains
 
 ## File Organization Conventions
 
@@ -186,6 +295,7 @@ Common settings include `grouping_threshold_arcmin` for frame set clustering.
 ## Common Patterns
 
 **Invoking Tauri Commands from React**:
+
 ```typescript
 import { invoke } from '@tauri-apps/api/core';
 
@@ -196,15 +306,19 @@ const result = await invoke<ReturnType>('command_name', {
 ```
 
 **Auto-Generating Frame Sets**:
+
 ```typescript
 // From frontend
 const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
-  projectId: 1
+  projectId: 1  // NOTE: projectId parameter is kept for backwards compatibility but is currently ignored
 });
 console.log(`Created ${result.sets_created} sets with ${result.frames_clustered} frames`);
 ```
 
+**Note on Projects**: The `projects` table exists in the database but is not currently linked to frame sets. The `project_id` parameter in commands like `get_frames_sets` and `auto_generate_frame_sets` is accepted for backwards compatibility but is ignored in the implementation. Frame sets are currently global and not scoped to any project.
+
 **Working with Settings**:
+
 ```typescript
 // Get a setting with default
 const threshold = await invoke<string>('get_setting', {
@@ -220,6 +334,7 @@ await invoke('set_setting', {
 ```
 
 **Querying Database in Rust**:
+
 ```rust
 let conn = db.conn();
 let mut stmt = conn.prepare("SELECT * FROM frames WHERE object = ?1")?;
@@ -229,6 +344,7 @@ let frames = stmt.query_map([object], |row| {
 ```
 
 **Accessing Settings in Rust Commands**:
+
 ```rust
 #[tauri::command]
 pub async fn my_command(state: State<'_, AppState>) -> Result<f64, String> {
@@ -252,6 +368,54 @@ let ra_deg = parse_ra_to_degrees("12h34m56.7s")?;
 let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
 ```
 
+**Working with Calibration Matching Config**:
+
+```typescript
+// From frontend - get current config
+const config = await invoke<CalibrationMatchingConfig>('get_calibration_matching_config');
+
+// Modify parameter matching rules
+config.lights.dark.ccd_temp.warning_threshold = 3.0;
+
+// Modify clustering settings
+config.clustering.flat.max_age_days = 60;
+config.clustering.flat.time_cluster_minutes = 45;
+
+// Modify scoring config
+config.scoring.temperature_match_weight = 0.5;
+
+// Modify warning thresholds
+config.warnings.temp_delta_celsius = 3.0;
+config.warnings.flat_date_warning_days = 60;
+
+// Save changes
+await invoke('set_calibration_matching_config', { config });
+
+// Reset to defaults
+const defaultConfig = await invoke<CalibrationMatchingConfig>('reset_calibration_matching_config');
+```
+
+```rust
+// In Rust - load and use config for matching
+use crate::calibration::configurable_matcher::{load_config, find_calibration_sets};
+
+let config = load_config(conn);
+
+// Use parameter matching rules
+let candidates = find_calibration_sets(conn, &frame, "lights", "dark", &config)?;
+
+// Access clustering settings
+let max_age = config.clustering.get("flat")
+    .map(|c| c.max_age_days)
+    .unwrap_or(30);
+
+// Access warning thresholds
+let temp_delta = config.warnings.temp_delta_celsius;
+
+// Access scoring config
+let temp_weight = config.scoring.temperature_match_weight;
+```
+
 ## Dependencies
 
 **Frontend**: React, React Router, Tailwind, TanStack Table, Lucide Icons, date-fns
@@ -264,4 +428,4 @@ let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
 - [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html)
 - [XISF 1.0 Specification](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html)
 - [xxHash](https://xxhash.com/)
-- Technical Specification: `TS.md` in repository root
+- Commands Refactoring: `src-tauri/REFACTORING.md` - Complete documentation of the 2025-11-17 modular refactoring

@@ -114,8 +114,8 @@ mod tests {
 
     #[test]
     fn test_cache_filename_generation() {
-        let params1 = StretchParams::auto(0.25);
-        let params2 = StretchParams::manual(850, 64000, 0.25);
+        let params1 = StretchParams::auto(0.25, "preview".to_string());
+        let params2 = StretchParams::manual(850, 64000, 0.25, "preview".to_string());
 
         let file1 = generate_cache_filename("/path/to/file.fits", &params1);
         let file2 = generate_cache_filename("/path/to/file.fits", &params2);

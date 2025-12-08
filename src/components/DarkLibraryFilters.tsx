@@ -1,38 +1,44 @@
-import { useState, useMemo } from "react";
-import { Filter, X, ChevronDown, ChevronUp } from "lucide-react";
+import { useMemo } from "react";
+import { X } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
 
+export type FilterMode = "darks" | "flats";
+
 export interface FilterState {
-  types: ImageType[];
-  gains: number[];
-  offsets: number[];
-  binnings: string[];
-  tempBands: string[];
-  exposures: number[];
+  type: ImageType | null;
+  tempBand: string | null;
+  exposure: number | null;
+  filter: string | null;
+  expFrom: number | null;
+  expTo: number | null;
+  dateFrom: string | null;
+  dateTo: string | null;
 }
 
 interface DarkLibraryFiltersProps {
   sets: CalibrationSetDetail[];
+  filters: FilterState;
   onFilterChange: (filters: FilterState) => void;
+  mode: FilterMode;
 }
 
-export default function DarkLibraryFilters({ sets, onFilterChange }: DarkLibraryFiltersProps) {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const [filters, setFilters] = useState<FilterState>({
-    types: [],
-    gains: [],
-    offsets: [],
-    binnings: [],
-    tempBands: [],
-    exposures: [],
-  });
+export const emptyFilters: FilterState = {
+  type: null,
+  tempBand: null,
+  exposure: null,
+  filter: null,
+  expFrom: null,
+  expTo: null,
+  dateFrom: null,
+  dateTo: null,
+};
 
+export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode }: DarkLibraryFiltersProps) {
   // Extract unique values from sets
   const uniqueValues = useMemo(() => {
-    const gains = Array.from(new Set(sets.map(s => s.gain).filter((g): g is number => g !== null))).sort((a, b) => a - b);
-    const offsets = Array.from(new Set(sets.map(s => s.offset).filter((o): o is number => o !== null))).sort((a, b) => a - b);
-    const binnings = Array.from(new Set(sets.map(s => s.binning).filter((b): b is string => b !== null))).sort();
+    const types = Array.from(new Set(sets.map(s => s.imagetyp))).sort();
     const exposures = Array.from(new Set(sets.map(s => s.exptime).filter((e): e is number => e !== null))).sort((a, b) => a - b);
+    const opticalFilters = Array.from(new Set(sets.map(s => s.filter).filter((f): f is string => f !== null && f !== ""))).sort();
 
     // Generate temperature bands (5°C steps)
     const temps = sets.map(s => s.ccd_temp).filter(t => t !== null && t !== undefined);
@@ -44,231 +50,193 @@ export default function DarkLibraryFilters({ sets, onFilterChange }: DarkLibrary
       tempBands.push(`${temp} to ${temp + 5}°C`);
     }
 
-    return { gains, offsets, binnings, exposures, tempBands };
+    // Get date range from sets
+    const allDates = sets.flatMap(set => [set.date_start, set.date_end]).filter(d => d);
+    const minDate = allDates.length > 0 ? allDates.sort()[0].split('T')[0] : '';
+    const maxDate = allDates.length > 0 ? allDates.sort().reverse()[0].split('T')[0] : '';
+
+    // Get exposure range for flats
+    const minExp = exposures.length > 0 ? Math.min(...exposures) : 0;
+    const maxExp = exposures.length > 0 ? Math.max(...exposures) : 0;
+
+    return { types, exposures, tempBands, opticalFilters, minDate, maxDate, minExp, maxExp };
   }, [sets]);
 
-  const handleTypeToggle = (type: ImageType) => {
-    const newTypes = filters.types.includes(type)
-      ? filters.types.filter(t => t !== type)
-      : [...filters.types, type];
+  const handleSelectChange = (field: keyof FilterState, value: string) => {
+    let newValue: any = value === "" ? null : value;
 
-    const newFilters = { ...filters, types: newTypes };
-    setFilters(newFilters);
-    onFilterChange(newFilters);
-  };
+    // Convert to number for numeric fields
+    if ((field === "exposure" || field === "expFrom" || field === "expTo") && value !== "") {
+      newValue = parseFloat(value);
+    }
 
-  const handleMultiSelect = (field: keyof FilterState, value: any) => {
-    const currentValues = filters[field] as any[];
-    const newValues = currentValues.includes(value)
-      ? currentValues.filter(v => v !== value)
-      : [...currentValues, value];
-
-    const newFilters = { ...filters, [field]: newValues };
-    setFilters(newFilters);
-    onFilterChange(newFilters);
+    onFilterChange({ ...filters, [field]: newValue });
   };
 
   const handleClearAll = () => {
-    const emptyFilters: FilterState = {
-      types: [],
-      gains: [],
-      offsets: [],
-      binnings: [],
-      tempBands: [],
-      exposures: [],
-    };
-    setFilters(emptyFilters);
     onFilterChange(emptyFilters);
   };
 
-  const activeFilterCount =
-    filters.types.length +
-    filters.gains.length +
-    filters.offsets.length +
-    filters.binnings.length +
-    filters.tempBands.length +
-    filters.exposures.length;
+  const hasActiveFilters = Object.values(filters).some(v => v !== null);
+
+  const selectClass = "px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer";
+  const inputClass = "px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500 w-20";
+  const labelClass = "text-xs text-gray-400 mr-1";
 
   return (
-    <div className="mb-4">
-      {/* Filter Toggle Button */}
-      <button
-        onClick={() => setIsExpanded(!isExpanded)}
-        className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-100 rounded-md transition-colors border border-gray-700"
-      >
-        <Filter size={16} />
-        <span>Filters</span>
-        {activeFilterCount > 0 && (
-          <span className="px-2 py-0.5 bg-blue-600 text-white text-xs rounded-full">
-            {activeFilterCount}
-          </span>
-        )}
-        {isExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-      </button>
-
-      {/* Filter Panel */}
-      {isExpanded && (
-        <div className="mt-4 p-4 bg-gray-800 rounded-lg border border-gray-700 space-y-4">
-          {/* Type Filter */}
-          <div>
-            <label className="block text-sm font-medium text-gray-300 mb-2">
-              Type
-            </label>
-            <div className="flex gap-3">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={filters.types.includes("Dark" as ImageType)}
-                  onChange={() => handleTypeToggle("Dark" as ImageType)}
-                  className="rounded border-gray-600 text-blue-600 focus:ring-blue-500"
-                />
-                <span className="text-sm text-gray-100">Dark</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={filters.types.includes("Bias" as ImageType)}
-                  onChange={() => handleTypeToggle("Bias" as ImageType)}
-                  className="rounded border-gray-600 text-blue-600 focus:ring-blue-500"
-                />
-                <span className="text-sm text-gray-100">Bias</span>
-              </label>
-            </div>
-          </div>
-
-          {/* Gain Filter */}
-          {uniqueValues.gains.length > 0 && (
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Gain
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {uniqueValues.gains.map(gain => (
-                  <button
-                    key={gain}
-                    onClick={() => handleMultiSelect('gains', gain)}
-                    className={`px-3 py-1 rounded text-sm transition-colors ${
-                      filters.gains.includes(gain)
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                    }`}
-                  >
-                    {gain}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Offset Filter */}
-          {uniqueValues.offsets.length > 0 && (
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Offset
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {uniqueValues.offsets.map(offset => (
-                  <button
-                    key={offset}
-                    onClick={() => handleMultiSelect('offsets', offset)}
-                    className={`px-3 py-1 rounded text-sm transition-colors ${
-                      filters.offsets.includes(offset)
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                    }`}
-                  >
-                    {offset}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Binning Filter */}
-          {uniqueValues.binnings.length > 0 && (
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Binning
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {uniqueValues.binnings.map(binning => (
-                  <button
-                    key={binning}
-                    onClick={() => handleMultiSelect('binnings', binning)}
-                    className={`px-3 py-1 rounded text-sm transition-colors ${
-                      filters.binnings.includes(binning)
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                    }`}
-                  >
-                    {binning}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Temperature Bands Filter */}
-          {uniqueValues.tempBands.length > 0 && (
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Temperature Bands
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {uniqueValues.tempBands.map(band => (
-                  <button
-                    key={band}
-                    onClick={() => handleMultiSelect('tempBands', band)}
-                    className={`px-3 py-1 rounded text-sm transition-colors ${
-                      filters.tempBands.includes(band)
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                    }`}
-                  >
-                    {band}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Exposure Filter */}
-          {uniqueValues.exposures.length > 0 && (
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Exposure (seconds)
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {uniqueValues.exposures.map(exp => (
-                  <button
-                    key={exp}
-                    onClick={() => handleMultiSelect('exposures', exp)}
-                    className={`px-3 py-1 rounded text-sm transition-colors ${
-                      filters.exposures.includes(exp)
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                    }`}
-                  >
-                    {exp}s
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Clear All Button */}
-          {activeFilterCount > 0 && (
-            <div className="pt-2 border-t border-gray-700">
-              <button
-                onClick={handleClearAll}
-                className="flex items-center gap-2 px-4 py-2 bg-red-900/20 hover:bg-red-900/30 text-red-400 rounded-md transition-colors text-sm"
+    <div className="flex flex-wrap items-center gap-3 mb-4 p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+      {/* DARKS MODE: Type, Temp, Exp (dropdown), Date range */}
+      {mode === "darks" && (
+        <>
+          {/* Type Filter - only show if multiple types */}
+          {uniqueValues.types.length > 1 && (
+            <div className="flex items-center">
+              <span className={labelClass}>Type:</span>
+              <select
+                value={filters.type || ""}
+                onChange={(e) => handleSelectChange("type", e.target.value)}
+                className={selectClass}
               >
-                <X size={16} />
-                Clear All Filters
-              </button>
+                <option value="">All</option>
+                {uniqueValues.types.map(type => (
+                  <option key={type} value={type}>{type}</option>
+                ))}
+              </select>
             </div>
           )}
-        </div>
+
+          {/* Temperature Band Filter */}
+          {uniqueValues.tempBands.length > 0 && (
+            <div className="flex items-center">
+              <span className={labelClass}>Temp:</span>
+              <select
+                value={filters.tempBand || ""}
+                onChange={(e) => handleSelectChange("tempBand", e.target.value)}
+                className={selectClass}
+              >
+                <option value="">All</option>
+                {uniqueValues.tempBands.map(band => (
+                  <option key={band} value={band}>{band}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Exposure Filter (dropdown) */}
+          {uniqueValues.exposures.length > 0 && (
+            <div className="flex items-center">
+              <span className={labelClass}>Exp:</span>
+              <select
+                value={filters.exposure?.toString() || ""}
+                onChange={(e) => handleSelectChange("exposure", e.target.value)}
+                className={selectClass}
+              >
+                <option value="">All</option>
+                {uniqueValues.exposures.map(exp => (
+                  <option key={exp} value={exp}>{exp}s</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* FLATS MODE: Temp, Filter, Exp from-to (inputs), Date range */}
+      {mode === "flats" && (
+        <>
+          {/* Temperature Band Filter */}
+          {uniqueValues.tempBands.length > 0 && (
+            <div className="flex items-center">
+              <span className={labelClass}>Temp:</span>
+              <select
+                value={filters.tempBand || ""}
+                onChange={(e) => handleSelectChange("tempBand", e.target.value)}
+                className={selectClass}
+              >
+                <option value="">All</option>
+                {uniqueValues.tempBands.map(band => (
+                  <option key={band} value={band}>{band}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Optical Filter */}
+          {uniqueValues.opticalFilters.length > 0 && (
+            <div className="flex items-center">
+              <span className={labelClass}>Filter:</span>
+              <select
+                value={filters.filter || ""}
+                onChange={(e) => handleSelectChange("filter", e.target.value)}
+                className={selectClass}
+              >
+                <option value="">All</option>
+                {uniqueValues.opticalFilters.map(f => (
+                  <option key={f} value={f}>{f}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Exposure Range (manual input) */}
+          <div className="flex items-center gap-2">
+            <span className={labelClass}>Exp from:</span>
+            <input
+              type="number"
+              step="0.001"
+              min="0"
+              value={filters.expFrom ?? ""}
+              placeholder={uniqueValues.minExp.toString()}
+              onChange={(e) => handleSelectChange("expFrom", e.target.value)}
+              className={inputClass}
+            />
+            <span className={labelClass}>to:</span>
+            <input
+              type="number"
+              step="0.001"
+              min="0"
+              value={filters.expTo ?? ""}
+              placeholder={uniqueValues.maxExp.toString()}
+              onChange={(e) => handleSelectChange("expTo", e.target.value)}
+              className={inputClass}
+            />
+            <span className="text-xs text-gray-500">s</span>
+          </div>
+        </>
+      )}
+
+      {/* Date Range - both modes */}
+      <div className="flex items-center gap-2">
+        <span className={labelClass}>Date from:</span>
+        <input
+          type="date"
+          value={filters.dateFrom || ""}
+          min={uniqueValues.minDate}
+          max={filters.dateTo || uniqueValues.maxDate}
+          onChange={(e) => handleSelectChange("dateFrom", e.target.value)}
+          className={`${selectClass} w-32`}
+        />
+        <span className={labelClass}>to:</span>
+        <input
+          type="date"
+          value={filters.dateTo || ""}
+          min={filters.dateFrom || uniqueValues.minDate}
+          max={uniqueValues.maxDate}
+          onChange={(e) => handleSelectChange("dateTo", e.target.value)}
+          className={`${selectClass} w-32`}
+        />
+      </div>
+
+      {/* Clear Button */}
+      {hasActiveFilters && (
+        <button
+          onClick={handleClearAll}
+          className="flex items-center gap-1 px-2 py-1.5 bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded text-sm transition-colors"
+          title="Clear all filters"
+        >
+          <X size={14} />
+          Clear
+        </button>
       )}
     </div>
   );

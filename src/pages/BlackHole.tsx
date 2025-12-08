@@ -236,7 +236,7 @@ export default function BlackHole() {
                       <span>{formatSize(entry.file_size)}</span>
                       <span>•</span>
                       <span>
-                        Moved: {format(new Date(entry.moved_at), 'PPpp')}
+                        Moved: {format(new Date(entry.moved_at), 'MMM d, yyyy HH:mm:ss')}
                       </span>
                     </div>
                   </div>

@@ -1,16 +1,18 @@
 import { useState, useEffect } from 'react';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning } from 'lucide-react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning, Info, AlertCircle } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { useScanRootsWithAvailability, useScan, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
-import type { ScanResult, RelinkResult, OrphanedFile } from '../types/models';
+import type { ScanResult, RelinkResult, OrphanedFile, FileWithFrame } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
+import { ScanSummaryModal } from '../components/ScanSummaryModal';
 
-type TabMode = 'directories' | 'browse' | 'duplicates';
+type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
+type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrument';
 
 export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
@@ -30,6 +32,20 @@ export default function FileManager() {
   const [relinkResult, setRelinkResult] = useState<RelinkResult | null>(null);
   const [missingFilesMap, setMissingFilesMap] = useState<Record<number, OrphanedFile[]>>({});
   const [checkingMissingFiles, setCheckingMissingFiles] = useState<Record<number, boolean>>({});
+  // Missing metadata tab state
+  const [missingCategory, setMissingCategory] = useState<MissingCategory>('all');
+  const [missingFrames, setMissingFrames] = useState<FileWithFrame[]>([]);
+  const [loadingMissing, setLoadingMissing] = useState(false);
+  const [missingError, setMissingError] = useState<string | null>(null);
+  const [scanSummaryModal, setScanSummaryModal] = useState<{
+    isOpen: boolean;
+    rootId: number | null;
+    rootPath: string;
+  }>({
+    isOpen: false,
+    rootId: null,
+    rootPath: '',
+  });
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -84,6 +100,28 @@ export default function FileManager() {
       }
     });
   }, [scanRoots]);
+
+  // Load frames with missing metadata
+  const loadMissingMetadata = async (category: MissingCategory) => {
+    try {
+      setLoadingMissing(true);
+      setMissingError(null);
+      const frames = await invoke<FileWithFrame[]>('get_frames_with_missing_metadata', { category });
+      setMissingFrames(frames);
+    } catch (error) {
+      console.error('Failed to load missing metadata:', error);
+      setMissingError(typeof error === 'string' ? error : 'Failed to load frames with missing metadata');
+    } finally {
+      setLoadingMissing(false);
+    }
+  };
+
+  // Load missing metadata when tab is selected or category changes
+  useEffect(() => {
+    if (activeTab === 'missing-metadata') {
+      loadMissingMetadata(missingCategory);
+    }
+  }, [activeTab, missingCategory]);
 
   // Handle deleting missing files
   const handleDeleteMissingFiles = async (rootId: number) => {
@@ -147,6 +185,10 @@ export default function FileManager() {
 
   // Handle starting a scan for a specific root
   const handleStartScan = async (rootId: number) => {
+    // Find the root path for the modal
+    const root = scanRoots.find(r => r.id === rootId);
+    const rootPath = root?.path || '';
+
     try {
       setScanningMap(prev => ({ ...prev, [rootId]: true }));
       setScanError(null);
@@ -156,6 +198,13 @@ export default function FileManager() {
 
       // Re-check for missing files after scan completes
       await checkMissingFiles(rootId);
+
+      // Open the scan summary modal
+      setScanSummaryModal({
+        isOpen: true,
+        rootId,
+        rootPath,
+      });
     } catch (error) {
       console.error('Scan failed:', error);
       setScanError(typeof error === 'string' ? error : 'Scan failed');
@@ -267,6 +316,19 @@ export default function FileManager() {
           <div className="flex items-center gap-2">
             <Copy size={16} />
             Duplicates ({duplicates.length})
+          </div>
+        </button>
+        <button
+          onClick={() => setActiveTab('missing-metadata')}
+          className={`px-4 py-2 transition relative ${
+            activeTab === 'missing-metadata'
+              ? 'text-orange-400 border-b-2 border-orange-400'
+              : 'text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <AlertCircle size={16} />
+            Missing Metadata
           </div>
         </button>
       </div>
@@ -390,7 +452,7 @@ export default function FileManager() {
                         </div>
                         {root.last_scan && (
                           <span className="text-xs text-gray-400">
-                            Last scan: {format(new Date(root.last_scan), 'PPpp')}
+                            Last scan: {format(new Date(root.last_scan), 'MMM d, yyyy HH:mm')}
                           </span>
                         )}
                       </div>
@@ -428,27 +490,41 @@ export default function FileManager() {
                     {/* Scan Result */}
                     {scanResult && (
                       <div className="mt-3 p-3 bg-green-900/30 border border-green-700 rounded">
-                        <div className="flex items-start gap-2">
-                          <CheckCircle2 className="text-green-400 flex-shrink-0 mt-0.5" size={16} />
-                          <div className="flex-1 text-sm">
-                            <p className="text-green-400 font-semibold mb-1">Scan Complete</p>
-                            <div className="text-gray-300 space-y-0.5">
-                              <p>Found: {scanResult.files_found} files</p>
-                              <p>Processed: {scanResult.files_processed} files</p>
-                              <p>Skipped: {scanResult.files_skipped} files</p>
-                            </div>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 className="text-green-400 flex-shrink-0" size={16} />
+                            <span className="text-green-400 font-semibold text-sm">Scan Complete</span>
+                          </div>
+                          <div className="flex items-center gap-4 text-sm">
+                            <span className="text-gray-300">
+                              <span className="font-semibold text-green-400">{scanResult.files_processed}</span> processed
+                              {scanResult.lights_count > 0 && (
+                                <span className="text-yellow-400 ml-2">
+                                  ({scanResult.lights_count} lights)
+                                </span>
+                              )}
+                              {(scanResult.darks_count + scanResult.flats_count + scanResult.bias_count + scanResult.darkflats_count) > 0 && (
+                                <span className="text-blue-400 ml-1">
+                                  + {scanResult.darks_count + scanResult.flats_count + scanResult.bias_count + scanResult.darkflats_count} cal
+                                </span>
+                              )}
+                            </span>
                             {scanResult.errors.length > 0 && (
-                              <details className="mt-2">
-                                <summary className="cursor-pointer text-red-400 text-xs">
-                                  {scanResult.errors.length} errors
-                                </summary>
-                                <ul className="mt-1 space-y-0.5 text-xs">
-                                  {scanResult.errors.map((error, idx) => (
-                                    <li key={idx} className="text-red-300">{String(error)}</li>
-                                  ))}
-                                </ul>
-                              </details>
+                              <span className="text-red-400 text-xs">
+                                {scanResult.errors.length} errors
+                              </span>
                             )}
+                            <button
+                              onClick={() => root.id && setScanSummaryModal({
+                                isOpen: true,
+                                rootId: root.id,
+                                rootPath: root.path,
+                              })}
+                              className="p-1.5 hover:bg-gray-700 rounded transition"
+                              title="View scan details"
+                            >
+                              <Info size={16} className="text-gray-400 hover:text-blue-400" />
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -859,6 +935,121 @@ export default function FileManager() {
         </div>
       )}
 
+      {/* Missing Metadata Tab */}
+      {activeTab === 'missing-metadata' && (
+        <div className="bg-gray-800 rounded-lg p-4">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold">Light Frames with Missing Metadata</h3>
+            <div className="flex items-center gap-3">
+              <select
+                value={missingCategory}
+                onChange={(e) => setMissingCategory(e.target.value as MissingCategory)}
+                className="bg-gray-700 border border-gray-600 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="all">All Missing</option>
+                <option value="coordinates">Missing Coordinates</option>
+                <option value="object">Missing Object Name</option>
+                <option value="datetime">Missing Date/Time</option>
+                <option value="instrument">Missing Instrument</option>
+              </select>
+              <button
+                onClick={() => loadMissingMetadata(missingCategory)}
+                disabled={loadingMissing}
+                className="text-sm text-blue-400 hover:text-blue-300 disabled:opacity-50"
+              >
+                {loadingMissing ? 'Loading...' : 'Refresh'}
+              </button>
+            </div>
+          </div>
+
+          {/* Results count */}
+          <div className="mb-4 text-sm text-gray-400">
+            Showing {missingFrames.length} frames with missing metadata
+          </div>
+
+          {missingError && (
+            <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded">
+              <p className="text-red-400 text-sm">Error: {missingError}</p>
+            </div>
+          )}
+
+          {loadingMissing ? (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 className="animate-spin mr-2" size={24} />
+              <span className="text-gray-400">Loading frames...</span>
+            </div>
+          ) : missingFrames.length === 0 ? (
+            <div className="text-gray-500 text-center py-12">
+              <CheckCircle2 className="mx-auto mb-3 text-green-400" size={48} />
+              <p className="font-semibold mb-1">All metadata complete!</p>
+              <p className="text-sm">No frames are missing the selected metadata.</p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-gray-900 sticky top-0">
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">File</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">Missing</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-700">
+                  {missingFrames.map((item, idx) => {
+                    const frame = item.frame;
+                    const missing: string[] = [];
+
+                    // Check what's missing
+                    if (frame) {
+                      const hasCoords = (frame.ra !== null && frame.dec !== null) ||
+                                        (frame.objctra !== null && frame.objctdec !== null);
+                      if (!hasCoords) missing.push('Coordinates');
+                      if (!frame.object) missing.push('Object');
+                      if (!frame.date_obs) missing.push('Date');
+                      if (!frame.instrume) missing.push('Instrument');
+                    }
+
+                    return (
+                      <tr key={item.file.id || idx} className="hover:bg-gray-750 transition">
+                        <td className="px-4 py-3">
+                          <div className="flex flex-col">
+                            <span className="font-medium text-sm truncate max-w-md" title={item.file.path}>
+                              {item.file.filename}
+                            </span>
+                            <span className="text-xs text-gray-500 truncate max-w-md" title={item.file.path}>
+                              {item.file.path}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap gap-1">
+                            {missing.map((m) => (
+                              <span
+                                key={m}
+                                className={`px-2 py-0.5 rounded text-xs font-medium ${
+                                  m === 'Coordinates'
+                                    ? 'bg-red-900/30 text-red-400 border border-red-700'
+                                    : m === 'Object'
+                                    ? 'bg-orange-900/30 text-orange-400 border border-orange-700'
+                                    : m === 'Date'
+                                    ? 'bg-yellow-900/30 text-yellow-400 border border-yellow-700'
+                                    : 'bg-blue-900/30 text-blue-400 border border-blue-700'
+                                }`}
+                              >
+                                {m}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Confirm Dialog */}
       <ConfirmDialog
         isOpen={confirmDialog.isOpen}
@@ -880,6 +1071,16 @@ export default function FileManager() {
         variant={alertDialog.variant}
         onClose={() => setAlertDialog({ ...alertDialog, isOpen: false })}
       />
+
+      {/* Scan Summary Modal */}
+      {scanSummaryModal.rootId && scanResultMap[scanSummaryModal.rootId] && (
+        <ScanSummaryModal
+          isOpen={scanSummaryModal.isOpen}
+          onClose={() => setScanSummaryModal({ ...scanSummaryModal, isOpen: false })}
+          scanResult={scanResultMap[scanSummaryModal.rootId]}
+          rootPath={scanSummaryModal.rootPath}
+        />
+      )}
     </div>
   );
 }

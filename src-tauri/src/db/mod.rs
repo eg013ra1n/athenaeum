@@ -1,10 +1,11 @@
 // Database operations module
 // Handles SQLite catalog operations
 
-mod schema;
+pub mod schema;
 mod operations;
 mod operations_blackhole;
 mod equipment;
+pub mod calibration_links;
 
 pub use schema::*;
 pub use operations::*;

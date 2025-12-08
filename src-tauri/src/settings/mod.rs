@@ -10,8 +10,6 @@ use std::sync::Mutex;
 pub mod defaults {
     pub const GROUPING_THRESHOLD_VALUE: &str = "3.0";
     pub const GROUPING_THRESHOLD_UNIT: &str = "deg";
-    pub const GROUPING_COORD_FRAME: &str = "ICRS";
-    pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "majority-object";
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "180";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "1.0";
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "false";
@@ -22,8 +20,6 @@ pub mod defaults {
 pub mod keys {
     pub const GROUPING_THRESHOLD_VALUE: &str = "grouping.threshold.value";
     pub const GROUPING_THRESHOLD_UNIT: &str = "grouping.threshold.unit";
-    pub const GROUPING_COORD_FRAME: &str = "grouping.coord.frame";
-    pub const UI_OBJECTS_AUTO_NAME_MODE: &str = "ui.objects.auto_name_mode";
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "dark_library.date_threshold_days";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "dark_library.temp_threshold_celsius";
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "duplicates.use_content_hash";
@@ -119,24 +115,6 @@ impl SettingsManager {
         )
     }
 
-    /// Get the coordinate frame (e.g., "ICRS")
-    pub fn get_grouping_coord_frame(&self, conn: &Connection) -> Result<String> {
-        self.get_with_precedence(
-            conn,
-            keys::GROUPING_COORD_FRAME,
-            defaults::GROUPING_COORD_FRAME,
-        )
-    }
-
-    /// Get the auto-name mode (e.g., "majority-object" or "ra-dec")
-    pub fn get_auto_name_mode(&self, conn: &Connection) -> Result<String> {
-        self.get_with_precedence(
-            conn,
-            keys::UI_OBJECTS_AUTO_NAME_MODE,
-            defaults::UI_OBJECTS_AUTO_NAME_MODE,
-        )
-    }
-
     /// Get the grouping threshold in arcseconds (converted from configured unit)
     pub fn get_grouping_threshold_arcsec(&self, conn: &Connection) -> Result<f64> {
         let value: f64 = self.get_grouping_threshold_value(conn)?.parse()?;
@@ -197,6 +175,7 @@ impl SettingsManager {
         )?;
         Ok(value.to_lowercase() == "true")
     }
+
 }
 
 #[cfg(test)]

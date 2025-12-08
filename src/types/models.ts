@@ -149,6 +149,14 @@ export interface ScanResult {
   files_processed: number;
   files_skipped: number;
   errors: string[];
+  // Frame type counts
+  lights_count: number;
+  darks_count: number;
+  flats_count: number;
+  bias_count: number;
+  darkflats_count: number;
+  // Calibration sets created
+  calibration_sets_created: number;
 }
 
 export interface FileWithFrame {
@@ -175,6 +183,7 @@ export interface FramesSet {
   objctra: string | null;
   objctdec: string | null;
   total_exp_time: number | null;
+  flat_pattern: string | null;  // e.g., "before_session", "after_session", "manual"
 }
 
 export interface FramesSetMember {
@@ -279,6 +288,7 @@ export interface CalibrationSetDetail {
   offset: number | null;
   binning: string | null;
   instrume: string | null;
+  filter: string | null;  // Filter (for flats)
   date_start: string;
   date_end: string;
   date_display: string;
@@ -353,4 +363,259 @@ export interface RefreshResult {
   frames_added: number;
   sets_updated: SetUpdateReport[];
   frames_unassigned: number;
+}
+
+// Calibration Finder
+export interface CalibrationLink {
+  id: number | null;
+  source_id: number;
+  source_type: 'frame' | 'calibration_set';
+  calibration_set_id: number;
+  calibration_type: 'Dark' | 'Flat' | 'Bias' | 'DarkFlat';
+  matched_at: string;  // ISO 8601
+  match_score: number | null;  // 0.0-1.0 confidence
+  date_warning: boolean;
+  temp_warning: boolean;
+  is_manual_override: boolean;  // true if manually assigned by user
+}
+
+export interface FrameCalibrationStatus {
+  frame_id: number;
+  has_flats: boolean;
+  has_darks: boolean;
+  has_bias: boolean;
+  has_darkflats: boolean;
+  flats_warning: boolean;
+  darks_warning: boolean;
+  bias_warning: boolean;
+  flat_set_id: number | null;
+  dark_set_id: number | null;
+  bias_set_id: number | null;
+  darkflat_set_id: number | null;
+}
+
+export interface CalibrationHierarchy {
+  light_frame_id: number;
+  flat_sets: CalibrationSetWithLinks[];
+  dark_sets: CalibrationSetWithLinks[];
+  missing_calibration: string[];  // List of missing calibration types
+  warnings: CalibrationWarning[];
+}
+
+export interface CalibrationSetWithLinks {
+  set: CalibrationSetDetail;
+  sub_calibration: CalibrationLink[];  // Links to Dark/Bias sets for this set
+}
+
+export interface CalibrationWarning {
+  warning_type: 'date' | 'temperature';
+  message: string;
+  calibration_type: 'Dark' | 'Flat' | 'Bias' | 'DarkFlat';
+  set_id: number;
+}
+
+export interface CalibrationMatchResult {
+  frames_processed: number;
+  frames_with_calibration: number;
+  frames_partial_calibration: number;
+  frames_no_calibration: number;
+  sets_linked: number;
+  warnings_count: number;
+  processing_time_ms: number;
+  frame_statuses: FrameCalibrationStatus[];
+}
+
+export interface CalibrationStats {
+  total_frames: number;
+  frames_with_flats: number;
+  frames_with_darks: number;
+  frames_with_bias: number;
+  frames_complete: number;  // All required calibration found
+  frames_partial: number;    // Some calibration found
+  frames_none: number;       // No calibration found
+  total_warnings: number;
+}
+
+export interface CalibrationGroup {
+  flat_set_id: number | null;
+  dark_set_id: number | null;
+  bias_set_id: number | null;
+  flat_set_detail: CalibrationSetDetail | null;
+  dark_set_detail: CalibrationSetDetail | null;
+  bias_set_detail: CalibrationSetDetail | null;
+  frame_count: number;
+  frame_ids: number[];
+  has_warnings: boolean;
+  // Per-calibration warnings with contextual messages
+  flat_warnings: CalibrationWarning[];
+  dark_warnings: CalibrationWarning[];
+  bias_warnings: CalibrationWarning[];
+}
+
+export interface FrameSetCalibrationGroups {
+  groups: CalibrationGroup[];
+  uncalibrated_frame_count: number;
+  uncalibrated_frame_ids: number[];
+  total_frames: number;
+}
+
+export interface CalibrationTolerance {
+  flat_date_warning_days: number;
+  dark_date_warning_days: number;
+}
+
+export interface ProcessingProgress {
+  total_frames: number;
+  processed_frames: number;
+  current_frame_id: number | null;
+  percent_complete: number;
+}
+
+export interface ProcessingStats {
+  total_frames: number;
+  frames_with_full_calibration: number;
+  frames_with_partial_calibration: number;
+  frames_with_no_calibration: number;
+  total_flat_sets_linked: number;
+  total_dark_sets_linked: number;
+  total_warnings: number;
+  date_warnings: number;
+  temp_warnings: number;
+  missing_flats: number;
+  missing_darks: number;
+  missing_bias: number;
+}
+
+// Flat Calibration System
+export enum FlatTiming {
+  Before = "Before",
+  After = "After",
+  During = "During",
+}
+
+export enum FlatPattern {
+  Automatic = "automatic",
+  LongTerm = "long_term",
+  Manual = "manual",
+}
+
+export interface FlatGroup {
+  frame_ids: number[];
+  start_time: string;  // ISO 8601 datetime
+  end_time: string;    // ISO 8601 datetime
+  avg_temp: number | null;
+  frame_count: number;
+  filter: string | null;
+  instrume: string;
+  binning: string;
+  gain: number | null;
+  offset: number | null;
+  exptime: number | null;
+  focal_length: number | null;
+}
+
+export interface FlatGroupMatch {
+  group: FlatGroup;
+  match_score: number;  // 0.0-1.0, higher is better
+  age_days: number;
+  temp_diff: number | null;
+  timing: FlatTiming;
+}
+
+export interface FilterPeriod {
+  filter: string | null;
+  start_time: string;  // ISO 8601 datetime
+  end_time: string;    // ISO 8601 datetime
+  frame_count: number;
+}
+
+// ========== Calibration Hierarchy View ==========
+
+/** Hierarchical calibration view organized by Date → Camera → Filter */
+export interface CalibrationHierarchyView {
+  date_groups: CalibrationDateGroup[];
+  total_frames: number;
+  calibrated_frames: number;
+  uncalibrated_frames: number;
+}
+
+/** Group of frames for a single session date */
+export interface CalibrationDateGroup {
+  date: string;                    // e.g., "2024-01-15"
+  date_display: string;            // e.g., "January 15, 2024"
+  camera_groups: CalibrationCameraGroup[];
+  frame_count: number;
+  has_warnings: boolean;
+}
+
+/** Group of frames for a single camera within a date */
+export interface CalibrationCameraGroup {
+  instrume: string;                // Camera name
+  filter_groups: CalibrationFilterGroup[];
+  frame_count: number;
+  has_warnings: boolean;
+}
+
+/** A calibration set with the count of frames that use it */
+export interface CalibrationSetWithFrameCount {
+  set: CalibrationSetDetail;
+  frame_count: number;        // How many frames in this group use this set
+  frame_ids: number[];        // Which frames use this set
+  warnings: CalibrationWarning[];
+}
+
+/** A calibration set with match score for manual selection */
+export interface CalibrationSetWithScore {
+  set: CalibrationSetDetail;
+  match_score: number;        // 0.0-1.0, higher is better match
+  match_details: MatchDetails;
+}
+
+/** Details about how well a calibration set matches light frame parameters */
+export interface MatchDetails {
+  instrume_match: boolean;    // Camera matches
+  binning_match: boolean;     // Binning matches
+  gain_match: boolean;        // Gain matches (or both null)
+  filter_match: boolean;      // Filter matches (only relevant for flats)
+  temp_diff: number | null;   // Temperature difference in Celsius
+  date_diff_days: number;     // Days between calibration and light frames
+}
+
+/** Average parameters of light frames for manual selection display */
+export interface LightFrameParameters {
+  instrume: string | null;
+  binning: string | null;
+  gain: number | null;
+  offset: number | null;
+  filter: string | null;
+  avg_ccd_temp: number | null;
+  avg_exptime: number | null;
+  exptime_range: [number, number] | null;  // [min, max]
+  frame_count: number;
+  date_range: [string, string] | null;     // [start, end]
+  current_flat_set_id: number | null;
+  current_dark_set_id: number | null;
+  current_bias_set_id: number | null;
+}
+
+/** Group of frames for a single filter within a camera */
+export interface CalibrationFilterGroup {
+  filter: string | null;          // null = "No Filter"
+  filter_display: string;          // "Ha", "OIII", "No Filter", or "Ha (60s)" when split by exptime
+  exptime: number | null;         // When split by exposure time, this is the exptime for this sub-group
+  light_frames: LightFrameWithCalibration[];
+  flat_sets: CalibrationSetWithFrameCount[];   // All unique flat sets used by frames in this group
+  dark_sets: CalibrationSetWithFrameCount[];   // All unique dark sets used by frames in this group
+  bias_sets: CalibrationSetWithFrameCount[];   // All unique bias sets used by frames in this group
+  has_warnings: boolean;
+  frame_count: number;
+}
+
+/** A light frame with its calibration status */
+export interface LightFrameWithCalibration {
+  frame_id: number;
+  filename: string;
+  date_obs: string | null;
+  exptime: number | null;
+  calibration_status: FrameCalibrationStatus;
 }

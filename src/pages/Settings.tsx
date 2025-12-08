@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
+import { CalibrationMatchingConfig } from '../components/calibration';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
@@ -16,8 +17,6 @@ interface CacheStats {
 export default function Settings() {
   const [thresholdValue, setThresholdValue] = useState('5.0');
   const [thresholdUnit, setThresholdUnit] = useState<ThresholdUnit>('arcmin');
-  const [coordFrame, setCoordFrame] = useState('ICRS');
-  const [nameMode, setNameMode] = useState('majority-object');
   const [sessionGapHours, setSessionGapHours] = useState('6.0');
   const [qualityThumbnail, setQualityThumbnail] = useState('70');
   const [qualityPreview, setQualityPreview] = useState('85');
@@ -25,6 +24,7 @@ export default function Settings() {
   const [blinkResolution, setBlinkResolution] = useState('preview');
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [clearingCache, setClearingCache] = useState(false);
@@ -41,6 +41,9 @@ export default function Settings() {
   const [rescanningContentHash, setRescanningContentHash] = useState(false);
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
+  // Tab state
+  const [activeTab, setActiveTab] = useState<'general' | 'calibration'>('general');
+
   useEffect(() => {
     loadSettings();
     loadCacheStats();
@@ -51,7 +54,9 @@ export default function Settings() {
       setLoading(true);
       setError(null);
 
-      const [value, unit, frame, mode, sessionGap, qThumbnail, qPreview, qFull, resolution, contentHash, contentHashRescanned] = await Promise.all([
+      const [
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, contentHash, contentHashRescanned
+      ] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
           defaultValue: '3.0',
@@ -59,14 +64,6 @@ export default function Settings() {
         invoke<string>('get_setting', {
           key: 'grouping.threshold.unit',
           defaultValue: 'deg',
-        }),
-        invoke<string>('get_setting', {
-          key: 'grouping.coord.frame',
-          defaultValue: 'ICRS',
-        }),
-        invoke<string>('get_setting', {
-          key: 'ui.objects.auto_name_mode',
-          defaultValue: 'majority-object',
         }),
         invoke<string>('get_setting', {
           key: 'session_gap_threshold_hours',
@@ -100,8 +97,6 @@ export default function Settings() {
 
       setThresholdValue(value);
       setThresholdUnit(unit as ThresholdUnit);
-      setCoordFrame(frame);
-      setNameMode(mode);
       setSessionGapHours(sessionGap);
       setQualityThumbnail(qThumbnail);
       setQualityPreview(qPreview);
@@ -164,14 +159,6 @@ export default function Settings() {
         invoke('set_setting', {
           key: 'grouping.threshold.unit',
           value: thresholdUnit,
-        }),
-        invoke('set_setting', {
-          key: 'grouping.coord.frame',
-          value: coordFrame,
-        }),
-        invoke('set_setting', {
-          key: 'ui.objects.auto_name_mode',
-          value: nameMode,
         }),
         invoke('set_setting', {
           key: 'session_gap_threshold_hours',
@@ -339,29 +326,70 @@ export default function Settings() {
     <div className="p-6 max-w-4xl">
       <div className="mb-6">
         <h2 className="text-3xl font-bold">Settings</h2>
-        <p className="text-gray-400">Configure frame set grouping parameters</p>
+        <p className="text-gray-400">Configure application settings</p>
       </div>
 
-      {error && (
-        <div className="mb-4 p-4 bg-red-900/20 border border-red-800 rounded-lg flex items-start gap-3">
-          <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
-          <div className="flex-1">
-            <p className="font-medium text-red-400">Error</p>
-            <p className="text-sm text-red-300">{String(error)}</p>
-          </div>
+      {/* Tab Navigation */}
+      <div className="flex gap-1 mb-6 border-b border-gray-700">
+        <button
+          onClick={() => setActiveTab('general')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'general'
+              ? 'bg-gray-800 text-white border-b-2 border-blue-500'
+              : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+          }`}
+        >
+          <SettingsIcon size={18} />
+          General
+        </button>
+        <button
+          onClick={() => setActiveTab('calibration')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'calibration'
+              ? 'bg-gray-800 text-white border-b-2 border-blue-500'
+              : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+          }`}
+        >
+          <Crosshair size={18} />
+          Calibration Matching
+        </button>
+      </div>
+
+      {/* Calibration Matching Tab */}
+      {activeTab === 'calibration' && (
+        <div className="bg-gray-800 rounded-lg p-6">
+          <h3 className="text-xl font-semibold mb-4">Calibration Matching Configuration</h3>
+          <p className="text-gray-400 mb-6">
+            Configure how calibration frames (Flats, Darks, Bias) are matched to source frames.
+            Define which parameters must match exactly, warn on threshold, or be ignored.
+          </p>
+          <CalibrationMatchingConfig />
         </div>
       )}
 
-      {success && (
-        <div className="mb-4 p-4 bg-green-900/20 border border-green-800 rounded-lg flex items-start gap-3">
-          <CheckCircle className="text-green-500 flex-shrink-0 mt-0.5" size={20} />
-          <div className="flex-1">
-            <p className="font-medium text-green-400">Settings saved successfully</p>
-          </div>
-        </div>
-      )}
+      {/* General Tab */}
+      {activeTab === 'general' && (
+        <>
+          {error && (
+            <div className="mb-4 p-4 bg-red-900/20 border border-red-800 rounded-lg flex items-start gap-3">
+              <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
+              <div className="flex-1">
+                <p className="font-medium text-red-400">Error</p>
+                <p className="text-sm text-red-300">{String(error)}</p>
+              </div>
+            </div>
+          )}
 
-      <div className="bg-gray-800 rounded-lg p-6 space-y-6">
+          {success && (
+            <div className="mb-4 p-4 bg-green-900/20 border border-green-800 rounded-lg flex items-start gap-3">
+              <CheckCircle className="text-green-500 flex-shrink-0 mt-0.5" size={20} />
+              <div className="flex-1">
+                <p className="font-medium text-green-400">Settings saved successfully</p>
+              </div>
+            </div>
+          )}
+
+          <div className="bg-gray-800 rounded-lg p-6 space-y-6">
         <div>
           <h3 className="text-lg font-semibold mb-4">Clustering Parameters</h3>
 
@@ -393,44 +421,6 @@ export default function Settings() {
               <p className="text-xs text-gray-500 mt-2">
                 Frames within this angular distance will be grouped together.
                 Current value: {getThresholdInDegrees()}° (decimal degrees)
-              </p>
-            </div>
-
-            {/* Coordinate Frame */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Coordinate Frame
-              </label>
-              <select
-                value={coordFrame}
-                onChange={(e) => setCoordFrame(e.target.value)}
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-              >
-                <option value="ICRS">ICRS (J2000)</option>
-                <option value="FK5">FK5</option>
-                <option value="FK4">FK4</option>
-              </select>
-              <p className="text-xs text-gray-500 mt-2">
-                Reference frame for coordinate normalization. ICRS (J2000) is recommended.
-              </p>
-            </div>
-
-            {/* Naming Mode */}
-            <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
-                Auto-Naming Mode
-              </label>
-              <select
-                value={nameMode}
-                onChange={(e) => setNameMode(e.target.value)}
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
-              >
-                <option value="majority-object">Majority OBJECT value</option>
-                <option value="ra-dec">RA/Dec coordinates</option>
-              </select>
-              <p className="text-xs text-gray-500 mt-2">
-                How to name auto-generated frame sets. "Majority OBJECT" uses the most common
-                OBJECT value; falls back to RA/Dec if no majority exists.
               </p>
             </div>
           </div>
@@ -688,6 +678,8 @@ export default function Settings() {
           </p>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }
