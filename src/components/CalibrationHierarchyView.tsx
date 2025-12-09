@@ -27,7 +27,7 @@ interface AggregatedWarning {
   camera?: string;
 }
 
-// Collect all warnings from a filter group
+// Collect all warnings from a filter group (for counting badges at all levels)
 function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup, includeContext: boolean = true): AggregatedWarning[] {
   const warnings: AggregatedWarning[] = [];
   const filterDisplay = filterGroup.filter_display;
@@ -69,7 +69,7 @@ function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup, include
   return warnings;
 }
 
-// Collect all warnings from a camera group
+// Collect all warnings from a camera group (for counting badges)
 function collectCameraGroupWarnings(cameraGroup: CalibrationCameraGroup, includeContext: boolean = true): AggregatedWarning[] {
   const warnings: AggregatedWarning[] = [];
 
@@ -86,7 +86,7 @@ function collectCameraGroupWarnings(cameraGroup: CalibrationCameraGroup, include
   return warnings;
 }
 
-// Collect all warnings from a date group
+// Collect all warnings from a date group (for counting badges)
 function collectDateGroupWarnings(dateGroup: CalibrationDateGroup): AggregatedWarning[] {
   const warnings: AggregatedWarning[] = [];
 
@@ -96,22 +96,6 @@ function collectDateGroupWarnings(dateGroup: CalibrationDateGroup): AggregatedWa
   }
 
   return warnings;
-}
-
-// Stacked warnings display component
-function WarningsList({ warnings, className = '' }: { warnings: AggregatedWarning[]; className?: string }) {
-  if (warnings.length === 0) return null;
-
-  return (
-    <div className={`space-y-1 ${className}`}>
-      {warnings.map((warning, i) => (
-        <div key={i} className="flex items-start gap-2 text-xs">
-          <AlertTriangle size={14} className="text-orange-400 flex-shrink-0 mt-0.5" />
-          <span className="text-orange-200">{warning.message}</span>
-        </div>
-      ))}
-    </div>
-  );
 }
 
 export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = false, onRefresh }: CalibrationHierarchyViewProps) {
@@ -214,20 +198,34 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
       Bias: 'bg-green-900/30 border-green-700/40',
     };
 
+    // Build warning message
+    const warningParts: string[] = [];
+    if (sub.temp_warning) warningParts.push('Temperature differs');
+    if (sub.date_warning) warningParts.push('Date differs');
+    const warningMessage = warningParts.join(', ');
+
     return (
       <div className={`border rounded p-2 ${typeColors[sub.calibration_type] || 'bg-gray-800/30 border-gray-700/40'}`}>
-        <div className="flex items-center justify-between text-xs">
-          <span className="font-medium text-gray-200">{sub.calibration_type}</span>
-          {(sub.date_warning || sub.temp_warning) && (
-            <AlertTriangle size={12} className="text-yellow-400" />
-          )}
-        </div>
+        <div className="text-xs font-medium text-gray-200">{sub.calibration_type}</div>
+
+        {/* Warning display - consistent with main card */}
+        {warningMessage && (
+          <div className="flex items-start gap-1.5 text-xs mt-1">
+            <AlertTriangle size={12} className="text-yellow-400 flex-shrink-0 mt-0.5" />
+            <span className="text-yellow-400">{warningMessage}</span>
+          </div>
+        )}
+
         <div className="text-xs text-gray-400 mt-1">
           {sub.set.exptime !== null && <span>{sub.set.exptime}s</span>}
-          {sub.set.ccd_temp !== null && <span> @ {sub.set.ccd_temp.toFixed(0)}°C</span>}
+          {sub.set.ccd_temp !== null && (
+            <span className={sub.temp_warning ? 'text-yellow-400 font-medium' : ''}>
+              {' '}@ {sub.set.ccd_temp.toFixed(0)}°C
+            </span>
+          )}
           <span className="ml-2">{sub.set.frame_count} frames</span>
         </div>
-        <div className="text-xs text-gray-500">
+        <div className={`text-xs ${sub.date_warning ? 'text-yellow-400 font-medium' : 'text-gray-500'}`}>
           {sub.set.date_start && new Date(sub.set.date_start).toLocaleDateString('en-GB')}
         </div>
       </div>
@@ -256,6 +254,10 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
       ? 'bg-purple-900/20 border-purple-700/30'
       : 'bg-green-900/20 border-green-700/30';
 
+    // Check for specific warning types
+    const hasTempWarning = warnings.some(w => w.warning_type === 'temperature');
+    const hasDateWarning = warnings.some(w => w.warning_type === 'date');
+
     return (
       <div className={`border rounded p-3 ${bgColor}`}>
         <h4 className="font-medium text-sm mb-2">
@@ -264,6 +266,19 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
             ({linkedFrameCount} light{linkedFrameCount !== 1 ? 's' : ''})
           </span>
         </h4>
+
+        {/* Warning display - shown right after title */}
+        {warnings.length > 0 && (
+          <div className="mb-3 space-y-1">
+            {warnings.map((warning, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs">
+                <AlertTriangle size={14} className="text-yellow-400 flex-shrink-0 mt-0.5" />
+                <span className="text-yellow-400">{warning.message}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="grid grid-cols-2 gap-2 text-xs">
           {set.exptime !== null && (
             <div>
@@ -273,10 +288,10 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
           )}
           <div>
             <span className="text-gray-400">Temp:</span>{' '}
-            <span className="text-gray-200">
+            <span className={hasTempWarning ? 'text-yellow-400 font-medium' : 'text-gray-200'}>
               {formatTemp(set.ccd_temp)}
               {set.temp_min !== set.temp_max && (
-                <span className="text-gray-400 ml-1">
+                <span className={hasTempWarning ? 'text-yellow-400/70 ml-1' : 'text-gray-400 ml-1'}>
                   ({formatTemp(set.temp_min)} - {formatTemp(set.temp_max)})
                 </span>
               )}
@@ -302,7 +317,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
           )}
           <div>
             <span className="text-gray-400">Date:</span>{' '}
-            <span className="text-gray-200">
+            <span className={hasDateWarning ? 'text-yellow-400 font-medium' : 'text-gray-200'}>
               {set.date_start ? new Date(set.date_start).toLocaleDateString('en-GB') : set.date_display}
             </span>
           </div>
@@ -327,18 +342,6 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
                 <SubCalibrationCard key={i} sub={sub} />
               ))}
             </div>
-          </div>
-        )}
-
-        {/* Warning display */}
-        {warnings.length > 0 && (
-          <div className="mt-3 pt-3 border-t border-yellow-700/30 space-y-1">
-            {warnings.map((warning, i) => (
-              <div key={i} className="flex items-start gap-2 text-xs">
-                <AlertTriangle size={14} className="text-yellow-400 flex-shrink-0 mt-0.5" />
-                <span className="text-yellow-200">{warning.message}</span>
-              </div>
-            ))}
           </div>
         )}
       </div>
@@ -408,7 +411,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
     const isExpanded = expandedItems.has(key);
     const isFramesExpanded = expandedItems.has(framesKey);
     const hasCalibration = filterGroup.flat_sets.length > 0 || filterGroup.dark_sets.length > 0 || filterGroup.bias_sets.length > 0;
-    const filterWarnings = collectFilterGroupWarnings(filterGroup, false); // false = no filter context (we're at filter level)
+    const filterWarnings = collectFilterGroupWarnings(filterGroup, false); // no filter context (we're at filter level)
 
     return (
       <div className="ml-8 border-l border-gray-700">
@@ -428,8 +431,8 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
               <span className="text-gray-200">{filterGroup.filter_display}</span>
               {filterWarnings.length > 0 && (
                 <span className="inline-flex items-center gap-1 ml-2">
-                  <AlertTriangle className="w-4 h-4 text-orange-400" />
-                  <span className="text-xs text-orange-400">({filterWarnings.length})</span>
+                  <AlertTriangle className="w-4 h-4 text-yellow-400" />
+                  <span className="text-xs text-yellow-400">({filterWarnings.length})</span>
                 </span>
               )}
             </div>
@@ -454,13 +457,6 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
         {/* Filter Expanded Content */}
         {isExpanded && (
           <div className="px-4 pb-4 space-y-4 bg-gray-850 ml-4">
-            {/* Stacked Warnings at Filter Level */}
-            {filterWarnings.length > 0 && (
-              <div className="py-2 px-3 rounded bg-orange-900/10 border border-orange-700/30 mt-3">
-                <WarningsList warnings={filterWarnings} />
-              </div>
-            )}
-
             {/* Calibration Set Cards */}
             {hasCalibration && (
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
@@ -471,7 +467,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
                     title={`Flat${flatWithCount.set.filter ? ` (${flatWithCount.set.filter})` : ''}`}
                     set={flatWithCount.set}
                     type="flat"
-                    warnings={[]} // Warnings now shown at filter level
+                    warnings={flatWithCount.warnings}
                     linkedFrameCount={flatWithCount.frame_count}
                     subCalibration={flatWithCount.sub_calibration}
                   />
@@ -483,7 +479,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
                     title={`Dark${darkWithCount.set.exptime !== null ? ` (${darkWithCount.set.exptime}s)` : ''}`}
                     set={darkWithCount.set}
                     type="dark"
-                    warnings={[]} // Warnings now shown at filter level
+                    warnings={darkWithCount.warnings}
                     linkedFrameCount={darkWithCount.frame_count}
                     subCalibration={darkWithCount.sub_calibration}
                   />
@@ -495,7 +491,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
                     title="Bias"
                     set={biasWithCount.set}
                     type="bias"
-                    warnings={[]} // Warnings now shown at filter level
+                    warnings={biasWithCount.warnings}
                     linkedFrameCount={biasWithCount.frame_count}
                     subCalibration={biasWithCount.sub_calibration}
                   />
@@ -561,8 +557,8 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
             <span className="text-gray-200 font-medium">{cameraGroup.instrume}</span>
             {cameraWarnings.length > 0 && (
               <span className="inline-flex items-center gap-1 ml-2">
-                <AlertTriangle className="w-4 h-4 text-orange-400" />
-                <span className="text-xs text-orange-400">({cameraWarnings.length})</span>
+                <AlertTriangle className="w-4 h-4 text-yellow-400" />
+                <span className="text-xs text-yellow-400">({cameraWarnings.length})</span>
               </span>
             )}
           </div>
@@ -574,13 +570,6 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
         {/* Camera Expanded Content */}
         {isExpanded && (
           <div className="pb-2">
-            {/* Stacked Warnings at Camera Level */}
-            {cameraWarnings.length > 0 && (
-              <div className="ml-8 px-4 py-2 border-l border-gray-700 bg-orange-900/10">
-                <WarningsList warnings={cameraWarnings} />
-              </div>
-            )}
-
             {/* Filter Groups */}
             {cameraGroup.filter_groups.map((filterGroup) => (
               <FilterGroupContent
@@ -619,8 +608,8 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
             <span className="text-gray-100 font-semibold">{dateGroup.date_display}</span>
             {dateWarnings.length > 0 && (
               <span className="inline-flex items-center gap-1 ml-2">
-                <AlertTriangle className="w-4 h-4 text-orange-400" />
-                <span className="text-xs text-orange-400">({dateWarnings.length})</span>
+                <AlertTriangle className="w-4 h-4 text-yellow-400" />
+                <span className="text-xs text-yellow-400">({dateWarnings.length})</span>
               </span>
             )}
           </div>
@@ -632,13 +621,6 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
         {/* Date Expanded Content */}
         {isExpanded && (
           <div className="pb-2 bg-gray-850">
-            {/* Stacked Warnings at Date Level */}
-            {dateWarnings.length > 0 && (
-              <div className="px-4 py-3 border-b border-gray-700 bg-orange-900/10">
-                <WarningsList warnings={dateWarnings} />
-              </div>
-            )}
-
             {/* Camera Groups */}
             {dateGroup.camera_groups.map((cameraGroup) => (
               <CameraGroupContent
