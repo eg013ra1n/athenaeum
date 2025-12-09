@@ -556,12 +556,21 @@ export interface CalibrationCameraGroup {
   has_warnings: boolean;
 }
 
+/** Sub-calibration linked to a calibration set with full details */
+export interface SubCalibrationDetail {
+  calibration_type: 'Dark' | 'DarkFlat' | 'Bias';
+  set: CalibrationSetDetail;
+  date_warning: boolean;
+  temp_warning: boolean;
+}
+
 /** A calibration set with the count of frames that use it */
 export interface CalibrationSetWithFrameCount {
   set: CalibrationSetDetail;
   frame_count: number;        // How many frames in this group use this set
   frame_ids: number[];        // Which frames use this set
   warnings: CalibrationWarning[];
+  sub_calibration: SubCalibrationDetail[];  // Linked sub-calibrations (e.g., Flat→Dark, Dark→Bias)
 }
 
 /** A calibration set with match score for manual selection */

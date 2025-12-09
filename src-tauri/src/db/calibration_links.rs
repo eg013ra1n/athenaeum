@@ -4,6 +4,7 @@ use crate::models::{
     FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning,
     CalibrationHierarchyView, CalibrationDateGroup, CalibrationCameraGroup,
     CalibrationFilterGroup, LightFrameWithCalibration, CalibrationSetWithFrameCount,
+    SubCalibrationDetail,
 };
 use crate::calibration::configurable_matcher::load_config;
 use crate::calibration::config::{MatchMode, CalibrationMatchingConfig};
@@ -118,6 +119,135 @@ pub fn get_links_for_calibration_set(conn: &Connection, set_id: i64) -> Result<V
     })?;
 
     links.collect()
+}
+
+/// Get sub-calibration details for a calibration set
+/// Returns the linked sub-calibrations (e.g., Flat→Dark/Bias, Dark→Bias) with full set details
+/// Warnings are calculated dynamically based on date and temperature differences
+pub fn get_sub_calibration_details(conn: &Connection, set_id: i64) -> Result<Vec<SubCalibrationDetail>> {
+    let links = get_links_for_calibration_set(conn, set_id)?;
+
+    // Get parent set details for warning calculation
+    let parent_set = get_calibration_set_detail(conn, set_id)?;
+
+    // Load config for warning thresholds
+    let config = load_config(conn);
+
+    let mut sub_calibrations = Vec::new();
+
+    for link in links {
+        // Get the full details of the linked calibration set
+        if let Ok(set_detail) = get_calibration_set_detail(conn, link.calibration_set_id) {
+            // Calculate date warning dynamically
+            let date_warning = calculate_sub_calibration_date_warning(
+                &parent_set,
+                &set_detail,
+                &link.calibration_type,
+                &config,
+            );
+
+            // Calculate temp warning dynamically
+            let temp_warning = calculate_sub_calibration_temp_warning(
+                &parent_set,
+                &set_detail,
+                &link.calibration_type,
+                &config,
+            );
+
+            sub_calibrations.push(SubCalibrationDetail {
+                calibration_type: link.calibration_type.clone(),
+                set: set_detail,
+                date_warning,
+                temp_warning,
+            });
+        }
+    }
+
+    Ok(sub_calibrations)
+}
+
+/// Calculate date warning for sub-calibration
+/// Returns true if the sub-calibration is significantly older than the parent
+fn calculate_sub_calibration_date_warning(
+    parent_set: &CalibrationSetDetail,
+    sub_set: &CalibrationSetDetail,
+    calibration_type: &str,
+    config: &CalibrationMatchingConfig,
+) -> bool {
+    // Get the date warning threshold based on calibration type
+    let threshold_days = match calibration_type {
+        "Dark" => config.warnings.dark_date_warning_days,
+        "DarkFlat" => config.warnings.darkflat_date_warning_days,
+        "Bias" => config.warnings.dark_date_warning_days,  // Use dark threshold for bias
+        _ => config.warnings.flat_date_warning_days,
+    };
+
+    // If threshold is 0, warnings are disabled
+    if threshold_days == 0 {
+        return false;
+    }
+
+    // Compare dates - date_start is a String (ISO 8601)
+    let parent_date = if parent_set.date_start.len() >= 10 {
+        NaiveDate::parse_from_str(&parent_set.date_start[..10], "%Y-%m-%d").ok()
+    } else {
+        None
+    };
+    let sub_date = if sub_set.date_start.len() >= 10 {
+        NaiveDate::parse_from_str(&sub_set.date_start[..10], "%Y-%m-%d").ok()
+    } else {
+        None
+    };
+
+    match (parent_date, sub_date) {
+        (Some(parent), Some(sub)) => {
+            let diff = (parent - sub).num_days().abs();
+            diff > threshold_days
+        }
+        _ => false,
+    }
+}
+
+/// Calculate temperature warning for sub-calibration
+/// Returns true if there's a significant temperature difference
+fn calculate_sub_calibration_temp_warning(
+    parent_set: &CalibrationSetDetail,
+    sub_set: &CalibrationSetDetail,
+    calibration_type: &str,
+    config: &CalibrationMatchingConfig,
+) -> bool {
+    // Get source config based on parent set type
+    let source_config = match parent_set.imagetyp {
+        ImageType::Flat | ImageType::DarkFlat => &config.flats,
+        ImageType::Dark => &config.darks,
+        _ => &config.lights,
+    };
+
+    // Get calibration type config
+    let cal_config = match calibration_type {
+        "Flat" => source_config.flat.as_ref(),
+        "Dark" => source_config.dark.as_ref(),
+        "DarkFlat" => source_config.darkflat.as_ref(),
+        "Bias" => source_config.bias.as_ref(),
+        _ => None,
+    };
+
+    // Get the warning threshold from config
+    let threshold = if let Some(cal_config) = cal_config {
+        let temp_param = &cal_config.ccd_temp;
+        // Only calculate warning if mode is "Warning"
+        if temp_param.mode != MatchMode::Warning {
+            return false;
+        }
+        // Use the configured threshold, default to 2.0°C
+        temp_param.warning_threshold.unwrap_or(2.0)
+    } else {
+        return false;  // No calibration type config
+    };
+
+    // Calculate temperature difference (ccd_temp is f64, not Option)
+    let diff = (parent_set.ccd_temp - sub_set.ccd_temp).abs();
+    diff > threshold
 }
 
 /// Get calibration status for a specific frame
@@ -1062,11 +1192,13 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         .filter_map(|(set_id, frame_ids)| {
                             let set = get_calibration_set_detail(conn, set_id).ok()?;
                             let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Flat");
+                            let sub_calibration = get_sub_calibration_details(conn, set_id).unwrap_or_default();
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
                                 frame_ids,
                                 warnings,
+                                sub_calibration,
                             })
                         })
                         .collect();
@@ -1077,16 +1209,19 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         .filter_map(|(set_id, frame_ids)| {
                             let set = get_calibration_set_detail(conn, set_id).ok()?;
                             let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Dark");
+                            let sub_calibration = get_sub_calibration_details(conn, set_id).unwrap_or_default();
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
                                 frame_ids,
                                 warnings,
+                                sub_calibration,
                             })
                         })
                         .collect();
 
                     // Build CalibrationSetWithFrameCount for each unique bias set
+                    // Bias sets don't have sub-calibrations
                     let bias_sets: Vec<CalibrationSetWithFrameCount> = bias_set_frames
                         .into_iter()
                         .filter_map(|(set_id, frame_ids)| {
@@ -1097,6 +1232,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
                                 frame_count: frame_ids.len() as i64,
                                 frame_ids,
                                 warnings,
+                                sub_calibration: Vec::new(),  // Bias sets don't have sub-calibrations
                             })
                         })
                         .collect();

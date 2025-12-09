@@ -510,11 +510,45 @@ pub fn build_complete_hierarchy(
                 });
             }
 
-            // Dark frames don't need sub-calibration
-            // (Bias is only used as fallback for calibrating Flats, not Darks)
+            // Find sub-calibration for Dark (Bias) if enabled in config
+            let dark_sub_calibration = if let Some(opts) = config.get_behavioral_options("darks") {
+                if opts.use_bias_for_dark_optimization {
+                    if let Some(set_id) = dark_set.id {
+                        match find_calibration_for_dark_set(conn, set_id, tolerance, state) {
+                            Ok(candidates) => {
+                                // Convert best candidate to CalibrationLink
+                                if let Some(best_bias) = candidates.first() {
+                                    vec![CalibrationLink {
+                                        id: None,
+                                        source_id: set_id,
+                                        source_type: "calibration_set".to_string(),
+                                        calibration_set_id: best_bias.set_id,
+                                        calibration_type: "Bias".to_string(),
+                                        matched_at: Utc::now().to_rfc3339(),
+                                        match_score: Some(best_bias.match_score),
+                                        date_warning: best_bias.date_warning,
+                                        temp_warning: best_bias.temp_warning,
+                                        is_manual_override: false,
+                                    }]
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            Err(_) => Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             dark_sets_with_links.push(CalibrationSetWithLinks {
                 set: dark_set,
-                sub_calibration: Vec::new(),
+                sub_calibration: dark_sub_calibration,
             });
         }
     }

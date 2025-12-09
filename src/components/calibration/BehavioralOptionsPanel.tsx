@@ -23,28 +23,30 @@ export default function BehavioralOptionsPanel({
     <div className="bg-gray-800/50 rounded-lg p-4">
       <h4 className="text-sm font-medium text-gray-300 mb-3">Options</h4>
       <div className="space-y-3">
-        <label className="flex items-center gap-3 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={safeOptions.use_bias_for_dark_optimization}
-            onChange={(e) =>
-              onUpdate(
-                sourceType,
-                "use_bias_for_dark_optimization",
-                e.target.checked
-              )
-            }
-            className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-2 focus:ring-blue-500"
-          />
-          <div>
-            <span className="text-sm text-gray-200">
-              Use BIAS for Dark Optimization
-            </span>
-            <p className="text-xs text-gray-500">
-              Link Bias sets as sub-calibration to Dark sets
-            </p>
-          </div>
-        </label>
+        {sourceType === "darks" && (
+          <label className="flex items-center gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={safeOptions.use_bias_for_dark_optimization}
+              onChange={(e) =>
+                onUpdate(
+                  sourceType,
+                  "use_bias_for_dark_optimization",
+                  e.target.checked
+                )
+              }
+              className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-2 focus:ring-blue-500"
+            />
+            <div>
+              <span className="text-sm text-gray-200">
+                Use BIAS for Dark Optimization
+              </span>
+              <p className="text-xs text-gray-500">
+                Link Bias sets as sub-calibration to Dark sets
+              </p>
+            </div>
+          </label>
+        )}
 
         {sourceType === "flats" && (
           <label className="flex items-center gap-3 cursor-pointer">

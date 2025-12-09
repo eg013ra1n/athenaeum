@@ -624,6 +624,15 @@ pub struct CalibrationCameraGroup {
     pub has_warnings: bool,
 }
 
+/// Sub-calibration linked to a calibration set with full details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubCalibrationDetail {
+    pub calibration_type: String,        // "Dark", "DarkFlat", "Bias"
+    pub set: CalibrationSetDetail,       // Full set details
+    pub date_warning: bool,
+    pub temp_warning: bool,
+}
+
 /// A calibration set with the count of frames that use it
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationSetWithFrameCount {
@@ -631,6 +640,7 @@ pub struct CalibrationSetWithFrameCount {
     pub frame_count: i64,              // How many frames in this group use this set
     pub frame_ids: Vec<i64>,           // Which frames use this set
     pub warnings: Vec<CalibrationWarning>,
+    pub sub_calibration: Vec<SubCalibrationDetail>,  // Linked sub-calibrations (e.g., Flat→Dark, Dark→Bias)
 }
 
 /// A calibration set with match score for manual selection

@@ -9,6 +9,7 @@ import type {
   LightFrameWithCalibration,
   CalibrationCameraGroup,
   CalibrationFilterGroup,
+  SubCalibrationDetail,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
 
@@ -205,19 +206,49 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
     return `${temp.toFixed(1)}°C`;
   };
 
+  // Sub-calibration card component (compact nested display)
+  const SubCalibrationCard = ({ sub }: { sub: SubCalibrationDetail }) => {
+    const typeColors: Record<string, string> = {
+      Dark: 'bg-purple-900/30 border-purple-700/40',
+      DarkFlat: 'bg-indigo-900/30 border-indigo-700/40',
+      Bias: 'bg-green-900/30 border-green-700/40',
+    };
+
+    return (
+      <div className={`border rounded p-2 ${typeColors[sub.calibration_type] || 'bg-gray-800/30 border-gray-700/40'}`}>
+        <div className="flex items-center justify-between text-xs">
+          <span className="font-medium text-gray-200">{sub.calibration_type}</span>
+          {(sub.date_warning || sub.temp_warning) && (
+            <AlertTriangle size={12} className="text-yellow-400" />
+          )}
+        </div>
+        <div className="text-xs text-gray-400 mt-1">
+          {sub.set.exptime !== null && <span>{sub.set.exptime}s</span>}
+          {sub.set.ccd_temp !== null && <span> @ {sub.set.ccd_temp.toFixed(0)}°C</span>}
+          <span className="ml-2">{sub.set.frame_count} frames</span>
+        </div>
+        <div className="text-xs text-gray-500">
+          {sub.set.date_start && new Date(sub.set.date_start).toLocaleDateString('en-GB')}
+        </div>
+      </div>
+    );
+  };
+
   // Calibration Set Card component (reused from CalibrationGroupsView)
   const CalibrationSetCard = ({
     title,
     set,
     type,
     warnings,
-    linkedFrameCount
+    linkedFrameCount,
+    subCalibration
   }: {
     title: string;
     set: CalibrationSetDetail;
     type: 'flat' | 'dark' | 'bias';
     warnings: CalibrationWarning[];
     linkedFrameCount: number;  // Number of light frames using this calibration set
+    subCalibration?: SubCalibrationDetail[];
   }) => {
     const bgColor = type === 'flat'
       ? 'bg-blue-900/20 border-blue-700/30'
@@ -286,6 +317,18 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
             <span className="text-gray-200">{set.frame_count}</span>
           </div>
         </div>
+
+        {/* Sub-calibration section */}
+        {subCalibration && subCalibration.length > 0 && (
+          <div className="mt-3 pt-3 border-t border-gray-600/30">
+            <div className="text-xs text-gray-400 mb-2">Sub-calibration:</div>
+            <div className="space-y-2">
+              {subCalibration.map((sub, i) => (
+                <SubCalibrationCard key={i} sub={sub} />
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Warning display */}
         {warnings.length > 0 && (
@@ -430,6 +473,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
                     type="flat"
                     warnings={[]} // Warnings now shown at filter level
                     linkedFrameCount={flatWithCount.frame_count}
+                    subCalibration={flatWithCount.sub_calibration}
                   />
                 ))}
                 {/* Dark calibration sets */}
@@ -441,6 +485,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
                     type="dark"
                     warnings={[]} // Warnings now shown at filter level
                     linkedFrameCount={darkWithCount.frame_count}
+                    subCalibration={darkWithCount.sub_calibration}
                   />
                 ))}
                 {/* Bias calibration sets */}
@@ -452,6 +497,7 @@ export function CalibrationHierarchyView({ data, useBiasForDarkOptimization = fa
                     type="bias"
                     warnings={[]} // Warnings now shown at filter level
                     linkedFrameCount={biasWithCount.frame_count}
+                    subCalibration={biasWithCount.sub_calibration}
                   />
                 ))}
               </div>
