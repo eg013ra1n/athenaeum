@@ -71,14 +71,14 @@ interface PropertyRowProps {
 }
 
 /**
- * Property row with accessible label and value display.
- * Uses minimum 14px text for labels, 16px for values.
+ * Property row with inline label:value display.
+ * Compact layout with label and value on same line.
  */
 function PropertyRow({ label, value, highlight = false }: PropertyRowProps) {
   return (
-    <div className="flex flex-col gap-0.5">
-      <dt className="text-sm text-gray-300">{label}</dt>
-      <dd className={`text-base font-medium ${highlight ? 'text-amber-300' : 'text-gray-100'}`}>
+    <div className="flex items-baseline gap-1">
+      <dt className="text-xs text-gray-400">{label}:</dt>
+      <dd className={`text-sm font-medium ${highlight ? 'text-amber-300' : 'text-gray-100'}`}>
         {value}
       </dd>
     </div>
@@ -87,6 +87,7 @@ function PropertyRow({ label, value, highlight = false }: PropertyRowProps) {
 
 /**
  * Sub-calibration card for nested calibration (e.g., Dark for Flat).
+ * Compact layout to minimize vertical space.
  */
 function SubCalibrationCard({ sub }: { sub: SubCalibrationDetail }) {
   const subTypeStyles: Record<string, string> = {
@@ -102,34 +103,28 @@ function SubCalibrationCard({ sub }: { sub: SubCalibrationDetail }) {
 
   return (
     <div
-      className={`border rounded-lg p-3 ${subTypeStyles[sub.calibration_type] || 'bg-gray-800/30 border-gray-700/40'}`}
+      className={`border rounded-lg p-2 ${subTypeStyles[sub.calibration_type] || 'bg-gray-800/30 border-gray-700/40'}`}
     >
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-sm font-semibold text-gray-200">{sub.calibration_type}</span>
-        <span className="text-sm text-gray-400">{sub.set.frame_count} frames</span>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs font-semibold text-gray-200">{sub.calibration_type}</span>
+        <span className="text-xs text-gray-400">{sub.set.frame_count} frames</span>
       </div>
 
       {hasWarning && (
-        <div className="flex items-start gap-2 mb-2 text-sm">
-          <AlertTriangle size={16} className="text-amber-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
+        <div className="flex items-start gap-1.5 mb-1 text-xs">
+          <AlertTriangle size={12} className="text-amber-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
           <span className="text-amber-300">{warningParts.join(', ')}</span>
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-2 text-sm">
-        {sub.set.exptime !== null && (
-          <div>
-            <span className="text-gray-400">Exp:</span>{' '}
-            <span className="text-gray-200">{sub.set.exptime}s</span>
-          </div>
-        )}
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs">
         <div>
           <span className="text-gray-400">Temp:</span>{' '}
           <span className={sub.temp_warning ? 'text-amber-300 font-medium' : 'text-gray-200'}>
             {formatTemp(sub.set.ccd_temp)}
           </span>
         </div>
-        <div className="col-span-2">
+        <div>
           <span className="text-gray-400">Date:</span>{' '}
           <span className={sub.date_warning ? 'text-amber-300 font-medium' : 'text-gray-200'}>
             {formatDate(sub.set.date_start)}
@@ -141,11 +136,11 @@ function SubCalibrationCard({ sub }: { sub: SubCalibrationDetail }) {
 }
 
 /**
- * Calibration set card with accessible design.
+ * Calibration set card with compact design.
  * Features:
- * - Spacious layout with larger text (14px labels, 16px values)
+ * - Inline label:value layout to reduce vertical space
  * - Clear warning display
- * - Sub-calibration section
+ * - Compact sub-calibration section
  */
 export function CalibrationSetCard({ type, data }: CalibrationSetCardProps) {
   const { set, warnings, sub_calibration, frame_count } = data;
@@ -156,25 +151,25 @@ export function CalibrationSetCard({ type, data }: CalibrationSetCardProps) {
 
   return (
     <article
-      className={`${styles.bg} ${styles.border} border-2 rounded-xl p-5`}
+      className={`${styles.bg} ${styles.border} border-2 rounded-xl p-4`}
       aria-label={`${type} calibration set`}
     >
       {/* Header */}
-      <header className="flex items-center justify-between mb-4">
-        <h4 className={`text-lg font-semibold ${styles.header}`}>
+      <header className="flex items-center justify-between mb-2">
+        <h4 className={`text-base font-semibold ${styles.header}`}>
           {getCardTitle(type, set)}
         </h4>
-        <span className="text-sm text-gray-300">
+        <span className="text-xs text-gray-300">
           {frame_count} light{frame_count !== 1 ? 's' : ''}
         </span>
       </header>
 
       {/* Warnings */}
       {warnings.length > 0 && (
-        <div className="mb-4 p-3 bg-amber-900/20 rounded-lg border border-amber-700/50">
+        <div className="mb-2 p-2 bg-amber-900/20 rounded-lg border border-amber-700/50">
           {warnings.map((w, i) => (
-            <div key={i} className="flex items-start gap-2 text-sm">
-              <AlertTriangle size={18} className="text-amber-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
+            <div key={i} className="flex items-start gap-1.5 text-xs">
+              <AlertTriangle size={14} className="text-amber-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
               <span className="text-amber-200">{w.message}</span>
             </div>
           ))}
@@ -182,17 +177,13 @@ export function CalibrationSetCard({ type, data }: CalibrationSetCardProps) {
       )}
 
       {/* Properties Grid */}
-      <dl className="grid grid-cols-2 gap-x-4 gap-y-3">
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5">
         {set.exptime !== null && (
           <PropertyRow label="Exposure" value={`${set.exptime}s`} />
         )}
         <PropertyRow
           label="Temperature"
-          value={
-            set.temp_min !== set.temp_max
-              ? `${formatTemp(set.ccd_temp)} (${formatTemp(set.temp_min)} - ${formatTemp(set.temp_max)})`
-              : formatTemp(set.ccd_temp)
-          }
+          value={formatTemp(set.ccd_temp)}
           highlight={hasTempWarning}
         />
         {set.gain !== null && (
@@ -210,9 +201,9 @@ export function CalibrationSetCard({ type, data }: CalibrationSetCardProps) {
 
       {/* Sub-calibration Section */}
       {sub_calibration && sub_calibration.length > 0 && (
-        <div className="mt-4 pt-4 border-t border-gray-600/50">
-          <h5 className="text-sm font-semibold text-gray-300 mb-3">Sub-calibration</h5>
-          <div className="space-y-2">
+        <div className="mt-3 pt-3 border-t border-gray-600/50">
+          <h5 className="text-xs font-semibold text-gray-300 mb-2">Sub-calibration</h5>
+          <div className="space-y-1.5">
             {sub_calibration.map((sub, i) => (
               <SubCalibrationCard key={i} sub={sub} />
             ))}
@@ -236,12 +227,12 @@ export function EmptyCalibrationCard({ type }: { type: CalibrationType }) {
 
   return (
     <div
-      className={`${styles.bg} ${styles.border} border-2 border-dashed rounded-xl p-5 flex flex-col items-center justify-center min-h-[120px]`}
+      className={`${styles.bg} ${styles.border} border-2 border-dashed rounded-xl p-4 flex flex-col items-center justify-center min-h-[80px]`}
     >
-      <span className={`text-lg font-semibold ${styles.header} opacity-60`}>
+      <span className={`text-base font-semibold ${styles.header} opacity-60`}>
         No {labels[type]}
       </span>
-      <span className="text-sm text-gray-400 mt-1">Not linked</span>
+      <span className="text-xs text-gray-400 mt-0.5">Not linked</span>
     </div>
   );
 }
