@@ -118,6 +118,7 @@ pub fn run() {
             commands::check_missing_files_in_scan_root,
             commands::get_imaging_locations,
             commands::get_frame_preview,
+            commands::get_files_with_frames_by_ids,
             commands::query_frames_in_circle,
             commands::query_frames_in_bounds,
             commands::query_frames_in_polygon,

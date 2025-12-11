@@ -1,15 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Calendar, Clock, MapPin, Camera, AlertCircle, ChevronDown, ChevronRight, Plus, Eye, Scissors } from 'lucide-react';
-import type { FrameSetDetail, ImagingNightWithSessions, FileWithFrame, FrameCalibrationStatus, CalibrationHierarchyView } from '../types/models';
+import { ArrowLeft, Clock, MapPin, AlertCircle, Scissors } from 'lucide-react';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
-import { CalibrationStatusBadges } from '../components/CalibrationStatusBadges';
 import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
-import SortableColumnHeader from '../components/SortableColumnHeader';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -17,16 +15,24 @@ export default function FrameSetDetail() {
   const [detail, setDetail] = useState<FrameSetDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [expandedSessions, setExpandedSessions] = useState<Set<number>>(new Set());
-  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<number>>(new Set());
+
+  // Custom set creation dialog
   const [customSetName, setCustomSetName] = useState('');
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [creating, setCreating] = useState(false);
+
+  // Blink viewer state
   const [blinkFrames, setBlinkFrames] = useState<FileWithFrame[] | null>(null);
+
+  // Split dialog state
   const [showSplitDialog, setShowSplitDialog] = useState(false);
   const [splitName, setSplitName] = useState('');
   const [splitting, setSplitting] = useState(false);
+
+  // Delete confirmation
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+
+  // Alert dialog
   const [alertDialog, setAlertDialog] = useState<{
     isOpen: boolean;
     title: string;
@@ -38,112 +44,62 @@ export default function FrameSetDetail() {
     message: '',
     variant: 'info',
   });
-  const [calibrationStatuses, setCalibrationStatuses] = useState<Map<number, FrameCalibrationStatus>>(new Map());
-  const [loadingStatuses, setLoadingStatuses] = useState<Set<number>>(new Set());
 
-  // Sorting and expansion state for frames
-  type SortField = "filename" | "time" | "object" | "filter" | "exptime" | "focallen" | "ccd_temp";
-  const [sortField, setSortField] = useState<SortField | null>(null);
-  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
-  const [expandedFrames, setExpandedFrames] = useState<Set<number>>(new Set());
-
-  // Tab system state
-  const [activeTab, setActiveTab] = useState<'sessions' | 'calibration'>('sessions');
+  // Calibration hierarchy data (loaded on mount)
   const [calibrationHierarchy, setCalibrationHierarchy] = useState<CalibrationHierarchyView | null>(null);
   const [loadingCalibration, setLoadingCalibration] = useState(false);
 
+  // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
+  const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
+
+  // Load both detail and calibration data on mount
   useEffect(() => {
-    loadDetail();
+    loadData();
   }, [id]);
 
-  const loadDetail = async () => {
+  const loadData = async () => {
     if (!id) return;
 
     try {
       setLoading(true);
+      setLoadingCalibration(true);
       setError(null);
-      const result = await invoke<FrameSetDetail>('get_frame_set_detail', {
-        framesSetId: parseInt(id),
-      });
-      setDetail(result);
+
+      // Load both in parallel
+      const [detailResult, hierarchyResult] = await Promise.all([
+        invoke<FrameSetDetail>('get_frame_set_detail', {
+          framesSetId: parseInt(id),
+        }),
+        invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
+          frameSetId: parseInt(id),
+        }),
+      ]);
+
+      setDetail(detailResult);
+      setCalibrationHierarchy(hierarchyResult);
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading(false);
+      setLoadingCalibration(false);
     }
   };
 
-  const loadCalibrationHierarchy = async (showLoading: boolean = true) => {
+  // Refresh calibration hierarchy without showing loading spinner (keeps expanded state)
+  const refreshCalibrationHierarchy = useCallback(async () => {
     if (!id) return;
-
     try {
-      // Only show loading spinner on initial load, not on refresh
-      // This prevents the component from unmounting and losing expanded state
-      if (showLoading) {
-        setLoadingCalibration(true);
-      }
       const result = await invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
         frameSetId: parseInt(id),
       });
       setCalibrationHierarchy(result);
     } catch (err) {
-      console.error('Failed to load calibration hierarchy:', err);
-      showAlert('Error', `Failed to load calibration data: ${err}`, 'error');
-    } finally {
-      if (showLoading) {
-        setLoadingCalibration(false);
-      }
+      console.error('Failed to refresh calibration hierarchy:', err);
     }
-  };
-
-  // Refresh without showing loading spinner (keeps expanded state)
-  const refreshCalibrationHierarchy = () => loadCalibrationHierarchy(false);
-
-  // Load calibration hierarchy when Calibration tab is selected
-  useEffect(() => {
-    if (activeTab === 'calibration' && !calibrationHierarchy) {
-      loadCalibrationHierarchy();
-    }
-  }, [activeTab]);
+  }, [id]);
 
   const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
     setAlertDialog({ isOpen: true, title, message, variant });
-  };
-
-  const formatDate = (isoString: string) => {
-    try {
-      return new Date(isoString).toLocaleString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-      });
-    } catch {
-      return isoString;
-    }
-  };
-
-  const formatDateRange = (startTime: string, endTime: string) => {
-    try {
-      const start = new Date(startTime);
-      const end = new Date(endTime);
-      const startDate = start.toLocaleDateString('en-US', {
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric',
-      });
-      const endDate = end.toLocaleDateString('en-US', {
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric',
-      });
-      return startDate === endDate ? startDate : `${startDate} - ${endDate}`;
-    } catch {
-      return `${startTime} - ${endTime}`;
-    }
   };
 
   const formatExposureTime = (seconds: number | null | undefined) => {
@@ -153,114 +109,82 @@ export default function FrameSetDetail() {
     return parseFloat(hours) >= 1 ? `${hours}h` : `${minutes}m`;
   };
 
-  const loadCalibrationStatus = async (frameId: number) => {
-    if (calibrationStatuses.has(frameId) || loadingStatuses.has(frameId)) {
-      return; // Already loaded or loading
-    }
+  // Build a unique filter key that includes exptime to differentiate same filter with different exposures
+  const buildFilterKey = useCallback((filterGroup: { filter: string | null; exptime: number | null }): string => {
+    const baseFilter = filterGroup.filter ?? '__no_filter__';
+    return filterGroup.exptime !== null
+      ? `${baseFilter}:${filterGroup.exptime}`
+      : baseFilter;
+  }, []);
 
-    try {
-      setLoadingStatuses(prev => new Set(prev).add(frameId));
-      const status = await invoke<FrameCalibrationStatus>('get_frame_status', { frameId });
-      setCalibrationStatuses(prev => new Map(prev).set(frameId, status));
-    } catch (err) {
-      console.error('Failed to load calibration status for frame', frameId, err);
-    } finally {
-      setLoadingStatuses(prev => {
-        const newSet = new Set(prev);
-        newSet.delete(frameId);
-        return newSet;
-      });
-    }
-  };
+  // Get frame IDs from selected filter keys
+  const getFrameIdsFromFilterKeys = useCallback((filterKeys: Set<string>): number[] => {
+    if (!calibrationHierarchy) return [];
 
-  const loadCalibrationStatusForSession = async (frames: FileWithFrame[]) => {
-    // Load calibration status for all LIGHT frames in the session
-    const lightFrames = frames.filter(f => f.frame?.imagetyp === 'Light' && f.frame?.id != null);
-    await Promise.all(lightFrames.map(f => loadCalibrationStatus(f.frame!.id!)));
-  };
-
-  const toggleSession = (sessionId: number | null | undefined, sessionFrames?: FileWithFrame[]) => {
-    if (!sessionId) return;
-    setExpandedSessions(prev => {
-      const newSet = new Set(prev);
-
-      if (newSet.has(sessionId)) {
-        newSet.delete(sessionId);
-      } else {
-        newSet.add(sessionId);
-        // Load calibration status when expanding
-        if (sessionFrames) {
-          loadCalibrationStatusForSession(sessionFrames);
+    const frameIds: number[] = [];
+    for (const dateGroup of calibrationHierarchy.date_groups) {
+      for (const cameraGroup of dateGroup.camera_groups) {
+        for (const filterGroup of cameraGroup.filter_groups) {
+          const filterKey = buildFilterKey(filterGroup);
+          const fullKey = `${dateGroup.date}:${cameraGroup.instrume}:${filterKey}`;
+          if (filterKeys.has(fullKey)) {
+            frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
+          }
         }
       }
-      return newSet;
-    });
-  };
+    }
+    return frameIds;
+  }, [calibrationHierarchy, buildFilterKey]);
 
-  const toggleSessionSelection = (sessionId: number | null | undefined) => {
-    if (!sessionId) return;
-    setSelectedSessionIds(prev => {
-      const newSet = new Set(prev);
-      if (newSet.has(sessionId)) {
-        newSet.delete(sessionId);
-      } else {
-        newSet.add(sessionId);
-      }
-      return newSet;
-    });
-  };
-
-  const handleOpenBlink = (frames: FileWithFrame[]) => {
-    // Filter only LIGHT frames with FITS format
-    const lightFitsFrames = frames.filter(
-      f => f.frame?.imagetyp === 'Light' && f.file.format === 'FITS'
-    );
-
-    if (lightFitsFrames.length === 0) {
-      showAlert('No LIGHT Frames', 'No LIGHT FITS frames found in this session', 'warning');
+  // Handle blink from CalibrationHierarchyView - load full frame data
+  const handleBlink = useCallback(async (frameIds: number[]) => {
+    if (frameIds.length === 0) {
+      showAlert('No Frames', 'No frames selected for blink', 'warning');
       return;
     }
 
-    setBlinkFrames(lightFitsFrames);
-  };
+    try {
+      // Load full frame data for the given frame IDs
+      const frames = await invoke<FileWithFrame[]>('get_files_with_frames_by_ids', {
+        frameIds,
+      });
 
-  const toggleNightSelection = (night: ImagingNightWithSessions) => {
-    const nightSessionIds = night.sessions
-      ?.map(s => s.session?.id)
-      .filter((id): id is number => id != null) || [];
+      // Filter only LIGHT frames with FITS format
+      const lightFitsFrames = frames.filter(
+        f => f.frame?.imagetyp === 'Light' && f.file.format === 'FITS'
+      );
 
-    if (nightSessionIds.length === 0) return;
-
-    const allSelected = nightSessionIds.every(id => selectedSessionIds.has(id));
-
-    setSelectedSessionIds(prev => {
-      const newSet = new Set(prev);
-      if (allSelected) {
-        // Deselect all
-        nightSessionIds.forEach(id => newSet.delete(id));
-      } else {
-        // Select all
-        nightSessionIds.forEach(id => newSet.add(id));
+      if (lightFitsFrames.length === 0) {
+        showAlert('No LIGHT Frames', 'No LIGHT FITS frames found for blink', 'warning');
+        return;
       }
-      return newSet;
-    });
-  };
 
-  const isNightFullySelected = (night: ImagingNightWithSessions) => {
-    const nightSessionIds = night.sessions
-      ?.map(s => s.session?.id)
-      .filter((id): id is number => id != null) || [];
+      setBlinkFrames(lightFitsFrames);
+    } catch (err) {
+      console.error('Failed to load frames for blink:', err);
+      showAlert('Error', 'Failed to load frames for blink: ' + String(err), 'error');
+    }
+  }, []);
 
-    return nightSessionIds.length > 0 && nightSessionIds.every(id => selectedSessionIds.has(id));
-  };
+  // Handle split from CalibrationHierarchyView
+  const handleOpenSplitDialog = useCallback((filterKeys: Set<string>) => {
+    if (!id || filterKeys.size === 0) return;
 
-  const isNightPartiallySelected = (night: ImagingNightWithSessions) => {
-    const nightSessionIds = night.sessions
-      ?.map(s => s.session?.id)
-      .filter((id): id is number => id != null) || [];
+    setSelectedFilterKeys(filterKeys);
 
-    return nightSessionIds.some(id => selectedSessionIds.has(id)) && !isNightFullySelected(night);
-  };
+    // Pre-fill split name
+    const originalName = detail?.frames_set?.name || 'Untitled';
+    setSplitName(`${originalName} - Split 1`);
+    setShowSplitDialog(true);
+  }, [id, detail]);
+
+  // Handle create custom set from CalibrationHierarchyView
+  const handleOpenCreateDialog = useCallback((filterKeys: Set<string>) => {
+    if (filterKeys.size === 0) return;
+
+    setSelectedFilterKeys(filterKeys);
+    setShowCreateDialog(true);
+  }, []);
 
   const handleCreateCustomSet = async () => {
     if (!customSetName.trim()) {
@@ -268,71 +192,35 @@ export default function FrameSetDetail() {
       return;
     }
 
-    if (selectedSessionIds.size === 0) {
-      showAlert('No Selection', 'Please select at least one session', 'warning');
+    if (selectedFilterKeys.size === 0) {
+      showAlert('No Selection', 'Please select at least one filter group', 'warning');
+      return;
+    }
+
+    const frameIds = getFrameIdsFromFilterKeys(selectedFilterKeys);
+    if (frameIds.length === 0) {
+      showAlert('No Frames', 'No frames found in selected filter groups', 'warning');
       return;
     }
 
     try {
       setCreating(true);
-      await invoke('create_custom_frames_set', {
+      // Use existing command that creates frame set from frame IDs
+      await invoke('create_frame_set_from_selection', {
         name: customSetName.trim(),
-        sessionIds: Array.from(selectedSessionIds),
-        projectId: null, // No project assignment for now (can be added later)
+        frame_ids: frameIds,
+        description: null,
       });
 
       // Success - silent update
       setShowCreateDialog(false);
       setCustomSetName('');
-      setSelectedSessionIds(new Set());
+      setSelectedFilterKeys(new Set());
       navigate('/objects');
     } catch (err) {
       showAlert('Creation Failed', 'Failed to create custom set: ' + String(err), 'error');
     } finally {
       setCreating(false);
-    }
-  };
-
-  const handleOpenSplitDialog = async () => {
-    if (!id || selectedSessionIds.size === 0) return;
-
-    // Determine selection type based on what's selected
-    // Check if entire nights are selected
-    const selectedNights = detail?.nights.filter(night => isNightFullySelected(night)) || [];
-
-    let selection: any;
-    if (selectedNights.length > 0) {
-      // Splitting by nights
-      selection = {
-        type: 'nights',
-        ids: selectedNights.map(n => n.imaging_night?.id).filter((id): id is number => id != null)
-      };
-    } else {
-      // Splitting by sessions
-      selection = {
-        type: 'sessions',
-        ids: Array.from(selectedSessionIds)
-      };
-    }
-
-    // Check if split is valid
-    try {
-      const canSplit = await invoke<boolean>('can_split', {
-        sourceSetId: parseInt(id),
-        selection
-      });
-
-      if (!canSplit) {
-        showAlert('Cannot Split', 'Cannot split: operation would leave the source frame set empty.\n\nYou must leave at least one night/session in the original set.', 'warning');
-        return;
-      }
-
-      // Pre-fill split name
-      const originalName = detail?.frames_set?.name || 'Untitled';
-      setSplitName(`${originalName} - Split 1`);
-      setShowSplitDialog(true);
-    } catch (err) {
-      showAlert('Validation Failed', 'Failed to validate split: ' + String(err), 'error');
     }
   };
 
@@ -342,41 +230,32 @@ export default function FrameSetDetail() {
       return;
     }
 
-    if (selectedSessionIds.size === 0) {
-      showAlert('No Selection', 'Please select at least one session', 'warning');
+    if (selectedFilterKeys.size === 0) {
+      showAlert('No Selection', 'Please select at least one filter group', 'warning');
       return;
     }
 
-    // Determine selection type
-    const selectedNights = detail?.nights.filter(night => isNightFullySelected(night)) || [];
-
-    let selection: any;
-    if (selectedNights.length > 0) {
-      selection = {
-        type: 'nights',
-        ids: selectedNights.map(n => n.imaging_night?.id).filter((id): id is number => id != null)
-      };
-    } else {
-      selection = {
-        type: 'sessions',
-        ids: Array.from(selectedSessionIds)
-      };
+    const frameIds = getFrameIdsFromFilterKeys(selectedFilterKeys);
+    if (frameIds.length === 0) {
+      showAlert('No Frames', 'No frames found in selected filter groups', 'warning');
+      return;
     }
 
     try {
       setSplitting(true);
+      // Use existing split_frame_set with Frames selection type
       await invoke('split_frame_set', {
         sourceSetId: parseInt(id),
-        selection,
-        newName: splitName.trim()
+        selection: { type: 'frames', ids: frameIds },
+        newName: splitName.trim(),
       });
 
       setShowSplitDialog(false);
       setSplitName('');
-      setSelectedSessionIds(new Set());
+      setSelectedFilterKeys(new Set());
 
-      // Reload the detail view to show updated data
-      await loadDetail();
+      // Reload to show updated data
+      await loadData();
 
       // Success - silent update (no alert)
     } catch (err) {
@@ -401,85 +280,6 @@ export default function FrameSetDetail() {
     } catch (err) {
       showAlert('Delete Failed', 'Failed to delete: ' + String(err), 'error');
     }
-  };
-
-  const handleSort = (field: string) => {
-    if (sortField === field) {
-      // Toggle direction
-      setSortDirection(sortDirection === "asc" ? "desc" : "asc");
-    } else {
-      // New field, default to ascending
-      setSortField(field as SortField);
-      setSortDirection("asc");
-    }
-  };
-
-  const toggleFrameExpansion = (fileId: number) => {
-    setExpandedFrames(prev => {
-      const newSet = new Set(prev);
-      if (newSet.has(fileId)) {
-        newSet.delete(fileId);
-      } else {
-        newSet.add(fileId);
-      }
-      return newSet;
-    });
-  };
-
-  const sortFrames = (frames: FileWithFrame[]) => {
-    if (!sortField) return frames;
-
-    return [...frames].sort((a, b) => {
-      let aVal: any;
-      let bVal: any;
-
-      switch (sortField) {
-        case "filename":
-          aVal = a.file?.filename || "";
-          bVal = b.file?.filename || "";
-          break;
-        case "time":
-          aVal = a.frame?.date_obs || "";
-          bVal = b.frame?.date_obs || "";
-          break;
-        case "object":
-          aVal = a.frame?.object || "";
-          bVal = b.frame?.object || "";
-          break;
-        case "filter":
-          aVal = a.frame?.filter || "";
-          bVal = b.frame?.filter || "";
-          break;
-        case "exptime":
-          aVal = a.frame?.exptime || 0;
-          bVal = b.frame?.exptime || 0;
-          break;
-        case "focallen":
-          aVal = a.frame?.focallen || 0;
-          bVal = b.frame?.focallen || 0;
-          break;
-        case "ccd_temp":
-          aVal = a.frame?.ccd_temp || 0;
-          bVal = b.frame?.ccd_temp || 0;
-          break;
-        default:
-          return 0;
-      }
-
-      // Handle null values
-      if (aVal === null || aVal === undefined || aVal === "") return 1;
-      if (bVal === null || bVal === undefined || bVal === "") return -1;
-
-      // String comparison
-      if (typeof aVal === "string") {
-        return sortDirection === "asc"
-          ? aVal.localeCompare(bVal)
-          : bVal.localeCompare(aVal);
-      }
-
-      // Numeric comparison
-      return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
-    });
   };
 
   if (loading) {
@@ -537,17 +337,10 @@ export default function FrameSetDetail() {
     );
   }
 
-  const totalFrames = detail.nights.length > 0
-    ? detail.nights.reduce(
-        (acc, night) => acc + night.sessions.reduce((acc2, session) => acc2 + (session.session?.frame_count || 0), 0),
-        0
-      )
-    : 0;
-
   return (
-    <div className="p-6">
-      {/* Back Button and Selection Info */}
-      <div className="mb-6 flex items-center justify-between">
+    <div className="p-6 h-full flex flex-col">
+      {/* Back Button */}
+      <div className="mb-6 flex items-center justify-between flex-shrink-0">
         <button
           onClick={() => navigate('/objects')}
           className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
@@ -555,476 +348,100 @@ export default function FrameSetDetail() {
           <ArrowLeft size={18} />
           Back to Objects
         </button>
-
-        {selectedSessionIds.size > 0 && (
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-400">
-              {selectedSessionIds.size} session{selectedSessionIds.size !== 1 ? 's' : ''} selected
-            </span>
-            <button
-              onClick={handleOpenSplitDialog}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition"
-            >
-              <Scissors size={18} />
-              Split
-            </button>
-            <button
-              onClick={() => setShowCreateDialog(true)}
-              className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition"
-            >
-              <Plus size={18} />
-              Create Custom Set
-            </button>
-          </div>
-        )}
       </div>
 
-      {/* Frame Set Header */}
-      <div className="bg-gray-800 rounded-lg p-6 mb-6 border border-gray-700">
+      {/* Frame Set Header - Combined with Stats */}
+      <div className="bg-gray-800 rounded-lg p-5 mb-4 border border-gray-700 flex-shrink-0">
         <div className="flex items-start justify-between mb-4">
-          <h1 className="text-3xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
-          <CalibrationFinderButton
-            frameSetId={parseInt(id!)}
-            frameSetName={detail.frames_set?.name || 'Untitled'}
-            onComplete={() => {
-              loadDetail();
-              loadCalibrationHierarchy();
-            }}
-          />
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="bg-gray-900/50 rounded p-4">
-            <p className="text-gray-500 text-sm mb-1">Coordinates</p>
-            {detail.frames_set?.objctra && detail.frames_set?.objctdec ? (
-              <div className="flex items-center gap-2">
-                <MapPin size={16} className="text-gray-400" />
-                <span className="font-mono text-sm text-gray-200">
+          <div className="flex items-center gap-4">
+            <h1 className="text-2xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
+            {detail.frames_set?.objctra && detail.frames_set?.objctdec && (
+              <div className="flex items-center gap-2 text-gray-400">
+                <MapPin size={16} />
+                <span className="font-mono text-sm">
                   {detail.frames_set.objctra} / {detail.frames_set.objctdec}
                 </span>
               </div>
-            ) : (
-              <span className="text-gray-500">-</span>
             )}
           </div>
+          <CalibrationFinderButton
+            frameSetId={parseInt(id!)}
+            frameSetName={detail.frames_set?.name || 'Untitled'}
+            onComplete={loadData}
+          />
+        </div>
 
-          <div className="bg-gray-900/50 rounded p-4">
-            <p className="text-gray-500 text-sm mb-1">Total Frames</p>
-            <p className="text-2xl font-bold text-gray-200">{totalFrames}</p>
+        {/* Stats Row */}
+        <div className="grid grid-cols-6 gap-4 text-center">
+          <div className="bg-gray-900/50 rounded p-3">
+            <div className="text-2xl font-bold text-gray-100">
+              {calibrationHierarchy?.total_frames ?? '-'}
+            </div>
+            <div className="text-xs text-gray-400 mt-1">Total Frames</div>
           </div>
-
-          <div className="bg-gray-900/50 rounded p-4">
-            <p className="text-gray-500 text-sm mb-1 flex items-center gap-1">
-              <Clock size={14} />
-              Total Exposure
-            </p>
-            <p className="text-2xl font-bold text-gray-200">
+          <div className="bg-gray-900/50 rounded p-3">
+            <div className="text-2xl font-bold text-emerald-400">
+              {calibrationHierarchy?.calibrated_frames ?? '-'}
+            </div>
+            <div className="text-xs text-gray-400 mt-1">Calibrated</div>
+          </div>
+          <div className="bg-gray-900/50 rounded p-3">
+            <div className="text-2xl font-bold text-amber-400">
+              {calibrationHierarchy?.uncalibrated_frames ?? '-'}
+            </div>
+            <div className="text-xs text-gray-400 mt-1">Uncalibrated</div>
+          </div>
+          <div className="bg-gray-900/50 rounded p-3">
+            <div className="text-2xl font-bold text-blue-400">
+              {calibrationHierarchy?.date_groups.length ?? '-'}
+            </div>
+            <div className="text-xs text-gray-400 mt-1">Sessions</div>
+          </div>
+          <div className="bg-gray-900/50 rounded p-3">
+            <div className="text-2xl font-bold text-gray-200">
               {formatExposureTime(detail.frames_set?.total_exp_time)}
-            </p>
+            </div>
+            <div className="text-xs text-gray-400 mt-1 flex items-center justify-center gap-1">
+              <Clock size={12} />
+              Exposure
+            </div>
+          </div>
+          <div className="bg-gray-900/50 rounded p-3">
+            <div className="text-sm font-mono text-gray-300 truncate" title={detail.frames_set?.objctra && detail.frames_set?.objctdec ? `${detail.frames_set.objctra} / ${detail.frames_set.objctdec}` : '-'}>
+              {detail.frames_set?.objctra ? detail.frames_set.objctra.substring(0, 10) : '-'}
+            </div>
+            <div className="text-xs text-gray-400 mt-1 flex items-center justify-center gap-1">
+              <MapPin size={12} />
+              RA
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Imaging Nights */}
-      <div>
-        {/* Tab Navigation */}
-        <div className="mb-6">
-          <div className="flex gap-4 border-b border-gray-700">
-            <button
-              className={`px-4 py-2 font-medium transition-colors ${
-                activeTab === 'sessions'
-                  ? 'text-blue-400 border-b-2 border-blue-400'
-                  : 'text-gray-400 hover:text-gray-200'
-              }`}
-              onClick={() => setActiveTab('sessions')}
-            >
-              Sessions
-            </button>
-            <button
-              className={`px-4 py-2 font-medium transition-colors ${
-                activeTab === 'calibration'
-                  ? 'text-blue-400 border-b-2 border-blue-400'
-                  : 'text-gray-400 hover:text-gray-200'
-              }`}
-              onClick={() => setActiveTab('calibration')}
-            >
-              Calibration
-            </button>
+      {/* Main Content - CalibrationHierarchyView */}
+      <div className="flex-1 min-h-0">
+        {loadingCalibration ? (
+          <div className="text-center py-12">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+            <p className="text-gray-400">Loading calibration data...</p>
           </div>
-        </div>
-
-        {/* Sessions Tab Content */}
-        {activeTab === 'sessions' && (
-          <>
-            {!detail.nights || detail.nights.length === 0 ? (
-          <div className="bg-yellow-900/20 border border-yellow-800 rounded-lg p-8 text-center">
-            <AlertCircle size={48} className="mx-auto mb-4 text-yellow-500" />
-            <h3 className="text-xl font-semibold text-yellow-400 mb-2">No Sessions Available</h3>
-            <p className="text-gray-400 mb-4">
-              This frame set was created without session data. Sessions are created automatically
-              when you use "Auto-Generate Sets" with frames that have DATE-OBS metadata.
-            </p>
-            <div className="flex gap-3 justify-center">
-              <button
-                onClick={() => navigate('/objects')}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
-              >
-                Back to Objects
-              </button>
-              <button
-                onClick={handleDeleteClick}
-                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
-              >
-                Delete Frame Set
-              </button>
-            </div>
-          </div>
+        ) : calibrationHierarchy ? (
+          <CalibrationHierarchyViewComponent
+            data={calibrationHierarchy}
+            onRefresh={refreshCalibrationHierarchy}
+            onBlink={handleBlink}
+            onSplit={handleOpenSplitDialog}
+            onCreateCustomSet={handleOpenCreateDialog}
+          />
         ) : (
-          <div className="space-y-8">
-            {detail.nights.map((night) => (
-              <div key={night.imaging_night?.id || Math.random()} className="mb-8">
-                {/* Night Header */}
-                <div className="bg-gray-750 rounded-lg px-4 py-3 mb-4 border border-gray-700">
-                  <div className="flex items-center gap-3">
-                    <input
-                      type="checkbox"
-                      checked={isNightFullySelected(night)}
-                      ref={(el) => {
-                        if (el) el.indeterminate = isNightPartiallySelected(night);
-                      }}
-                      onChange={() => toggleNightSelection(night)}
-                      className="w-4 h-4 cursor-pointer"
-                      title="Select all sessions in this night"
-                    />
-                    <Calendar size={20} className="text-purple-400" />
-                    <div>
-                      <h3 className="font-semibold text-lg text-gray-100">
-                        {formatDateRange(night.imaging_night?.start_time || '', night.imaging_night?.end_time || '')}
-                      </h3>
-                      <div className="flex items-center gap-4 text-sm text-gray-400 mt-1">
-                        <div className="flex items-center gap-1">
-                          <Clock size={14} />
-                          {formatDate(night.imaging_night?.start_time || '')} → {formatDate(night.imaging_night?.end_time || '')}
-                        </div>
-                        <div>{night.sessions?.length || 0} session{(night.sessions?.length || 0) !== 1 ? 's' : ''}</div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Sessions within this night */}
-                {night.sessions?.map((sessionData) => {
-                  const sessionId = sessionData.session?.id;
-                  const isExpanded = sessionId ? expandedSessions.has(sessionId) : false;
-
-                  return (
-                    <div key={sessionId || Math.random()} className="bg-gray-800 rounded-lg overflow-hidden mb-4">
-                      {/* Session Header - Clickable */}
-                      <div className="w-full bg-gray-750 border-b border-gray-700 px-4 py-3 flex items-center gap-3">
-                        <input
-                          type="checkbox"
-                          checked={sessionId ? selectedSessionIds.has(sessionId) : false}
-                          onChange={(e) => {
-                            e.stopPropagation();
-                            toggleSessionSelection(sessionId);
-                          }}
-                          className="w-4 h-4 cursor-pointer"
-                        />
-                        <button
-                          onClick={() => toggleSession(sessionId, sessionData.frames)}
-                          className="flex-1 flex items-center gap-3 hover:bg-gray-700 transition-colors text-left -my-3 -mr-4 py-3 pr-4 rounded"
-                        >
-                          {isExpanded ? (
-                            <ChevronDown size={18} className="text-gray-400" />
-                          ) : (
-                            <ChevronRight size={18} className="text-gray-400" />
-                          )}
-                          <Camera size={18} className="text-blue-400" />
-                          <div className="flex-1">
-                            <h4 className="font-semibold text-gray-100">{sessionData.session?.instrume || 'Unknown'}</h4>
-                            <p className="text-xs text-gray-400 mt-0.5">
-                              {sessionData.session?.frame_count || 0} frame{(sessionData.session?.frame_count || 0) !== 1 ? 's' : ''} •
-                              {' '}{formatExposureTime(sessionData.session?.total_exp_time)} total
-                            </p>
-                          </div>
-                        </button>
-
-                        {/* Blink button - only show if session has 2+ LIGHT FITS frames */}
-                        {sessionData.frames && sessionData.frames.filter(f => f.frame?.imagetyp === 'Light' && f.file.format === 'FITS').length >= 2 && (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleOpenBlink(sessionData.frames!);
-                            }}
-                            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded flex items-center gap-2 transition-colors"
-                            title="Open blink viewer for LIGHT frames"
-                          >
-                            <Eye size={16} />
-                            <span>Blink</span>
-                          </button>
-                        )}
-                      </div>
-
-                      {/* Frames Table - Collapsible */}
-                      {isExpanded && sessionData.frames && sessionData.frames.length > 0 && (
-                        <div className="overflow-x-auto">
-                          <table className="w-full">
-                            <thead className="bg-gray-900 sticky top-0">
-                              <tr>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  <SortableColumnHeader
-                                    field="time"
-                                    label="Time"
-                                    currentSortField={sortField}
-                                    sortDirection={sortDirection}
-                                    onSort={handleSort}
-                                  />
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  <SortableColumnHeader
-                                    field="object"
-                                    label="Object"
-                                    currentSortField={sortField}
-                                    sortDirection={sortDirection}
-                                    onSort={handleSort}
-                                  />
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  <SortableColumnHeader
-                                    field="filter"
-                                    label="Filter"
-                                    currentSortField={sortField}
-                                    sortDirection={sortDirection}
-                                    onSort={handleSort}
-                                  />
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  <SortableColumnHeader
-                                    field="exptime"
-                                    label="Exposure"
-                                    currentSortField={sortField}
-                                    sortDirection={sortDirection}
-                                    onSort={handleSort}
-                                    align="right"
-                                  />
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  Type
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  <SortableColumnHeader
-                                    field="focallen"
-                                    label="Focal Len"
-                                    currentSortField={sortField}
-                                    sortDirection={sortDirection}
-                                    onSort={handleSort}
-                                    align="right"
-                                  />
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                                  <SortableColumnHeader
-                                    field="ccd_temp"
-                                    label="Temp"
-                                    currentSortField={sortField}
-                                    sortDirection={sortDirection}
-                                    onSort={handleSort}
-                                    align="right"
-                                  />
-                                </th>
-                                <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 tracking-wider">
-                                  Calibration
-                                </th>
-                              </tr>
-                            </thead>
-                            <tbody className="divide-y divide-gray-700">
-                              {sortFrames(sessionData.frames).map((item, idx) => {
-                                const frameId = item.frame?.id;
-                                const fileId = item.file?.id;
-                                const calibrationStatus = frameId ? (calibrationStatuses.get(frameId) || null) : null;
-                                const isLoadingStatus = frameId ? loadingStatuses.has(frameId) : false;
-                                const isLightFrame = item.frame?.imagetyp === 'Light';
-                                const isFrameExpanded = fileId ? expandedFrames.has(fileId) : false;
-
-                                return (
-                                  <React.Fragment key={fileId || idx}>
-                                    <tr
-                                      onClick={() => fileId && toggleFrameExpansion(fileId)}
-                                      className={`${
-                                        idx % 2 === 0 ? "bg-gray-800" : "bg-gray-850"
-                                      } hover:bg-gray-750 cursor-pointer transition-colors`}
-                                    >
-                                      <td className="px-4 py-3 text-sm text-gray-400">
-                                        {item.frame?.date_obs
-                                          ? new Date(item.frame.date_obs).toLocaleTimeString('en-US', {
-                                              hour: '2-digit',
-                                              minute: '2-digit',
-                                              second: '2-digit',
-                                              hour12: false,
-                                            })
-                                          : '-'}
-                                      </td>
-                                      <td className="px-4 py-3 text-sm text-gray-300 truncate">
-                                        {item.frame?.object || '-'}
-                                      </td>
-                                      <td className="px-4 py-3 text-sm text-gray-400 truncate">
-                                        {item.frame?.filter || '-'}
-                                      </td>
-                                      <td className="px-4 py-3 text-sm text-gray-400 text-right">
-                                        {item.frame?.exptime ? `${item.frame.exptime}s` : '-'}
-                                      </td>
-                                      <td className="px-4 py-3">
-                                        {item.frame?.imagetyp && (
-                                          <span
-                                            className={`px-2 py-0.5 rounded text-xs ${
-                                              item.frame.imagetyp === 'Light'
-                                                ? 'bg-blue-900 text-blue-200'
-                                                : 'bg-gray-700 text-gray-300'
-                                            }`}
-                                          >
-                                            {item.frame.imagetyp}
-                                          </span>
-                                        )}
-                                      </td>
-                                      <td className="px-4 py-3 text-sm text-gray-500 text-right">
-                                        {item.frame?.focallen ? `${item.frame.focallen}mm` : '-'}
-                                      </td>
-                                      <td className="px-4 py-3 text-sm text-gray-500 text-right">
-                                        {item.frame?.ccd_temp ? `${item.frame.ccd_temp}°C` : '-'}
-                                      </td>
-                                      <td className="px-4 py-3">
-                                        {isLightFrame && (
-                                          <CalibrationStatusBadges
-                                            status={calibrationStatus}
-                                            loading={isLoadingStatus}
-                                          />
-                                        )}
-                                      </td>
-                                    </tr>
-
-                                    {/* Expanded Frame Details Row */}
-                                    {isFrameExpanded && (
-                                      <tr className="bg-gray-900 border-t border-gray-700">
-                                        <td colSpan={8} className="px-4 py-4">
-                                          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 text-sm">
-                                            <div>
-                                              <span className="text-gray-400">File Path:</span>
-                                              <span className="ml-2 text-gray-100 font-mono text-xs break-all">
-                                                {item.file?.path || 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Date/Time:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.frame?.date_obs
-                                                  ? formatDate(item.frame.date_obs)
-                                                  : 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Binning:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.frame?.xbinning && item.frame?.ybinning
-                                                  ? `${item.frame.xbinning}x${item.frame.ybinning}`
-                                                  : 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Gain:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.frame?.gain !== null && item.frame?.gain !== undefined
-                                                  ? item.frame.gain
-                                                  : 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Offset:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.frame?.offset !== null && item.frame?.offset !== undefined
-                                                  ? item.frame.offset
-                                                  : 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Set Temp:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.frame?.set_temp !== null && item.frame?.set_temp !== undefined
-                                                  ? `${item.frame.set_temp}°C`
-                                                  : 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Telescope:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.frame?.telescop || 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Instrument:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.frame?.instrume || 'N/A'}
-                                              </span>
-                                            </div>
-                                            {(item.frame?.ra || item.frame?.dec) && (
-                                              <div className="col-span-2">
-                                                <span className="text-gray-400">Coordinates:</span>
-                                                <span className="ml-2 text-gray-100 font-mono">
-                                                  RA: {item.frame?.ra || 'N/A'}, Dec: {item.frame?.dec || 'N/A'}
-                                                </span>
-                                              </div>
-                                            )}
-                                            <div>
-                                              <span className="text-gray-400">File Size:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.file?.size
-                                                  ? `${(item.file.size / 1024 / 1024).toFixed(2)} MB`
-                                                  : 'N/A'}
-                                              </span>
-                                            </div>
-                                            <div>
-                                              <span className="text-gray-400">Format:</span>
-                                              <span className="ml-2 text-gray-100">
-                                                {item.file?.format || 'N/A'}
-                                              </span>
-                                            </div>
-                                          </div>
-                                        </td>
-                                      </tr>
-                                    )}
-                                  </React.Fragment>
-                                );
-                              })}
-                            </tbody>
-                          </table>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            ))}
-          </div>
-        )}
-          </>
-        )}
-
-        {/* Calibration Tab Content */}
-        {activeTab === 'calibration' && (
-          <div>
-            {loadingCalibration ? (
-              <div className="text-center py-12">
-                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
-                <p className="text-gray-400">Loading calibration data...</p>
-              </div>
-            ) : calibrationHierarchy ? (
-              <CalibrationHierarchyViewComponent
-                data={calibrationHierarchy}
-                onRefresh={refreshCalibrationHierarchy}
-              />
-            ) : (
-              <div className="text-center py-12 text-gray-400">
-                <p>Failed to load calibration data.</p>
-              </div>
-            )}
+          <div className="text-center py-12 text-gray-400">
+            <p>Failed to load calibration data.</p>
+            <button
+              onClick={handleDeleteClick}
+              className="mt-4 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
+            >
+              Delete Frame Set
+            </button>
           </div>
         )}
       </div>
@@ -1050,7 +467,7 @@ export default function FrameSetDetail() {
             </div>
 
             <div className="mb-6 text-sm text-gray-400">
-              {selectedSessionIds.size} session{selectedSessionIds.size !== 1 ? 's' : ''} will be included in the new set
+              {selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be included in the new set
             </div>
 
             <div className="flex gap-3 justify-end">
@@ -1099,9 +516,9 @@ export default function FrameSetDetail() {
             </div>
 
             <div className="mb-6 text-sm text-gray-400 space-y-2">
-              <p>{selectedSessionIds.size} session{selectedSessionIds.size !== 1 ? 's' : ''} will be split into the new set</p>
+              <p>{selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be split into the new set</p>
               <p className="text-yellow-400">
-                The selected sessions will be removed from "{detail?.frames_set?.name || 'this set'}" and moved to the new set.
+                The selected frames will be removed from "{detail?.frames_set?.name || 'this set'}" and moved to the new set.
               </p>
             </div>
 

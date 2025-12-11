@@ -1,7 +1,10 @@
-import { useState } from 'react';
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { useState, useMemo, useCallback } from 'react';
+import { ChevronDown, ChevronRight, Copy, Check } from 'lucide-react';
 import type { LightFrameWithCalibration } from '../../types/models';
 import { StatusIndicator } from './StatusIndicator';
+
+type SortField = 'time' | 'telescop' | 'focallen' | 'exptime' | 'binning';
+type SortDirection = 'asc' | 'desc';
 
 interface LightFrameListProps {
   frames: LightFrameWithCalibration[];
@@ -10,15 +13,172 @@ interface LightFrameListProps {
 }
 
 /**
- * Accessible light frame list with proper table semantics.
+ * Format date/time for display.
+ */
+function formatTime(dateStr: string | null): string {
+  if (!dateStr) return '-';
+  try {
+    return new Date(dateStr).toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+  } catch {
+    return '-';
+  }
+}
+
+/**
+ * Sortable column header component.
+ */
+function SortableHeader({
+  field,
+  label,
+  currentSort,
+  currentDirection,
+  onSort,
+  align = 'left',
+}: {
+  field: SortField;
+  label: string;
+  currentSort: SortField | null;
+  currentDirection: SortDirection;
+  onSort: (field: SortField) => void;
+  align?: 'left' | 'right';
+}) {
+  const isActive = currentSort === field;
+
+  return (
+    <button
+      onClick={() => onSort(field)}
+      className={`
+        flex items-center gap-1 text-sm font-semibold text-gray-300
+        hover:text-gray-100 transition-colors
+        ${align === 'right' ? 'ml-auto' : ''}
+      `}
+    >
+      {label}
+      {isActive && (
+        <span className="text-blue-400">
+          {currentDirection === 'asc' ? '↑' : '↓'}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/**
+ * Copy button with feedback.
+ */
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation(); // Prevent row toggle
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  }, [text]);
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="
+        inline-flex items-center gap-1 px-2 py-1
+        text-xs text-gray-400 hover:text-gray-100
+        bg-gray-700 hover:bg-gray-600
+        rounded transition-colors
+      "
+      title="Copy to clipboard"
+    >
+      {copied ? (
+        <>
+          <Check size={14} className="text-emerald-400" />
+          <span className="text-emerald-400">Copied</span>
+        </>
+      ) : (
+        <>
+          <Copy size={14} />
+          <span>Copy</span>
+        </>
+      )}
+    </button>
+  );
+}
+
+/**
+ * Accessible light frame list with Sessions-style table.
  * Features:
  * - Collapsible to reduce information overload
  * - Proper table structure with headers
+ * - Sortable columns
  * - Status indicators with full labels
  * - Minimum 14px text for all content
+ * - Columns: Time, Telescope, Focal Length, Exposure, Binning
+ * - Expanded details: File path (with copy), Frame ID
  */
 export function LightFrameList({ frames, defaultExpanded = false }: LightFrameListProps) {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
+  const [sortField, setSortField] = useState<SortField | null>(null);
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+  const [expandedFrames, setExpandedFrames] = useState<Set<number>>(new Set());
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortDirection('asc');
+    }
+  };
+
+  const toggleFrameExpansion = (frameId: number) => {
+    setExpandedFrames(prev => {
+      const next = new Set(prev);
+      if (next.has(frameId)) {
+        next.delete(frameId);
+      } else {
+        next.add(frameId);
+      }
+      return next;
+    });
+  };
+
+  const sortedFrames = useMemo(() => {
+    if (!sortField) return frames;
+
+    return [...frames].sort((a, b) => {
+      let comparison = 0;
+
+      switch (sortField) {
+        case 'time': {
+          const timeA = a.date_obs ? new Date(a.date_obs).getTime() : 0;
+          const timeB = b.date_obs ? new Date(b.date_obs).getTime() : 0;
+          comparison = timeA - timeB;
+          break;
+        }
+        case 'telescop':
+          comparison = (a.telescop ?? '').localeCompare(b.telescop ?? '');
+          break;
+        case 'focallen':
+          comparison = (a.focallen ?? 0) - (b.focallen ?? 0);
+          break;
+        case 'exptime':
+          comparison = (a.exptime ?? 0) - (b.exptime ?? 0);
+          break;
+        case 'binning':
+          comparison = (a.binning ?? '').localeCompare(b.binning ?? '');
+          break;
+      }
+
+      return sortDirection === 'asc' ? comparison : -comparison;
+    });
+  }, [frames, sortField, sortDirection]);
 
   return (
     <div className="mt-6">
@@ -57,53 +217,125 @@ export function LightFrameList({ frames, defaultExpanded = false }: LightFrameLi
           <table className="w-full" role="table">
             <thead className="bg-gray-900">
               <tr>
-                <th
-                  scope="col"
-                  className="px-4 py-3 text-left text-sm font-semibold text-gray-200"
-                >
-                  Filename
+                <th scope="col" className="px-4 py-3 text-left">
+                  <SortableHeader
+                    field="time"
+                    label="Time"
+                    currentSort={sortField}
+                    currentDirection={sortDirection}
+                    onSort={handleSort}
+                  />
                 </th>
-                <th
-                  scope="col"
-                  className="px-4 py-3 text-right text-sm font-semibold text-gray-200 w-24"
-                >
-                  Exposure
+                <th scope="col" className="px-4 py-3 text-left">
+                  <SortableHeader
+                    field="telescop"
+                    label="Telescope"
+                    currentSort={sortField}
+                    currentDirection={sortDirection}
+                    onSort={handleSort}
+                  />
                 </th>
-                <th
-                  scope="col"
-                  className="px-4 py-3 text-left text-sm font-semibold text-gray-200"
-                >
-                  Calibration Status
+                <th scope="col" className="px-4 py-3 text-right">
+                  <SortableHeader
+                    field="focallen"
+                    label="Focal Len"
+                    currentSort={sortField}
+                    currentDirection={sortDirection}
+                    onSort={handleSort}
+                    align="right"
+                  />
+                </th>
+                <th scope="col" className="px-4 py-3 text-right">
+                  <SortableHeader
+                    field="exptime"
+                    label="Exposure"
+                    currentSort={sortField}
+                    currentDirection={sortDirection}
+                    onSort={handleSort}
+                    align="right"
+                  />
+                </th>
+                <th scope="col" className="px-4 py-3 text-center">
+                  <SortableHeader
+                    field="binning"
+                    label="Binning"
+                    currentSort={sortField}
+                    currentDirection={sortDirection}
+                    onSort={handleSort}
+                  />
+                </th>
+                <th scope="col" className="px-4 py-3 text-left text-sm font-semibold text-gray-300">
+                  Calibration
                 </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
-              {frames.map((frame, idx) => (
-                <tr
-                  key={frame.frame_id}
-                  className={`
-                    ${idx % 2 === 0 ? 'bg-gray-800' : 'bg-gray-850'}
-                    hover:bg-gray-700 transition-colors
-                  `}
-                >
-                  <td className="px-4 py-3">
-                    <span
-                      className="text-sm font-mono text-gray-100 truncate block max-w-[300px]"
-                      title={frame.filename}
+              {sortedFrames.map((frame, idx) => {
+                const isFrameExpanded = expandedFrames.has(frame.frame_id);
+
+                return (
+                  <>
+                    <tr
+                      key={frame.frame_id}
+                      onClick={() => toggleFrameExpansion(frame.frame_id)}
+                      className={`
+                        ${idx % 2 === 0 ? 'bg-gray-800' : 'bg-gray-850'}
+                        hover:bg-gray-700 cursor-pointer transition-colors
+                      `}
                     >
-                      {frame.filename}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-right">
-                    <span className="text-sm text-gray-300">
-                      {frame.exptime !== null ? `${frame.exptime}s` : '-'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <StatusIndicator status={frame.calibration_status} />
-                  </td>
-                </tr>
-              ))}
+                      <td className="px-4 py-3 text-sm text-gray-300">
+                        {formatTime(frame.date_obs)}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-300">
+                        {frame.telescop ?? '-'}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-300 text-right">
+                        {frame.focallen !== null ? `${frame.focallen}mm` : '-'}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-300 text-right">
+                        {frame.exptime !== null ? `${frame.exptime}s` : '-'}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-gray-300 text-center">
+                        {frame.binning ?? '-'}
+                      </td>
+                      <td className="px-4 py-3">
+                        <StatusIndicator status={frame.calibration_status} />
+                      </td>
+                    </tr>
+
+                    {/* Expanded frame details */}
+                    {isFrameExpanded && (
+                      <tr key={`${frame.frame_id}-details`} className="bg-gray-900 border-t border-gray-700">
+                        <td colSpan={6} className="px-4 py-4">
+                          <div className="space-y-3">
+                            {/* File path with copy button */}
+                            <div className="flex items-start gap-3">
+                              <span className="text-gray-400 text-sm shrink-0">File Path:</span>
+                              <div className="flex items-center gap-2 min-w-0 flex-1">
+                                <span
+                                  className="text-gray-100 font-mono text-sm truncate"
+                                  title={frame.file_path}
+                                >
+                                  {frame.file_path}
+                                </span>
+                                <CopyButton text={frame.file_path} />
+                              </div>
+                            </div>
+
+                            {/* Frame ID */}
+                            <div className="flex items-center gap-3">
+                              <span className="text-gray-400 text-sm">Frame ID:</span>
+                              <span className="text-gray-100 font-mono text-sm">
+                                {frame.frame_id}
+                              </span>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </>
+                );
+              })}
             </tbody>
           </table>
 

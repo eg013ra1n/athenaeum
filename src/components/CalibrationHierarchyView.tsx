@@ -1,8 +1,10 @@
 import { useState, useMemo, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { Scissors, Plus } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   CalibrationFilterGroup,
+  LightFrameWithCalibration,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
 import {
@@ -16,6 +18,22 @@ interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
   useBiasForDarkOptimization?: boolean;
   onRefresh?: () => void;
+  /** Callback when Blink button is clicked with frame IDs */
+  onBlink?: (frameIds: number[]) => void;
+  /** Callback to open split dialog with selected filter keys */
+  onSplit?: (selectedFilterKeys: Set<string>) => void;
+  /** Callback to open create custom set dialog with selected filter keys */
+  onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
+}
+
+/**
+ * Build a unique filter key that includes exptime to differentiate same filter with different exposures.
+ */
+function buildFilterKey(filterGroup: CalibrationFilterGroup): string {
+  const baseFilter = filterGroup.filter ?? '__no_filter__';
+  return filterGroup.exptime !== null
+    ? `${baseFilter}:${filterGroup.exptime}`
+    : baseFilter;
 }
 
 /**
@@ -69,9 +87,15 @@ export function CalibrationHierarchyView({
   data,
   useBiasForDarkOptimization = false,
   onRefresh,
+  onBlink,
+  onSplit,
+  onCreateCustomSet,
 }: CalibrationHierarchyViewProps) {
   // Selection state for master-detail navigation
   const [selectedItem, setSelectedItem] = useState<SelectedItem | null>(null);
+
+  // Checkbox selection state for filter groups (format: "dateKey:cameraKey:filterKey")
+  const [checkedFilters, setCheckedFilters] = useState<Set<string>>(new Set());
 
   // Manual calibration modal state
   const [manualModalOpen, setManualModalOpen] = useState(false);
@@ -94,7 +118,7 @@ export function CalibrationHierarchyView({
         let cameraWarnings = 0;
 
         for (const filterGroup of cameraGroup.filter_groups) {
-          const filterKey = filterGroup.filter ?? '__no_filter__';
+          const filterKey = buildFilterKey(filterGroup);
           const fullKey = `${dateKey}:${cameraGroup.instrume}:${filterKey}`;
           const filterWarnings = collectFilterGroupWarnings(filterGroup).length;
 
@@ -111,6 +135,45 @@ export function CalibrationHierarchyView({
 
     return counts;
   }, [data]);
+
+  // Count total selected frames across all checked filter groups
+  const selectedFrameCount = useMemo(() => {
+    let count = 0;
+    for (const dateGroup of data.date_groups) {
+      for (const cameraGroup of dateGroup.camera_groups) {
+        for (const filterGroup of cameraGroup.filter_groups) {
+          const filterKey = buildFilterKey(filterGroup);
+          const fullKey = `${dateGroup.date}:${cameraGroup.instrume}:${filterKey}`;
+          if (checkedFilters.has(fullKey)) {
+            count += filterGroup.light_frames.length;
+          }
+        }
+      }
+    }
+    return count;
+  }, [data, checkedFilters]);
+
+  // Handle blink from DetailPanel - passes frame IDs to parent
+  const handleBlink = useCallback((frames: LightFrameWithCalibration[]) => {
+    if (onBlink) {
+      const frameIds = frames.map(f => f.frame_id);
+      onBlink(frameIds);
+    }
+  }, [onBlink]);
+
+  // Handle split button click
+  const handleSplit = useCallback(() => {
+    if (onSplit && checkedFilters.size > 0) {
+      onSplit(checkedFilters);
+    }
+  }, [onSplit, checkedFilters]);
+
+  // Handle create custom set button click
+  const handleCreateCustomSet = useCallback(() => {
+    if (onCreateCustomSet && checkedFilters.size > 0) {
+      onCreateCustomSet(checkedFilters);
+    }
+  }, [onCreateCustomSet, checkedFilters]);
 
   // Open manual calibration modal for a filter group
   const openManualCalibrationModal = useCallback((filterGroup: CalibrationFilterGroup) => {
@@ -170,31 +233,9 @@ export function CalibrationHierarchyView({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Summary Stats Bar */}
-      <div className="bg-gray-800 rounded-xl p-5 border border-gray-600">
-        <div className="grid grid-cols-4 gap-6 text-center">
-          <div>
-            <div className="text-3xl font-bold text-gray-100">{data.total_frames}</div>
-            <div className="text-sm text-gray-300 mt-1">Total Frames</div>
-          </div>
-          <div>
-            <div className="text-3xl font-bold text-emerald-400">{data.calibrated_frames}</div>
-            <div className="text-sm text-gray-300 mt-1">Calibrated</div>
-          </div>
-          <div>
-            <div className="text-3xl font-bold text-amber-400">{data.uncalibrated_frames}</div>
-            <div className="text-sm text-gray-300 mt-1">Uncalibrated</div>
-          </div>
-          <div>
-            <div className="text-3xl font-bold text-blue-400">{data.date_groups.length}</div>
-            <div className="text-sm text-gray-300 mt-1">Sessions</div>
-          </div>
-        </div>
-      </div>
-
       {/* Main Content - Master-Detail Layout */}
       {data.date_groups.length > 0 ? (
-        <div className="flex flex-1 min-h-0 mt-4 gap-4">
+        <div className="flex flex-1 min-h-0 gap-4">
           {/* Navigation Tree - Left Panel */}
           <NavigationTree
             data={data}
@@ -202,20 +243,74 @@ export function CalibrationHierarchyView({
             onSelect={setSelectedItem}
             warningCounts={warningCounts}
             className="w-96 flex-shrink-0"
+            checkedFilters={checkedFilters}
+            onCheckedChange={setCheckedFilters}
           />
 
           {/* Detail Panel - Right Panel */}
           <DetailPanel
             selectedItem={selectedItem}
             onManualCalibration={openManualCalibrationModal}
+            onBlink={onBlink ? handleBlink : undefined}
             className="flex-1"
           />
         </div>
       ) : (
         /* Empty State */
-        <div className="flex-1 flex items-center justify-center mt-4">
+        <div className="flex-1 flex items-center justify-center">
           <div className="text-center py-16 px-8 bg-gray-800 rounded-xl border border-gray-600">
             <p className="text-lg text-gray-400">No frames found in this frame set.</p>
+          </div>
+        </div>
+      )}
+
+      {/* Bottom Action Bar - visible when items are selected */}
+      {checkedFilters.size > 0 && (onSplit || onCreateCustomSet) && (
+        <div className="mt-4 bg-gray-800 rounded-xl p-4 border border-gray-600">
+          <div className="flex items-center justify-between">
+            <div className="text-sm text-gray-300">
+              <span className="font-medium text-gray-100">{checkedFilters.size}</span>{' '}
+              filter group{checkedFilters.size !== 1 ? 's' : ''} selected
+              <span className="text-gray-400 ml-2">
+                ({selectedFrameCount} frame{selectedFrameCount !== 1 ? 's' : ''})
+              </span>
+            </div>
+            <div className="flex items-center gap-3">
+              {onSplit && (
+                <button
+                  onClick={handleSplit}
+                  className="
+                    inline-flex items-center gap-2
+                    min-h-[44px] px-4 py-2
+                    bg-blue-600 hover:bg-blue-700
+                    text-white text-sm font-medium
+                    rounded-lg
+                    transition-colors
+                    focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
+                  "
+                >
+                  <Scissors size={18} aria-hidden="true" />
+                  Split Selected
+                </button>
+              )}
+              {onCreateCustomSet && (
+                <button
+                  onClick={handleCreateCustomSet}
+                  className="
+                    inline-flex items-center gap-2
+                    min-h-[44px] px-4 py-2
+                    bg-green-600 hover:bg-green-700
+                    text-white text-sm font-medium
+                    rounded-lg
+                    transition-colors
+                    focus:outline-none focus-visible:ring-2 focus-visible:ring-green-500
+                  "
+                >
+                  <Plus size={18} aria-hidden="true" />
+                  Create Custom Set
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}

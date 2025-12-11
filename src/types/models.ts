@@ -624,7 +624,11 @@ export interface CalibrationFilterGroup {
 export interface LightFrameWithCalibration {
   frame_id: number;
   filename: string;
+  file_path: string;
   date_obs: string | null;
   exptime: number | null;
+  telescop: string | null;
+  focallen: number | null;
+  binning: string | null;
   calibration_status: FrameCalibrationStatus;
 }

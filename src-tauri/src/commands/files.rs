@@ -196,6 +196,29 @@ pub async fn get_frame_preview(
     Ok(format!("data:image/jpeg;base64,{}", base64_data))
 }
 
+/// Get files with frames by frame IDs
+/// Useful for loading full file data when you only have frame IDs
+#[tauri::command]
+pub async fn get_files_with_frames_by_ids(
+    frame_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<FileWithFrame>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids)
+        .map_err(|e| format!("Failed to get frames: {}", e))?;
+
+    Ok(frames
+        .into_iter()
+        .map(|(file_id, file, frame)| FileWithFrame {
+            file,
+            frame: Some(frame),
+        })
+        .collect())
+}
+
 // DTOs for files commands
 #[derive(serde::Serialize)]
 pub struct DirectoryContents {

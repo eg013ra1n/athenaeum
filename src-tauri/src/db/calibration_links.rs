@@ -995,6 +995,10 @@ pub fn get_calibration_hierarchy_for_frame_set(
             f.filter,
             f.exptime,
             fi.filename,
+            fi.path,
+            f.telescop,
+            f.focallen,
+            f.binning,
             DATE(f.date_obs) as session_date
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
@@ -1013,6 +1017,10 @@ pub fn get_calibration_hierarchy_for_frame_set(
         filter: Option<String>,
         exptime: Option<f64>,
         filename: String,
+        file_path: String,
+        telescop: Option<String>,
+        focallen: Option<f64>,
+        binning: Option<String>,
         session_date: Option<String>,
     }
 
@@ -1025,7 +1033,11 @@ pub fn get_calibration_hierarchy_for_frame_set(
                 filter: row.get(3)?,
                 exptime: row.get(4)?,
                 filename: row.get(5)?,
-                session_date: row.get(6)?,
+                file_path: row.get(6)?,
+                telescop: row.get(7)?,
+                focallen: row.get(8)?,
+                binning: row.get(9)?,
+                session_date: row.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -1180,8 +1192,12 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         light_frames.push(LightFrameWithCalibration {
                             frame_id: raw_frame.id,
                             filename: raw_frame.filename.clone(),
+                            file_path: raw_frame.file_path.clone(),
                             date_obs: raw_frame.date_obs.clone(),
                             exptime: raw_frame.exptime,
+                            telescop: raw_frame.telescop.clone(),
+                            focallen: raw_frame.focallen,
+                            binning: raw_frame.binning.clone(),
                             calibration_status: status,
                         });
                     }

@@ -1,5 +1,5 @@
-import { Settings } from 'lucide-react';
-import type { CalibrationFilterGroup } from '../../types/models';
+import { Settings, Eye } from 'lucide-react';
+import type { CalibrationFilterGroup, LightFrameWithCalibration } from '../../types/models';
 import type { SelectedItem } from './NavigationTree';
 import { CalibrationSetCard, EmptyCalibrationCard } from './CalibrationSetCard';
 import { LightFrameList } from './LightFrameList';
@@ -8,6 +8,8 @@ import { WarningPanel, AggregatedWarning } from './WarningPanel';
 interface DetailPanelProps {
   selectedItem: SelectedItem | null;
   onManualCalibration: (filterGroup: CalibrationFilterGroup) => void;
+  /** Callback to open blink viewer with frames */
+  onBlink?: (frames: LightFrameWithCalibration[]) => void;
   className?: string;
 }
 
@@ -58,11 +60,13 @@ function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup): Aggreg
  * - Spacious layout with larger text
  * - Clear section hierarchy
  * - Prominent warning display
+ * - Blink button for LIGHT frames
  * - Manual calibration button
  */
 export function DetailPanel({
   selectedItem,
   onManualCalibration,
+  onBlink,
   className = '',
 }: DetailPanelProps) {
   // Empty state when nothing selected
@@ -84,8 +88,10 @@ export function DetailPanel({
   const warnings = collectFilterGroupWarnings(filterGroup);
   const hasCalibration =
     filterGroup.flat_sets.length > 0 ||
-    filterGroup.dark_sets.length > 0 ||
-    filterGroup.bias_sets.length > 0;
+    filterGroup.dark_sets.length > 0;
+
+  // Check if we have enough frames to blink (2+ LIGHT frames)
+  const canBlink = filterGroup.light_frames.length >= 2;
 
   return (
     <div
@@ -103,21 +109,43 @@ export function DetailPanel({
               {filterGroup.exptime !== null && ` at ${filterGroup.exptime}s`}
             </p>
           </div>
-          <button
-            onClick={() => onManualCalibration(filterGroup)}
-            className="
-              inline-flex items-center gap-2
-              min-h-[44px] px-4 py-2
-              bg-gray-700 hover:bg-gray-600
-              text-gray-200 text-sm font-medium
-              rounded-lg border border-gray-600
-              transition-colors
-              focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
-            "
-          >
-            <Settings size={18} aria-hidden="true" />
-            Manual Calibration
-          </button>
+          <div className="flex items-center gap-2">
+            {/* Blink button */}
+            {onBlink && canBlink && (
+              <button
+                onClick={() => onBlink(filterGroup.light_frames)}
+                className="
+                  inline-flex items-center gap-2
+                  min-h-[44px] px-4 py-2
+                  bg-blue-600 hover:bg-blue-700
+                  text-white text-sm font-medium
+                  rounded-lg
+                  transition-colors
+                  focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
+                "
+                title="Open blink viewer for LIGHT frames"
+              >
+                <Eye size={18} aria-hidden="true" />
+                Blink
+              </button>
+            )}
+            {/* Manual Calibration button */}
+            <button
+              onClick={() => onManualCalibration(filterGroup)}
+              className="
+                inline-flex items-center gap-2
+                min-h-[44px] px-4 py-2
+                bg-gray-700 hover:bg-gray-600
+                text-gray-200 text-sm font-medium
+                rounded-lg border border-gray-600
+                transition-colors
+                focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
+              "
+            >
+              <Settings size={18} aria-hidden="true" />
+              Manual Calibration
+            </button>
+          </div>
         </header>
 
         {/* Warnings Section */}

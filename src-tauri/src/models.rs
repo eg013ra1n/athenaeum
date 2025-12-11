@@ -701,7 +701,11 @@ pub struct CalibrationFilterGroup {
 pub struct LightFrameWithCalibration {
     pub frame_id: i64,
     pub filename: String,
+    pub file_path: String,
     pub date_obs: Option<String>,
     pub exptime: Option<f64>,
+    pub telescop: Option<String>,
+    pub focallen: Option<f64>,
+    pub binning: Option<String>,
     pub calibration_status: FrameCalibrationStatus,
 }
