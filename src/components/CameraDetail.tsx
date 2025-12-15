@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { ArrowLeft, RefreshCw, Package, Calendar } from "lucide-react";
 import DarkLibrary, { LibraryStats } from "./DarkLibrary";
 import { invoke } from "@tauri-apps/api/core";
@@ -26,6 +26,10 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [currentStats, setCurrentStats] = useState<LibraryStats | null>(null);
+
+  // Memoize imageTypeFilter arrays to prevent infinite re-render loops
+  const darksFilter = useMemo(() => [ImageType.Dark, ImageType.Bias, ImageType.DarkFlat], []);
+  const flatsFilter = useMemo(() => [ImageType.Flat], []);
 
   const handleRefreshLibrary = async () => {
     try {
@@ -144,7 +148,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           <DarkLibrary
             instrume={instrume}
             isTabView={true}
-            imageTypeFilter={[ImageType.Dark, ImageType.Bias, ImageType.DarkFlat]}
+            imageTypeFilter={darksFilter}
             onStatsChange={setCurrentStats}
           />
         )}
@@ -152,7 +156,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           <DarkLibrary
             instrume={instrume}
             isTabView={true}
-            imageTypeFilter={[ImageType.Flat]}
+            imageTypeFilter={flatsFilter}
             onStatsChange={setCurrentStats}
           />
         )}
