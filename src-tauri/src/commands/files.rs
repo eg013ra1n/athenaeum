@@ -93,8 +93,6 @@ pub async fn get_directory_contents(
     }
 
     let mut subdirectories = Vec::new();
-    let mut files_in_dir = Vec::new();
-
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
 
     for entry in entries {
@@ -115,7 +113,7 @@ pub async fn get_directory_contents(
     let db_files = db::get_files_by_directory(&conn, &directory_path, None)
         .map_err(|e| e.to_string())?;
 
-    files_in_dir = db_files
+    let files_in_dir: Vec<FileWithFrame> = db_files
         .into_iter()
         .map(|(file, frame)| FileWithFrame { file, frame })
         .collect();
@@ -211,7 +209,7 @@ pub async fn get_files_with_frames_by_ids(
 
     Ok(frames
         .into_iter()
-        .map(|(file_id, file, frame)| FileWithFrame {
+        .map(|(_file_id, file, frame)| FileWithFrame {
             file,
             frame: Some(frame),
         })

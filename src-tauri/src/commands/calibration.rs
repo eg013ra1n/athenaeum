@@ -884,7 +884,7 @@ pub async fn clear_manual_calibration_override(
     let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
 
     let sql = match &calibration_type {
-        Some(ct) => format!(
+        Some(_ct) => format!(
             "DELETE FROM calibration_set_to_frames
              WHERE source_id IN ({}) AND source_type = 'frame'
              AND calibration_type = ?{} AND is_manual_override = 1",

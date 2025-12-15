@@ -149,7 +149,7 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
 pub fn find_calibration_for_flat_set(
     conn: &Connection,
     flat_set_id: i64,
-    tolerance: &CalibrationTolerance,
+    _tolerance: &CalibrationTolerance,
     state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
     // Get a representative frame from the flat set to use for matching
@@ -641,7 +641,7 @@ pub fn store_calibration_hierarchy(
 fn try_create_dark_for_frame(
     conn: &Connection,
     frame: &Frame,
-    state: &State<'_, AppState>,
+    _state: &State<'_, AppState>,
 ) -> Result<Option<i64>> {
     // Extract frame parameters
     let instrume = match &frame.instrume {
@@ -727,7 +727,7 @@ fn try_create_dark_for_frame(
 fn try_create_bias_for_frame(
     conn: &Connection,
     frame: &Frame,
-    state: &State<'_, AppState>,
+    _state: &State<'_, AppState>,
 ) -> Result<Option<i64>> {
     // Extract frame parameters
     let instrume = match &frame.instrume {

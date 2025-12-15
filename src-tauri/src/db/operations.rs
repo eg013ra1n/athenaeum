@@ -749,7 +749,7 @@ pub fn update_frames_set_flat_pattern(
 /// Get all LIGHT frames for a project (for clustering)
 pub fn get_light_frames_for_project(
     conn: &Connection,
-    project_id: i64,
+    _project_id: i64,
 ) -> Result<Vec<(i64, crate::models::Frame)>> {
     // For now, we'll get all LIGHT frames regardless of project
     // In the future, we can add project filtering at the frame level

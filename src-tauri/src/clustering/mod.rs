@@ -51,7 +51,7 @@ impl FrameCluster {
         self.member_frame_ids.push(frame.frame_id);
 
         // Collect all coordinates including the new one
-        let coords: Vec<(f64, f64)> = self
+        let _coords: Vec<(f64, f64)> = self
             .member_frame_ids
             .iter()
             .enumerate()

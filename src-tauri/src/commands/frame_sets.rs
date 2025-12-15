@@ -916,7 +916,7 @@ pub async fn create_frame_set_from_selection(
     state: State<'_, AppState>,
     name: String,
     frame_ids: Vec<i64>,
-    description: Option<String>,
+    _description: Option<String>,
 ) -> Result<i64, String> {
     println!(
         "Creating frame set from selection: name='{}', frame_count={}",

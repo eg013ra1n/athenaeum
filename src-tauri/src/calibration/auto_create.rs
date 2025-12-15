@@ -107,7 +107,7 @@ pub fn check_for_duplicate_set(
     if *imagetyp == ImageType::Flat {
         if focallen.is_some() {
             query.push_str(&format!(" AND ABS(focallen - ?{}) < 1.0", param_count));
-            param_count += 1;
+            // param_count not incremented as this is the last parameter
         } else {
             query.push_str(" AND focallen IS NULL");
         }
@@ -168,7 +168,7 @@ pub fn find_matching_individual_frames(
     filter: &Option<String>,
     exptime: Option<f64>,
     focallen: Option<f64>,
-    tolerance: &CalibrationTolerance,
+    _tolerance: &CalibrationTolerance,
 ) -> Result<Vec<i64>> {
     let imagetyp_str = match imagetyp {
         ImageType::Dark => "Dark",
@@ -214,7 +214,7 @@ pub fn find_matching_individual_frames(
     }
     if *imagetyp == ImageType::Flat && focallen.is_some() {
         query.push_str(&format!(" AND ABS(f.focallen - ?{}) < 1.0", param_count));
-        param_count += 1;
+        // param_count not incremented as this is the last parameter
     }
 
     query.push_str(" ORDER BY f.date_obs");
@@ -266,7 +266,7 @@ pub fn find_matching_individual_frames(
 pub fn group_frames_into_set(
     conn: &Connection,
     frame_ids: &[i64],
-    tolerance: &CalibrationTolerance,
+    _tolerance: &CalibrationTolerance,
 ) -> Result<Vec<SuggestedCalibrationSet>> {
     if frame_ids.is_empty() {
         return Ok(Vec::new());
