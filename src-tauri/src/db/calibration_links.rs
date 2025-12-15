@@ -302,6 +302,7 @@ pub fn get_frame_calibration_status(conn: &Connection, frame_id: i64) -> Result<
 }
 
 /// Delete all calibration links for frames in a specific frame set
+#[allow(dead_code)]
 pub fn delete_links_for_frame_set(conn: &Connection, frame_set_id: i64) -> Result<usize> {
     // First get all frame IDs in the frame set
     let mut stmt = conn.prepare(
@@ -339,6 +340,7 @@ pub fn delete_links_for_frame_set(conn: &Connection, frame_set_id: i64) -> Resul
 }
 
 /// Delete a specific calibration link
+#[allow(dead_code)]
 pub fn delete_calibration_link(conn: &Connection, link_id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM calibration_set_to_frames WHERE id = ?1",
@@ -409,6 +411,7 @@ pub fn get_calibration_statistics(conn: &Connection, frame_set_id: i64) -> Resul
 }
 
 /// Get all frames that use a specific calibration set
+#[allow(dead_code)]
 pub fn get_frames_using_calibration_set(conn: &Connection, set_id: i64) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT source_id
@@ -422,6 +425,7 @@ pub fn get_frames_using_calibration_set(conn: &Connection, set_id: i64) -> Resul
 }
 
 /// Check if a calibration link exists
+#[allow(dead_code)]
 pub fn link_exists(
     conn: &Connection,
     source_id: i64,

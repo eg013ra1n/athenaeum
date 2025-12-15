@@ -48,6 +48,7 @@ pub fn calculate_fov(
 ///
 /// # Returns
 /// Angular distance in degrees
+#[allow(dead_code)]
 pub fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
     let ra1 = ra1_deg.to_radians();
     let dec1 = dec1_deg.to_radians();
@@ -73,6 +74,7 @@ pub fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64
 ///
 /// # Returns
 /// Formatted string (e.g., "1.23 GB", "456.78 MB", "789 KB", "123 bytes")
+#[allow(dead_code)]
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;

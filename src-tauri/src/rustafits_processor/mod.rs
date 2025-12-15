@@ -37,6 +37,7 @@ impl Resolution {
     }
 
     /// Get default JPEG quality for this resolution
+    #[allow(dead_code)]
     pub fn default_quality(&self) -> u8 {
         self.jpeg_quality(None)
     }

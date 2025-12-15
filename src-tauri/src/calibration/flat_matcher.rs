@@ -67,22 +67,6 @@ impl FlatPattern {
         }
     }
 
-    pub fn to_string(&self) -> &str {
-        match self {
-            Self::Automatic => "automatic",
-            Self::LongTerm => "long_term",
-            Self::Manual => "manual",
-        }
-    }
-}
-
-/// Filter period for detecting filter changes
-#[derive(Debug, Clone)]
-pub struct FilterPeriod {
-    pub filter: Option<String>,
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub frame_count: usize,
 }
 
 /// Finds flat groups matching a light frame's parameters
@@ -257,68 +241,6 @@ pub fn apply_pattern_selection(
             matches.into_iter().next()
         }
     }
-}
-
-/// Detects filter change periods in a set of light frames
-///
-/// # Arguments
-/// * `frames` - Light frames in chronological order
-///
-/// # Returns
-/// Vector of FilterPeriod, one for each continuous filter usage
-pub fn detect_filter_changes(frames: &[Frame]) -> Vec<FilterPeriod> {
-    if frames.is_empty() {
-        return Vec::new();
-    }
-
-    let mut periods = Vec::new();
-    let mut current_filter: Option<String> = None;
-    let mut period_start: Option<DateTime<Utc>> = None;
-    let mut period_frames = 0;
-
-    for frame in frames {
-        let frame_filter = frame.filter.clone();
-        let frame_date = match frame.date_obs {
-            Some(d) => d,
-            None => continue, // Skip frames without date
-        };
-
-        if current_filter != frame_filter {
-            // Filter changed - close previous period
-            if let Some(start) = period_start {
-                periods.push(FilterPeriod {
-                    filter: current_filter.clone(),
-                    start_time: start,
-                    end_time: frame_date,
-                    frame_count: period_frames,
-                });
-            }
-
-            // Start new period
-            current_filter = frame_filter;
-            period_start = Some(frame_date);
-            period_frames = 1;
-        } else {
-            period_frames += 1;
-        }
-    }
-
-    // Close final period
-    if let Some(start) = period_start {
-        let end_time = frames
-            .last()
-            .and_then(|f| f.date_obs)
-            .unwrap_or(start);
-
-        periods.push(FilterPeriod {
-            filter: current_filter,
-            start_time: start,
-            end_time,
-            frame_count: period_frames,
-        });
-    }
-
-    periods
 }
 
 #[cfg(test)]
@@ -597,78 +519,4 @@ mod tests {
         assert_ne!(FlatTiming::After, FlatTiming::During);
     }
 
-    // ========== detect_filter_changes tests ==========
-
-    #[test]
-    fn test_detect_filter_changes_empty_frames() {
-        let frames: Vec<Frame> = vec![];
-        let periods = detect_filter_changes(&frames);
-        assert!(periods.is_empty());
-    }
-
-    #[test]
-    fn test_detect_filter_changes_single_filter() {
-        let frames = vec![
-            Frame {
-                id: Some(1),
-                file_id: 1,
-                filter: Some("L".to_string()),
-                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z").unwrap().with_timezone(&Utc)),
-                ..Default::default()
-            },
-            Frame {
-                id: Some(2),
-                file_id: 2,
-                filter: Some("L".to_string()),
-                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:05:00Z").unwrap().with_timezone(&Utc)),
-                ..Default::default()
-            },
-        ];
-
-        let periods = detect_filter_changes(&frames);
-        assert_eq!(periods.len(), 1);
-        assert_eq!(periods[0].filter, Some("L".to_string()));
-        assert_eq!(periods[0].frame_count, 2);
-    }
-
-    #[test]
-    fn test_detect_filter_changes_multiple_filters() {
-        let frames = vec![
-            Frame {
-                id: Some(1),
-                file_id: 1,
-                filter: Some("L".to_string()),
-                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z").unwrap().with_timezone(&Utc)),
-                ..Default::default()
-            },
-            Frame {
-                id: Some(2),
-                file_id: 2,
-                filter: Some("L".to_string()),
-                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T20:05:00Z").unwrap().with_timezone(&Utc)),
-                ..Default::default()
-            },
-            Frame {
-                id: Some(3),
-                file_id: 3,
-                filter: Some("Ha".to_string()),
-                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc)),
-                ..Default::default()
-            },
-            Frame {
-                id: Some(4),
-                file_id: 4,
-                filter: Some("Ha".to_string()),
-                date_obs: Some(DateTime::parse_from_rfc3339("2025-01-15T21:05:00Z").unwrap().with_timezone(&Utc)),
-                ..Default::default()
-            },
-        ];
-
-        let periods = detect_filter_changes(&frames);
-        assert_eq!(periods.len(), 2);
-        assert_eq!(periods[0].filter, Some("L".to_string()));
-        assert_eq!(periods[0].frame_count, 2);
-        assert_eq!(periods[1].filter, Some("Ha".to_string()));
-        assert_eq!(periods[1].frame_count, 2);
-    }
 }

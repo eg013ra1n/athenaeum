@@ -318,6 +318,7 @@ pub struct ScanResult {
     pub calibration_sets_created: usize,
 }
 
+#[allow(dead_code)]
 pub struct ScanProgress {
     pub current: usize,
     pub total: usize,

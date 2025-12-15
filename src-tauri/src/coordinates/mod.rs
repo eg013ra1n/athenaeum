@@ -148,6 +148,7 @@ pub fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64
 /// More stable for very small angles
 /// Input: RA and Dec in decimal degrees
 /// Output: Angular separation in degrees
+#[allow(dead_code)]
 pub fn angular_distance_haversine(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
     // Convert to radians
     let ra1 = ra1_deg.to_radians();

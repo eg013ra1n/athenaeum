@@ -20,6 +20,7 @@ pub struct DetectedSession {
 
 /// Frame with parsed timestamp for sorting and gap detection
 struct FrameWithTime {
+    #[allow(dead_code)]
     file_id: i64,
     frame_id: i64,
     frame: Frame,

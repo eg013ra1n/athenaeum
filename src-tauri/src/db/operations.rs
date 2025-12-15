@@ -881,6 +881,7 @@ pub fn sessions_exist_for_frame_set(conn: &Connection, frames_set_id: i64) -> Re
 }
 
 /// Delete all sessions for a frame set
+#[allow(dead_code)]
 pub fn delete_sessions_for_frame_set(conn: &Connection, frames_set_id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM imaging_nights WHERE frames_set_id = ?1",
@@ -1050,6 +1051,7 @@ pub fn get_sessions_for_night(
 }
 
 /// Get frames for a specific frames_set with file info (for session detection)
+#[allow(dead_code)]
 pub fn get_frames_with_files_for_set(
     conn: &Connection,
     frames_set_id: i64,

@@ -17,6 +17,7 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct ParameterCheckResult {
     pub matches: bool,
+    #[allow(dead_code)]
     pub warning: bool,
     pub warning_message: Option<String>,
     pub skip_matching: bool, // If true, skip this calibration type entirely
@@ -533,6 +534,7 @@ pub fn find_dark_for_light(
 }
 
 /// Find Bias calibration sets for a frame using configurable rules
+#[allow(dead_code)]
 pub fn find_bias_for_frame(
     conn: &Connection,
     frame: &Frame,

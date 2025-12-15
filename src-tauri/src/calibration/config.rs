@@ -414,6 +414,7 @@ impl CalibrationMatchingConfig {
     }
 
     /// Get clustering config for a calibration type
+    #[allow(dead_code)]
     pub fn get_clustering(&self, calibration: &str) -> ClusteringConfig {
         self.clustering
             .get(calibration)

@@ -257,6 +257,7 @@ pub fn process_frame_set(
 }
 
 /// Process all light frames in a frame set with progress callback
+#[allow(dead_code)]
 pub fn process_frame_set_with_progress<F>(
     conn: &Connection,
     frame_set_id: i64,

@@ -1,5 +1,9 @@
+// Cache module is work-in-progress functionality
+#[allow(dead_code)]
 pub mod database;
+#[allow(dead_code)]
 pub mod models;
+#[allow(dead_code)]
 pub mod storage;
 
 use anyhow::{Context, Result};
@@ -23,12 +27,14 @@ use storage::*;
 const CACHE_VERSION: &str = "v1";
 
 /// Cache manager for handling disk-based image cache
+#[allow(dead_code)]
 pub struct CacheManager {
     cache_dir: PathBuf,
     cache_db: Arc<Mutex<Connection>>,
     settings: Arc<SettingsManager>,
 }
 
+#[allow(dead_code)]
 impl CacheManager {
     /// Create a new cache manager
     pub fn new(app_dir: &Path, settings: Arc<SettingsManager>) -> Result<Self> {

@@ -89,87 +89,12 @@ impl ImageType {
         }
     }
 
-    pub fn to_frame_folder(&self) -> String {
-        match self {
-            Self::Light => "Lights".to_string(),
-            Self::Dark => "Calibration/Darks".to_string(),
-            Self::Flat => "Calibration/Flats".to_string(),
-            Self::Bias => "Calibration/Bias".to_string(),
-            Self::DarkFlat => "Calibration/DarkFlats".to_string(),
-            Self::MasterLight => "Masters/Lights".to_string(),
-            Self::MasterDark => "Masters/Darks".to_string(),
-            Self::MasterFlat => "Masters/Flats".to_string(),
-            Self::MasterBias => "Masters/Bias".to_string(),
-            Self::MasterDarkFlat => "Masters/DarkFlats".to_string(),
-        }
-    }
-
     pub fn is_master(&self) -> bool {
         matches!(
             self,
             Self::MasterLight | Self::MasterDark | Self::MasterFlat | Self::MasterBias | Self::MasterDarkFlat
         )
     }
-
-    pub fn base_type(&self) -> Self {
-        match self {
-            Self::MasterLight => Self::Light,
-            Self::MasterDark => Self::Dark,
-            Self::MasterFlat => Self::Flat,
-            Self::MasterBias => Self::Bias,
-            Self::MasterDarkFlat => Self::DarkFlat,
-            _ => self.clone(),
-        }
-    }
-}
-
-/// Represents a day of captures
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Day {
-    pub id: Option<i64>,
-    pub date: String, // ISO 8601 date (YYYY-MM-DD)
-    pub frame_count: i32,
-}
-
-/// Represents a capture setup (telescope + camera + settings)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Setup {
-    pub id: Option<i64>,
-    pub telescop: Option<String>,
-    pub instrume: Option<String>,
-    pub filter: Option<String>,
-    pub binning: Option<String>,
-    pub gain: Option<f64>,
-}
-
-/// Represents a calibration set
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalibrationSet {
-    pub id: Option<i64>,
-    pub imagetyp: ImageType,
-    pub exptime: Option<f64>,
-    pub filter: Option<String>,
-    pub ccd_temp: Option<f64>,
-    pub gain: Option<f64>,
-    pub binning: Option<String>,
-    pub instrume: Option<String>,
-    pub date: String,
-    pub frame_ids: Vec<i64>,
-}
-
-/// User-defined tag
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Tag {
-    pub id: Option<i64>,
-    pub name: String,
-    pub color: Option<String>,
-}
-
-/// Tag assignment to frames
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrameTag {
-    pub frame_id: i64,
-    pub tag_id: i64,
 }
 
 /// Monitored scan root path
@@ -180,15 +105,6 @@ pub struct ScanRoot {
     pub enabled: bool,
     pub find_duplicates: bool,
     pub last_scan: Option<DateTime<Utc>>,
-}
-
-/// Export template configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportTemplate {
-    pub id: Option<i64>,
-    pub name: String,
-    pub template: String,
-    pub description: Option<String>,
 }
 
 /// Duplicate detection result
@@ -227,13 +143,6 @@ pub struct FolderSimilarity {
     pub shared_file_ids: Vec<i64>,
 }
 
-/// Project for organizing imaging sessions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Project {
-    pub id: Option<i64>,
-    pub name: String,
-}
-
 /// Frames set (collection of related frames)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FramesSet {
@@ -246,14 +155,6 @@ pub struct FramesSet {
     pub objctdec: Option<String>,
     pub total_exp_time: Option<f64>,
     pub flat_pattern: Option<String>,
-}
-
-/// FITS header storage
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FitsHeader {
-    pub id: Option<i64>,
-    pub file_id: i64,
-    pub header: String,
 }
 
 /// Application settings
@@ -283,28 +184,6 @@ pub struct Session {
     pub frame_count: i32,
     pub total_exp_time: Option<f64>,
     pub created_at: Option<DateTime<Utc>>,
-}
-
-/// Session with aggregated metadata (for filtering in custom set creation)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionWithMetadata {
-    pub id: Option<i64>,
-    pub imaging_night_id: i64,
-    pub instrume: String,
-    pub frame_count: i32,
-    pub total_exp_time: Option<f64>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub start_date: Option<String>,
-    pub end_date: Option<String>,
-    pub avg_ra: Option<String>,
-    pub avg_dec: Option<String>,
-}
-
-/// Junction table member for session_members
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMember {
-    pub session_id: i64,
-    pub frame_id: i64,
 }
 
 /// DTO: File with optional frame metadata
@@ -445,28 +324,6 @@ pub enum SplitSelection {
     Frames { ids: Vec<i64> },
 }
 
-/// Report of frames added to a specific frame set during refresh
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SetUpdateReport {
-    pub set_id: i64,
-    pub set_name: String,
-    pub frames_added: usize,
-    pub nights_created: usize,
-    pub nights_updated: usize,
-    pub frame_ids_added: Vec<i64>,
-    pub frame_names_added: Vec<String>,
-}
-
-/// Result of refreshing frame sets with new unassigned frames
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct RefreshResult {
-    pub frames_added: usize,
-    pub sets_updated: Vec<SetUpdateReport>,
-    pub frames_unassigned: usize,
-}
-
 /// Link between a frame/calibration set and its required calibration set
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationLink {
@@ -523,19 +380,6 @@ pub struct CalibrationWarning {
     pub message: String,
     pub calibration_type: String,  // 'Dark', 'Flat', 'Bias', 'DarkFlat'
     pub set_id: i64,
-}
-
-/// Result of finding calibration for a frame set
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalibrationMatchResult {
-    pub frames_processed: usize,
-    pub frames_with_calibration: usize,
-    pub frames_partial_calibration: usize,
-    pub frames_no_calibration: usize,
-    pub sets_linked: usize,
-    pub warnings_count: usize,
-    pub processing_time_ms: u64,
-    pub frame_statuses: Vec<FrameCalibrationStatus>,
 }
 
 /// Statistics about calibration for a frame set

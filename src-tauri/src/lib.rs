@@ -5,7 +5,6 @@ mod fits_parser;
 mod scanner;
 mod duplicates;
 mod calibration;
-mod export;
 mod settings;
 mod coordinates;
 mod clustering;

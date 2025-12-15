@@ -13,6 +13,7 @@ pub mod defaults {
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "180";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "1.0";
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "false";
+    #[allow(dead_code)]
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "false";
 }
 
@@ -23,6 +24,7 @@ pub mod keys {
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "dark_library.date_threshold_days";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "dark_library.temp_threshold_celsius";
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "duplicates.use_content_hash";
+    #[allow(dead_code)]
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "duplicates.content_hash_rescanned";
 }
 
@@ -62,6 +64,7 @@ impl SettingsManager {
     }
 
     /// Set a runtime override (session-specific, not persisted)
+    #[allow(dead_code)]
     pub fn set_runtime_override(&self, key: String, value: String) {
         if let Ok(mut overrides) = self.runtime_overrides.lock() {
             overrides.insert(key, value);
@@ -69,6 +72,7 @@ impl SettingsManager {
     }
 
     /// Clear a runtime override
+    #[allow(dead_code)]
     pub fn clear_runtime_override(&self, key: &str) {
         if let Ok(mut overrides) = self.runtime_overrides.lock() {
             overrides.remove(key);
@@ -76,6 +80,7 @@ impl SettingsManager {
     }
 
     /// Clear all runtime overrides
+    #[allow(dead_code)]
     pub fn clear_all_runtime_overrides(&self) {
         if let Ok(mut overrides) = self.runtime_overrides.lock() {
             overrides.clear();
@@ -167,6 +172,7 @@ impl SettingsManager {
     }
 
     /// Get whether content hash rescan has been completed
+    #[allow(dead_code)]
     pub fn get_duplicates_content_hash_rescanned(&self, conn: &Connection) -> Result<bool> {
         let value = self.get_with_precedence(
             conn,

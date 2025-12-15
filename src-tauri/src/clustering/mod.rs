@@ -15,6 +15,7 @@ pub struct ClusterableFrame {
     pub ra_deg: f64,      // Normalized to [0, 360)
     pub dec_deg: f64,     // Normalized to [-90, 90]
     pub date_obs: Option<String>,
+    #[allow(dead_code)]
     pub object: Option<String>,
 }
 
