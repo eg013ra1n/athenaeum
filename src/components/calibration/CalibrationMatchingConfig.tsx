@@ -298,7 +298,7 @@ export default function CalibrationMatchingConfig() {
           )}
         </button>
         {expandedSections.lights && (
-          <div className="px-4 pb-4 space-y-4">
+          <div className="px-4 pt-2 pb-4 space-y-4">
             <BehavioralOptionsPanel
               sourceType="lights"
               options={config.behavioral_options.lights}
@@ -327,7 +327,7 @@ export default function CalibrationMatchingConfig() {
           )}
         </button>
         {expandedSections.flats && (
-          <div className="px-4 pb-4 space-y-4">
+          <div className="px-4 pt-2 pb-4 space-y-4">
             <BehavioralOptionsPanel
               sourceType="flats"
               options={config.behavioral_options.flats}
@@ -357,7 +357,7 @@ export default function CalibrationMatchingConfig() {
           )}
         </button>
         {expandedSections.darks && (
-          <div className="px-4 pb-4 space-y-4">
+          <div className="px-4 pt-2 pb-4 space-y-4">
             <BehavioralOptionsPanel
               sourceType="darks"
               options={config.behavioral_options.darks}
@@ -388,7 +388,7 @@ export default function CalibrationMatchingConfig() {
           )}
         </button>
         {expandedSections.clustering && (
-          <div className="px-4 pb-4">
+          <div className="px-4 pt-2 pb-4">
             <ClusteringParametersPanel
               clustering={config.clustering}
               scoring={config.scoring}
@@ -413,7 +413,7 @@ export default function CalibrationMatchingConfig() {
           )}
         </button>
         {expandedSections.warnings && (
-          <div className="px-4 pb-4">
+          <div className="px-4 pt-2 pb-4">
             <p className="text-sm text-gray-400 mb-4">
               Warn when calibration frames are older than these thresholds.
             </p>
@@ -499,7 +499,7 @@ export default function CalibrationMatchingConfig() {
           )}
         </button>
         {expandedSections.preferences && (
-          <div className="px-4 pb-4">
+          <div className="px-4 pt-2 pb-4">
             <p className="text-sm text-gray-400 mb-4">
               Choose whether to prefer Master calibration frames or frame sets
               when both are available.

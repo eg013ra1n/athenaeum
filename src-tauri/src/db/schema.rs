@@ -102,6 +102,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             gain REAL,
             binning TEXT,
             instrume TEXT,
+            telescop TEXT,
             date TEXT NOT NULL,
             date_start TEXT,
             date_end TEXT,
@@ -433,6 +434,20 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_is_manual_override {
         conn.execute(
             "ALTER TABLE calibration_set_to_frames ADD COLUMN is_manual_override INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Add telescop to calibration_set table (migration for existing databases)
+    // Used for telescope-based calibration matching
+    let has_telescop: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('calibration_set') WHERE name='telescop'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_telescop {
+        conn.execute(
+            "ALTER TABLE calibration_set ADD COLUMN telescop TEXT",
             [],
         )?;
     }

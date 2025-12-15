@@ -559,6 +559,9 @@ pub async fn set_calibration_matching_config(
     config: crate::calibration::CalibrationMatchingConfig,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Validate config before saving (ensures warning_threshold <= matching_threshold)
+    config.validate()?;
+
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();

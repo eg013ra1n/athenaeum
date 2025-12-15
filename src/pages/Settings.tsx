@@ -15,8 +15,9 @@ interface CacheStats {
 }
 
 export default function Settings() {
-  const [thresholdValue, setThresholdValue] = useState('5.0');
-  const [thresholdUnit, setThresholdUnit] = useState<ThresholdUnit>('arcmin');
+  // Defaults should match backend: settings/mod.rs defaults
+  const [thresholdValue, setThresholdValue] = useState('3.0');
+  const [thresholdUnit, setThresholdUnit] = useState<ThresholdUnit>('deg');
   const [sessionGapHours, setSessionGapHours] = useState('6.0');
   const [qualityThumbnail, setQualityThumbnail] = useState('70');
   const [qualityPreview, setQualityPreview] = useState('85');

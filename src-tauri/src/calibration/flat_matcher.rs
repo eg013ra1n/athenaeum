@@ -67,6 +67,15 @@ impl FlatPattern {
         }
     }
 
+    /// Convert to string representation
+    #[allow(dead_code)] // Used in tests
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::LongTerm => "long_term",
+            Self::Manual => "manual",
+        }
+    }
 }
 
 /// Finds flat groups matching a light frame's parameters
@@ -263,8 +272,8 @@ mod tests {
                 avg_temp: Some(-10.0),
                 frame_count: 3,
                 filter: Some("L".to_string()),
-                instrume: "ASI2600MM".to_string(),
-                binning: "1x1".to_string(),
+                instrume: Some("ASI2600MM".to_string()),
+                binning: Some("1x1".to_string()),
                 gain: Some(100.0),
                 offset: Some(10.0),
                 exptime: Some(1.0),
@@ -344,13 +353,13 @@ mod tests {
         );
     }
 
-    // ========== FlatPattern::to_string tests ==========
+    // ========== FlatPattern::as_str tests ==========
 
     #[test]
-    fn test_flat_pattern_to_string() {
-        assert_eq!(FlatPattern::Automatic.to_string(), "automatic");
-        assert_eq!(FlatPattern::LongTerm.to_string(), "long_term");
-        assert_eq!(FlatPattern::Manual.to_string(), "manual");
+    fn test_flat_pattern_as_str() {
+        assert_eq!(FlatPattern::Automatic.as_str(), "automatic");
+        assert_eq!(FlatPattern::LongTerm.as_str(), "long_term");
+        assert_eq!(FlatPattern::Manual.as_str(), "manual");
     }
 
     // ========== apply_pattern_selection tests ==========

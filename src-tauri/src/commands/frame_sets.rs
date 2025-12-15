@@ -69,9 +69,7 @@ pub async fn auto_generate_frame_sets(
 
     // Get session gap threshold from settings
     let gap_threshold_hours: f64 = state.settings
-        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-        .map_err(|e| e.to_string())?
-        .parse()
+        .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
     for cluster in clusters {
@@ -542,9 +540,7 @@ pub async fn split_frame_set(
 
         // Get session gap threshold from settings
         let gap_threshold_hours: f64 = state.settings
-            .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-            .map_err(|e| e.to_string())?
-            .parse()
+            .get_session_gap_threshold_hours(&conn)
             .unwrap_or(6.0);
 
         // Collect frame IDs based on selection type
@@ -783,9 +779,7 @@ pub async fn create_custom_frames_set(
 
     // Get session gap threshold from settings
     let gap_threshold_hours: f64 = state.settings
-        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-        .map_err(|e| e.to_string())?
-        .parse()
+        .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
     // Flatten all frames and group by session_id for later
@@ -962,9 +956,7 @@ pub async fn create_frame_set_from_selection(
 
     // Detect nights from selected frames using gap threshold
     let gap_threshold_hours: f64 = state.settings
-        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-        .map_err(|e| format!("Failed to get settings: {}", e))?
-        .parse()
+        .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
     println!("Detecting nights from {} frames with gap threshold {} hours", frames.len(), gap_threshold_hours);

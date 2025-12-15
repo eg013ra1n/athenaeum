@@ -13,6 +13,11 @@ export default function BehavioralOptionsPanel({
   onUpdate,
   showFallbackInfo = false,
 }: BehavioralOptionsPanelProps) {
+  // Don't render if no options apply to this source type
+  // (only darks and flats have behavioral options)
+  const hasOptions = sourceType === "darks" || sourceType === "flats";
+  if (!hasOptions) return null;
+
   const safeOptions: BehavioralOptions = options || {
     use_bias_for_dark_optimization: false,
     use_bias_if_no_darks: false,

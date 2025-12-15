@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Current configuration schema version
-pub const CONFIG_VERSION: i32 = 1;
+/// v2: Added telescop field, dual thresholds (warning + matching), locked/supports_warning flags
+pub const CONFIG_VERSION: i32 = 2;
 
 /// Match mode for parameter comparison
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -34,9 +35,20 @@ pub struct ParameterConfig {
     pub mode: MatchMode,
     /// If true and frame's metadata is NULL, skip matching entirely
     pub required: bool,
-    /// For Warning mode: threshold value (e.g., temperature delta in °C)
+    /// For Warning mode: threshold that triggers warning display (must be <= matching_threshold)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning_threshold: Option<f64>,
+    /// For Warning mode: threshold that rejects match if exceeded
+    /// If value difference > matching_threshold, the calibration set is rejected.
+    /// If value difference > warning_threshold but <= matching_threshold, match is accepted with warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matching_threshold: Option<f64>,
+    /// Whether this parameter can be changed by user (false = locked to Exact mode)
+    #[serde(default)]
+    pub locked: bool,
+    /// Whether Warning mode is available for this parameter
+    #[serde(default)]
+    pub supports_warning: bool,
 }
 
 impl Default for ParameterConfig {
@@ -45,66 +57,141 @@ impl Default for ParameterConfig {
             mode: MatchMode::Ignore,
             required: false,
             warning_threshold: None,
+            matching_threshold: None,
+            locked: false,
+            supports_warning: false,
         }
     }
 }
 
 impl ParameterConfig {
+    /// Create an exact match parameter (cannot be changed by user)
+    pub fn exact_locked() -> Self {
+        Self {
+            mode: MatchMode::Exact,
+            required: true,
+            warning_threshold: None,
+            matching_threshold: None,
+            locked: true,
+            supports_warning: false,
+        }
+    }
+
+    /// Create an exact match parameter (can be changed to Ignore)
     pub fn exact(required: bool) -> Self {
         Self {
             mode: MatchMode::Exact,
             required,
             warning_threshold: None,
+            matching_threshold: None,
+            locked: false,
+            supports_warning: false,
         }
     }
 
-    pub fn warning(threshold: f64) -> Self {
+    /// Create a warning mode parameter with dual thresholds
+    /// - warning_threshold: triggers warning display
+    /// - matching_threshold: rejects match if exceeded
+    pub fn warning(warning_threshold: f64, matching_threshold: f64) -> Self {
         Self {
             mode: MatchMode::Warning,
             required: false,
-            warning_threshold: Some(threshold),
+            warning_threshold: Some(warning_threshold),
+            matching_threshold: Some(matching_threshold),
+            locked: false,
+            supports_warning: true,
         }
     }
 
+    /// Create an ignore parameter
     pub fn ignore() -> Self {
         Self::default()
+    }
+
+    /// Create an ignore parameter that supports warning mode
+    pub fn ignore_with_warning_support() -> Self {
+        Self {
+            mode: MatchMode::Ignore,
+            required: false,
+            warning_threshold: None,
+            matching_threshold: None,
+            locked: false,
+            supports_warning: true,
+        }
+    }
+
+    /// Validate that warning_threshold <= matching_threshold
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode == MatchMode::Warning {
+            let warn = self.warning_threshold.unwrap_or(0.0);
+            let match_thresh = self.matching_threshold.unwrap_or(f64::MAX);
+            if warn > match_thresh {
+                return Err(format!(
+                    "Warning threshold ({}) cannot be greater than matching threshold ({})",
+                    warn, match_thresh
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
 /// Configuration for matching a specific calibration type
-/// Contains rules for all 8 matchable parameters
+/// Contains rules for all 9 matchable parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationTypeConfig {
-    /// Camera/instrument name
+    /// Camera/instrument name - always exact, locked
     pub instrume: ParameterConfig,
-    /// Binning mode (e.g., "1x1", "2x2")
+    /// Binning mode (e.g., "1x1", "2x2") - always exact, locked
     pub binning: ParameterConfig,
-    /// Sensor gain value
+    /// Sensor gain value - always exact, locked
     pub gain: ParameterConfig,
-    /// Sensor offset value
+    /// Sensor offset value - always exact, locked
     pub offset: ParameterConfig,
-    /// Exposure time in seconds
+    /// Telescope name - exact or disabled (no warning mode)
+    pub telescop: ParameterConfig,
+    /// Exposure time in seconds - supports warning mode with thresholds
     pub exptime: ParameterConfig,
-    /// Focal length in mm
+    /// Focal length in mm - supports warning mode with thresholds
     pub focallen: ParameterConfig,
-    /// Filter name
+    /// Filter name - exact or disabled (no warning mode)
     pub filter: ParameterConfig,
-    /// CCD temperature in Celsius
+    /// CCD temperature in Celsius - supports warning mode with thresholds
     pub ccd_temp: ParameterConfig,
 }
 
 impl Default for CalibrationTypeConfig {
     fn default() -> Self {
         Self {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::ignore(),
-            focallen: ParameterConfig::ignore(),
-            filter: ParameterConfig::ignore(),
-            ccd_temp: ParameterConfig::ignore(),
+            // Always exact, locked parameters
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            // Exact or disabled (no warning support)
+            telescop: ParameterConfig::ignore(), // Can be set to exact or ignore
+            filter: ParameterConfig::ignore(),   // Can be set to exact or ignore
+            // Warning-capable parameters (with dual thresholds)
+            exptime: ParameterConfig::ignore_with_warning_support(),
+            focallen: ParameterConfig::ignore_with_warning_support(),
+            ccd_temp: ParameterConfig::ignore_with_warning_support(),
         }
+    }
+}
+
+impl CalibrationTypeConfig {
+    /// Validate all parameter configs in this type config
+    pub fn validate(&self) -> Result<(), String> {
+        self.instrume.validate().map_err(|e| format!("instrume: {}", e))?;
+        self.binning.validate().map_err(|e| format!("binning: {}", e))?;
+        self.gain.validate().map_err(|e| format!("gain: {}", e))?;
+        self.offset.validate().map_err(|e| format!("offset: {}", e))?;
+        self.telescop.validate().map_err(|e| format!("telescop: {}", e))?;
+        self.exptime.validate().map_err(|e| format!("exptime: {}", e))?;
+        self.focallen.validate().map_err(|e| format!("focallen: {}", e))?;
+        self.filter.validate().map_err(|e| format!("filter: {}", e))?;
+        self.ccd_temp.validate().map_err(|e| format!("ccd_temp: {}", e))?;
+        Ok(())
     }
 }
 
@@ -267,88 +354,100 @@ impl Default for CalibrationMatchingConfig {
             warnings: WarningConfig::default(),
         };
 
-        // Configure Lights → Flat (with filter matching)
+        // Configure Lights → Flat (with filter matching, focal length with threshold)
         config.lights.flat = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::ignore(),
-            focallen: ParameterConfig::exact(true),
+            // Locked exact parameters
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            // Exact or disabled (no warning)
+            telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::exact(true),
-            ccd_temp: ParameterConfig::ignore(),
+            // Warning-capable (with dual thresholds: warn at 5mm, reject at 10mm)
+            exptime: ParameterConfig::ignore_with_warning_support(),
+            focallen: ParameterConfig::warning(5.0, 10.0),
+            ccd_temp: ParameterConfig::ignore_with_warning_support(),
         });
 
-        // Configure Lights → Dark (no filter, with temp warning)
+        // Configure Lights → Dark (exposure must match, temp with thresholds)
         config.lights.dark = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::exact(true),
-            focallen: ParameterConfig::ignore(),
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
-            ccd_temp: ParameterConfig::warning(2.0),
+            // Exposure: warn at 1s diff, reject at 5s diff
+            exptime: ParameterConfig::warning(1.0, 5.0),
+            focallen: ParameterConfig::ignore_with_warning_support(),
+            // Temperature: warn at 2°C, reject at 5°C
+            ccd_temp: ParameterConfig::warning(2.0, 5.0),
         });
 
-        // Configure Lights → Bias (no filter, no exptime, with temp warning)
+        // Configure Lights → Bias (no filter, no exptime, temp with thresholds)
         config.lights.bias = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::ignore(),
-            focallen: ParameterConfig::ignore(),
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
-            ccd_temp: ParameterConfig::warning(2.0),
+            exptime: ParameterConfig::ignore_with_warning_support(),
+            focallen: ParameterConfig::ignore_with_warning_support(),
+            ccd_temp: ParameterConfig::warning(2.0, 5.0),
         });
 
-        // Configure Flats → DarkFlat (no filter, with temp warning)
+        // Configure Flats → DarkFlat (exposure match, temp with thresholds)
         config.flats.darkflat = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::exact(true),
-            focallen: ParameterConfig::ignore(),
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
-            ccd_temp: ParameterConfig::warning(2.0),
+            exptime: ParameterConfig::warning(1.0, 5.0),
+            focallen: ParameterConfig::ignore_with_warning_support(),
+            ccd_temp: ParameterConfig::warning(2.0, 5.0),
         });
 
         // Configure Flats → Dark (same as DarkFlat)
         config.flats.dark = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::exact(true),
-            focallen: ParameterConfig::ignore(),
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
-            ccd_temp: ParameterConfig::warning(2.0),
+            exptime: ParameterConfig::warning(1.0, 5.0),
+            focallen: ParameterConfig::ignore_with_warning_support(),
+            ccd_temp: ParameterConfig::warning(2.0, 5.0),
         });
 
-        // Configure Flats → Bias
+        // Configure Flats → Bias (temp with thresholds)
         config.flats.bias = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::ignore(),
-            focallen: ParameterConfig::ignore(),
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
-            ccd_temp: ParameterConfig::warning(2.0),
+            exptime: ParameterConfig::ignore_with_warning_support(),
+            focallen: ParameterConfig::ignore_with_warning_support(),
+            ccd_temp: ParameterConfig::warning(2.0, 5.0),
         });
 
-        // Configure Darks → Bias
+        // Configure Darks → Bias (temp with thresholds)
         config.darks.bias = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact(true),
-            binning: ParameterConfig::exact(true),
-            gain: ParameterConfig::exact(true),
-            offset: ParameterConfig::exact(true),
-            exptime: ParameterConfig::ignore(),
-            focallen: ParameterConfig::ignore(),
+            instrume: ParameterConfig::exact_locked(),
+            binning: ParameterConfig::exact_locked(),
+            gain: ParameterConfig::exact_locked(),
+            offset: ParameterConfig::exact_locked(),
+            telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
-            ccd_temp: ParameterConfig::warning(2.0),
+            exptime: ParameterConfig::ignore_with_warning_support(),
+            focallen: ParameterConfig::ignore_with_warning_support(),
+            ccd_temp: ParameterConfig::warning(2.0, 5.0),
         });
 
         // Behavioral options
@@ -431,6 +530,39 @@ impl CalibrationMatchingConfig {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
+
+    /// Validate all parameter configs across all source→calibration pairs
+    /// Returns an error if any parameter has invalid threshold configuration
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate lights configs
+        if let Some(flat) = &self.lights.flat {
+            flat.validate().map_err(|e| format!("lights→flat: {}", e))?;
+        }
+        if let Some(dark) = &self.lights.dark {
+            dark.validate().map_err(|e| format!("lights→dark: {}", e))?;
+        }
+        if let Some(bias) = &self.lights.bias {
+            bias.validate().map_err(|e| format!("lights→bias: {}", e))?;
+        }
+
+        // Validate flats configs
+        if let Some(darkflat) = &self.flats.darkflat {
+            darkflat.validate().map_err(|e| format!("flats→darkflat: {}", e))?;
+        }
+        if let Some(dark) = &self.flats.dark {
+            dark.validate().map_err(|e| format!("flats→dark: {}", e))?;
+        }
+        if let Some(bias) = &self.flats.bias {
+            bias.validate().map_err(|e| format!("flats→bias: {}", e))?;
+        }
+
+        // Validate darks configs
+        if let Some(bias) = &self.darks.bias {
+            bias.validate().map_err(|e| format!("darks→bias: {}", e))?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -442,14 +574,23 @@ mod tests {
         let config = CalibrationMatchingConfig::default();
         assert_eq!(config.version, CONFIG_VERSION);
 
-        // Check Lights→Flat has filter matching
+        // Check Lights→Flat has filter matching and locked params
         let flat_config = config.get_type_config("lights", "flat").unwrap();
         assert_eq!(flat_config.filter.mode, MatchMode::Exact);
+        assert!(flat_config.instrume.locked, "instrume should be locked");
+        assert!(flat_config.gain.locked, "gain should be locked");
+        assert!(flat_config.binning.locked, "binning should be locked");
+        assert!(flat_config.offset.locked, "offset should be locked");
 
-        // Check Lights→Dark has temp warning
+        // Check Lights→Dark has temp warning with dual thresholds
         let dark_config = config.get_type_config("lights", "dark").unwrap();
         assert_eq!(dark_config.ccd_temp.mode, MatchMode::Warning);
         assert_eq!(dark_config.ccd_temp.warning_threshold, Some(2.0));
+        assert_eq!(dark_config.ccd_temp.matching_threshold, Some(5.0));
+
+        // Check warning-capable params have supports_warning flag
+        assert!(dark_config.ccd_temp.supports_warning);
+        assert!(dark_config.exptime.supports_warning);
 
         // Check Flats has fallback chain
         let flats_opts = config.get_behavioral_options("flats").unwrap();

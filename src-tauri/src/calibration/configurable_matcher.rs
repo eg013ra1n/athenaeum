@@ -89,6 +89,11 @@ fn check_string_param(
 }
 
 /// Check if a float parameter matches based on config
+///
+/// For Warning mode with dual thresholds:
+/// - If diff > matching_threshold: REJECT the match
+/// - If diff > warning_threshold but <= matching_threshold: Accept with WARNING
+/// - If diff <= warning_threshold: Accept without warning
 fn check_float_param(
     frame_value: Option<f64>,
     set_value: Option<f64>,
@@ -123,13 +128,26 @@ fn check_float_param(
             }
         }
         MatchMode::Warning => {
-            let threshold = config.warning_threshold.unwrap_or(tolerance);
+            // Dual threshold logic:
+            // - matching_threshold: maximum allowed difference (rejects if exceeded)
+            // - warning_threshold: triggers warning display (must be <= matching_threshold)
+            let warning_thresh = config.warning_threshold.unwrap_or(tolerance);
+            let matching_thresh = config.matching_threshold.unwrap_or(f64::MAX);
+
             match (frame_value, set_value) {
                 (Some(f), Some(s)) => {
                     let diff = (f - s).abs();
-                    if diff > threshold {
+
+                    // First check: if outside matching threshold, REJECT
+                    if diff > matching_thresh {
+                        return ParameterCheckResult::failed();
+                    }
+
+                    // Second check: if outside warning threshold, accept with WARNING
+                    if diff > warning_thresh {
                         ParameterCheckResult::warning(format!(
-                            "{} differs by {:.1} (threshold: {:.1})", param_name, diff, threshold
+                            "{} differs by {:.1} (warning threshold: {:.1}, max: {:.1})",
+                            param_name, diff, warning_thresh, matching_thresh
                         ))
                     } else {
                         ParameterCheckResult::matched()
@@ -156,6 +174,7 @@ pub fn check_calibration_match(
     set_binning: &Option<String>,
     set_gain: Option<f64>,
     set_offset: Option<f64>,
+    set_telescop: &Option<String>,
     set_exptime: Option<f64>,
     set_focallen: Option<f64>,
     set_filter: &Option<String>,
@@ -165,49 +184,55 @@ pub fn check_calibration_match(
     let mut warnings = Vec::new();
     let mut all_match = true;
 
-    // Check instrume
+    // Check instrume (always exact, locked)
     let result = check_string_param(&frame.instrume, set_instrume, &config.instrume, "instrume");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check binning
+    // Check binning (always exact, locked)
     let result = check_string_param(&frame.binning, set_binning, &config.binning, "binning");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check gain (tolerance: 0.01)
+    // Check gain (always exact, locked, tolerance: 0.01)
     let result = check_float_param(frame.gain, set_gain, &config.gain, "gain", 0.01);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check offset (tolerance: 0.01)
+    // Check offset (always exact, locked, tolerance: 0.01)
     let result = check_float_param(frame.offset, set_offset, &config.offset, "offset", 0.01);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check exptime (tolerance: 0.1s)
+    // Check telescop (exact or disabled, no warning mode)
+    let result = check_string_param(&frame.telescop, set_telescop, &config.telescop, "telescop");
+    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
+    if !result.matches { all_match = false; }
+    if let Some(msg) = result.warning_message { warnings.push(msg); }
+
+    // Check exptime (supports warning mode with dual thresholds, tolerance: 0.1s)
     let result = check_float_param(frame.exptime, set_exptime, &config.exptime, "exptime", 0.1);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check focallen (tolerance: 1.0mm)
+    // Check focallen (supports warning mode with dual thresholds, tolerance: 1.0mm)
     let result = check_float_param(frame.focallen, set_focallen, &config.focallen, "focallen", 1.0);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check filter
+    // Check filter (exact or disabled, no warning mode)
     let result = check_string_param(&frame.filter, set_filter, &config.filter, "filter");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check ccd_temp (tolerance: default 2.0°C)
+    // Check ccd_temp (supports warning mode with dual thresholds, tolerance: 2.0°C)
     let result = check_float_param(frame.ccd_temp, set_ccd_temp, &config.ccd_temp, "ccd_temp", 2.0);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
@@ -253,7 +278,7 @@ pub fn find_calibration_sets(
 
     let mut stmt = conn.prepare(
         "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
-                ccd_temp, temp_min, temp_max, date_start, date_end
+                ccd_temp, temp_min, temp_max, date_start, date_end, telescop
          FROM calibration_set
          WHERE imagetyp = ?1
          ORDER BY date_start DESC"
@@ -276,12 +301,13 @@ pub fn find_calibration_sets(
             row.get::<_, Option<f64>>(10)?,  // temp_max
             row.get::<_, String>(11)?,       // date_start
             row.get::<_, String>(12)?,       // date_end
+            row.get::<_, Option<String>>(13)?, // telescop
         ))
     })?;
 
     for row_result in rows {
         let (set_id, gain, offset, binning, instrume, exptime, focallen, filter,
-             ccd_temp, temp_min, temp_max, date_start, date_end) = row_result?;
+             ccd_temp, temp_min, temp_max, date_start, date_end, telescop) = row_result?;
 
         // Use the average temp if available
         let set_temp = match (temp_min, temp_max) {
@@ -296,6 +322,7 @@ pub fn find_calibration_sets(
             &binning,
             gain,
             offset,
+            &telescop,
             exptime,
             focallen,
             &filter,
@@ -621,10 +648,11 @@ mod tests {
     }
 
     #[test]
-    fn test_check_float_param_warning() {
-        let config = ParameterConfig::warning(2.0);
+    fn test_check_float_param_warning_dual_threshold() {
+        // Dual threshold: warn at 2.0, reject at 5.0
+        let config = ParameterConfig::warning(2.0, 5.0);
 
-        // Within threshold
+        // Within warning threshold - no warning
         let result = check_float_param(
             Some(-10.0),
             Some(-11.0),
@@ -632,20 +660,30 @@ mod tests {
             "ccd_temp",
             2.0,
         );
-        assert!(result.matches);
-        assert!(!result.warning);
+        assert!(result.matches, "Should match when within warning threshold");
+        assert!(!result.warning, "Should not warn when within warning threshold");
 
-        // Outside threshold - should match but with warning
+        // Outside warning threshold but within matching threshold - warning but match
         let result = check_float_param(
             Some(-10.0),
-            Some(-15.0),
+            Some(-14.0), // 4 degree difference: > 2.0 warn, < 5.0 reject
             &config,
             "ccd_temp",
             2.0,
         );
-        assert!(result.matches);
-        assert!(result.warning);
+        assert!(result.matches, "Should match when within matching threshold");
+        assert!(result.warning, "Should warn when outside warning threshold");
         assert!(result.warning_message.is_some());
+
+        // Outside matching threshold - should REJECT (not match)
+        let result = check_float_param(
+            Some(-10.0),
+            Some(-16.0), // 6 degree difference: > 5.0 reject threshold
+            &config,
+            "ccd_temp",
+            2.0,
+        );
+        assert!(!result.matches, "Should NOT match when outside matching threshold");
     }
 
     #[test]
