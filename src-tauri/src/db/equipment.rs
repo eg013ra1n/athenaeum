@@ -255,7 +255,7 @@ pub fn get_frames_for_calibration_set(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM calibration_set_frames csf
          JOIN frames fr ON csf.frame_id = fr.id
@@ -307,7 +307,7 @@ pub fn get_frames_for_calibration_set(
             set_temp: row.get(25)?,
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
+            ypixsz: row.get(28)?,
             naxis1: row.get(29)?,
             naxis2: row.get(30)?,
             ra: row.get(31)?,

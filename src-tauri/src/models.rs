@@ -43,7 +43,7 @@ pub struct Frame {
     pub set_temp: Option<f64>,
     pub focallen: Option<f64>,
     pub xpixsz: Option<f64>,
-    pub pixsz: Option<f64>,
+    pub ypixsz: Option<f64>,
     pub naxis1: Option<i32>,
     pub naxis2: Option<i32>,
     pub ra: Option<f64>,

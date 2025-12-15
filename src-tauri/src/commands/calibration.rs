@@ -292,7 +292,7 @@ pub async fn get_frame_calibration_hierarchy(
     let mut stmt = conn.prepare(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter,
                 imagetyp, is_master, ra, dec, objctra, objctdec, gain, offset,
-                xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, pixsz,
+                xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, ypixsz,
                 naxis1, naxis2, sitelat, lat_obs, sitelong, long_obs
          FROM frames WHERE id = ?1"
     ).map_err(|e| e.to_string())?;
@@ -337,7 +337,7 @@ pub async fn get_frame_calibration_hierarchy(
             set_temp: row.get(19)?,
             focallen: row.get(20)?,
             xpixsz: row.get(21)?,
-            pixsz: row.get(22)?,
+            ypixsz: row.get(22)?,
             naxis1: row.get(23)?,
             naxis2: row.get(24)?,
             sitelat: row.get(25)?,

@@ -43,7 +43,7 @@ export interface Frame {
   set_temp: number | null;
   focallen: number | null;
   xpixsz: number | null;
-  pixsz: number | null;
+  ypixsz: number | null;
   ra: number | null;
   dec: number | null;
   sitelat: number | null;

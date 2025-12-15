@@ -38,7 +38,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             set_temp REAL,
             focallen REAL,
             xpixsz REAL,
-            pixsz REAL,
+            ypixsz REAL,
             naxis1 INTEGER,
             naxis2 INTEGER,
             ra REAL,

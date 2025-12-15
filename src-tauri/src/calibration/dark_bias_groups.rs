@@ -132,7 +132,7 @@ pub fn detect_dark_groups(
     let mut query = String::from(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
                 is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
-                ccd_temp, set_temp, focallen, xpixsz, pixsz, naxis1, naxis2,
+                ccd_temp, set_temp, focallen, xpixsz, ypixsz, naxis1, naxis2,
                 sitelat, lat_obs, sitelong, long_obs
          FROM frames
          WHERE imagetyp = 'Dark' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4"
@@ -236,7 +236,7 @@ pub fn detect_bias_groups(
     let mut query = String::from(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
                 is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
-                ccd_temp, set_temp, focallen, xpixsz, pixsz, naxis1, naxis2,
+                ccd_temp, set_temp, focallen, xpixsz, ypixsz, naxis1, naxis2,
                 sitelat, lat_obs, sitelong, long_obs
          FROM frames
          WHERE imagetyp = 'Bias' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4"
@@ -369,7 +369,7 @@ fn execute_dark_query(
             set_temp: row.get(19)?,
             focallen: row.get(20)?,
             xpixsz: row.get(21)?,
-            pixsz: row.get(22)?,
+            ypixsz: row.get(22)?,
             naxis1: row.get(23)?,
             naxis2: row.get(24)?,
             ra: row.get(10)?,
@@ -469,7 +469,7 @@ fn execute_bias_query(
             set_temp: row.get(19)?,
             focallen: row.get(20)?,
             xpixsz: row.get(21)?,
-            pixsz: row.get(22)?,
+            ypixsz: row.get(22)?,
             naxis1: row.get(23)?,
             naxis2: row.get(24)?,
             ra: row.get(10)?,

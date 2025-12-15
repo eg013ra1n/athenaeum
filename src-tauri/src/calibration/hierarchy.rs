@@ -57,7 +57,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
     let mut stmt = conn.prepare(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter,
                 gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp,
-                focallen, xpixsz, pixsz, naxis1, naxis2, ra, dec, sitelat, lat_obs,
+                focallen, xpixsz, ypixsz, naxis1, naxis2, ra, dec, sitelat, lat_obs,
                 sitelong, long_obs, objctra, objctdec, override, imagetyp, is_master
          FROM frames
          WHERE id = ?1"
@@ -86,7 +86,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
             set_temp: row.get(14)?,
             focallen: row.get(15)?,
             xpixsz: row.get(16)?,
-            pixsz: row.get(17)?,
+            ypixsz: row.get(17)?,
             naxis1: row.get(18)?,
             naxis2: row.get(19)?,
             ra: row.get(20)?,

@@ -36,7 +36,7 @@ pub fn calculate_metadata_from_frame_ids(
         "SELECT fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM frames fr
          WHERE fr.id IN ({})",
@@ -78,7 +78,7 @@ pub fn calculate_metadata_from_frame_ids(
                 set_temp: row.get(16)?,
                 focallen: row.get(17)?,
                 xpixsz: row.get(18)?,
-                pixsz: row.get(19)?,
+                ypixsz: row.get(19)?,
                 naxis1: row.get(20)?,
                 naxis2: row.get(21)?,
                 ra: row.get(22)?,
@@ -244,7 +244,7 @@ mod tests {
             set_temp: None,
             focallen: None,
             xpixsz: None,
-            pixsz: None,
+            ypixsz: None,
             naxis1: None,
             naxis2: None,
             sitelat: None,

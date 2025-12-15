@@ -48,10 +48,10 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 
     conn.execute(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp, is_master,
-         gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, pixsz,
-         ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override)
+         gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, ypixsz,
+         naxis1, naxis2, ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
         params![
             frame.file_id,
             frame.object,
@@ -71,7 +71,9 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
             frame.set_temp,
             frame.focallen,
             frame.xpixsz,
-            frame.pixsz,
+            frame.ypixsz,
+            frame.naxis1,
+            frame.naxis2,
             frame.ra,
             frame.dec,
             frame.sitelat,
@@ -228,7 +230,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
@@ -283,7 +285,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 set_temp: row.get(24).ok(),
                 focallen: row.get(25).ok(),
                 xpixsz: row.get(26).ok(),
-                pixsz: row.get(27).ok(),
+                ypixsz: row.get(27).ok(),
                 naxis1: row.get(28).ok(),
                 naxis2: row.get(29).ok(),
                 ra: row.get(30).ok(),
@@ -323,7 +325,7 @@ pub fn get_files_by_directory(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
@@ -381,7 +383,7 @@ pub fn get_files_by_directory(
                 set_temp: row.get(24).ok(),
                 focallen: row.get(25).ok(),
                 xpixsz: row.get(26).ok(),
-                pixsz: row.get(27).ok(),
+                ypixsz: row.get(27).ok(),
                 naxis1: row.get(28).ok(),
                 naxis2: row.get(29).ok(),
                 ra: row.get(30).ok(),
@@ -422,7 +424,7 @@ pub fn get_frames_with_missing_metadata(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
@@ -476,7 +478,7 @@ pub fn get_frames_with_missing_metadata(
             set_temp: row.get(24).ok(),
             focallen: row.get(25).ok(),
             xpixsz: row.get(26).ok(),
-            pixsz: row.get(27).ok(),
+            ypixsz: row.get(27).ok(),
             naxis1: row.get(28).ok(),
             naxis2: row.get(29).ok(),
             ra: row.get(30).ok(),
@@ -757,7 +759,7 @@ pub fn get_light_frames_for_project(
         "SELECT f.id, fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
@@ -796,7 +798,7 @@ pub fn get_light_frames_for_project(
             set_temp: row.get(17)?,
             focallen: row.get(18)?,
             xpixsz: row.get(19)?,
-            pixsz: row.get(20)?,
+            ypixsz: row.get(20)?,
             naxis1: row.get(21)?,
             naxis2: row.get(22)?,
             ra: row.get(23)?,
@@ -1061,7 +1063,7 @@ pub fn get_frames_with_files_for_set(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM session_members sm
          JOIN sessions s ON sm.session_id = s.id
@@ -1115,7 +1117,7 @@ pub fn get_frames_with_files_for_set(
             set_temp: row.get(25)?,
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
+            ypixsz: row.get(28)?,
             naxis1: row.get(29)?,
             naxis2: row.get(30)?,
             ra: row.get(31)?,
@@ -1165,7 +1167,7 @@ pub fn get_frames_with_files_by_ids(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM frames fr
          JOIN files f ON fr.file_id = f.id
@@ -1227,7 +1229,7 @@ pub fn get_frames_with_files_by_ids(
             set_temp: row.get(25)?,
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
+            ypixsz: row.get(28)?,
             naxis1: row.get(29)?,
             naxis2: row.get(30)?,
             ra: row.get(31)?,
@@ -1312,7 +1314,7 @@ pub fn get_imaging_nights_with_sessions(
                         fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                         fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                         fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                        fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                        fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                         fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
                  FROM session_members sm
                  JOIN frames fr ON sm.frame_id = fr.id
@@ -1364,7 +1366,7 @@ pub fn get_imaging_nights_with_sessions(
                     set_temp: row.get(25)?,
                     focallen: row.get(26)?,
                     xpixsz: row.get(27)?,
-                    pixsz: row.get(28)?,
+                    ypixsz: row.get(28)?,
                     naxis1: row.get(29)?,
                     naxis2: row.get(30)?,
                     ra: row.get(31)?,

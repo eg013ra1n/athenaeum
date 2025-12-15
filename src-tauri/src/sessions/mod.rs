@@ -212,7 +212,7 @@ mod tests {
             set_temp: None,
             focallen: None,
             xpixsz: None,
-            pixsz: None,
+            ypixsz: None,
             naxis1: None,
             naxis2: None,
             ra: None,
