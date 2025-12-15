@@ -183,7 +183,7 @@ pub fn find_flat_groups_for_light_frame(
             // Temperature score (if available)
             let temp_score = if let Some(diff) = temp_diff {
                 // Perfect match = 1.0, 10°C difference = 0.0
-                (1.0 - (diff / 10.0).min(1.0))
+                1.0 - (diff / 10.0).min(1.0)
             } else {
                 0.5 // Neutral score if temp not available
             };

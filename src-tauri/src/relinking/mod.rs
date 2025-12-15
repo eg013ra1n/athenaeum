@@ -11,7 +11,7 @@ use crate::models::{FileFormat, RelinkResult};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use walkdir::WalkDir;
 
 /// Relink files from an old scan root path to a new location

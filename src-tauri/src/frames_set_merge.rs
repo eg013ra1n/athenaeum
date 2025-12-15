@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::models::ImagingNight;
 

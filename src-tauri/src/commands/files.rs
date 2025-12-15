@@ -1,9 +1,8 @@
 // File commands - file operations and browsing
 
-use crate::db::{self, Database};
+use crate::db::{self};
 use crate::models::*;
 use std::path::Path;
-use std::sync::Mutex;
 use tauri::State;
 
 use super::AppState;

@@ -2,9 +2,9 @@
 
 use crate::coordinates::{
     angular_distance, format_dec_sexagesimal, format_ra_sexagesimal,
-    parse_dec_sexagesimal, parse_ra_sexagesimal, spherical_mean,
+    parse_dec_sexagesimal, parse_ra_sexagesimal,
 };
-use crate::models::{Frame, FramesSet, ImageType};
+use crate::models::{Frame, ImageType};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 

@@ -1,8 +1,7 @@
 // Frame set commands - frame set management and operations
 
-use crate::db::{self, Database};
+use crate::db::{self};
 use crate::models::*;
-use std::sync::Mutex;
 use tauri::State;
 
 use super::AppState;

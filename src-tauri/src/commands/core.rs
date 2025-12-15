@@ -1,7 +1,6 @@
 // Core commands - app initialization and basic operations
 
 use crate::db::Database;
-use std::sync::Mutex;
 use tauri::{Manager, State};
 
 use super::AppState;

@@ -1,7 +1,6 @@
 // Coordinate parsing and conversion utilities for astronomical coordinates
 
 use anyhow::{anyhow, Result};
-use std::f64::consts::PI;
 
 /// Parse Right Ascension from sexagesimal string to decimal degrees
 /// Accepts formats like "HH:MM:SS.sss" or "HH MM SS.sss"

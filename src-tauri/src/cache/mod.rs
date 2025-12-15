@@ -13,7 +13,7 @@ use crate::rustafits_processor::{self, Resolution};
 use crate::settings::SettingsManager;
 
 pub use models::{
-    CacheBuildTask, CacheEntry, CacheProgress, CachePriority, CacheStats, StretchMode,
+    CacheEntry, CacheStats, StretchMode,
     StretchParams,
 };
 

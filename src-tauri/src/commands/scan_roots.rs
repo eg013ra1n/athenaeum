@@ -1,10 +1,9 @@
 // Scan root commands - directory scanning and monitoring
 
-use crate::db::{self, Database};
+use crate::db::{self};
 use crate::models::*;
 use crate::scanner::scan_directory;
 use std::path::Path;
-use std::sync::Mutex;
 use tauri::State;
 
 use super::AppState;

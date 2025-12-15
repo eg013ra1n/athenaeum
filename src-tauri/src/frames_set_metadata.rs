@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rusqlite::Connection;
 use chrono::{DateTime, Utc};
 

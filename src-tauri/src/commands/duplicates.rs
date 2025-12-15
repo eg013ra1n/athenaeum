@@ -1,8 +1,6 @@
 // Duplicate detection and black hole management commands
 
-use crate::db::{self, Database};
-use crate::models::*;
-use std::sync::Mutex;
+use crate::db::{self};
 use tauri::State;
 
 use super::AppState;

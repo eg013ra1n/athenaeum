@@ -1,10 +1,9 @@
 // Calibration commands - calibration frame matching and library management
 
 use crate::calibration::scan_integration::{create_calibration_sets_from_scan, CalibrationScanResult};
-use crate::db::{self, Database};
+use crate::db::{self};
 use crate::models::*;
 use chrono::{DateTime, Utc};
-use std::sync::Mutex;
 use tauri::State;
 
 use super::AppState;

@@ -1,7 +1,7 @@
 // Auto-creation of calibration sets from individual frames
-use crate::models::{ImageType, Frame, CalibrationTolerance};
+use crate::models::{ImageType, CalibrationTolerance};
 use rusqlite::{Connection, params, OptionalExtension};
-use anyhow::{Result, Context};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
