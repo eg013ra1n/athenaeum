@@ -35,7 +35,7 @@ fitsio = "0.21"
 anyhow = "1"
 thiserror = "2"
 quick-xml = "0.36"
-rustafits = { git = "https://github.com/eg013ra1n/rustafits" }
+rustafits = "0.2"
 base64 = "0.22"
 
 [profile.release]

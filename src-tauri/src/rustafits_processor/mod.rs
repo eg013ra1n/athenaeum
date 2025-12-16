@@ -76,57 +76,8 @@ pub struct ProcessedImage {
     pub is_color: bool, // Whether this is a color/Bayer image
 }
 
-/// Detect if a FITS file contains a color/Bayer pattern image
-///
-/// Checks for common color indicators in FITS headers:
-/// - BAYERPAT (Bayer pattern identifier)
-/// - COLORTYP (Color type)
-/// - NAXIS3 = 3 (RGB channels)
-fn detect_color_image<P: AsRef<Path>>(path: P) -> bool {
-    use fitsio::FitsFile;
 
-    let path = path.as_ref();
-
-    // Try to open FITS file and check for color indicators
-    if let Ok(mut fitsfile) = FitsFile::open(path) {
-        if let Ok(hdu) = fitsfile.primary_hdu() {
-            // Check for BAYERPAT keyword (most common for OSC cameras)
-            if let Ok(_) = hdu.read_key::<String>(&mut fitsfile, "BAYERPAT") {
-                return true;
-            }
-
-            // Check for COLORTYP keyword
-            if let Ok(colortyp) = hdu.read_key::<String>(&mut fitsfile, "COLORTYP") {
-                if colortyp.to_uppercase().contains("COLOR") ||
-                   colortyp.to_uppercase().contains("RGB") ||
-                   colortyp.to_uppercase().contains("BAYER") {
-                    return true;
-                }
-            }
-
-            // Check for XBAYEROFF/YBAYEROFF (Bayer offset indicators)
-            if hdu.read_key::<i64>(&mut fitsfile, "XBAYROFF").is_ok() ||
-               hdu.read_key::<i64>(&mut fitsfile, "YBAYROFF").is_ok() {
-                return true;
-            }
-
-            // Check for NAXIS3 = 3 (3-channel RGB image)
-            if let Ok(naxis) = hdu.read_key::<i64>(&mut fitsfile, "NAXIS") {
-                if naxis >= 3 {
-                    if let Ok(naxis3) = hdu.read_key::<i64>(&mut fitsfile, "NAXIS3") {
-                        if naxis3 == 3 {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// Process a FITS file to JPEG using rustafits
+/// Process a FITS/XISF file to JPEG using rustafits
 ///
 /// This function:
 /// 1. Creates a temporary output path for the JPEG
@@ -134,6 +85,8 @@ fn detect_color_image<P: AsRef<Path>>(path: P) -> bool {
 /// 3. Reads the JPEG bytes from disk
 /// 4. Cleans up the temporary file
 /// 5. Returns the JPEG data
+///
+/// Note: rustafits 0.2+ handles Bayer/color detection internally for both FITS and XISF
 pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     input_path: P,
     resolution: Resolution,
@@ -143,11 +96,8 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
 
     // Validate input file exists
     if !input_path.exists() {
-        anyhow::bail!("Input FITS file does not exist: {}", input_path.display());
+        anyhow::bail!("Input file does not exist: {}", input_path.display());
     }
-
-    // Detect if this is a color image
-    let is_color = detect_color_image(input_path);
 
     // Create temporary output path
     let temp_dir = std::env::temp_dir();
@@ -173,18 +123,18 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         converter = converter.with_downscale(resolution.downscale_factor());
     }
 
-    // Apply preview mode ONLY for mono images
-    // For color images, skip preview_mode to avoid binning before debayering
-    if resolution.use_preview_mode() && !is_color {
+    // Apply preview mode for faster processing
+    // rustafits 0.2+ handles color/Bayer detection internally
+    if resolution.use_preview_mode() {
         converter = converter.with_preview_mode();
     }
 
-    // Convert FITS to JPEG
+    // Convert FITS/XISF to JPEG
     converter
         .convert(&input_path, &output_path)
         .with_context(|| {
             format!(
-                "Failed to convert FITS to JPEG: {} -> {}",
+                "Failed to convert image: {} -> {}",
                 input_path.display(),
                 output_path.display()
             )
@@ -195,9 +145,7 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         format!("Failed to read generated JPEG: {}", output_path.display())
     })?;
 
-    // Try to get image dimensions using image crate (if available) or estimate
-    // For now, we'll just set dummy values since rustafits doesn't expose dimensions
-    // The frontend can determine actual dimensions when loading the JPEG
+    // Dimensions set to 0 - frontend determines from JPEG
     let width = 0;
     let height = 0;
 
@@ -209,14 +157,16 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         width,
         height,
         format: "jpeg".to_string(),
-        is_color,
+        is_color: false, // Not used - rustafits handles color internally
     })
 }
 
-/// Process FITS to JPEG and cache it in the specified directory
+/// Process FITS/XISF to JPEG and cache it in the specified directory
 ///
 /// This variant writes directly to the cache directory instead of a temp file,
 /// which is more efficient for the caching use case.
+///
+/// Note: rustafits 0.2+ handles Bayer/color detection internally for both FITS and XISF
 pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
     input_path: P,
     output_path: P,
@@ -228,11 +178,8 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
 
     // Validate input file exists
     if !input_path.exists() {
-        anyhow::bail!("Input FITS file does not exist: {}", input_path.display());
+        anyhow::bail!("Input file does not exist: {}", input_path.display());
     }
-
-    // Detect if this is a color image
-    let is_color = detect_color_image(input_path);
 
     // Ensure output directory exists
     if let Some(parent) = output_path.parent() {
@@ -250,18 +197,18 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         converter = converter.with_downscale(resolution.downscale_factor());
     }
 
-    // Apply preview mode ONLY for mono images
-    // For color images, skip preview_mode to avoid binning before debayering
-    if resolution.use_preview_mode() && !is_color {
+    // Apply preview mode for faster processing
+    // rustafits 0.2+ handles color/Bayer detection internally
+    if resolution.use_preview_mode() {
         converter = converter.with_preview_mode();
     }
 
-    // Convert FITS to JPEG
+    // Convert FITS/XISF to JPEG
     converter
         .convert(&input_path, &output_path)
         .with_context(|| {
             format!(
-                "Failed to convert FITS to JPEG: {} -> {}",
+                "Failed to convert image: {} -> {}",
                 input_path.display(),
                 output_path.display()
             )
@@ -272,7 +219,7 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         format!("Failed to read generated JPEG: {}", output_path.display())
     })?;
 
-    // Dimensions are set to 0 for now (frontend determines from JPEG)
+    // Dimensions set to 0 - frontend determines from JPEG
     let width = 0;
     let height = 0;
 
@@ -281,6 +228,6 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         width,
         height,
         format: "jpeg".to_string(),
-        is_color,
+        is_color: false, // Not used - rustafits handles color internally
     })
 }

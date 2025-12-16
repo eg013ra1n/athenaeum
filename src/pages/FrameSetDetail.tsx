@@ -149,13 +149,13 @@ export default function FrameSetDetail() {
         frameIds,
       });
 
-      // Filter only LIGHT frames with FITS format
+      // Filter only LIGHT frames with FITS or XISF format
       const lightFitsFrames = frames.filter(
-        f => f.frame?.imagetyp === 'Light' && f.file.format === 'FITS'
+        f => f.frame?.imagetyp === 'Light' && (f.file.format === 'FITS' || f.file.format === 'XISF')
       );
 
       if (lightFitsFrames.length === 0) {
-        showAlert('No LIGHT Frames', 'No LIGHT FITS frames found for blink', 'warning');
+        showAlert('No LIGHT Frames', 'No LIGHT frames found for blink', 'warning');
         return;
       }
 

@@ -56,8 +56,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Get current frame
   const currentFrame = frames[currentIndex];
 
-  // Filter only FITS files (for now, XISF not supported in blink)
-  const fitsFrames = frames.filter((f) => f.file.format === "FITS");
+  // Filter FITS and XISF files (both supported by rustafits 0.2+)
+  const fitsFrames = frames.filter(
+    (f) => f.file.format === "FITS" || f.file.format === "XISF"
+  );
 
   // Load image from backend
   const loadImage = useCallback(

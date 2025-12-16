@@ -104,7 +104,11 @@ pub async fn read_fits_image_rustafits(
                                 .and_then(|m| m.modified().ok())
                                 .map(|t| chrono::DateTime::<chrono::Utc>::from(t))
                                 .unwrap_or_else(|| chrono::Utc::now()),
-                            format: crate::models::FileFormat::FITS,
+                            format: if path_buf.extension().map_or(false, |e| e.eq_ignore_ascii_case("xisf")) {
+                                crate::models::FileFormat::XISF
+                            } else {
+                                crate::models::FileFormat::FITS
+                            },
                             created_at: chrono::Utc::now(),
                             metadata_hash: None,
                             content_hash: None,
