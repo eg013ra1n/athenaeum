@@ -1,5 +1,5 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { Calendar, Camera, Aperture, ChevronDown, ChevronRight } from 'lucide-react';
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import { Calendar, Camera, Aperture, ChevronDown, ChevronRight, ChevronsDownUp } from 'lucide-react';
 import type {
   CalibrationHierarchyView,
   CalibrationDateGroup,
@@ -124,6 +124,35 @@ export function NavigationTree({
       return next;
     });
   }, []);
+
+  const isAllExpanded = useMemo(() => {
+    if (data.date_groups.length === 0) return false;
+    const allDatesExpanded = data.date_groups.every(dg => expandedDates.has(dg.date));
+    if (!allDatesExpanded) return false;
+    for (const dg of data.date_groups) {
+      for (const cg of dg.camera_groups) {
+        if (!expandedCameras.has(`${dg.date}:${cg.instrume}`)) return false;
+      }
+    }
+    return true;
+  }, [data.date_groups, expandedDates, expandedCameras]);
+
+  const toggleExpandAll = useCallback(() => {
+    if (isAllExpanded) {
+      setExpandedDates(new Set());
+      setExpandedCameras(new Set());
+    } else {
+      const allDateKeys = new Set(data.date_groups.map(dg => dg.date));
+      setExpandedDates(allDateKeys);
+      const allCameraKeys = new Set<string>();
+      data.date_groups.forEach(dg => {
+        dg.camera_groups.forEach(cg => {
+          allCameraKeys.add(`${dg.date}:${cg.instrume}`);
+        });
+      });
+      setExpandedCameras(allCameraKeys);
+    }
+  }, [isAllExpanded, data.date_groups]);
 
   const isSelected = useCallback(
     (type: 'date' | 'camera' | 'filter', dateKey: string, cameraKey?: string, filterKey?: string) => {
@@ -259,18 +288,27 @@ export function NavigationTree({
         <span className="text-xs text-gray-400">
           {data.date_groups.length} night{data.date_groups.length !== 1 ? 's' : ''} · {data.total_frames} frames
         </span>
-        {onToggleSelectionMode && (
+        <div className="flex items-center gap-1">
           <button
-            onClick={onToggleSelectionMode}
-            className={`text-xs px-2 py-0.5 rounded transition-colors ${
-              selectionMode
-                ? 'bg-blue-500/20 text-blue-400'
-                : 'text-gray-500 hover:text-gray-300 hover:bg-gray-700/50'
-            }`}
+            onClick={toggleExpandAll}
+            className="p-1 text-gray-500 hover:text-gray-300 hover:bg-gray-700/50 rounded transition-colors"
+            title={isAllExpanded ? "Collapse all" : "Expand all"}
           >
-            {selectionMode ? 'Done' : 'Select'}
+            <ChevronsDownUp size={14} className={isAllExpanded ? "rotate-180" : ""} />
           </button>
-        )}
+          {onToggleSelectionMode && (
+            <button
+              onClick={onToggleSelectionMode}
+              className={`text-xs px-2 py-0.5 rounded transition-colors ${
+                selectionMode
+                  ? 'bg-blue-500/20 text-blue-400'
+                  : 'text-gray-500 hover:text-gray-300 hover:bg-gray-700/50'
+              }`}
+            >
+              {selectionMode ? 'Done' : 'Select'}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Tree content */}
