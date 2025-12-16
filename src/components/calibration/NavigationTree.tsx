@@ -28,12 +28,16 @@ interface NavigationTreeProps {
   checkedFilters?: Set<string>;
   /** Callback when filter selection changes */
   onCheckedChange?: (checkedFilters: Set<string>) => void;
+  /** Whether selection mode is active (shows checkboxes) */
+  selectionMode?: boolean;
+  /** Callback to toggle selection mode */
+  onToggleSelectionMode?: () => void;
 }
 
 /**
- * Indeterminate checkbox component.
+ * Styled checkbox component with indeterminate support.
  */
-function IndeterminateCheckbox({
+function StyledCheckbox({
   checked,
   indeterminate,
   onChange,
@@ -41,7 +45,7 @@ function IndeterminateCheckbox({
   title,
 }: {
   checked: boolean;
-  indeterminate: boolean;
+  indeterminate?: boolean;
   onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   className?: string;
   title?: string;
@@ -50,7 +54,7 @@ function IndeterminateCheckbox({
 
   useEffect(() => {
     if (ref.current) {
-      ref.current.indeterminate = indeterminate;
+      ref.current.indeterminate = indeterminate ?? false;
     }
   }, [indeterminate]);
 
@@ -60,7 +64,14 @@ function IndeterminateCheckbox({
       type="checkbox"
       checked={checked}
       onChange={onChange}
-      className={`w-4 h-4 cursor-pointer accent-blue-500 ${className}`}
+      className={`
+        w-3.5 h-3.5 cursor-pointer rounded
+        border border-gray-500
+        bg-transparent
+        checked:bg-blue-500 checked:border-blue-500
+        focus:ring-1 focus:ring-blue-500 focus:ring-offset-0
+        ${className}
+      `}
       title={title}
       onClick={(e) => e.stopPropagation()}
     />
@@ -69,12 +80,11 @@ function IndeterminateCheckbox({
 
 /**
  * Navigation tree for calibration hierarchy.
- * Shows Night → Camera → Filter structure with accessible design:
- * - Checkboxes at all levels for selection
- * - Minimum 44px touch targets
- * - Clear focus indicators
- * - Keyboard navigation support
- * - ARIA tree roles
+ * VS Code-style compact design with:
+ * - Compact rows with minimal padding
+ * - Indent guide lines for hierarchy
+ * - Selection mode toggle for multi-select
+ * - ARIA tree roles for accessibility
  */
 export function NavigationTree({
   data,
@@ -84,6 +94,8 @@ export function NavigationTree({
   warningCounts,
   checkedFilters = new Set(),
   onCheckedChange,
+  selectionMode = false,
+  onToggleSelectionMode,
 }: NavigationTreeProps) {
   // Track expanded state for date and camera levels
   const [expandedDates, setExpandedDates] = useState<Set<string>>(new Set());
@@ -238,21 +250,31 @@ export function NavigationTree({
 
   return (
     <nav
-      className={`bg-gray-800 rounded-xl border border-gray-600 overflow-hidden flex flex-col ${className}`}
+      className={`bg-gray-800/50 rounded-lg border border-gray-700/50 overflow-hidden flex flex-col ${className}`}
       role="tree"
       aria-label="Calibration session navigation"
     >
-      {/* Header */}
-      <div className="px-4 py-3 border-b border-gray-600 bg-gray-850">
-        <h3 className="text-base font-semibold text-gray-100">Sessions</h3>
-        <p className="text-sm text-gray-400 mt-0.5">
-          {data.date_groups.length} night{data.date_groups.length !== 1 ? 's' : ''} &middot;{' '}
-          {data.total_frames} frame{data.total_frames !== 1 ? 's' : ''}
-        </p>
+      {/* Compact Header with Selection Toggle */}
+      <div className="px-2 py-1.5 border-b border-gray-700/50 flex items-center justify-between">
+        <span className="text-xs text-gray-400">
+          {data.date_groups.length} night{data.date_groups.length !== 1 ? 's' : ''} · {data.total_frames} frames
+        </span>
+        {onToggleSelectionMode && (
+          <button
+            onClick={onToggleSelectionMode}
+            className={`text-xs px-2 py-0.5 rounded transition-colors ${
+              selectionMode
+                ? 'bg-blue-500/20 text-blue-400'
+                : 'text-gray-500 hover:text-gray-300 hover:bg-gray-700/50'
+            }`}
+          >
+            {selectionMode ? 'Done' : 'Select'}
+          </button>
+        )}
       </div>
 
       {/* Tree content */}
-      <div className="flex-1 overflow-y-auto py-2">
+      <div className="flex-1 overflow-y-auto py-1">
         {data.date_groups.map((dateGroup) => {
           const dateKey = dateGroup.date;
           const isDateExpanded = expandedDates.has(dateKey);
@@ -262,18 +284,18 @@ export function NavigationTree({
 
           return (
             <div key={dateKey} role="treeitem" aria-expanded={isDateExpanded}>
-              {/* Date/Night level header */}
+              {/* Date/Night level - compact row */}
               <div
                 className={`
-                  w-full min-h-[52px] px-4 py-3
-                  flex items-center gap-3
+                  w-full py-1 px-2
+                  flex items-center gap-1.5
                   transition-colors
-                  hover:bg-gray-700
-                  ${isSelected('date', dateKey) ? 'bg-blue-900/30' : ''}
+                  hover:bg-gray-700/40
+                  ${isSelected('date', dateKey) ? 'bg-blue-500/15' : ''}
                 `}
               >
-                {onCheckedChange && (
-                  <IndeterminateCheckbox
+                {selectionMode && onCheckedChange && (
+                  <StyledCheckbox
                     checked={dateFullyChecked}
                     indeterminate={datePartiallyChecked}
                     onChange={() => toggleDateChecked(dateGroup)}
@@ -282,30 +304,28 @@ export function NavigationTree({
                 )}
                 <button
                   onClick={() => toggleDate(dateKey)}
-                  className="flex-1 flex items-center gap-3 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                  className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 rounded min-h-[26px]"
                   aria-label={`${dateGroup.date_display}, ${dateGroup.frame_count} frames${dateWarnings > 0 ? `, ${dateWarnings} warnings` : ''}`}
                 >
                   {isDateExpanded ? (
-                    <ChevronDown size={20} className="text-gray-400 flex-shrink-0" aria-hidden="true" />
+                    <ChevronDown size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
                   ) : (
-                    <ChevronRight size={20} className="text-gray-400 flex-shrink-0" aria-hidden="true" />
+                    <ChevronRight size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
                   )}
-                  <Calendar size={20} className="text-violet-400 flex-shrink-0" aria-hidden="true" />
-                  <div className="flex-1 min-w-0">
-                    <span className="text-base font-semibold text-gray-100 truncate block">
-                      {dateGroup.date_display}
-                    </span>
-                  </div>
+                  <Calendar size={14} className="text-violet-400 flex-shrink-0" aria-hidden="true" />
+                  <span className="flex-1 min-w-0 text-sm text-gray-200 truncate">
+                    {dateGroup.date_display}
+                  </span>
                   {dateWarnings > 0 && <WarningBadge count={dateWarnings} />}
-                  <span className="text-sm text-gray-400 flex-shrink-0">
+                  <span className="text-xs text-gray-500 flex-shrink-0 tabular-nums">
                     {dateGroup.frame_count}
                   </span>
                 </button>
               </div>
 
-              {/* Camera groups (nested) */}
+              {/* Camera groups (nested with indent guide) */}
               {isDateExpanded && (
-                <div role="group" className="ml-4">
+                <div role="group" className="ml-3 pl-2 border-l border-gray-700/50">
                   {dateGroup.camera_groups.map((cameraGroup) => {
                     const cameraKey = `${dateKey}:${cameraGroup.instrume}`;
                     const isCameraExpanded = expandedCameras.has(cameraKey);
@@ -315,18 +335,18 @@ export function NavigationTree({
 
                     return (
                       <div key={cameraKey} role="treeitem" aria-expanded={isCameraExpanded}>
-                        {/* Camera level header */}
+                        {/* Camera level - compact row */}
                         <div
                           className={`
-                            w-full min-h-[48px] px-4 py-2.5
-                            flex items-center gap-3
+                            w-full py-1 px-1
+                            flex items-center gap-1.5
                             transition-colors
-                            hover:bg-gray-700
-                            ${isSelected('camera', dateKey, cameraGroup.instrume) ? 'bg-blue-900/30' : ''}
+                            hover:bg-gray-700/40
+                            ${isSelected('camera', dateKey, cameraGroup.instrume) ? 'bg-blue-500/15' : ''}
                           `}
                         >
-                          {onCheckedChange && (
-                            <IndeterminateCheckbox
+                          {selectionMode && onCheckedChange && (
+                            <StyledCheckbox
                               checked={cameraFullyChecked}
                               indeterminate={cameraPartiallyChecked}
                               onChange={() => toggleCameraChecked(dateKey, cameraGroup)}
@@ -335,30 +355,28 @@ export function NavigationTree({
                           )}
                           <button
                             onClick={() => toggleCamera(cameraKey)}
-                            className="flex-1 flex items-center gap-3 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                            className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 rounded min-h-[24px]"
                             aria-label={`${cameraGroup.instrume}, ${cameraGroup.frame_count} frames${cameraWarnings > 0 ? `, ${cameraWarnings} warnings` : ''}`}
                           >
                             {isCameraExpanded ? (
-                              <ChevronDown size={18} className="text-gray-400 flex-shrink-0" aria-hidden="true" />
+                              <ChevronDown size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
                             ) : (
-                              <ChevronRight size={18} className="text-gray-400 flex-shrink-0" aria-hidden="true" />
+                              <ChevronRight size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
                             )}
-                            <Camera size={18} className="text-blue-400 flex-shrink-0" aria-hidden="true" />
-                            <div className="flex-1 min-w-0">
-                              <span className="text-sm font-medium text-gray-200 truncate block">
-                                {cameraGroup.instrume}
-                              </span>
-                            </div>
+                            <Camera size={14} className="text-blue-400 flex-shrink-0" aria-hidden="true" />
+                            <span className="flex-1 min-w-0 text-sm text-gray-300 truncate">
+                              {cameraGroup.instrume}
+                            </span>
                             {cameraWarnings > 0 && <WarningBadge count={cameraWarnings} />}
-                            <span className="text-sm text-gray-400 flex-shrink-0">
+                            <span className="text-xs text-gray-500 flex-shrink-0 tabular-nums">
                               {cameraGroup.frame_count}
                             </span>
                           </button>
                         </div>
 
-                        {/* Filter groups (leaf level - selectable) */}
+                        {/* Filter groups (leaf level with indent guide) */}
                         {isCameraExpanded && (
-                          <div role="group" className="ml-4">
+                          <div role="group" className="ml-3 pl-2 border-l border-gray-700/50">
                             {cameraGroup.filter_groups.map((filterGroup) => {
                               const filterKey = buildFilterKey(filterGroup);
                               const fullKey = `${dateKey}:${cameraGroup.instrume}:${filterKey}`;
@@ -370,26 +388,20 @@ export function NavigationTree({
                                 <div
                                   key={fullKey}
                                   className={`
-                                    w-full min-h-[44px] px-4 py-2
-                                    flex items-center gap-3
+                                    w-full py-1 px-1
+                                    flex items-center gap-1.5
                                     transition-colors
-                                    hover:bg-gray-700
-                                    ${isFilterSelected
-                                      ? 'bg-blue-600/30 ring-1 ring-blue-500/50 ring-inset'
-                                      : ''
-                                    }
+                                    hover:bg-gray-700/40
+                                    ${isFilterSelected ? 'bg-blue-500/20' : ''}
                                   `}
                                   role="treeitem"
                                   aria-selected={isFilterSelected}
                                 >
-                                  {onCheckedChange && (
-                                    <input
-                                      type="checkbox"
+                                  {selectionMode && onCheckedChange && (
+                                    <StyledCheckbox
                                       checked={isFilterChecked}
                                       onChange={() => toggleFilterChecked(fullKey)}
-                                      className="w-4 h-4 cursor-pointer accent-blue-500"
                                       title="Select this filter group"
-                                      onClick={(e) => e.stopPropagation()}
                                     />
                                   )}
                                   <button
@@ -400,17 +412,15 @@ export function NavigationTree({
                                       filterKey,
                                       data: filterGroup,
                                     })}
-                                    className="flex-1 flex items-center gap-3 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
+                                    className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 rounded min-h-[24px]"
                                     aria-label={`${filterGroup.filter_display}, ${filterGroup.frame_count} frames${filterWarnings > 0 ? `, ${filterWarnings} warnings` : ''}`}
                                   >
-                                    <Aperture size={16} className="text-cyan-400 flex-shrink-0" aria-hidden="true" />
-                                    <div className="flex-1 min-w-0">
-                                      <span className="text-sm text-gray-200 truncate block">
-                                        {filterGroup.filter_display}
-                                      </span>
-                                    </div>
+                                    <Aperture size={14} className="text-cyan-400 flex-shrink-0" aria-hidden="true" />
+                                    <span className="flex-1 min-w-0 text-sm text-gray-300 truncate">
+                                      {filterGroup.filter_display}
+                                    </span>
                                     {filterWarnings > 0 && <WarningBadge count={filterWarnings} />}
-                                    <span className="text-sm text-gray-400 flex-shrink-0">
+                                    <span className="text-xs text-gray-500 flex-shrink-0 tabular-nums">
                                       {filterGroup.frame_count}
                                     </span>
                                   </button>
@@ -430,8 +440,8 @@ export function NavigationTree({
 
         {/* Empty state */}
         {data.date_groups.length === 0 && (
-          <div className="px-4 py-8 text-center text-gray-400">
-            <p className="text-sm">No sessions found</p>
+          <div className="px-2 py-6 text-center text-gray-500">
+            <p className="text-xs">No sessions found</p>
           </div>
         )}
       </div>

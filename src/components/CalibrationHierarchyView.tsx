@@ -94,8 +94,19 @@ export function CalibrationHierarchyView({
   // Selection state for master-detail navigation
   const [selectedItem, setSelectedItem] = useState<SelectedItem | null>(null);
 
+  // Selection mode state (controls checkbox visibility)
+  const [selectionMode, setSelectionMode] = useState(false);
+
   // Checkbox selection state for filter groups (format: "dateKey:cameraKey:filterKey")
   const [checkedFilters, setCheckedFilters] = useState<Set<string>>(new Set());
+
+  // Toggle selection mode and clear selection when exiting
+  const toggleSelectionMode = useCallback(() => {
+    if (selectionMode) {
+      setCheckedFilters(new Set());
+    }
+    setSelectionMode(prev => !prev);
+  }, [selectionMode]);
 
   // Manual calibration modal state
   const [manualModalOpen, setManualModalOpen] = useState(false);
@@ -242,9 +253,11 @@ export function CalibrationHierarchyView({
             selectedItem={selectedItem}
             onSelect={setSelectedItem}
             warningCounts={warningCounts}
-            className="w-96 flex-shrink-0"
+            className="w-80 flex-shrink-0"
             checkedFilters={checkedFilters}
             onCheckedChange={setCheckedFilters}
+            selectionMode={selectionMode}
+            onToggleSelectionMode={toggleSelectionMode}
           />
 
           {/* Detail Panel - Right Panel */}
@@ -264,50 +277,63 @@ export function CalibrationHierarchyView({
         </div>
       )}
 
-      {/* Bottom Action Bar - visible when items are selected */}
-      {checkedFilters.size > 0 && (onSplit || onCreateCustomSet) && (
-        <div className="mt-4 bg-gray-800 rounded-xl p-4 border border-gray-600">
+      {/* Bottom Action Bar - visible when in selection mode with items selected */}
+      {selectionMode && checkedFilters.size > 0 && (onSplit || onCreateCustomSet) && (
+        <div className="mt-3 bg-gray-800/80 rounded-lg p-3 border border-gray-700/50">
           <div className="flex items-center justify-between">
             <div className="text-sm text-gray-300">
               <span className="font-medium text-gray-100">{checkedFilters.size}</span>{' '}
               filter group{checkedFilters.size !== 1 ? 's' : ''} selected
-              <span className="text-gray-400 ml-2">
+              <span className="text-gray-500 ml-2">
                 ({selectedFrameCount} frame{selectedFrameCount !== 1 ? 's' : ''})
               </span>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={toggleSelectionMode}
+                className="
+                  px-3 py-1.5
+                  text-gray-400 hover:text-gray-200
+                  text-sm
+                  rounded
+                  transition-colors
+                  focus:outline-none focus-visible:ring-1 focus-visible:ring-gray-500
+                "
+              >
+                Cancel
+              </button>
               {onSplit && (
                 <button
                   onClick={handleSplit}
                   className="
-                    inline-flex items-center gap-2
-                    min-h-[44px] px-4 py-2
+                    inline-flex items-center gap-1.5
+                    px-3 py-1.5
                     bg-blue-600 hover:bg-blue-700
-                    text-white text-sm font-medium
-                    rounded-lg
+                    text-white text-sm
+                    rounded
                     transition-colors
-                    focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
+                    focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500
                   "
                 >
-                  <Scissors size={18} aria-hidden="true" />
-                  Split Selected
+                  <Scissors size={14} aria-hidden="true" />
+                  Split
                 </button>
               )}
               {onCreateCustomSet && (
                 <button
                   onClick={handleCreateCustomSet}
                   className="
-                    inline-flex items-center gap-2
-                    min-h-[44px] px-4 py-2
+                    inline-flex items-center gap-1.5
+                    px-3 py-1.5
                     bg-green-600 hover:bg-green-700
-                    text-white text-sm font-medium
-                    rounded-lg
+                    text-white text-sm
+                    rounded
                     transition-colors
-                    focus:outline-none focus-visible:ring-2 focus-visible:ring-green-500
+                    focus:outline-none focus-visible:ring-1 focus-visible:ring-green-500
                   "
                 >
-                  <Plus size={18} aria-hidden="true" />
-                  Create Custom Set
+                  <Plus size={14} aria-hidden="true" />
+                  Create Set
                 </button>
               )}
             </div>
