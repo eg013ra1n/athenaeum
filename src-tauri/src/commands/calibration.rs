@@ -449,6 +449,11 @@ pub async fn get_flat_group_options_for_frame_set(
         .collect();
     filters.sort();
 
+    // Get focallen threshold from config
+    let focallen_threshold = config.lights.flat
+        .as_ref()
+        .and_then(|f| f.focallen.matching_threshold);
+
     // Detect flat groups for each filter
     let mut results = std::collections::HashMap::new();
 
@@ -460,6 +465,7 @@ pub async fn get_flat_group_options_for_frame_set(
             binning,
             gain,
             focal_length,
+            focallen_threshold,
             time_cluster_minutes,
             date_range,
         ).map_err(|e| format!("Failed to detect flat groups: {}", e))?;

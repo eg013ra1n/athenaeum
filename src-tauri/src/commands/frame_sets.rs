@@ -662,11 +662,17 @@ pub async fn split_frame_set(
                 }
             }
             crate::models::SplitSelection::Frames { ids } => {
-                // Remove specific frames from all sessions
+                // Remove specific frames from source frameset's sessions only
                 for frame_id in ids {
                     conn.execute(
-                        "DELETE FROM session_members WHERE frame_id = ?1",
-                        [frame_id],
+                        "DELETE FROM session_members
+                         WHERE frame_id = ?1
+                         AND session_id IN (
+                            SELECT s.id FROM sessions s
+                            JOIN imaging_nights n ON s.imaging_night_id = n.id
+                            WHERE n.frames_set_id = ?2
+                         )",
+                        rusqlite::params![frame_id, source_set_id],
                     ).map_err(|e| format!("Failed to remove frame: {}", e))?;
                 }
             }

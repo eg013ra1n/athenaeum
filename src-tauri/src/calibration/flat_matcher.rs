@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::Frame;
 use super::flat_groups::{FlatGroup, detect_flat_groups};
+use super::configurable_matcher::load_config;
 
 /// Represents a flat group with match score and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +123,14 @@ pub fn find_flat_groups_for_light_frame(
     let start_date = frame_date - chrono::Duration::days(max_age_days);
     let end_date = frame_date + chrono::Duration::days(max_age_days);
 
+    // Load config to get focallen threshold
+    let config = load_config(conn);
+    let focallen_threshold = config.lights.flat
+        .as_ref()
+        .and_then(|f| f.focallen.matching_threshold);
+
+    println!("  🔧 focallen_threshold from config: {:?}", focallen_threshold);
+
     // Detect flat groups matching parameters
     let flat_groups = detect_flat_groups(
         conn,
@@ -130,6 +139,7 @@ pub fn find_flat_groups_for_light_frame(
         binning,
         gain,
         focal_length,
+        focallen_threshold,
         time_cluster_minutes,
         Some((start_date, end_date)),
     ).map_err(|e| {

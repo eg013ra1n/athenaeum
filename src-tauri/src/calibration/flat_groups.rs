@@ -66,7 +66,8 @@ pub struct FlatGroup {
 /// * `filter` - Filter name (exact match, None for no filter)
 /// * `binning` - Binning pattern (exact match)
 /// * `gain` - Gain setting (exact match if Some)
-/// * `focal_length` - Focal length (exact match if Some)
+/// * `focal_length` - Focal length (range match if threshold provided, else exact)
+/// * `focallen_threshold` - Optional threshold for focal length matching (from config)
 /// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
 /// * `date_range` - Optional date range to limit search (start, end)
 ///
@@ -79,6 +80,7 @@ pub fn detect_flat_groups(
     binning: &str,
     gain: Option<f64>,
     focal_length: Option<f64>,
+    focallen_threshold: Option<f64>,
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<FlatGroup>> {
@@ -108,10 +110,23 @@ pub fn detect_flat_groups(
         query.push_str(&format!(" AND gain = ?{}", param_count));
     }
 
-    // Focal length parameter (exact match if provided)
+    // Focal length parameter (range match if threshold provided, else exact)
     if focal_length.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND focallen = ?{}", param_count));
+        if let Some(_threshold) = focallen_threshold {
+            // Range-based matching using threshold from config
+            param_count += 1;
+            let focal_param = param_count;
+            param_count += 1;
+            let threshold_param = param_count;
+            query.push_str(&format!(
+                " AND focallen IS NOT NULL AND ABS(focallen - ?{}) <= ?{}",
+                focal_param, threshold_param
+            ));
+        } else {
+            // Exact match (fallback)
+            param_count += 1;
+            query.push_str(&format!(" AND focallen = ?{}", param_count));
+        }
     }
 
     // Date range filter (optional)
@@ -126,8 +141,8 @@ pub fn detect_flat_groups(
 
     // Log the complete SQL query
     println!("    🔍 Executing SQL query:");
-    println!("       instrume={}, binning={}, filter={:?}, gain={:?}, focallen={:?}",
-        instrume, binning, filter, gain, focal_length);
+    println!("       instrume={}, binning={}, filter={:?}, gain={:?}, focallen={:?} (threshold={:?})",
+        instrume, binning, filter, gain, focal_length, focallen_threshold);
     if let Some((start, end)) = date_range {
         println!("       date_range: {} to {}", start, end);
     }
@@ -154,6 +169,10 @@ pub fn detect_flat_groups(
     if let Some(fl) = focal_length {
         stmt.raw_bind_parameter(param_idx, fl)?;
         param_idx += 1;
+        if let Some(threshold) = focallen_threshold {
+            stmt.raw_bind_parameter(param_idx, threshold)?;
+            param_idx += 1;
+        }
     }
 
     if let Some((start, end)) = date_range {
