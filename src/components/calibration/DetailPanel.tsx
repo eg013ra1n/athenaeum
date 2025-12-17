@@ -90,8 +90,8 @@ export function DetailPanel({
     filterGroup.flat_sets.length > 0 ||
     filterGroup.dark_sets.length > 0;
 
-  // Check if we have enough frames to blink (2+ LIGHT frames)
-  const canBlink = filterGroup.light_frames.length >= 2;
+  // Check if we have frames to view/blink (1+ LIGHT frames)
+  const canBlink = filterGroup.light_frames.length >= 1;
 
   return (
     <div
