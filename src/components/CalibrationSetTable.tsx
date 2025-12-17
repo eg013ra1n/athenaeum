@@ -373,6 +373,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false }: 
         <BlinkViewer
           frames={blinkFrames}
           onClose={() => setBlinkFrames(null)}
+          sourceType="calibration"
         />
       )}
     </div>

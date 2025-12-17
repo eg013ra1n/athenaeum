@@ -104,6 +104,7 @@ pub fn run() {
             commands::set_scan_root_duplicates_flag,
             commands::move_to_black_hole,
             commands::get_black_hole_files,
+            commands::get_blackholed_file_ids,
             commands::restore_from_black_hole,
             commands::send_to_void,
             commands::send_all_to_void,
