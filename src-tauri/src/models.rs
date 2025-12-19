@@ -55,6 +55,7 @@ pub struct Frame {
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
     pub override_: bool,
+    pub swcreate: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -551,5 +552,7 @@ pub struct LightFrameWithCalibration {
     pub telescop: Option<String>,
     pub focallen: Option<f64>,
     pub binning: Option<String>,
+    pub ccd_temp: Option<f64>,
+    pub swcreate: Option<String>,
     pub calibration_status: FrameCalibrationStatus,
 }

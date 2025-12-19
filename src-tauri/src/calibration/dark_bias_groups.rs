@@ -381,6 +381,7 @@ fn execute_dark_query(
             objctra: row.get(12)?,
             objctdec: row.get(13)?,
             override_: false,
+            swcreate: None,
         };
 
         frames.push(frame);
@@ -481,6 +482,7 @@ fn execute_bias_query(
             objctra: row.get(12)?,
             objctdec: row.get(13)?,
             override_: false,
+            swcreate: None,
         };
 
         frames.push(frame);

@@ -1003,7 +1003,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
             f.telescop,
             f.focallen,
             f.binning,
-            DATE(f.date_obs) as session_date
+            DATE(f.date_obs) as session_date,
+            f.ccd_temp,
+            f.swcreate
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          JOIN session_members sm ON f.id = sm.frame_id
@@ -1026,6 +1028,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
         focallen: Option<f64>,
         binning: Option<String>,
         session_date: Option<String>,
+        ccd_temp: Option<f64>,
+        swcreate: Option<String>,
     }
 
     let frames: Vec<RawFrame> = stmt
@@ -1042,6 +1046,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                 focallen: row.get(8)?,
                 binning: row.get(9)?,
                 session_date: row.get(10)?,
+                ccd_temp: row.get(11)?,
+                swcreate: row.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -1202,6 +1208,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                             telescop: raw_frame.telescop.clone(),
                             focallen: raw_frame.focallen,
                             binning: raw_frame.binning.clone(),
+                            ccd_temp: raw_frame.ccd_temp,
+                            swcreate: raw_frame.swcreate.clone(),
                             calibration_status: status,
                         });
                     }

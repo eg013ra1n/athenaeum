@@ -256,6 +256,7 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let ccd_temp = read_keyword_f64(&mut fitsfile, &hdu, "CCD-TEMP").ok();
     let set_temp = read_keyword_f64(&mut fitsfile, &hdu, "SET-TEMP").ok();
     let focallen = read_keyword_f64(&mut fitsfile, &hdu, "FOCALLEN").ok();
+    let swcreate = read_keyword_string(&mut fitsfile, &hdu, "SWCREATE").ok();
 
     // Pixel size
     let xpixsz = read_keyword_f64(&mut fitsfile, &hdu, "XPIXSZ").ok();
@@ -361,6 +362,7 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         objctra,
         objctdec,
         override_: false,
+        swcreate,
     })
 }
 
@@ -473,6 +475,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         .and_then(|s| s.parse::<f64>().ok());
     let focallen = fits_keywords.get("FOCALLEN")
         .and_then(|s| s.parse::<f64>().ok());
+    let swcreate = fits_keywords.get("SWCREATE").cloned();
     let xpixsz = fits_keywords.get("XPIXSZ")
         .and_then(|s| s.parse::<f64>().ok());
     let ypixsz = fits_keywords.get("YPIXSZ")
@@ -581,6 +584,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         objctra,
         objctdec,
         override_: false,
+        swcreate,
     })
 }
 

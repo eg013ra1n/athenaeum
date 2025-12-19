@@ -240,6 +240,7 @@ pub fn detect_flat_groups(
             objctra: row.get(12)?,
             objctdec: row.get(13)?,
             override_: false,
+            swcreate: None,
         };
 
         frames.push(frame);

@@ -103,6 +103,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
                 imagetyp_str.and_then(|s| ImageType::from_str(&s))
             },
             is_master: row.get::<_, i32>(30)? != 0,
+            swcreate: None,
         })
     })?;
 
