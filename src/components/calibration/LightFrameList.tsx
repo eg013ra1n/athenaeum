@@ -299,7 +299,7 @@ export function LightFrameList({ frames, defaultExpanded = false }: LightFrameLi
                         {frame.binning ?? '-'}
                       </td>
                       <td className="px-4 py-3">
-                        <StatusIndicator status={frame.calibration_status} />
+                        <StatusIndicator status={frame.calibration_status} compact />
                       </td>
                     </tr>
 

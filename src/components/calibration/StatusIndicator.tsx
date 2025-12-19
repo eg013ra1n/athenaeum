@@ -58,19 +58,19 @@ export function StatusIndicator({ status, compact = false }: StatusIndicatorProp
 
   if (compact) {
     return (
-      <div className="flex items-center gap-1.5" role="group" aria-label="Calibration status">
+      <div className="flex items-center gap-1" role="group" aria-label="Calibration status">
         {items.map(({ key, has, warning, label }) => (
           <span
             key={key}
             className={`
               inline-flex items-center justify-center
-              w-7 h-7 rounded-md border
+              w-6 h-6 rounded text-xs font-bold
               ${getStatusStyles(has, warning)}
             `}
             title={getStatusLabel(has, warning, label)}
             aria-label={getStatusLabel(has, warning, label)}
           >
-            {getStatusIcon(has, warning)}
+            {label[0]}
           </span>
         ))}
       </div>
