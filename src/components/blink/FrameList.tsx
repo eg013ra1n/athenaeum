@@ -48,7 +48,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
       </div>
 
       {/* Scrollable frame list */}
-      <div className="flex-1 overflow-y-auto p-2">
+      <div className="flex-1 overflow-y-auto p-2 select-none">
         <div className="space-y-1">
           {frames.map((frame, index) => {
             const isSelected = selectedFrames.has(index);

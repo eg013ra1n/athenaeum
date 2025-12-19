@@ -346,13 +346,24 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
   const handleCheckboxClick = useCallback((index: number, e: React.MouseEvent) => {
     e.stopPropagation();
-    setSelectedFrames((prev) => {
-      const newSet = new Set(prev);
-      newSet.has(index) ? newSet.delete(index) : newSet.add(index);
-      return newSet;
-    });
+    if (e.shiftKey && lastSelectedIndex !== null) {
+      // Range selection with shift+click
+      const [start, end] = [Math.min(lastSelectedIndex, index), Math.max(lastSelectedIndex, index)];
+      setSelectedFrames((prev) => {
+        const newSet = new Set(prev);
+        for (let i = start; i <= end; i++) newSet.add(i);
+        return newSet;
+      });
+    } else {
+      // Toggle single item
+      setSelectedFrames((prev) => {
+        const newSet = new Set(prev);
+        newSet.has(index) ? newSet.delete(index) : newSet.add(index);
+        return newSet;
+      });
+    }
     setLastSelectedIndex(index);
-  }, []);
+  }, [lastSelectedIndex]);
 
   const handleSelectAll = useCallback(() => {
     setSelectedFrames(new Set(fitsFrames.map((_, i) => i)));
