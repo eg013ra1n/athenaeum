@@ -97,9 +97,31 @@ export function NavigationTree({
   selectionMode = false,
   onToggleSelectionMode,
 }: NavigationTreeProps) {
-  // Track expanded state for date and camera levels
-  const [expandedDates, setExpandedDates] = useState<Set<string>>(new Set());
-  const [expandedCameras, setExpandedCameras] = useState<Set<string>>(new Set());
+  // Track expanded state for date and camera levels - expanded by default
+  const [expandedDates, setExpandedDates] = useState<Set<string>>(() => {
+    return new Set(data.date_groups.map(dg => dg.date));
+  });
+  const [expandedCameras, setExpandedCameras] = useState<Set<string>>(() => {
+    const keys = new Set<string>();
+    data.date_groups.forEach(dg => {
+      dg.camera_groups.forEach(cg => {
+        keys.add(`${dg.date}:${cg.instrume}`);
+      });
+    });
+    return keys;
+  });
+
+  // Expand all when data changes (e.g., navigating to different frame set)
+  useEffect(() => {
+    setExpandedDates(new Set(data.date_groups.map(dg => dg.date)));
+    const cameraKeys = new Set<string>();
+    data.date_groups.forEach(dg => {
+      dg.camera_groups.forEach(cg => {
+        cameraKeys.add(`${dg.date}:${cg.instrume}`);
+      });
+    });
+    setExpandedCameras(cameraKeys);
+  }, [data]);
 
   const toggleDate = useCallback((dateKey: string) => {
     setExpandedDates(prev => {
