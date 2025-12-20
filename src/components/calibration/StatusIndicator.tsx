@@ -58,7 +58,7 @@ export function StatusIndicator({ status, compact = false }: StatusIndicatorProp
 
   if (compact) {
     return (
-      <div className="flex items-center gap-1" role="group" aria-label="Calibration status">
+      <div className="flex items-center justify-center gap-1" role="group" aria-label="Calibration status">
         {items.map(({ key, has, warning, label }) => (
           <span
             key={key}

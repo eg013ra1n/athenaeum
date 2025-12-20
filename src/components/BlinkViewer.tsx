@@ -435,11 +435,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       });
       setSelectedFrames(new Set());
       setLastSelectedIndex(null);
+      onFramesRemoved?.(restored);
     }
 
     if (errors.length > 0) setBlackholeError(`Restore errors: ${errors[0]}`);
     setIsBlackholing(false);
-  }, [selectedFrames, fitsFrames, blackholedFileIds]);
+  }, [selectedFrames, fitsFrames, blackholedFileIds, onFramesRemoved]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black flex flex-col">

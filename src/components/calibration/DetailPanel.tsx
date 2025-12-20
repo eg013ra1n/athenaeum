@@ -1,3 +1,5 @@
+import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { Settings, Eye } from 'lucide-react';
 import type { CalibrationFilterGroup, LightFrameWithCalibration } from '../../types/models';
 import type { SelectedItem } from './NavigationTree';
@@ -69,6 +71,31 @@ export function DetailPanel({
   onBlink,
   className = '',
 }: DetailPanelProps) {
+  const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
+
+  // Fetch blackholed file IDs when filter group changes
+  useEffect(() => {
+    if (!selectedItem || selectedItem.type !== 'filter') {
+      setBlackholedFileIds(new Set());
+      return;
+    }
+
+    const filterGroup = selectedItem.data as CalibrationFilterGroup;
+    const fileIds = filterGroup.light_frames.map(f => f.file_id);
+
+    if (fileIds.length === 0) {
+      setBlackholedFileIds(new Set());
+      return;
+    }
+
+    invoke<number[]>('get_blackholed_file_ids', { fileIds })
+      .then(blackholed => setBlackholedFileIds(new Set(blackholed)))
+      .catch(err => {
+        console.error('Failed to fetch blackholed file IDs:', err);
+        setBlackholedFileIds(new Set());
+      });
+  }, [selectedItem]);
+
   // Empty state when nothing selected
   if (!selectedItem || selectedItem.type !== 'filter') {
     return (
@@ -198,7 +225,7 @@ export function DetailPanel({
         </section>
 
         {/* Light Frames Section */}
-        <LightFrameList frames={filterGroup.light_frames} />
+        <LightFrameList frames={filterGroup.light_frames} blackholedFileIds={blackholedFileIds} />
       </div>
     </div>
   );

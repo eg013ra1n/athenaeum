@@ -623,6 +623,7 @@ export interface CalibrationFilterGroup {
 /** A light frame with its calibration status */
 export interface LightFrameWithCalibration {
   frame_id: number;
+  file_id: number;
   filename: string;
   file_path: string;
   date_obs: string | null;
@@ -632,5 +633,7 @@ export interface LightFrameWithCalibration {
   binning: string | null;
   ccd_temp: number | null;
   swcreate: string | null;
+  gain: number | null;
+  offset: number | null;
   calibration_status: FrameCalibrationStatus;
 }

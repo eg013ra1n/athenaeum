@@ -545,6 +545,7 @@ pub struct CalibrationFilterGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightFrameWithCalibration {
     pub frame_id: i64,
+    pub file_id: i64,
     pub filename: String,
     pub file_path: String,
     pub date_obs: Option<String>,
@@ -554,5 +555,7 @@ pub struct LightFrameWithCalibration {
     pub binning: Option<String>,
     pub ccd_temp: Option<f64>,
     pub swcreate: Option<String>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
     pub calibration_status: FrameCalibrationStatus,
 }

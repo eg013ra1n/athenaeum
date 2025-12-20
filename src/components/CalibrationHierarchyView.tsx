@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Scissors, Plus } from 'lucide-react';
 import type {
@@ -93,6 +93,38 @@ export function CalibrationHierarchyView({
 }: CalibrationHierarchyViewProps) {
   // Selection state for master-detail navigation
   const [selectedItem, setSelectedItem] = useState<SelectedItem | null>(null);
+
+  // Sync selectedItem with refreshed data to get updated calibration status
+  useEffect(() => {
+    if (!selectedItem || selectedItem.type !== 'filter') return;
+
+    const oldFilterGroup = selectedItem.data as CalibrationFilterGroup;
+    const oldFilterKey = buildFilterKey(oldFilterGroup);
+
+    // Find the corresponding filter group in the new data
+    for (const dateGroup of data.date_groups) {
+      if (dateGroup.date !== selectedItem.dateKey) continue;
+
+      for (const cameraGroup of dateGroup.camera_groups) {
+        if (cameraGroup.instrume !== selectedItem.cameraKey) continue;
+
+        for (const filterGroup of cameraGroup.filter_groups) {
+          const filterKey = buildFilterKey(filterGroup);
+          if (filterKey === oldFilterKey) {
+            // Update selectedItem with fresh data
+            setSelectedItem({
+              type: 'filter',
+              dateKey: dateGroup.date,
+              cameraKey: cameraGroup.instrume,
+              filterKey,
+              data: filterGroup,
+            });
+            return;
+          }
+        }
+      }
+    }
+  }, [data]);
 
   // Selection mode state (controls checkbox visibility)
   const [selectionMode, setSelectionMode] = useState(false);

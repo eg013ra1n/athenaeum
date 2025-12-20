@@ -994,6 +994,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
     let mut stmt = conn.prepare(
         "SELECT
             f.id,
+            f.file_id,
             f.date_obs,
             f.instrume,
             f.filter,
@@ -1005,7 +1006,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
             f.binning,
             DATE(f.date_obs) as session_date,
             f.ccd_temp,
-            f.swcreate
+            f.swcreate,
+            f.gain,
+            f.offset
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          JOIN session_members sm ON f.id = sm.frame_id
@@ -1018,6 +1021,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
     // Collect raw frame data
     struct RawFrame {
         id: i64,
+        file_id: i64,
         date_obs: Option<String>,
         instrume: Option<String>,
         filter: Option<String>,
@@ -1030,24 +1034,29 @@ pub fn get_calibration_hierarchy_for_frame_set(
         session_date: Option<String>,
         ccd_temp: Option<f64>,
         swcreate: Option<String>,
+        gain: Option<f64>,
+        offset: Option<f64>,
     }
 
     let frames: Vec<RawFrame> = stmt
         .query_map([frame_set_id], |row| {
             Ok(RawFrame {
                 id: row.get(0)?,
-                date_obs: row.get(1)?,
-                instrume: row.get(2)?,
-                filter: row.get(3)?,
-                exptime: row.get(4)?,
-                filename: row.get(5)?,
-                file_path: row.get(6)?,
-                telescop: row.get(7)?,
-                focallen: row.get(8)?,
-                binning: row.get(9)?,
-                session_date: row.get(10)?,
-                ccd_temp: row.get(11)?,
-                swcreate: row.get(12)?,
+                file_id: row.get(1)?,
+                date_obs: row.get(2)?,
+                instrume: row.get(3)?,
+                filter: row.get(4)?,
+                exptime: row.get(5)?,
+                filename: row.get(6)?,
+                file_path: row.get(7)?,
+                telescop: row.get(8)?,
+                focallen: row.get(9)?,
+                binning: row.get(10)?,
+                session_date: row.get(11)?,
+                ccd_temp: row.get(12)?,
+                swcreate: row.get(13)?,
+                gain: row.get(14)?,
+                offset: row.get(15)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -1201,6 +1210,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
 
                         light_frames.push(LightFrameWithCalibration {
                             frame_id: raw_frame.id,
+                            file_id: raw_frame.file_id,
                             filename: raw_frame.filename.clone(),
                             file_path: raw_frame.file_path.clone(),
                             date_obs: raw_frame.date_obs.clone(),
@@ -1210,6 +1220,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                             binning: raw_frame.binning.clone(),
                             ccd_temp: raw_frame.ccd_temp,
                             swcreate: raw_frame.swcreate.clone(),
+                            gain: raw_frame.gain,
+                            offset: raw_frame.offset,
                             calibration_status: status,
                         });
                     }

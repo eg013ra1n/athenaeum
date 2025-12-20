@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, Clock, MapPin, AlertCircle, Scissors } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
@@ -12,6 +12,7 @@ import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '.
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const [detail, setDetail] = useState<FrameSetDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -52,10 +53,10 @@ export default function FrameSetDetail() {
   // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
   const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
 
-  // Load both detail and calibration data on mount
+  // Load both detail and calibration data on mount and when navigating back
   useEffect(() => {
     loadData();
-  }, [id]);
+  }, [id, location.key]);
 
   const loadData = async () => {
     if (!id) return;
