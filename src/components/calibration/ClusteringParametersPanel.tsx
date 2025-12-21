@@ -24,7 +24,11 @@ export default function ClusteringParametersPanel({
   onScoringUpdate,
 }: ClusteringParametersPanelProps) {
   const getClusteringConfig = (type: string): ClusteringConfig => {
-    return clustering[type] || { max_age_days: 30, time_cluster_minutes: 30, temp_threshold_celsius: 2.0 };
+    // Defaults: flat = 30 days max age, 30 min cluster; dark/bias/darkflat = 365 days max age, 30 days cluster
+    const isFlat = type === "flat";
+    const defaultMaxAge = isFlat ? 30 : 365;
+    const defaultTimeCluster = isFlat ? 30 : 43200; // 30 min for flat, 30 days (43200 min) for others
+    return clustering[type] || { max_age_days: defaultMaxAge, time_cluster_minutes: defaultTimeCluster, temp_threshold_celsius: 2.0 };
   };
 
   return (

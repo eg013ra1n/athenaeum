@@ -489,7 +489,24 @@ fn apply_master_preference(
     }
 }
 
+/// Get default fallback chain for a source type
+fn get_default_fallback_chain(source_type: &str, include_bias: bool) -> Vec<String> {
+    match source_type {
+        "flats" => {
+            if include_bias {
+                vec!["darkflat".to_string(), "dark".to_string(), "bias".to_string()]
+            } else {
+                vec!["darkflat".to_string(), "dark".to_string()]
+            }
+        }
+        "lights" => vec!["dark".to_string()], // Lights don't have fallback to bias
+        "darks" => vec!["bias".to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// Find calibration with fallback chain (for Flats: DarkFlat → Dark → Bias)
+/// Respects the use_bias_if_no_darks setting for flats
 pub fn find_calibration_with_fallback(
     conn: &Connection,
     frame: &Frame,
@@ -498,16 +515,27 @@ pub fn find_calibration_with_fallback(
 ) -> Result<Vec<CalibrationCandidate>> {
     // Get behavioral options for the source type
     let fallback_chain = match config.get_behavioral_options(source_type) {
-        Some(opts) if !opts.fallback_chain.is_empty() => opts.fallback_chain.clone(),
-        _ => {
-            // Default fallback chains
-            match source_type {
-                "flats" => vec!["darkflat".to_string(), "dark".to_string(), "bias".to_string()],
-                "lights" => vec!["dark".to_string()], // Lights don't have fallback to bias
-                "darks" => vec!["bias".to_string()],
-                _ => Vec::new(),
+        Some(opts) => {
+            // For flats: respect use_bias_if_no_darks setting
+            if source_type == "flats" {
+                if opts.use_bias_if_no_darks {
+                    // Include bias in fallback chain
+                    if !opts.fallback_chain.is_empty() {
+                        opts.fallback_chain.clone()
+                    } else {
+                        get_default_fallback_chain(source_type, true)
+                    }
+                } else {
+                    // Exclude bias from fallback chain
+                    get_default_fallback_chain(source_type, false)
+                }
+            } else if !opts.fallback_chain.is_empty() {
+                opts.fallback_chain.clone()
+            } else {
+                get_default_fallback_chain(source_type, true)
             }
         }
+        _ => get_default_fallback_chain(source_type, true),
     };
 
     // Try each calibration type in the fallback chain

@@ -1302,3 +1302,109 @@ fn query_frame_ids_by_type(
 
     Ok(ids)
 }
+
+// ========== Cleanup Commands ==========
+
+/// Result of cleanup operation
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubCalibrationCleanupResult {
+    pub sets_cleaned: usize,
+    pub details: Vec<String>,
+}
+
+/// Clean up duplicate sub-calibration links for flat calibration sets
+/// This removes Bias links when a Dark link exists (respecting fallback chain priority)
+#[tauri::command]
+pub async fn cleanup_duplicate_flat_subcalibrations(
+    state: State<'_, AppState>,
+) -> Result<SubCalibrationCleanupResult, String> {
+    use crate::calibration::configurable_matcher::load_config;
+    use rusqlite::params;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Load config to determine fallback priority
+    let config = load_config(&conn);
+    let use_bias = config.get_behavioral_options("flats")
+        .map(|opts| opts.use_bias_if_no_darks)
+        .unwrap_or(false);
+
+    println!("🧹 Starting sub-calibration cleanup (use_bias_if_no_darks={})", use_bias);
+
+    // Find calibration sets with multiple sub-calibrations
+    let mut stmt = conn.prepare(
+        "SELECT source_id, GROUP_CONCAT(calibration_type) as types
+         FROM calibration_set_to_frames
+         WHERE source_type = 'calibration_set'
+         GROUP BY source_id
+         HAVING COUNT(*) > 1"
+    ).map_err(|e| e.to_string())?;
+
+    let duplicates: Vec<(i64, String)> = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    }).map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+
+    println!("  Found {} calibration sets with multiple sub-calibrations", duplicates.len());
+
+    let mut cleaned = 0;
+    let mut details: Vec<String> = Vec::new();
+
+    for (source_id, types) in duplicates {
+        // Priority: DarkFlat > Dark > Bias
+        let has_darkflat = types.contains("DarkFlat");
+        let has_dark = types.contains("Dark");
+        let has_bias = types.contains("Bias");
+
+        // Determine which to keep based on priority
+        let keep_type = if has_darkflat {
+            "DarkFlat"
+        } else if has_dark {
+            "Dark"
+        } else if has_bias && use_bias {
+            "Bias"
+        } else {
+            continue; // Skip if nothing to keep
+        };
+
+        // Count what we're deleting
+        let types_to_delete: Vec<&str> = ["DarkFlat", "Dark", "Bias"]
+            .iter()
+            .filter(|t| **t != keep_type && types.contains(*t))
+            .copied()
+            .collect();
+
+        if types_to_delete.is_empty() {
+            continue;
+        }
+
+        // Delete all except the one we're keeping
+        let deleted = conn.execute(
+            "DELETE FROM calibration_set_to_frames
+             WHERE source_id = ?1 AND source_type = 'calibration_set' AND calibration_type != ?2",
+            params![source_id, keep_type],
+        ).map_err(|e| e.to_string())?;
+
+        if deleted > 0 {
+            let detail = format!(
+                "Set #{}: kept {}, removed {} ({})",
+                source_id,
+                keep_type,
+                types_to_delete.len(),
+                types_to_delete.join(", ")
+            );
+            println!("  ✅ {}", detail);
+            details.push(detail);
+            cleaned += 1;
+        }
+    }
+
+    println!("🎉 Cleanup complete - cleaned {} sets", cleaned);
+
+    Ok(SubCalibrationCleanupResult {
+        sets_cleaned: cleaned,
+        details,
+    })
+}

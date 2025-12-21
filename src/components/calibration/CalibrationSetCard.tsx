@@ -106,7 +106,12 @@ function SubCalibrationCard({ sub }: { sub: SubCalibrationDetail }) {
       className={`border rounded-lg p-2 ${subTypeStyles[sub.calibration_type] || 'bg-gray-800/30 border-gray-700/40'}`}
     >
       <div className="flex items-center justify-between mb-1">
-        <span className="text-xs font-semibold text-gray-200">{sub.calibration_type}</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs font-semibold text-gray-200">{sub.calibration_type}</span>
+          {sub.set.id !== null && (
+            <span className="text-xs text-gray-500">#{sub.set.id}</span>
+          )}
+        </div>
         <span className="text-xs text-gray-400">{sub.set.frame_count} frames</span>
       </div>
 
@@ -156,9 +161,14 @@ export function CalibrationSetCard({ type, data }: CalibrationSetCardProps) {
     >
       {/* Header */}
       <header className="flex items-center justify-between mb-2">
-        <h4 className={`text-base font-semibold ${styles.header}`}>
-          {getCardTitle(type, set)}
-        </h4>
+        <div className="flex items-center gap-2">
+          <h4 className={`text-base font-semibold ${styles.header}`}>
+            {getCardTitle(type, set)}
+          </h4>
+          {set.id !== null && (
+            <span className="text-xs text-gray-500">#{set.id}</span>
+          )}
+        </div>
         <span className="text-xs text-gray-300">
           {frame_count} light{frame_count !== 1 ? 's' : ''}
         </span>

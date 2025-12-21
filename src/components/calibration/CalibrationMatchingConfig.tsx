@@ -142,7 +142,7 @@ export default function CalibrationMatchingConfig() {
       if (!newBehavioralOptions[sourceType]) {
         newBehavioralOptions[sourceType] = {
           use_bias_for_dark_optimization: false,
-          use_bias_if_no_darks: false,
+          use_bias_if_no_darks: true,
           fallback_chain: [],
         };
       }
@@ -171,9 +171,13 @@ export default function CalibrationMatchingConfig() {
 
       const newClustering = { ...prev.clustering };
       if (!newClustering[calibrationType]) {
+        // Defaults: flat = 30 days max age, 30 min cluster; dark/bias/darkflat = 365 days max age, 30 days cluster
+        const isFlat = calibrationType === "flat";
+        const defaultMaxAge = isFlat ? 30 : 365;
+        const defaultTimeCluster = isFlat ? 30 : 43200; // 30 min for flat, 30 days (43200 min) for others
         newClustering[calibrationType] = {
-          max_age_days: 30,
-          time_cluster_minutes: 30,
+          max_age_days: defaultMaxAge,
+          time_cluster_minutes: defaultTimeCluster,
           temp_threshold_celsius: 2.0,
         };
       }

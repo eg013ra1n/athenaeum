@@ -20,7 +20,7 @@ export default function BehavioralOptionsPanel({
 
   const safeOptions: BehavioralOptions = options || {
     use_bias_for_dark_optimization: false,
-    use_bias_if_no_darks: false,
+    use_bias_if_no_darks: true,
     fallback_chain: [],
   };
 

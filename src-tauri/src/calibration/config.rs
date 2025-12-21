@@ -457,6 +457,7 @@ impl Default for CalibrationMatchingConfig {
 
         let mut flats_opts = BehavioralOptions::default();
         flats_opts.use_bias_for_dark_optimization = true;
+        flats_opts.use_bias_if_no_darks = true; // Default to true for backwards compatibility
         flats_opts.fallback_chain = vec!["darkflat".to_string(), "dark".to_string(), "bias".to_string()];
         config.behavioral_options.insert("flats".to_string(), flats_opts);
 
@@ -471,10 +472,24 @@ impl Default for CalibrationMatchingConfig {
         config.master_preferences.insert("darkflat".to_string(), MasterPreference::NoPreference);
 
         // Clustering defaults
+        // Flat: 30 days max age, 30 minutes time cluster (session-based)
         config.clustering.insert("flat".to_string(), ClusteringConfig::default());
-        config.clustering.insert("dark".to_string(), ClusteringConfig::default());
-        config.clustering.insert("bias".to_string(), ClusteringConfig::default());
-        config.clustering.insert("darkflat".to_string(), ClusteringConfig::default());
+        // Dark/Bias/DarkFlat: 365 days max age, 30 days time cluster (1440 min/day * 30 = 43200)
+        config.clustering.insert("dark".to_string(), ClusteringConfig {
+            max_age_days: 365,
+            time_cluster_minutes: 43200, // 30 days
+            ..ClusteringConfig::default()
+        });
+        config.clustering.insert("bias".to_string(), ClusteringConfig {
+            max_age_days: 365,
+            time_cluster_minutes: 43200, // 30 days
+            ..ClusteringConfig::default()
+        });
+        config.clustering.insert("darkflat".to_string(), ClusteringConfig {
+            max_age_days: 365,
+            time_cluster_minutes: 43200, // 30 days
+            ..ClusteringConfig::default()
+        });
 
         config
     }
