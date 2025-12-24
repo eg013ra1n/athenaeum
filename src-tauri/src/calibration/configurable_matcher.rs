@@ -421,8 +421,9 @@ fn check_date_warning_days(date_diff: Option<i64>, calibration_type: &str, confi
     }
 }
 
-/// Score a calibration match
-fn score_match(
+/// Score a calibration match based on date proximity, temperature, and exposure time.
+/// Returns a score from 0.0 to 1.0 where 1.0 is a perfect match.
+pub fn score_match(
     date_diff_days: Option<i64>,
     temp_diff: Option<f64>,
     exptime_diff: Option<f64>,

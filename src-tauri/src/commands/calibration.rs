@@ -1519,6 +1519,9 @@ pub async fn get_subcalibration_sets_for_manual_selection(
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
+    // Load calibration matching config for scoring
+    let config = crate::calibration::configurable_matcher::load_config(&conn);
+
     // Get the source calibration set to use as reference
     let mut stmt = conn.prepare(
         "SELECT instrume, binning, gain, offset, exptime, filter, ccd_temp, date_start, date_end
@@ -1615,14 +1618,21 @@ pub async fn get_subcalibration_sets_for_manual_selection(
         })
         .collect();
 
-    // Calculate match score for each set (use "dark" type logic for all sub-calibrations)
-    // Sub-calibration matching: instrume, binning, gain, offset must match
-    // For dark/darkflat: exptime must also match the source set's exptime
+    // Calculate match score for each set using shared scoring logic
+    // Sub-calibration matching: instrume, binning, gain, offset must match exactly
+    // Scoring considers date proximity, temperature proximity, and exposure time proximity
     let mut scored_sets: Vec<CalibrationSetWithScore> = Vec::new();
 
     for set in sets {
         let match_details = calculate_subcal_match_details(&params, &set, &calibration_type);
-        let match_score = calculate_subcal_match_score(&match_details, &calibration_type);
+
+        // Calculate exposure time difference for scoring
+        let exptime_diff = match (params.avg_exptime, set.exptime) {
+            (Some(p), Some(s)) => Some((p - s).abs()),
+            _ => None,
+        };
+
+        let match_score = calculate_subcal_match_score(&match_details, &calibration_type, exptime_diff, &config.scoring);
 
         // Skip non-matching sets unless show_all is true
         if !show_all && match_score < 0.1 {
@@ -1672,13 +1682,14 @@ fn calculate_subcal_match_details(
         _ => false,
     };
 
-    // For Dark/DarkFlat sub-calibration of Flats, we need to match exposure time
+    // For Dark/DarkFlat sub-calibration of Flats, exposure time should be reasonably close
+    // Use 5 second tolerance (same as default matching_threshold in config)
     // Bias doesn't need exptime match
     let exptime_match = if calibration_type.to_lowercase() == "bias" {
         true
     } else {
         match (params.avg_exptime, set.exptime) {
-            (Some(p), Some(s)) => (p - s).abs() < 0.1,
+            (Some(p), Some(s)) => (p - s).abs() <= 5.0,
             (None, None) => true,
             _ => false,
         }
@@ -1706,51 +1717,28 @@ fn calculate_subcal_match_details(
     }
 }
 
-/// Calculate match score for sub-calibration
-fn calculate_subcal_match_score(details: &MatchDetails, calibration_type: &str) -> f64 {
-    let mut score: f64 = 1.0;
-    let cal_type_lower = calibration_type.to_lowercase();
-
-    // Critical parameters
-    if !details.instrume_match {
-        score -= 0.5;
-    }
-    if !details.binning_match {
-        score -= 0.3;
-    }
-    if !details.gain_match {
-        score -= 0.2;
-    }
-    if !details.offset_match {
-        score -= 0.2;
+/// Calculate match score for sub-calibration using the shared scoring function.
+/// Critical parameters (instrume, binning, gain, offset) must match exactly for any score > 0.
+fn calculate_subcal_match_score(
+    details: &MatchDetails,
+    _calibration_type: &str,
+    exptime_diff: Option<f64>,
+    scoring_config: &crate::calibration::config::ScoringConfig,
+) -> f64 {
+    // Critical parameters MUST match - if any fail, return 0
+    if !details.instrume_match || !details.binning_match ||
+       !details.gain_match || !details.offset_match {
+        return 0.0;
     }
 
-    // Exposure time MUST match for dark/darkflat
-    if (cal_type_lower == "dark" || cal_type_lower == "darkflat") && !details.exptime_match {
-        score -= 1.0;
-    }
-
-    // Temperature penalty
-    if let Some(temp_diff) = details.temp_diff {
-        if temp_diff > 10.0 {
-            score -= 0.15;
-        } else if temp_diff > 5.0 {
-            score -= 0.1;
-        } else if temp_diff > 2.0 {
-            score -= 0.05;
-        }
-    }
-
-    // Date penalty
-    if details.date_diff_days > 365 {
-        score -= 0.15;
-    } else if details.date_diff_days > 90 {
-        score -= 0.1;
-    } else if details.date_diff_days > 30 {
-        score -= 0.05;
-    }
-
-    score.max(0.0).min(1.0)
+    // Use the shared scoring function from configurable_matcher
+    // This handles date, temperature, and exposure time scoring with configurable weights
+    crate::calibration::configurable_matcher::score_match(
+        Some(details.date_diff_days),
+        details.temp_diff,
+        exptime_diff,
+        scoring_config,
+    )
 }
 
 /// Manually assign a sub-calibration set to a calibration set
