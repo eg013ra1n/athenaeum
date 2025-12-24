@@ -336,6 +336,27 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
                               <span className="text-gray-400">Software:</span>
                               <span className="text-gray-100">{frame.swcreate ?? '-'}</span>
                             </div>
+                            <div className="border-l border-gray-600 pl-6 flex items-center gap-4">
+                              <span className="text-gray-500 text-xs uppercase tracking-wide">Linked:</span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-gray-400">Flat:</span>
+                                <span className={frame.calibration_status.flat_set_id ? 'text-emerald-400' : 'text-gray-500'}>
+                                  {frame.calibration_status.flat_set_id ? `#${frame.calibration_status.flat_set_id}` : 'None'}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-gray-400">Dark:</span>
+                                <span className={frame.calibration_status.dark_set_id ? 'text-emerald-400' : 'text-gray-500'}>
+                                  {frame.calibration_status.dark_set_id ? `#${frame.calibration_status.dark_set_id}` : 'None'}
+                                </span>
+                              </div>
+                              {frame.calibration_status.bias_set_id && (
+                                <div className="flex items-center gap-2">
+                                  <span className="text-gray-400">Bias:</span>
+                                  <span className="text-emerald-400">#{frame.calibration_status.bias_set_id}</span>
+                                </div>
+                              )}
+                            </div>
                           </div>
                         </td>
                       </tr>
