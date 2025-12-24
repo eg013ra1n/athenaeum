@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { ChevronUp, ChevronDown, ChevronsUpDown, Eye } from "lucide-react";
-import { CalibrationSetDetail, FileWithFrame } from "../types/models";
+import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings } from "lucide-react";
+import { CalibrationSetDetail, FileWithFrame, ImageType } from "../types/models";
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import BlinkViewer from "./BlinkViewer";
@@ -8,12 +8,14 @@ import BlinkViewer from "./BlinkViewer";
 interface CalibrationSetTableProps {
   sets: CalibrationSetDetail[];
   showFilterColumn?: boolean;
+  /** Callback to edit sub-calibration for a set (for flat/dark sets only) */
+  onEditSubCalibration?: (setId: number, setType: 'flat' | 'dark') => void;
 }
 
 type SortField = "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
 type SortDirection = "asc" | "desc";
 
-export default function CalibrationSetTable({ sets, showFilterColumn = false }: CalibrationSetTableProps) {
+export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration }: CalibrationSetTableProps) {
   const [sortField, setSortField] = useState<SortField>("exptime");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
@@ -286,15 +288,31 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false }: 
 
                   {/* Actions */}
                   <td className="px-4 py-3 text-center">
-                    <button
-                      onClick={(e) => handleViewFrames(set.id!, e)}
-                      disabled={loadingFrames === set.id}
-                      className="inline-flex items-center gap-1 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                      title="View frames in blink viewer"
-                    >
-                      <Eye size={14} />
-                      {loadingFrames === set.id ? 'Loading...' : 'View'}
-                    </button>
+                    <div className="flex items-center justify-center gap-2">
+                      <button
+                        onClick={(e) => handleViewFrames(set.id!, e)}
+                        disabled={loadingFrames === set.id}
+                        className="inline-flex items-center gap-1 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="View frames in blink viewer"
+                      >
+                        <Eye size={14} />
+                        {loadingFrames === set.id ? 'Loading...' : 'View'}
+                      </button>
+                      {onEditSubCalibration && set.id !== null && set.imagetyp !== ImageType.Bias && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const setType = set.imagetyp === ImageType.Flat ? 'flat' : 'dark';
+                            onEditSubCalibration(set.id!, setType);
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs rounded transition-colors"
+                          title="Edit sub-calibration"
+                        >
+                          <Settings size={14} />
+                          Sub-Cal
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
 

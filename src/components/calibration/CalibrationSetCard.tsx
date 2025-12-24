@@ -1,4 +1,4 @@
-import { AlertTriangle } from 'lucide-react';
+import { AlertTriangle, Settings } from 'lucide-react';
 import type {
   CalibrationSetDetail,
   CalibrationSetWithFrameCount,
@@ -10,6 +10,8 @@ type CalibrationType = 'flat' | 'dark' | 'bias';
 interface CalibrationSetCardProps {
   type: CalibrationType;
   data: CalibrationSetWithFrameCount;
+  /** Callback to edit sub-calibration for this set (only for flat/dark) */
+  onEditSubCalibration?: (setId: number, setType: CalibrationType) => void;
 }
 
 const typeStyles: Record<CalibrationType, { bg: string; border: string; header: string }> = {
@@ -146,8 +148,9 @@ function SubCalibrationCard({ sub }: { sub: SubCalibrationDetail }) {
  * - Inline label:value layout to reduce vertical space
  * - Clear warning display
  * - Compact sub-calibration section
+ * - Edit button for sub-calibration (flat/dark only)
  */
-export function CalibrationSetCard({ type, data }: CalibrationSetCardProps) {
+export function CalibrationSetCard({ type, data, onEditSubCalibration }: CalibrationSetCardProps) {
   const { set, warnings, sub_calibration, frame_count } = data;
   const styles = typeStyles[type];
 
@@ -169,9 +172,24 @@ export function CalibrationSetCard({ type, data }: CalibrationSetCardProps) {
             <span className="text-xs text-gray-500">#{set.id}</span>
           )}
         </div>
-        <span className="text-xs text-gray-300">
-          {frame_count} light{frame_count !== 1 ? 's' : ''}
-        </span>
+        <div className="flex items-center gap-2">
+          {onEditSubCalibration && type !== 'bias' && set.id !== null && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onEditSubCalibration(set.id!, type);
+              }}
+              className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700/50 rounded transition-colors"
+              title="Edit sub-calibration"
+            >
+              <Settings size={12} />
+              <span>Edit</span>
+            </button>
+          )}
+          <span className="text-xs text-gray-300">
+            {frame_count} light{frame_count !== 1 ? 's' : ''}
+          </span>
+        </div>
       </header>
 
       {/* Warnings */}

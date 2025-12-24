@@ -6,12 +6,15 @@ import type { SelectedItem } from './NavigationTree';
 import { CalibrationSetCard, EmptyCalibrationCard } from './CalibrationSetCard';
 import { LightFrameList } from './LightFrameList';
 import { WarningPanel, AggregatedWarning } from './WarningPanel';
+import { SubCalibrationModal } from '../SubCalibrationModal';
 
 interface DetailPanelProps {
   selectedItem: SelectedItem | null;
   onManualCalibration: (filterGroup: CalibrationFilterGroup) => void;
   /** Callback to open blink viewer with frames */
   onBlink?: (frames: LightFrameWithCalibration[]) => void;
+  /** Callback when sub-calibration is changed (to refresh hierarchy) */
+  onRefresh?: () => void;
   className?: string;
 }
 
@@ -69,9 +72,25 @@ export function DetailPanel({
   selectedItem,
   onManualCalibration,
   onBlink,
+  onRefresh,
   className = '',
 }: DetailPanelProps) {
   const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
+
+  // Sub-calibration modal state
+  const [subCalModalSetId, setSubCalModalSetId] = useState<number | null>(null);
+  const [subCalModalType, setSubCalModalType] = useState<'flat' | 'dark'>('flat');
+
+  const handleEditSubCalibration = (setId: number, setType: 'flat' | 'dark' | 'bias') => {
+    if (setType === 'bias') return; // Bias sets don't have sub-calibration
+    setSubCalModalSetId(setId);
+    setSubCalModalType(setType);
+  };
+
+  const handleSubCalApply = () => {
+    // Refresh the hierarchy to show updated sub-calibration
+    onRefresh?.();
+  };
 
   // Fetch blackholed file IDs when filter group changes
   useEffect(() => {
@@ -197,6 +216,7 @@ export function DetailPanel({
                     key={`flat-${flatSet.set.id ?? idx}`}
                     type="flat"
                     data={flatSet}
+                    onEditSubCalibration={handleEditSubCalibration}
                   />
                 ))
               ) : (
@@ -210,6 +230,7 @@ export function DetailPanel({
                     key={`dark-${darkSet.set.id ?? idx}`}
                     type="dark"
                     data={darkSet}
+                    onEditSubCalibration={handleEditSubCalibration}
                   />
                 ))
               ) : (
@@ -227,6 +248,17 @@ export function DetailPanel({
         {/* Light Frames Section */}
         <LightFrameList frames={filterGroup.light_frames} blackholedFileIds={blackholedFileIds} />
       </div>
+
+      {/* Sub-Calibration Modal */}
+      {subCalModalSetId !== null && (
+        <SubCalibrationModal
+          isOpen={true}
+          sourceSetId={subCalModalSetId}
+          sourceType={subCalModalType}
+          onApply={handleSubCalApply}
+          onClose={() => setSubCalModalSetId(null)}
+        />
+      )}
     </div>
   );
 }

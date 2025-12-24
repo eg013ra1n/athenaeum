@@ -94,6 +94,10 @@ export interface ScoringConfig {
   temperature_match_weight: number;
   /** Temperature scaling factor for scoring formula (default 2.0) */
   temperature_scale: number;
+  /** Weight for exposure time proximity in scoring (0.0-1.0) */
+  exposure_match_weight: number;
+  /** Exposure time scaling factor for scoring formula (default 1.0s) */
+  exposure_scale: number;
 }
 
 /** Warning thresholds for calibration matching */

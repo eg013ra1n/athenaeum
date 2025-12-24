@@ -5,7 +5,7 @@
 
 use crate::calibration::config::{
     CalibrationMatchingConfig, CalibrationTypeConfig, MatchMode, ParameterConfig,
-    MasterPreference,
+    MasterPreference, ScoringConfig,
 };
 use crate::calibration::finder::CalibrationCandidate;
 use crate::models::{Frame, ImageType};
@@ -349,8 +349,14 @@ pub fn find_calibration_sets(
             _ => None,
         };
 
-        // Score the match using temperature weight and scale from config
-        let score = score_match(date_diff, temp_diff, config.scoring.temperature_match_weight, config.scoring.temperature_scale);
+        // Calculate exposure time difference for scoring
+        let exptime_diff = match (frame.exptime, exptime) {
+            (Some(f_exp), Some(s_exp)) => Some((f_exp - s_exp).abs()),
+            _ => None,
+        };
+
+        // Score the match using configurable weights and scales
+        let score = score_match(date_diff, temp_diff, exptime_diff, &config.scoring);
 
         // Determine warnings
         let temp_warning = !match_result.warnings.is_empty() &&
@@ -419,8 +425,8 @@ fn check_date_warning_days(date_diff: Option<i64>, calibration_type: &str, confi
 fn score_match(
     date_diff_days: Option<i64>,
     temp_diff: Option<f64>,
-    temp_weight: f64,
-    temp_scale: f64,
+    exptime_diff: Option<f64>,
+    config: &ScoringConfig,
 ) -> f64 {
     let mut score = 1.0;
 
@@ -432,10 +438,18 @@ fn score_match(
 
     // Temperature scoring with configurable weight and scale
     if let Some(temp) = temp_diff {
-        let temp_score = 1.0 / (1.0 + (temp.abs() / temp_scale));
+        let temp_score = 1.0 / (1.0 + (temp.abs() / config.temperature_scale));
         // Apply weight: weighted average between 1.0 and temp_score
-        let weighted_temp = 1.0 * (1.0 - temp_weight) + temp_score * temp_weight;
+        let weighted_temp = 1.0 * (1.0 - config.temperature_match_weight) + temp_score * config.temperature_match_weight;
         score *= weighted_temp;
+    }
+
+    // Exposure time scoring with configurable weight and scale
+    if let Some(exp) = exptime_diff {
+        let exp_score = 1.0 / (1.0 + (exp.abs() / config.exposure_scale));
+        // Apply weight: weighted average between 1.0 and exp_score
+        let weighted_exp = 1.0 * (1.0 - config.exposure_match_weight) + exp_score * config.exposure_match_weight;
+        score *= weighted_exp;
     }
 
     score.max(0.0).min(1.0)
@@ -716,17 +730,60 @@ mod tests {
 
     #[test]
     fn test_score_match() {
+        let config = ScoringConfig {
+            temperature_match_weight: 0.3,
+            temperature_scale: 2.0,
+            exposure_match_weight: 0.4,
+            exposure_scale: 1.0,
+        };
+
         // Perfect match
-        let score = score_match(Some(0), Some(0.0), 0.3, 2.0);
+        let score = score_match(Some(0), Some(0.0), Some(0.0), &config);
         assert!(score > 0.99);
 
-        // With temperature weight
-        let score_low_weight = score_match(Some(10), Some(5.0), 0.1, 2.0);
-        let score_high_weight = score_match(Some(10), Some(5.0), 0.5, 2.0);
+        // With temperature difference only
+        let score_temp = score_match(Some(10), Some(5.0), None, &config);
+        assert!(score_temp > 0.0 && score_temp <= 1.0);
 
-        // Higher weight should amplify the temperature effect
-        // Both should be valid scores
-        assert!(score_low_weight > 0.0 && score_low_weight <= 1.0);
-        assert!(score_high_weight > 0.0 && score_high_weight <= 1.0);
+        // With exposure difference only
+        let score_exp = score_match(Some(10), None, Some(2.0), &config);
+        assert!(score_exp > 0.0 && score_exp <= 1.0);
+
+        // With both temperature and exposure differences
+        let score_both = score_match(Some(10), Some(3.0), Some(1.5), &config);
+        assert!(score_both > 0.0 && score_both <= 1.0);
+
+        // Higher weight should amplify the effect
+        let config_low_weight = ScoringConfig {
+            temperature_match_weight: 0.1,
+            temperature_scale: 2.0,
+            exposure_match_weight: 0.1,
+            exposure_scale: 1.0,
+        };
+        let config_high_weight = ScoringConfig {
+            temperature_match_weight: 0.5,
+            temperature_scale: 2.0,
+            exposure_match_weight: 0.5,
+            exposure_scale: 1.0,
+        };
+
+        let score_low_weight = score_match(Some(10), Some(5.0), Some(3.0), &config_low_weight);
+        let score_high_weight = score_match(Some(10), Some(5.0), Some(3.0), &config_high_weight);
+
+        // Higher weight should amplify the differences (lower score)
+        assert!(score_high_weight < score_low_weight);
+    }
+
+    #[test]
+    fn test_score_match_exposure_preference() {
+        // Test that closer exposure time is preferred
+        let config = ScoringConfig::default();
+
+        // Simulating Flat 1.18s vs Dark 1s (diff = 0.18) and Dark 5s (diff = 3.82)
+        let score_1s = score_match(Some(3), Some(0.1), Some(0.18), &config);
+        let score_5s = score_match(Some(3), Some(0.1), Some(3.82), &config);
+
+        // 1s dark should score higher (closer exposure match)
+        assert!(score_1s > score_5s, "Closer exposure should score higher: {} vs {}", score_1s, score_5s);
     }
 }

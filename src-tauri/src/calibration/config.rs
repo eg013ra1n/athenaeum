@@ -284,6 +284,10 @@ pub struct ScoringConfig {
     pub temperature_match_weight: f64,
     /// Temperature scaling factor for scoring formula (default 2.0)
     pub temperature_scale: f64,
+    /// Weight for exposure time proximity in scoring (0.0-1.0)
+    pub exposure_match_weight: f64,
+    /// Exposure time scaling factor for scoring formula (default 1.0s)
+    pub exposure_scale: f64,
 }
 
 impl Default for ScoringConfig {
@@ -291,6 +295,8 @@ impl Default for ScoringConfig {
         Self {
             temperature_match_weight: 0.3,
             temperature_scale: 2.0,
+            exposure_match_weight: 0.4,
+            exposure_scale: 1.0,
         }
     }
 }

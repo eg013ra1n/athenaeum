@@ -140,6 +140,10 @@ pub fn run() {
             commands::manual_assign_calibration,
             commands::clear_manual_calibration_override,
             commands::cleanup_duplicate_flat_subcalibrations,
+            commands::get_calibration_set_parameters,
+            commands::get_subcalibration_sets_for_manual_selection,
+            commands::manual_assign_subcalibration,
+            commands::clear_subcalibration_override,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

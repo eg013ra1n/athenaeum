@@ -224,6 +224,7 @@ mod tests {
             objctra: None,
             objctdec: None,
             override_: false,
+            swcreate: None,
         };
 
         (id, file, frame)

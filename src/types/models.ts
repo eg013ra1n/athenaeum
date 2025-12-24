@@ -607,6 +607,26 @@ export interface LightFrameParameters {
   current_bias_set_id: number | null;
 }
 
+/** Parameters of a calibration set for sub-calibration selection display */
+export interface CalibrationSetParameters {
+  set_id: number;
+  imagetyp: string;
+  instrume: string | null;
+  binning: string | null;
+  gain: number | null;
+  offset: number | null;
+  exptime: number | null;
+  filter: string | null;
+  ccd_temp: number | null;
+  date_start: string | null;
+  date_end: string | null;
+  frame_count: number;
+  // Current sub-calibration links
+  current_dark_set_id: number | null;
+  current_darkflat_set_id: number | null;
+  current_bias_set_id: number | null;
+}
+
 /** Group of frames for a single filter within a camera */
 export interface CalibrationFilterGroup {
   filter: string | null;          // null = "No Filter"

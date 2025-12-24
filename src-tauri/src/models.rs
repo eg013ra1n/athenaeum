@@ -527,6 +527,27 @@ pub struct LightFrameParameters {
     pub current_bias_set_id: Option<i64>,
 }
 
+/// Parameters of a calibration set for sub-calibration selection display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSetParameters {
+    pub set_id: i64,
+    pub imagetyp: String,
+    pub instrume: Option<String>,
+    pub binning: Option<String>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    pub exptime: Option<f64>,
+    pub filter: Option<String>,
+    pub ccd_temp: Option<f64>,
+    pub date_start: Option<String>,
+    pub date_end: Option<String>,
+    pub frame_count: i64,
+    // Current sub-calibration links
+    pub current_dark_set_id: Option<i64>,
+    pub current_darkflat_set_id: Option<i64>,
+    pub current_bias_set_id: Option<i64>,
+}
+
 /// Group of frames for a single filter within a camera
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationFilterGroup {

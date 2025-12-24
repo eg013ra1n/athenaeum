@@ -4,6 +4,7 @@ import { ArrowLeft } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
+import { SubCalibrationModal } from "./SubCalibrationModal";
 
 export interface LibraryStats {
   totalSets: number;
@@ -24,6 +25,20 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filters, setFilters] = useState<FilterState>(emptyFilters);
+
+  // Sub-calibration modal state
+  const [subCalModalSetId, setSubCalModalSetId] = useState<number | null>(null);
+  const [subCalModalType, setSubCalModalType] = useState<'flat' | 'dark'>('flat');
+
+  const handleEditSubCalibration = (setId: number, setType: 'flat' | 'dark') => {
+    setSubCalModalSetId(setId);
+    setSubCalModalType(setType);
+  };
+
+  const handleSubCalApply = () => {
+    // Refresh the library to show updated sub-calibration
+    checkAndLoadLibrary();
+  };
 
   useEffect(() => {
     checkAndLoadLibrary();
@@ -207,6 +222,7 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
             <CalibrationSetTable
               sets={filteredSets}
               showFilterColumn={imageTypeFilter?.length === 1 && imageTypeFilter[0] === "Flat"}
+              onEditSubCalibration={handleEditSubCalibration}
             />
           ) : (
             <div className="text-center py-12 bg-gray-800 rounded-lg">
@@ -224,6 +240,16 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
         </div>
       )}
 
+      {/* Sub-Calibration Modal */}
+      {subCalModalSetId !== null && (
+        <SubCalibrationModal
+          isOpen={true}
+          sourceSetId={subCalModalSetId}
+          sourceType={subCalModalType}
+          onApply={handleSubCalApply}
+          onClose={() => setSubCalModalSetId(null)}
+        />
+      )}
     </div>
   );
 }
