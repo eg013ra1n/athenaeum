@@ -497,24 +497,29 @@ pub fn create_flat_calibration_set(
 }
 
 /// Checks if a calibration set already exists for this flat group
+/// Uses date range overlap instead of exact date match to preserve set identity
+/// when frames are added/removed
 fn check_for_existing_flat_set(
     conn: &Connection,
     flat_group: &FlatGroup,
 ) -> Result<Option<i64>> {
-    let date = flat_group.start_time.format("%Y-%m-%d").to_string();
+    let cluster_start = flat_group.start_time.to_rfc3339();
+    let cluster_end = flat_group.end_time.to_rfc3339();
 
     // Build query with NULL-aware comparisons for binning and instrume
+    // Use date range overlap: existing set overlaps with new cluster if
+    // existing.date_start <= cluster.end AND existing.date_end >= cluster.start
     let mut query = String::from(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Flat'
-           AND cs.date = ?1
-           AND cs.frame_count > 0
            AND cs.date_start IS NOT NULL
-           AND cs.date_end IS NOT NULL"
+           AND cs.date_end IS NOT NULL
+           AND cs.date_start <= ?1
+           AND cs.date_end >= ?2"
     );
 
-    let mut param_count = 1;
+    let mut param_count = 2;
 
     // NULL-aware comparison for binning
     if flat_group.binning.is_some() {
@@ -564,8 +569,11 @@ fn check_for_existing_flat_set(
 
     let mut stmt = conn.prepare(&query)?;
 
+    // Bind date range parameters (cluster_end for ?1, cluster_start for ?2)
     let mut param_idx = 1;
-    stmt.raw_bind_parameter(param_idx, &date)?;
+    stmt.raw_bind_parameter(param_idx, &cluster_end)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &cluster_start)?;
     param_idx += 1;
 
     if let Some(ref binning) = flat_group.binning {

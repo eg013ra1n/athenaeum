@@ -1234,10 +1234,11 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
 
 /// Refresh calibration library for a specific camera
 ///
-/// This command:
-/// 1. Deletes all existing calibration sets for the camera
+/// This command preserves calibration set IDs by:
+/// 1. Clearing frame memberships (but keeping the sets)
 /// 2. Queries all calibration frame IDs for the camera (Flat, Dark, Bias, DarkFlat)
-/// 3. Recreates calibration sets using the same algorithm as folder scanning
+/// 3. Reclusters and assigns frames to sets - sets are matched by params + date overlap
+/// 4. Deletes orphaned sets (sets with 0 frames after reclustering)
 #[tauri::command]
 pub async fn refresh_calibration_library_for_camera(
     state: State<'_, AppState>,
@@ -1249,11 +1250,24 @@ pub async fn refresh_calibration_library_for_camera(
 
     println!("🔄 Refreshing calibration library for camera: {}", instrume);
 
-    // Step 1: Delete all existing calibration sets for this camera
-    db::delete_all_calibration_sets_for_camera(&conn, &instrume)
-        .map_err(|e| format!("Failed to delete existing sets: {}", e))?;
+    // Step 1: Clear frame memberships for this camera's sets (but keep the sets)
+    // This allows reclustering to rebuild the memberships while preserving set IDs
+    conn.execute(
+        "DELETE FROM calibration_set_frames
+         WHERE set_id IN (
+             SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0
+         )",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to clear frame memberships: {}", e))?;
 
-    println!("   ✅ Deleted existing calibration sets");
+    // Reset frame counts to 0 for these sets
+    conn.execute(
+        "UPDATE calibration_set SET frame_count = 0
+         WHERE instrume = ?1 AND is_master_library = 0",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to reset frame counts: {}", e))?;
+
+    println!("   ✅ Cleared existing frame memberships (sets preserved for ID stability)");
 
     // Step 2: Query all calibration frame IDs for this camera
     let flat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "FLAT")
@@ -1272,6 +1286,7 @@ pub async fn refresh_calibration_library_for_camera(
         flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
 
     // Step 3: Recreate calibration sets using the same algorithm as folder scanning
+    // Sets will be matched by params + date range overlap, preserving IDs
     let result = create_calibration_sets_from_scan(
         &conn,
         flat_frame_ids,
@@ -1280,7 +1295,18 @@ pub async fn refresh_calibration_library_for_camera(
         darkflat_frame_ids,
     ).map_err(|e| format!("Failed to create calibration sets: {}", e))?;
 
-    println!("🎉 Refresh complete - created {} calibration sets", result.sets_created);
+    // Step 4: Delete orphaned sets (sets with no frames after reclustering)
+    let deleted_orphans = conn.execute(
+        "DELETE FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to delete orphaned sets: {}", e))?;
+
+    if deleted_orphans > 0 {
+        println!("   🗑️  Deleted {} orphaned sets", deleted_orphans);
+    }
+
+    println!("🎉 Refresh complete - {} calibration sets active (IDs preserved)", result.sets_created);
 
     Ok(result)
 }

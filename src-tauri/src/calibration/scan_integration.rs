@@ -571,18 +571,22 @@ fn create_dark_calibration_set_with_type(
     dark_group: &DarkGroup,
     imagetyp: &str,
 ) -> Result<i64> {
-    // Check if set already exists with same parameters
-    let date = dark_group.start_time.format("%Y-%m-%d").to_string();
+    // Check if set already exists with same parameters using date range overlap
+    let cluster_start = dark_group.start_time.to_rfc3339();
+    let cluster_end = dark_group.end_time.to_rfc3339();
 
     // Build query with NULL-aware comparisons for ALL parameters
-    // This is critical - must check exptime, gain, offset in addition to binning/instrume
+    // Use date range overlap: existing set overlaps with new cluster if
+    // existing.date_start <= cluster.end AND existing.date_end >= cluster.start
     let existing_set_id: Option<i64> = {
         let mut query = String::from(
             "SELECT id FROM calibration_set
-             WHERE imagetyp = ?1 AND date = ?2 AND frame_count > 0"
+             WHERE imagetyp = ?1
+             AND date_start IS NOT NULL AND date_end IS NOT NULL
+             AND date_start <= ?2 AND date_end >= ?3"
         );
 
-        let mut param_count = 2;
+        let mut param_count = 3;
 
         // NULL-aware comparison for binning
         if dark_group.binning.is_some() {
@@ -634,7 +638,9 @@ fn create_dark_calibration_set_with_type(
             let mut param_idx = 1;
             stmt.raw_bind_parameter(param_idx, imagetyp).ok()?;
             param_idx += 1;
-            stmt.raw_bind_parameter(param_idx, &date).ok()?;
+            stmt.raw_bind_parameter(param_idx, &cluster_end).ok()?;
+            param_idx += 1;
+            stmt.raw_bind_parameter(param_idx, &cluster_start).ok()?;
             param_idx += 1;
 
             if let Some(ref binning) = dark_group.binning {
@@ -690,6 +696,7 @@ fn create_dark_calibration_set_with_type(
     }
 
     // Create new calibration set
+    let date = dark_group.start_time.format("%Y-%m-%d").to_string();
     let date_start = dark_group.start_time.to_rfc3339();
     let date_end = dark_group.end_time.to_rfc3339();
     let frame_count = dark_group.frame_ids.len() as i64;

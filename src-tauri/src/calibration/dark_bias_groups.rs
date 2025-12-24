@@ -930,24 +930,28 @@ pub fn create_bias_calibration_set(
 }
 
 /// Checks if a calibration set already exists for this dark group
+/// Uses date range overlap instead of exact date match to preserve set identity
 fn check_for_existing_dark_set(
     conn: &Connection,
     dark_group: &DarkGroup,
 ) -> Result<Option<i64>> {
-    let date = dark_group.start_time.format("%Y-%m-%d").to_string();
+    let cluster_start = dark_group.start_time.to_rfc3339();
+    let cluster_end = dark_group.end_time.to_rfc3339();
 
     // Build query with NULL-aware comparisons for nullable fields
+    // Use date range overlap: existing set overlaps with new cluster if
+    // existing.date_start <= cluster.end AND existing.date_end >= cluster.start
     let mut query = String::from(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Dark'
-           AND cs.date = ?1
-           AND cs.frame_count > 0
            AND cs.date_start IS NOT NULL
-           AND cs.date_end IS NOT NULL"
+           AND cs.date_end IS NOT NULL
+           AND cs.date_start <= ?1
+           AND cs.date_end >= ?2"
     );
 
-    let mut param_count = 1;
+    let mut param_count = 2;
 
     // NULL-aware comparison for binning
     if dark_group.binning.is_some() {
@@ -997,8 +1001,11 @@ fn check_for_existing_dark_set(
 
     let mut stmt = conn.prepare(&query)?;
 
+    // Bind date range parameters (cluster_end for ?1, cluster_start for ?2)
     let mut param_idx = 1;
-    stmt.raw_bind_parameter(param_idx, &date)?;
+    stmt.raw_bind_parameter(param_idx, &cluster_end)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &cluster_start)?;
     param_idx += 1;
 
     if let Some(ref binning) = dark_group.binning {
@@ -1039,24 +1046,28 @@ fn check_for_existing_dark_set(
 }
 
 /// Checks if a calibration set already exists for this bias group
+/// Uses date range overlap instead of exact date match to preserve set identity
 fn check_for_existing_bias_set(
     conn: &Connection,
     bias_group: &BiasGroup,
 ) -> Result<Option<i64>> {
-    let date = bias_group.start_time.format("%Y-%m-%d").to_string();
+    let cluster_start = bias_group.start_time.to_rfc3339();
+    let cluster_end = bias_group.end_time.to_rfc3339();
 
     // Build query with NULL-aware comparisons for nullable fields
+    // Use date range overlap: existing set overlaps with new cluster if
+    // existing.date_start <= cluster.end AND existing.date_end >= cluster.start
     let mut query = String::from(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Bias'
-           AND cs.date = ?1
-           AND cs.frame_count > 0
            AND cs.date_start IS NOT NULL
-           AND cs.date_end IS NOT NULL"
+           AND cs.date_end IS NOT NULL
+           AND cs.date_start <= ?1
+           AND cs.date_end >= ?2"
     );
 
-    let mut param_count = 1;
+    let mut param_count = 2;
 
     // NULL-aware comparison for binning
     if bias_group.binning.is_some() {
@@ -1099,8 +1110,11 @@ fn check_for_existing_bias_set(
 
     let mut stmt = conn.prepare(&query)?;
 
+    // Bind date range parameters (cluster_end for ?1, cluster_start for ?2)
     let mut param_idx = 1;
-    stmt.raw_bind_parameter(param_idx, &date)?;
+    stmt.raw_bind_parameter(param_idx, &cluster_end)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &cluster_start)?;
     param_idx += 1;
 
     if let Some(ref binning) = bias_group.binning {
