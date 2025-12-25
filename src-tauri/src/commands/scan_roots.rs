@@ -2,11 +2,13 @@
 
 use crate::db::{self};
 use crate::models::*;
-use crate::scanner::scan_directory;
+use crate::scanner::{scan_directory, scan_directory_parallel};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::State;
 
-use super::AppState;
+use super::{AppState, ScanHandle};
 
 #[tauri::command]
 pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<ScanRoot, String> {
@@ -376,4 +378,105 @@ pub struct RescanResultDto {
     pub files_skipped: usize,
     pub files_missing: usize,
     pub errors: Vec<String>,
+}
+
+/// Start a scan with progress events - runs synchronously but emits progress events
+/// The frontend should call this and listen to scan-progress/scan-complete events
+#[tauri::command]
+pub async fn start_scan_with_progress(
+    root_id: i64,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ScanResultDto, String> {
+    // Check if already scanning this root
+    {
+        let scans = state.active_scans.lock().unwrap();
+        if scans.contains_key(&root_id) {
+            return Err("Scan already in progress for this root".to_string());
+        }
+    }
+
+    // Create cancel flag and register scan
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut scans = state.active_scans.lock().unwrap();
+        scans.insert(root_id, ScanHandle {
+            root_id,
+            cancel_flag: cancel_flag.clone(),
+        });
+    }
+
+    // Get scan root info and perform scan
+    let result = {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+
+        let roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
+        let root = roots
+            .into_iter()
+            .find(|r| r.id == Some(root_id))
+            .ok_or("Scan root not found")?;
+
+        let use_content_hash = state.settings
+            .get_duplicates_use_content_hash(&conn)
+            .unwrap_or(false);
+
+        // Perform the parallel scan with progress events
+        let result = scan_directory_parallel(
+            Path::new(&root.path),
+            root_id,
+            &conn,
+            &app_handle,
+            use_content_hash,
+        );
+
+        // Update last_scan timestamp
+        db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
+
+        result
+    };
+
+    // Remove from active scans
+    {
+        let mut scans = state.active_scans.lock().unwrap();
+        scans.remove(&root_id);
+    }
+
+    Ok(ScanResultDto {
+        files_found: result.files_found,
+        files_processed: result.files_processed,
+        files_skipped: result.files_skipped,
+        errors: result.errors,
+        lights_count: result.lights_count,
+        darks_count: result.darks_count,
+        flats_count: result.flats_count,
+        bias_count: result.bias_count,
+        darkflats_count: result.darkflats_count,
+        calibration_sets_created: result.calibration_sets_created,
+    })
+}
+
+/// Cancel an active scan
+#[tauri::command]
+pub async fn cancel_scan(
+    root_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let scans = state.active_scans.lock().unwrap();
+    if let Some(handle) = scans.get(&root_id) {
+        handle.cancel_flag.store(true, Ordering::SeqCst);
+        Ok(())
+    } else {
+        Err("No active scan for this root".to_string())
+    }
+}
+
+/// Get list of active scan root IDs
+#[tauri::command]
+pub async fn get_active_scans(
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    let scans = state.active_scans.lock().unwrap();
+    Ok(scans.keys().cloned().collect())
 }

@@ -24,6 +24,7 @@ mod commands_rustafits;
 use cache::CacheManager;
 use commands::AppState;
 use settings::SettingsManager;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
@@ -37,6 +38,7 @@ pub fn run() {
             db: Mutex::new(None),
             settings: Arc::new(SettingsManager::new()),
             cache: Arc::new(Mutex::new(None)),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
         })
         .setup(|app| {
             // Initialize cache manager after app is ready
@@ -65,6 +67,9 @@ pub fn run() {
             commands::get_scan_roots,
             commands::delete_scan_root,
             commands::start_scan,
+            commands::start_scan_with_progress,
+            commands::cancel_scan,
+            commands::get_active_scans,
             commands::rescan_all_for_content_hash,
             commands::get_files,
             commands::get_files_by_directory,

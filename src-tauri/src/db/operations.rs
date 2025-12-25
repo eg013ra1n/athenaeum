@@ -150,21 +150,80 @@ pub fn update_scan_root_timestamp(conn: &Connection, id: i64) -> Result<()> {
 }
 
 /// Delete a scan root and all associated files
+/// Optimized: uses transaction, pre-computes IDs, deletes child tables explicitly
 pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
-    // First, get the path of the scan root
+    // Get the path of the scan root
     let path: String = conn.query_row(
         "SELECT path FROM scan_roots WHERE id = ?1",
         params![id],
         |row| row.get(0),
     )?;
 
-    // Delete all files under this path (frames will be cascade deleted due to foreign key)
-    conn.execute(
-        "DELETE FROM files WHERE path LIKE ?1 || '%'",
-        params![path],
-    )?;
+    // Start transaction for atomicity and performance
+    conn.execute("BEGIN TRANSACTION", [])?;
 
-    // Delete orphaned calibration sets (sets with no remaining linked frames)
+    // Pre-compute file IDs to delete (single LIKE query)
+    let file_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM files WHERE path LIKE ?1 || '%'")?;
+        let rows = stmt.query_map(params![path], |row| row.get(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if !file_ids.is_empty() {
+        // Pre-compute frame IDs for these files
+        let frame_ids: Vec<i64> = {
+            let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id FROM frames WHERE file_id IN ({})", placeholders);
+            let mut stmt = conn.prepare(&sql)?;
+            let params_vec: Vec<rusqlite::types::Value> = file_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| row.get(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        // Delete child tables explicitly (avoiding cascade overhead)
+        if !frame_ids.is_empty() {
+            let frame_placeholders: String = frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let frame_values: Vec<rusqlite::types::Value> = frame_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+
+            // 1. session_members
+            let sql = format!("DELETE FROM session_members WHERE frame_id IN ({})", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+
+            // 2. calibration_set_frames
+            let sql = format!("DELETE FROM calibration_set_frames WHERE frame_id IN ({})", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+
+            // 3. frame_tags
+            let sql = format!("DELETE FROM frame_tags WHERE frame_id IN ({})", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+
+            // 4. calibration_set_to_frames (source_id refers to frame_id when source_type='frame')
+            let sql = format!("DELETE FROM calibration_set_to_frames WHERE source_id IN ({}) AND source_type = 'frame'", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+        }
+
+        // Delete by file_id
+        let file_placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let file_values: Vec<rusqlite::types::Value> = file_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+
+        // 5. fits_header
+        let sql = format!("DELETE FROM fits_header WHERE file_id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+
+        // 6. black_hole
+        let sql = format!("DELETE FROM black_hole WHERE file_id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+
+        // 7. frames
+        let sql = format!("DELETE FROM frames WHERE file_id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+
+        // 8. files
+        let sql = format!("DELETE FROM files WHERE id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+    }
+
+    // 9. Delete orphaned calibration sets
     conn.execute(
         "DELETE FROM calibration_set WHERE id NOT IN (
             SELECT DISTINCT set_id FROM calibration_set_frames
@@ -172,20 +231,34 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         [],
     )?;
 
-    // Delete orphaned frame sets (sets with no remaining linked frames)
+    // 10. Delete orphaned sessions and imaging_nights first
     conn.execute(
-        "DELETE FROM frames_set WHERE id NOT IN (
-            SELECT DISTINCT fs.id
-            FROM frames_set fs
-            INNER JOIN imaging_nights inn ON inn.frames_set_id = fs.id
-            INNER JOIN sessions s ON s.imaging_night_id = inn.id
-            INNER JOIN session_members sm ON sm.session_id = s.id
+        "DELETE FROM sessions WHERE id NOT IN (
+            SELECT DISTINCT session_id FROM session_members
         )",
         [],
     )?;
 
-    // Delete the scan root
+    conn.execute(
+        "DELETE FROM imaging_nights WHERE id NOT IN (
+            SELECT DISTINCT imaging_night_id FROM sessions
+        )",
+        [],
+    )?;
+
+    // 11. Delete orphaned frame sets
+    conn.execute(
+        "DELETE FROM frames_set WHERE id NOT IN (
+            SELECT DISTINCT frames_set_id FROM imaging_nights
+        )",
+        [],
+    )?;
+
+    // 12. Delete the scan root
     conn.execute("DELETE FROM scan_roots WHERE id = ?1", params![id])?;
+
+    // Commit transaction
+    conn.execute("COMMIT", [])?;
 
     Ok(())
 }

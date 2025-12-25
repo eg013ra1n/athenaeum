@@ -178,6 +178,31 @@ export interface ScanResult {
   calibration_sets_created: number;
 }
 
+// Scan progress event sent from backend
+export interface ScanProgressEvent {
+  current: number;
+  total: number;
+  current_file: string | null;
+  percent: number;
+  root_id: number;
+  phase: 'discovery' | 'processing' | 'inserting' | 'calibrating';
+}
+
+// Scan completion event sent from backend
+export interface ScanCompleteEvent {
+  root_id: number;
+  files_found: number;
+  files_processed: number;
+  files_skipped: number;
+  errors: string[];
+  lights_count: number;
+  darks_count: number;
+  flats_count: number;
+  bias_count: number;
+  darkflats_count: number;
+  calibration_sets_created: number;
+}
+
 export interface FileWithFrame {
   file: File;
   frame: Frame | null;

@@ -6,13 +6,22 @@
 use crate::cache::CacheManager;
 use crate::db::Database;
 use crate::settings::SettingsManager;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-/// App state containing database connection, settings manager, and cache manager
+/// Handle to track an active scan operation
+pub struct ScanHandle {
+    pub root_id: i64,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+/// App state containing database connection, settings manager, cache manager, and active scans
 pub struct AppState {
     pub db: Mutex<Option<Database>>,
     pub settings: Arc<SettingsManager>,
     pub cache: Arc<Mutex<Option<CacheManager>>>,
+    pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
 }
 
 pub mod core;

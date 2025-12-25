@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react';
 import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning, Info, AlertCircle } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
-import { useScanRootsWithAvailability, useScan, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
+import { useScanRootsWithAvailability, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
+import { useScanProgressContext } from '../contexts/ScanProgressContext';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
 import type { ScanResult, RelinkResult, OrphanedFile, FileWithFrame } from '../types/models';
@@ -17,14 +18,13 @@ type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrume
 export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
   const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, relinkScanRoot } = useScanRootsWithAvailability();
-  const { startScan } = useScan();
+  const { startScanWithProgress, isScanning } = useScanProgressContext();
   const { duplicates, loading: dupsLoading, error: dupsError, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
   const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
   const [typeFilter, setTypeFilter] = useState<string>('All Types');
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [scanningMap, setScanningMap] = useState<Record<number, boolean>>({});
   const [scanResultMap, setScanResultMap] = useState<Record<number, ScanResult>>({});
   const [scanError, setScanError] = useState<string | null>(null);
   const [movingToBlackHole, setMovingToBlackHole] = useState<Record<string, boolean>>({});
@@ -190,9 +190,9 @@ export default function FileManager() {
     const rootPath = root?.path || '';
 
     try {
-      setScanningMap(prev => ({ ...prev, [rootId]: true }));
       setScanError(null);
-      const result = await startScan(rootId);
+      // Use parallel scan with progress events
+      const result = await startScanWithProgress(rootId, rootPath);
       setScanResultMap(prev => ({ ...prev, [rootId]: result }));
       setRefreshTrigger(prev => prev + 1); // Trigger refresh after scanning
 
@@ -208,8 +208,6 @@ export default function FileManager() {
     } catch (error) {
       console.error('Scan failed:', error);
       setScanError(typeof error === 'string' ? error : 'Scan failed');
-    } finally {
-      setScanningMap(prev => ({ ...prev, [rootId]: false }));
     }
   };
 
@@ -375,7 +373,7 @@ export default function FileManager() {
           ) : (
             <div className="space-y-3">
               {scanRoots.map((root) => {
-                const isScanning = root.id ? scanningMap[root.id] : false;
+                const rootIsScanning = root.id ? isScanning(root.id) : false;
                 const scanResult = root.id ? scanResultMap[root.id] : null;
                 const isUnavailable = !root.is_available;
 
@@ -468,15 +466,15 @@ export default function FileManager() {
                         </label>
                         <button
                           onClick={() => root.id && handleStartScan(root.id)}
-                          disabled={isScanning || isUnavailable}
+                          disabled={rootIsScanning || isUnavailable}
                           className="flex items-center gap-2 px-3 py-2 bg-green-600 hover:bg-green-700 rounded transition disabled:opacity-50 disabled:cursor-not-allowed"
                         >
-                          {isScanning ? (
+                          {rootIsScanning ? (
                             <Loader2 className="animate-spin" size={16} />
                           ) : (
                             <Play size={16} />
                           )}
-                          {isScanning ? 'Scanning...' : 'Rescan'}
+                          {rootIsScanning ? 'Scanning...' : 'Rescan'}
                         </button>
                         <button
                           onClick={() => root.id && handleRemoveScanRoot(root.id)}
