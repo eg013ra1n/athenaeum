@@ -528,6 +528,11 @@ export default function SkyAtlas() {
                     hasInvalidCorner = true;
                     break;
                   }
+                  // Also check if corner is inside projection clip region (handles bottom/top edges)
+                  if (!window.Celestial.clip(c)) {
+                    hasInvalidCorner = true;
+                    break;
+                  }
                   projectedCorners.push([pt[0] * scaling.scaleX, pt[1] * scaling.scaleY]);
                 }
 
@@ -555,6 +560,18 @@ export default function SkyAtlas() {
                   return;
                 }
 
+                // Check for excessive distortion by comparing projected aspect ratio to original
+                // Near projection edges, frames get stretched significantly
+                const originalAspectRatio = fovW / fovH;
+                const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
+                const distortionRatio = projectedAspectRatio / originalAspectRatio;
+
+                // If distortion is more than 3x in either direction, hide it
+                if (distortionRatio > 3 || distortionRatio < 0.33) {
+                  g.style('display', 'none');
+                  return;
+                }
+
                 const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
 
                 // Create fill color with opacity
@@ -572,8 +589,10 @@ export default function SkyAtlas() {
                   .style('stroke-width', '2px')
                   .style('cursor', d.properties.frameSetId ? 'pointer' : 'default');
 
-                // Store corners for redraw
+                // Store corners and dimensions for redraw
                 (this as any).__fovCorners = corners;
+                (this as any).__fovWidth = fovW;
+                (this as any).__fovHeight = fovH;
               } else {
                 // No FOV data: draw star/sparkle marker
                 const pt = window.Celestial.map.projection()(d.geometry.coordinates);
@@ -803,6 +822,20 @@ export default function SkyAtlas() {
               if (xSpan > canvasWidth * 0.5 || ySpan > canvasHeight * 0.5) {
                 d3.select(this).style('display', 'none');
                 return;
+              }
+
+              // Check for excessive distortion by comparing projected aspect ratio to original
+              const storedFovW = (this as any).__fovWidth;
+              const storedFovH = (this as any).__fovHeight;
+              if (storedFovW && storedFovH) {
+                const originalAspectRatio = storedFovW / storedFovH;
+                const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
+                const distortionRatio = projectedAspectRatio / originalAspectRatio;
+
+                if (distortionRatio > 3 || distortionRatio < 0.33) {
+                  d3.select(this).style('display', 'none');
+                  return;
+                }
               }
 
               const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
