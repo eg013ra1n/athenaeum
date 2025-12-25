@@ -580,3 +580,55 @@ pub struct LightFrameWithCalibration {
     pub offset: Option<f64>,
     pub calibration_status: FrameCalibrationStatus,
 }
+
+// ========== Calendar View Structures ==========
+
+/// Summary of a frame set for calendar display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarFrameSetSummary {
+    pub id: i64,
+    pub name: Option<String>,
+    pub object_name: Option<String>,
+    pub frame_count: i32,
+    pub total_exposure_seconds: f64,
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
+    pub filters: Vec<String>,
+}
+
+/// Group of unorganized frames for calendar display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarUnorganizedGroup {
+    pub id: String,
+    pub object_name: Option<String>,
+    pub frame_count: i32,
+    pub total_exposure_seconds: f64,
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
+    pub filters: Vec<String>,
+    pub frame_ids: Vec<i64>,
+}
+
+/// Summary of imaging activity for a single calendar day
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarDayEvent {
+    pub date: String, // YYYY-MM-DD
+    pub frame_sets: Vec<CalendarFrameSetSummary>,
+    pub unorganized_groups: Vec<CalendarUnorganizedGroup>,
+    pub total_frame_count: i32,
+    pub total_exposure_seconds: f64,
+}
+
+/// Full calendar data for a month
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarMonthData {
+    pub year: i32,
+    pub month: i32, // 1-12
+    pub days: Vec<CalendarDayEvent>,
+    pub total_frame_count: i32,
+    pub total_exposure_seconds: f64,
+}
