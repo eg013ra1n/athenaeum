@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 /// Handle to track an active scan operation
 pub struct ScanHandle {
+    #[allow(dead_code)] // Kept for debugging - HashMap key already provides root_id
     pub root_id: i64,
     pub cancel_flag: Arc<AtomicBool>,
 }

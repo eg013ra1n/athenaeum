@@ -106,28 +106,6 @@ impl MasterFrameIds {
     }
 }
 
-/// Create calibration sets from newly scanned frames
-///
-/// This function is called after a directory scan completes to automatically
-/// create calibration sets from the newly scanned calibration frames.
-pub fn create_calibration_sets_from_scan(
-    conn: &Connection,
-    flat_frame_ids: Vec<i64>,
-    dark_frame_ids: Vec<i64>,
-    bias_frame_ids: Vec<i64>,
-    darkflat_frame_ids: Vec<i64>,
-) -> Result<CalibrationScanResult> {
-    // Call the extended version with empty master frame IDs
-    create_calibration_sets_from_scan_with_masters(
-        conn,
-        flat_frame_ids,
-        dark_frame_ids,
-        bias_frame_ids,
-        darkflat_frame_ids,
-        MasterFrameIds::default(),
-    )
-}
-
 /// Create calibration sets from newly scanned frames, including master frames
 ///
 /// This extended function handles both regular calibration frames (grouped by parameters)
