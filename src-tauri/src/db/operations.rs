@@ -625,6 +625,164 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
     groups.collect()
 }
 
+/// Rebuild the duplicate groups cache tables
+/// This clears existing cache and recomputes all duplicate groups
+pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool) -> Result<usize> {
+    let hash_type = if use_content_hash { "content" } else { "metadata" };
+    let hash_column = if use_content_hash { "content_hash" } else { "metadata_hash" };
+
+    // Start transaction
+    conn.execute("BEGIN TRANSACTION", [])?;
+
+    // Clear existing cache for this hash type
+    conn.execute(
+        "DELETE FROM duplicate_group_files WHERE group_id IN (SELECT id FROM duplicate_groups WHERE hash_type = ?1)",
+        params![hash_type],
+    )?;
+    conn.execute(
+        "DELETE FROM duplicate_groups WHERE hash_type = ?1",
+        params![hash_type],
+    )?;
+
+    // Find duplicate files (groups with count > 1)
+    let query = format!(
+        "SELECT f.{}, f.size, COUNT(*) as count
+         FROM files f
+         WHERE f.{} IS NOT NULL
+         AND NOT EXISTS (
+             SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
+         )
+         AND EXISTS (
+             SELECT 1 FROM scan_roots sr
+             WHERE sr.find_duplicates = 1
+             AND f.path LIKE sr.path || '%'
+         )
+         GROUP BY f.{}, f.size
+         HAVING count > 1",
+        hash_column, hash_column, hash_column
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut groups_created = 0;
+
+    for (hash, size, file_count) in rows {
+        // Insert the group
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![hash, hash_type, size, file_count, now],
+        )?;
+        let group_id = conn.last_insert_rowid();
+
+        // Find and insert all files in this group
+        let files_query = format!(
+            "SELECT id FROM files WHERE {} = ?1 AND size = ?2
+             AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)
+             AND EXISTS (
+                 SELECT 1 FROM scan_roots sr
+                 WHERE sr.find_duplicates = 1
+                 AND files.path LIKE sr.path || '%'
+             )",
+            hash_column
+        );
+        let mut files_stmt = conn.prepare(&files_query)?;
+        let file_ids: Vec<i64> = files_stmt
+            .query_map(params![hash, size], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for file_id in file_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO duplicate_group_files (group_id, file_id) VALUES (?1, ?2)",
+                params![group_id, file_id],
+            )?;
+        }
+
+        groups_created += 1;
+    }
+
+    conn.execute("COMMIT", [])?;
+    Ok(groups_created)
+}
+
+/// Get duplicate groups from cache
+/// Returns cached duplicate groups with file paths and IDs
+pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
+    let hash_type = if use_content_hash { "content" } else { "metadata" };
+
+    let mut stmt = conn.prepare(
+        "SELECT dg.id, dg.hash, dg.size, dg.file_count
+         FROM duplicate_groups dg
+         WHERE dg.hash_type = ?1
+         ORDER BY dg.file_count DESC, dg.size DESC"
+    )?;
+
+    let groups: Vec<(i64, String, i64, i64)> = stmt
+        .query_map(params![hash_type], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut result = Vec::with_capacity(groups.len());
+
+    for (group_id, hash, size, file_count) in groups {
+        // Get files for this group
+        let mut files_stmt = conn.prepare(
+            "SELECT f.id, f.path
+             FROM duplicate_group_files dgf
+             JOIN files f ON f.id = dgf.file_id
+             WHERE dgf.group_id = ?1
+             ORDER BY f.path"
+        )?;
+
+        let files: Vec<(i64, String)> = files_stmt
+            .query_map(params![group_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Skip if no files found (may have been deleted)
+        if files.is_empty() {
+            continue;
+        }
+
+        let file_ids: Vec<i64> = files.iter().map(|(id, _)| *id).collect();
+        let file_paths: Vec<String> = files.iter().map(|(_, path)| path.clone()).collect();
+
+        result.push(DuplicateGroup {
+            id: Some(group_id),
+            size,
+            content_hash: hash,
+            file_count: file_count as i32,
+            file_paths,
+            file_ids,
+        });
+    }
+
+    Ok(result)
+}
+
+/// Check if duplicate cache exists and has data
+pub fn has_duplicate_cache(conn: &Connection, use_content_hash: bool) -> Result<bool> {
+    let hash_type = if use_content_hash { "content" } else { "metadata" };
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM duplicate_groups WHERE hash_type = ?1",
+        params![hash_type],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Check if file already exists in database
 pub fn file_exists(conn: &Connection, path: &str) -> Result<bool> {
     let count: i32 = conn.query_row(

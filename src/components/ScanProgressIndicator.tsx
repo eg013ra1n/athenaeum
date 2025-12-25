@@ -6,6 +6,7 @@ const phaseConfig: Record<string, { label: string; icon: typeof Loader2 }> = {
   processing: { label: 'Processing files', icon: Loader2 },
   inserting: { label: 'Saving to database', icon: Database },
   calibrating: { label: 'Creating calibration sets', icon: Sparkles },
+  caching: { label: 'Building duplicate cache...', icon: Database },
 };
 
 export function ScanProgressIndicator() {

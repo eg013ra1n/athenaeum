@@ -63,7 +63,7 @@ pub async fn get_frames_with_missing_metadata(
         .collect())
 }
 
-/// Get duplicate file groups
+/// Get duplicate file groups (from cache)
 #[tauri::command]
 pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateGroup>, String> {
     let state_lock = state.db.lock().unwrap();
@@ -75,6 +75,12 @@ pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateG
         .get_duplicates_use_content_hash(&conn)
         .unwrap_or(false);
 
+    // Try to get from cache first (fast path)
+    if db::has_duplicate_cache(&conn, use_content_hash).unwrap_or(false) {
+        return db::get_cached_duplicates(&conn, use_content_hash).map_err(|e| e.to_string());
+    }
+
+    // Cache not populated - compute on the fly (slow path, for first load before any scan)
     db::find_duplicate_groups(&conn, use_content_hash).map_err(|e| e.to_string())
 }
 

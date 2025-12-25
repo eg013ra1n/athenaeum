@@ -124,7 +124,7 @@ pub async fn send_all_to_void(state: State<'_, AppState>) -> Result<usize, Strin
     db::send_all_to_void(&conn).map_err(|e| e.to_string())
 }
 
-/// Get folders with high duplicate file similarity
+/// Get folders with high duplicate file similarity (from cache)
 #[tauri::command]
 pub async fn get_duplicate_folders(
     threshold: Option<f64>,
@@ -135,6 +135,13 @@ pub async fn get_duplicate_folders(
     let conn = db.conn();
 
     let similarity_threshold = threshold.unwrap_or(70.0);
+
+    // Try to get from cache first (fast path)
+    if db::has_folder_similarity_cache(&conn).unwrap_or(false) {
+        return db::get_cached_folder_similarity(&conn, similarity_threshold).map_err(|e| e.to_string());
+    }
+
+    // Cache not populated - compute on the fly (slow path, for first load before any scan)
     db::find_duplicate_folders(&conn, similarity_threshold).map_err(|e| e.to_string())
 }
 

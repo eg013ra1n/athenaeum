@@ -1,7 +1,10 @@
 // File scanner module
 // Handles directory traversal and metadata extraction
 
-use crate::db::{file_exists, insert_file, insert_frame, insert_fits_header};
+use crate::db::{
+    file_exists, insert_file, insert_frame, insert_fits_header,
+    rebuild_duplicate_groups_cache, rebuild_folder_similarity_cache,
+};
 use crate::fits_parser::{parse_fits, parse_xisf, extract_fits_header, extract_xisf_header};
 use crate::duplicates::compute_metadata_hash;
 use crate::models::{File, Frame, FileFormat, ImageType};
@@ -743,6 +746,10 @@ pub fn scan_directory_parallel(
     // Commit transaction
     let _ = conn.execute("COMMIT", []);
 
+    // Force WAL checkpoint to consolidate writes and reduce post-scan CPU activity
+    // TRUNCATE mode moves all data from WAL to main DB and truncates the WAL file
+    let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+
     // Collect errors
     result.errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
     result.lights_count = lights_count;
@@ -789,6 +796,27 @@ pub fn scan_directory_parallel(
                 result.errors.push(format!("Failed to auto-create calibration sets: {}", e));
             }
         }
+    }
+
+    // Phase 4: Rebuild duplicate caches
+    // This runs once after all scanning to pre-compute duplicate data
+    emit_progress(
+        app_handle,
+        root_id,
+        result.files_processed,
+        result.files_processed,
+        None,
+        "caching",
+    );
+
+    // Rebuild duplicate groups cache (using metadata hash by default)
+    if let Err(e) = rebuild_duplicate_groups_cache(conn, false) {
+        result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
+    }
+
+    // Rebuild folder similarity cache (threshold 70%)
+    if let Err(e) = rebuild_folder_similarity_cache(conn, 70.0) {
+        result.errors.push(format!("Failed to rebuild folder similarity cache: {}", e));
     }
 
     // Emit completion

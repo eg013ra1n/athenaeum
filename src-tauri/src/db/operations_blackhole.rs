@@ -217,3 +217,85 @@ pub fn find_duplicate_folders(
 
     Ok(similarities)
 }
+
+/// Rebuild the folder similarity cache table
+/// This clears existing cache and recomputes all folder similarities
+pub fn rebuild_folder_similarity_cache(
+    conn: &Connection,
+    similarity_threshold: f64,
+) -> Result<usize> {
+    // Start transaction
+    conn.execute("BEGIN TRANSACTION", [])?;
+
+    // Clear existing cache
+    conn.execute("DELETE FROM folder_similarity", [])?;
+
+    // Compute folder similarities (reuse existing logic)
+    let similarities = find_duplicate_folders(conn, similarity_threshold)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut count = 0;
+
+    for sim in similarities {
+        conn.execute(
+            "INSERT INTO folder_similarity
+             (folder_a, folder_b, shared_files, shared_size, unique_a, unique_b, similarity_percent, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                sim.folder_a,
+                sim.folder_b,
+                sim.shared_files,
+                sim.shared_size,
+                sim.unique_a,
+                sim.unique_b,
+                sim.similarity_percent,
+                now
+            ],
+        )?;
+        count += 1;
+    }
+
+    conn.execute("COMMIT", [])?;
+    Ok(count)
+}
+
+/// Get folder similarity from cache
+pub fn get_cached_folder_similarity(
+    conn: &Connection,
+    similarity_threshold: f64,
+) -> Result<Vec<FolderSimilarity>> {
+    let mut stmt = conn.prepare(
+        "SELECT folder_a, folder_b, shared_files, shared_size, unique_a, unique_b, similarity_percent
+         FROM folder_similarity
+         WHERE similarity_percent >= ?1
+         ORDER BY similarity_percent DESC"
+    )?;
+
+    let results = stmt
+        .query_map(params![similarity_threshold], |row| {
+            Ok(FolderSimilarity {
+                folder_a: row.get(0)?,
+                folder_b: row.get(1)?,
+                shared_files: row.get(2)?,
+                shared_size: row.get(3)?,
+                unique_a: row.get(4)?,
+                unique_b: row.get(5)?,
+                similarity_percent: row.get(6)?,
+                shared_file_ids: Vec::new(), // Not stored in cache
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Check if folder similarity cache exists and has data
+pub fn has_folder_similarity_cache(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM folder_similarity",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}

@@ -19,8 +19,8 @@ export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
   const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, relinkScanRoot } = useScanRootsWithAvailability();
   const { startScanWithProgress, isScanning } = useScanProgressContext();
-  const { duplicates, loading: dupsLoading, error: dupsError, refresh: refreshDuplicates } = useDuplicates();
-  const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, refresh: refreshFolders } = useDuplicateFolders(70);
+  const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
+  const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
   const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
   const [typeFilter, setTypeFilter] = useState<string>('All Types');
@@ -92,14 +92,19 @@ export default function FileManager() {
     }
   };
 
-  // Check missing files for all available scan roots when they load
+  // Lazy load duplicates when Duplicates tab is clicked
   useEffect(() => {
-    scanRoots.forEach(root => {
-      if (root.id && root.is_available && !missingFilesMap[root.id]) {
-        checkMissingFiles(root.id);
-      }
-    });
-  }, [scanRoots]);
+    if (activeTab === 'duplicates') {
+      loadDuplicates();
+    }
+  }, [activeTab, loadDuplicates]);
+
+  // Lazy load folder similarity when Folders sub-tab is clicked
+  useEffect(() => {
+    if (activeTab === 'duplicates' && duplicatesView === 'folders') {
+      loadFolders();
+    }
+  }, [activeTab, duplicatesView, loadFolders]);
 
   // Load frames with missing metadata
   const loadMissingMetadata = async (category: MissingCategory) => {
@@ -313,7 +318,7 @@ export default function FileManager() {
         >
           <div className="flex items-center gap-2">
             <Copy size={16} />
-            Duplicates ({duplicates.length})
+            Duplicates
           </div>
         </button>
         <button
