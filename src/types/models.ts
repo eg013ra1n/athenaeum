@@ -701,3 +701,47 @@ export interface LightFrameWithCalibration {
   offset: number | null;
   calibration_status: FrameCalibrationStatus;
 }
+
+// ========== Calendar View Interfaces ==========
+
+/** Summary of a frame set for calendar display */
+export interface CalendarFrameSetSummary {
+  id: number;
+  name: string | null;
+  objectName: string | null;
+  frameCount: number;
+  totalExposureSeconds: number;
+  ra: number | null;
+  dec: number | null;
+  filters: string[];
+}
+
+/** Group of unorganized frames for calendar display */
+export interface CalendarUnorganizedGroup {
+  id: string;
+  objectName: string | null;
+  frameCount: number;
+  totalExposureSeconds: number;
+  ra: number | null;
+  dec: number | null;
+  filters: string[];
+  frameIds: number[];
+}
+
+/** Summary of imaging activity for a single calendar day */
+export interface CalendarDayEvent {
+  date: string; // YYYY-MM-DD
+  frameSets: CalendarFrameSetSummary[];
+  unorganizedGroups: CalendarUnorganizedGroup[];
+  totalFrameCount: number;
+  totalExposureSeconds: number;
+}
+
+/** Full calendar data for a month */
+export interface CalendarMonthData {
+  year: number;
+  month: number; // 1-12
+  days: CalendarDayEvent[];
+  totalFrameCount: number;
+  totalExposureSeconds: number;
+}

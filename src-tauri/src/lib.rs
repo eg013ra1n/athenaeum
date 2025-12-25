@@ -130,6 +130,7 @@ pub fn run() {
             commands::query_frames_in_circle,
             commands::query_frames_in_bounds,
             commands::query_frames_in_polygon,
+            commands::get_calendar_month_data,
             commands::create_frame_set_from_selection,
             commands::find_calibration_for_frame_set,
             commands::get_calibration_status,

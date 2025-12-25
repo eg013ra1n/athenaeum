@@ -34,6 +34,7 @@ pub mod calibration;
 pub mod duplicates;
 pub mod cache;
 pub mod spatial;
+pub mod calendar;
 pub mod utils;
 
 // Re-export all commands for convenient access
@@ -46,3 +47,4 @@ pub use calibration::*;
 pub use duplicates::*;
 pub use cache::*;
 pub use spatial::*;
+pub use calendar::*;
