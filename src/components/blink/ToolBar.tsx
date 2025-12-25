@@ -6,7 +6,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Loader2,
-  XSquare,
   Trash2,
   RotateCcw,
 } from "lucide-react";
@@ -25,7 +24,6 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   selectionCount,
   blackholedInSelectionCount,
   nonBlackholedInSelectionCount,
-  onClearSelection,
   onBlackhole,
   onRestore,
   isBlackholing,
@@ -70,7 +68,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           <input
             type="range"
             min="0.5"
-            max="10"
+            max="25"
             step="0.5"
             value={blinkSpeed}
             onChange={(e) => onSpeedChange(parseFloat(e.target.value))}
@@ -129,19 +127,11 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
                 Blackhole ({nonBlackholedInSelectionCount})
               </button>
             )}
-            <button
-              onClick={onClearSelection}
-              className="flex items-center gap-1 px-2 py-1 text-sm text-gray-300 hover:text-white hover:bg-gray-700 rounded transition-colors"
-              title="Clear selection"
-            >
-              <XSquare size={16} />
-              Clear
-            </button>
           </>
         )}
 
         <div className="text-xs text-gray-500 mr-2">
-          Space: Select | Ctrl+Space: Play | Shift+Click: Range
+          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed
         </div>
         <button
           onClick={onClose}

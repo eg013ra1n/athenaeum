@@ -248,17 +248,29 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       switch (e.key) {
         case " ":
           e.preventDefault();
-          (e.ctrlKey || e.metaKey) ? setIsPlaying((p) => !p) : toggleCurrentFrameSelection();
+          toggleCurrentFrameSelection();
           break;
-        case "ArrowLeft":
+        case "Enter":
+          e.preventDefault();
+          setIsPlaying((p) => !p);
+          break;
+        case "ArrowUp":
           e.preventDefault();
           setIsPlaying(false);
           setCurrentIndex((p) => Math.max(0, p - 1));
           break;
-        case "ArrowRight":
+        case "ArrowDown":
           e.preventDefault();
           setIsPlaying(false);
           setCurrentIndex((p) => Math.min(fitsFrames.length - 1, p + 1));
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          setBlinkSpeed((p) => Math.max(0.5, p - 0.5));
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          setBlinkSpeed((p) => Math.min(25, p + 0.5));
           break;
         case "Escape":
           e.preventDefault();
