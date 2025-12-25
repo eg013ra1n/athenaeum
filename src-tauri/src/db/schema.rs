@@ -420,6 +420,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_folder_sim_percent ON folder_similarity(similarity_percent DESC)",
         [],
     )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_members_frame ON session_members(frame_id)",
+        [],
+    )?;
 
     // Migrations - add columns to existing tables if they don't exist
     // Add find_duplicates to scan_roots table (migration for existing databases)
