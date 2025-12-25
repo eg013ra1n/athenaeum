@@ -734,13 +734,14 @@ pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Resul
 
     let mut result = Vec::with_capacity(groups.len());
 
-    for (group_id, hash, size, file_count) in groups {
-        // Get files for this group
+    for (group_id, hash, size, _file_count) in groups {
+        // Get files for this group, excluding files in black_hole
         let mut files_stmt = conn.prepare(
             "SELECT f.id, f.path
              FROM duplicate_group_files dgf
              JOIN files f ON f.id = dgf.file_id
              WHERE dgf.group_id = ?1
+             AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)
              ORDER BY f.path"
         )?;
 
@@ -751,8 +752,8 @@ pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Resul
             .filter_map(|r| r.ok())
             .collect();
 
-        // Skip if no files found (may have been deleted)
-        if files.is_empty() {
+        // Skip if fewer than 2 files (no longer duplicates after black_hole filtering)
+        if files.len() < 2 {
             continue;
         }
 
@@ -763,7 +764,7 @@ pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Resul
             id: Some(group_id),
             size,
             content_hash: hash,
-            file_count: file_count as i32,
+            file_count: files.len() as i32,  // Use actual count after filtering
             file_paths,
             file_ids,
         });

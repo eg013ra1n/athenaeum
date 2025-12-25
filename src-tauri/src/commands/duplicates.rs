@@ -124,7 +124,9 @@ pub async fn send_all_to_void(state: State<'_, AppState>) -> Result<usize, Strin
     db::send_all_to_void(&conn).map_err(|e| e.to_string())
 }
 
-/// Get folders with high duplicate file similarity (from cache)
+/// Get folders with high duplicate file similarity
+/// Always computes fresh since folder similarity depends on current file state
+/// and can't easily filter out black_hole files from cached data
 #[tauri::command]
 pub async fn get_duplicate_folders(
     threshold: Option<f64>,
@@ -136,12 +138,8 @@ pub async fn get_duplicate_folders(
 
     let similarity_threshold = threshold.unwrap_or(70.0);
 
-    // Try to get from cache first (fast path)
-    if db::has_folder_similarity_cache(&conn).unwrap_or(false) {
-        return db::get_cached_folder_similarity(&conn, similarity_threshold).map_err(|e| e.to_string());
-    }
-
-    // Cache not populated - compute on the fly (slow path, for first load before any scan)
+    // Always compute fresh - folder similarity depends on current file state
+    // and the cache can't account for files moved to black_hole
     db::find_duplicate_folders(&conn, similarity_threshold).map_err(|e| e.to_string())
 }
 
