@@ -141,7 +141,7 @@ pub fn has_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Get master calibration sets for a specific camera
+/// Get master dark/bias calibration sets for a specific camera (MasterDark, MasterBias, MasterDarkFlat)
 pub fn get_camera_master_dark_library(
     conn: &Connection,
     instrume: &str,
@@ -166,6 +166,7 @@ pub fn get_camera_master_dark_library(
         FROM calibration_set
         WHERE instrume = ?1
         AND is_master_library = 1
+        AND imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')
         ORDER BY imagetyp, exptime, ccd_temp"
     )?;
 
@@ -209,9 +210,93 @@ pub fn get_camera_master_dark_library(
     Ok(sets)
 }
 
-/// Check if master dark library exists for camera
+/// Check if master dark library exists for camera (MasterDark, MasterBias, MasterDarkFlat)
 pub fn has_master_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1")?;
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(*) FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 1
+         AND imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')"
+    )?;
+    let count: i64 = stmt.query_row([instrume], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// Get master flat calibration sets for a specific camera (MasterFlat)
+pub fn get_camera_master_flat_library(
+    conn: &Connection,
+    instrume: &str,
+) -> Result<Vec<CalibrationSetDetail>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            id,
+            imagetyp,
+            exptime,
+            ccd_temp,
+            temp_min,
+            temp_max,
+            gain,
+            offset,
+            binning,
+            instrume,
+            filter,
+            date_start,
+            date_end,
+            date,
+            frame_count
+        FROM calibration_set
+        WHERE instrume = ?1
+        AND is_master_library = 1
+        AND imagetyp = 'MasterFlat'
+        ORDER BY filter, exptime, ccd_temp"
+    )?;
+
+    let sets = stmt
+        .query_map([instrume], |row| {
+            let imagetyp_str: String = row.get(1)?;
+            let imagetyp = ImageType::from_str(&imagetyp_str)
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+
+            let date_start: String = row.get(11)?;
+            let date_end: String = row.get(12)?;
+
+            // Generate date_display from date_start (YYYY-MM format)
+            let date_display = if let Ok(dt) = DateTime::parse_from_rfc3339(&date_start) {
+                dt.format("%Y-%m").to_string()
+            } else {
+                // Fallback if parsing fails
+                date_start.chars().take(7).collect()
+            };
+
+            Ok(CalibrationSetDetail {
+                id: Some(row.get(0)?),
+                imagetyp,
+                exptime: row.get(2)?,
+                ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                temp_min: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                temp_max: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                gain: row.get(6)?,
+                offset: row.get(7)?,
+                binning: row.get(8)?,
+                instrume: row.get(9)?,
+                filter: row.get(10)?,
+                date_start,
+                date_end,
+                date_display,
+                frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(sets)
+}
+
+/// Check if master flat library exists for camera
+pub fn has_master_flat_library(conn: &Connection, instrume: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(*) FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 1
+         AND imagetyp = 'MasterFlat'"
+    )?;
     let count: i64 = stmt.query_row([instrume], |row| row.get(0))?;
     Ok(count > 0)
 }

@@ -11,6 +11,25 @@ export enum ImageType {
   Flat = "Flat",
   Bias = "Bias",
   DarkFlat = "DarkFlat",
+  // Master calibration types (already calibrated, no sub-calibration needed)
+  MasterDark = "MasterDark",
+  MasterFlat = "MasterFlat",
+  MasterBias = "MasterBias",
+  MasterDarkFlat = "MasterDarkFlat",
+}
+
+// Helper function to check if an imagetyp is a master type
+export function isMasterType(imagetyp: ImageType | string): boolean {
+  return [
+    ImageType.MasterDark,
+    ImageType.MasterFlat,
+    ImageType.MasterBias,
+    ImageType.MasterDarkFlat,
+    "MasterDark",
+    "MasterFlat",
+    "MasterBias",
+    "MasterDarkFlat",
+  ].includes(imagetyp as ImageType);
 }
 
 export interface File {

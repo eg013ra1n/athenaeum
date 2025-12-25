@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings } from "lucide-react";
-import { CalibrationSetDetail, FileWithFrame, ImageType } from "../types/models";
+import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star } from "lucide-react";
+import { CalibrationSetDetail, FileWithFrame, ImageType, isMasterType } from "../types/models";
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import BlinkViewer from "./BlinkViewer";
@@ -217,17 +217,26 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 >
                   {/* Type */}
                   <td className="px-4 py-3">
-                    <span
-                      className={`px-2 py-1 rounded text-xs font-medium ${
-                        set.imagetyp === "Dark"
-                          ? "bg-purple-900/30 text-purple-400 border border-purple-700"
-                          : set.imagetyp === "Flat"
-                          ? "bg-yellow-900/30 text-yellow-400 border border-yellow-700"
-                          : "bg-blue-900/30 text-blue-400 border border-blue-700"
-                      }`}
-                    >
-                      {set.imagetyp}
-                    </span>
+                    <div className="flex items-center gap-1">
+                      {isMasterType(set.imagetyp) && (
+                        <Star size={12} className="text-amber-400 fill-amber-400" />
+                      )}
+                      <span
+                        className={`px-2 py-1 rounded text-xs font-medium ${
+                          set.imagetyp === "Dark" || set.imagetyp === "MasterDark"
+                            ? "bg-purple-900/30 text-purple-400 border border-purple-700"
+                            : set.imagetyp === "Flat" || set.imagetyp === "MasterFlat"
+                            ? "bg-yellow-900/30 text-yellow-400 border border-yellow-700"
+                            : set.imagetyp === "Bias" || set.imagetyp === "MasterBias"
+                            ? "bg-blue-900/30 text-blue-400 border border-blue-700"
+                            : set.imagetyp === "DarkFlat" || set.imagetyp === "MasterDarkFlat"
+                            ? "bg-indigo-900/30 text-indigo-400 border border-indigo-700"
+                            : "bg-gray-900/30 text-gray-400 border border-gray-700"
+                        }`}
+                      >
+                        {set.imagetyp}
+                      </span>
+                    </div>
                   </td>
 
                   {/* Filter (for flats) */}
@@ -298,7 +307,8 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                         <Eye size={14} />
                         {loadingFrames === set.id ? 'Loading...' : 'View'}
                       </button>
-                      {onEditSubCalibration && set.id !== null && set.imagetyp !== ImageType.Bias && (
+                      {/* Don't show Sub-Cal button for Bias or Master types (masters don't need sub-calibration) */}
+                      {onEditSubCalibration && set.id !== null && set.imagetyp !== ImageType.Bias && !isMasterType(set.imagetyp) && (
                         <button
                           onClick={(e) => {
                             e.stopPropagation();

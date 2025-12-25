@@ -1,6 +1,6 @@
 // Calibration commands - calibration frame matching and library management
 
-use crate::calibration::scan_integration::{create_calibration_sets_from_scan, CalibrationScanResult};
+use crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, CalibrationScanResult, MasterFrameIds};
 use crate::db::{self};
 use crate::models::*;
 use chrono::{DateTime, Utc};
@@ -133,6 +133,57 @@ pub async fn has_master_dark_library(
     let conn = db.conn();
 
     db::has_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_master_flat_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<DarkLibraryResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get thresholds from settings
+    let date_threshold = state.settings
+        .get_dark_library_date_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    let temp_threshold = state.settings
+        .get_dark_library_temp_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    // Create the master flat library
+    crate::calibration::create_master_flat_library(
+        &conn,
+        &instrume,
+        date_threshold,
+        temp_threshold,
+    ).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_master_flat_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<Vec<CalibrationSetDetail>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_camera_master_flat_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn has_master_flat_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<bool, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::has_master_flat_library(&conn, &instrume).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1282,17 +1333,42 @@ pub async fn refresh_calibration_library_for_camera(
     let darkflat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARKFLAT")
         .map_err(|e| format!("Failed to query darkflat frames: {}", e))?;
 
+    // Query master frame IDs
+    let master_dark_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARK")
+        .map_err(|e| format!("Failed to query master dark frames: {}", e))?;
+    let master_flat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERFLAT")
+        .map_err(|e| format!("Failed to query master flat frames: {}", e))?;
+    let master_bias_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERBIAS")
+        .map_err(|e| format!("Failed to query master bias frames: {}", e))?;
+    let master_darkflat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARKFLAT")
+        .map_err(|e| format!("Failed to query master darkflat frames: {}", e))?;
+
+    let master_frame_ids = MasterFrameIds {
+        master_dark_ids,
+        master_flat_ids,
+        master_bias_ids,
+        master_darkflat_ids,
+    };
+
     println!("   📊 Found frames - Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
         flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
+    if !master_frame_ids.is_empty() {
+        println!("   ⭐ Found master frames - Dark: {}, Flat: {}, Bias: {}, DarkFlat: {}",
+            master_frame_ids.master_dark_ids.len(),
+            master_frame_ids.master_flat_ids.len(),
+            master_frame_ids.master_bias_ids.len(),
+            master_frame_ids.master_darkflat_ids.len());
+    }
 
     // Step 3: Recreate calibration sets using the same algorithm as folder scanning
     // Sets will be matched by params + date range overlap, preserving IDs
-    let result = create_calibration_sets_from_scan(
+    let result = create_calibration_sets_from_scan_with_masters(
         &conn,
         flat_frame_ids,
         dark_frame_ids,
         bias_frame_ids,
         darkflat_frame_ids,
+        master_frame_ids,
     ).map_err(|e| format!("Failed to create calibration sets: {}", e))?;
 
     // Step 4: Delete orphaned sets (sets with no frames after reclustering)
@@ -1508,6 +1584,7 @@ pub async fn get_calibration_set_parameters(
 }
 
 /// Get compatible sub-calibration sets with match scores for a calibration set
+/// Note: Master sets (is_master_library = 1) don't need sub-calibration
 #[tauri::command]
 pub async fn get_subcalibration_sets_for_manual_selection(
     set_id: i64,
@@ -1518,6 +1595,18 @@ pub async fn get_subcalibration_sets_for_manual_selection(
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
+
+    // Check if this is a master set - masters don't need sub-calibration
+    let is_master_library: bool = conn.query_row(
+        "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+        [set_id],
+        |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
+    ).unwrap_or(false);
+
+    if is_master_library {
+        // Master sets are already calibrated - no sub-calibration needed
+        return Ok(Vec::new());
+    }
 
     // Load calibration matching config for scoring
     let config = crate::calibration::configurable_matcher::load_config(&conn);

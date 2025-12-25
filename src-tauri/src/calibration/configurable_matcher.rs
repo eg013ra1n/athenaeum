@@ -267,26 +267,45 @@ pub fn find_calibration_sets(
         _ => return Ok(Vec::new()),
     };
 
-    // Query calibration sets
-    let imagetyp_str = match calibration_type {
-        "flat" => "Flat",
-        "dark" => "Dark",
-        "bias" => "Bias",
-        "darkflat" => "DarkFlat",
+    // Query calibration sets - determine which image types to include
+    let (imagetyp_str, master_imagetyp_str) = match calibration_type {
+        "flat" => ("Flat", "MasterFlat"),
+        "dark" => ("Dark", "MasterDark"),
+        "bias" => ("Bias", "MasterBias"),
+        "darkflat" => ("DarkFlat", "MasterDarkFlat"),
         _ => return Ok(Vec::new()),
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
-                ccd_temp, temp_min, temp_max, date_start, date_end, telescop
-         FROM calibration_set
-         WHERE imagetyp = ?1
-         ORDER BY date_start DESC"
-    )?;
+    // Check master preference to decide whether to include master sets
+    let master_pref = config.get_master_preference(calibration_type);
+    let include_masters = matches!(master_pref, MasterPreference::PreferMaster);
 
+    let query = if include_masters {
+        // Include both regular calibration sets and master sets
+        format!(
+            "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
+                    ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
+             FROM calibration_set
+             WHERE imagetyp IN ('{}', '{}')
+             ORDER BY date_start DESC",
+            imagetyp_str, master_imagetyp_str
+        )
+    } else {
+        // Only include regular calibration sets (is_master_library = 0)
+        format!(
+            "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
+                    ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
+             FROM calibration_set
+             WHERE imagetyp = '{}' AND is_master_library = 0
+             ORDER BY date_start DESC",
+            imagetyp_str
+        )
+    };
+
+    let mut stmt = conn.prepare(&query)?;
     let mut candidates = Vec::new();
 
-    let rows = stmt.query_map([imagetyp_str], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,           // id
             row.get::<_, Option<f64>>(1)?,   // gain
@@ -302,12 +321,13 @@ pub fn find_calibration_sets(
             row.get::<_, String>(11)?,       // date_start
             row.get::<_, String>(12)?,       // date_end
             row.get::<_, Option<String>>(13)?, // telescop
+            row.get::<_, i32>(14).unwrap_or(0), // is_master_library
         ))
     })?;
 
     for row_result in rows {
         let (set_id, gain, offset, binning, instrume, exptime, focallen, filter,
-             ccd_temp, temp_min, temp_max, date_start, date_end, telescop) = row_result?;
+             ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library) = row_result?;
 
         // Use the average temp if available
         let set_temp = match (temp_min, temp_max) {
@@ -371,6 +391,7 @@ pub fn find_calibration_sets(
             temp_diff,
             date_warning,
             temp_warning,
+            is_master: is_master_library == 1,
         });
     }
 
@@ -379,9 +400,8 @@ pub fn find_calibration_sets(
         b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Apply master preference if configured
-    let master_pref = config.get_master_preference(calibration_type);
-    candidates = apply_master_preference(conn, candidates, master_pref)?;
+    // Apply master preference if configured (reuse the master_pref from above)
+    candidates = apply_master_preference(candidates, master_pref);
 
     Ok(candidates)
 }
@@ -458,30 +478,18 @@ pub fn score_match(
 
 /// Apply master preference to sort candidates
 fn apply_master_preference(
-    conn: &Connection,
     mut candidates: Vec<CalibrationCandidate>,
     preference: MasterPreference,
-) -> Result<Vec<CalibrationCandidate>> {
+) -> Vec<CalibrationCandidate> {
     match preference {
-        MasterPreference::NoPreference => Ok(candidates),
+        MasterPreference::NoPreference => candidates,
         MasterPreference::PreferMaster | MasterPreference::PreferFrameset => {
-            // Separate into masters and non-masters
+            // Separate into masters and non-masters using the is_master field
             let mut masters = Vec::new();
             let mut framesets = Vec::new();
 
             for candidate in candidates.drain(..) {
-                // Check if this set contains any master frames
-                let is_master: bool = conn.query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM calibration_set_frames csf
-                        JOIN frames f ON csf.frame_id = f.id
-                        WHERE csf.set_id = ?1 AND f.is_master = 1
-                    )",
-                    [candidate.set_id],
-                    |row| row.get(0),
-                ).unwrap_or(false);
-
-                if is_master {
+                if candidate.is_master {
                     masters.push(candidate);
                 } else {
                     framesets.push(candidate);
@@ -492,11 +500,11 @@ fn apply_master_preference(
             match preference {
                 MasterPreference::PreferMaster => {
                     masters.extend(framesets);
-                    Ok(masters)
+                    masters
                 }
                 MasterPreference::PreferFrameset => {
                     framesets.extend(masters);
-                    Ok(framesets)
+                    framesets
                 }
                 _ => unreachable!(),
             }

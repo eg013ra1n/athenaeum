@@ -70,6 +70,12 @@ pub fn scan_directory(
     let mut darkflat_frame_ids: Vec<i64> = Vec::new();
     let mut lights_count: usize = 0;
 
+    // Track master calibration frame IDs
+    let mut master_dark_ids: Vec<i64> = Vec::new();
+    let mut master_flat_ids: Vec<i64> = Vec::new();
+    let mut master_bias_ids: Vec<i64> = Vec::new();
+    let mut master_darkflat_ids: Vec<i64> = Vec::new();
+
     for (idx, file_path) in files.iter().enumerate() {
         if let Some(ref cb) = progress_callback {
             cb(ScanProgress {
@@ -97,7 +103,12 @@ pub fn scan_directory(
                         ImageType::Dark => dark_frame_ids.push(frame_id),
                         ImageType::Bias => bias_frame_ids.push(frame_id),
                         ImageType::DarkFlat => darkflat_frame_ids.push(frame_id),
-                        _ => {} // Unknown types - no tracking
+                        // Master calibration frames
+                        ImageType::MasterDark => master_dark_ids.push(frame_id),
+                        ImageType::MasterFlat => master_flat_ids.push(frame_id),
+                        ImageType::MasterBias => master_bias_ids.push(frame_id),
+                        ImageType::MasterDarkFlat => master_darkflat_ids.push(frame_id),
+                        _ => {} // Unknown types (MasterLight) - no tracking
                     }
                 }
             }
@@ -127,17 +138,40 @@ pub fn scan_directory(
         || !bias_frame_ids.is_empty()
         || !darkflat_frame_ids.is_empty();
 
-    if has_calibration_frames {
-        match crate::calibration::scan_integration::create_calibration_sets_from_scan(
+    let has_master_frames = !master_dark_ids.is_empty()
+        || !master_flat_ids.is_empty()
+        || !master_bias_ids.is_empty()
+        || !master_darkflat_ids.is_empty();
+
+    if has_calibration_frames || has_master_frames {
+        use crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, MasterFrameIds};
+
+        let master_frame_ids = MasterFrameIds {
+            master_dark_ids,
+            master_flat_ids,
+            master_bias_ids,
+            master_darkflat_ids,
+        };
+
+        match create_calibration_sets_from_scan_with_masters(
             conn,
             flat_frame_ids,
             dark_frame_ids,
             bias_frame_ids,
             darkflat_frame_ids,
+            master_frame_ids,
         ) {
             Ok(cal_result) => {
                 result.calibration_sets_created = cal_result.sets_created as usize;
-                println!("Auto-created {} calibration sets from scan", cal_result.sets_created);
+                let master_total = cal_result.master_dark_sets_created
+                    + cal_result.master_flat_sets_created
+                    + cal_result.master_bias_sets_created
+                    + cal_result.master_darkflat_sets_created;
+                if master_total > 0 {
+                    println!("Auto-created {} calibration sets from scan ({} master)", cal_result.sets_created, master_total);
+                } else {
+                    println!("Auto-created {} calibration sets from scan", cal_result.sets_created);
+                }
             }
             Err(e) => {
                 // Surface errors to user instead of just logging

@@ -147,12 +147,26 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
 /// Find Dark or Bias calibration for a Flat calibration set
 /// Uses configurable matching rules with fallback chain (DarkFlat → Dark → Bias)
 /// Creates sets on-demand if not found
+/// Note: Master sets (is_master_library = 1) don't need sub-calibration
 pub fn find_calibration_for_flat_set(
     conn: &Connection,
     flat_set_id: i64,
     _tolerance: &CalibrationTolerance,
     state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
+    // Check if this is a master set - masters don't need sub-calibration
+    let is_master_library: bool = conn.query_row(
+        "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+        [flat_set_id],
+        |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
+    ).unwrap_or(false);
+
+    if is_master_library {
+        // Master sets are already calibrated - no sub-calibration needed
+        println!("  ⭐ Flat set {} is a master - no sub-calibration needed", flat_set_id);
+        return Ok(Vec::new());
+    }
+
     // Get a representative frame from the flat set to use for matching
     let mut stmt = conn.prepare(
         "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 LIMIT 1"
@@ -197,12 +211,26 @@ pub fn find_calibration_for_flat_set(
 /// Find Bias calibration for a Dark calibration set
 /// Only returns Bias if "use_bias_for_dark_optimization" is enabled in config
 /// Creates Bias on-demand if not found
+/// Note: Master sets (is_master_library = 1) don't need sub-calibration
 pub fn find_calibration_for_dark_set(
     conn: &Connection,
     dark_set_id: i64,
     _tolerance: &CalibrationTolerance,
     state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
+    // Check if this is a master set - masters don't need sub-calibration
+    let is_master_library: bool = conn.query_row(
+        "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+        [dark_set_id],
+        |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
+    ).unwrap_or(false);
+
+    if is_master_library {
+        // Master sets are already calibrated - no sub-calibration needed
+        println!("  ⭐ Dark set {} is a master - no sub-calibration needed", dark_set_id);
+        return Ok(Vec::new());
+    }
+
     // Get a representative frame from the dark set
     let mut stmt = conn.prepare(
         "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 LIMIT 1"

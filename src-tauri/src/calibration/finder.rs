@@ -11,4 +11,5 @@ pub struct CalibrationCandidate {
     pub temp_diff: Option<f64>,
     pub date_warning: bool,
     pub temp_warning: bool,
+    pub is_master: bool,  // Whether this is a master calibration set (is_master_library = 1)
 }
