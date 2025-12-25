@@ -217,3 +217,44 @@ pub fn find_duplicate_folders(
 
     Ok(similarities)
 }
+
+/// Rebuild the folder similarity cache table
+/// This clears existing cache and recomputes all folder similarities
+pub fn rebuild_folder_similarity_cache(
+    conn: &Connection,
+    similarity_threshold: f64,
+) -> Result<usize> {
+    // Start transaction
+    conn.execute("BEGIN TRANSACTION", [])?;
+
+    // Clear existing cache
+    conn.execute("DELETE FROM folder_similarity", [])?;
+
+    // Compute folder similarities (reuse existing logic)
+    let similarities = find_duplicate_folders(conn, similarity_threshold)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut count = 0;
+
+    for sim in similarities {
+        conn.execute(
+            "INSERT INTO folder_similarity
+             (folder_a, folder_b, shared_files, shared_size, unique_a, unique_b, similarity_percent, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                sim.folder_a,
+                sim.folder_b,
+                sim.shared_files,
+                sim.shared_size,
+                sim.unique_a,
+                sim.unique_b,
+                sim.similarity_percent,
+                now
+            ],
+        )?;
+        count += 1;
+    }
+
+    conn.execute("COMMIT", [])?;
+    Ok(count)
+}

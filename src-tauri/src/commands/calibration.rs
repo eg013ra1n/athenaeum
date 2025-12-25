@@ -1,10 +1,9 @@
 // Calibration commands - calibration frame matching and library management
 
-use crate::calibration::scan_integration::{create_calibration_sets_from_scan, CalibrationScanResult};
-use crate::db::{self, Database};
+use crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, CalibrationScanResult, MasterFrameIds};
+use crate::db::{self};
 use crate::models::*;
 use chrono::{DateTime, Utc};
-use std::sync::Mutex;
 use tauri::State;
 
 use super::AppState;
@@ -134,6 +133,57 @@ pub async fn has_master_dark_library(
     let conn = db.conn();
 
     db::has_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_master_flat_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<DarkLibraryResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get thresholds from settings
+    let date_threshold = state.settings
+        .get_dark_library_date_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    let temp_threshold = state.settings
+        .get_dark_library_temp_threshold(&conn)
+        .map_err(|e| e.to_string())?;
+
+    // Create the master flat library
+    crate::calibration::create_master_flat_library(
+        &conn,
+        &instrume,
+        date_threshold,
+        temp_threshold,
+    ).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_master_flat_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<Vec<CalibrationSetDetail>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_camera_master_flat_library(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn has_master_flat_library(
+    state: State<'_, AppState>,
+    instrume: String,
+) -> Result<bool, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::has_master_flat_library(&conn, &instrume).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -293,7 +343,7 @@ pub async fn get_frame_calibration_hierarchy(
     let mut stmt = conn.prepare(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter,
                 imagetyp, is_master, ra, dec, objctra, objctdec, gain, offset,
-                xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, pixsz,
+                xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, ypixsz,
                 naxis1, naxis2, sitelat, lat_obs, sitelong, long_obs
          FROM frames WHERE id = ?1"
     ).map_err(|e| e.to_string())?;
@@ -338,7 +388,7 @@ pub async fn get_frame_calibration_hierarchy(
             set_temp: row.get(19)?,
             focallen: row.get(20)?,
             xpixsz: row.get(21)?,
-            pixsz: row.get(22)?,
+            ypixsz: row.get(22)?,
             naxis1: row.get(23)?,
             naxis2: row.get(24)?,
             sitelat: row.get(25)?,
@@ -346,6 +396,7 @@ pub async fn get_frame_calibration_hierarchy(
             sitelong: row.get(27)?,
             long_obs: row.get(28)?,
             override_: false,
+            swcreate: None,
         })
     }).map_err(|e| format!("Frame not found: {}", e))?;
 
@@ -450,6 +501,11 @@ pub async fn get_flat_group_options_for_frame_set(
         .collect();
     filters.sort();
 
+    // Get focallen threshold from config
+    let focallen_threshold = config.lights.flat
+        .as_ref()
+        .and_then(|f| f.focallen.matching_threshold);
+
     // Detect flat groups for each filter
     let mut results = std::collections::HashMap::new();
 
@@ -461,6 +517,7 @@ pub async fn get_flat_group_options_for_frame_set(
             binning,
             gain,
             focal_length,
+            focallen_threshold,
             time_cluster_minutes,
             date_range,
         ).map_err(|e| format!("Failed to detect flat groups: {}", e))?;
@@ -560,6 +617,9 @@ pub async fn set_calibration_matching_config(
     config: crate::calibration::CalibrationMatchingConfig,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Validate config before saving (ensures warning_threshold <= matching_threshold)
+    config.validate()?;
+
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -885,7 +945,7 @@ pub async fn clear_manual_calibration_override(
     let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
 
     let sql = match &calibration_type {
-        Some(ct) => format!(
+        Some(_ct) => format!(
             "DELETE FROM calibration_set_to_frames
              WHERE source_id IN ({}) AND source_type = 'frame'
              AND calibration_type = ?{} AND is_manual_override = 1",
@@ -1225,10 +1285,11 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
 
 /// Refresh calibration library for a specific camera
 ///
-/// This command:
-/// 1. Deletes all existing calibration sets for the camera
+/// This command preserves calibration set IDs by:
+/// 1. Clearing frame memberships (but keeping the sets)
 /// 2. Queries all calibration frame IDs for the camera (Flat, Dark, Bias, DarkFlat)
-/// 3. Recreates calibration sets using the same algorithm as folder scanning
+/// 3. Reclusters and assigns frames to sets - sets are matched by params + date overlap
+/// 4. Deletes orphaned sets (sets with 0 frames after reclustering)
 #[tauri::command]
 pub async fn refresh_calibration_library_for_camera(
     state: State<'_, AppState>,
@@ -1240,11 +1301,24 @@ pub async fn refresh_calibration_library_for_camera(
 
     println!("🔄 Refreshing calibration library for camera: {}", instrume);
 
-    // Step 1: Delete all existing calibration sets for this camera
-    db::delete_all_calibration_sets_for_camera(&conn, &instrume)
-        .map_err(|e| format!("Failed to delete existing sets: {}", e))?;
+    // Step 1: Clear frame memberships for this camera's sets (but keep the sets)
+    // This allows reclustering to rebuild the memberships while preserving set IDs
+    conn.execute(
+        "DELETE FROM calibration_set_frames
+         WHERE set_id IN (
+             SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0
+         )",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to clear frame memberships: {}", e))?;
 
-    println!("   ✅ Deleted existing calibration sets");
+    // Reset frame counts to 0 for these sets
+    conn.execute(
+        "UPDATE calibration_set SET frame_count = 0
+         WHERE instrume = ?1 AND is_master_library = 0",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to reset frame counts: {}", e))?;
+
+    println!("   ✅ Cleared existing frame memberships (sets preserved for ID stability)");
 
     // Step 2: Query all calibration frame IDs for this camera
     let flat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "FLAT")
@@ -1259,19 +1333,56 @@ pub async fn refresh_calibration_library_for_camera(
     let darkflat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARKFLAT")
         .map_err(|e| format!("Failed to query darkflat frames: {}", e))?;
 
+    // Query master frame IDs
+    let master_dark_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARK")
+        .map_err(|e| format!("Failed to query master dark frames: {}", e))?;
+    let master_flat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERFLAT")
+        .map_err(|e| format!("Failed to query master flat frames: {}", e))?;
+    let master_bias_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERBIAS")
+        .map_err(|e| format!("Failed to query master bias frames: {}", e))?;
+    let master_darkflat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARKFLAT")
+        .map_err(|e| format!("Failed to query master darkflat frames: {}", e))?;
+
+    let master_frame_ids = MasterFrameIds {
+        master_dark_ids,
+        master_flat_ids,
+        master_bias_ids,
+        master_darkflat_ids,
+    };
+
     println!("   📊 Found frames - Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
         flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
+    if !master_frame_ids.is_empty() {
+        println!("   ⭐ Found master frames - Dark: {}, Flat: {}, Bias: {}, DarkFlat: {}",
+            master_frame_ids.master_dark_ids.len(),
+            master_frame_ids.master_flat_ids.len(),
+            master_frame_ids.master_bias_ids.len(),
+            master_frame_ids.master_darkflat_ids.len());
+    }
 
     // Step 3: Recreate calibration sets using the same algorithm as folder scanning
-    let result = create_calibration_sets_from_scan(
+    // Sets will be matched by params + date range overlap, preserving IDs
+    let result = create_calibration_sets_from_scan_with_masters(
         &conn,
         flat_frame_ids,
         dark_frame_ids,
         bias_frame_ids,
         darkflat_frame_ids,
+        master_frame_ids,
     ).map_err(|e| format!("Failed to create calibration sets: {}", e))?;
 
-    println!("🎉 Refresh complete - created {} calibration sets", result.sets_created);
+    // Step 4: Delete orphaned sets (sets with no frames after reclustering)
+    let deleted_orphans = conn.execute(
+        "DELETE FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to delete orphaned sets: {}", e))?;
+
+    if deleted_orphans > 0 {
+        println!("   🗑️  Deleted {} orphaned sets", deleted_orphans);
+    }
+
+    println!("🎉 Refresh complete - {} calibration sets active (IDs preserved)", result.sets_created);
 
     Ok(result)
 }
@@ -1292,4 +1403,510 @@ fn query_frame_ids_by_type(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ids)
+}
+
+// ========== Cleanup Commands ==========
+
+/// Result of cleanup operation
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubCalibrationCleanupResult {
+    pub sets_cleaned: usize,
+    pub details: Vec<String>,
+}
+
+/// Clean up duplicate sub-calibration links for flat calibration sets
+/// This removes Bias links when a Dark link exists (respecting fallback chain priority)
+#[tauri::command]
+pub async fn cleanup_duplicate_flat_subcalibrations(
+    state: State<'_, AppState>,
+) -> Result<SubCalibrationCleanupResult, String> {
+    use crate::calibration::configurable_matcher::load_config;
+    use rusqlite::params;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Load config to determine fallback priority
+    let config = load_config(&conn);
+    let use_bias = config.get_behavioral_options("flats")
+        .map(|opts| opts.use_bias_if_no_darks)
+        .unwrap_or(false);
+
+    println!("🧹 Starting sub-calibration cleanup (use_bias_if_no_darks={})", use_bias);
+
+    // Find calibration sets with multiple sub-calibrations
+    let mut stmt = conn.prepare(
+        "SELECT source_id, GROUP_CONCAT(calibration_type) as types
+         FROM calibration_set_to_frames
+         WHERE source_type = 'calibration_set'
+         GROUP BY source_id
+         HAVING COUNT(*) > 1"
+    ).map_err(|e| e.to_string())?;
+
+    let duplicates: Vec<(i64, String)> = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    }).map_err(|e| e.to_string())?
+    .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+
+    println!("  Found {} calibration sets with multiple sub-calibrations", duplicates.len());
+
+    let mut cleaned = 0;
+    let mut details: Vec<String> = Vec::new();
+
+    for (source_id, types) in duplicates {
+        // Priority: DarkFlat > Dark > Bias
+        let has_darkflat = types.contains("DarkFlat");
+        let has_dark = types.contains("Dark");
+        let has_bias = types.contains("Bias");
+
+        // Determine which to keep based on priority
+        let keep_type = if has_darkflat {
+            "DarkFlat"
+        } else if has_dark {
+            "Dark"
+        } else if has_bias && use_bias {
+            "Bias"
+        } else {
+            continue; // Skip if nothing to keep
+        };
+
+        // Count what we're deleting
+        let types_to_delete: Vec<&str> = ["DarkFlat", "Dark", "Bias"]
+            .iter()
+            .filter(|t| **t != keep_type && types.contains(*t))
+            .copied()
+            .collect();
+
+        if types_to_delete.is_empty() {
+            continue;
+        }
+
+        // Delete all except the one we're keeping
+        let deleted = conn.execute(
+            "DELETE FROM calibration_set_to_frames
+             WHERE source_id = ?1 AND source_type = 'calibration_set' AND calibration_type != ?2",
+            params![source_id, keep_type],
+        ).map_err(|e| e.to_string())?;
+
+        if deleted > 0 {
+            let detail = format!(
+                "Set #{}: kept {}, removed {} ({})",
+                source_id,
+                keep_type,
+                types_to_delete.len(),
+                types_to_delete.join(", ")
+            );
+            println!("  ✅ {}", detail);
+            details.push(detail);
+            cleaned += 1;
+        }
+    }
+
+    println!("🎉 Cleanup complete - cleaned {} sets", cleaned);
+
+    Ok(SubCalibrationCleanupResult {
+        sets_cleaned: cleaned,
+        details,
+    })
+}
+
+// ========== Sub-Calibration Selection Commands ==========
+
+/// Get parameters of a calibration set for sub-calibration selection display
+#[tauri::command]
+pub async fn get_calibration_set_parameters(
+    set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<CalibrationSetParameters, String> {
+    use crate::db::calibration_links::get_links_for_calibration_set;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Get calibration set details
+    let mut stmt = conn.prepare(
+        "SELECT id, imagetyp, instrume, binning, gain, offset, exptime, filter,
+                ccd_temp, date_start, date_end, frame_count
+         FROM calibration_set WHERE id = ?1"
+    ).map_err(|e| e.to_string())?;
+
+    let (imagetyp, instrume, binning, gain, offset, exptime, filter, ccd_temp, date_start, date_end, frame_count): (
+        String, Option<String>, Option<String>, Option<f64>, Option<f64>,
+        Option<f64>, Option<String>, Option<f64>, Option<String>, Option<String>, i64
+    ) = stmt.query_row([set_id], |row| {
+        Ok((
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+        ))
+    }).map_err(|e| format!("Calibration set not found: {}", e))?;
+
+    // Get current sub-calibration links
+    let links = get_links_for_calibration_set(&conn, set_id).map_err(|e| e.to_string())?;
+
+    let current_dark_set_id = links.iter()
+        .find(|l| l.calibration_type == "Dark")
+        .map(|l| l.calibration_set_id);
+    let current_darkflat_set_id = links.iter()
+        .find(|l| l.calibration_type == "DarkFlat")
+        .map(|l| l.calibration_set_id);
+    let current_bias_set_id = links.iter()
+        .find(|l| l.calibration_type == "Bias")
+        .map(|l| l.calibration_set_id);
+
+    Ok(CalibrationSetParameters {
+        set_id,
+        imagetyp,
+        instrume,
+        binning,
+        gain,
+        offset,
+        exptime,
+        filter,
+        ccd_temp,
+        date_start,
+        date_end,
+        frame_count,
+        current_dark_set_id,
+        current_darkflat_set_id,
+        current_bias_set_id,
+    })
+}
+
+/// Get compatible sub-calibration sets with match scores for a calibration set
+/// Note: Master sets (is_master_library = 1) don't need sub-calibration
+#[tauri::command]
+pub async fn get_subcalibration_sets_for_manual_selection(
+    set_id: i64,
+    calibration_type: String,  // "dark", "darkflat", "bias"
+    show_all: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<CalibrationSetWithScore>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Check if this is a master set - masters don't need sub-calibration
+    let is_master_library: bool = conn.query_row(
+        "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+        [set_id],
+        |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
+    ).unwrap_or(false);
+
+    if is_master_library {
+        // Master sets are already calibrated - no sub-calibration needed
+        return Ok(Vec::new());
+    }
+
+    // Load calibration matching config for scoring
+    let config = crate::calibration::configurable_matcher::load_config(&conn);
+
+    // Get the source calibration set to use as reference
+    let mut stmt = conn.prepare(
+        "SELECT instrume, binning, gain, offset, exptime, filter, ccd_temp, date_start, date_end
+         FROM calibration_set WHERE id = ?1"
+    ).map_err(|e| e.to_string())?;
+
+    let (instrume, binning, gain, offset, exptime, filter, ccd_temp, date_start, date_end): (
+        Option<String>, Option<String>, Option<f64>, Option<f64>,
+        Option<f64>, Option<String>, Option<f64>, Option<String>, Option<String>
+    ) = stmt.query_row([set_id], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+        ))
+    }).map_err(|e| format!("Calibration set not found: {}", e))?;
+
+    // Create pseudo light frame params for matching
+    let params = LightFrameParameters {
+        instrume: instrume.clone(),
+        binning: binning.clone(),
+        gain,
+        offset,
+        filter: filter.clone(),
+        avg_ccd_temp: ccd_temp,
+        avg_exptime: exptime,
+        exptime_range: exptime.map(|e| (e, e)),
+        frame_count: 1,
+        date_range: match (&date_start, &date_end) {
+            (Some(s), Some(e)) => Some((s.clone(), e.clone())),
+            _ => None,
+        },
+        current_flat_set_id: None,
+        current_dark_set_id: None,
+        current_bias_set_id: None,
+    };
+
+    // Get target calibration type
+    let imagetyp = match calibration_type.to_lowercase().as_str() {
+        "dark" => "DARK",
+        "darkflat" => "DARKFLAT",
+        "bias" => "BIAS",
+        _ => return Err(format!("Invalid calibration type for sub-calibration: {}", calibration_type)),
+    };
+
+    // Query all sets of this type
+    let mut stmt = conn.prepare(
+        "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
+                cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen
+         FROM calibration_set cs
+         WHERE UPPER(cs.imagetyp) = ?1
+         ORDER BY cs.date_start DESC"
+    ).map_err(|e| e.to_string())?;
+
+    let sets_iter = stmt.query_map([imagetyp], |row| {
+        Ok(CalibrationSetDetail {
+            id: row.get(0)?,
+            imagetyp: ImageType::from_str(row.get::<_, String>(1)?.as_str())
+                .unwrap_or(ImageType::Dark),
+            exptime: row.get(2)?,
+            ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            gain: row.get(4)?,
+            offset: row.get(5)?,
+            binning: row.get(6)?,
+            instrume: row.get(7)?,
+            filter: row.get(8)?,
+            date_start: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            date_end: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+            temp_min: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
+            temp_max: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
+            frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+            date_display: "".to_string(),
+        })
+    }).map_err(|e| e.to_string())?;
+
+    let sets: Vec<CalibrationSetDetail> = sets_iter
+        .filter_map(|r| r.ok())
+        .map(|mut set| {
+            if set.date_start == set.date_end {
+                set.date_display = set.date_start.chars().take(10).collect();
+            } else {
+                let start: String = set.date_start.chars().take(10).collect();
+                let end: String = set.date_end.chars().take(10).collect();
+                set.date_display = format!("{} - {}", start, end);
+            }
+            set
+        })
+        .collect();
+
+    // Calculate match score for each set using shared scoring logic
+    // Sub-calibration matching: instrume, binning, gain, offset must match exactly
+    // Scoring considers date proximity, temperature proximity, and exposure time proximity
+    let mut scored_sets: Vec<CalibrationSetWithScore> = Vec::new();
+
+    for set in sets {
+        let match_details = calculate_subcal_match_details(&params, &set, &calibration_type);
+
+        // Calculate exposure time difference for scoring
+        let exptime_diff = match (params.avg_exptime, set.exptime) {
+            (Some(p), Some(s)) => Some((p - s).abs()),
+            _ => None,
+        };
+
+        let match_score = calculate_subcal_match_score(&match_details, &calibration_type, exptime_diff, &config.scoring);
+
+        // Skip non-matching sets unless show_all is true
+        if !show_all && match_score < 0.1 {
+            continue;
+        }
+
+        scored_sets.push(CalibrationSetWithScore {
+            set,
+            match_score,
+            match_details,
+        });
+    }
+
+    // Sort by match score (highest first)
+    scored_sets.sort_by(|a, b| b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(scored_sets)
+}
+
+/// Calculate match details for sub-calibration
+fn calculate_subcal_match_details(
+    params: &LightFrameParameters,
+    set: &CalibrationSetDetail,
+    calibration_type: &str,
+) -> MatchDetails {
+    let instrume_match = match (&params.instrume, &set.instrume) {
+        (Some(p), Some(s)) => p.to_lowercase() == s.to_lowercase(),
+        (None, None) => true,
+        _ => false,
+    };
+
+    let binning_match = match (&params.binning, &set.binning) {
+        (Some(p), Some(s)) => p == s,
+        (None, None) => true,
+        _ => false,
+    };
+
+    let gain_match = match (params.gain, set.gain) {
+        (Some(p), Some(s)) => (p - s).abs() < 0.01,
+        (None, None) => true,
+        _ => false,
+    };
+
+    let offset_match = match (params.offset, set.offset) {
+        (Some(p), Some(s)) => (p - s).abs() < 0.01,
+        (None, None) => true,
+        _ => false,
+    };
+
+    // For Dark/DarkFlat sub-calibration of Flats, exposure time should be reasonably close
+    // Use 5 second tolerance (same as default matching_threshold in config)
+    // Bias doesn't need exptime match
+    let exptime_match = if calibration_type.to_lowercase() == "bias" {
+        true
+    } else {
+        match (params.avg_exptime, set.exptime) {
+            (Some(p), Some(s)) => (p - s).abs() <= 5.0,
+            (None, None) => true,
+            _ => false,
+        }
+    };
+
+    // Filter doesn't need to match for sub-calibration (Dark/Bias don't have filters)
+    let filter_match = true;
+
+    let temp_diff = match (params.avg_ccd_temp, set.ccd_temp) {
+        (Some(p), c) if c != 0.0 => Some((p - c).abs()),
+        _ => None,
+    };
+
+    let date_diff_days = calculate_date_diff_days(params, set);
+
+    MatchDetails {
+        instrume_match,
+        binning_match,
+        gain_match,
+        offset_match,
+        exptime_match,
+        filter_match,
+        temp_diff,
+        date_diff_days,
+    }
+}
+
+/// Calculate match score for sub-calibration using the shared scoring function.
+/// Critical parameters (instrume, binning, gain, offset) must match exactly for any score > 0.
+fn calculate_subcal_match_score(
+    details: &MatchDetails,
+    _calibration_type: &str,
+    exptime_diff: Option<f64>,
+    scoring_config: &crate::calibration::config::ScoringConfig,
+) -> f64 {
+    // Critical parameters MUST match - if any fail, return 0
+    if !details.instrume_match || !details.binning_match ||
+       !details.gain_match || !details.offset_match {
+        return 0.0;
+    }
+
+    // Use the shared scoring function from configurable_matcher
+    // This handles date, temperature, and exposure time scoring with configurable weights
+    crate::calibration::configurable_matcher::score_match(
+        Some(details.date_diff_days),
+        details.temp_diff,
+        exptime_diff,
+        scoring_config,
+    )
+}
+
+/// Manually assign a sub-calibration set to a calibration set
+#[tauri::command]
+pub async fn manual_assign_subcalibration(
+    source_set_id: i64,
+    calibration_set_id: i64,
+    calibration_type: String,  // "Dark", "DarkFlat", "Bias"
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use crate::db::calibration_links::insert_calibration_link;
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Validate calibration_type
+    let valid_types = ["Dark", "DarkFlat", "Bias"];
+    if !valid_types.contains(&calibration_type.as_str()) {
+        return Err(format!("Invalid sub-calibration type: {}", calibration_type));
+    }
+
+    // Create the calibration link with source_type = 'calibration_set'
+    let link = CalibrationLink {
+        id: None,
+        source_id: source_set_id,
+        source_type: "calibration_set".to_string(),
+        calibration_set_id,
+        calibration_type: calibration_type.clone(),
+        matched_at: Utc::now().to_rfc3339(),
+        match_score: Some(1.0),  // Manual assignment gets perfect score
+        date_warning: false,
+        temp_warning: false,
+        is_manual_override: true,
+    };
+
+    insert_calibration_link(&conn, &link)
+        .map_err(|e| format!("Failed to assign sub-calibration: {}", e))?;
+
+    println!(
+        "✅ Manually assigned {} set #{} as sub-calibration for set #{}",
+        calibration_type, calibration_set_id, source_set_id
+    );
+
+    Ok(())
+}
+
+/// Clear sub-calibration override for a calibration set
+#[tauri::command]
+pub async fn clear_subcalibration_override(
+    source_set_id: i64,
+    calibration_type: Option<String>,  // None = clear all sub-calibrations
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let deleted = match &calibration_type {
+        Some(ct) => {
+            conn.execute(
+                "DELETE FROM calibration_set_to_frames
+                 WHERE source_id = ?1 AND source_type = 'calibration_set' AND calibration_type = ?2",
+                rusqlite::params![source_set_id, ct],
+            ).map_err(|e| e.to_string())?
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM calibration_set_to_frames
+                 WHERE source_id = ?1 AND source_type = 'calibration_set'",
+                rusqlite::params![source_set_id],
+            ).map_err(|e| e.to_string())?
+        }
+    };
+
+    println!(
+        "✅ Cleared {} sub-calibration link(s) for set #{}",
+        deleted, source_set_id
+    );
+
+    Ok(deleted)
 }

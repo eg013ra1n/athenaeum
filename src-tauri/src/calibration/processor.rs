@@ -110,7 +110,7 @@ pub fn get_light_frames_from_frame_set(
         "SELECT f.id, f.file_id, f.object, f.date_obs, f.telescop, f.instrume,
                 f.exptime, f.filter, f.imagetyp, f.is_master, f.ra, f.dec, f.objctra, f.objctdec,
                 f.gain, f.offset, f.xbinning, f.ybinning, f.ccd_temp, f.set_temp,
-                f.focallen, f.xpixsz, f.pixsz, f.naxis1, f.naxis2, f.sitelat, f.lat_obs, f.sitelong, f.long_obs
+                f.focallen, f.xpixsz, f.ypixsz, f.naxis1, f.naxis2, f.sitelat, f.lat_obs, f.sitelong, f.long_obs
          FROM frames f
          JOIN session_members sm ON f.id = sm.frame_id
          JOIN sessions s ON sm.session_id = s.id
@@ -162,7 +162,7 @@ pub fn get_light_frames_from_frame_set(
             set_temp: row.get(19)?,
             focallen: row.get(20)?,
             xpixsz: row.get(21)?,
-            pixsz: row.get(22)?,
+            ypixsz: row.get(22)?,
             naxis1: row.get(23)?,
             naxis2: row.get(24)?,
             sitelat: row.get(25)?,
@@ -170,6 +170,7 @@ pub fn get_light_frames_from_frame_set(
             sitelong: row.get(27)?,
             long_obs: row.get(28)?,
             override_: false,
+            swcreate: None,
         })
     })?
     .collect::<Result<Vec<Frame>, _>>()?;
@@ -257,6 +258,7 @@ pub fn process_frame_set(
 }
 
 /// Process all light frames in a frame set with progress callback
+#[allow(dead_code)]
 pub fn process_frame_set_with_progress<F>(
     conn: &Connection,
     frame_set_id: i64,

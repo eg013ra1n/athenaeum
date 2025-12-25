@@ -22,6 +22,11 @@ pub struct CalibrationScanResult {
     pub dark_sets_created: i64,
     pub bias_sets_created: i64,
     pub darkflat_sets_created: i64,
+    // Master calibration sets (1 file = 1 set)
+    pub master_dark_sets_created: i64,
+    pub master_flat_sets_created: i64,
+    pub master_bias_sets_created: i64,
+    pub master_darkflat_sets_created: i64,
 }
 
 /// Default time clustering threshold in minutes
@@ -76,20 +81,54 @@ struct BiasGroupKey {
     offset: String,
 }
 
-/// Create calibration sets from newly scanned frames
+/// Master frame IDs for creating master calibration sets
+#[derive(Debug, Clone, Default)]
+pub struct MasterFrameIds {
+    pub master_dark_ids: Vec<i64>,
+    pub master_flat_ids: Vec<i64>,
+    pub master_bias_ids: Vec<i64>,
+    pub master_darkflat_ids: Vec<i64>,
+}
+
+impl MasterFrameIds {
+    pub fn is_empty(&self) -> bool {
+        self.master_dark_ids.is_empty()
+            && self.master_flat_ids.is_empty()
+            && self.master_bias_ids.is_empty()
+            && self.master_darkflat_ids.is_empty()
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.master_dark_ids.len()
+            + self.master_flat_ids.len()
+            + self.master_bias_ids.len()
+            + self.master_darkflat_ids.len()
+    }
+}
+
+/// Create calibration sets from newly scanned frames, including master frames
 ///
-/// This function is called after a directory scan completes to automatically
-/// create calibration sets from the newly scanned calibration frames.
-pub fn create_calibration_sets_from_scan(
+/// This extended function handles both regular calibration frames (grouped by parameters)
+/// and master frames (1 file = 1 set with is_master_library = 1).
+pub fn create_calibration_sets_from_scan_with_masters(
     conn: &Connection,
     flat_frame_ids: Vec<i64>,
     dark_frame_ids: Vec<i64>,
     bias_frame_ids: Vec<i64>,
     darkflat_frame_ids: Vec<i64>,
+    master_frame_ids: MasterFrameIds,
 ) -> Result<CalibrationScanResult> {
     println!("🔧 Creating calibration sets from scan:");
     println!("   Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
         flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
+    if !master_frame_ids.is_empty() {
+        println!("   Masters: {} total (Dark: {}, Flat: {}, Bias: {}, DarkFlat: {})",
+            master_frame_ids.total_count(),
+            master_frame_ids.master_dark_ids.len(),
+            master_frame_ids.master_flat_ids.len(),
+            master_frame_ids.master_bias_ids.len(),
+            master_frame_ids.master_darkflat_ids.len());
+    }
 
     // Load clustering settings from user config
     let config = load_config(conn);
@@ -132,6 +171,10 @@ pub fn create_calibration_sets_from_scan(
         dark_sets_created: 0,
         bias_sets_created: 0,
         darkflat_sets_created: 0,
+        master_dark_sets_created: 0,
+        master_flat_sets_created: 0,
+        master_bias_sets_created: 0,
+        master_darkflat_sets_created: 0,
     };
 
     // Process each calibration type with its specific clustering threshold
@@ -153,6 +196,20 @@ pub fn create_calibration_sets_from_scan(
     if !darkflat_frame_ids.is_empty() {
         result.darkflat_sets_created = create_dark_sets_from_frames(conn, &darkflat_frame_ids, "DarkFlat", darkflat_cluster_mins, darkflat_temp_threshold)?;
         result.sets_created += result.darkflat_sets_created;
+    }
+
+    // Process master frames (1 file = 1 set, no clustering needed)
+    if !master_frame_ids.is_empty() {
+        result.master_dark_sets_created = create_master_sets_from_frames(conn, &master_frame_ids.master_dark_ids, "MasterDark")?;
+        result.master_flat_sets_created = create_master_sets_from_frames(conn, &master_frame_ids.master_flat_ids, "MasterFlat")?;
+        result.master_bias_sets_created = create_master_sets_from_frames(conn, &master_frame_ids.master_bias_ids, "MasterBias")?;
+        result.master_darkflat_sets_created = create_master_sets_from_frames(conn, &master_frame_ids.master_darkflat_ids, "MasterDarkFlat")?;
+
+        let total_master_sets = result.master_dark_sets_created
+            + result.master_flat_sets_created
+            + result.master_bias_sets_created
+            + result.master_darkflat_sets_created;
+        result.sets_created += total_master_sets;
     }
 
     println!("✅ Created {} total calibration sets", result.sets_created);
@@ -571,18 +628,22 @@ fn create_dark_calibration_set_with_type(
     dark_group: &DarkGroup,
     imagetyp: &str,
 ) -> Result<i64> {
-    // Check if set already exists with same parameters
-    let date = dark_group.start_time.format("%Y-%m-%d").to_string();
+    // Check if set already exists with same parameters using date range overlap
+    let cluster_start = dark_group.start_time.to_rfc3339();
+    let cluster_end = dark_group.end_time.to_rfc3339();
 
     // Build query with NULL-aware comparisons for ALL parameters
-    // This is critical - must check exptime, gain, offset in addition to binning/instrume
+    // Use date range overlap: existing set overlaps with new cluster if
+    // existing.date_start <= cluster.end AND existing.date_end >= cluster.start
     let existing_set_id: Option<i64> = {
         let mut query = String::from(
             "SELECT id FROM calibration_set
-             WHERE imagetyp = ?1 AND date = ?2 AND frame_count > 0"
+             WHERE imagetyp = ?1
+             AND date_start IS NOT NULL AND date_end IS NOT NULL
+             AND date_start <= ?2 AND date_end >= ?3"
         );
 
-        let mut param_count = 2;
+        let mut param_count = 3;
 
         // NULL-aware comparison for binning
         if dark_group.binning.is_some() {
@@ -634,7 +695,9 @@ fn create_dark_calibration_set_with_type(
             let mut param_idx = 1;
             stmt.raw_bind_parameter(param_idx, imagetyp).ok()?;
             param_idx += 1;
-            stmt.raw_bind_parameter(param_idx, &date).ok()?;
+            stmt.raw_bind_parameter(param_idx, &cluster_end).ok()?;
+            param_idx += 1;
+            stmt.raw_bind_parameter(param_idx, &cluster_start).ok()?;
             param_idx += 1;
 
             if let Some(ref binning) = dark_group.binning {
@@ -690,6 +753,7 @@ fn create_dark_calibration_set_with_type(
     }
 
     // Create new calibration set
+    let date = dark_group.start_time.format("%Y-%m-%d").to_string();
     let date_start = dark_group.start_time.to_rfc3339();
     let date_end = dark_group.end_time.to_rfc3339();
     let frame_count = dark_group.frame_ids.len() as i64;
@@ -728,4 +792,88 @@ fn create_dark_calibration_set_with_type(
     }
 
     Ok(set_id)
+}
+
+/// Create master calibration sets from frame IDs (1 file = 1 set)
+///
+/// Master frames are already calibrated and don't need sub-calibration.
+/// Each master frame becomes its own calibration set with is_master_library = 1.
+fn create_master_sets_from_frames(
+    conn: &Connection,
+    frame_ids: &[i64],
+    imagetyp: &str,
+) -> Result<i64> {
+    if frame_ids.is_empty() {
+        return Ok(0);
+    }
+
+    println!("   ⭐ Processing {} {} frames", frame_ids.len(), imagetyp);
+
+    let frames = query_frame_data(conn, frame_ids)?;
+    let mut sets_created = 0i64;
+
+    for frame in frames {
+        // Check if set already exists for this exact frame (based on date_obs and params)
+        let date_obs_str = frame.date_obs.map(|d| d.to_rfc3339());
+
+        // For masters, we check if a set already contains this exact frame
+        let existing_set_id: Option<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT set_id FROM calibration_set_frames WHERE frame_id = ?1"
+            )?;
+            let mut rows = stmt.query(rusqlite::params![frame.id])?;
+            match rows.next()? {
+                Some(row) => Some(row.get(0)?),
+                None => None,
+            }
+        };
+
+        if existing_set_id.is_some() {
+            // Frame already in a set, skip
+            continue;
+        }
+
+        // Create a new calibration set for this single master frame
+        let date = frame.date_obs
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let date_start = date_obs_str.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let date_end = date_start.clone();
+
+        conn.execute(
+            "INSERT INTO calibration_set
+             (imagetyp, exptime, filter, ccd_temp, gain, offset, binning, instrume, date,
+              date_start, date_end, temp_min, temp_max, frame_count, focallen, is_master_library)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, 1)",
+            rusqlite::params![
+                imagetyp,
+                frame.exptime,
+                frame.filter,
+                frame.ccd_temp,
+                frame.gain,
+                frame.offset,
+                frame.binning,
+                frame.instrume,
+                date,
+                date_start,
+                date_end,
+                frame.ccd_temp,
+                frame.ccd_temp,
+                frame.focallen,
+            ],
+        )?;
+
+        let set_id = conn.last_insert_rowid();
+
+        // Link the single frame to the set
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![set_id, frame.id],
+        )?;
+
+        sets_created += 1;
+    }
+
+    println!("   ✅ Created {} {} calibration sets", sets_created, imagetyp);
+    Ok(sets_created)
 }

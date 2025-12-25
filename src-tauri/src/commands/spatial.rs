@@ -1,8 +1,6 @@
 // Spatial query commands - sky coordinates and location-based operations
 
-use crate::db::{self, Database};
 use crate::models::*;
-use std::sync::Mutex;
 use tauri::State;
 
 use super::utils::calculate_fov;

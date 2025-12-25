@@ -2,9 +2,9 @@
 
 use crate::coordinates::{
     angular_distance, format_dec_sexagesimal, format_ra_sexagesimal,
-    parse_dec_sexagesimal, parse_ra_sexagesimal, spherical_mean,
+    parse_dec_sexagesimal, parse_ra_sexagesimal,
 };
-use crate::models::{Frame, FramesSet, ImageType};
+use crate::models::{Frame, ImageType};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
@@ -15,6 +15,7 @@ pub struct ClusterableFrame {
     pub ra_deg: f64,      // Normalized to [0, 360)
     pub dec_deg: f64,     // Normalized to [-90, 90]
     pub date_obs: Option<String>,
+    #[allow(dead_code)]
     pub object: Option<String>,
 }
 
@@ -51,7 +52,7 @@ impl FrameCluster {
         self.member_frame_ids.push(frame.frame_id);
 
         // Collect all coordinates including the new one
-        let coords: Vec<(f64, f64)> = self
+        let _coords: Vec<(f64, f64)> = self
             .member_frame_ids
             .iter()
             .enumerate()
@@ -332,7 +333,7 @@ mod tests {
             set_temp: None,
             focallen: None,
             xpixsz: None,
-            pixsz: None,
+            ypixsz: None,
             naxis1: None,
             naxis2: None,
             ra: Some(ra),
@@ -344,6 +345,7 @@ mod tests {
             objctra: None,
             objctdec: None,
             override_: false,
+            swcreate: None,
         }
     }
 

@@ -38,7 +38,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             set_temp REAL,
             focallen REAL,
             xpixsz REAL,
-            pixsz REAL,
+            ypixsz REAL,
             naxis1 INTEGER,
             naxis2 INTEGER,
             ra REAL,
@@ -52,6 +52,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             override INTEGER NOT NULL DEFAULT 0,
             imagetyp TEXT,
             is_master INTEGER NOT NULL DEFAULT 0,
+            swcreate TEXT,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         )",
         [],
@@ -102,6 +103,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             gain REAL,
             binning TEXT,
             instrume TEXT,
+            telescop TEXT,
             date TEXT NOT NULL,
             date_start TEXT,
             date_end TEXT,
@@ -255,6 +257,51 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Duplicate groups cache - stores pre-computed duplicate file groups
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS duplicate_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hash TEXT NOT NULL,
+            hash_type TEXT NOT NULL CHECK(hash_type IN ('content', 'metadata')),
+            size INTEGER NOT NULL,
+            file_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(hash, hash_type)
+        )",
+        [],
+    )?;
+
+    // Duplicate group files - links files to duplicate groups
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS duplicate_group_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            FOREIGN KEY (group_id) REFERENCES duplicate_groups(id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            UNIQUE(group_id, file_id)
+        )",
+        [],
+    )?;
+
+    // Folder similarity cache - stores pre-computed folder similarity results
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS folder_similarity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            folder_a TEXT NOT NULL,
+            folder_b TEXT NOT NULL,
+            shared_files INTEGER NOT NULL,
+            shared_size INTEGER NOT NULL,
+            unique_a INTEGER NOT NULL,
+            unique_b INTEGER NOT NULL,
+            similarity_percent REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(folder_a, folder_b)
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -268,6 +315,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)",
         [],
     )?;
+    // Path index for LIKE prefix queries (e.g., path LIKE '/foo/bar%')
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)",
+        [],
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_frames_date_obs ON frames(date_obs)",
         [],
@@ -278,6 +330,12 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_frames_instrume ON frames(instrume)",
+        [],
+    )?;
+    // Covering index for Equipment page query (get_all_cameras)
+    // Includes instrume, exptime, date_obs to avoid table lookups for aggregations
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_instrume_stats ON frames(instrume, exptime, date_obs)",
         [],
     )?;
     conn.execute(
@@ -342,6 +400,24 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_calib_link_type ON calibration_set_to_frames(calibration_type)",
+        [],
+    )?;
+
+    // Indexes for duplicate cache tables
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dup_group_hash ON duplicate_groups(hash, hash_type)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dup_group_files_group ON duplicate_group_files(group_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dup_group_files_file ON duplicate_group_files(file_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_folder_sim_percent ON folder_similarity(similarity_percent DESC)",
         [],
     )?;
 
@@ -433,6 +509,20 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_is_manual_override {
         conn.execute(
             "ALTER TABLE calibration_set_to_frames ADD COLUMN is_manual_override INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Add telescop to calibration_set table (migration for existing databases)
+    // Used for telescope-based calibration matching
+    let has_telescop: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('calibration_set') WHERE name='telescop'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_telescop {
+        conn.execute(
+            "ALTER TABLE calibration_set ADD COLUMN telescop TEXT",
             [],
         )?;
     }

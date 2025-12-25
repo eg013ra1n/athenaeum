@@ -134,35 +134,6 @@ pub fn delete_camera_dark_library(conn: &Connection, instrume: &str) -> Result<(
     Ok(())
 }
 
-/// Delete ALL calibration sets for a camera (including Flats)
-pub fn delete_all_calibration_sets_for_camera(conn: &Connection, instrume: &str) -> Result<()> {
-    // First, get all set IDs for this camera (all types)
-    let mut stmt = conn.prepare(
-        "SELECT id FROM calibration_set
-         WHERE instrume = ?1 AND is_master_library = 0"
-    )?;
-    let set_ids: Vec<i64> = stmt
-        .query_map([instrume], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Delete all calibration_set_frames entries for these sets
-    for set_id in &set_ids {
-        conn.execute(
-            "DELETE FROM calibration_set_frames WHERE set_id = ?1",
-            [set_id],
-        )?;
-    }
-
-    // Delete all calibration_set entries for this camera
-    conn.execute(
-        "DELETE FROM calibration_set
-         WHERE instrume = ?1 AND is_master_library = 0",
-        [instrume]
-    )?;
-
-    Ok(())
-}
-
 /// Check if dark library exists for camera
 pub fn has_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0")?;
@@ -170,7 +141,7 @@ pub fn has_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Get master calibration sets for a specific camera
+/// Get master dark/bias calibration sets for a specific camera (MasterDark, MasterBias, MasterDarkFlat)
 pub fn get_camera_master_dark_library(
     conn: &Connection,
     instrume: &str,
@@ -195,6 +166,7 @@ pub fn get_camera_master_dark_library(
         FROM calibration_set
         WHERE instrume = ?1
         AND is_master_library = 1
+        AND imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')
         ORDER BY imagetyp, exptime, ccd_temp"
     )?;
 
@@ -238,9 +210,93 @@ pub fn get_camera_master_dark_library(
     Ok(sets)
 }
 
-/// Check if master dark library exists for camera
+/// Check if master dark library exists for camera (MasterDark, MasterBias, MasterDarkFlat)
 pub fn has_master_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1")?;
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(*) FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 1
+         AND imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')"
+    )?;
+    let count: i64 = stmt.query_row([instrume], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// Get master flat calibration sets for a specific camera (MasterFlat)
+pub fn get_camera_master_flat_library(
+    conn: &Connection,
+    instrume: &str,
+) -> Result<Vec<CalibrationSetDetail>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            id,
+            imagetyp,
+            exptime,
+            ccd_temp,
+            temp_min,
+            temp_max,
+            gain,
+            offset,
+            binning,
+            instrume,
+            filter,
+            date_start,
+            date_end,
+            date,
+            frame_count
+        FROM calibration_set
+        WHERE instrume = ?1
+        AND is_master_library = 1
+        AND imagetyp = 'MasterFlat'
+        ORDER BY filter, exptime, ccd_temp"
+    )?;
+
+    let sets = stmt
+        .query_map([instrume], |row| {
+            let imagetyp_str: String = row.get(1)?;
+            let imagetyp = ImageType::from_str(&imagetyp_str)
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+
+            let date_start: String = row.get(11)?;
+            let date_end: String = row.get(12)?;
+
+            // Generate date_display from date_start (YYYY-MM format)
+            let date_display = if let Ok(dt) = DateTime::parse_from_rfc3339(&date_start) {
+                dt.format("%Y-%m").to_string()
+            } else {
+                // Fallback if parsing fails
+                date_start.chars().take(7).collect()
+            };
+
+            Ok(CalibrationSetDetail {
+                id: Some(row.get(0)?),
+                imagetyp,
+                exptime: row.get(2)?,
+                ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                temp_min: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                temp_max: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                gain: row.get(6)?,
+                offset: row.get(7)?,
+                binning: row.get(8)?,
+                instrume: row.get(9)?,
+                filter: row.get(10)?,
+                date_start,
+                date_end,
+                date_display,
+                frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(sets)
+}
+
+/// Check if master flat library exists for camera
+pub fn has_master_flat_library(conn: &Connection, instrume: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(*) FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 1
+         AND imagetyp = 'MasterFlat'"
+    )?;
     let count: i64 = stmt.query_row([instrume], |row| row.get(0))?;
     Ok(count > 0)
 }
@@ -255,7 +311,7 @@ pub fn get_frames_for_calibration_set(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM calibration_set_frames csf
          JOIN frames fr ON csf.frame_id = fr.id
@@ -307,7 +363,7 @@ pub fn get_frames_for_calibration_set(
             set_temp: row.get(25)?,
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
+            ypixsz: row.get(28)?,
             naxis1: row.get(29)?,
             naxis2: row.get(30)?,
             ra: row.get(31)?,
@@ -319,6 +375,7 @@ pub fn get_frames_for_calibration_set(
             objctra: row.get(37)?,
             objctdec: row.get(38)?,
             override_: row.get::<_, i32>(39)? == 1,
+            swcreate: None,
         };
 
         Ok(FileWithFrame {

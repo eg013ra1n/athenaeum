@@ -20,6 +20,7 @@ pub struct DetectedSession {
 
 /// Frame with parsed timestamp for sorting and gap detection
 struct FrameWithTime {
+    #[allow(dead_code)]
     file_id: i64,
     frame_id: i64,
     frame: Frame,
@@ -211,7 +212,7 @@ mod tests {
             set_temp: None,
             focallen: None,
             xpixsz: None,
-            pixsz: None,
+            ypixsz: None,
             naxis1: None,
             naxis2: None,
             ra: None,
@@ -223,6 +224,7 @@ mod tests {
             objctra: None,
             objctdec: None,
             override_: false,
+            swcreate: None,
         };
 
         (id, file, frame)

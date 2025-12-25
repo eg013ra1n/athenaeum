@@ -1,8 +1,7 @@
 // Frame set commands - frame set management and operations
 
-use crate::db::{self, Database};
+use crate::db::{self};
 use crate::models::*;
-use std::sync::Mutex;
 use tauri::State;
 
 use super::AppState;
@@ -70,9 +69,7 @@ pub async fn auto_generate_frame_sets(
 
     // Get session gap threshold from settings
     let gap_threshold_hours: f64 = state.settings
-        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-        .map_err(|e| e.to_string())?
-        .parse()
+        .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
     for cluster in clusters {
@@ -543,9 +540,7 @@ pub async fn split_frame_set(
 
         // Get session gap threshold from settings
         let gap_threshold_hours: f64 = state.settings
-            .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-            .map_err(|e| e.to_string())?
-            .parse()
+            .get_session_gap_threshold_hours(&conn)
             .unwrap_or(6.0);
 
         // Collect frame IDs based on selection type
@@ -667,11 +662,17 @@ pub async fn split_frame_set(
                 }
             }
             crate::models::SplitSelection::Frames { ids } => {
-                // Remove specific frames from all sessions
+                // Remove specific frames from source frameset's sessions only
                 for frame_id in ids {
                     conn.execute(
-                        "DELETE FROM session_members WHERE frame_id = ?1",
-                        [frame_id],
+                        "DELETE FROM session_members
+                         WHERE frame_id = ?1
+                         AND session_id IN (
+                            SELECT s.id FROM sessions s
+                            JOIN imaging_nights n ON s.imaging_night_id = n.id
+                            WHERE n.frames_set_id = ?2
+                         )",
+                        rusqlite::params![frame_id, source_set_id],
                     ).map_err(|e| format!("Failed to remove frame: {}", e))?;
                 }
             }
@@ -784,9 +785,7 @@ pub async fn create_custom_frames_set(
 
     // Get session gap threshold from settings
     let gap_threshold_hours: f64 = state.settings
-        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-        .map_err(|e| e.to_string())?
-        .parse()
+        .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
     // Flatten all frames and group by session_id for later
@@ -917,7 +916,7 @@ pub async fn create_frame_set_from_selection(
     state: State<'_, AppState>,
     name: String,
     frame_ids: Vec<i64>,
-    description: Option<String>,
+    _description: Option<String>,
 ) -> Result<i64, String> {
     println!(
         "Creating frame set from selection: name='{}', frame_count={}",
@@ -963,9 +962,7 @@ pub async fn create_frame_set_from_selection(
 
     // Detect nights from selected frames using gap threshold
     let gap_threshold_hours: f64 = state.settings
-        .get_with_precedence(&conn, "session_gap_threshold_hours", "6.0")
-        .map_err(|e| format!("Failed to get settings: {}", e))?
-        .parse()
+        .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
     println!("Detecting nights from {} frames with gap threshold {} hours", frames.len(), gap_threshold_hours);

@@ -57,7 +57,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
     let mut stmt = conn.prepare(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter,
                 gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp,
-                focallen, xpixsz, pixsz, naxis1, naxis2, ra, dec, sitelat, lat_obs,
+                focallen, xpixsz, ypixsz, naxis1, naxis2, ra, dec, sitelat, lat_obs,
                 sitelong, long_obs, objctra, objctdec, override, imagetyp, is_master
          FROM frames
          WHERE id = ?1"
@@ -86,7 +86,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
             set_temp: row.get(14)?,
             focallen: row.get(15)?,
             xpixsz: row.get(16)?,
-            pixsz: row.get(17)?,
+            ypixsz: row.get(17)?,
             naxis1: row.get(18)?,
             naxis2: row.get(19)?,
             ra: row.get(20)?,
@@ -103,6 +103,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
                 imagetyp_str.and_then(|s| ImageType::from_str(&s))
             },
             is_master: row.get::<_, i32>(30)? != 0,
+            swcreate: None,
         })
     })?;
 
@@ -146,12 +147,26 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
 /// Find Dark or Bias calibration for a Flat calibration set
 /// Uses configurable matching rules with fallback chain (DarkFlat → Dark → Bias)
 /// Creates sets on-demand if not found
+/// Note: Master sets (is_master_library = 1) don't need sub-calibration
 pub fn find_calibration_for_flat_set(
     conn: &Connection,
     flat_set_id: i64,
-    tolerance: &CalibrationTolerance,
+    _tolerance: &CalibrationTolerance,
     state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
+    // Check if this is a master set - masters don't need sub-calibration
+    let is_master_library: bool = conn.query_row(
+        "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+        [flat_set_id],
+        |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
+    ).unwrap_or(false);
+
+    if is_master_library {
+        // Master sets are already calibrated - no sub-calibration needed
+        println!("  ⭐ Flat set {} is a master - no sub-calibration needed", flat_set_id);
+        return Ok(Vec::new());
+    }
+
     // Get a representative frame from the flat set to use for matching
     let mut stmt = conn.prepare(
         "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 LIMIT 1"
@@ -196,12 +211,26 @@ pub fn find_calibration_for_flat_set(
 /// Find Bias calibration for a Dark calibration set
 /// Only returns Bias if "use_bias_for_dark_optimization" is enabled in config
 /// Creates Bias on-demand if not found
+/// Note: Master sets (is_master_library = 1) don't need sub-calibration
 pub fn find_calibration_for_dark_set(
     conn: &Connection,
     dark_set_id: i64,
     _tolerance: &CalibrationTolerance,
     state: &State<'_, AppState>,
 ) -> Result<Vec<CalibrationCandidate>> {
+    // Check if this is a master set - masters don't need sub-calibration
+    let is_master_library: bool = conn.query_row(
+        "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+        [dark_set_id],
+        |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
+    ).unwrap_or(false);
+
+    if is_master_library {
+        // Master sets are already calibrated - no sub-calibration needed
+        println!("  ⭐ Dark set {} is a master - no sub-calibration needed", dark_set_id);
+        return Ok(Vec::new());
+    }
+
     // Get a representative frame from the dark set
     let mut stmt = conn.prepare(
         "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 LIMIT 1"
@@ -510,11 +539,45 @@ pub fn build_complete_hierarchy(
                 });
             }
 
-            // Dark frames don't need sub-calibration
-            // (Bias is only used as fallback for calibrating Flats, not Darks)
+            // Find sub-calibration for Dark (Bias) if enabled in config
+            let dark_sub_calibration = if let Some(opts) = config.get_behavioral_options("darks") {
+                if opts.use_bias_for_dark_optimization {
+                    if let Some(set_id) = dark_set.id {
+                        match find_calibration_for_dark_set(conn, set_id, tolerance, state) {
+                            Ok(candidates) => {
+                                // Convert best candidate to CalibrationLink
+                                if let Some(best_bias) = candidates.first() {
+                                    vec![CalibrationLink {
+                                        id: None,
+                                        source_id: set_id,
+                                        source_type: "calibration_set".to_string(),
+                                        calibration_set_id: best_bias.set_id,
+                                        calibration_type: "Bias".to_string(),
+                                        matched_at: Utc::now().to_rfc3339(),
+                                        match_score: Some(best_bias.match_score),
+                                        date_warning: best_bias.date_warning,
+                                        temp_warning: best_bias.temp_warning,
+                                        is_manual_override: false,
+                                    }]
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            Err(_) => Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             dark_sets_with_links.push(CalibrationSetWithLinks {
                 set: dark_set,
-                sub_calibration: Vec::new(),
+                sub_calibration: dark_sub_calibration,
             });
         }
     }
@@ -607,7 +670,7 @@ pub fn store_calibration_hierarchy(
 fn try_create_dark_for_frame(
     conn: &Connection,
     frame: &Frame,
-    state: &State<'_, AppState>,
+    _state: &State<'_, AppState>,
 ) -> Result<Option<i64>> {
     // Extract frame parameters
     let instrume = match &frame.instrume {
@@ -693,7 +756,7 @@ fn try_create_dark_for_frame(
 fn try_create_bias_for_frame(
     conn: &Connection,
     frame: &Frame,
-    state: &State<'_, AppState>,
+    _state: &State<'_, AppState>,
 ) -> Result<Option<i64>> {
     // Extract frame parameters
     let instrume = match &frame.instrume {

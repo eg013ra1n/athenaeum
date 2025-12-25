@@ -1,496 +1,493 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   X,
-  Play,
-  Pause,
-  ChevronLeft,
-  ChevronRight,
   Loader2,
-  Database,
+  Trash2,
+  AlertTriangle,
 } from "lucide-react";
 import type { FileWithFrame } from "../types/models";
+import { ToolBar, FrameList, DetailsBar } from "./blink";
 
 interface BlinkViewerProps {
   frames: FileWithFrame[];
   initialIndex?: number;
   onClose: () => void;
+  /** Context for actions - 'light' or 'calibration' */
+  sourceType?: 'light' | 'calibration';
+  /** Callback when frames are removed (sent to blackhole) */
+  onFramesRemoved?: (frameIds: number[]) => void;
 }
 
 const BlinkViewer: React.FC<BlinkViewerProps> = ({
   frames,
   initialIndex = 0,
   onClose,
+  sourceType = 'light',
+  onFramesRemoved,
 }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [blinkSpeed, setBlinkSpeed] = useState(2); // FPS
-  const [loadedImages, setLoadedImages] = useState<Map<number, string>>(
-    new Map()
-  );
+  const [blinkSpeed, setBlinkSpeed] = useState(2);
+  const [loadedImages, setLoadedImages] = useState<Map<number, string>>(new Map());
   const [loadingIndices, setLoadingIndices] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [isCaching, setIsCaching] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ current: 0, total: 0 });
-  const [debugLogs, setDebugLogs] = useState<string[]>([]);
-  const [showDebug, setShowDebug] = useState(true);
+
+  // Selection state
+  const [selectedFrames, setSelectedFrames] = useState<Set<number>>(new Set());
+  const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null);
+
+  // Blackhole state
+  const [showBlackholeConfirm, setShowBlackholeConfirm] = useState(false);
+  const [isBlackholing, setIsBlackholing] = useState(false);
+  const [blackholeError, setBlackholeError] = useState<string | null>(null);
+  const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const blinkIntervalRef = useRef<number | null>(null);
   const currentIndexRef = useRef(currentIndex);
   const loadedImagesRef = useRef(loadedImages);
-  const renderLockRef = useRef(false); // Prevent concurrent renders
+  const renderLockRef = useRef(false);
 
   // Keep refs updated
   currentIndexRef.current = currentIndex;
   loadedImagesRef.current = loadedImages;
 
-  // Debug logging helper
-  const addDebugLog = useCallback((message: string) => {
-    const timestamp = new Date().toLocaleTimeString();
-    const logMessage = `[${timestamp}] ${message}`;
-    console.log(logMessage);
-    setDebugLogs((prev) => [...prev.slice(-50), logMessage]); // Keep last 50 logs
-  }, []);
+  // Filter FITS and XISF files
+  const fitsFrames = useMemo(
+    () => frames.filter((f) => f.file.format === "FITS" || f.file.format === "XISF"),
+    [frames]
+  );
 
-  // Get current frame
-  const currentFrame = frames[currentIndex];
+  const currentFrame = fitsFrames[currentIndex];
 
-  // Filter only FITS files (for now, XISF not supported in blink)
-  const fitsFrames = frames.filter((f) => f.file.format === "FITS");
+  // Selection counts
+  const selectionCount = selectedFrames.size;
+
+  const blackholedInSelectionCount = useMemo(() => {
+    return Array.from(selectedFrames).filter((index) => {
+      const frame = fitsFrames[index];
+      return frame?.file?.id && blackholedFileIds.has(frame.file.id);
+    }).length;
+  }, [selectedFrames, fitsFrames, blackholedFileIds]);
+
+  const nonBlackholedInSelectionCount = selectionCount - blackholedInSelectionCount;
 
   // Load image from backend
-  const loadImage = useCallback(
-    async (index: number) => {
-      if (index < 0 || index >= fitsFrames.length) return;
+  const loadImage = useCallback(async (index: number) => {
+    if (index < 0 || index >= fitsFrames.length) return;
 
-      // Use functional updates to check and set loading state atomically
-      const shouldLoad = await new Promise<boolean>((resolve) => {
-        setLoadingIndices((prev) => {
-          // Check if already loading
-          if (prev.has(index)) {
-            resolve(false);
-            return prev;
-          }
+    const shouldLoad = await new Promise<boolean>((resolve) => {
+      setLoadingIndices((prev) => {
+        if (prev.has(index) || loadedImagesRef.current.has(index)) {
+          resolve(false);
+          return prev;
+        }
+        resolve(true);
+        return new Set(prev).add(index);
+      });
+    });
 
-          // Check if already loaded using ref
-          if (loadedImagesRef.current.has(index)) {
-            resolve(false);
-            return prev;
-          }
+    if (!shouldLoad) return;
 
-          // Mark as loading
-          resolve(true);
-          return new Set(prev).add(index);
-        });
+    const frame = fitsFrames[index];
+    if (!frame) return;
+
+    setError(null);
+
+    try {
+      const imageData = await invoke<Uint8Array>("read_fits_image_rustafits", {
+        path: frame.file.path,
       });
 
-      if (!shouldLoad) {
-        return;
-      }
+      const binaryData = imageData instanceof Uint8Array
+        ? imageData
+        : new Uint8Array(imageData as number[]);
 
-      const frame = fitsFrames[index];
-      if (!frame) return;
+      const blob = new Blob([binaryData], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
 
-      setError(null);
-
-      try {
-        addDebugLog(`📥 Loading image ${index}: ${frame.file.filename}`);
-
-        // Use rustafits for fast FITS to JPEG conversion
-        // Resolution is read from settings database (no parameter = use setting)
-        const imageData = await invoke<Uint8Array>("read_fits_image_rustafits", {
-          path: frame.file.path,
-        });
-
-        addDebugLog(`📦 Received data for image ${index}: ${imageData?.length || 0} bytes`);
-
-        // Handle both Uint8Array and regular array
-        let binaryData: Uint8Array;
-        if (imageData instanceof Uint8Array) {
-          binaryData = imageData;
-        } else if (Array.isArray(imageData)) {
-          binaryData = new Uint8Array(imageData);
-        } else {
-          throw new Error(`Unexpected data type: ${typeof imageData}`);
-        }
-
-        // Convert binary JPEG to blob URL (JPEG is much smaller than PNG!)
-        const blob = new Blob([binaryData], { type: "image/jpeg" });
-        const url = URL.createObjectURL(blob);
-
-        addDebugLog(`🔗 Created blob URL for image ${index}: ${(blob.size / 1024).toFixed(1)}KB`);
-
-        // Store blob URL instead of base64
-        setLoadedImages((prev) => {
-          const newMap = new Map(prev);
-          newMap.set(index, url);
-          return newMap;
-        });
-
-        addDebugLog(`✅ Loaded image ${index + 1}/${fitsFrames.length}`);
-      } catch (err) {
-        addDebugLog(`❌ Failed to load image ${index}: ${err}`);
-        setError(`Failed to load image: ${err}`);
-      } finally {
-        setLoadingIndices((prev) => {
-          const newSet = new Set(prev);
-          newSet.delete(index);
-          return newSet;
-        });
-      }
-    },
-    [fitsFrames, addDebugLog]
-  );
+      setLoadedImages((prev) => new Map(prev).set(index, url));
+    } catch (err) {
+      console.error(`Failed to load image ${index}:`, err);
+      setError(`Failed to load image: ${err}`);
+    } finally {
+      setLoadingIndices((prev) => {
+        const newSet = new Set(prev);
+        newSet.delete(index);
+        return newSet;
+      });
+    }
+  }, [fitsFrames]);
 
   // Render image to canvas
-  const renderImage = useCallback(
-    (imageUrl: string) => {
-      addDebugLog(`🖼️  Starting render: ${imageUrl.substring(0, 50)}...`);
+  const renderImage = useCallback((imageUrl: string) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !canvas.width || !canvas.height) return;
 
-      const canvas = canvasRef.current;
-      if (!canvas) {
-        addDebugLog("❌ Canvas ref is null");
-        return;
-      }
+    const ctx = canvas.getContext("2d");
+    if (!ctx || (ctx as any).isContextLost?.() || renderLockRef.current) return;
 
-      // Validate canvas dimensions
-      if (!canvas.width || !canvas.height || canvas.width <= 0 || canvas.height <= 0) {
-        addDebugLog(`❌ Invalid canvas dimensions: ${canvas.width}x${canvas.height}`);
-        return;
-      }
+    renderLockRef.current = true;
+    const img = new Image();
 
-      const ctx = canvas.getContext("2d");
-      if (!ctx) {
-        addDebugLog("❌ Failed to get canvas 2d context");
-        return;
-      }
+    img.onload = () => {
+      try {
+        if (!img.width || !img.height) return;
 
-      // Check for lost context
-      if ((ctx as any).isContextLost?.()) {
-        addDebugLog("❌ Canvas context is lost");
-        return;
-      }
+        const canvasAspect = canvas.width / canvas.height;
+        const imageAspect = img.width / img.height;
 
-      // Prevent concurrent renders
-      if (renderLockRef.current) {
-        addDebugLog("⏸️  Render already in progress, skipping");
-        return;
-      }
+        if (!isFinite(canvasAspect) || !isFinite(imageAspect)) return;
 
-      renderLockRef.current = true;
-      addDebugLog("🔒 Render lock acquired");
+        let renderWidth, renderHeight, offsetX, offsetY;
 
-      const img = new Image();
-
-      img.onload = () => {
-        try {
-          addDebugLog(`📸 Image loaded: ${img.width}x${img.height}`);
-
-          // Validate image dimensions
-          if (!img.width || !img.height || img.width <= 0 || img.height <= 0) {
-            addDebugLog(`❌ Invalid image dimensions: ${img.width}x${img.height}`);
-            return;
-          }
-
-          // Calculate scaling to fit canvas
-          const canvasAspect = canvas.width / canvas.height;
-          const imageAspect = img.width / img.height;
-
-          addDebugLog(`📐 Aspect ratios - Canvas: ${canvasAspect.toFixed(2)}, Image: ${imageAspect.toFixed(2)}`);
-
-          // Check for NaN or Infinity
-          if (!isFinite(canvasAspect) || !isFinite(imageAspect)) {
-            addDebugLog(`❌ Invalid aspect ratios: canvas=${canvasAspect}, image=${imageAspect}`);
-            return;
-          }
-
-          let renderWidth, renderHeight, offsetX, offsetY;
-
-          if (imageAspect > canvasAspect) {
-            // Image is wider - fit to width
-            renderWidth = canvas.width;
-            renderHeight = canvas.width / imageAspect;
-            offsetX = 0;
-            offsetY = (canvas.height - renderHeight) / 2;
-          } else {
-            // Image is taller - fit to height
-            renderHeight = canvas.height;
-            renderWidth = canvas.height * imageAspect;
-            offsetX = (canvas.width - renderWidth) / 2;
-            offsetY = 0;
-          }
-
-          // Validate calculated dimensions
-          if (!isFinite(renderWidth) || !isFinite(renderHeight) ||
-              !isFinite(offsetX) || !isFinite(offsetY)) {
-            addDebugLog(`❌ Invalid render dimensions: w=${renderWidth}, h=${renderHeight}, x=${offsetX}, y=${offsetY}`);
-            return;
-          }
-
-          addDebugLog(`🎯 Drawing at: ${offsetX.toFixed(0)},${offsetY.toFixed(0)} size: ${renderWidth.toFixed(0)}x${renderHeight.toFixed(0)}`);
-
-          // Clear only letterbox areas (black bars) - keeps previous image visible during transitions
-          ctx.fillStyle = "#000000";
-
-          // Clear top/bottom bars (if image is wider than canvas aspect)
-          if (offsetY > 0) {
-            ctx.fillRect(0, 0, canvas.width, offsetY); // Top bar
-            ctx.fillRect(0, offsetY + renderHeight, canvas.width, canvas.height - offsetY - renderHeight); // Bottom bar
-          }
-
-          // Clear left/right bars (if image is taller than canvas aspect)
-          if (offsetX > 0) {
-            ctx.fillRect(0, 0, offsetX, canvas.height); // Left bar
-            ctx.fillRect(offsetX + renderWidth, 0, canvas.width - offsetX - renderWidth, canvas.height); // Right bar
-          }
-
-          // Draw image (overlays previous image for smooth transition)
-          ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
-          addDebugLog("✅ Image rendered successfully");
-        } catch (err) {
-          addDebugLog(`❌ Error in img.onload handler: ${err}`);
-          setError(`Failed to render image: ${err}`);
-        } finally {
-          renderLockRef.current = false;
-          addDebugLog("🔓 Render lock released");
+        if (imageAspect > canvasAspect) {
+          renderWidth = canvas.width;
+          renderHeight = canvas.width / imageAspect;
+          offsetX = 0;
+          offsetY = (canvas.height - renderHeight) / 2;
+        } else {
+          renderHeight = canvas.height;
+          renderWidth = canvas.height * imageAspect;
+          offsetX = (canvas.width - renderWidth) / 2;
+          offsetY = 0;
         }
-      };
 
-      img.onerror = (err) => {
-        addDebugLog(`❌ Image load/decode error: ${err}`);
-        setError(`Failed to load/decode image: ${err}`);
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
+      } finally {
         renderLockRef.current = false;
-        addDebugLog("🔓 Render lock released (error)");
-      };
+      }
+    };
 
-      img.src = imageUrl; // Can be blob: URL or data: URL
-      addDebugLog("🔗 Image src set, waiting for load...");
-    },
-    [addDebugLog]
-  );
+    img.onerror = () => {
+      setError("Failed to load/decode image");
+      renderLockRef.current = false;
+    };
 
-  // Load current image and preload next few
+    img.src = imageUrl;
+  }, []);
+
+  // Load current and preload next images
   useEffect(() => {
-    // Load current image
     loadImage(currentIndex);
-
-    // Preload next 2 images
     loadImage(currentIndex + 1);
     loadImage(currentIndex + 2);
   }, [currentIndex, loadImage]);
 
-  // Cleanup blob URLs when component unmounts
+  // Cleanup blob URLs on unmount
   useEffect(() => {
     return () => {
-      // Clean up all blob URLs when component unmounts
       loadedImagesRef.current.forEach((url) => {
-        if (url && url.startsWith("blob:")) {
-          URL.revokeObjectURL(url);
-        }
+        if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
       });
     };
-  }, []); // Empty dependency array - only run on mount/unmount
+  }, []);
 
-  // Render current image when loaded
+  // Render current image
   useEffect(() => {
     const imageUrl = loadedImages.get(currentIndex);
-    if (imageUrl) {
-      renderImage(imageUrl);
-    }
+    if (imageUrl) renderImage(imageUrl);
   }, [currentIndex, loadedImages, renderImage]);
 
-  // Handle window resize - update canvas size
-  // NOTE: Canvas size change clears the canvas, so we only do this on mount and actual window resize
+  // Handle window resize
   useEffect(() => {
     const updateCanvasSize = () => {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
       const newWidth = window.innerWidth * 0.75;
-      const newHeight = window.innerHeight - 80;
+      const newHeight = window.innerHeight - 140;
 
-      // Only update if size actually changed (avoid clearing canvas unnecessarily)
       if (canvas.width !== newWidth || canvas.height !== newHeight) {
         canvas.width = newWidth;
         canvas.height = newHeight;
-
-        // Canvas was cleared by size change, re-render current image using refs for current values
         const imageUrl = loadedImagesRef.current.get(currentIndexRef.current);
-        if (imageUrl) {
-          renderImage(imageUrl);
-        }
+        if (imageUrl) renderImage(imageUrl);
       }
     };
 
     updateCanvasSize();
     window.addEventListener("resize", updateCanvasSize);
     return () => window.removeEventListener("resize", updateCanvasSize);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [renderImage]); // Only depends on renderImage - doesn't re-run when currentIndex changes!
+  }, [renderImage]);
 
   // Blink playback
   useEffect(() => {
     if (isPlaying) {
-      const interval = 1000 / blinkSpeed;
       blinkIntervalRef.current = setInterval(() => {
-        setCurrentIndex((prev) => {
-          const next = prev + 1;
-          return next >= fitsFrames.length ? 0 : next;
-        });
-      }, interval);
-    } else {
-      if (blinkIntervalRef.current) {
-        clearInterval(blinkIntervalRef.current);
-        blinkIntervalRef.current = null;
-      }
+        setCurrentIndex((prev) => (prev + 1 >= fitsFrames.length ? 0 : prev + 1));
+      }, 1000 / blinkSpeed);
+    } else if (blinkIntervalRef.current) {
+      clearInterval(blinkIntervalRef.current);
+      blinkIntervalRef.current = null;
     }
 
     return () => {
-      if (blinkIntervalRef.current) {
-        clearInterval(blinkIntervalRef.current);
-      }
+      if (blinkIntervalRef.current) clearInterval(blinkIntervalRef.current);
     };
   }, [isPlaying, blinkSpeed, fitsFrames.length]);
+
+  // Toggle selection for current frame
+  const toggleCurrentFrameSelection = useCallback(() => {
+    setSelectedFrames((prev) => {
+      const newSet = new Set(prev);
+      newSet.has(currentIndex) ? newSet.delete(currentIndex) : newSet.add(currentIndex);
+      return newSet;
+    });
+    setLastSelectedIndex(currentIndex);
+  }, [currentIndex]);
 
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
       switch (e.key) {
-        case " ": // Space - play/pause
+        case " ":
           e.preventDefault();
-          setIsPlaying((prev) => !prev);
+          toggleCurrentFrameSelection();
           break;
-        case "ArrowLeft": // Previous frame
+        case "Enter":
+          e.preventDefault();
+          setIsPlaying((p) => !p);
+          break;
+        case "ArrowUp":
           e.preventDefault();
           setIsPlaying(false);
-          setCurrentIndex((prev) => Math.max(0, prev - 1));
+          setCurrentIndex((p) => Math.max(0, p - 1));
           break;
-        case "ArrowRight": // Next frame
+        case "ArrowDown":
           e.preventDefault();
           setIsPlaying(false);
-          setCurrentIndex((prev) => Math.min(fitsFrames.length - 1, prev + 1));
+          setCurrentIndex((p) => Math.min(fitsFrames.length - 1, p + 1));
           break;
-        case "Escape": // Close
+        case "ArrowLeft":
+          e.preventDefault();
+          setBlinkSpeed((p) => Math.max(0.5, p - 0.5));
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          setBlinkSpeed((p) => Math.min(25, p + 0.5));
+          break;
+        case "Escape":
           e.preventDefault();
           onClose();
+          break;
+        case "a":
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            setSelectedFrames(new Set(fitsFrames.map((_, i) => i)));
+          }
           break;
       }
     };
 
     window.addEventListener("keydown", handleKeyPress);
     return () => window.removeEventListener("keydown", handleKeyPress);
-  }, [fitsFrames.length, onClose]);
+  }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames]);
 
-  const handlePrevious = () => {
-    setIsPlaying(false);
-    setCurrentIndex((prev) => Math.max(0, prev - 1));
-  };
+  // Auto-cache on mount
+  useEffect(() => {
+    const startCaching = async () => {
+      await new Promise((r) => setTimeout(r, 100));
+      const uncached = fitsFrames.map((_, i) => i).filter((i) => !loadedImages.has(i) && i !== currentIndex);
+      if (uncached.length === 0) return;
 
-  const handleNext = () => {
-    setIsPlaying(false);
-    setCurrentIndex((prev) => Math.min(fitsFrames.length - 1, prev + 1));
-  };
+      setIsCaching(true);
+      setCacheProgress({ current: 0, total: uncached.length });
 
-  const handleTogglePlay = () => {
-    setIsPlaying((prev) => !prev);
-  };
-
-  const handleFrameClick = (index: number) => {
-    setIsPlaying(false);
-    setCurrentIndex(index);
-  };
-
-  const handleCacheAll = async () => {
-    setIsCaching(true);
-    setIsPlaying(false); // Stop playback during caching
-
-    // Get list of uncached indices
-    const uncachedIndices = fitsFrames
-      .map((_, i) => i)
-      .filter((i) => !loadedImages.has(i));
-
-    setCacheProgress({ current: 0, total: uncachedIndices.length });
-
-    if (uncachedIndices.length === 0) {
-      console.log("All images already cached!");
+      const BATCH = 4;
+      for (let i = 0; i < uncached.length; i += BATCH) {
+        await Promise.allSettled(uncached.slice(i, i + BATCH).map(loadImage));
+        setCacheProgress({ current: Math.min(i + BATCH, uncached.length), total: uncached.length });
+      }
       setIsCaching(false);
-      return;
-    }
+    };
+    startCaching();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    console.log(`Caching ${uncachedIndices.length} images in parallel batches of 4...`);
+  // Check blackhole status on mount
+  useEffect(() => {
+    const check = async () => {
+      const ids = frames.map((f) => f.file.id).filter((id): id is number => id != null);
+      if (ids.length === 0) return;
+      try {
+        const blackholed = await invoke<number[]>('get_blackholed_file_ids', { fileIds: ids });
+        setBlackholedFileIds(new Set(blackholed));
+      } catch (err) {
+        console.error('Failed to check blackhole status:', err);
+      }
+    };
+    check();
+  }, [frames]);
 
-    // Process images in batches of 4 for optimal parallel performance
-    const BATCH_SIZE = 4;
-    let completed = 0;
+  // Handlers
+  const handlePrevious = useCallback(() => {
+    setIsPlaying(false);
+    setCurrentIndex((p) => Math.max(0, p - 1));
+  }, []);
 
-    for (let i = 0; i < uncachedIndices.length; i += BATCH_SIZE) {
-      const batch = uncachedIndices.slice(i, i + BATCH_SIZE);
+  const handleNext = useCallback(() => {
+    setIsPlaying(false);
+    setCurrentIndex((p) => Math.min(fitsFrames.length - 1, p + 1));
+  }, [fitsFrames.length]);
 
-      // Load batch in parallel
-      const results = await Promise.allSettled(
-        batch.map((idx) => loadImage(idx))
-      );
+  const handleTogglePlay = useCallback(() => setIsPlaying((p) => !p), []);
 
-      // Count successful loads
-      results.forEach((result, batchIdx) => {
-        if (result.status === "rejected") {
-          console.error(`Failed to cache frame ${batch[batchIdx]}:`, result.reason);
-        }
+  const handleSpeedChange = useCallback((speed: number) => setBlinkSpeed(speed), []);
+
+  const handleFrameClick = useCallback((index: number, e: React.MouseEvent) => {
+    setIsPlaying(false);
+    if (e.shiftKey && lastSelectedIndex !== null) {
+      const [start, end] = [Math.min(lastSelectedIndex, index), Math.max(lastSelectedIndex, index)];
+      setSelectedFrames((prev) => {
+        const newSet = new Set(prev);
+        for (let i = start; i <= end; i++) newSet.add(i);
+        return newSet;
       });
+      setLastSelectedIndex(index);
+    } else {
+      setCurrentIndex(index);
+      setLastSelectedIndex(index);
+    }
+  }, [lastSelectedIndex]);
 
-      completed += batch.length;
-      setCacheProgress({ current: completed, total: uncachedIndices.length });
+  const handleCheckboxClick = useCallback((index: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (e.shiftKey && lastSelectedIndex !== null) {
+      // Range selection with shift+click
+      const [start, end] = [Math.min(lastSelectedIndex, index), Math.max(lastSelectedIndex, index)];
+      setSelectedFrames((prev) => {
+        const newSet = new Set(prev);
+        for (let i = start; i <= end; i++) newSet.add(i);
+        return newSet;
+      });
+    } else {
+      // Toggle single item
+      setSelectedFrames((prev) => {
+        const newSet = new Set(prev);
+        newSet.has(index) ? newSet.delete(index) : newSet.add(index);
+        return newSet;
+      });
+    }
+    setLastSelectedIndex(index);
+  }, [lastSelectedIndex]);
+
+  const handleSelectAll = useCallback(() => {
+    setSelectedFrames(new Set(fitsFrames.map((_, i) => i)));
+  }, [fitsFrames]);
+
+  const handleClearSelection = useCallback(() => {
+    setSelectedFrames(new Set());
+    setLastSelectedIndex(null);
+  }, []);
+
+  const handleBlackholeSelected = useCallback(async () => {
+    if (selectedFrames.size === 0) return;
+    setIsBlackholing(true);
+    setBlackholeError(null);
+
+    const blackholedIds: number[] = [];
+    const errors: string[] = [];
+
+    for (const index of selectedFrames) {
+      const frame = fitsFrames[index];
+      if (!frame?.file?.id) continue;
+      try {
+        await invoke('move_to_black_hole', { fileId: frame.file.id, fromWhere: sourceType });
+        blackholedIds.push(frame.file.id);
+      } catch (err) {
+        errors.push(`${frame.file.filename}: ${err}`);
+      }
     }
 
-    console.log(`Caching complete! Loaded ${completed} images.`);
-    setIsCaching(false);
-  };
+    if (blackholedIds.length > 0) {
+      setBlackholedFileIds((prev) => new Set([...prev, ...blackholedIds]));
+      setSelectedFrames(new Set());
+      setLastSelectedIndex(null);
+      onFramesRemoved?.(blackholedIds);
+    }
+
+    if (errors.length > 0) setBlackholeError(`${errors.length} error(s): ${errors[0]}`);
+    setIsBlackholing(false);
+    setShowBlackholeConfirm(false);
+  }, [selectedFrames, fitsFrames, sourceType, onFramesRemoved]);
+
+  const handleRestoreSelected = useCallback(async () => {
+    const toRestore = Array.from(selectedFrames)
+      .map((i) => fitsFrames[i])
+      .filter((f) => f?.file?.id && blackholedFileIds.has(f.file.id))
+      .map((f) => f.file.id!);
+
+    if (toRestore.length === 0) return;
+    setIsBlackholing(true);
+    setBlackholeError(null);
+
+    const restored: number[] = [];
+    const errors: string[] = [];
+
+    for (const id of toRestore) {
+      try {
+        await invoke('restore_from_black_hole', { fileId: id });
+        restored.push(id);
+      } catch (err) {
+        errors.push(`${id}: ${err}`);
+      }
+    }
+
+    if (restored.length > 0) {
+      setBlackholedFileIds((prev) => {
+        const newSet = new Set(prev);
+        restored.forEach((id) => newSet.delete(id));
+        return newSet;
+      });
+      setSelectedFrames(new Set());
+      setLastSelectedIndex(null);
+      onFramesRemoved?.(restored);
+    }
+
+    if (errors.length > 0) setBlackholeError(`Restore errors: ${errors[0]}`);
+    setIsBlackholing(false);
+  }, [selectedFrames, fitsFrames, blackholedFileIds, onFramesRemoved]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black flex flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-700">
-        <div className="text-white">
-          <span className="font-semibold">Blink Viewer</span>
-          {currentFrame && (
-            <span className="ml-4 text-sm text-gray-400">
-              {currentFrame.file.filename}
-              {currentFrame.frame?.filter && (
-                <span className="ml-2">• {currentFrame.frame.filter}</span>
-              )}
-              {currentFrame.frame?.exptime && (
-                <span className="ml-2">• {currentFrame.frame.exptime}s</span>
-              )}
-            </span>
-          )}
-        </div>
-        <button
-          onClick={onClose}
-          className="p-2 hover:bg-gray-800 rounded transition-colors"
-        >
-          <X className="text-white" size={20} />
-        </button>
-      </div>
+      {/* TOP TOOLBAR */}
+      <ToolBar
+        currentIndex={currentIndex}
+        totalFrames={fitsFrames.length}
+        isPlaying={isPlaying}
+        blinkSpeed={blinkSpeed}
+        onPrevious={handlePrevious}
+        onNext={handleNext}
+        onTogglePlay={handleTogglePlay}
+        onSpeedChange={handleSpeedChange}
+        selectionCount={selectionCount}
+        blackholedInSelectionCount={blackholedInSelectionCount}
+        nonBlackholedInSelectionCount={nonBlackholedInSelectionCount}
+        onClearSelection={handleClearSelection}
+        onBlackhole={() => setShowBlackholeConfirm(true)}
+        onRestore={handleRestoreSelected}
+        isBlackholing={isBlackholing}
+        isCaching={isCaching}
+        cacheProgress={cacheProgress}
+        onClose={onClose}
+      />
 
-      {/* Main content area */}
+      {/* MAIN CONTENT AREA */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Canvas area (left 75%) */}
+        {/* Canvas area */}
         <div className="flex-1 relative bg-black flex items-center justify-center">
-          <canvas
-            ref={canvasRef}
-            className="max-w-full max-h-full"
-            style={{ imageRendering: "pixelated" }}
-          />
-
-          {/* Loading indicator - non-intrusive corner spinner */}
+          <canvas ref={canvasRef} className="max-w-full max-h-full" style={{ imageRendering: "pixelated" }} />
           {loadingIndices.has(currentIndex) && (
             <div className="absolute top-4 right-4 bg-gray-900 bg-opacity-75 rounded-full p-2">
               <Loader2 className="animate-spin text-white" size={24} />
             </div>
           )}
-
-          {/* Error message */}
           {error && (
             <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded shadow-lg">
               {error}
@@ -498,180 +495,71 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           )}
         </div>
 
-        {/* File list (right 25%) */}
-        <div className="w-1/4 bg-gray-900 border-l border-gray-700 overflow-y-auto">
-          <div className="p-2">
-            <h3 className="text-sm font-semibold text-gray-400 mb-2">
-              Frames ({fitsFrames.length})
-            </h3>
-            <div className="space-y-1">
-              {fitsFrames.map((frame, index) => (
-                <button
-                  key={frame.file.id}
-                  onClick={() => handleFrameClick(index)}
-                  className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${
-                    index === currentIndex
-                      ? "bg-blue-600 text-white"
-                      : "bg-gray-800 text-gray-300 hover:bg-gray-700"
-                  }`}
-                >
-                  <div className="font-medium truncate">
-                    {frame.file.filename}
-                  </div>
-                  <div className="text-xs opacity-75 mt-1">
-                    {frame.frame?.filter && (
-                      <span>{frame.frame.filter}</span>
-                    )}
-                    {frame.frame?.exptime && (
-                      <span className="ml-2">{frame.frame.exptime}s</span>
-                    )}
-                  </div>
-                  {loadingIndices.has(index) && (
-                    <Loader2
-                      className="animate-spin inline ml-2"
-                      size={12}
-                    />
-                  )}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
+        {/* Frame list */}
+        <FrameList
+          frames={fitsFrames}
+          currentIndex={currentIndex}
+          selectedFrames={selectedFrames}
+          blackholedFileIds={blackholedFileIds}
+          loadingIndices={loadingIndices}
+          onFrameClick={handleFrameClick}
+          onCheckboxClick={handleCheckboxClick}
+          onSelectAll={handleSelectAll}
+          onClearSelection={handleClearSelection}
+        />
       </div>
 
-      {/* Caching progress bar */}
-      {isCaching && (
-        <div className="bg-gray-800 border-t border-gray-700 px-4 py-2">
-          <div className="max-w-4xl mx-auto">
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-sm text-gray-300">Caching images...</span>
-              <span className="text-sm text-gray-400">
-                {cacheProgress.current} / {cacheProgress.total}
-              </span>
-            </div>
-            <div className="w-full bg-gray-700 rounded-full h-2">
-              <div
-                className="bg-green-600 h-2 rounded-full transition-all duration-200"
-                style={{
-                  width: `${
-                    cacheProgress.total > 0
-                      ? (cacheProgress.current / cacheProgress.total) * 100
-                      : 0
-                  }%`,
-                }}
-              />
-            </div>
-          </div>
+      {/* BOTTOM DETAILS BAR */}
+      <DetailsBar currentFrame={currentFrame} />
+
+      {/* Blackhole error notification */}
+      {blackholeError && (
+        <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded shadow-lg z-60 flex items-center gap-2">
+          <AlertTriangle size={18} />
+          {blackholeError}
+          <button onClick={() => setBlackholeError(null)} className="ml-2 p-1 hover:bg-red-700 rounded">
+            <X size={16} />
+          </button>
         </div>
       )}
 
-      {/* Controls bar */}
-      <div className="bg-gray-900 border-t border-gray-700 px-4 py-3">
-        <div className="flex items-center justify-between max-w-4xl mx-auto">
-          {/* Playback controls */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handlePrevious}
-              disabled={currentIndex === 0}
-              className="p-2 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              <ChevronLeft className="text-white" size={20} />
-            </button>
-
-            <button
-              onClick={handleTogglePlay}
-              className="p-2 rounded bg-blue-600 hover:bg-blue-700 transition-colors"
-            >
-              {isPlaying ? (
-                <Pause className="text-white" size={20} />
-              ) : (
-                <Play className="text-white" size={20} />
-              )}
-            </button>
-
-            <button
-              onClick={handleNext}
-              disabled={currentIndex === fitsFrames.length - 1}
-              className="p-2 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              <ChevronRight className="text-white" size={20} />
-            </button>
-
-            <button
-              onClick={handleCacheAll}
-              disabled={isCaching}
-              className="p-2 rounded bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors ml-4"
-              title="Cache all images"
-            >
-              <Database className="text-white" size={20} />
-            </button>
-          </div>
-
-          {/* Frame counter */}
-          <div className="text-white text-sm">
-            <span className="font-semibold">{currentIndex + 1}</span>
-            <span className="text-gray-400"> / {fitsFrames.length}</span>
-          </div>
-
-          {/* Speed control */}
-          <div className="flex items-center gap-3">
-            <label className="text-sm text-gray-400">Speed:</label>
-            <input
-              type="range"
-              min="0.5"
-              max="10"
-              step="0.5"
-              value={blinkSpeed}
-              onChange={(e) => setBlinkSpeed(parseFloat(e.target.value))}
-              className="w-32"
-            />
-            <span className="text-sm text-white w-12">{blinkSpeed} FPS</span>
+      {/* Blackhole confirmation dialog */}
+      {showBlackholeConfirm && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-60">
+          <div className="bg-gray-800 rounded-lg shadow-xl border border-gray-600 p-6 max-w-md w-full mx-4">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="p-2 bg-red-600/20 rounded-full">
+                <Trash2 className="text-red-400" size={24} />
+              </div>
+              <h3 className="text-lg font-semibold text-white">Send to Blackhole?</h3>
+            </div>
+            <p className="text-gray-300 mb-6">
+              Are you sure you want to send{" "}
+              <span className="font-semibold text-white">{nonBlackholedInSelectionCount} frame{nonBlackholedInSelectionCount !== 1 ? "s" : ""}</span>{" "}
+              to the blackhole? This is a soft delete - files can be restored later.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => setShowBlackholeConfirm(false)}
+                disabled={isBlackholing}
+                className="px-4 py-2 text-gray-300 hover:text-white hover:bg-gray-700 rounded transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleBlackholeSelected}
+                disabled={isBlackholing}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors disabled:opacity-50"
+              >
+                {isBlackholing ? (
+                  <><Loader2 className="animate-spin" size={16} />Processing...</>
+                ) : (
+                  <><Trash2 size={16} />Send to Blackhole</>
+                )}
+              </button>
+            </div>
           </div>
         </div>
-      </div>
-
-      {/* Keyboard shortcuts help */}
-      <div className="absolute bottom-20 right-6 bg-gray-900 bg-opacity-90 text-gray-300 text-xs p-3 rounded shadow-lg">
-        <div className="font-semibold mb-1">Keyboard Shortcuts:</div>
-        <div>Space: Play/Pause</div>
-        <div>← →: Previous/Next frame</div>
-        <div>Esc: Close</div>
-      </div>
-
-      {/* Debug Console */}
-      {showDebug && (
-        <div className="absolute bottom-20 left-6 w-96 bg-gray-900 bg-opacity-95 text-gray-300 text-xs rounded shadow-lg max-h-96 flex flex-col">
-          <div className="flex items-center justify-between px-3 py-2 border-b border-gray-700">
-            <div className="font-semibold">Debug Console</div>
-            <button
-              onClick={() => setShowDebug(false)}
-              className="text-gray-400 hover:text-white"
-            >
-              <X size={14} />
-            </button>
-          </div>
-          <div className="overflow-y-auto p-2 space-y-1 max-h-80">
-            {debugLogs.length === 0 ? (
-              <div className="text-gray-500 italic">No logs yet...</div>
-            ) : (
-              debugLogs.map((log, i) => (
-                <div key={i} className="font-mono text-xs">
-                  {log}
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Debug Console Toggle (when hidden) */}
-      {!showDebug && (
-        <button
-          onClick={() => setShowDebug(true)}
-          className="absolute bottom-20 left-6 bg-gray-900 bg-opacity-90 text-gray-300 text-xs px-3 py-2 rounded shadow-lg hover:bg-gray-800"
-        >
-          Show Debug Console
-        </button>
       )}
     </div>
   );

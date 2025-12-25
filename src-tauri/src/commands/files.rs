@@ -1,9 +1,8 @@
 // File commands - file operations and browsing
 
-use crate::db::{self, Database};
+use crate::db::{self};
 use crate::models::*;
 use std::path::Path;
-use std::sync::Mutex;
 use tauri::State;
 
 use super::AppState;
@@ -64,7 +63,7 @@ pub async fn get_frames_with_missing_metadata(
         .collect())
 }
 
-/// Get duplicate file groups
+/// Get duplicate file groups (from cache)
 #[tauri::command]
 pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateGroup>, String> {
     let state_lock = state.db.lock().unwrap();
@@ -76,6 +75,12 @@ pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateG
         .get_duplicates_use_content_hash(&conn)
         .unwrap_or(false);
 
+    // Try to get from cache first (fast path)
+    if db::has_duplicate_cache(&conn, use_content_hash).unwrap_or(false) {
+        return db::get_cached_duplicates(&conn, use_content_hash).map_err(|e| e.to_string());
+    }
+
+    // Cache not populated - compute on the fly (slow path, for first load before any scan)
     db::find_duplicate_groups(&conn, use_content_hash).map_err(|e| e.to_string())
 }
 
@@ -94,8 +99,6 @@ pub async fn get_directory_contents(
     }
 
     let mut subdirectories = Vec::new();
-    let mut files_in_dir = Vec::new();
-
     let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
 
     for entry in entries {
@@ -116,7 +119,7 @@ pub async fn get_directory_contents(
     let db_files = db::get_files_by_directory(&conn, &directory_path, None)
         .map_err(|e| e.to_string())?;
 
-    files_in_dir = db_files
+    let files_in_dir: Vec<FileWithFrame> = db_files
         .into_iter()
         .map(|(file, frame)| FileWithFrame { file, frame })
         .collect();
@@ -194,6 +197,29 @@ pub async fn get_frame_preview(
     // Encode as base64 for SVG embedding
     let base64_data = STANDARD.encode(&jpeg_data);
     Ok(format!("data:image/jpeg;base64,{}", base64_data))
+}
+
+/// Get files with frames by frame IDs
+/// Useful for loading full file data when you only have frame IDs
+#[tauri::command]
+pub async fn get_files_with_frames_by_ids(
+    frame_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<FileWithFrame>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids)
+        .map_err(|e| format!("Failed to get frames: {}", e))?;
+
+    Ok(frames
+        .into_iter()
+        .map(|(_file_id, file, frame)| FileWithFrame {
+            file,
+            frame: Some(frame),
+        })
+        .collect())
 }
 
 // DTOs for files commands

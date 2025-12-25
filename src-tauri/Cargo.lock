@@ -3248,8 +3248,9 @@ dependencies = [
 
 [[package]]
 name = "rustafits"
-version = "0.1.0"
-source = "git+https://github.com/eg013ra1n/rustafits#9811c3b45df79cbfc96861acadb4a7defbc482b0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df1a569f84847645a557e0fa336aea974d6ef4eb2757e5b06e66212be060dee7"
 dependencies = [
  "anyhow",
  "cc",

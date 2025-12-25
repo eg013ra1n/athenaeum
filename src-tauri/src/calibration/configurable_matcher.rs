@@ -5,7 +5,7 @@
 
 use crate::calibration::config::{
     CalibrationMatchingConfig, CalibrationTypeConfig, MatchMode, ParameterConfig,
-    MasterPreference,
+    MasterPreference, ScoringConfig,
 };
 use crate::calibration::finder::CalibrationCandidate;
 use crate::models::{Frame, ImageType};
@@ -17,6 +17,7 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct ParameterCheckResult {
     pub matches: bool,
+    #[allow(dead_code)]
     pub warning: bool,
     pub warning_message: Option<String>,
     pub skip_matching: bool, // If true, skip this calibration type entirely
@@ -88,6 +89,11 @@ fn check_string_param(
 }
 
 /// Check if a float parameter matches based on config
+///
+/// For Warning mode with dual thresholds:
+/// - If diff > matching_threshold: REJECT the match
+/// - If diff > warning_threshold but <= matching_threshold: Accept with WARNING
+/// - If diff <= warning_threshold: Accept without warning
 fn check_float_param(
     frame_value: Option<f64>,
     set_value: Option<f64>,
@@ -122,13 +128,26 @@ fn check_float_param(
             }
         }
         MatchMode::Warning => {
-            let threshold = config.warning_threshold.unwrap_or(tolerance);
+            // Dual threshold logic:
+            // - matching_threshold: maximum allowed difference (rejects if exceeded)
+            // - warning_threshold: triggers warning display (must be <= matching_threshold)
+            let warning_thresh = config.warning_threshold.unwrap_or(tolerance);
+            let matching_thresh = config.matching_threshold.unwrap_or(f64::MAX);
+
             match (frame_value, set_value) {
                 (Some(f), Some(s)) => {
                     let diff = (f - s).abs();
-                    if diff > threshold {
+
+                    // First check: if outside matching threshold, REJECT
+                    if diff > matching_thresh {
+                        return ParameterCheckResult::failed();
+                    }
+
+                    // Second check: if outside warning threshold, accept with WARNING
+                    if diff > warning_thresh {
                         ParameterCheckResult::warning(format!(
-                            "{} differs by {:.1} (threshold: {:.1})", param_name, diff, threshold
+                            "{} differs by {:.1} (warning threshold: {:.1}, max: {:.1})",
+                            param_name, diff, warning_thresh, matching_thresh
                         ))
                     } else {
                         ParameterCheckResult::matched()
@@ -155,6 +174,7 @@ pub fn check_calibration_match(
     set_binning: &Option<String>,
     set_gain: Option<f64>,
     set_offset: Option<f64>,
+    set_telescop: &Option<String>,
     set_exptime: Option<f64>,
     set_focallen: Option<f64>,
     set_filter: &Option<String>,
@@ -164,49 +184,55 @@ pub fn check_calibration_match(
     let mut warnings = Vec::new();
     let mut all_match = true;
 
-    // Check instrume
+    // Check instrume (always exact, locked)
     let result = check_string_param(&frame.instrume, set_instrume, &config.instrume, "instrume");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check binning
+    // Check binning (always exact, locked)
     let result = check_string_param(&frame.binning, set_binning, &config.binning, "binning");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check gain (tolerance: 0.01)
+    // Check gain (always exact, locked, tolerance: 0.01)
     let result = check_float_param(frame.gain, set_gain, &config.gain, "gain", 0.01);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check offset (tolerance: 0.01)
+    // Check offset (always exact, locked, tolerance: 0.01)
     let result = check_float_param(frame.offset, set_offset, &config.offset, "offset", 0.01);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check exptime (tolerance: 0.1s)
+    // Check telescop (exact or disabled, no warning mode)
+    let result = check_string_param(&frame.telescop, set_telescop, &config.telescop, "telescop");
+    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
+    if !result.matches { all_match = false; }
+    if let Some(msg) = result.warning_message { warnings.push(msg); }
+
+    // Check exptime (supports warning mode with dual thresholds, tolerance: 0.1s)
     let result = check_float_param(frame.exptime, set_exptime, &config.exptime, "exptime", 0.1);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check focallen (tolerance: 1.0mm)
+    // Check focallen (supports warning mode with dual thresholds, tolerance: 1.0mm)
     let result = check_float_param(frame.focallen, set_focallen, &config.focallen, "focallen", 1.0);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check filter
+    // Check filter (exact or disabled, no warning mode)
     let result = check_string_param(&frame.filter, set_filter, &config.filter, "filter");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check ccd_temp (tolerance: default 2.0°C)
+    // Check ccd_temp (supports warning mode with dual thresholds, tolerance: 2.0°C)
     let result = check_float_param(frame.ccd_temp, set_ccd_temp, &config.ccd_temp, "ccd_temp", 2.0);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
@@ -241,26 +267,45 @@ pub fn find_calibration_sets(
         _ => return Ok(Vec::new()),
     };
 
-    // Query calibration sets
-    let imagetyp_str = match calibration_type {
-        "flat" => "Flat",
-        "dark" => "Dark",
-        "bias" => "Bias",
-        "darkflat" => "DarkFlat",
+    // Query calibration sets - determine which image types to include
+    let (imagetyp_str, master_imagetyp_str) = match calibration_type {
+        "flat" => ("Flat", "MasterFlat"),
+        "dark" => ("Dark", "MasterDark"),
+        "bias" => ("Bias", "MasterBias"),
+        "darkflat" => ("DarkFlat", "MasterDarkFlat"),
         _ => return Ok(Vec::new()),
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
-                ccd_temp, temp_min, temp_max, date_start, date_end
-         FROM calibration_set
-         WHERE imagetyp = ?1
-         ORDER BY date_start DESC"
-    )?;
+    // Check master preference to decide whether to include master sets
+    let master_pref = config.get_master_preference(calibration_type);
+    let include_masters = matches!(master_pref, MasterPreference::PreferMaster);
 
+    let query = if include_masters {
+        // Include both regular calibration sets and master sets
+        format!(
+            "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
+                    ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
+             FROM calibration_set
+             WHERE imagetyp IN ('{}', '{}')
+             ORDER BY date_start DESC",
+            imagetyp_str, master_imagetyp_str
+        )
+    } else {
+        // Only include regular calibration sets (is_master_library = 0)
+        format!(
+            "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
+                    ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
+             FROM calibration_set
+             WHERE imagetyp = '{}' AND is_master_library = 0
+             ORDER BY date_start DESC",
+            imagetyp_str
+        )
+    };
+
+    let mut stmt = conn.prepare(&query)?;
     let mut candidates = Vec::new();
 
-    let rows = stmt.query_map([imagetyp_str], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,           // id
             row.get::<_, Option<f64>>(1)?,   // gain
@@ -275,12 +320,14 @@ pub fn find_calibration_sets(
             row.get::<_, Option<f64>>(10)?,  // temp_max
             row.get::<_, String>(11)?,       // date_start
             row.get::<_, String>(12)?,       // date_end
+            row.get::<_, Option<String>>(13)?, // telescop
+            row.get::<_, i32>(14).unwrap_or(0), // is_master_library
         ))
     })?;
 
     for row_result in rows {
         let (set_id, gain, offset, binning, instrume, exptime, focallen, filter,
-             ccd_temp, temp_min, temp_max, date_start, date_end) = row_result?;
+             ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library) = row_result?;
 
         // Use the average temp if available
         let set_temp = match (temp_min, temp_max) {
@@ -295,6 +342,7 @@ pub fn find_calibration_sets(
             &binning,
             gain,
             offset,
+            &telescop,
             exptime,
             focallen,
             &filter,
@@ -321,8 +369,14 @@ pub fn find_calibration_sets(
             _ => None,
         };
 
-        // Score the match using temperature weight and scale from config
-        let score = score_match(date_diff, temp_diff, config.scoring.temperature_match_weight, config.scoring.temperature_scale);
+        // Calculate exposure time difference for scoring
+        let exptime_diff = match (frame.exptime, exptime) {
+            (Some(f_exp), Some(s_exp)) => Some((f_exp - s_exp).abs()),
+            _ => None,
+        };
+
+        // Score the match using configurable weights and scales
+        let score = score_match(date_diff, temp_diff, exptime_diff, &config.scoring);
 
         // Determine warnings
         let temp_warning = !match_result.warnings.is_empty() &&
@@ -337,6 +391,7 @@ pub fn find_calibration_sets(
             temp_diff,
             date_warning,
             temp_warning,
+            is_master: is_master_library == 1,
         });
     }
 
@@ -345,9 +400,8 @@ pub fn find_calibration_sets(
         b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Apply master preference if configured
-    let master_pref = config.get_master_preference(calibration_type);
-    candidates = apply_master_preference(conn, candidates, master_pref)?;
+    // Apply master preference if configured (reuse the master_pref from above)
+    candidates = apply_master_preference(candidates, master_pref);
 
     Ok(candidates)
 }
@@ -387,12 +441,13 @@ fn check_date_warning_days(date_diff: Option<i64>, calibration_type: &str, confi
     }
 }
 
-/// Score a calibration match
-fn score_match(
+/// Score a calibration match based on date proximity, temperature, and exposure time.
+/// Returns a score from 0.0 to 1.0 where 1.0 is a perfect match.
+pub fn score_match(
     date_diff_days: Option<i64>,
     temp_diff: Option<f64>,
-    temp_weight: f64,
-    temp_scale: f64,
+    exptime_diff: Option<f64>,
+    config: &ScoringConfig,
 ) -> f64 {
     let mut score = 1.0;
 
@@ -404,10 +459,18 @@ fn score_match(
 
     // Temperature scoring with configurable weight and scale
     if let Some(temp) = temp_diff {
-        let temp_score = 1.0 / (1.0 + (temp.abs() / temp_scale));
+        let temp_score = 1.0 / (1.0 + (temp.abs() / config.temperature_scale));
         // Apply weight: weighted average between 1.0 and temp_score
-        let weighted_temp = 1.0 * (1.0 - temp_weight) + temp_score * temp_weight;
+        let weighted_temp = 1.0 * (1.0 - config.temperature_match_weight) + temp_score * config.temperature_match_weight;
         score *= weighted_temp;
+    }
+
+    // Exposure time scoring with configurable weight and scale
+    if let Some(exp) = exptime_diff {
+        let exp_score = 1.0 / (1.0 + (exp.abs() / config.exposure_scale));
+        // Apply weight: weighted average between 1.0 and exp_score
+        let weighted_exp = 1.0 * (1.0 - config.exposure_match_weight) + exp_score * config.exposure_match_weight;
+        score *= weighted_exp;
     }
 
     score.max(0.0).min(1.0)
@@ -415,30 +478,18 @@ fn score_match(
 
 /// Apply master preference to sort candidates
 fn apply_master_preference(
-    conn: &Connection,
     mut candidates: Vec<CalibrationCandidate>,
     preference: MasterPreference,
-) -> Result<Vec<CalibrationCandidate>> {
+) -> Vec<CalibrationCandidate> {
     match preference {
-        MasterPreference::NoPreference => Ok(candidates),
+        MasterPreference::NoPreference => candidates,
         MasterPreference::PreferMaster | MasterPreference::PreferFrameset => {
-            // Separate into masters and non-masters
+            // Separate into masters and non-masters using the is_master field
             let mut masters = Vec::new();
             let mut framesets = Vec::new();
 
             for candidate in candidates.drain(..) {
-                // Check if this set contains any master frames
-                let is_master: bool = conn.query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM calibration_set_frames csf
-                        JOIN frames f ON csf.frame_id = f.id
-                        WHERE csf.set_id = ?1 AND f.is_master = 1
-                    )",
-                    [candidate.set_id],
-                    |row| row.get(0),
-                ).unwrap_or(false);
-
-                if is_master {
+                if candidate.is_master {
                     masters.push(candidate);
                 } else {
                     framesets.push(candidate);
@@ -449,11 +500,11 @@ fn apply_master_preference(
             match preference {
                 MasterPreference::PreferMaster => {
                     masters.extend(framesets);
-                    Ok(masters)
+                    masters
                 }
                 MasterPreference::PreferFrameset => {
                     framesets.extend(masters);
-                    Ok(framesets)
+                    framesets
                 }
                 _ => unreachable!(),
             }
@@ -461,7 +512,24 @@ fn apply_master_preference(
     }
 }
 
+/// Get default fallback chain for a source type
+fn get_default_fallback_chain(source_type: &str, include_bias: bool) -> Vec<String> {
+    match source_type {
+        "flats" => {
+            if include_bias {
+                vec!["darkflat".to_string(), "dark".to_string(), "bias".to_string()]
+            } else {
+                vec!["darkflat".to_string(), "dark".to_string()]
+            }
+        }
+        "lights" => vec!["dark".to_string()], // Lights don't have fallback to bias
+        "darks" => vec!["bias".to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// Find calibration with fallback chain (for Flats: DarkFlat → Dark → Bias)
+/// Respects the use_bias_if_no_darks setting for flats
 pub fn find_calibration_with_fallback(
     conn: &Connection,
     frame: &Frame,
@@ -470,16 +538,27 @@ pub fn find_calibration_with_fallback(
 ) -> Result<Vec<CalibrationCandidate>> {
     // Get behavioral options for the source type
     let fallback_chain = match config.get_behavioral_options(source_type) {
-        Some(opts) if !opts.fallback_chain.is_empty() => opts.fallback_chain.clone(),
-        _ => {
-            // Default fallback chains
-            match source_type {
-                "flats" => vec!["darkflat".to_string(), "dark".to_string(), "bias".to_string()],
-                "lights" => vec!["dark".to_string()], // Lights don't have fallback to bias
-                "darks" => vec!["bias".to_string()],
-                _ => Vec::new(),
+        Some(opts) => {
+            // For flats: respect use_bias_if_no_darks setting
+            if source_type == "flats" {
+                if opts.use_bias_if_no_darks {
+                    // Include bias in fallback chain
+                    if !opts.fallback_chain.is_empty() {
+                        opts.fallback_chain.clone()
+                    } else {
+                        get_default_fallback_chain(source_type, true)
+                    }
+                } else {
+                    // Exclude bias from fallback chain
+                    get_default_fallback_chain(source_type, false)
+                }
+            } else if !opts.fallback_chain.is_empty() {
+                opts.fallback_chain.clone()
+            } else {
+                get_default_fallback_chain(source_type, true)
             }
         }
+        _ => get_default_fallback_chain(source_type, true),
     };
 
     // Try each calibration type in the fallback chain
@@ -533,6 +612,7 @@ pub fn find_dark_for_light(
 }
 
 /// Find Bias calibration sets for a frame using configurable rules
+#[allow(dead_code)]
 pub fn find_bias_for_frame(
     conn: &Connection,
     frame: &Frame,
@@ -619,10 +699,11 @@ mod tests {
     }
 
     #[test]
-    fn test_check_float_param_warning() {
-        let config = ParameterConfig::warning(2.0);
+    fn test_check_float_param_warning_dual_threshold() {
+        // Dual threshold: warn at 2.0, reject at 5.0
+        let config = ParameterConfig::warning(2.0, 5.0);
 
-        // Within threshold
+        // Within warning threshold - no warning
         let result = check_float_param(
             Some(-10.0),
             Some(-11.0),
@@ -630,35 +711,88 @@ mod tests {
             "ccd_temp",
             2.0,
         );
-        assert!(result.matches);
-        assert!(!result.warning);
+        assert!(result.matches, "Should match when within warning threshold");
+        assert!(!result.warning, "Should not warn when within warning threshold");
 
-        // Outside threshold - should match but with warning
+        // Outside warning threshold but within matching threshold - warning but match
         let result = check_float_param(
             Some(-10.0),
-            Some(-15.0),
+            Some(-14.0), // 4 degree difference: > 2.0 warn, < 5.0 reject
             &config,
             "ccd_temp",
             2.0,
         );
-        assert!(result.matches);
-        assert!(result.warning);
+        assert!(result.matches, "Should match when within matching threshold");
+        assert!(result.warning, "Should warn when outside warning threshold");
         assert!(result.warning_message.is_some());
+
+        // Outside matching threshold - should REJECT (not match)
+        let result = check_float_param(
+            Some(-10.0),
+            Some(-16.0), // 6 degree difference: > 5.0 reject threshold
+            &config,
+            "ccd_temp",
+            2.0,
+        );
+        assert!(!result.matches, "Should NOT match when outside matching threshold");
     }
 
     #[test]
     fn test_score_match() {
+        let config = ScoringConfig {
+            temperature_match_weight: 0.3,
+            temperature_scale: 2.0,
+            exposure_match_weight: 0.4,
+            exposure_scale: 1.0,
+        };
+
         // Perfect match
-        let score = score_match(Some(0), Some(0.0), 0.3, 2.0);
+        let score = score_match(Some(0), Some(0.0), Some(0.0), &config);
         assert!(score > 0.99);
 
-        // With temperature weight
-        let score_low_weight = score_match(Some(10), Some(5.0), 0.1, 2.0);
-        let score_high_weight = score_match(Some(10), Some(5.0), 0.5, 2.0);
+        // With temperature difference only
+        let score_temp = score_match(Some(10), Some(5.0), None, &config);
+        assert!(score_temp > 0.0 && score_temp <= 1.0);
 
-        // Higher weight should amplify the temperature effect
-        // Both should be valid scores
-        assert!(score_low_weight > 0.0 && score_low_weight <= 1.0);
-        assert!(score_high_weight > 0.0 && score_high_weight <= 1.0);
+        // With exposure difference only
+        let score_exp = score_match(Some(10), None, Some(2.0), &config);
+        assert!(score_exp > 0.0 && score_exp <= 1.0);
+
+        // With both temperature and exposure differences
+        let score_both = score_match(Some(10), Some(3.0), Some(1.5), &config);
+        assert!(score_both > 0.0 && score_both <= 1.0);
+
+        // Higher weight should amplify the effect
+        let config_low_weight = ScoringConfig {
+            temperature_match_weight: 0.1,
+            temperature_scale: 2.0,
+            exposure_match_weight: 0.1,
+            exposure_scale: 1.0,
+        };
+        let config_high_weight = ScoringConfig {
+            temperature_match_weight: 0.5,
+            temperature_scale: 2.0,
+            exposure_match_weight: 0.5,
+            exposure_scale: 1.0,
+        };
+
+        let score_low_weight = score_match(Some(10), Some(5.0), Some(3.0), &config_low_weight);
+        let score_high_weight = score_match(Some(10), Some(5.0), Some(3.0), &config_high_weight);
+
+        // Higher weight should amplify the differences (lower score)
+        assert!(score_high_weight < score_low_weight);
+    }
+
+    #[test]
+    fn test_score_match_exposure_preference() {
+        // Test that closer exposure time is preferred
+        let config = ScoringConfig::default();
+
+        // Simulating Flat 1.18s vs Dark 1s (diff = 0.18) and Dark 5s (diff = 3.82)
+        let score_1s = score_match(Some(3), Some(0.1), Some(0.18), &config);
+        let score_5s = score_match(Some(3), Some(0.1), Some(3.82), &config);
+
+        // 1s dark should score higher (closer exposure match)
+        assert!(score_1s > score_5s, "Closer exposure should score higher: {} vs {}", score_1s, score_5s);
     }
 }

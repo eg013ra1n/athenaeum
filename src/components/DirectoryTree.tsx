@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Folder, File as FileIcon, ArrowLeft, AlertCircle, Copy, Check, AlertTriangle } from 'lucide-react';
+import { Folder, File as FileIcon, ArrowLeft, AlertCircle, Copy, Check, AlertTriangle, Play } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import type { ScanRootWithAvailability, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
+import BlinkViewer from './BlinkViewer';
 
 interface DirectoryTreeProps {
   scanRoots: ScanRootWithAvailability[];
@@ -16,6 +17,8 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [hoveredFile, setHoveredFile] = useState<FileWithFrame | null>(null);
+  const [showBlinkViewer, setShowBlinkViewer] = useState(false);
+  const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
 
   // Create a set of filenames that have duplicates for quick lookup
   const duplicateFilenames = useMemo(() => {
@@ -26,6 +29,36 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
     });
     return set;
   }, [duplicates]);
+
+  // Filter to only FITS/XISF image files for blink functionality
+  const imageFiles = useMemo(() => {
+    if (!contents) return [];
+    return contents.files.filter(f =>
+      f.file.format === 'FITS' || f.file.format === 'XISF'
+    );
+  }, [contents]);
+
+  // Fetch blackholed file IDs when files change
+  useEffect(() => {
+    const fetchBlackholedIds = async () => {
+      if (!contents || contents.files.length === 0) {
+        setBlackholedFileIds(new Set());
+        return;
+      }
+      const fileIds = contents.files
+        .map(f => f.file.id)
+        .filter((id): id is number => id !== null);
+      if (fileIds.length === 0) return;
+
+      try {
+        const blackholed = await invoke<number[]>('get_blackholed_file_ids', { fileIds });
+        setBlackholedFileIds(new Set(blackholed));
+      } catch (err) {
+        console.error('Failed to fetch blackholed file IDs:', err);
+      }
+    };
+    fetchBlackholedIds();
+  }, [contents]);
 
   // Load directory contents
   const loadDirectory = useCallback(async (path: string) => {
@@ -233,8 +266,8 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
 
         {!loading && contents && (
           <div className="flex gap-4 h-[calc(100vh-250px)]">
-            {/* Left Column - Files and Folders List */}
-            <div className="flex-1 overflow-y-auto">
+              {/* Left Column - Files and Folders List */}
+              <div className="flex-1 overflow-y-auto">
               {/* Subdirectories */}
               {contents.subdirectories.length > 0 && (
                 <div className="mb-4">
@@ -258,6 +291,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                 <div>
                   {contents.files.map((item, idx) => {
                     const hasDuplicate = duplicateFilenames.has(item.file.filename);
+                    const isBlackholed = item.file.id !== null && blackholedFileIds.has(item.file.id);
 
                     return (
                       <div
@@ -266,15 +300,18 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                         onMouseLeave={() => setHoveredFile(null)}
                         className={`flex items-center gap-3 w-full px-3 py-2 transition text-left border-b border-gray-800 ${
                           hoveredFile?.file.id === item.file.id ? 'bg-gray-700' : 'hover:bg-gray-750'
-                        }`}
+                        } ${isBlackholed ? 'opacity-60' : ''}`}
                       >
-                        <FileIcon size={16} className="text-gray-500 flex-shrink-0" />
+                        <FileIcon size={16} className={`flex-shrink-0 ${isBlackholed ? 'text-red-500' : 'text-gray-500'}`} />
                         {hasDuplicate && (
                           <span title="Duplicate file">
                             <AlertCircle size={14} className="text-yellow-500 flex-shrink-0" />
                           </span>
                         )}
-                        <span className="text-sm truncate font-mono" title={item.file.filename}>
+                        <span
+                          className={`text-sm truncate font-mono ${isBlackholed ? 'line-through text-red-400' : ''}`}
+                          title={isBlackholed ? `${item.file.filename} (blackholed)` : item.file.filename}
+                        >
                           {item.file.filename}
                         </span>
                       </div>
@@ -292,7 +329,19 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
             </div>
 
             {/* Right Panel - Metadata */}
-            <div className="w-80 bg-gray-750 rounded-lg p-4 flex-shrink-0 overflow-y-auto">
+            <div className="w-80 bg-gray-750 rounded-lg p-4 flex-shrink-0 overflow-y-auto flex flex-col">
+              {/* Blink button */}
+              {imageFiles.length > 0 && (
+                <button
+                  onClick={() => setShowBlinkViewer(true)}
+                  className="mb-4 flex items-center justify-center gap-2 w-full px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition"
+                >
+                  <Play size={18} />
+                  <span>Blink ({imageFiles.length})</span>
+                </button>
+              )}
+
+              <div className="flex-1 overflow-y-auto">
               {hoveredFile ? (
                 <div className="space-y-4">
                   {/* File Name */}
@@ -460,10 +509,20 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                   Hover over a file to see its metadata
                 </div>
               )}
+              </div>
             </div>
           </div>
         )}
       </div>
+
+      {/* Blink Viewer Overlay */}
+      {showBlinkViewer && imageFiles.length > 0 && (
+        <BlinkViewer
+          frames={imageFiles}
+          onClose={() => setShowBlinkViewer(false)}
+          onFramesRemoved={() => loadDirectory(currentPath)}
+        />
+      )}
     </div>
   );
 }

@@ -1,7 +1,6 @@
 // Coordinate parsing and conversion utilities for astronomical coordinates
 
 use anyhow::{anyhow, Result};
-use std::f64::consts::PI;
 
 /// Parse Right Ascension from sexagesimal string to decimal degrees
 /// Accepts formats like "HH:MM:SS.sss" or "HH MM SS.sss"
@@ -149,6 +148,7 @@ pub fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64
 /// More stable for very small angles
 /// Input: RA and Dec in decimal degrees
 /// Output: Angular separation in degrees
+#[allow(dead_code)]
 pub fn angular_distance_haversine(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
     // Convert to radians
     let ra1 = ra1_deg.to_radians();

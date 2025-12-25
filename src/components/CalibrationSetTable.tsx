@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { ChevronUp, ChevronDown, ChevronsUpDown, Eye } from "lucide-react";
-import { CalibrationSetDetail, FileWithFrame } from "../types/models";
+import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star } from "lucide-react";
+import { CalibrationSetDetail, FileWithFrame, ImageType, isMasterType } from "../types/models";
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
 import BlinkViewer from "./BlinkViewer";
@@ -8,12 +8,14 @@ import BlinkViewer from "./BlinkViewer";
 interface CalibrationSetTableProps {
   sets: CalibrationSetDetail[];
   showFilterColumn?: boolean;
+  /** Callback to edit sub-calibration for a set (for flat/dark sets only) */
+  onEditSubCalibration?: (setId: number, setType: 'flat' | 'dark') => void;
 }
 
 type SortField = "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
 type SortDirection = "asc" | "desc";
 
-export default function CalibrationSetTable({ sets, showFilterColumn = false }: CalibrationSetTableProps) {
+export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration }: CalibrationSetTableProps) {
   const [sortField, setSortField] = useState<SortField>("exptime");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
@@ -215,17 +217,26 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false }: 
                 >
                   {/* Type */}
                   <td className="px-4 py-3">
-                    <span
-                      className={`px-2 py-1 rounded text-xs font-medium ${
-                        set.imagetyp === "Dark"
-                          ? "bg-purple-900/30 text-purple-400 border border-purple-700"
-                          : set.imagetyp === "Flat"
-                          ? "bg-yellow-900/30 text-yellow-400 border border-yellow-700"
-                          : "bg-blue-900/30 text-blue-400 border border-blue-700"
-                      }`}
-                    >
-                      {set.imagetyp}
-                    </span>
+                    <div className="flex items-center gap-1">
+                      {isMasterType(set.imagetyp) && (
+                        <Star size={12} className="text-amber-400 fill-amber-400" />
+                      )}
+                      <span
+                        className={`px-2 py-1 rounded text-xs font-medium ${
+                          set.imagetyp === "Dark" || set.imagetyp === "MasterDark"
+                            ? "bg-purple-900/30 text-purple-400 border border-purple-700"
+                            : set.imagetyp === "Flat" || set.imagetyp === "MasterFlat"
+                            ? "bg-yellow-900/30 text-yellow-400 border border-yellow-700"
+                            : set.imagetyp === "Bias" || set.imagetyp === "MasterBias"
+                            ? "bg-blue-900/30 text-blue-400 border border-blue-700"
+                            : set.imagetyp === "DarkFlat" || set.imagetyp === "MasterDarkFlat"
+                            ? "bg-indigo-900/30 text-indigo-400 border border-indigo-700"
+                            : "bg-gray-900/30 text-gray-400 border border-gray-700"
+                        }`}
+                      >
+                        {set.imagetyp}
+                      </span>
+                    </div>
                   </td>
 
                   {/* Filter (for flats) */}
@@ -286,15 +297,32 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false }: 
 
                   {/* Actions */}
                   <td className="px-4 py-3 text-center">
-                    <button
-                      onClick={(e) => handleViewFrames(set.id!, e)}
-                      disabled={loadingFrames === set.id}
-                      className="inline-flex items-center gap-1 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                      title="View frames in blink viewer"
-                    >
-                      <Eye size={14} />
-                      {loadingFrames === set.id ? 'Loading...' : 'View'}
-                    </button>
+                    <div className="flex items-center justify-center gap-2">
+                      <button
+                        onClick={(e) => handleViewFrames(set.id!, e)}
+                        disabled={loadingFrames === set.id}
+                        className="inline-flex items-center gap-1 px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="View frames in blink viewer"
+                      >
+                        <Eye size={14} />
+                        {loadingFrames === set.id ? 'Loading...' : 'View'}
+                      </button>
+                      {/* Don't show Sub-Cal button for Bias or Master types (masters don't need sub-calibration) */}
+                      {onEditSubCalibration && set.id !== null && set.imagetyp !== ImageType.Bias && !isMasterType(set.imagetyp) && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const setType = set.imagetyp === ImageType.Flat ? 'flat' : 'dark';
+                            onEditSubCalibration(set.id!, setType);
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 text-xs rounded transition-colors"
+                          title="Edit sub-calibration"
+                        >
+                          <Settings size={14} />
+                          Sub-Cal
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
 
@@ -373,6 +401,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false }: 
         <BlinkViewer
           frames={blinkFrames}
           onClose={() => setBlinkFrames(null)}
+          sourceType="calibration"
         />
       )}
     </div>

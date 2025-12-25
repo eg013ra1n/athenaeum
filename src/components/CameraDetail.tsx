@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { ArrowLeft, RefreshCw, Package, Calendar } from "lucide-react";
 import DarkLibrary, { LibraryStats } from "./DarkLibrary";
+import MasterDarkLibrary from "./MasterDarkLibrary";
+import MasterFlatLibrary from "./MasterFlatLibrary";
 import { invoke } from "@tauri-apps/api/core";
 import { ImageType } from "../types/models";
 import { format } from "date-fns";
@@ -11,6 +13,11 @@ interface CalibrationScanResult {
   dark_sets_created: number;
   bias_sets_created: number;
   darkflat_sets_created: number;
+  // Master calibration sets (1 file = 1 set)
+  master_dark_sets_created: number;
+  master_flat_sets_created: number;
+  master_bias_sets_created: number;
+  master_darkflat_sets_created: number;
 }
 
 interface CameraDetailProps {
@@ -18,7 +25,7 @@ interface CameraDetailProps {
   onClose: () => void;
 }
 
-type TabType = "darks" | "flats";
+type TabType = "darks" | "flats" | "master-darks" | "master-flats";
 
 export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
   const [activeTab, setActiveTab] = useState<TabType>("darks");
@@ -26,6 +33,10 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [currentStats, setCurrentStats] = useState<LibraryStats | null>(null);
+
+  // Memoize imageTypeFilter arrays to prevent infinite re-render loops
+  const darksFilter = useMemo(() => [ImageType.Dark, ImageType.Bias, ImageType.DarkFlat], []);
+  const flatsFilter = useMemo(() => [ImageType.Flat], []);
 
   const handleRefreshLibrary = async () => {
     try {
@@ -35,9 +46,21 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
 
       const result = await invoke<CalibrationScanResult>("refresh_calibration_library_for_camera", { instrume });
 
-      setSuccessMessage(
-        `Refreshed library: ${result.sets_created} sets created (${result.flat_sets_created} flat, ${result.dark_sets_created} dark, ${result.bias_sets_created} bias, ${result.darkflat_sets_created} darkflat)`
-      );
+      // Build success message
+      const masterTotal = result.master_dark_sets_created + result.master_flat_sets_created +
+                          result.master_bias_sets_created + result.master_darkflat_sets_created;
+      const regularTotal = result.flat_sets_created + result.dark_sets_created +
+                           result.bias_sets_created + result.darkflat_sets_created;
+
+      let message = `Refreshed library: ${result.sets_created} sets`;
+      if (regularTotal > 0) {
+        message += ` (${result.flat_sets_created} flat, ${result.dark_sets_created} dark, ${result.bias_sets_created} bias, ${result.darkflat_sets_created} darkflat)`;
+      }
+      if (masterTotal > 0) {
+        message += ` + ${masterTotal} master sets`;
+      }
+
+      setSuccessMessage(message);
 
       // Trigger refresh in child components
       window.dispatchEvent(new CustomEvent("library-updated"));
@@ -135,6 +158,28 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
             Flats
             <span className="text-xs ml-2 text-gray-500">(Flat Calibration)</span>
           </button>
+          <button
+            onClick={() => setActiveTab("master-darks")}
+            className={`px-4 py-2 border-b-2 transition-colors ${
+              activeTab === "master-darks"
+                ? "border-purple-500 text-purple-400"
+                : "border-transparent text-gray-400 hover:text-gray-200"
+            }`}
+          >
+            Master Darks
+            <span className="text-xs ml-2 text-gray-500">(MasterDark/Bias/DarkFlat)</span>
+          </button>
+          <button
+            onClick={() => setActiveTab("master-flats")}
+            className={`px-4 py-2 border-b-2 transition-colors ${
+              activeTab === "master-flats"
+                ? "border-purple-500 text-purple-400"
+                : "border-transparent text-gray-400 hover:text-gray-200"
+            }`}
+          >
+            Master Flats
+            <span className="text-xs ml-2 text-gray-500">(MasterFlat)</span>
+          </button>
         </div>
       </div>
 
@@ -144,7 +189,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           <DarkLibrary
             instrume={instrume}
             isTabView={true}
-            imageTypeFilter={[ImageType.Dark, ImageType.Bias, ImageType.DarkFlat]}
+            imageTypeFilter={darksFilter}
             onStatsChange={setCurrentStats}
           />
         )}
@@ -152,9 +197,15 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           <DarkLibrary
             instrume={instrume}
             isTabView={true}
-            imageTypeFilter={[ImageType.Flat]}
+            imageTypeFilter={flatsFilter}
             onStatsChange={setCurrentStats}
           />
+        )}
+        {activeTab === "master-darks" && (
+          <MasterDarkLibrary instrume={instrume} />
+        )}
+        {activeTab === "master-flats" && (
+          <MasterFlatLibrary instrume={instrume} />
         )}
       </div>
 

@@ -340,12 +340,13 @@ export function useFilesByDirectory(directoryPath: string, limit?: number) {
 }
 
 /**
- * Fetch duplicate groups
+ * Fetch duplicate groups - lazy loaded (call load() to fetch)
  */
 export function useDuplicates() {
   const [duplicates, setDuplicates] = useState<DuplicateGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   const fetchDuplicates = useCallback(async () => {
     try {
@@ -353,6 +354,7 @@ export function useDuplicates() {
       const result = await invoke<DuplicateGroup[]>('get_duplicates');
       setDuplicates(result);
       setError(null);
+      setLoaded(true);
     } catch (e) {
       setError(e as string);
     } finally {
@@ -360,25 +362,31 @@ export function useDuplicates() {
     }
   }, []);
 
-  useEffect(() => {
-    fetchDuplicates();
-  }, [fetchDuplicates]);
+  // Load only if not already loaded
+  const load = useCallback(() => {
+    if (!loaded && !loading) {
+      fetchDuplicates();
+    }
+  }, [loaded, loading, fetchDuplicates]);
 
   return {
     duplicates,
     loading,
     error,
-    refresh: fetchDuplicates,
+    loaded,
+    load,        // Call to trigger initial load
+    refresh: fetchDuplicates,  // Force refresh
   };
 }
 
 /**
- * Fetch duplicate folders (folder similarity)
+ * Fetch duplicate folders (folder similarity) - lazy loaded (call load() to fetch)
  */
 export function useDuplicateFolders(threshold: number = 70.0) {
   const [folders, setFolders] = useState<FolderSimilarity[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   const fetchFolders = useCallback(async () => {
     try {
@@ -386,6 +394,7 @@ export function useDuplicateFolders(threshold: number = 70.0) {
       const result = await invoke<FolderSimilarity[]>('get_duplicate_folders', { threshold });
       setFolders(result);
       setError(null);
+      setLoaded(true);
     } catch (e) {
       setError(e as string);
     } finally {
@@ -393,15 +402,20 @@ export function useDuplicateFolders(threshold: number = 70.0) {
     }
   }, [threshold]);
 
-  useEffect(() => {
-    fetchFolders();
-  }, [fetchFolders]);
+  // Load only if not already loaded
+  const load = useCallback(() => {
+    if (!loaded && !loading) {
+      fetchFolders();
+    }
+  }, [loaded, loading, fetchFolders]);
 
   return {
     folders,
     loading,
     error,
-    refresh: fetchFolders,
+    loaded,
+    load,        // Call to trigger initial load
+    refresh: fetchFolders,  // Force refresh
   };
 }
 

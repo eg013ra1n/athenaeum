@@ -5,7 +5,7 @@
 export enum MatchMode {
   /** Must match exactly (with small tolerance for floats) */
   Exact = "exact",
-  /** Match but warn if threshold exceeded (e.g., temperature delta > 2°C) */
+  /** Match but warn if threshold exceeded, reject if matching threshold exceeded */
   Warning = "warning",
   /** Don't check this parameter */
   Ignore = "ignore",
@@ -17,27 +17,35 @@ export interface ParameterConfig {
   mode: MatchMode;
   /** If true and frame's metadata is NULL, skip matching entirely */
   required: boolean;
-  /** For Warning mode: threshold value (e.g., temperature delta in °C) */
+  /** For Warning mode: threshold that triggers warning display (must be <= matching_threshold) */
   warning_threshold?: number;
+  /** For Warning mode: threshold that rejects match if exceeded */
+  matching_threshold?: number;
+  /** Whether this parameter can be changed by user (false = locked to Exact mode) */
+  locked: boolean;
+  /** Whether Warning mode is available for this parameter */
+  supports_warning: boolean;
 }
 
 /** Configuration for matching a specific calibration type */
 export interface CalibrationTypeConfig {
-  /** Camera/instrument name */
+  /** Camera/instrument name - always exact, locked */
   instrume: ParameterConfig;
-  /** Binning mode (e.g., "1x1", "2x2") */
+  /** Binning mode (e.g., "1x1", "2x2") - always exact, locked */
   binning: ParameterConfig;
-  /** Sensor gain value */
+  /** Sensor gain value - always exact, locked */
   gain: ParameterConfig;
-  /** Sensor offset value */
+  /** Sensor offset value - always exact, locked */
   offset: ParameterConfig;
-  /** Exposure time in seconds */
+  /** Telescope name - exact or disabled (no warning mode) */
+  telescop: ParameterConfig;
+  /** Exposure time in seconds - supports warning mode with thresholds */
   exptime: ParameterConfig;
-  /** Focal length in mm */
+  /** Focal length in mm - supports warning mode with thresholds */
   focallen: ParameterConfig;
-  /** Filter name */
+  /** Filter name - exact or disabled (no warning mode) */
   filter: ParameterConfig;
-  /** CCD temperature in Celsius */
+  /** CCD temperature in Celsius - supports warning mode with thresholds */
   ccd_temp: ParameterConfig;
 }
 
@@ -86,6 +94,10 @@ export interface ScoringConfig {
   temperature_match_weight: number;
   /** Temperature scaling factor for scoring formula (default 2.0) */
   temperature_scale: number;
+  /** Weight for exposure time proximity in scoring (0.0-1.0) */
+  exposure_match_weight: number;
+  /** Exposure time scaling factor for scoring formula (default 1.0s) */
+  exposure_scale: number;
 }
 
 /** Warning thresholds for calibration matching */
@@ -123,25 +135,89 @@ export interface CalibrationMatchingConfig {
 /** Helper to create a default ParameterConfig */
 export function createParameterConfig(
   mode: MatchMode = MatchMode.Ignore,
-  required: boolean = false,
-  warning_threshold?: number
+  options: {
+    required?: boolean;
+    warning_threshold?: number;
+    matching_threshold?: number;
+    locked?: boolean;
+    supports_warning?: boolean;
+  } = {}
 ): ParameterConfig {
-  return { mode, required, warning_threshold };
+  return {
+    mode,
+    required: options.required ?? false,
+    warning_threshold: options.warning_threshold,
+    matching_threshold: options.matching_threshold,
+    locked: options.locked ?? false,
+    supports_warning: options.supports_warning ?? false,
+  };
 }
 
-/** Helper to create exact match config */
+/** Helper to create exact match config (locked, always exact) */
+export function exactLocked(): ParameterConfig {
+  return {
+    mode: MatchMode.Exact,
+    required: true,
+    locked: true,
+    supports_warning: false,
+  };
+}
+
+/** Helper to create exact match config (can be changed to ignore) */
 export function exactMatch(required: boolean = true): ParameterConfig {
-  return { mode: MatchMode.Exact, required };
+  return {
+    mode: MatchMode.Exact,
+    required,
+    locked: false,
+    supports_warning: false,
+  };
 }
 
-/** Helper to create warning match config */
-export function warningMatch(threshold: number): ParameterConfig {
-  return { mode: MatchMode.Warning, required: false, warning_threshold: threshold };
+/** Helper to create warning match config with dual thresholds */
+export function warningMatch(
+  warningThreshold: number,
+  matchingThreshold: number
+): ParameterConfig {
+  return {
+    mode: MatchMode.Warning,
+    required: false,
+    warning_threshold: warningThreshold,
+    matching_threshold: matchingThreshold,
+    locked: false,
+    supports_warning: true,
+  };
 }
 
 /** Helper to create ignore config */
 export function ignoreParam(): ParameterConfig {
-  return { mode: MatchMode.Ignore, required: false };
+  return {
+    mode: MatchMode.Ignore,
+    required: false,
+    locked: false,
+    supports_warning: false,
+  };
+}
+
+/** Helper to create ignore config that supports warning mode */
+export function ignoreWithWarningSupport(): ParameterConfig {
+  return {
+    mode: MatchMode.Ignore,
+    required: false,
+    locked: false,
+    supports_warning: true,
+  };
+}
+
+/** Validate that warning_threshold <= matching_threshold */
+export function validateThresholds(config: ParameterConfig): string | null {
+  if (config.mode === MatchMode.Warning) {
+    const warn = config.warning_threshold ?? 0;
+    const match = config.matching_threshold ?? Infinity;
+    if (warn > match) {
+      return `Warning threshold (${warn}) cannot be greater than matching threshold (${match})`;
+    }
+  }
+  return null;
 }
 
 /** Get display label for a parameter */
@@ -151,6 +227,7 @@ export function getParameterLabel(param: string): string {
     binning: "Binning",
     gain: "Gain",
     offset: "Offset",
+    telescop: "Telescope",
     exptime: "Exposure",
     focallen: "Focal Length",
     filter: "Filter",
@@ -159,12 +236,31 @@ export function getParameterLabel(param: string): string {
   return labels[param] || param;
 }
 
+/** Parameters that are always exact and locked (cannot be changed) */
+export const LOCKED_PARAMETERS = [
+  "instrume",
+  "binning",
+  "gain",
+  "offset",
+] as const;
+
+/** Parameters that can be exact or disabled (no warning mode) */
+export const EXACT_OR_DISABLED_PARAMETERS = ["telescop", "filter"] as const;
+
+/** Parameters that support warning mode with dual thresholds */
+export const WARNING_CAPABLE_PARAMETERS = [
+  "exptime",
+  "focallen",
+  "ccd_temp",
+] as const;
+
 /** All configurable parameters */
 export const CONFIGURABLE_PARAMETERS = [
   "instrume",
   "binning",
   "gain",
   "offset",
+  "telescop",
   "exptime",
   "focallen",
   "filter",
@@ -172,3 +268,27 @@ export const CONFIGURABLE_PARAMETERS = [
 ] as const;
 
 export type ConfigurableParameter = (typeof CONFIGURABLE_PARAMETERS)[number];
+export type LockedParameter = (typeof LOCKED_PARAMETERS)[number];
+export type ExactOrDisabledParameter =
+  (typeof EXACT_OR_DISABLED_PARAMETERS)[number];
+export type WarningCapableParameter =
+  (typeof WARNING_CAPABLE_PARAMETERS)[number];
+
+/** Check if a parameter is locked (always exact) */
+export function isLockedParameter(param: string): param is LockedParameter {
+  return (LOCKED_PARAMETERS as readonly string[]).includes(param);
+}
+
+/** Check if a parameter supports warning mode */
+export function supportsWarningMode(
+  param: string
+): param is WarningCapableParameter {
+  return (WARNING_CAPABLE_PARAMETERS as readonly string[]).includes(param);
+}
+
+/** Check if a parameter is exact-or-disabled (no warning mode) */
+export function isExactOrDisabled(
+  param: string
+): param is ExactOrDisabledParameter {
+  return (EXACT_OR_DISABLED_PARAMETERS as readonly string[]).includes(param);
+}

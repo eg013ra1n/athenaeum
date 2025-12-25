@@ -8,21 +8,42 @@ use std::sync::Mutex;
 
 /// Application defaults for grouping settings
 pub mod defaults {
+    // Frame set clustering (for grouping LIGHT frames by sky coordinates)
     pub const GROUPING_THRESHOLD_VALUE: &str = "3.0";
     pub const GROUPING_THRESHOLD_UNIT: &str = "deg";
+    pub const SESSION_GAP_THRESHOLD_HOURS: &str = "6.0";
+
+    // Dark Library creation (batch organization of ALL dark/bias frames for a camera)
+    // Note: These are separate from calibration matching settings (calibration.matching_config)
+    // which are used for finding calibrations for specific light frames.
+    // Dark Library uses broader thresholds because it organizes existing frames,
+    // while calibration matching uses narrower thresholds for precision matching.
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "180";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "1.0";
+
+    // Duplicate detection
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "false";
+    // Used by frontend via get_setting/set_setting as a UI flag (not directly in Rust)
+    #[allow(dead_code)]
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "false";
 }
 
 /// Setting keys used throughout the application
 pub mod keys {
+    // Frame set clustering
     pub const GROUPING_THRESHOLD_VALUE: &str = "grouping.threshold.value";
     pub const GROUPING_THRESHOLD_UNIT: &str = "grouping.threshold.unit";
+    pub const SESSION_GAP_THRESHOLD_HOURS: &str = "session_gap_threshold_hours";
+
+    // Dark Library creation (see defaults module for explanation of why these
+    // are separate from calibration.matching_config settings)
     pub const DARK_LIBRARY_DATE_THRESHOLD_DAYS: &str = "dark_library.date_threshold_days";
     pub const DARK_LIBRARY_TEMP_THRESHOLD_CELSIUS: &str = "dark_library.temp_threshold_celsius";
+
+    // Duplicate detection
     pub const DUPLICATES_USE_CONTENT_HASH: &str = "duplicates.use_content_hash";
+    // Used by frontend via get_setting/set_setting as a UI flag (not directly in Rust)
+    #[allow(dead_code)]
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "duplicates.content_hash_rescanned";
 }
 
@@ -62,6 +83,7 @@ impl SettingsManager {
     }
 
     /// Set a runtime override (session-specific, not persisted)
+    #[allow(dead_code)]
     pub fn set_runtime_override(&self, key: String, value: String) {
         if let Ok(mut overrides) = self.runtime_overrides.lock() {
             overrides.insert(key, value);
@@ -69,6 +91,7 @@ impl SettingsManager {
     }
 
     /// Clear a runtime override
+    #[allow(dead_code)]
     pub fn clear_runtime_override(&self, key: &str) {
         if let Ok(mut overrides) = self.runtime_overrides.lock() {
             overrides.remove(key);
@@ -76,6 +99,7 @@ impl SettingsManager {
     }
 
     /// Clear all runtime overrides
+    #[allow(dead_code)]
     pub fn clear_all_runtime_overrides(&self) {
         if let Ok(mut overrides) = self.runtime_overrides.lock() {
             overrides.clear();
@@ -136,7 +160,19 @@ impl SettingsManager {
         Ok(arcsec / 3600.0)
     }
 
-    /// Get the dark library date threshold in days
+    /// Get the session gap threshold in hours (for imaging night detection)
+    pub fn get_session_gap_threshold_hours(&self, conn: &Connection) -> Result<f64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::SESSION_GAP_THRESHOLD_HOURS,
+            defaults::SESSION_GAP_THRESHOLD_HOURS,
+        )?;
+        Ok(value.parse()?)
+    }
+
+    /// Get the dark library date threshold in days (for batch Dark Library creation).
+    /// Note: This is different from calibration.matching_config clustering settings
+    /// which are used for per-frame calibration matching.
     pub fn get_dark_library_date_threshold(&self, conn: &Connection) -> Result<i64> {
         let value = self.get_with_precedence(
             conn,
@@ -146,7 +182,9 @@ impl SettingsManager {
         Ok(value.parse()?)
     }
 
-    /// Get the dark library temperature threshold in Celsius
+    /// Get the dark library temperature threshold in Celsius (for batch Dark Library creation).
+    /// Note: This is different from calibration.matching_config warning thresholds
+    /// which are used for per-frame calibration matching warnings.
     pub fn get_dark_library_temp_threshold(&self, conn: &Connection) -> Result<f64> {
         let value = self.get_with_precedence(
             conn,
@@ -165,17 +203,6 @@ impl SettingsManager {
         )?;
         Ok(value.to_lowercase() == "true")
     }
-
-    /// Get whether content hash rescan has been completed
-    pub fn get_duplicates_content_hash_rescanned(&self, conn: &Connection) -> Result<bool> {
-        let value = self.get_with_precedence(
-            conn,
-            keys::DUPLICATES_CONTENT_HASH_RESCANNED,
-            defaults::DUPLICATES_CONTENT_HASH_RESCANNED,
-        )?;
-        Ok(value.to_lowercase() == "true")
-    }
-
 }
 
 #[cfg(test)]

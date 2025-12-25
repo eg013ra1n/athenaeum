@@ -48,10 +48,10 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 
     conn.execute(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp, is_master,
-         gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, pixsz,
-         ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override)
+         gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, ypixsz,
+         naxis1, naxis2, ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, swcreate)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
         params![
             frame.file_id,
             frame.object,
@@ -71,7 +71,9 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
             frame.set_temp,
             frame.focallen,
             frame.xpixsz,
-            frame.pixsz,
+            frame.ypixsz,
+            frame.naxis1,
+            frame.naxis2,
             frame.ra,
             frame.dec,
             frame.sitelat,
@@ -81,6 +83,7 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
             frame.objctra,
             frame.objctdec,
             override_int,
+            frame.swcreate,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -147,21 +150,80 @@ pub fn update_scan_root_timestamp(conn: &Connection, id: i64) -> Result<()> {
 }
 
 /// Delete a scan root and all associated files
+/// Optimized: uses transaction, pre-computes IDs, deletes child tables explicitly
 pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
-    // First, get the path of the scan root
+    // Get the path of the scan root
     let path: String = conn.query_row(
         "SELECT path FROM scan_roots WHERE id = ?1",
         params![id],
         |row| row.get(0),
     )?;
 
-    // Delete all files under this path (frames will be cascade deleted due to foreign key)
-    conn.execute(
-        "DELETE FROM files WHERE path LIKE ?1 || '%'",
-        params![path],
-    )?;
+    // Start transaction for atomicity and performance
+    conn.execute("BEGIN TRANSACTION", [])?;
 
-    // Delete orphaned calibration sets (sets with no remaining linked frames)
+    // Pre-compute file IDs to delete (single LIKE query)
+    let file_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM files WHERE path LIKE ?1 || '%'")?;
+        let rows = stmt.query_map(params![path], |row| row.get(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if !file_ids.is_empty() {
+        // Pre-compute frame IDs for these files
+        let frame_ids: Vec<i64> = {
+            let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id FROM frames WHERE file_id IN ({})", placeholders);
+            let mut stmt = conn.prepare(&sql)?;
+            let params_vec: Vec<rusqlite::types::Value> = file_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| row.get(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        // Delete child tables explicitly (avoiding cascade overhead)
+        if !frame_ids.is_empty() {
+            let frame_placeholders: String = frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let frame_values: Vec<rusqlite::types::Value> = frame_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+
+            // 1. session_members
+            let sql = format!("DELETE FROM session_members WHERE frame_id IN ({})", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+
+            // 2. calibration_set_frames
+            let sql = format!("DELETE FROM calibration_set_frames WHERE frame_id IN ({})", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+
+            // 3. frame_tags
+            let sql = format!("DELETE FROM frame_tags WHERE frame_id IN ({})", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+
+            // 4. calibration_set_to_frames (source_id refers to frame_id when source_type='frame')
+            let sql = format!("DELETE FROM calibration_set_to_frames WHERE source_id IN ({}) AND source_type = 'frame'", frame_placeholders);
+            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+        }
+
+        // Delete by file_id
+        let file_placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let file_values: Vec<rusqlite::types::Value> = file_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+
+        // 5. fits_header
+        let sql = format!("DELETE FROM fits_header WHERE file_id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+
+        // 6. black_hole
+        let sql = format!("DELETE FROM black_hole WHERE file_id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+
+        // 7. frames
+        let sql = format!("DELETE FROM frames WHERE file_id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+
+        // 8. files
+        let sql = format!("DELETE FROM files WHERE id IN ({})", file_placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+    }
+
+    // 9. Delete orphaned calibration sets
     conn.execute(
         "DELETE FROM calibration_set WHERE id NOT IN (
             SELECT DISTINCT set_id FROM calibration_set_frames
@@ -169,20 +231,34 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         [],
     )?;
 
-    // Delete orphaned frame sets (sets with no remaining linked frames)
+    // 10. Delete orphaned sessions and imaging_nights first
     conn.execute(
-        "DELETE FROM frames_set WHERE id NOT IN (
-            SELECT DISTINCT fs.id
-            FROM frames_set fs
-            INNER JOIN imaging_nights inn ON inn.frames_set_id = fs.id
-            INNER JOIN sessions s ON s.imaging_night_id = inn.id
-            INNER JOIN session_members sm ON sm.session_id = s.id
+        "DELETE FROM sessions WHERE id NOT IN (
+            SELECT DISTINCT session_id FROM session_members
         )",
         [],
     )?;
 
-    // Delete the scan root
+    conn.execute(
+        "DELETE FROM imaging_nights WHERE id NOT IN (
+            SELECT DISTINCT imaging_night_id FROM sessions
+        )",
+        [],
+    )?;
+
+    // 11. Delete orphaned frame sets
+    conn.execute(
+        "DELETE FROM frames_set WHERE id NOT IN (
+            SELECT DISTINCT frames_set_id FROM imaging_nights
+        )",
+        [],
+    )?;
+
+    // 12. Delete the scan root
     conn.execute("DELETE FROM scan_roots WHERE id = ?1", params![id])?;
+
+    // Commit transaction
+    conn.execute("COMMIT", [])?;
 
     Ok(())
 }
@@ -228,8 +304,8 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          ORDER BY f.created_at DESC
@@ -283,7 +359,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 set_temp: row.get(24).ok(),
                 focallen: row.get(25).ok(),
                 xpixsz: row.get(26).ok(),
-                pixsz: row.get(27).ok(),
+                ypixsz: row.get(27).ok(),
                 naxis1: row.get(28).ok(),
                 naxis2: row.get(29).ok(),
                 ra: row.get(30).ok(),
@@ -295,6 +371,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 objctra: row.get(36).ok(),
                 objctdec: row.get(37).ok(),
                 override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
+                swcreate: row.get(39).ok(),
             })
         } else {
             None
@@ -323,8 +400,8 @@ pub fn get_files_by_directory(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          WHERE f.path LIKE ?1 || '/%'
@@ -381,7 +458,7 @@ pub fn get_files_by_directory(
                 set_temp: row.get(24).ok(),
                 focallen: row.get(25).ok(),
                 xpixsz: row.get(26).ok(),
-                pixsz: row.get(27).ok(),
+                ypixsz: row.get(27).ok(),
                 naxis1: row.get(28).ok(),
                 naxis2: row.get(29).ok(),
                 ra: row.get(30).ok(),
@@ -393,6 +470,7 @@ pub fn get_files_by_directory(
                 objctra: row.get(36).ok(),
                 objctdec: row.get(37).ok(),
                 override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
+                swcreate: row.get(39).ok(),
             })
         } else {
             None
@@ -422,8 +500,8 @@ pub fn get_frames_with_missing_metadata(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
          WHERE UPPER(fr.imagetyp) = 'LIGHT' AND ({})
@@ -476,7 +554,7 @@ pub fn get_frames_with_missing_metadata(
             set_temp: row.get(24).ok(),
             focallen: row.get(25).ok(),
             xpixsz: row.get(26).ok(),
-            pixsz: row.get(27).ok(),
+            ypixsz: row.get(27).ok(),
             naxis1: row.get(28).ok(),
             naxis2: row.get(29).ok(),
             ra: row.get(30).ok(),
@@ -488,6 +566,7 @@ pub fn get_frames_with_missing_metadata(
             objctra: row.get(36).ok(),
             objctdec: row.get(37).ok(),
             override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
+            swcreate: row.get(39).ok(),
         };
 
         Ok((file, frame))
@@ -544,6 +623,165 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
     })?;
 
     groups.collect()
+}
+
+/// Rebuild the duplicate groups cache tables
+/// This clears existing cache and recomputes all duplicate groups
+pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool) -> Result<usize> {
+    let hash_type = if use_content_hash { "content" } else { "metadata" };
+    let hash_column = if use_content_hash { "content_hash" } else { "metadata_hash" };
+
+    // Start transaction
+    conn.execute("BEGIN TRANSACTION", [])?;
+
+    // Clear existing cache for this hash type
+    conn.execute(
+        "DELETE FROM duplicate_group_files WHERE group_id IN (SELECT id FROM duplicate_groups WHERE hash_type = ?1)",
+        params![hash_type],
+    )?;
+    conn.execute(
+        "DELETE FROM duplicate_groups WHERE hash_type = ?1",
+        params![hash_type],
+    )?;
+
+    // Find duplicate files (groups with count > 1)
+    let query = format!(
+        "SELECT f.{}, f.size, COUNT(*) as count
+         FROM files f
+         WHERE f.{} IS NOT NULL
+         AND NOT EXISTS (
+             SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
+         )
+         AND EXISTS (
+             SELECT 1 FROM scan_roots sr
+             WHERE sr.find_duplicates = 1
+             AND f.path LIKE sr.path || '%'
+         )
+         GROUP BY f.{}, f.size
+         HAVING count > 1",
+        hash_column, hash_column, hash_column
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut groups_created = 0;
+
+    for (hash, size, file_count) in rows {
+        // Insert the group
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![hash, hash_type, size, file_count, now],
+        )?;
+        let group_id = conn.last_insert_rowid();
+
+        // Find and insert all files in this group
+        let files_query = format!(
+            "SELECT id FROM files WHERE {} = ?1 AND size = ?2
+             AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)
+             AND EXISTS (
+                 SELECT 1 FROM scan_roots sr
+                 WHERE sr.find_duplicates = 1
+                 AND files.path LIKE sr.path || '%'
+             )",
+            hash_column
+        );
+        let mut files_stmt = conn.prepare(&files_query)?;
+        let file_ids: Vec<i64> = files_stmt
+            .query_map(params![hash, size], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for file_id in file_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO duplicate_group_files (group_id, file_id) VALUES (?1, ?2)",
+                params![group_id, file_id],
+            )?;
+        }
+
+        groups_created += 1;
+    }
+
+    conn.execute("COMMIT", [])?;
+    Ok(groups_created)
+}
+
+/// Get duplicate groups from cache
+/// Returns cached duplicate groups with file paths and IDs
+pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
+    let hash_type = if use_content_hash { "content" } else { "metadata" };
+
+    let mut stmt = conn.prepare(
+        "SELECT dg.id, dg.hash, dg.size, dg.file_count
+         FROM duplicate_groups dg
+         WHERE dg.hash_type = ?1
+         ORDER BY dg.file_count DESC, dg.size DESC"
+    )?;
+
+    let groups: Vec<(i64, String, i64, i64)> = stmt
+        .query_map(params![hash_type], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut result = Vec::with_capacity(groups.len());
+
+    for (group_id, hash, size, _file_count) in groups {
+        // Get files for this group, excluding files in black_hole
+        let mut files_stmt = conn.prepare(
+            "SELECT f.id, f.path
+             FROM duplicate_group_files dgf
+             JOIN files f ON f.id = dgf.file_id
+             WHERE dgf.group_id = ?1
+             AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)
+             ORDER BY f.path"
+        )?;
+
+        let files: Vec<(i64, String)> = files_stmt
+            .query_map(params![group_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Skip if fewer than 2 files (no longer duplicates after black_hole filtering)
+        if files.len() < 2 {
+            continue;
+        }
+
+        let file_ids: Vec<i64> = files.iter().map(|(id, _)| *id).collect();
+        let file_paths: Vec<String> = files.iter().map(|(_, path)| path.clone()).collect();
+
+        result.push(DuplicateGroup {
+            id: Some(group_id),
+            size,
+            content_hash: hash,
+            file_count: files.len() as i32,  // Use actual count after filtering
+            file_paths,
+            file_ids,
+        });
+    }
+
+    Ok(result)
+}
+
+/// Check if duplicate cache exists and has data
+pub fn has_duplicate_cache(conn: &Connection, use_content_hash: bool) -> Result<bool> {
+    let hash_type = if use_content_hash { "content" } else { "metadata" };
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM duplicate_groups WHERE hash_type = ?1",
+        params![hash_type],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Check if file already exists in database
@@ -749,7 +987,7 @@ pub fn update_frames_set_flat_pattern(
 /// Get all LIGHT frames for a project (for clustering)
 pub fn get_light_frames_for_project(
     conn: &Connection,
-    project_id: i64,
+    _project_id: i64,
 ) -> Result<Vec<(i64, crate::models::Frame)>> {
     // For now, we'll get all LIGHT frames regardless of project
     // In the future, we can add project filtering at the frame level
@@ -757,7 +995,7 @@ pub fn get_light_frames_for_project(
         "SELECT f.id, fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
@@ -796,7 +1034,7 @@ pub fn get_light_frames_for_project(
             set_temp: row.get(17)?,
             focallen: row.get(18)?,
             xpixsz: row.get(19)?,
-            pixsz: row.get(20)?,
+            ypixsz: row.get(20)?,
             naxis1: row.get(21)?,
             naxis2: row.get(22)?,
             ra: row.get(23)?,
@@ -808,6 +1046,7 @@ pub fn get_light_frames_for_project(
             objctra: row.get(29)?,
             objctdec: row.get(30)?,
             override_: row.get::<_, i32>(31)? == 1,
+            swcreate: None,
         };
 
         Ok((file_id, frame))
@@ -881,6 +1120,7 @@ pub fn sessions_exist_for_frame_set(conn: &Connection, frames_set_id: i64) -> Re
 }
 
 /// Delete all sessions for a frame set
+#[allow(dead_code)]
 pub fn delete_sessions_for_frame_set(conn: &Connection, frames_set_id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM imaging_nights WHERE frames_set_id = ?1",
@@ -1050,6 +1290,7 @@ pub fn get_sessions_for_night(
 }
 
 /// Get frames for a specific frames_set with file info (for session detection)
+#[allow(dead_code)]
 pub fn get_frames_with_files_for_set(
     conn: &Connection,
     frames_set_id: i64,
@@ -1059,7 +1300,7 @@ pub fn get_frames_with_files_for_set(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM session_members sm
          JOIN sessions s ON sm.session_id = s.id
@@ -1113,7 +1354,7 @@ pub fn get_frames_with_files_for_set(
             set_temp: row.get(25)?,
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
+            ypixsz: row.get(28)?,
             naxis1: row.get(29)?,
             naxis2: row.get(30)?,
             ra: row.get(31)?,
@@ -1125,6 +1366,7 @@ pub fn get_frames_with_files_for_set(
             objctra: row.get(37)?,
             objctdec: row.get(38)?,
             override_: row.get::<_, i32>(39)? == 1,
+            swcreate: None,
         };
 
         // Debug: Check date_obs in database
@@ -1163,7 +1405,7 @@ pub fn get_frames_with_files_by_ids(
                 fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM frames fr
          JOIN files f ON fr.file_id = f.id
@@ -1225,7 +1467,7 @@ pub fn get_frames_with_files_by_ids(
             set_temp: row.get(25)?,
             focallen: row.get(26)?,
             xpixsz: row.get(27)?,
-            pixsz: row.get(28)?,
+            ypixsz: row.get(28)?,
             naxis1: row.get(29)?,
             naxis2: row.get(30)?,
             ra: row.get(31)?,
@@ -1237,6 +1479,7 @@ pub fn get_frames_with_files_by_ids(
             objctra: row.get(37)?,
             objctdec: row.get(38)?,
             override_: row.get::<_, i32>(39)? == 1,
+            swcreate: None,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -1310,7 +1553,7 @@ pub fn get_imaging_nights_with_sessions(
                         fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
                         fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                         fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                        fr.xpixsz, fr.pixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
+                        fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
                         fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
                  FROM session_members sm
                  JOIN frames fr ON sm.frame_id = fr.id
@@ -1362,7 +1605,7 @@ pub fn get_imaging_nights_with_sessions(
                     set_temp: row.get(25)?,
                     focallen: row.get(26)?,
                     xpixsz: row.get(27)?,
-                    pixsz: row.get(28)?,
+                    ypixsz: row.get(28)?,
                     naxis1: row.get(29)?,
                     naxis2: row.get(30)?,
                     ra: row.get(31)?,
@@ -1374,6 +1617,7 @@ pub fn get_imaging_nights_with_sessions(
                     objctra: row.get(37)?,
                     objctdec: row.get(38)?,
                     override_: row.get::<_, i32>(39)? == 1,
+                    swcreate: None,
                 };
 
                 Ok(crate::models::FileWithFrame {

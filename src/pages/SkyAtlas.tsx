@@ -520,12 +520,41 @@ export default function SkyAtlas() {
                 ];
 
                 // Project corners and apply scaling
-                const projectedCorners = corners.map((c: any) => {
+                const projectedCorners: [number, number][] = [];
+                let hasInvalidCorner = false;
+                for (const c of corners) {
                   const pt = window.Celestial.map.projection()(c);
-                  if (!pt) return [0, 0];
-                  // Apply canvas scaling
-                  return [pt[0] * scaling.scaleX, pt[1] * scaling.scaleY];
-                });
+                  if (!pt || !isFinite(pt[0]) || !isFinite(pt[1])) {
+                    hasInvalidCorner = true;
+                    break;
+                  }
+                  projectedCorners.push([pt[0] * scaling.scaleX, pt[1] * scaling.scaleY]);
+                }
+
+                // Skip rendering if any corner is invalid (outside projection)
+                if (hasInvalidCorner || projectedCorners.length !== 4) {
+                  g.style('display', 'none');
+                  return;
+                }
+
+                // Check if the FOV spans across the projection edge
+                // by detecting if corners are too far apart horizontally
+                const xCoords = projectedCorners.map(p => p[0]);
+                const yCoords = projectedCorners.map(p => p[1]);
+                const xSpan = Math.max(...xCoords) - Math.min(...xCoords);
+                const ySpan = Math.max(...yCoords) - Math.min(...yCoords);
+
+                // Get canvas dimensions to determine threshold
+                const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
+                const canvasWidth = canvas ? canvas.getBoundingClientRect().width : 1000;
+                const canvasHeight = canvas ? canvas.getBoundingClientRect().height : 500;
+
+                // If FOV spans more than 50% of the canvas, it's likely wrapping around the edge
+                if (xSpan > canvasWidth * 0.5 || ySpan > canvasHeight * 0.5) {
+                  g.style('display', 'none');
+                  return;
+                }
+
                 const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
 
                 // Create fill color with opacity
@@ -736,6 +765,11 @@ export default function SkyAtlas() {
         const scaling = getCanvasScaling();
 
         if (isZoomedIn) {
+          // Get canvas dimensions for edge detection
+          const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
+          const canvasWidth = canvas ? canvas.getBoundingClientRect().width : 1000;
+          const canvasHeight = canvas ? canvas.getBoundingClientRect().height : 500;
+
           // Redraw FOV boxes
           markersGroup.selectAll('.fov-box').each(function(this: any, d: any) {
             const pt = map.projection()(d.geometry.coordinates);
@@ -743,27 +777,52 @@ export default function SkyAtlas() {
 
             if (corners) {
               // Project corners and apply scaling
-              const projectedCorners = corners.map((c: any) => {
-                const pt = map.projection()(c);
-                if (!pt) return [0, 0];
-                return [pt[0] * scaling.scaleX, pt[1] * scaling.scaleY];
-              });
+              const projectedCorners: [number, number][] = [];
+              let hasInvalidCorner = false;
+              for (const c of corners) {
+                const projPt = map.projection()(c);
+                if (!projPt || !isFinite(projPt[0]) || !isFinite(projPt[1])) {
+                  hasInvalidCorner = true;
+                  break;
+                }
+                projectedCorners.push([projPt[0] * scaling.scaleX, projPt[1] * scaling.scaleY]);
+              }
+
+              // Hide if any corner is invalid
+              if (hasInvalidCorner || projectedCorners.length !== 4) {
+                d3.select(this).style('display', 'none');
+                return;
+              }
+
+              // Check if the FOV spans across the projection edge
+              const xCoords = projectedCorners.map(p => p[0]);
+              const yCoords = projectedCorners.map(p => p[1]);
+              const xSpan = Math.max(...xCoords) - Math.min(...xCoords);
+              const ySpan = Math.max(...yCoords) - Math.min(...yCoords);
+
+              if (xSpan > canvasWidth * 0.5 || ySpan > canvasHeight * 0.5) {
+                d3.select(this).style('display', 'none');
+                return;
+              }
+
               const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
 
               d3.select(this).select('.fov-rect')
                 .attr('d', pathData);
+
+              // Show the FOV box (it passed validation)
+              d3.select(this).style('display', null);
             } else if (pt) {
               // Update cross position with scaling
               const scaledX = pt[0] * scaling.scaleX;
               const scaledY = pt[1] * scaling.scaleY;
               d3.select(this).select('path')
                 .attr('transform', `translate(${scaledX},${scaledY})`);
-            }
 
-            // Visibility check
-            const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
-            d3.select(this)
-              .style('display', isVisible ? null : 'none');
+              // Visibility check for markers without FOV
+              const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
+              d3.select(this).style('display', isVisible ? null : 'none');
+            }
           });
         } else {
           // Redraw simple markers with scaling

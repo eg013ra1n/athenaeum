@@ -5,7 +5,6 @@ pub mod config;
 pub mod configurable_matcher;
 pub mod finder;
 pub mod hierarchy;
-pub mod auto_create;
 pub mod processor;
 pub mod flat_groups;
 pub mod flat_matcher;
@@ -13,52 +12,9 @@ pub mod dark_bias_groups;
 pub mod scan_integration;
 
 // Re-export config types for convenience
-pub use config::{
-    CalibrationMatchingConfig, CalibrationTypeConfig, SourceTypeConfig,
-    ParameterConfig, MatchMode, BehavioralOptions, MasterPreference,
-    ClusteringConfig, ScoringConfig,
-};
+pub use config::CalibrationMatchingConfig;
 
-use crate::models::{CalibrationSet, Frame};
 use anyhow::Result;
-
-/// Find matching calibration frames for a light frame
-pub fn find_matching_calibrations(
-    _frame: &Frame,
-    _tolerance: &CalibrationTolerance,
-) -> Result<MatchedCalibrations> {
-    // TODO: Query for calibration frames matching:
-    // - IMAGETYP (Dark, Flat, Bias, DarkFlat)
-    // - EXPTIME (for Darks, within tolerance)
-    // - FILTER (for Flats)
-    // - INSTRUME
-    // - GAIN/ISO (within tolerance)
-    // - CCD-TEMP (within tolerance)
-    // - Date proximity
-
-    unimplemented!("Calibration matching not yet implemented")
-}
-
-/// Suggest calibration sets for a capture day
-pub fn suggest_calibrations(_date: &str) -> Result<Vec<CalibrationSet>> {
-    // TODO: Auto-suggest calibration frames for a given day
-    // Group by parameters and suggest matches
-
-    unimplemented!("Calibration suggestion not yet implemented")
-}
-
-pub struct CalibrationTolerance {
-    pub temp_delta: f64,        // °C
-    pub exptime_percent: f64,   // percentage
-    pub gain_delta: f64,
-}
-
-pub struct MatchedCalibrations {
-    pub darks: Vec<Frame>,
-    pub flats: Vec<Frame>,
-    pub bias: Vec<Frame>,
-    pub dark_flats: Vec<Frame>,
-}
 
 // ========== Dark Library Clustering ==========
 
@@ -552,12 +508,282 @@ pub fn create_master_dark_library(
     })
 }
 
-/// Delete camera's master dark library
+/// Delete camera's master dark library (only MasterDark, MasterBias, MasterDarkFlat)
 fn delete_camera_master_dark_library(conn: &Connection, instrume: &str) -> Result<()> {
-    // Delete all calibration sets for this camera that are master library sets
     conn.execute(
-        "DELETE FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1",
+        "DELETE FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1
+         AND imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')",
         rusqlite::params![instrume],
     )?;
     Ok(())
+}
+
+/// Delete camera's master flat library (only MasterFlat)
+fn delete_camera_master_flat_library(conn: &Connection, instrume: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM calibration_set WHERE instrume = ?1 AND is_master_library = 1
+         AND imagetyp = 'MasterFlat'",
+        rusqlite::params![instrume],
+    )?;
+    Ok(())
+}
+
+/// Frame data for flat clustering (includes filter)
+#[derive(Debug, Clone)]
+struct FlatCalibrationFrame {
+    id: i64,
+    date_obs: DateTime<Utc>,
+    exptime: Option<f64>,
+    ccd_temp: Option<f64>,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    binning: Option<String>,
+    filter: Option<String>,
+    imagetyp: ImageType,
+}
+
+/// Grouping key for master flats (includes filter)
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct FlatGroupKey {
+    exptime: String,
+    gain: String,
+    offset: String,
+    binning: String,
+    filter: String,
+}
+
+/// Cluster of flat frames with similar dates and temperatures
+#[derive(Debug, Clone)]
+struct FlatFrameCluster {
+    frames: Vec<FlatCalibrationFrame>,
+}
+
+impl FlatFrameCluster {
+    fn new(frame: FlatCalibrationFrame) -> Self {
+        Self { frames: vec![frame] }
+    }
+
+    fn add(&mut self, frame: FlatCalibrationFrame) {
+        self.frames.push(frame);
+    }
+
+    fn date_range(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        let dates: Vec<_> = self.frames.iter().map(|f| f.date_obs).collect();
+        (*dates.iter().min().unwrap(), *dates.iter().max().unwrap())
+    }
+
+    fn avg_temp(&self) -> Option<f64> {
+        let temps: Vec<f64> = self.frames.iter().filter_map(|f| f.ccd_temp).collect();
+        if temps.is_empty() {
+            None
+        } else {
+            Some(temps.iter().sum::<f64>() / temps.len() as f64)
+        }
+    }
+
+    fn temp_range(&self) -> (f64, f64) {
+        let temps: Vec<f64> = self.frames.iter().filter_map(|f| f.ccd_temp).collect();
+        if temps.is_empty() {
+            (0.0, 0.0)
+        } else {
+            (
+                temps.iter().cloned().fold(f64::INFINITY, f64::min),
+                temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            )
+        }
+    }
+
+    fn date_display(&self) -> String {
+        let (start, _) = self.date_range();
+        start.format("%Y-%m").to_string()
+    }
+
+    fn get_metadata(&self) -> (Option<f64>, Option<f64>, Option<f64>, Option<String>, Option<String>, ImageType) {
+        let first = &self.frames[0];
+        (first.exptime, first.gain, first.offset, first.binning.clone(), first.filter.clone(), first.imagetyp.clone())
+    }
+
+    fn can_add(&self, frame: &FlatCalibrationFrame, date_threshold_days: i64, temp_threshold: f64) -> bool {
+        let (cluster_start, cluster_end) = self.date_range();
+        let frame_date = frame.date_obs;
+
+        // Check date proximity
+        let date_ok = (frame_date - cluster_start).num_days().abs() <= date_threshold_days
+            || (frame_date - cluster_end).num_days().abs() <= date_threshold_days;
+
+        if !date_ok {
+            return false;
+        }
+
+        // Check temperature proximity
+        if let Some(frame_temp) = frame.ccd_temp {
+            if let Some(avg_temp) = self.avg_temp() {
+                return (frame_temp - avg_temp).abs() <= temp_threshold;
+            }
+        }
+
+        true
+    }
+}
+
+/// Cluster flat frames by date and temperature
+fn cluster_flat_frames(
+    frames: Vec<FlatCalibrationFrame>,
+    date_threshold_days: i64,
+    temp_threshold: f64,
+) -> Vec<FlatFrameCluster> {
+    let mut clusters: Vec<FlatFrameCluster> = Vec::new();
+
+    for frame in frames {
+        let mut added = false;
+        for cluster in &mut clusters {
+            if cluster.can_add(&frame, date_threshold_days, temp_threshold) {
+                cluster.add(frame.clone());
+                added = true;
+                break;
+            }
+        }
+        if !added {
+            clusters.push(FlatFrameCluster::new(frame));
+        }
+    }
+
+    clusters
+}
+
+/// Creates master flat library for a specific camera
+/// This handles master flat calibration frames (MasterFlat)
+pub fn create_master_flat_library(
+    conn: &Connection,
+    instrume: &str,
+    date_threshold_days: i64,
+    temp_threshold: f64,
+) -> Result<DarkLibraryResult> {
+    // Delete existing master flat library first
+    delete_camera_master_flat_library(conn, instrume)?;
+
+    // Query all MASTER FLAT frames for this camera
+    let mut stmt = conn.prepare(
+        "SELECT
+            f.id,
+            f.date_obs,
+            f.exptime,
+            f.ccd_temp,
+            f.gain,
+            f.offset,
+            f.binning,
+            f.filter,
+            f.imagetyp
+        FROM frames f
+        WHERE f.instrume = ?1
+        AND f.imagetyp = 'MasterFlat'
+        AND f.date_obs IS NOT NULL
+        ORDER BY f.date_obs"
+    )?;
+
+    let frames: Vec<FlatCalibrationFrame> = stmt
+        .query_map([instrume], |row| {
+            let date_obs_str: String = row.get(1)?;
+            let date_obs = DateTime::parse_from_rfc3339(&date_obs_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+            let imagetyp_str: String = row.get(8)?;
+            let imagetyp = ImageType::from_str(&imagetyp_str)
+                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+
+            Ok(FlatCalibrationFrame {
+                id: row.get(0)?,
+                date_obs,
+                exptime: row.get(2)?,
+                ccd_temp: row.get(3)?,
+                gain: row.get(4)?,
+                offset: row.get(5)?,
+                binning: row.get(6)?,
+                filter: row.get(7)?,
+                imagetyp,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let total_frames = frames.len() as i64;
+    let mut frames_grouped = 0i64;
+    let mut sets_created = 0i64;
+
+    // Group frames by exact-match parameters (including filter)
+    let mut groups: HashMap<FlatGroupKey, Vec<FlatCalibrationFrame>> = HashMap::new();
+
+    for frame in frames {
+        let key = FlatGroupKey {
+            exptime: frame.exptime.map(|e| format!("{:.2}", e)).unwrap_or_default(),
+            gain: frame.gain.map(|g| format!("{:.2}", g)).unwrap_or_default(),
+            offset: frame.offset.map(|o| format!("{:.2}", o)).unwrap_or_default(),
+            binning: frame.binning.clone().unwrap_or_default(),
+            filter: frame.filter.clone().unwrap_or_default(),
+        };
+
+        groups.entry(key).or_insert_with(Vec::new).push(frame);
+    }
+
+    // Process each group
+    for (_key, group_frames) in groups {
+        // Cluster by date and temperature
+        let clusters = cluster_flat_frames(group_frames, date_threshold_days, temp_threshold);
+
+        // Create calibration sets for each cluster
+        for cluster in clusters {
+            let (date_start, date_end) = cluster.date_range();
+            let avg_temp = cluster.avg_temp().unwrap_or(0.0);
+            let (temp_min, temp_max) = cluster.temp_range();
+            let (exptime, gain, offset, binning, filter, imagetyp) = cluster.get_metadata();
+            let date_display = cluster.date_display();
+            let frame_count = cluster.frames.len() as i64;
+
+            // Insert calibration set with is_master_library = 1
+            conn.execute(
+                "INSERT INTO calibration_set (
+                    imagetyp, exptime, ccd_temp, temp_min, temp_max,
+                    gain, offset, binning, instrume, filter, date,
+                    date_start, date_end, frame_count, is_master_library
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
+                rusqlite::params![
+                    format!("{:?}", imagetyp),
+                    exptime,
+                    avg_temp,
+                    temp_min,
+                    temp_max,
+                    gain,
+                    offset,
+                    binning,
+                    instrume,
+                    filter,
+                    date_display,
+                    date_start.to_rfc3339(),
+                    date_end.to_rfc3339(),
+                    frame_count,
+                ],
+            )?;
+
+            let set_id = conn.last_insert_rowid();
+
+            // Link frames to set
+            for frame in &cluster.frames {
+                conn.execute(
+                    "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                    rusqlite::params![set_id, frame.id],
+                )?;
+            }
+
+            frames_grouped += cluster.frames.len() as i64;
+            sets_created += 1;
+        }
+    }
+
+    let frames_excluded = total_frames - frames_grouped;
+
+    Ok(DarkLibraryResult {
+        sets_created,
+        frames_grouped,
+        frames_excluded,
+    })
 }

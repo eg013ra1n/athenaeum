@@ -76,12 +76,14 @@ pub fn compute_metadata_hash(size: i64, modified_at: &DateTime<Utc>, filename: &
 
 /// Group files by size and hash to find duplicates
 /// This function is a wrapper - actual implementation is in db::find_duplicate_groups
+#[allow(dead_code)]
 pub fn find_duplicates(conn: &rusqlite::Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
     crate::db::find_duplicate_groups(conn, use_content_hash).map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 /// Verify two files are byte-identical (optional safeguard)
 /// Used before destructive operations on duplicates
+#[allow(dead_code)]
 pub fn verify_byte_identical(path1: &Path, path2: &Path) -> Result<bool> {
     use std::io::Read;
 

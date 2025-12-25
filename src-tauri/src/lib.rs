@@ -5,7 +5,6 @@ mod fits_parser;
 mod scanner;
 mod duplicates;
 mod calibration;
-mod export;
 mod settings;
 mod coordinates;
 mod clustering;
@@ -25,6 +24,7 @@ mod commands_rustafits;
 use cache::CacheManager;
 use commands::AppState;
 use settings::SettingsManager;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
@@ -38,6 +38,7 @@ pub fn run() {
             db: Mutex::new(None),
             settings: Arc::new(SettingsManager::new()),
             cache: Arc::new(Mutex::new(None)),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
         })
         .setup(|app| {
             // Initialize cache manager after app is ready
@@ -66,6 +67,9 @@ pub fn run() {
             commands::get_scan_roots,
             commands::delete_scan_root,
             commands::start_scan,
+            commands::start_scan_with_progress,
+            commands::cancel_scan,
+            commands::get_active_scans,
             commands::rescan_all_for_content_hash,
             commands::get_files,
             commands::get_files_by_directory,
@@ -98,6 +102,9 @@ pub fn run() {
             commands::create_master_dark_library,
             commands::get_master_dark_library,
             commands::has_master_dark_library,
+            commands::create_master_flat_library,
+            commands::get_master_flat_library,
+            commands::has_master_flat_library,
             commands::refresh_calibration_library_for_camera,
             commands::get_calibration_set_frames,
             commands::get_cache_stats,
@@ -105,6 +112,7 @@ pub fn run() {
             commands::set_scan_root_duplicates_flag,
             commands::move_to_black_hole,
             commands::get_black_hole_files,
+            commands::get_blackholed_file_ids,
             commands::restore_from_black_hole,
             commands::send_to_void,
             commands::send_all_to_void,
@@ -118,6 +126,7 @@ pub fn run() {
             commands::check_missing_files_in_scan_root,
             commands::get_imaging_locations,
             commands::get_frame_preview,
+            commands::get_files_with_frames_by_ids,
             commands::query_frames_in_circle,
             commands::query_frames_in_bounds,
             commands::query_frames_in_polygon,
@@ -138,6 +147,11 @@ pub fn run() {
             commands::get_calibration_sets_for_manual_selection,
             commands::manual_assign_calibration,
             commands::clear_manual_calibration_override,
+            commands::cleanup_duplicate_flat_subcalibrations,
+            commands::get_calibration_set_parameters,
+            commands::get_subcalibration_sets_for_manual_selection,
+            commands::manual_assign_subcalibration,
+            commands::clear_subcalibration_override,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

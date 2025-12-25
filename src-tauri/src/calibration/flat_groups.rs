@@ -66,7 +66,8 @@ pub struct FlatGroup {
 /// * `filter` - Filter name (exact match, None for no filter)
 /// * `binning` - Binning pattern (exact match)
 /// * `gain` - Gain setting (exact match if Some)
-/// * `focal_length` - Focal length (exact match if Some)
+/// * `focal_length` - Focal length (range match if threshold provided, else exact)
+/// * `focallen_threshold` - Optional threshold for focal length matching (from config)
 /// * `time_cluster_minutes` - Time threshold for clustering (default: 30 minutes)
 /// * `date_range` - Optional date range to limit search (start, end)
 ///
@@ -79,6 +80,7 @@ pub fn detect_flat_groups(
     binning: &str,
     gain: Option<f64>,
     focal_length: Option<f64>,
+    focallen_threshold: Option<f64>,
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<FlatGroup>> {
@@ -86,7 +88,7 @@ pub fn detect_flat_groups(
     let mut query = String::from(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
                 is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
-                ccd_temp, set_temp, focallen, xpixsz, pixsz, naxis1, naxis2,
+                ccd_temp, set_temp, focallen, xpixsz, ypixsz, naxis1, naxis2,
                 sitelat, lat_obs, sitelong, long_obs
          FROM frames
          WHERE imagetyp = 'Flat' AND instrume = ?1 AND binning = ?2"
@@ -108,10 +110,23 @@ pub fn detect_flat_groups(
         query.push_str(&format!(" AND gain = ?{}", param_count));
     }
 
-    // Focal length parameter (exact match if provided)
+    // Focal length parameter (range match if threshold provided, else exact)
     if focal_length.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND focallen = ?{}", param_count));
+        if let Some(_threshold) = focallen_threshold {
+            // Range-based matching using threshold from config
+            param_count += 1;
+            let focal_param = param_count;
+            param_count += 1;
+            let threshold_param = param_count;
+            query.push_str(&format!(
+                " AND focallen IS NOT NULL AND ABS(focallen - ?{}) <= ?{}",
+                focal_param, threshold_param
+            ));
+        } else {
+            // Exact match (fallback)
+            param_count += 1;
+            query.push_str(&format!(" AND focallen = ?{}", param_count));
+        }
     }
 
     // Date range filter (optional)
@@ -126,8 +141,8 @@ pub fn detect_flat_groups(
 
     // Log the complete SQL query
     println!("    🔍 Executing SQL query:");
-    println!("       instrume={}, binning={}, filter={:?}, gain={:?}, focallen={:?}",
-        instrume, binning, filter, gain, focal_length);
+    println!("       instrume={}, binning={}, filter={:?}, gain={:?}, focallen={:?} (threshold={:?})",
+        instrume, binning, filter, gain, focal_length, focallen_threshold);
     if let Some((start, end)) = date_range {
         println!("       date_range: {} to {}", start, end);
     }
@@ -154,6 +169,10 @@ pub fn detect_flat_groups(
     if let Some(fl) = focal_length {
         stmt.raw_bind_parameter(param_idx, fl)?;
         param_idx += 1;
+        if let Some(threshold) = focallen_threshold {
+            stmt.raw_bind_parameter(param_idx, threshold)?;
+            param_idx += 1;
+        }
     }
 
     if let Some((start, end)) = date_range {
@@ -209,7 +228,7 @@ pub fn detect_flat_groups(
             set_temp: row.get(19)?,
             focallen: row.get(20)?,
             xpixsz: row.get(21)?,
-            pixsz: row.get(22)?,
+            ypixsz: row.get(22)?,
             naxis1: row.get(23)?,
             naxis2: row.get(24)?,
             ra: row.get(10)?,
@@ -221,6 +240,7 @@ pub fn detect_flat_groups(
             objctra: row.get(12)?,
             objctdec: row.get(13)?,
             override_: false,
+            swcreate: None,
         };
 
         frames.push(frame);
@@ -477,24 +497,29 @@ pub fn create_flat_calibration_set(
 }
 
 /// Checks if a calibration set already exists for this flat group
+/// Uses date range overlap instead of exact date match to preserve set identity
+/// when frames are added/removed
 fn check_for_existing_flat_set(
     conn: &Connection,
     flat_group: &FlatGroup,
 ) -> Result<Option<i64>> {
-    let date = flat_group.start_time.format("%Y-%m-%d").to_string();
+    let cluster_start = flat_group.start_time.to_rfc3339();
+    let cluster_end = flat_group.end_time.to_rfc3339();
 
     // Build query with NULL-aware comparisons for binning and instrume
+    // Use date range overlap: existing set overlaps with new cluster if
+    // existing.date_start <= cluster.end AND existing.date_end >= cluster.start
     let mut query = String::from(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Flat'
-           AND cs.date = ?1
-           AND cs.frame_count > 0
            AND cs.date_start IS NOT NULL
-           AND cs.date_end IS NOT NULL"
+           AND cs.date_end IS NOT NULL
+           AND cs.date_start <= ?1
+           AND cs.date_end >= ?2"
     );
 
-    let mut param_count = 1;
+    let mut param_count = 2;
 
     // NULL-aware comparison for binning
     if flat_group.binning.is_some() {
@@ -544,8 +569,11 @@ fn check_for_existing_flat_set(
 
     let mut stmt = conn.prepare(&query)?;
 
+    // Bind date range parameters (cluster_end for ?1, cluster_start for ?2)
     let mut param_idx = 1;
-    stmt.raw_bind_parameter(param_idx, &date)?;
+    stmt.raw_bind_parameter(param_idx, &cluster_end)?;
+    param_idx += 1;
+    stmt.raw_bind_parameter(param_idx, &cluster_start)?;
     param_idx += 1;
 
     if let Some(ref binning) = flat_group.binning {

@@ -11,6 +11,25 @@ export enum ImageType {
   Flat = "Flat",
   Bias = "Bias",
   DarkFlat = "DarkFlat",
+  // Master calibration types (already calibrated, no sub-calibration needed)
+  MasterDark = "MasterDark",
+  MasterFlat = "MasterFlat",
+  MasterBias = "MasterBias",
+  MasterDarkFlat = "MasterDarkFlat",
+}
+
+// Helper function to check if an imagetyp is a master type
+export function isMasterType(imagetyp: ImageType | string): boolean {
+  return [
+    ImageType.MasterDark,
+    ImageType.MasterFlat,
+    ImageType.MasterBias,
+    ImageType.MasterDarkFlat,
+    "MasterDark",
+    "MasterFlat",
+    "MasterBias",
+    "MasterDarkFlat",
+  ].includes(imagetyp as ImageType);
 }
 
 export interface File {
@@ -43,7 +62,7 @@ export interface Frame {
   set_temp: number | null;
   focallen: number | null;
   xpixsz: number | null;
-  pixsz: number | null;
+  ypixsz: number | null;
   ra: number | null;
   dec: number | null;
   sitelat: number | null;
@@ -156,6 +175,31 @@ export interface ScanResult {
   bias_count: number;
   darkflats_count: number;
   // Calibration sets created
+  calibration_sets_created: number;
+}
+
+// Scan progress event sent from backend
+export interface ScanProgressEvent {
+  current: number;
+  total: number;
+  current_file: string | null;
+  percent: number;
+  root_id: number;
+  phase: 'discovery' | 'processing' | 'inserting' | 'calibrating';
+}
+
+// Scan completion event sent from backend
+export interface ScanCompleteEvent {
+  root_id: number;
+  files_found: number;
+  files_processed: number;
+  files_skipped: number;
+  errors: string[];
+  lights_count: number;
+  darks_count: number;
+  flats_count: number;
+  bias_count: number;
+  darkflats_count: number;
   calibration_sets_created: number;
 }
 
@@ -556,12 +600,21 @@ export interface CalibrationCameraGroup {
   has_warnings: boolean;
 }
 
+/** Sub-calibration linked to a calibration set with full details */
+export interface SubCalibrationDetail {
+  calibration_type: 'Dark' | 'DarkFlat' | 'Bias';
+  set: CalibrationSetDetail;
+  date_warning: boolean;
+  temp_warning: boolean;
+}
+
 /** A calibration set with the count of frames that use it */
 export interface CalibrationSetWithFrameCount {
   set: CalibrationSetDetail;
   frame_count: number;        // How many frames in this group use this set
   frame_ids: number[];        // Which frames use this set
   warnings: CalibrationWarning[];
+  sub_calibration: SubCalibrationDetail[];  // Linked sub-calibrations (e.g., Flat→Dark, Dark→Bias)
 }
 
 /** A calibration set with match score for manual selection */
@@ -598,6 +651,26 @@ export interface LightFrameParameters {
   current_bias_set_id: number | null;
 }
 
+/** Parameters of a calibration set for sub-calibration selection display */
+export interface CalibrationSetParameters {
+  set_id: number;
+  imagetyp: string;
+  instrume: string | null;
+  binning: string | null;
+  gain: number | null;
+  offset: number | null;
+  exptime: number | null;
+  filter: string | null;
+  ccd_temp: number | null;
+  date_start: string | null;
+  date_end: string | null;
+  frame_count: number;
+  // Current sub-calibration links
+  current_dark_set_id: number | null;
+  current_darkflat_set_id: number | null;
+  current_bias_set_id: number | null;
+}
+
 /** Group of frames for a single filter within a camera */
 export interface CalibrationFilterGroup {
   filter: string | null;          // null = "No Filter"
@@ -614,8 +687,17 @@ export interface CalibrationFilterGroup {
 /** A light frame with its calibration status */
 export interface LightFrameWithCalibration {
   frame_id: number;
+  file_id: number;
   filename: string;
+  file_path: string;
   date_obs: string | null;
   exptime: number | null;
+  telescop: string | null;
+  focallen: number | null;
+  binning: string | null;
+  ccd_temp: number | null;
+  swcreate: string | null;
+  gain: number | null;
+  offset: number | null;
   calibration_status: FrameCalibrationStatus;
 }

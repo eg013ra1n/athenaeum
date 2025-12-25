@@ -256,10 +256,11 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let ccd_temp = read_keyword_f64(&mut fitsfile, &hdu, "CCD-TEMP").ok();
     let set_temp = read_keyword_f64(&mut fitsfile, &hdu, "SET-TEMP").ok();
     let focallen = read_keyword_f64(&mut fitsfile, &hdu, "FOCALLEN").ok();
+    let swcreate = read_keyword_string(&mut fitsfile, &hdu, "SWCREATE").ok();
 
     // Pixel size
     let xpixsz = read_keyword_f64(&mut fitsfile, &hdu, "XPIXSZ").ok();
-    let pixsz = read_keyword_f64(&mut fitsfile, &hdu, "PIXSZ").ok();
+    let ypixsz = read_keyword_f64(&mut fitsfile, &hdu, "YPIXSZ").ok();
 
     // Image dimensions
     let naxis1 = read_keyword_i32(&mut fitsfile, &hdu, "NAXIS1").ok();
@@ -349,7 +350,7 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         set_temp,
         focallen,
         xpixsz,
-        pixsz,
+        ypixsz,
         naxis1,
         naxis2,
         ra,
@@ -361,6 +362,7 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         objctra,
         objctdec,
         override_: false,
+        swcreate,
     })
 }
 
@@ -473,10 +475,10 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         .and_then(|s| s.parse::<f64>().ok());
     let focallen = fits_keywords.get("FOCALLEN")
         .and_then(|s| s.parse::<f64>().ok());
+    let swcreate = fits_keywords.get("SWCREATE").cloned();
     let xpixsz = fits_keywords.get("XPIXSZ")
-        .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| fits_keywords.get("YPIXSZ").and_then(|s| s.parse::<f64>().ok()));
-    let pixsz = fits_keywords.get("PIXSZ")
+        .and_then(|s| s.parse::<f64>().ok());
+    let ypixsz = fits_keywords.get("YPIXSZ")
         .and_then(|s| s.parse::<f64>().ok());
 
     // Image dimensions
@@ -570,7 +572,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         set_temp,
         focallen,
         xpixsz,
-        pixsz,
+        ypixsz,
         naxis1,
         naxis2,
         ra,
@@ -582,6 +584,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         objctra,
         objctdec,
         override_: false,
+        swcreate,
     })
 }
 
@@ -637,8 +640,10 @@ fn read_keyword_f64(fitsfile: &mut FitsFile, hdu: &fitsio::hdu::FitsHdu, key: &s
 }
 
 fn read_keyword_i32(fitsfile: &mut FitsFile, hdu: &fitsio::hdu::FitsHdu, key: &str) -> Result<i32> {
-    let value: i32 = hdu.read_key(fitsfile, key)?;
-    Ok(value)
+    // Use i64 to work around fitsio bug: i32 uses fits_read_key_log (boolean)
+    // instead of fits_read_key_lng (integer), causing values like 2 to become 1
+    let value: i64 = hdu.read_key(fitsfile, key)?;
+    Ok(value as i32)
 }
 
 #[cfg(test)]

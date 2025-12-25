@@ -1,8 +1,6 @@
 // Duplicate detection and black hole management commands
 
-use crate::db::{self, Database};
-use crate::models::*;
-use std::sync::Mutex;
+use crate::db::{self};
 use tauri::State;
 
 use super::AppState;
@@ -55,6 +53,44 @@ pub async fn get_black_hole_files(
     db::get_black_hole_files(&conn, filter).map_err(|e| e.to_string())
 }
 
+/// Check which file IDs from a given list are in the black hole
+#[tauri::command]
+pub async fn get_blackholed_file_ids(
+    file_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    if file_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Build IN clause with placeholders
+    let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT file_id FROM black_hole WHERE file_id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+
+    // Convert file_ids to rusqlite params
+    let params: Vec<&dyn rusqlite::ToSql> = file_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+
+    let blackholed: Vec<i64> = stmt
+        .query_map(params.as_slice(), |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(blackholed)
+}
+
 /// Restore a file from the black hole
 #[tauri::command]
 pub async fn restore_from_black_hole(
@@ -89,6 +125,8 @@ pub async fn send_all_to_void(state: State<'_, AppState>) -> Result<usize, Strin
 }
 
 /// Get folders with high duplicate file similarity
+/// Always computes fresh since folder similarity depends on current file state
+/// and can't easily filter out black_hole files from cached data
 #[tauri::command]
 pub async fn get_duplicate_folders(
     threshold: Option<f64>,
@@ -99,6 +137,9 @@ pub async fn get_duplicate_folders(
     let conn = db.conn();
 
     let similarity_threshold = threshold.unwrap_or(70.0);
+
+    // Always compute fresh - folder similarity depends on current file state
+    // and the cache can't account for files moved to black_hole
     db::find_duplicate_folders(&conn, similarity_threshold).map_err(|e| e.to_string())
 }
 
