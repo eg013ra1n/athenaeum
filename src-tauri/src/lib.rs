@@ -16,6 +16,7 @@ mod relinking;
 mod selection;
 mod frames_set_metadata;
 mod frames_set_merge;
+mod export;
 
 // Commands (Tauri API endpoints)
 mod commands;
@@ -153,6 +154,11 @@ pub fn run() {
             commands::get_subcalibration_sets_for_manual_selection,
             commands::manual_assign_subcalibration,
             commands::clear_subcalibration_override,
+            commands::get_export_preview,
+            commands::export_frame_set,
+            commands::get_siril_path,
+            commands::set_siril_path,
+            commands::get_exportable_frame_sets,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())
