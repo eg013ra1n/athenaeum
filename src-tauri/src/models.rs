@@ -56,6 +56,9 @@ pub struct Frame {
     pub objctdec: Option<String>,
     pub override_: bool,
     pub swcreate: Option<String>,
+    /// Bayer pattern for OSC cameras (e.g., "RGGB", "BGGR")
+    /// None indicates a mono camera
+    pub bayerpat: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -6,7 +6,9 @@ use crate::export::models::SirilWorkflow;
 
 /// Script template configuration
 pub struct ScriptTemplate {
+    #[allow(dead_code)]
     pub name: &'static str,
+    #[allow(dead_code)]
     pub description: &'static str,
     pub template: &'static str,
 }

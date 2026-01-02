@@ -4,16 +4,17 @@
 //! to prepare data for export.
 
 use crate::export::models::{
-    CalibrationSummary, ExportCalibrationSet, ExportData, ExportFrame, FilterExportGroup,
+    CalibrationSetInfo, CalibrationSubgroup, CalibrationSummary, CameraType, ExportCalibrationSet,
+    ExportData, ExportFrame, ExportGroup, FilterExportGroup, MasterCreationPlan, MasterInfo,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Collect all export data for a frame set
 ///
 /// This traverses the frame set hierarchy to get all light frames,
-/// groups them by filter, and retrieves their calibration links.
+/// groups them by filter and camera type, and retrieves their calibration links.
 pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<ExportData> {
     println!("📦 Collecting export data for frame set {}", frame_set_id);
 
@@ -25,7 +26,18 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
     let light_frames = get_light_frames_for_frame_set(conn, frame_set_id)?;
     println!("  Found {} light frames", light_frames.len());
 
-    // Group frames by filter
+    // =========================================================================
+    // Phase 3: Build new export groups with subgroups
+    // =========================================================================
+    let groups = build_export_groups(conn, &light_frames)?;
+    let master_plan = build_master_creation_plan(conn, &groups)?;
+
+    println!("  Built {} export groups with {} masters to create",
+             groups.len(), master_plan.masters.len());
+
+    // =========================================================================
+    // Legacy: Build filter groups for backwards compatibility
+    // =========================================================================
     let mut filter_groups: HashMap<Option<String>, Vec<ExportFrame>> = HashMap::new();
     for frame in &light_frames {
         filter_groups
@@ -34,7 +46,7 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
             .push(frame.clone());
     }
 
-    // Build filter export groups with calibrations
+    // Build filter export groups with calibrations (legacy format)
     let mut filters = Vec::new();
     let mut total_flat_count = 0;
     let mut total_dark_count = 0;
@@ -58,11 +70,11 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         for flat in &flat_sets {
             total_flat_count += flat.frames.len() as i32;
             for sub in &flat.sub_calibrations {
-                if sub.imagetyp == "DARKFLAT" {
+                if sub.imagetyp == "DarkFlat" {
                     total_dark_flat_count += sub.frames.len() as i32;
-                } else if sub.imagetyp == "DARK" {
+                } else if sub.imagetyp == "Dark" {
                     total_dark_count += sub.frames.len() as i32;
-                } else if sub.imagetyp == "BIAS" {
+                } else if sub.imagetyp == "Bias" {
                     total_bias_count += sub.frames.len() as i32;
                 }
             }
@@ -72,7 +84,7 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         for dark in &dark_sets {
             total_dark_count += dark.frames.len() as i32;
             for sub in &dark.sub_calibrations {
-                if sub.imagetyp == "BIAS" {
+                if sub.imagetyp == "Bias" {
                     total_bias_count += sub.frames.len() as i32;
                 }
             }
@@ -122,6 +134,8 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         frame_set_id,
         frame_set_name,
         object_name,
+        groups,
+        master_plan,
         filters,
         calibration_summary: CalibrationSummary {
             flat_count: total_flat_count,
@@ -190,8 +204,8 @@ fn get_light_frames_for_frame_set(conn: &Connection, frame_set_id: i64) -> Resul
 
     // Now get full frame info for each ID
     let mut frames = Vec::new();
-    for frame_id in frame_ids {
-        if let Ok(frame) = get_export_frame_by_id(conn, frame_id) {
+    for frame_id in &frame_ids {
+        if let Ok(frame) = get_export_frame_by_id(conn, *frame_id) {
             frames.push(frame);
         }
     }
@@ -205,7 +219,7 @@ fn get_export_frame_by_id(conn: &Connection, frame_id: i64) -> Result<ExportFram
     conn.query_row(
         "SELECT f.id, f.file_id, fi.path, fi.filename,
                 f.exptime, f.filter, f.ccd_temp, f.gain, f.offset,
-                f.binning, f.date_obs
+                f.binning, f.date_obs, f.focallen, f.bayerpat, f.instrume
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          WHERE f.id = ?1",
@@ -223,9 +237,12 @@ fn get_export_frame_by_id(conn: &Connection, frame_id: i64) -> Result<ExportFram
                 offset: row.get(8)?,
                 binning: row.get(9)?,
                 date_obs: row.get(10)?,
+                focallen: row.get(11)?,
+                bayerpat: row.get(12)?,
+                instrume: row.get(13)?,
             })
         },
-    ).context("Failed to get frame by ID")
+    ).context(format!("Failed to get frame by ID: {}", frame_id))
 }
 
 /// Collect calibrations for a single frame
@@ -327,7 +344,7 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
     let mut stmt = conn.prepare(
         "SELECT f.id, f.file_id, fi.path, fi.filename,
                 f.exptime, f.filter, f.ccd_temp, f.gain, f.offset,
-                f.binning, f.date_obs
+                f.binning, f.date_obs, f.focallen, f.bayerpat, f.instrume
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          JOIN calibration_set_frames csf ON f.id = csf.frame_id
@@ -349,6 +366,9 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
                 offset: row.get(8)?,
                 binning: row.get(9)?,
                 date_obs: row.get(10)?,
+                focallen: row.get(11)?,
+                bayerpat: row.get(12)?,
+                instrume: row.get(13)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -428,13 +448,611 @@ fn build_calibration_set_shallow(
     })
 }
 
+// ============================================================================
+// Phase 3: New Export Group Building Logic
+// ============================================================================
+
+/// Calibration links for a single frame
+#[derive(Debug, Clone)]
+struct FrameCalibrationLinks {
+    #[allow(dead_code)]
+    frame_id: i64,
+    flat_id: Option<i64>,
+    dark_id: Option<i64>,
+    bias_id: Option<i64>,
+}
+
+impl FrameCalibrationLinks {
+    /// Generate a subgroup key from calibration set IDs
+    fn subgroup_key(&self) -> String {
+        format!(
+            "f{}_d{}_b{}",
+            self.flat_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+            self.dark_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+            self.bias_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+        )
+    }
+}
+
+/// Get calibration links for a single frame
+fn get_frame_calibration_links(conn: &Connection, frame_id: i64) -> Result<FrameCalibrationLinks> {
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'frame'",
+    )?;
+
+    let links: Vec<(i64, String)> = stmt
+        .query_map([frame_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut flat_id = None;
+    let mut dark_id = None;
+    let mut bias_id = None;
+
+    for (set_id, cal_type) in links {
+        match cal_type.as_str() {
+            "Flat" => flat_id = Some(set_id),
+            "Dark" => dark_id = Some(set_id),
+            "Bias" => bias_id = Some(set_id),
+            _ => {}
+        }
+    }
+
+    Ok(FrameCalibrationLinks {
+        frame_id,
+        flat_id,
+        dark_id,
+        bias_id,
+    })
+}
+
+/// Build CalibrationSetInfo with recursive sub-calibrations
+fn build_calibration_set_info(
+    conn: &Connection,
+    set_id: i64,
+    match_score: Option<f64>,
+    date_warning: bool,
+    temp_warning: bool,
+) -> Result<CalibrationSetInfo> {
+    // Get calibration set info
+    let imagetyp: String = conn
+        .query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .context("Failed to get calibration set")?;
+
+    // Get frames in the calibration set
+    let frames = get_calibration_set_frames(conn, set_id)?;
+    let frame_count = frames.len() as i32;
+
+    // Build warnings list
+    let mut warnings = Vec::new();
+    if date_warning {
+        warnings.push("Date warning: calibration may be too old".to_string());
+    }
+    if temp_warning {
+        warnings.push("Temperature warning: temperature mismatch detected".to_string());
+    }
+
+    // Get sub-calibrations for this set
+    let mut dark_flat: Option<Box<CalibrationSetInfo>> = None;
+    let mut dark: Option<Box<CalibrationSetInfo>> = None;
+    let mut bias: Option<Box<CalibrationSetInfo>> = None;
+
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type, match_score, date_warning, temp_warning
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'calibration_set'",
+    )?;
+
+    let sub_links: Vec<(i64, String, Option<f64>, bool, bool)> = stmt
+        .query_map([set_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get::<_, i32>(3)? != 0,
+                row.get::<_, i32>(4)? != 0,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (sub_set_id, cal_type, sub_score, sub_date_warn, sub_temp_warn) in sub_links {
+        // Build sub-calibration (one level deep to avoid infinite recursion)
+        let sub_info = build_calibration_set_info_shallow(conn, sub_set_id, sub_score, sub_date_warn, sub_temp_warn)?;
+
+        match cal_type.as_str() {
+            "DarkFlat" => dark_flat = Some(Box::new(sub_info)),
+            "Dark" => dark = Some(Box::new(sub_info)),
+            "Bias" => bias = Some(Box::new(sub_info)),
+            _ => {}
+        }
+    }
+
+    Ok(CalibrationSetInfo {
+        set_id,
+        imagetyp,
+        frames,
+        frame_count,
+        dark_flat,
+        dark,
+        bias,
+        match_score,
+        warnings,
+    })
+}
+
+/// Build CalibrationSetInfo without deep recursion (for sub-calibrations)
+fn build_calibration_set_info_shallow(
+    conn: &Connection,
+    set_id: i64,
+    match_score: Option<f64>,
+    date_warning: bool,
+    temp_warning: bool,
+) -> Result<CalibrationSetInfo> {
+    let imagetyp: String = conn
+        .query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .context("Failed to get calibration set")?;
+
+    let frames = get_calibration_set_frames(conn, set_id)?;
+    let frame_count = frames.len() as i32;
+
+    let mut warnings = Vec::new();
+    if date_warning {
+        warnings.push("Date warning: calibration may be too old".to_string());
+    }
+    if temp_warning {
+        warnings.push("Temperature warning: temperature mismatch detected".to_string());
+    }
+
+    // Get sub-calibrations (bias for darks)
+    let mut bias: Option<Box<CalibrationSetInfo>> = None;
+
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type, match_score, date_warning, temp_warning
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'calibration_set' AND calibration_type = 'Bias'",
+    )?;
+
+    if let Ok((bias_id, _, bias_score, bias_date, bias_temp)) = stmt.query_row([set_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<f64>>(2)?,
+            row.get::<_, i32>(3)? != 0,
+            row.get::<_, i32>(4)? != 0,
+        ))
+    }) {
+        // Build bias (terminal node, no further sub-calibrations)
+        let bias_info = build_calibration_set_info_terminal(conn, bias_id, bias_score, bias_date, bias_temp)?;
+        bias = Some(Box::new(bias_info));
+    }
+
+    Ok(CalibrationSetInfo {
+        set_id,
+        imagetyp,
+        frames,
+        frame_count,
+        dark_flat: None,
+        dark: None,
+        bias,
+        match_score,
+        warnings,
+    })
+}
+
+/// Build CalibrationSetInfo as terminal node (no sub-calibrations)
+fn build_calibration_set_info_terminal(
+    conn: &Connection,
+    set_id: i64,
+    match_score: Option<f64>,
+    date_warning: bool,
+    temp_warning: bool,
+) -> Result<CalibrationSetInfo> {
+    let imagetyp: String = conn
+        .query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .context("Failed to get calibration set")?;
+
+    let frames = get_calibration_set_frames(conn, set_id)?;
+    let frame_count = frames.len() as i32;
+
+    let mut warnings = Vec::new();
+    if date_warning {
+        warnings.push("Date warning: calibration may be too old".to_string());
+    }
+    if temp_warning {
+        warnings.push("Temperature warning: temperature mismatch detected".to_string());
+    }
+
+    Ok(CalibrationSetInfo {
+        set_id,
+        imagetyp,
+        frames,
+        frame_count,
+        dark_flat: None,
+        dark: None,
+        bias: None,
+        match_score,
+        warnings,
+    })
+}
+
+/// Get CalibrationSetInfo for a frame's calibration link
+fn get_calibration_set_info_for_frame(
+    conn: &Connection,
+    frame_id: i64,
+    cal_type: &str,
+) -> Result<Option<CalibrationSetInfo>> {
+    let result: Option<(i64, Option<f64>, bool, bool)> = conn
+        .query_row(
+            "SELECT calibration_set_id, match_score, date_warning, temp_warning
+             FROM calibration_set_to_frames
+             WHERE source_id = ?1 AND source_type = 'frame' AND calibration_type = ?2",
+            rusqlite::params![frame_id, cal_type],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, i32>(2)? != 0,
+                    row.get::<_, i32>(3)? != 0,
+                ))
+            },
+        )
+        .ok();
+
+    match result {
+        Some((set_id, match_score, date_warning, temp_warning)) => {
+            let info = build_calibration_set_info(conn, set_id, match_score, date_warning, temp_warning)?;
+            Ok(Some(info))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Build export groups from light frames
+/// Groups by (filter, camera_type) and creates subgroups by calibration links
+fn build_export_groups(conn: &Connection, light_frames: &[ExportFrame]) -> Result<Vec<ExportGroup>> {
+    println!("  📊 Building export groups from {} light frames", light_frames.len());
+
+    // Group key: (filter, camera_type)
+    type GroupKey = (Option<String>, CameraType);
+    let mut groups_map: HashMap<GroupKey, Vec<&ExportFrame>> = HashMap::new();
+
+    // Group frames by filter and camera type
+    for frame in light_frames {
+        let camera_type = CameraType::from_bayerpat(frame.bayerpat.as_deref());
+        let key = (frame.filter.clone(), camera_type);
+        groups_map.entry(key).or_default().push(frame);
+    }
+
+    println!("  Found {} distinct (filter, camera_type) groups", groups_map.len());
+
+    let mut export_groups = Vec::new();
+
+    for ((filter, camera_type), frames) in groups_map {
+        let group_key = ExportGroup::make_group_key(filter.as_deref(), &camera_type);
+        let display_name = ExportGroup::make_display_name(filter.as_deref(), &camera_type);
+
+        println!("  Building group: {} with {} frames", display_name, frames.len());
+
+        // Build subgroups within this group
+        let subgroups = build_calibration_subgroups(conn, &frames)?;
+
+        // Calculate totals
+        let total_frames = frames.len() as i32;
+        let total_exposure: f64 = frames.iter().filter_map(|f| f.exptime).sum();
+
+        // Collect warnings
+        let mut warnings = Vec::new();
+        for subgroup in &subgroups {
+            warnings.extend(subgroup.warnings.clone());
+        }
+
+        export_groups.push(ExportGroup {
+            group_key,
+            filter,
+            camera_type,
+            display_name,
+            subgroups,
+            total_frames,
+            total_exposure,
+            warnings,
+        });
+    }
+
+    // Sort groups by display name for consistent ordering
+    export_groups.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+    Ok(export_groups)
+}
+
+/// Build calibration subgroups within an export group
+/// Groups frames by their linked calibration set IDs
+fn build_calibration_subgroups(
+    conn: &Connection,
+    frames: &[&ExportFrame],
+) -> Result<Vec<CalibrationSubgroup>> {
+    // Get calibration links for each frame
+    let mut frame_links: HashMap<i64, FrameCalibrationLinks> = HashMap::new();
+    for frame in frames {
+        let links = get_frame_calibration_links(conn, frame.frame_id)?;
+        frame_links.insert(frame.frame_id, links);
+    }
+
+    // Group frames by subgroup key (combination of calibration set IDs)
+    let mut subgroup_map: HashMap<String, Vec<&ExportFrame>> = HashMap::new();
+    for frame in frames {
+        if let Some(links) = frame_links.get(&frame.frame_id) {
+            let key = links.subgroup_key();
+            subgroup_map.entry(key).or_default().push(*frame);
+        }
+    }
+
+    let subgroup_count = subgroup_map.len();
+    println!("    Found {} calibration subgroups", subgroup_count);
+
+    let mut subgroups = Vec::new();
+    let mut subgroup_index = 1;
+
+    for (subgroup_key, subgroup_frames) in subgroup_map {
+        // Get the calibration links from the first frame (all frames in subgroup share the same links)
+        let first_frame = subgroup_frames.first().unwrap();
+        let links = frame_links.get(&first_frame.frame_id).unwrap();
+
+        // Build CalibrationSetInfo for each calibration type
+        let flat = if links.flat_id.is_some() {
+            get_calibration_set_info_for_frame(conn, first_frame.frame_id, "Flat")?
+        } else {
+            None
+        };
+
+        let dark = if links.dark_id.is_some() {
+            get_calibration_set_info_for_frame(conn, first_frame.frame_id, "Dark")?
+        } else {
+            None
+        };
+
+        let bias = if links.bias_id.is_some() {
+            get_calibration_set_info_for_frame(conn, first_frame.frame_id, "Bias")?
+        } else {
+            None
+        };
+
+        // Generate display name
+        let display_name = if subgroup_count == 1 {
+            "Default".to_string()
+        } else {
+            format!("Subgroup {}", subgroup_index)
+        };
+
+        // Collect warnings
+        let mut warnings = Vec::new();
+        if let Some(ref f) = flat {
+            warnings.extend(f.warnings.clone());
+        }
+        if let Some(ref d) = dark {
+            warnings.extend(d.warnings.clone());
+        }
+        if let Some(ref b) = bias {
+            warnings.extend(b.warnings.clone());
+        }
+
+        subgroups.push(CalibrationSubgroup {
+            subgroup_key,
+            display_name,
+            frames: subgroup_frames.iter().map(|f| (*f).clone()).collect(),
+            flat,
+            dark,
+            bias,
+            warnings,
+        });
+
+        subgroup_index += 1;
+    }
+
+    // Sort subgroups by display name
+    subgroups.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+    Ok(subgroups)
+}
+
+/// Build the master creation plan from export groups
+/// Collects all unique calibration sets and topologically sorts by dependencies
+fn build_master_creation_plan(
+    conn: &Connection,
+    groups: &[ExportGroup],
+) -> Result<MasterCreationPlan> {
+    println!("  🔧 Building master creation plan");
+
+    // Collect all unique calibration set IDs with their types
+    let mut all_sets: HashMap<i64, String> = HashMap::new(); // set_id -> imagetyp
+    let mut dependencies: HashMap<i64, Vec<i64>> = HashMap::new(); // set_id -> depends on set_ids
+
+    // Traverse all groups and subgroups to collect calibration sets
+    for group in groups {
+        for subgroup in &group.subgroups {
+            // Collect from flat
+            if let Some(ref flat) = subgroup.flat {
+                collect_calibration_sets_recursive(flat, &mut all_sets, &mut dependencies);
+            }
+            // Collect from dark
+            if let Some(ref dark) = subgroup.dark {
+                collect_calibration_sets_recursive(dark, &mut all_sets, &mut dependencies);
+            }
+            // Collect from bias
+            if let Some(ref bias) = subgroup.bias {
+                collect_calibration_sets_recursive(bias, &mut all_sets, &mut dependencies);
+            }
+        }
+    }
+
+    println!("    Found {} unique calibration sets", all_sets.len());
+
+    // Topological sort to determine creation order
+    let sorted_ids = topological_sort(&all_sets, &dependencies);
+
+    println!("    Topological sort complete, {} masters to create", sorted_ids.len());
+
+    // Build MasterInfo for each set
+    let mut masters = Vec::new();
+    let mut master_paths: HashMap<i64, String> = HashMap::new();
+
+    for set_id in sorted_ids {
+        if let Some(imagetyp) = all_sets.get(&set_id) {
+            // Get frames for this set
+            let frames = get_calibration_set_frames(conn, set_id)?;
+
+            // Determine dependencies
+            let deps = dependencies.get(&set_id).cloned().unwrap_or_default();
+
+            // Determine which calibrations to apply
+            let (apply_bias, apply_dark) = get_calibration_applications(conn, set_id)?;
+
+            // Generate output filename
+            let output_name = format!("master_{}_{}.fit", imagetyp.to_lowercase(), set_id);
+            master_paths.insert(set_id, output_name.clone());
+
+            masters.push(MasterInfo {
+                set_id,
+                master_type: imagetyp.clone(),
+                output_name,
+                source_frames: frames,
+                depends_on: deps,
+                apply_bias,
+                apply_dark,
+            });
+        }
+    }
+
+    Ok(MasterCreationPlan {
+        masters,
+        master_paths,
+    })
+}
+
+/// Recursively collect calibration sets from a CalibrationSetInfo hierarchy
+fn collect_calibration_sets_recursive(
+    info: &CalibrationSetInfo,
+    all_sets: &mut HashMap<i64, String>,
+    dependencies: &mut HashMap<i64, Vec<i64>>,
+) {
+    // Add this set
+    all_sets.insert(info.set_id, info.imagetyp.clone());
+
+    // Track dependencies
+    let mut deps = Vec::new();
+
+    // Recurse into sub-calibrations
+    if let Some(ref dark_flat) = info.dark_flat {
+        deps.push(dark_flat.set_id);
+        collect_calibration_sets_recursive(dark_flat, all_sets, dependencies);
+    }
+    if let Some(ref dark) = info.dark {
+        deps.push(dark.set_id);
+        collect_calibration_sets_recursive(dark, all_sets, dependencies);
+    }
+    if let Some(ref bias) = info.bias {
+        deps.push(bias.set_id);
+        collect_calibration_sets_recursive(bias, all_sets, dependencies);
+    }
+
+    if !deps.is_empty() {
+        dependencies.insert(info.set_id, deps);
+    }
+}
+
+/// Topological sort of calibration sets by dependencies
+/// Returns set IDs in order they should be created (dependencies first)
+fn topological_sort(
+    all_sets: &HashMap<i64, String>,
+    dependencies: &HashMap<i64, Vec<i64>>,
+) -> Vec<i64> {
+    let mut result = Vec::new();
+    let mut visited: HashSet<i64> = HashSet::new();
+    let mut temp_mark: HashSet<i64> = HashSet::new();
+
+    fn visit(
+        node: i64,
+        dependencies: &HashMap<i64, Vec<i64>>,
+        visited: &mut HashSet<i64>,
+        temp_mark: &mut HashSet<i64>,
+        result: &mut Vec<i64>,
+    ) {
+        if visited.contains(&node) {
+            return;
+        }
+        if temp_mark.contains(&node) {
+            // Cycle detected, skip (shouldn't happen with proper calibration hierarchy)
+            return;
+        }
+
+        temp_mark.insert(node);
+
+        // Visit dependencies first
+        if let Some(deps) = dependencies.get(&node) {
+            for dep in deps {
+                visit(*dep, dependencies, visited, temp_mark, result);
+            }
+        }
+
+        temp_mark.remove(&node);
+        visited.insert(node);
+        result.push(node);
+    }
+
+    for &set_id in all_sets.keys() {
+        visit(set_id, dependencies, &mut visited, &mut temp_mark, &mut result);
+    }
+
+    result
+}
+
+/// Get which calibrations should be applied when creating a master
+/// Returns (apply_bias, apply_dark) set IDs
+fn get_calibration_applications(conn: &Connection, set_id: i64) -> Result<(Option<i64>, Option<i64>)> {
+    let mut apply_bias = None;
+    let mut apply_dark = None;
+
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'calibration_set'",
+    )?;
+
+    let links: Vec<(i64, String)> = stmt
+        .query_map([set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (cal_id, cal_type) in links {
+        match cal_type.as_str() {
+            "Bias" => apply_bias = Some(cal_id),
+            "Dark" | "DarkFlat" => apply_dark = Some(cal_id),
+            _ => {}
+        }
+    }
+
+    Ok((apply_bias, apply_dark))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_filter_sorting() {
-        let mut filters = vec![
+        let mut filters: Vec<(Option<String>, Vec<i64>)> = vec![
             (Some("R".to_string()), vec![]),
             (None, vec![]),
             (Some("Ha".to_string()), vec![]),
@@ -452,5 +1070,34 @@ mod tests {
         assert_eq!(filters[1].0, Some("G".to_string()));
         assert_eq!(filters[2].0, Some("Ha".to_string()));
         assert_eq!(filters[3].0, Some("R".to_string()));
+    }
+
+    #[test]
+    fn test_subgroup_key_generation() {
+        use super::FrameCalibrationLinks;
+
+        let links = FrameCalibrationLinks {
+            frame_id: 1,
+            flat_id: Some(5),
+            dark_id: Some(3),
+            bias_id: Some(1),
+        };
+        assert_eq!(links.subgroup_key(), "f5_d3_b1");
+
+        let links_partial = FrameCalibrationLinks {
+            frame_id: 2,
+            flat_id: Some(5),
+            dark_id: None,
+            bias_id: Some(1),
+        };
+        assert_eq!(links_partial.subgroup_key(), "f5_dnone_b1");
+
+        let links_none = FrameCalibrationLinks {
+            frame_id: 3,
+            flat_id: None,
+            dark_id: None,
+            bias_id: None,
+        };
+        assert_eq!(links_none.subgroup_key(), "fnone_dnone_bnone");
     }
 }

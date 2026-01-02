@@ -531,5 +531,20 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add bayerpat to frames table (migration for existing databases)
+    // Used to distinguish OSC (one-shot color) cameras from mono cameras
+    // OSC cameras have a Bayer pattern (e.g., "RGGB", "BGGR")
+    let has_bayerpat: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name='bayerpat'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_bayerpat {
+        conn.execute(
+            "ALTER TABLE frames ADD COLUMN bayerpat TEXT",
+            [],
+        )?;
+    }
+
     Ok(())
 }

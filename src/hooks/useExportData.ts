@@ -6,6 +6,8 @@ import type {
   ExportableFrameSet,
   ExportMode,
   SirilWorkflow,
+  CalibrationRoute,
+  ExportGroupsSummary,
 } from '../types/export';
 
 interface UseExportDataResult {
@@ -187,4 +189,152 @@ export function useSirilPath(): UseSirilPathResult {
   }, [loadPath]);
 
   return { path, loading, error, setPath, refresh: loadPath };
+}
+
+// ============================================================================
+// New V2 Export Hooks
+// ============================================================================
+
+interface UseCalibrationRouteResult {
+  route: CalibrationRoute | null;
+  loading: boolean;
+  error: string | null;
+  refresh: () => void;
+}
+
+/**
+ * Hook to fetch the calibration route for UI display
+ * Shows complete calibration hierarchy and script preview
+ */
+export function useCalibrationRoute(frameSetId: number | null): UseCalibrationRouteResult {
+  const [route, setRoute] = useState<CalibrationRoute | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadData = useCallback(async () => {
+    if (frameSetId === null) {
+      setRoute(null);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+      const result = await invoke<CalibrationRoute>('get_calibration_route', {
+        frameSetId,
+      });
+      setRoute(result);
+    } catch (err) {
+      setError(err as string);
+      setRoute(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [frameSetId]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  return { route, loading, error, refresh: loadData };
+}
+
+interface UseExportGroupsSummaryResult {
+  summary: ExportGroupsSummary | null;
+  loading: boolean;
+  error: string | null;
+  refresh: () => void;
+}
+
+/**
+ * Hook to fetch lightweight export groups summary
+ * Good for quick preview without full calibration details
+ */
+export function useExportGroupsSummary(frameSetId: number | null): UseExportGroupsSummaryResult {
+  const [summary, setSummary] = useState<ExportGroupsSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadData = useCallback(async () => {
+    if (frameSetId === null) {
+      setSummary(null);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+      const result = await invoke<ExportGroupsSummary>('get_export_groups_summary', {
+        frameSetId,
+      });
+      setSummary(result);
+    } catch (err) {
+      setError(err as string);
+      setSummary(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [frameSetId]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  return { summary, loading, error, refresh: loadData };
+}
+
+interface UseExportV2Result {
+  execute: (config: ExportV2Config) => Promise<ExportResult>;
+  loading: boolean;
+  error: string | null;
+  result: ExportResult | null;
+}
+
+interface ExportV2Config {
+  frameSetId: number;
+  outputDir: string;
+  mode: ExportMode;
+  createMasters?: boolean;
+  rejectionLow?: number;
+  rejectionHigh?: number;
+  useSymlinks?: boolean;
+}
+
+/**
+ * Hook to execute a v2 export operation
+ * Uses the new ExportGroup structure with auto-detected workflows
+ */
+export function useExportV2(): UseExportV2Result {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<ExportResult | null>(null);
+
+  const execute = useCallback(async (config: ExportV2Config): Promise<ExportResult> => {
+    try {
+      setLoading(true);
+      setError(null);
+      setResult(null);
+
+      const exportResult = await invoke<ExportResult>('export_frame_set_v2', {
+        frameSetId: config.frameSetId,
+        outputDir: config.outputDir,
+        mode: config.mode,
+        createMasters: config.createMasters ?? true,
+        rejectionLow: config.rejectionLow ?? 3.0,
+        rejectionHigh: config.rejectionHigh ?? 3.0,
+        useSymlinks: config.useSymlinks ?? false,
+      });
+
+      setResult(exportResult);
+      return exportResult;
+    } catch (err) {
+      const errorMessage = err as string;
+      setError(errorMessage);
+      throw new Error(errorMessage);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return { execute, loading, error, result };
 }

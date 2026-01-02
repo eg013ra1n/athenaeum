@@ -171,6 +171,7 @@ pub fn get_light_frames_from_frame_set(
             long_obs: row.get(28)?,
             override_: false,
             swcreate: None,
+            bayerpat: None,
         })
     })?
     .collect::<Result<Vec<Frame>, _>>()?;

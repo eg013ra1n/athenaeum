@@ -18,6 +18,11 @@ export type SirilWorkflow =
   | 'lrgb_processing';
 
 /**
+ * Camera type based on Bayer pattern presence
+ */
+export type CameraType = 'osc' | 'mono';
+
+/**
  * Configuration for an export operation
  */
 export interface ExportConfig {
@@ -46,6 +51,12 @@ export interface ExportFrame {
   offset: number | null;
   binning: string | null;
   dateObs: string | null;
+  /** Focal length in mm */
+  focallen: number | null;
+  /** Bayer pattern for OSC detection (e.g., "RGGB") */
+  bayerpat: string | null;
+  /** Camera/instrument name */
+  instrume: string | null;
 }
 
 /**
@@ -92,10 +103,187 @@ export interface ExportData {
   frameSetId: number;
   frameSetName: string;
   objectName: string | null;
+  /** New export groups structure (grouped by filter + camera type) */
+  groups: ExportGroup[];
+  /** Master creation plan with dependency ordering */
+  masterPlan: MasterCreationPlan;
+  /** Legacy filter groups (kept for compatibility) */
   filters: FilterExportGroup[];
   calibrationSummary: CalibrationSummary;
   totalLightFrames: number;
   totalExposureSeconds: number;
+}
+
+// ============================================================================
+// New Export Models (Phase 2 Refactoring)
+// ============================================================================
+
+/**
+ * Information about a calibration set and its sub-calibrations (recursive)
+ */
+export interface CalibrationSetInfo {
+  setId: number;
+  imagetyp: string;
+  frames: ExportFrame[];
+  frameCount: number;
+  /** Sub-calibration: DarkFlat set (for Flats) */
+  darkFlat: CalibrationSetInfo | null;
+  /** Sub-calibration: Dark set (for Flats or Lights) */
+  dark: CalibrationSetInfo | null;
+  /** Sub-calibration: Bias set (for Flats, Darks, or Lights) */
+  bias: CalibrationSetInfo | null;
+  matchScore: number | null;
+  warnings: string[];
+}
+
+/**
+ * A subgroup of frames that share the same calibration set links
+ */
+export interface CalibrationSubgroup {
+  subgroupKey: string;
+  displayName: string;
+  frames: ExportFrame[];
+  flat: CalibrationSetInfo | null;
+  dark: CalibrationSetInfo | null;
+  bias: CalibrationSetInfo | null;
+  warnings: string[];
+}
+
+/**
+ * An export group - frames that will be stacked into one master light
+ * Groups frames by filter AND camera type (OSC vs Mono)
+ */
+export interface ExportGroup {
+  groupKey: string;
+  filter: string | null;
+  cameraType: CameraType;
+  displayName: string;
+  subgroups: CalibrationSubgroup[];
+  totalFrames: number;
+  totalExposure: number;
+  warnings: string[];
+}
+
+// ============================================================================
+// Master Creation Plan
+// ============================================================================
+
+/**
+ * Plan for creating all required master calibration files
+ */
+export interface MasterCreationPlan {
+  /** Ordered list of masters to create (respects dependencies) */
+  masters: MasterInfo[];
+  /** Map of set_id → master file path for reference */
+  masterPaths: Record<number, string>;
+}
+
+/**
+ * Information about a master calibration file to create
+ */
+export interface MasterInfo {
+  setId: number;
+  masterType: string;
+  outputName: string;
+  sourceFrames: ExportFrame[];
+  dependsOn: number[];
+  applyBias: number | null;
+  applyDark: number | null;
+}
+
+// ============================================================================
+// Calibration Route (UI Display)
+// ============================================================================
+
+/**
+ * Calibration route for UI display - shows complete hierarchy and script preview
+ */
+export interface CalibrationRoute {
+  groups: CalibrationRouteGroup[];
+  scriptPreview: SirilScriptPreview[];
+  summary: CalibrationRouteSummary;
+}
+
+/**
+ * A group in the calibration route display
+ */
+export interface CalibrationRouteGroup {
+  name: string;
+  lightCount: number;
+  totalExposure: number;
+  subgroupCount: number;
+  calibrationTree: CalibrationTreeNode[];
+}
+
+/**
+ * A node in the calibration tree for UI display
+ */
+export interface CalibrationTreeNode {
+  nodeType: 'Light' | 'Flat' | 'Dark' | 'Bias' | 'DarkFlat';
+  label: string;
+  setId: number | null;
+  count: number;
+  children: CalibrationTreeNode[];
+  warnings: string[];
+  isMissing: boolean;
+  isShared: boolean;
+}
+
+/**
+ * Preview of a Siril script
+ */
+export interface SirilScriptPreview {
+  name: string;
+  description: string;
+  content: string;
+}
+
+/**
+ * Summary of the calibration route
+ */
+export interface CalibrationRouteSummary {
+  groupCount: number;
+  totalLights: number;
+  totalExposure: number;
+  uniqueCalibrationSets: number;
+  mastersToCreate: number;
+  flatsComplete: boolean;
+  darksComplete: boolean;
+  biasComplete: boolean;
+  warnings: string[];
+}
+
+// ============================================================================
+// Export Groups Summary (Lightweight)
+// ============================================================================
+
+/**
+ * Summary of export groups for quick preview
+ */
+export interface ExportGroupsSummary {
+  frameSetId: number;
+  totalGroups: number;
+  totalFrames: number;
+  totalExposure: number;
+  mastersToCreate: number;
+  groups: ExportGroupInfo[];
+}
+
+/**
+ * Info about a single export group
+ */
+export interface ExportGroupInfo {
+  groupKey: string;
+  filter: string | null;
+  cameraType: string;
+  displayName: string;
+  frameCount: number;
+  totalExposure: number;
+  subgroupCount: number;
+  hasFlat: boolean;
+  hasDark: boolean;
+  hasBias: boolean;
+  warnings: string[];
 }
 
 /**

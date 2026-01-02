@@ -91,6 +91,7 @@ pub fn calculate_metadata_from_frame_ids(
                 objctdec: row.get(29)?,
                 override_: row.get::<_, i32>(30)? == 1,
                 swcreate: None,
+                bayerpat: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -256,6 +257,7 @@ mod tests {
             objctdec: None,
             override_: false,
             swcreate: None,
+            bayerpat: None,
         };
 
         let result = calculate_metadata_from_frames(&[frame]).unwrap();

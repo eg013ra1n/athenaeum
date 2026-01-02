@@ -156,9 +156,13 @@ pub fn run() {
             commands::clear_subcalibration_override,
             commands::get_export_preview,
             commands::export_frame_set,
+            commands::export_frame_set_v2,
+            commands::get_calibration_route,
+            commands::get_export_groups_summary,
             commands::get_siril_path,
             commands::set_siril_path,
             commands::get_exportable_frame_sets,
+            commands::diagnose_calibration_links,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

@@ -241,6 +241,7 @@ pub fn detect_flat_groups(
             objctdec: row.get(13)?,
             override_: false,
             swcreate: None,
+            bayerpat: None,
         };
 
         frames.push(frame);

@@ -376,6 +376,7 @@ pub fn get_frames_for_calibration_set(
             objctdec: row.get(38)?,
             override_: row.get::<_, i32>(39)? == 1,
             swcreate: None,
+            bayerpat: None,
         };
 
         Ok(FileWithFrame {

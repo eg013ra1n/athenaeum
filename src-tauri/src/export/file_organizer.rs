@@ -1,9 +1,13 @@
 //! File organizer for export operations
 //!
 //! Creates folder structures and copies/symlinks files for processing.
+//!
+//! V2: Organizes calibration files per set ID so each master can be created
+//! from its own set of files without mixing with other sets.
 
-use crate::export::models::{ExportConfig, ExportData, ExportResult};
+use crate::export::models::{CalibrationSetInfo, ExportConfig, ExportData, ExportResult};
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +15,7 @@ use std::path::{Path, PathBuf};
 pub struct ExportFolders {
     pub root: PathBuf,
     pub lights: PathBuf,
+    #[allow(dead_code)]
     pub calibration: PathBuf,
     pub darks: PathBuf,
     pub flats: PathBuf,
@@ -67,96 +72,93 @@ impl ExportFolders {
             None => self.flats.clone(),
         }
     }
+
+    /// Get folder for a specific calibration set by ID
+    /// V2: Organizes calibration frames per set for proper Siril processing
+    pub fn calibration_set_folder(&self, imagetyp: &str, set_id: i64) -> PathBuf {
+        let base = match imagetyp {
+            "Bias" => &self.bias,
+            "Dark" => &self.darks,
+            "DarkFlat" => &self.dark_flats,
+            "Flat" => &self.flats,
+            _ => &self.calibration,
+        };
+        base.join(format!("set_{}", set_id))
+    }
 }
 
 /// Organize files into export folder structure
+/// V2: Uses ExportGroups and MasterCreationPlan for proper per-set organization
 pub fn organize_files(config: &ExportConfig, data: &ExportData) -> Result<ExportResult> {
     let folders = ExportFolders::new(config.output_dir.clone());
     folders.create_all()?;
 
     let mut files_organized = 0;
     let mut warnings = Vec::new();
+    let mut organized_sets: HashSet<i64> = HashSet::new();
 
-    // Organize light frames by filter
-    for filter_group in &data.filters {
-        let filter_folder = folders.lights_for_filter(filter_group.filter.as_deref());
+    // Organize light frames by group (filter + camera type) and subgroup
+    for group in &data.groups {
+        let filter_folder = folders.lights_for_filter(group.filter.as_deref());
         fs::create_dir_all(&filter_folder)?;
 
-        for frame in &filter_group.light_frames {
-            let dest = filter_folder.join(&frame.filename);
-            copy_or_link(&frame.file_path, &dest, config.use_symlinks)?;
-            files_organized += 1;
-        }
+        // If only one subgroup, put lights directly in filter folder
+        // If multiple subgroups, organize by subgroup key for separate calibration
+        let has_multiple_subgroups = group.subgroups.len() > 1;
 
-        // Organize flats for this filter
-        let flat_folder = folders.flats_for_filter(filter_group.filter.as_deref());
-        for flat_set in &filter_group.flat_sets {
-            fs::create_dir_all(&flat_folder)?;
-            for frame in &flat_set.frames {
-                let dest = flat_folder.join(&frame.filename);
+        for (subgroup_idx, subgroup) in group.subgroups.iter().enumerate() {
+            let light_dest_folder = if has_multiple_subgroups {
+                // Multiple subgroups: organize by subgroup for separate calibration
+                filter_folder.join(format!("subgroup_{}", subgroup_idx + 1))
+            } else {
+                // Single subgroup: put directly in filter folder
+                filter_folder.clone()
+            };
+            fs::create_dir_all(&light_dest_folder)?;
+
+            for frame in &subgroup.frames {
+                let dest = light_dest_folder.join(&frame.filename);
                 if let Err(e) = copy_or_link(&frame.file_path, &dest, config.use_symlinks) {
-                    warnings.push(format!("Failed to copy flat {}: {}", frame.filename, e));
+                    warnings.push(format!("Failed to copy light {}: {}", frame.filename, e));
                 } else {
                     files_organized += 1;
                 }
             }
 
-            // Organize sub-calibrations (dark flats, darks, bias for flats)
-            for sub_cal in &flat_set.sub_calibrations {
-                let sub_folder = match sub_cal.imagetyp.as_str() {
-                    "DARKFLAT" => &folders.dark_flats,
-                    "DARK" => &folders.darks,
-                    "BIAS" => &folders.bias,
-                    _ => continue,
-                };
-                for frame in &sub_cal.frames {
-                    let dest = sub_folder.join(&frame.filename);
-                    if let Err(e) = copy_or_link(&frame.file_path, &dest, config.use_symlinks) {
-                        warnings.push(format!("Failed to copy {}: {}", frame.filename, e));
-                    } else {
-                        files_organized += 1;
-                    }
-                }
+            // Organize calibration sets per set ID (not mixed together)
+            if let Some(ref flat) = subgroup.flat {
+                files_organized +=
+                    organize_calibration_set(&folders, flat, config.use_symlinks, &mut warnings, &mut organized_sets)?;
+            }
+            if let Some(ref dark) = subgroup.dark {
+                files_organized +=
+                    organize_calibration_set(&folders, dark, config.use_symlinks, &mut warnings, &mut organized_sets)?;
+            }
+            if let Some(ref bias) = subgroup.bias {
+                files_organized +=
+                    organize_calibration_set(&folders, bias, config.use_symlinks, &mut warnings, &mut organized_sets)?;
             }
         }
+    }
 
-        // Organize darks
-        for dark_set in &filter_group.dark_sets {
-            for frame in &dark_set.frames {
-                let dest = folders.darks.join(&frame.filename);
-                if let Err(e) = copy_or_link(&frame.file_path, &dest, config.use_symlinks) {
-                    warnings.push(format!("Failed to copy dark {}: {}", frame.filename, e));
-                } else {
-                    files_organized += 1;
-                }
-            }
-
-            // Bias for darks
-            for sub_cal in &dark_set.sub_calibrations {
-                if sub_cal.imagetyp == "BIAS" {
-                    for frame in &sub_cal.frames {
-                        let dest = folders.bias.join(&frame.filename);
-                        if let Err(e) = copy_or_link(&frame.file_path, &dest, config.use_symlinks) {
-                            warnings.push(format!("Failed to copy bias {}: {}", frame.filename, e));
-                        } else {
-                            files_organized += 1;
-                        }
-                    }
-                }
-            }
+    // Also organize calibration sets from master_plan that might not be in subgroups
+    for master in &data.master_plan.masters {
+        if organized_sets.contains(&master.set_id) {
+            continue;
         }
 
-        // Organize standalone bias
-        for bias_set in &filter_group.bias_sets {
-            for frame in &bias_set.frames {
-                let dest = folders.bias.join(&frame.filename);
-                if let Err(e) = copy_or_link(&frame.file_path, &dest, config.use_symlinks) {
-                    warnings.push(format!("Failed to copy bias {}: {}", frame.filename, e));
-                } else {
-                    files_organized += 1;
-                }
+        let set_folder = folders.calibration_set_folder(&master.master_type, master.set_id);
+        fs::create_dir_all(&set_folder)?;
+
+        for frame in &master.source_frames {
+            let dest = set_folder.join(&frame.filename);
+            if let Err(e) = copy_or_link(&frame.file_path, &dest, config.use_symlinks) {
+                warnings.push(format!("Failed to copy {} {}: {}", master.master_type, frame.filename, e));
+            } else {
+                files_organized += 1;
             }
         }
+        organized_sets.insert(master.set_id);
     }
 
     Ok(ExportResult {
@@ -167,6 +169,48 @@ pub fn organize_files(config: &ExportConfig, data: &ExportData) -> Result<Export
         warnings,
         error: None,
     })
+}
+
+/// Recursively organize a calibration set and its sub-calibrations
+fn organize_calibration_set(
+    folders: &ExportFolders,
+    cal_set: &CalibrationSetInfo,
+    use_symlinks: bool,
+    warnings: &mut Vec<String>,
+    organized_sets: &mut HashSet<i64>,
+) -> Result<i32> {
+    // Skip if already organized
+    if organized_sets.contains(&cal_set.set_id) {
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    let set_folder = folders.calibration_set_folder(&cal_set.imagetyp, cal_set.set_id);
+    fs::create_dir_all(&set_folder)?;
+
+    for frame in &cal_set.frames {
+        let dest = set_folder.join(&frame.filename);
+        if let Err(e) = copy_or_link(&frame.file_path, &dest, use_symlinks) {
+            warnings.push(format!("Failed to copy {} {}: {}", cal_set.imagetyp, frame.filename, e));
+        } else {
+            count += 1;
+        }
+    }
+
+    organized_sets.insert(cal_set.set_id);
+
+    // Recursively organize sub-calibrations
+    if let Some(ref dark_flat) = cal_set.dark_flat {
+        count += organize_calibration_set(folders, dark_flat, use_symlinks, warnings, organized_sets)?;
+    }
+    if let Some(ref dark) = cal_set.dark {
+        count += organize_calibration_set(folders, dark, use_symlinks, warnings, organized_sets)?;
+    }
+    if let Some(ref bias) = cal_set.bias {
+        count += organize_calibration_set(folders, bias, use_symlinks, warnings, organized_sets)?;
+    }
+
+    Ok(count)
 }
 
 /// Copy or create symlink based on config
