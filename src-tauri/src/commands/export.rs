@@ -6,13 +6,13 @@
 
 use crate::commands::AppState;
 use crate::export::{
-    collect_export_data, organize_files,
+    collect_export_data, collect_export_data_v3, organize_files, organize_files_v3, organize_files_v4,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
-        ExportConfig, ExportData, ExportMode, ExportProgress, ExportResult, ExportStage,
-        SirilScriptPreview, SirilWorkflow,
+        ExportConfig, ExportData, ExportDataV3, ExportMode, ExportProgress, ExportResult, ExportStage,
+        ExportTarget, SirilScriptPreview, SirilWorkflow,
     },
-    siril::{find_siril_cli, generate_scripts, generate_scripts_v2, run_siril_script},
+    siril::{find_siril_cli, generate_scripts, generate_scripts_v2, generate_scripts_v3, run_siril_script},
 };
 use std::path::PathBuf;
 use tauri::{Emitter, State};
@@ -72,6 +72,7 @@ pub async fn export_frame_set(
     let config = ExportConfig {
         frame_set_id,
         output_dir: PathBuf::from(&output_dir),
+        target: ExportTarget::default(),
         mode: export_mode.clone(),
         workflow: siril_workflow,
         create_masters: true,
@@ -507,6 +508,7 @@ pub async fn export_frame_set_v2(
     let config = ExportConfig {
         frame_set_id,
         output_dir: PathBuf::from(&output_dir),
+        target: ExportTarget::default(),
         mode: export_mode.clone(),
         workflow: SirilWorkflow::MonoPreprocessing, // Will be overridden per group
         create_masters,
@@ -1047,4 +1049,287 @@ pub struct ExportGroupInfo {
     pub has_dark: bool,
     pub has_bias: bool,
     pub warnings: Vec<String>,
+}
+
+// ============================================================================
+// Phase 6: V3 Export with Nested Folder Hierarchy
+// ============================================================================
+
+/// Export a frame set using the V3/V4 workflow
+///
+/// Supports two export targets:
+/// - Siril: Flat folder structure with generated scripts
+/// - PixInsight WBPP: Grouped structure (camera/flats/lights) for auto-detection
+#[tauri::command]
+pub async fn export_frame_set_v3(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    frame_set_id: i64,
+    output_dir: String,
+    mode: String,
+    target: Option<String>,
+    create_masters: bool,
+    rejection_low: f64,
+    rejection_high: f64,
+    use_symlinks: bool,
+) -> Result<ExportResult, String> {
+    // Parse mode
+    let export_mode = match mode.as_str() {
+        "generate_scripts" => ExportMode::GenerateScripts,
+        "organize_files" => ExportMode::OrganizeFiles,
+        "organize_and_script" => ExportMode::OrganizeAndScript,
+        "direct_execution" => ExportMode::DirectExecution,
+        _ => return Err(format!("Invalid export mode: {}", mode)),
+    };
+
+    // Parse target (default to Siril for backwards compatibility)
+    let export_target = match target.as_deref() {
+        Some("pixinsight_wbpp") | Some("wbpp") => ExportTarget::PixInsightWBPP,
+        _ => ExportTarget::Siril,
+    };
+
+    // Build config
+    let config = ExportConfig {
+        frame_set_id,
+        output_dir: PathBuf::from(&output_dir),
+        target: export_target.clone(),
+        mode: export_mode.clone(),
+        workflow: SirilWorkflow::MonoPreprocessing, // Will be determined per branch
+        create_masters,
+        rejection_low,
+        rejection_high,
+        use_symlinks,
+    };
+
+    // Emit collecting progress
+    let _ = app_handle.emit(
+        "export-progress",
+        ExportProgress {
+            stage: ExportStage::Collecting,
+            progress: 0.0,
+            message: "Collecting frame data (V3)...".to_string(),
+            current_file: None,
+        },
+    );
+
+    // Collect export data using V3 collector
+    let export_data = {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        collect_export_data_v3(&conn, frame_set_id).map_err(|e| e.to_string())?
+    };
+
+    // Emit data collection complete
+    let _ = app_handle.emit(
+        "export-progress",
+        ExportProgress {
+            stage: ExportStage::Collecting,
+            progress: 100.0,
+            message: format!(
+                "Found {} light frames in {} branches across {} cameras",
+                export_data.total_light_frames,
+                export_data.branches.len(),
+                export_data.cameras.len()
+            ),
+            current_file: None,
+        },
+    );
+
+    let mut result = ExportResult {
+        success: true,
+        output_dir: output_dir.clone(),
+        files_organized: 0,
+        scripts_generated: Vec::new(),
+        warnings: Vec::new(),
+        error: None,
+    };
+
+    // Step 1: Organize files (if needed)
+    if matches!(
+        export_mode,
+        ExportMode::OrganizeFiles | ExportMode::OrganizeAndScript | ExportMode::DirectExecution
+    ) {
+        let organize_message = match export_target {
+            ExportTarget::Siril => "Organizing files for Siril...",
+            ExportTarget::PixInsightWBPP => "Organizing files for PixInsight WBPP...",
+        };
+        let _ = app_handle.emit(
+            "export-progress",
+            ExportProgress {
+                stage: ExportStage::Organizing,
+                progress: 0.0,
+                message: organize_message.to_string(),
+                current_file: None,
+            },
+        );
+
+        match organize_files_v4(&config, &export_data) {
+            Ok(org_result) => {
+                result.files_organized = org_result.files_organized;
+                result.warnings.extend(org_result.warnings);
+
+                let _ = app_handle.emit(
+                    "export-progress",
+                    ExportProgress {
+                        stage: ExportStage::Organizing,
+                        progress: 100.0,
+                        message: format!("Organized {} files", org_result.files_organized),
+                        current_file: None,
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = app_handle.emit(
+                    "export-progress",
+                    ExportProgress {
+                        stage: ExportStage::Failed,
+                        progress: 0.0,
+                        message: format!("Failed to organize files: {}", e),
+                        current_file: None,
+                    },
+                );
+                return Ok(ExportResult {
+                    success: false,
+                    output_dir,
+                    files_organized: 0,
+                    scripts_generated: Vec::new(),
+                    warnings: Vec::new(),
+                    error: Some(format!("Failed to organize files: {}", e)),
+                });
+            }
+        }
+    }
+
+    // Step 2: Generate scripts (Siril only)
+    // WBPP doesn't need scripts - it auto-detects from FITS keywords
+    if export_target == ExportTarget::Siril
+        && matches!(
+            export_mode,
+            ExportMode::GenerateScripts | ExportMode::OrganizeAndScript | ExportMode::DirectExecution
+        )
+    {
+        let _ = app_handle.emit(
+            "export-progress",
+            ExportProgress {
+                stage: ExportStage::GeneratingScripts,
+                progress: 0.0,
+                message: "Generating Siril scripts...".to_string(),
+                current_file: None,
+            },
+        );
+
+        // TODO: Update to use new Siril folder structure
+        // For now, use v3 generator (will need updating for new flat paths)
+        match generate_scripts_v3(&config, &export_data) {
+            Ok(scripts) => {
+                result.scripts_generated = scripts
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+
+                let _ = app_handle.emit(
+                    "export-progress",
+                    ExportProgress {
+                        stage: ExportStage::GeneratingScripts,
+                        progress: 100.0,
+                        message: format!("Generated {} scripts", result.scripts_generated.len()),
+                        current_file: None,
+                    },
+                );
+            }
+            Err(e) => {
+                let _ = app_handle.emit(
+                    "export-progress",
+                    ExportProgress {
+                        stage: ExportStage::Failed,
+                        progress: 0.0,
+                        message: format!("Failed to generate scripts: {}", e),
+                        current_file: None,
+                    },
+                );
+                return Ok(ExportResult {
+                    success: false,
+                    output_dir,
+                    files_organized: result.files_organized,
+                    scripts_generated: Vec::new(),
+                    warnings: result.warnings,
+                    error: Some(format!("Failed to generate scripts: {}", e)),
+                });
+            }
+        }
+    }
+
+    // Step 3: Execute Siril (if direct execution mode and Siril target)
+    if export_target == ExportTarget::Siril && export_mode == ExportMode::DirectExecution {
+        let siril_path = {
+            let state_lock = state.db.lock().unwrap();
+            let db = state_lock.as_ref().ok_or("Database not initialized")?;
+            let conn = db.conn();
+
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = 'siril_cli_path'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        };
+
+        let siril_path = siril_path
+            .or_else(find_siril_cli)
+            .ok_or("Siril CLI not found. Please configure the path in settings.")?;
+
+        // Run scripts in order (masters → calibration → registration/stacking)
+        for script_path in &result.scripts_generated {
+            let _ = app_handle.emit(
+                "export-progress",
+                ExportProgress {
+                    stage: ExportStage::SirilCalibrating,
+                    progress: 0.0,
+                    message: format!("Running {}...", script_path),
+                    current_file: Some(script_path.clone()),
+                },
+            );
+
+            if let Err(e) =
+                run_siril_script(&siril_path, &PathBuf::from(script_path), &app_handle)
+            {
+                result
+                    .warnings
+                    .push(format!("Script {} failed: {}", script_path, e));
+            }
+        }
+    }
+
+    // Emit export complete
+    let _ = app_handle.emit(
+        "export-progress",
+        ExportProgress {
+            stage: ExportStage::Complete,
+            progress: 100.0,
+            message: format!(
+                "Export complete! {} files, {} scripts",
+                result.files_organized,
+                result.scripts_generated.len()
+            ),
+            current_file: None,
+        },
+    );
+
+    Ok(result)
+}
+
+/// Get V3 export preview data for a frame set
+///
+/// Returns nested hierarchy structure suitable for preview before export.
+#[tauri::command]
+pub async fn get_export_preview_v3(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+) -> Result<ExportDataV3, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    collect_export_data_v3(&conn, frame_set_id).map_err(|e| e.to_string())
 }

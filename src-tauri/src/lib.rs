@@ -163,6 +163,8 @@ pub fn run() {
             commands::set_siril_path,
             commands::get_exportable_frame_sets,
             commands::diagnose_calibration_links,
+            commands::export_frame_set_v3,
+            commands::get_export_preview_v3,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

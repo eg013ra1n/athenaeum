@@ -18,6 +18,11 @@ export type SirilWorkflow =
   | 'lrgb_processing';
 
 /**
+ * Export target application
+ */
+export type ExportTarget = 'siril' | 'pixinsight_wbpp';
+
+/**
  * Camera type based on Bayer pattern presence
  */
 export type CameraType = 'osc' | 'mono';
@@ -28,6 +33,7 @@ export type CameraType = 'osc' | 'mono';
 export interface ExportConfig {
   frameSetId: number;
   outputDir: string;
+  target: ExportTarget;
   mode: ExportMode;
   workflow: SirilWorkflow;
   createMasters: boolean;

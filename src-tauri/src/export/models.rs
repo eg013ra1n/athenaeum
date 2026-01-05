@@ -62,6 +62,17 @@ pub enum SirilWorkflow {
     LrgbProcessing,
 }
 
+/// Export target application
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportTarget {
+    /// Siril - flat structure with generated scripts
+    #[default]
+    Siril,
+    /// PixInsight WBPP - grouped structure for auto-detection
+    PixInsightWBPP,
+}
+
 /// Configuration for an export operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,15 +81,18 @@ pub struct ExportConfig {
     pub frame_set_id: i64,
     /// Output directory path
     pub output_dir: PathBuf,
+    /// Export target application (Siril or PixInsight WBPP)
+    #[serde(default)]
+    pub target: ExportTarget,
     /// Export operation mode
     pub mode: ExportMode,
-    /// Siril workflow type
+    /// Siril workflow type (only used when target is Siril)
     pub workflow: SirilWorkflow,
-    /// Whether to create master calibration frames
+    /// Whether to create master calibration frames (Siril only)
     pub create_masters: bool,
-    /// Low rejection sigma for stacking
+    /// Low rejection sigma for stacking (Siril only)
     pub rejection_low: f64,
-    /// High rejection sigma for stacking
+    /// High rejection sigma for stacking (Siril only)
     pub rejection_high: f64,
     /// Use symbolic links instead of copying files
     pub use_symlinks: bool,
@@ -89,6 +103,7 @@ impl Default for ExportConfig {
         Self {
             frame_set_id: 0,
             output_dir: PathBuf::new(),
+            target: ExportTarget::default(),
             mode: ExportMode::OrganizeAndScript,
             workflow: SirilWorkflow::MonoPreprocessing,
             create_masters: true,
@@ -275,8 +290,135 @@ pub struct MasterInfo {
     pub depends_on: Vec<i64>,
     /// Calibration master to apply: Bias set ID
     pub apply_bias: Option<i64>,
-    /// Calibration master to apply: Dark set ID
+    /// Calibration master to apply: Dark set ID (for lights and darks that need dark calibration)
     pub apply_dark: Option<i64>,
+    /// Calibration master to apply: DarkFlat set ID (for flats - short exposure dark matching flat exposure)
+    pub apply_darkflat: Option<i64>,
+}
+
+// ============================================================================
+// V3 Export Models - Nested Folder Hierarchy
+// ============================================================================
+
+/// Sanitize a name for use in folder paths
+/// Replaces spaces and special characters with underscores
+pub fn sanitize_folder_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// A calibration branch represents a unique path through the calibration hierarchy
+/// Each branch has: Camera → Bias → Dark → Flat → (DarkFlat) → Lights
+/// Branch ID includes filter for per-filter stacking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationBranch {
+    /// Unique branch identifier (e.g., "qhy268m_b23_d56_f38_L")
+    pub branch_id: String,
+    /// Camera name (from instrume field)
+    pub camera_name: String,
+    /// Sanitized camera name for folder paths
+    pub camera_folder_name: String,
+    /// Bias set ID (0 if missing)
+    pub bias_id: i64,
+    /// Dark set ID (0 if missing)
+    pub dark_id: i64,
+    /// Flat set ID (0 if missing)
+    pub flat_id: i64,
+    /// DarkFlat set ID (0 if missing)
+    pub darkflat_id: i64,
+    /// Filter name (from flat or lights)
+    pub filter: Option<String>,
+    /// Light frames in this branch
+    pub light_frames: Vec<ExportFrame>,
+    /// Calibration set info for bias level
+    pub bias_info: Option<CalibrationSetInfo>,
+    /// Calibration set info for dark level
+    pub dark_info: Option<CalibrationSetInfo>,
+    /// Calibration set info for flat level
+    pub flat_info: Option<CalibrationSetInfo>,
+    /// Calibration set info for darkflat level
+    pub darkflat_info: Option<CalibrationSetInfo>,
+}
+
+impl CalibrationBranch {
+    /// Generate branch ID from calibration set IDs and filter
+    /// Format: "{camera}_b{bias}_d{dark}_f{flat}_{filter}"
+    pub fn make_branch_id(
+        camera: &str,
+        bias_id: i64,
+        dark_id: i64,
+        flat_id: i64,
+        filter: Option<&str>,
+    ) -> String {
+        let cam_safe = sanitize_folder_name(camera);
+        let filter_safe = filter
+            .map(|f| sanitize_folder_name(f))
+            .unwrap_or_else(|| "nofilter".to_string());
+        format!("{}_b{}_d{}_f{}_{}", cam_safe, bias_id, dark_id, flat_id, filter_safe)
+    }
+
+    /// Get total exposure time for this branch
+    pub fn total_exposure(&self) -> f64 {
+        self.light_frames
+            .iter()
+            .filter_map(|f| f.exptime)
+            .sum()
+    }
+
+    /// Check if this branch uses OSC camera (has Bayer pattern)
+    pub fn is_osc(&self) -> bool {
+        self.light_frames
+            .first()
+            .and_then(|f| f.bayerpat.as_ref())
+            .map(|p| !p.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// Complete export data using V3 nested hierarchy structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportDataV3 {
+    /// Frame set ID
+    pub frame_set_id: i64,
+    /// Frame set name
+    pub frame_set_name: String,
+    /// Object name (target name)
+    pub object_name: Option<String>,
+    /// All calibration branches (one per unique calibration path + filter)
+    pub branches: Vec<CalibrationBranch>,
+    /// Master creation plan (topologically sorted)
+    pub master_plan: MasterCreationPlan,
+    /// Total light frame count
+    pub total_light_frames: i32,
+    /// Total exposure time in seconds
+    pub total_exposure_seconds: f64,
+    /// All unique camera names
+    pub cameras: Vec<String>,
+    /// All unique filter names
+    pub filters: Vec<String>,
+}
+
+impl ExportDataV3 {
+    /// Get all unique filters from branches
+    pub fn unique_filters(&self) -> Vec<Option<String>> {
+        let mut filters: Vec<Option<String>> = self.branches
+            .iter()
+            .map(|b| b.filter.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        filters.sort();
+        filters
+    }
 }
 
 // ============================================================================

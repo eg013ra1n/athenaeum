@@ -13,6 +13,6 @@ pub mod templates;
 pub use cli_runner::*;
 #[allow(unused_imports)]
 pub use script_generator::{
-    generate_combined_script, generate_scripts, generate_scripts_v2,
+    generate_combined_script, generate_scripts, generate_scripts_v2, generate_scripts_v3,
 };
 // Note: templates are used internally by script_generator

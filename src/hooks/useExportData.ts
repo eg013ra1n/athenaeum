@@ -5,6 +5,7 @@ import type {
   ExportResult,
   ExportableFrameSet,
   ExportMode,
+  ExportTarget,
   SirilWorkflow,
   CalibrationRoute,
   ExportGroupsSummary,
@@ -192,7 +193,7 @@ export function useSirilPath(): UseSirilPathResult {
 }
 
 // ============================================================================
-// New V2 Export Hooks
+// V3 Export Hooks (Nested Folder Hierarchy)
 // ============================================================================
 
 interface UseCalibrationRouteResult {
@@ -294,6 +295,7 @@ interface ExportV2Config {
   frameSetId: number;
   outputDir: string;
   mode: ExportMode;
+  target?: ExportTarget;
   createMasters?: boolean;
   rejectionLow?: number;
   rejectionHigh?: number;
@@ -301,8 +303,8 @@ interface ExportV2Config {
 }
 
 /**
- * Hook to execute a v2 export operation
- * Uses the new ExportGroup structure with auto-detected workflows
+ * Hook to execute a V3 export operation
+ * Uses nested folder hierarchy: camera → bias → darks → flats → fdarks → lights
  */
 export function useExportV2(): UseExportV2Result {
   const [loading, setLoading] = useState(false);
@@ -315,10 +317,11 @@ export function useExportV2(): UseExportV2Result {
       setError(null);
       setResult(null);
 
-      const exportResult = await invoke<ExportResult>('export_frame_set_v2', {
+      const exportResult = await invoke<ExportResult>('export_frame_set_v3', {
         frameSetId: config.frameSetId,
         outputDir: config.outputDir,
         mode: config.mode,
+        target: config.target ?? 'siril',
         createMasters: config.createMasters ?? true,
         rejectionLow: config.rejectionLow ?? 3.0,
         rejectionHigh: config.rejectionHigh ?? 3.0,

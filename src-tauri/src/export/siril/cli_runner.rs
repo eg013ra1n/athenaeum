@@ -61,6 +61,8 @@ pub fn run_siril_script(
     script_path: &Path,
     app_handle: &AppHandle,
 ) -> Result<()> {
+    println!("🚀 Running Siril script: {:?}", script_path);
+
     // Emit starting progress
     emit_progress(
         app_handle,
@@ -81,7 +83,22 @@ pub fn run_siril_script(
         .spawn()
         .with_context(|| format!("Failed to start Siril CLI at {}", siril_path))?;
 
+    // Collect stderr in a separate thread
+    let stderr = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut stderr_output = Vec::new();
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().flatten() {
+                println!("  [SIRIL STDERR] {}", line);
+                stderr_output.push(line);
+            }
+        }
+        stderr_output
+    });
+
     // Read stdout for progress
+    let mut last_lines: Vec<String> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
         let mut current_stage = ExportStage::SirilCalibrating;
@@ -90,6 +107,13 @@ pub fn run_siril_script(
         for line in reader.lines() {
             if let Ok(line) = line {
                 line_count += 1;
+                println!("  [SIRIL] {}", line);
+
+                // Keep last 20 lines for error reporting
+                last_lines.push(line.clone());
+                if last_lines.len() > 20 {
+                    last_lines.remove(0);
+                }
 
                 // Parse Siril output to determine stage
                 let (stage, message) = parse_siril_output(&line, &current_stage);
@@ -114,7 +138,11 @@ pub fn run_siril_script(
     // Wait for completion
     let status = child.wait().context("Failed to wait for Siril to complete")?;
 
+    // Get stderr output
+    let stderr_output = stderr_handle.join().unwrap_or_default();
+
     if status.success() {
+        println!("✅ Siril script completed successfully");
         emit_progress(
             app_handle,
             ExportProgress {
@@ -126,19 +154,35 @@ pub fn run_siril_script(
         );
         Ok(())
     } else {
+        // Build detailed error message
+        let mut error_details = format!("Siril exited with code: {:?}\n", status.code());
+
+        if !last_lines.is_empty() {
+            error_details.push_str("\n--- Last stdout lines ---\n");
+            for line in &last_lines {
+                error_details.push_str(&format!("  {}\n", line));
+            }
+        }
+
+        if !stderr_output.is_empty() {
+            error_details.push_str("\n--- Stderr ---\n");
+            for line in &stderr_output {
+                error_details.push_str(&format!("  {}\n", line));
+            }
+        }
+
+        println!("❌ Siril script failed:\n{}", error_details);
+
         emit_progress(
             app_handle,
             ExportProgress {
                 stage: ExportStage::Failed,
                 progress: 0.0,
-                message: format!("Siril exited with code: {:?}", status.code()),
+                message: error_details.clone(),
                 current_file: None,
             },
         );
-        Err(anyhow::anyhow!(
-            "Siril exited with code: {:?}",
-            status.code()
-        ))
+        Err(anyhow::anyhow!("{}", error_details))
     }
 }
 

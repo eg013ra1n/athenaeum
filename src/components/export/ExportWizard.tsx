@@ -17,6 +17,7 @@ import {
 } from '../../hooks/useExportData';
 import type {
   ExportMode,
+  ExportTarget,
   SirilWorkflow,
   ExportProgress as ExportProgressType,
   ExportResult,
@@ -31,6 +32,7 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   const [selectedFrameSetId, setSelectedFrameSetId] = useState<number | null>(
     initialFrameSetId ?? null
   );
+  const [exportTarget, setExportTarget] = useState<ExportTarget>('siril');
   const [mode, setMode] = useState<ExportMode>('organize_and_script');
   const [workflow, setWorkflow] = useState<SirilWorkflow>('mono_preprocessing');
   const [outputDir, setOutputDir] = useState<string>('');
@@ -38,7 +40,7 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   const [rejectionHigh, setRejectionHigh] = useState(3.0);
   const [useSymlinks, setUseSymlinks] = useState(false);
   const [createMasters, setCreateMasters] = useState(true);
-  const [useV2Export, setUseV2Export] = useState(true); // Default to v2
+  const [useV2Export, setUseV2Export] = useState(true); // Default to v4 (smart export)
   const [progress, setProgress] = useState<ExportProgressType | null>(null);
   const [result, setResult] = useState<ExportResult | null>(null);
 
@@ -88,11 +90,12 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
       let exportResult: ExportResult;
 
       if (useV2Export) {
-        // Use v2 export with auto-detected workflows
+        // Use v4 export with auto-detected workflows and flat folder structure
         exportResult = await executeV2({
           frameSetId: selectedFrameSetId,
           outputDir,
           mode,
+          target: exportTarget,
           createMasters,
           rejectionLow,
           rejectionHigh,
@@ -119,6 +122,7 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     outputDir,
     mode,
     workflow,
+    exportTarget,
     createMasters,
     rejectionLow,
     rejectionHigh,
@@ -148,11 +152,48 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         />
       </section>
 
-      {/* Step 2: Calibration Summary */}
+      {/* Step 2: Export Target */}
+      {selectedFrameSetId && (
+        <section className="bg-gray-800 rounded-lg p-4">
+          <h3 className="text-lg font-medium mb-3">2. Export Target</h3>
+          <div className="flex gap-4">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="exportTarget"
+                value="siril"
+                checked={exportTarget === 'siril'}
+                onChange={() => setExportTarget('siril')}
+                className="w-4 h-4 border-gray-600 bg-gray-700 text-blue-500 focus:ring-blue-500"
+              />
+              <div>
+                <span className="text-gray-200">Siril</span>
+                <p className="text-sm text-gray-500">Flat structure with generated scripts</p>
+              </div>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="exportTarget"
+                value="pixinsight_wbpp"
+                checked={exportTarget === 'pixinsight_wbpp'}
+                onChange={() => setExportTarget('pixinsight_wbpp')}
+                className="w-4 h-4 border-gray-600 bg-gray-700 text-blue-500 focus:ring-blue-500"
+              />
+              <div>
+                <span className="text-gray-200">PixInsight WBPP</span>
+                <p className="text-sm text-gray-500">Grouped structure for auto-detection</p>
+              </div>
+            </label>
+          </div>
+        </section>
+      )}
+
+      {/* Step 3: Calibration Summary */}
       {selectedFrameSetId && (
         <section className="bg-gray-800 rounded-lg p-4">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-lg font-medium">2. Calibration Summary</h3>
+            <h3 className="text-lg font-medium">3. Calibration Summary</h3>
             {/* V2 Export Toggle */}
             <label className="flex items-center gap-2 cursor-pointer">
               <input
@@ -163,7 +204,7 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
               />
               <span className="text-sm text-gray-400 flex items-center gap-1">
                 <Sparkles size={14} className="text-yellow-500" />
-                Smart Export (v2)
+                Smart Export (v4)
               </span>
             </label>
           </div>
@@ -234,26 +275,26 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         </section>
       )}
 
-      {/* Step 3: Export Mode */}
-      {selectedFrameSetId && exportData && (
+      {/* Step 4: Export Mode (Siril only) */}
+      {selectedFrameSetId && exportData && exportTarget === 'siril' && (
         <section className="bg-gray-800 rounded-lg p-4">
-          <h3 className="text-lg font-medium mb-3">3. Export Mode</h3>
+          <h3 className="text-lg font-medium mb-3">4. Export Mode</h3>
           <ExportModeSelector value={mode} onChange={setMode} />
         </section>
       )}
 
-      {/* Step 4: Workflow (only in legacy mode) */}
-      {selectedFrameSetId && exportData && !useV2Export && (
+      {/* Step 5: Workflow (only in legacy mode) */}
+      {selectedFrameSetId && exportData && exportTarget === 'siril' && !useV2Export && (
         <section className="bg-gray-800 rounded-lg p-4">
-          <h3 className="text-lg font-medium mb-3">4. Siril Workflow</h3>
+          <h3 className="text-lg font-medium mb-3">5. Siril Workflow</h3>
           <WorkflowSelector value={workflow} onChange={setWorkflow} />
         </section>
       )}
 
-      {/* V2 Mode: Master creation option */}
-      {selectedFrameSetId && exportData && useV2Export && (
+      {/* V2 Mode: Master creation option (Siril only) */}
+      {selectedFrameSetId && exportData && exportTarget === 'siril' && useV2Export && (
         <section className="bg-gray-800 rounded-lg p-4">
-          <h3 className="text-lg font-medium mb-3">4. Processing Options</h3>
+          <h3 className="text-lg font-medium mb-3">5. Processing Options</h3>
           <div className="p-3 bg-gray-700/50 rounded-lg">
             <label className="flex items-center gap-2 cursor-pointer">
               <input
@@ -277,10 +318,12 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         </section>
       )}
 
-      {/* Step 5: Options */}
+      {/* Step 6: Options (or Step 4 for WBPP) */}
       {selectedFrameSetId && exportData && (
         <section className="bg-gray-800 rounded-lg p-4">
-          <h3 className="text-lg font-medium mb-3">5. Options</h3>
+          <h3 className="text-lg font-medium mb-3">
+            {exportTarget === 'siril' ? '6' : '4'}. Options
+          </h3>
           <div className="space-y-4">
             {/* Output directory */}
             <div>
@@ -305,37 +348,39 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
               </div>
             </div>
 
-            {/* Rejection parameters */}
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">
-                  Rejection Low (sigma)
-                </label>
-                <input
-                  type="number"
-                  value={rejectionLow}
-                  onChange={(e) => setRejectionLow(parseFloat(e.target.value) || 3.0)}
-                  step="0.1"
-                  min="1"
-                  max="6"
-                  className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
-                />
+            {/* Rejection parameters (Siril only) */}
+            {exportTarget === 'siril' && (
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">
+                    Rejection Low (sigma)
+                  </label>
+                  <input
+                    type="number"
+                    value={rejectionLow}
+                    onChange={(e) => setRejectionLow(parseFloat(e.target.value) || 3.0)}
+                    step="0.1"
+                    min="1"
+                    max="6"
+                    className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">
+                    Rejection High (sigma)
+                  </label>
+                  <input
+                    type="number"
+                    value={rejectionHigh}
+                    onChange={(e) => setRejectionHigh(parseFloat(e.target.value) || 3.0)}
+                    step="0.1"
+                    min="1"
+                    max="6"
+                    className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                  />
+                </div>
               </div>
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">
-                  Rejection High (sigma)
-                </label>
-                <input
-                  type="number"
-                  value={rejectionHigh}
-                  onChange={(e) => setRejectionHigh(parseFloat(e.target.value) || 3.0)}
-                  step="0.1"
-                  min="1"
-                  max="6"
-                  className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
-                />
-              </div>
-            </div>
+            )}
 
             {/* Use symlinks */}
             <label className="flex items-center gap-2 cursor-pointer">
