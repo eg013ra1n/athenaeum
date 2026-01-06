@@ -28,6 +28,52 @@ export type ExportTarget = 'siril' | 'pixinsight_wbpp';
 export type CameraType = 'osc' | 'mono';
 
 /**
+ * Reference frame selection mode for registration
+ */
+export type ReferenceFrameMode =
+  | 'siril_auto' // Use Siril's -2pass auto-selection (recommended)
+  | 'athenaeum_scoring' // Pre-select using Athenaeum quality metrics
+  | 'manual'; // User manually specifies reference frame
+
+/**
+ * Pixel rejection algorithm for stacking
+ */
+export type RejectionAlgorithm =
+  | 'percentile' // Good for small datasets (<20 frames)
+  | 'sigma' // General purpose (default)
+  | 'linear_fit' // Good for large sets with gradients
+  | 'gesd' // Best for 50+ images
+  | 'mad'; // Good for drizzled CFA data
+
+/**
+ * Image weighting method for stacking
+ */
+export type ImageWeightingMethod =
+  | 'none' // No weighting
+  | 'stars' // Weight by number of stars detected
+  | 'wfwhm' // Weight by weighted FWHM (recommended)
+  | 'noise' // Weight by noise level
+  | 'exposure_time'; // Weight by integration time
+
+/**
+ * Drizzle scale factor for super-resolution
+ */
+export type DrizzleScale =
+  | 'none' // No drizzle (1x, disabled)
+  | 'x2' // 2x super-resolution
+  | 'x3'; // 3x super-resolution
+
+/**
+ * Exposure time tolerance mode for stacking grouping
+ *
+ * Controls how frames with different exposure times are grouped for stacking.
+ */
+export type ExptimeToleranceMode =
+  | 'disabled' // Stack all frames with same filter together (ignores exposure time)
+  | 'absolute' // Group frames if within X seconds of each other
+  | 'relative'; // Group frames if within X percent of each other
+
+/**
  * Configuration for an export operation
  */
 export interface ExportConfig {
@@ -40,6 +86,28 @@ export interface ExportConfig {
   rejectionLow: number;
   rejectionHigh: number;
   useSymlinks: boolean;
+
+  // === Advanced Siril Options ===
+
+  /** Reference frame selection mode for registration */
+  referenceFrameMode: ReferenceFrameMode;
+  /** Manual reference frame ID (only used when referenceFrameMode is 'manual') */
+  manualReferenceFrameId?: number;
+  /** Pixel rejection algorithm for stacking */
+  rejectionAlgorithm: RejectionAlgorithm;
+  /** Image weighting method for stacking */
+  imageWeighting: ImageWeightingMethod;
+  /** Enable drizzle for super-resolution */
+  drizzleEnabled: boolean;
+  /** Drizzle scale factor (only used when drizzleEnabled is true) */
+  drizzleScale: DrizzleScale;
+
+  // === Exposure Time Grouping ===
+
+  /** Exposure time tolerance mode for stacking grouping */
+  exptimeToleranceMode: ExptimeToleranceMode;
+  /** Exposure time tolerance value (seconds for absolute, percentage for relative) */
+  exptimeToleranceValue: number;
 }
 
 /**

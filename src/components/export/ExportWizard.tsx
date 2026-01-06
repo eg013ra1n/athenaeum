@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
-import { Folder, Loader2, Check, AlertCircle, Sparkles } from 'lucide-react';
+import { Folder, Loader2, Check, AlertCircle, Sparkles, ChevronDown, ChevronRight } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
 import { ExportModeSelector } from './ExportModeSelector';
 import { WorkflowSelector } from './WorkflowSelector';
@@ -21,6 +21,11 @@ import type {
   SirilWorkflow,
   ExportProgress as ExportProgressType,
   ExportResult,
+  ReferenceFrameMode,
+  RejectionAlgorithm,
+  ImageWeightingMethod,
+  DrizzleScale,
+  ExptimeToleranceMode,
 } from '../../types/export';
 
 interface ExportWizardProps {
@@ -36,13 +41,25 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   const [mode, setMode] = useState<ExportMode>('organize_and_script');
   const [workflow, setWorkflow] = useState<SirilWorkflow>('mono_preprocessing');
   const [outputDir, setOutputDir] = useState<string>('');
-  const [rejectionLow, setRejectionLow] = useState(3.0);
-  const [rejectionHigh, setRejectionHigh] = useState(3.0);
+  const [rejectionLow, setRejectionLow] = useState(2.5);
+  const [rejectionHigh, setRejectionHigh] = useState(2.5);
   const [useSymlinks, setUseSymlinks] = useState(false);
   const [createMasters, setCreateMasters] = useState(true);
   const [useV2Export, setUseV2Export] = useState(true); // Default to v4 (smart export)
   const [progress, setProgress] = useState<ExportProgressType | null>(null);
   const [result, setResult] = useState<ExportResult | null>(null);
+
+  // Advanced Siril options
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
+  const [referenceFrameMode, setReferenceFrameMode] = useState<ReferenceFrameMode>('siril_auto');
+  const [rejectionAlgorithm, setRejectionAlgorithm] = useState<RejectionAlgorithm>('sigma');
+  const [imageWeighting, setImageWeighting] = useState<ImageWeightingMethod>('wfwhm');
+  const [drizzleEnabled, setDrizzleEnabled] = useState(false);
+  const [drizzleScale, setDrizzleScale] = useState<DrizzleScale>('x2');
+
+  // Exposure time tolerance (for grouping frames with similar exposures)
+  const [exptimeToleranceMode, setExptimeToleranceMode] = useState<ExptimeToleranceMode>('disabled');
+  const [exptimeToleranceValue, setExptimeToleranceValue] = useState(30);
 
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
@@ -100,6 +117,15 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
           rejectionLow,
           rejectionHigh,
           useSymlinks,
+          // Advanced Siril options
+          referenceFrameMode,
+          rejectionAlgorithm,
+          imageWeighting,
+          drizzleEnabled,
+          drizzleScale,
+          // Exposure time grouping
+          exptimeToleranceMode,
+          exptimeToleranceValue,
         });
       } else {
         // Use legacy export with manual workflow selection
@@ -130,6 +156,15 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     useV2Export,
     executeLegacy,
     executeV2,
+    // Advanced Siril options
+    referenceFrameMode,
+    rejectionAlgorithm,
+    imageWeighting,
+    drizzleEnabled,
+    drizzleScale,
+    // Exposure time grouping
+    exptimeToleranceMode,
+    exptimeToleranceValue,
   ]);
 
   // Check if ready to export
@@ -348,37 +383,180 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
               </div>
             </div>
 
-            {/* Rejection parameters (Siril only) */}
+            {/* Advanced Siril Options (collapsible) */}
             {exportTarget === 'siril' && (
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm text-gray-400 mb-1">
-                    Rejection Low (sigma)
-                  </label>
-                  <input
-                    type="number"
-                    value={rejectionLow}
-                    onChange={(e) => setRejectionLow(parseFloat(e.target.value) || 3.0)}
-                    step="0.1"
-                    min="1"
-                    max="6"
-                    className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm text-gray-400 mb-1">
-                    Rejection High (sigma)
-                  </label>
-                  <input
-                    type="number"
-                    value={rejectionHigh}
-                    onChange={(e) => setRejectionHigh(parseFloat(e.target.value) || 3.0)}
-                    step="0.1"
-                    min="1"
-                    max="6"
-                    className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
-                  />
-                </div>
+              <div className="border border-gray-600 rounded-lg overflow-hidden">
+                <button
+                  onClick={() => setShowAdvancedOptions(!showAdvancedOptions)}
+                  className="w-full px-4 py-3 bg-gray-700/50 hover:bg-gray-700 flex items-center justify-between text-left"
+                >
+                  <span className="font-medium text-gray-200">Advanced Siril Options</span>
+                  {showAdvancedOptions ? (
+                    <ChevronDown size={20} className="text-gray-400" />
+                  ) : (
+                    <ChevronRight size={20} className="text-gray-400" />
+                  )}
+                </button>
+                {showAdvancedOptions && (
+                  <div className="p-4 space-y-4 bg-gray-800/50">
+                    {/* Rejection Algorithm */}
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1">
+                        Rejection Algorithm
+                      </label>
+                      <select
+                        value={rejectionAlgorithm}
+                        onChange={(e) => setRejectionAlgorithm(e.target.value as RejectionAlgorithm)}
+                        className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                      >
+                        <option value="sigma">Sigma Clipping (general purpose)</option>
+                        <option value="percentile">Percentile (small datasets &lt;20 frames)</option>
+                        <option value="linear_fit">Linear Fit (large sets with gradients)</option>
+                        <option value="gesd">GESD (50+ images)</option>
+                        <option value="mad">MAD (drizzled CFA data)</option>
+                      </select>
+                    </div>
+
+                    {/* Rejection Sigma Values */}
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm text-gray-400 mb-1">
+                          Rejection Low (sigma)
+                        </label>
+                        <input
+                          type="number"
+                          value={rejectionLow}
+                          onChange={(e) => setRejectionLow(parseFloat(e.target.value) || 2.5)}
+                          step="0.1"
+                          min="1"
+                          max="6"
+                          className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm text-gray-400 mb-1">
+                          Rejection High (sigma)
+                        </label>
+                        <input
+                          type="number"
+                          value={rejectionHigh}
+                          onChange={(e) => setRejectionHigh(parseFloat(e.target.value) || 2.5)}
+                          step="0.1"
+                          min="1"
+                          max="6"
+                          className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Image Weighting */}
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1">
+                        Image Weighting
+                      </label>
+                      <select
+                        value={imageWeighting}
+                        onChange={(e) => setImageWeighting(e.target.value as ImageWeightingMethod)}
+                        className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                      >
+                        <option value="wfwhm">Weighted FWHM (recommended)</option>
+                        <option value="stars">Number of Stars</option>
+                        <option value="noise">Noise Level</option>
+                        <option value="exposure_time">Exposure Time</option>
+                        <option value="none">No Weighting</option>
+                      </select>
+                      <p className="text-xs text-gray-500 mt-1">
+                        wFWHM weights by seeing quality and star count
+                      </p>
+                    </div>
+
+                    {/* Reference Frame Mode */}
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1">
+                        Reference Frame Selection
+                      </label>
+                      <select
+                        value={referenceFrameMode}
+                        onChange={(e) => setReferenceFrameMode(e.target.value as ReferenceFrameMode)}
+                        className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                      >
+                        <option value="siril_auto">Siril Auto (-2pass)</option>
+                        <option value="athenaeum_scoring">Athenaeum Quality Scoring (coming soon)</option>
+                      </select>
+                      <p className="text-xs text-gray-500 mt-1">
+                        -2pass automatically selects the best reference frame based on FWHM and star count
+                      </p>
+                    </div>
+
+                    {/* Drizzle */}
+                    <div className="space-y-2">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={drizzleEnabled}
+                          onChange={(e) => setDrizzleEnabled(e.target.checked)}
+                          className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-500 focus:ring-blue-500"
+                        />
+                        <span className="text-gray-200">Enable Drizzle (super-resolution)</span>
+                      </label>
+                      {drizzleEnabled && (
+                        <div className="ml-6">
+                          <select
+                            value={drizzleScale}
+                            onChange={(e) => setDrizzleScale(e.target.value as DrizzleScale)}
+                            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                          >
+                            <option value="x2">2x Scale</option>
+                            <option value="x3">3x Scale</option>
+                          </select>
+                          <p className="text-xs text-gray-500 mt-1">
+                            For OSC cameras: Bayer pattern is preserved during registration
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Exposure Time Grouping */}
+                    <div className="space-y-2">
+                      <label className="block text-sm text-gray-400 mb-1">
+                        Exposure Time Grouping
+                      </label>
+                      <select
+                        value={exptimeToleranceMode}
+                        onChange={(e) => setExptimeToleranceMode(e.target.value as ExptimeToleranceMode)}
+                        className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                      >
+                        <option value="disabled">Disabled (stack all frames together)</option>
+                        <option value="absolute">Absolute tolerance (seconds)</option>
+                        <option value="relative">Relative tolerance (percent)</option>
+                      </select>
+                      <p className="text-xs text-gray-500">
+                        Group frames with similar exposure times into separate stacks
+                      </p>
+                      {exptimeToleranceMode !== 'disabled' && (
+                        <div className="mt-2">
+                          <label className="block text-sm text-gray-400 mb-1">
+                            Tolerance {exptimeToleranceMode === 'absolute' ? '(seconds)' : '(%)'}
+                          </label>
+                          <input
+                            type="number"
+                            value={exptimeToleranceValue}
+                            onChange={(e) => setExptimeToleranceValue(parseFloat(e.target.value) || 30)}
+                            step={exptimeToleranceMode === 'absolute' ? 1 : 5}
+                            min={exptimeToleranceMode === 'absolute' ? 1 : 1}
+                            max={exptimeToleranceMode === 'absolute' ? 300 : 50}
+                            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                          />
+                          <p className="text-xs text-gray-500 mt-1">
+                            {exptimeToleranceMode === 'absolute'
+                              ? 'Frames within ±X seconds will be stacked together (e.g., 30s groups 55s-85s frames)'
+                              : 'Frames within ±X% will be stacked together (e.g., 10% groups 54s-66s for 60s center)'}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

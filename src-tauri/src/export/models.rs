@@ -73,6 +73,83 @@ pub enum ExportTarget {
     PixInsightWBPP,
 }
 
+/// Reference frame selection mode for registration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceFrameMode {
+    /// Use Siril's -2pass auto-selection (recommended)
+    #[default]
+    SirilAuto,
+    /// Pre-select using Athenaeum quality metrics
+    AtheneumScoring,
+    /// User manually specifies reference frame
+    Manual,
+}
+
+/// Pixel rejection algorithm for stacking
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionAlgorithm {
+    /// Percentile clipping - good for small datasets (<20 frames)
+    Percentile,
+    /// Sigma clipping - general purpose (default)
+    #[default]
+    Sigma,
+    /// Linear fit clipping - good for large sets with gradients
+    LinearFit,
+    /// Generalized ESD - best for 50+ images
+    Gesd,
+    /// MAD clipping - good for drizzled CFA data
+    Mad,
+}
+
+/// Image weighting method for stacking
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageWeightingMethod {
+    /// No weighting
+    None,
+    /// Weight by number of stars detected
+    Stars,
+    /// Weight by weighted FWHM (recommended)
+    #[default]
+    Wfwhm,
+    /// Weight by noise level
+    Noise,
+    /// Weight by integration time
+    ExposureTime,
+}
+
+/// Drizzle scale factor for super-resolution
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DrizzleScale {
+    /// No drizzle (1x, disabled)
+    #[default]
+    None,
+    /// 2x super-resolution
+    X2,
+    /// 3x super-resolution
+    X3,
+}
+
+/// Exposure time tolerance mode for stacking grouping
+///
+/// Controls how frames with different exposure times are grouped for stacking.
+/// When enabled, frames are only stacked together if their exposure times are
+/// within the specified tolerance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExptimeToleranceMode {
+    /// Stack all frames with same filter together (ignores exposure time)
+    #[default]
+    Disabled,
+    /// Group frames if within X seconds of each other (e.g., 30 = ±30s)
+    Absolute,
+    /// Group frames if within X percent of each other (e.g., 10 = ±10%)
+    Relative,
+}
+
 /// Configuration for an export operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +173,40 @@ pub struct ExportConfig {
     pub rejection_high: f64,
     /// Use symbolic links instead of copying files
     pub use_symlinks: bool,
+
+    // === Advanced Siril Options ===
+
+    /// Reference frame selection mode for registration
+    #[serde(default)]
+    pub reference_frame_mode: ReferenceFrameMode,
+    /// Manual reference frame ID (only used when reference_frame_mode is Manual)
+    #[serde(default)]
+    pub manual_reference_frame_id: Option<i64>,
+    /// Pixel rejection algorithm for stacking
+    #[serde(default)]
+    pub rejection_algorithm: RejectionAlgorithm,
+    /// Image weighting method for stacking
+    #[serde(default)]
+    pub image_weighting: ImageWeightingMethod,
+    /// Enable drizzle for super-resolution
+    #[serde(default)]
+    pub drizzle_enabled: bool,
+    /// Drizzle scale factor (only used when drizzle_enabled is true)
+    #[serde(default)]
+    pub drizzle_scale: DrizzleScale,
+
+    // === Exposure Time Grouping ===
+
+    /// Exposure time tolerance mode for stacking grouping
+    #[serde(default)]
+    pub exptime_tolerance_mode: ExptimeToleranceMode,
+    /// Exposure time tolerance value (seconds for Absolute, percentage for Relative)
+    #[serde(default = "default_exptime_tolerance")]
+    pub exptime_tolerance_value: f64,
+}
+
+fn default_exptime_tolerance() -> f64 {
+    30.0 // 30 seconds or 30% depending on mode
 }
 
 impl Default for ExportConfig {
@@ -107,9 +218,19 @@ impl Default for ExportConfig {
             mode: ExportMode::OrganizeAndScript,
             workflow: SirilWorkflow::MonoPreprocessing,
             create_masters: true,
-            rejection_low: 3.0,
-            rejection_high: 3.0,
+            rejection_low: 2.5,
+            rejection_high: 2.5,
             use_symlinks: false,
+            // Advanced Siril options with sensible defaults
+            reference_frame_mode: ReferenceFrameMode::default(),
+            manual_reference_frame_id: None,
+            rejection_algorithm: RejectionAlgorithm::default(),
+            image_weighting: ImageWeightingMethod::default(),
+            drizzle_enabled: false,
+            drizzle_scale: DrizzleScale::default(),
+            // Exposure time grouping
+            exptime_tolerance_mode: ExptimeToleranceMode::default(),
+            exptime_tolerance_value: default_exptime_tolerance(),
         }
     }
 }
@@ -628,4 +749,345 @@ pub enum ExportStage {
     Complete,
     /// Export failed
     Failed,
+}
+
+// ============================================================================
+// Global Registration Plan
+// ============================================================================
+
+/// Information about a branch's position in the global merged sequence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchMergeInfo {
+    /// Branch index in the data.branches array
+    pub branch_idx: usize,
+    /// Branch ID
+    pub branch_id: String,
+    /// Filter name
+    pub filter: Option<String>,
+    /// Camera type (Mono or OSC)
+    pub camera_type: CameraType,
+    /// Representative exposure time for this branch (median of frames)
+    pub exptime: Option<f64>,
+    /// Number of frames in this branch
+    pub frame_count: usize,
+    /// Starting frame index in the global sequence (1-based, as Siril uses)
+    pub start_frame: usize,
+    /// Ending frame index in the global sequence (inclusive)
+    pub end_frame: usize,
+}
+
+/// Plan for global registration across all lights
+///
+/// When all calibrated lights are merged into a single sequence and registered
+/// with a global reference frame, this structure tracks which frame numbers
+/// in the merged sequence belong to which filter/camera for later stacking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalRegistrationPlan {
+    /// Ordered list of branches in the merge order
+    /// This determines frame numbering in the merged sequence
+    pub merge_order: Vec<BranchMergeInfo>,
+    /// Total number of frames in the merged sequence
+    pub total_frames: usize,
+    /// Unique filters present
+    pub filters: Vec<Option<String>>,
+    /// Unique camera types present
+    pub camera_types: Vec<CameraType>,
+}
+
+/// Calculate median exposure time from a list of frames
+fn calculate_median_exptime(frames: &[ExportFrame]) -> Option<f64> {
+    let mut exptimes: Vec<f64> = frames
+        .iter()
+        .filter_map(|f| f.exptime)
+        .collect();
+
+    if exptimes.is_empty() {
+        return None;
+    }
+
+    exptimes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = exptimes.len() / 2;
+
+    if exptimes.len() % 2 == 0 && exptimes.len() >= 2 {
+        Some((exptimes[mid - 1] + exptimes[mid]) / 2.0)
+    } else {
+        Some(exptimes[mid])
+    }
+}
+
+/// Format exposure time for display in filenames
+fn format_exptime_display(exptime: f64) -> String {
+    if exptime < 1.0 {
+        format!("{:.0}ms", exptime * 1000.0)
+    } else if (exptime - exptime.round()).abs() < 0.01 {
+        format!("{:.0}s", exptime)
+    } else {
+        format!("{:.1}s", exptime)
+    }
+}
+
+/// A stacking group for frames with similar exposure times
+///
+/// Groups frames by filter AND exposure time to ensure only similar
+/// exposures are stacked together.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExptimeStackGroup {
+    /// Filter name for this group
+    pub filter: Option<String>,
+    /// Representative exposure time for this group
+    pub exptime: Option<f64>,
+    /// Display string for output filename (e.g., "60s", "300s")
+    pub exptime_display: String,
+    /// Frame indices in the registered sequence (1-based)
+    pub frame_indices: Vec<usize>,
+    /// Whether this group has OSC (color) frames
+    pub has_osc: bool,
+}
+
+impl GlobalRegistrationPlan {
+    /// Create a global registration plan from export data
+    pub fn from_export_data(data: &ExportDataV3) -> Self {
+        let mut merge_order = Vec::new();
+        let mut current_frame = 1; // Siril uses 1-based frame indices
+
+        // Only include branches with >= 2 light frames (Siril requirement)
+        for (idx, branch) in data.branches.iter().enumerate() {
+            if branch.light_frames.len() >= 2 {
+                let frame_count = branch.light_frames.len();
+                let camera_type = if branch.is_osc() {
+                    CameraType::Osc
+                } else {
+                    CameraType::Mono
+                };
+
+                // Calculate median exposure time for the branch
+                let exptime = calculate_median_exptime(&branch.light_frames);
+
+                merge_order.push(BranchMergeInfo {
+                    branch_idx: idx,
+                    branch_id: branch.branch_id.clone(),
+                    filter: branch.filter.clone(),
+                    camera_type,
+                    exptime,
+                    frame_count,
+                    start_frame: current_frame,
+                    end_frame: current_frame + frame_count - 1,
+                });
+
+                current_frame += frame_count;
+            }
+        }
+
+        let total_frames = current_frame - 1;
+
+        // Collect unique filters
+        let mut filters: Vec<Option<String>> = merge_order
+            .iter()
+            .map(|b| b.filter.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        filters.sort();
+
+        // Collect unique camera types
+        let mut camera_types: Vec<CameraType> = merge_order
+            .iter()
+            .map(|b| b.camera_type.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        camera_types.sort_by_key(|c| c.display_name().to_string());
+
+        Self {
+            merge_order,
+            total_frames,
+            filters,
+            camera_types,
+        }
+    }
+
+    /// Get branches for a specific filter
+    pub fn branches_for_filter(&self, filter: &Option<String>) -> Vec<&BranchMergeInfo> {
+        self.merge_order
+            .iter()
+            .filter(|b| &b.filter == filter)
+            .collect()
+    }
+
+    /// Get branches for a specific filter and camera type
+    pub fn branches_for_filter_and_camera(
+        &self,
+        filter: &Option<String>,
+        camera_type: &CameraType,
+    ) -> Vec<&BranchMergeInfo> {
+        self.merge_order
+            .iter()
+            .filter(|b| &b.filter == filter && &b.camera_type == camera_type)
+            .collect()
+    }
+
+    /// Get all frame indices for a specific filter (for organizing registered files)
+    pub fn frame_indices_for_filter(&self, filter: &Option<String>) -> Vec<usize> {
+        self.branches_for_filter(filter)
+            .iter()
+            .flat_map(|b| b.start_frame..=b.end_frame)
+            .collect()
+    }
+
+    /// Group branches into stacking groups by filter and exposure time
+    ///
+    /// Returns a list of `ExptimeStackGroup` that can be iterated over for stacking.
+    /// Each group contains frames that share the same filter and have exposure times
+    /// within the specified tolerance.
+    pub fn stacking_groups(
+        &self,
+        mode: &ExptimeToleranceMode,
+        tolerance: f64,
+    ) -> Vec<ExptimeStackGroup> {
+        let mut groups = Vec::new();
+
+        for filter in &self.filters {
+            let branches = self.branches_for_filter(filter);
+
+            match mode {
+                ExptimeToleranceMode::Disabled => {
+                    // All branches with same filter go in one group
+                    let frame_indices = self.frame_indices_for_filter(filter);
+                    let has_osc = branches.iter().any(|b| b.camera_type == CameraType::Osc);
+
+                    groups.push(ExptimeStackGroup {
+                        filter: filter.clone(),
+                        exptime: None,
+                        exptime_display: String::new(),
+                        frame_indices,
+                        has_osc,
+                    });
+                }
+                ExptimeToleranceMode::Absolute | ExptimeToleranceMode::Relative => {
+                    let clustered = self.cluster_by_exptime(&branches, filter, mode, tolerance);
+                    groups.extend(clustered);
+                }
+            }
+        }
+
+        groups
+    }
+
+    /// Cluster branches by exposure time within tolerance
+    fn cluster_by_exptime(
+        &self,
+        branches: &[&BranchMergeInfo],
+        filter: &Option<String>,
+        mode: &ExptimeToleranceMode,
+        tolerance: f64,
+    ) -> Vec<ExptimeStackGroup> {
+        // Collect branches with valid exposure times
+        let mut with_exptime: Vec<(&BranchMergeInfo, f64)> = branches
+            .iter()
+            .filter_map(|b| b.exptime.map(|e| (*b, e)))
+            .collect();
+
+        // Sort by exposure time
+        with_exptime.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        if with_exptime.is_empty() {
+            // No exposure times available, create single group with all frames
+            let frame_indices: Vec<usize> = branches
+                .iter()
+                .flat_map(|b| b.start_frame..=b.end_frame)
+                .collect();
+            let has_osc = branches.iter().any(|b| b.camera_type == CameraType::Osc);
+
+            return vec![ExptimeStackGroup {
+                filter: filter.clone(),
+                exptime: None,
+                exptime_display: String::new(),
+                frame_indices,
+                has_osc,
+            }];
+        }
+
+        // Cluster using tolerance
+        let mut clusters: Vec<Vec<&BranchMergeInfo>> = Vec::new();
+        let mut current_cluster: Vec<&BranchMergeInfo> = Vec::new();
+        let mut cluster_first_exptime: Option<f64> = None;
+
+        for (branch, exptime) in &with_exptime {
+            let should_join = if let Some(first_exp) = cluster_first_exptime {
+                match mode {
+                    ExptimeToleranceMode::Absolute => {
+                        (exptime - first_exp).abs() <= tolerance
+                    }
+                    ExptimeToleranceMode::Relative => {
+                        let max_exp = exptime.max(first_exp);
+                        if max_exp > 0.0 {
+                            (exptime - first_exp).abs() / max_exp * 100.0 <= tolerance
+                        } else {
+                            true
+                        }
+                    }
+                    ExptimeToleranceMode::Disabled => true,
+                }
+            } else {
+                true // First item always joins
+            };
+
+            if should_join {
+                current_cluster.push(branch);
+                if cluster_first_exptime.is_none() {
+                    cluster_first_exptime = Some(*exptime);
+                }
+            } else {
+                // Start new cluster
+                if !current_cluster.is_empty() {
+                    clusters.push(current_cluster);
+                }
+                current_cluster = vec![branch];
+                cluster_first_exptime = Some(*exptime);
+            }
+        }
+
+        // Don't forget last cluster
+        if !current_cluster.is_empty() {
+            clusters.push(current_cluster);
+        }
+
+        // Convert clusters to ExptimeStackGroups
+        clusters
+            .into_iter()
+            .map(|cluster| {
+                let frame_indices: Vec<usize> = cluster
+                    .iter()
+                    .flat_map(|b| b.start_frame..=b.end_frame)
+                    .collect();
+
+                let has_osc = cluster.iter().any(|b| b.camera_type == CameraType::Osc);
+
+                // Calculate representative exposure time (median of cluster)
+                let mut exptimes: Vec<f64> = cluster.iter().filter_map(|b| b.exptime).collect();
+                exptimes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let exptime = if exptimes.is_empty() {
+                    None
+                } else {
+                    let mid = exptimes.len() / 2;
+                    Some(exptimes[mid])
+                };
+
+                let exptime_display = exptime
+                    .map(format_exptime_display)
+                    .unwrap_or_default();
+
+                ExptimeStackGroup {
+                    filter: filter.clone(),
+                    exptime,
+                    exptime_display,
+                    frame_indices,
+                    has_osc,
+                }
+            })
+            .collect()
+    }
 }

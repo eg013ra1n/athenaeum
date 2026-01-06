@@ -165,6 +165,8 @@ pub fn run() {
             commands::diagnose_calibration_links,
             commands::export_frame_set_v3,
             commands::get_export_preview_v3,
+            commands::organize_registered_files_cmd,
+            commands::get_registered_files_status,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

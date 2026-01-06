@@ -812,6 +812,128 @@ pub fn organize_for_wbpp(config: &ExportConfig, data: &ExportDataV3) -> Result<E
     })
 }
 
+// ============================================================================
+// Post-Registration File Organization
+// ============================================================================
+
+use crate::export::models::GlobalRegistrationPlan;
+
+/// Result of organizing registered files
+#[derive(Debug, Clone)]
+pub struct RegisteredFilesResult {
+    pub files_organized: usize,
+    pub filters_created: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Organize globally registered files into filter-specific folders
+///
+/// After script 02 (global registration) runs, this function:
+/// 1. Reads the registered files from `process/r_all_lights_*.fit`
+/// 2. Uses the GlobalRegistrationPlan to map frame numbers to filters
+/// 3. Creates filter-specific folders in `process/registered/{filter}/`
+/// 4. Symlinks (or copies) registered files into appropriate filter folders
+///
+/// The registered files follow Siril's naming convention: r_all_lights_XXXXX.fit
+/// where XXXXX is the 5-digit frame number (1-based).
+pub fn organize_registered_files(
+    output_dir: &Path,
+    plan: &GlobalRegistrationPlan,
+    use_symlinks: bool,
+) -> Result<RegisteredFilesResult> {
+    let process_dir = output_dir.join("process");
+    let registered_base = process_dir.join("registered");
+
+    let mut files_organized = 0;
+    let mut filters_created = Vec::new();
+    let mut warnings = Vec::new();
+
+    // Create the registered base folder
+    fs::create_dir_all(&registered_base)
+        .context("Failed to create registered folder")?;
+
+    // Create filter-specific folders
+    for filter in &plan.filters {
+        let filter_safe = filter
+            .as_ref()
+            .map(|f| sanitize_folder_name(f))
+            .unwrap_or_else(|| "unfiltered".to_string());
+
+        let filter_dir = registered_base.join(&filter_safe);
+        fs::create_dir_all(&filter_dir)?;
+        filters_created.push(filter_safe);
+    }
+
+    // Organize registered files by filter
+    for merge_info in &plan.merge_order {
+        let filter_safe = merge_info.filter
+            .as_ref()
+            .map(|f| sanitize_folder_name(f))
+            .unwrap_or_else(|| "unfiltered".to_string());
+
+        let filter_dir = registered_base.join(&filter_safe);
+
+        // Process each frame in this branch's range
+        for frame_num in merge_info.start_frame..=merge_info.end_frame {
+            // Siril names registered files as r_{sequence}_{frame:05}.fit
+            let registered_filename = format!("r_all_lights_{:05}.fit", frame_num);
+            let source_path = process_dir.join(&registered_filename);
+
+            // Destination uses "registered_" prefix for convert command
+            let dest_filename = format!("registered_{:05}.fit", frame_num);
+            let dest_path = filter_dir.join(&dest_filename);
+
+            if source_path.exists() {
+                let source_str = source_path.to_string_lossy();
+                if let Err(e) = copy_or_link(&source_str, &dest_path, use_symlinks) {
+                    warnings.push(format!(
+                        "Failed to organize {}: {}",
+                        registered_filename, e
+                    ));
+                } else {
+                    files_organized += 1;
+                }
+            } else {
+                warnings.push(format!(
+                    "Expected registered file not found: {}",
+                    registered_filename
+                ));
+            }
+        }
+    }
+
+    // Deduplicate filter list
+    filters_created.sort();
+    filters_created.dedup();
+
+    Ok(RegisteredFilesResult {
+        files_organized,
+        filters_created,
+        warnings,
+    })
+}
+
+/// Check if registered files exist in the process folder
+///
+/// Returns the count of r_all_lights_*.fit files found
+pub fn count_registered_files(output_dir: &Path) -> usize {
+    let process_dir = output_dir.join("process");
+
+    match fs::read_dir(&process_dir) {
+        Ok(entries) => {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name_str = name.to_string_lossy();
+                    name_str.starts_with("r_all_lights_") && name_str.ends_with(".fit")
+                })
+                .count()
+        }
+        Err(_) => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

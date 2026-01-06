@@ -8,8 +8,9 @@
 use crate::export::file_organizer::{ExportFolders, ExportFoldersV3};
 use crate::export::folder_structures::SirilFolders;
 use crate::export::models::{
-    sanitize_folder_name, CalibrationBranch, CameraType, ExportConfig, ExportData, ExportDataV3,
-    ExportGroup, FilterExportGroup, MasterCreationPlan, MasterInfo, SirilWorkflow,
+    sanitize_folder_name, CalibrationBranch, CameraType, DrizzleScale, ExportConfig, ExportData,
+    ExportDataV3, ExportGroup, FilterExportGroup, ImageWeightingMethod, MasterCreationPlan,
+    MasterInfo, RejectionAlgorithm, SirilWorkflow,
 };
 use crate::export::siril::templates::{
     get_template, BIAS_SECTION_EMPTY, BIAS_SECTION_TEMPLATE, CALIBRATE_LIGHTS_DARK_ONLY,
@@ -19,7 +20,112 @@ use crate::export::siril::templates::{
 };
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+// ============================================================================
+// Helper Functions for Siril Command Generation
+// ============================================================================
+
+/// Build a stack command with proper rejection algorithm and weighting
+///
+/// # Arguments
+/// * `config` - Export configuration with rejection settings
+/// * `sequence_name` - Name of the sequence to stack
+/// * `output_path` - Path for the output file
+/// * `is_calibration` - Whether this is a calibration frame (affects normalization)
+/// * `is_osc` - Whether this is OSC camera data (adds -rgb_equal for lights)
+fn build_stack_command(
+    config: &ExportConfig,
+    sequence_name: &str,
+    output_path: &Path,
+    is_calibration: bool,
+    is_osc: bool,
+) -> String {
+    let mut cmd = format!("stack {}", sequence_name);
+
+    // Rejection algorithm (Siril 1.4+ syntax: rej <method> low high)
+    let rej_cmd = match config.rejection_algorithm {
+        RejectionAlgorithm::Percentile => {
+            format!(" rej percentile {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::Sigma => {
+            format!(" rej sigma {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::LinearFit => {
+            format!(" rej linear {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::Gesd => {
+            format!(" rej gesd {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::Mad => {
+            format!(" rej mad {} {}", config.rejection_low, config.rejection_high)
+        }
+    };
+    cmd.push_str(&rej_cmd);
+
+    // Normalization
+    if is_calibration {
+        cmd.push_str(" -nonorm");
+    } else {
+        cmd.push_str(" -norm=addscale -output_norm");
+    }
+
+    // Image weighting (only for lights)
+    if !is_calibration {
+        match config.image_weighting {
+            ImageWeightingMethod::None => {}
+            ImageWeightingMethod::Stars => cmd.push_str(" -weight=stars"),
+            ImageWeightingMethod::Wfwhm => cmd.push_str(" -weight=wfwhm"),
+            ImageWeightingMethod::Noise => cmd.push_str(" -weight=noise"),
+            ImageWeightingMethod::ExposureTime => cmd.push_str(" -weight=exptime"),
+        }
+    }
+
+    // RGB equal for OSC light frames
+    if !is_calibration && is_osc {
+        cmd.push_str(" -rgb_equal");
+    }
+
+    cmd.push_str(&format!(" -out={}", output_path.to_string_lossy()));
+    cmd
+}
+
+/// Build a register command with reference frame selection and optional drizzle
+fn build_register_command(config: &ExportConfig, sequence_name: &str) -> String {
+    let mut cmd = format!("register {}", sequence_name);
+
+    // Reference frame mode
+    match config.reference_frame_mode {
+        crate::export::models::ReferenceFrameMode::SirilAuto => {
+            cmd.push_str(" -2pass");
+        }
+        crate::export::models::ReferenceFrameMode::AtheneumScoring => {
+            // For now, fall back to -2pass until quality scoring is implemented
+            cmd.push_str(" -2pass");
+        }
+        crate::export::models::ReferenceFrameMode::Manual => {
+            // Manual reference frame - would need frame index
+            // For now, use -2pass as fallback
+            cmd.push_str(" -2pass");
+        }
+    }
+
+    // Drizzle
+    if config.drizzle_enabled {
+        cmd.push_str(" -drizzle");
+        match config.drizzle_scale {
+            DrizzleScale::None => {}
+            DrizzleScale::X2 => cmd.push_str(" -scale=2.0"),
+            DrizzleScale::X3 => cmd.push_str(" -scale=3.0"),
+        }
+    }
+
+    cmd
+}
+
+// ============================================================================
+// Main Script Generation Functions
+// ============================================================================
 
 /// Generate Siril scripts for the export
 pub fn generate_scripts(config: &ExportConfig, data: &ExportData) -> Result<Vec<PathBuf>> {
@@ -735,7 +841,7 @@ register pp_lights
             r#"# ========================================
 # Stack Light Frames
 # ========================================
-stack r_pp_lights {} -out={}/{}
+stack r_pp_lights_ {} -out={}/{}
 
 close
 "#,
@@ -851,9 +957,10 @@ pub fn generate_scripts_v3(config: &ExportConfig, data: &ExportDataV3) -> Result
     let calibrate_script = generate_calibrate_lights_script_v4(config, &folders, data)?;
     scripts.push(calibrate_script);
 
-    // Script 3: Register all and stack per filter
-    let register_script = generate_register_and_stack_script_v4(config, &folders, data)?;
-    scripts.push(register_script);
+    // Script 3: Register ALL lights globally and stack per filter
+    // Uses -filter-incl to preserve registration metadata (FWHM, star data) for weighting
+    let register_and_stack_script = generate_register_and_stack_script_v4(config, &folders, data)?;
+    scripts.push(register_and_stack_script);
 
     println!("  Generated {} scripts", scripts.len());
     Ok(scripts)
@@ -1252,10 +1359,11 @@ requires 1.2.0
         }
 
         // Build list of registered sequence paths for this filter
+        // Note: Siril -2pass creates output with trailing underscore (r_pp_lights_)
         let mut filter_sequences: Vec<String> = Vec::new();
         for branch in &filter_branches {
             let lights_path = folders.lights_path(branch);
-            let seq_path = format!("\"{}/r_pp_lights\"", lights_path.to_string_lossy());
+            let seq_path = format!("\"{}/r_pp_lights_\"", lights_path.to_string_lossy());
             filter_sequences.push(seq_path);
         }
 
@@ -1446,7 +1554,7 @@ requires 1.2.0
 
 /// Generate 01_calibrate_lights.ssf using flat SirilFolders structure
 fn generate_calibrate_lights_script_v4(
-    _config: &ExportConfig,
+    config: &ExportConfig,
     folders: &SirilFolders,
     data: &ExportDataV3,
 ) -> Result<PathBuf> {
@@ -1498,11 +1606,16 @@ requires 1.2.0
 
         // Build calibrate command
         let mut cal_args = Vec::new();
+        let is_osc = branch.is_osc();
 
         if branch.dark_id > 0 {
             let dark_master = folders.masters.join(format!("master_dark_{}", branch.dark_id));
             cal_args.push(format!("-dark={}", dark_master.to_string_lossy()));
             cal_args.push("-cc=dark".to_string());
+            // Add -cfa for OSC to ensure cosmetic correction respects Bayer pattern
+            if is_osc {
+                cal_args.push("-cfa".to_string());
+            }
         }
 
         if branch.flat_id > 0 {
@@ -1514,8 +1627,9 @@ requires 1.2.0
             script.push_str(&format!("calibrate lights {}\n", cal_args.join(" ")));
         }
 
-        // OSC debayer
-        if branch.is_osc() {
+        // OSC debayer - ONLY if drizzle is NOT enabled
+        // With drizzle, we preserve the CFA pattern and debayer happens after drizzle stacking
+        if is_osc && !config.drizzle_enabled {
             script.push_str("preprocess pp_lights -debayer\n");
         }
 
@@ -1532,143 +1646,205 @@ requires 1.2.0
     Ok(script_path)
 }
 
-/// Generate 02_register_and_stack.ssf using flat SirilFolders structure
+/// Generate 02_register_and_stack.ssf - Global registration and per-filter stacking
+///
+/// This script:
+/// 1. Merges ALL calibrated lights from ALL branches into one global sequence
+/// 2. Registers the global sequence with -2pass to find the single best reference frame
+/// 3. Applies registration to create aligned files
+/// 4. Stacks per filter using -filter-incl with frame indices
 fn generate_register_and_stack_script_v4(
     config: &ExportConfig,
     folders: &SirilFolders,
     data: &ExportDataV3,
 ) -> Result<PathBuf> {
+    use crate::export::models::GlobalRegistrationPlan;
+
+    let plan = GlobalRegistrationPlan::from_export_data(data);
     let mut script = String::new();
-
-    // Get unique filters (only from branches with >= 2 lights)
-    let valid_branches: Vec<(usize, &CalibrationBranch)> = data
-        .branches
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.light_frames.len() >= 2)
-        .collect();
-
-    let unique_filters: Vec<Option<String>> = {
-        let mut filters: Vec<Option<String>> = valid_branches
-            .iter()
-            .map(|(_, b)| b.filter.clone())
-            .collect();
-        filters.sort();
-        filters.dedup();
-        filters
-    };
 
     script.push_str(&format!(
         r#"############################################
-# Siril Registration and Stacking Script (V4 - Flat Structure)
+# Siril Global Registration and Stacking Script
 # Generated by Athenaeum
-# Valid branches: {} (of {} total)
+#
+# This script:
+# 1. Merges ALL calibrated lights into one global sequence
+# 2. Registers with a SINGLE global reference frame
+# 3. Applies registration to create aligned files
+# 4. Stacks per filter using -filter-incl
+#
+# Total branches: {} (valid: {})
+# Total frames: {}
 # Filters: {}
 ############################################
 
 requires 1.2.0
 
+cd {}
+
 "#,
-        valid_branches.len(),
         data.branches.len(),
-        unique_filters.len()
+        plan.merge_order.len(),
+        plan.total_frames,
+        plan.filters.len(),
+        folders.process.to_string_lossy()
     ));
 
-    // Step 1: Register each branch's calibrated lights in place
-    script.push_str("# ========== Step 1: Register Each Branch ==========\n\n");
+    // Step 1: Merge ALL calibrated lights into one global sequence
+    script.push_str("# ========== Step 1: Merge ALL Calibrated Lights ==========\n");
+    script.push_str("# Merging calibrated sequences from all branches:\n");
 
-    for (idx, branch) in data.branches.iter().enumerate() {
+    // Build list of all calibrated sequence paths in merge order
+    let mut all_sequences: Vec<String> = Vec::new();
+    for merge_info in &plan.merge_order {
+        // Get the branch
+        let branch = &data.branches[merge_info.branch_idx];
+        let lights_path = folders.lights_path(branch, merge_info.branch_idx);
+        // Use pp_lights_ (calibrated, not registered)
+        let seq_path = format!("\"{}/pp_lights_\"", lights_path.to_string_lossy());
+        all_sequences.push(seq_path);
+
         script.push_str(&format!(
-            "# Branch {} of {}: {}\n",
-            idx + 1,
-            data.branches.len(),
-            branch.branch_id
+            "#   {} ({} frames, filter: {}, frames {}-{})\n",
+            merge_info.branch_id,
+            merge_info.frame_count,
+            merge_info.filter.as_deref().unwrap_or("None"),
+            merge_info.start_frame,
+            merge_info.end_frame
         ));
-
-        if branch.light_frames.len() < 2 {
-            script.push_str(&format!(
-                "# SKIPPED: only {} light frame(s)\n\n",
-                branch.light_frames.len()
-            ));
-            continue;
-        }
-
-        let lights_path = folders.lights_path(branch, idx);
-        script.push_str(&format!("cd {}\n", lights_path.to_string_lossy()));
-        script.push_str("register pp_lights\n\n");
     }
 
-    // Step 2: Stack per filter
-    script.push_str("# ========== Step 2: Merge and Stack Per Filter ==========\n");
-    script.push_str(&format!("cd {}\n\n", folders.process.to_string_lossy()));
+    script.push_str(&format!(
+        "\nmerge {} all_lights\n\n",
+        all_sequences.join(" ")
+    ));
 
-    for filter in &unique_filters {
-        let filter_name = filter.as_deref().unwrap_or("Unfiltered");
-        let filter_safe = filter
+    // Step 2: Register the global sequence
+    script.push_str("# ========== Step 2: Global Registration ==========\n");
+    script.push_str("# Finding the single best reference frame across ALL lights\n");
+
+    let register_cmd = build_register_command(config, "all_lights");
+    script.push_str(&format!("{}\n\n", register_cmd));
+
+    // Step 3: Apply registration to create aligned files
+    script.push_str("# ========== Step 3: Apply Registration ==========\n");
+    script.push_str("# Creating aligned files from registration transforms\n");
+    script.push_str("seqapplyreg all_lights -framing=min\n\n");
+
+    // Step 4: Stack per filter using -filter-incl
+    script.push_str("# ========== Step 4: Stack Per Exposure Time Group ==========\n");
+    script.push_str("# Using -filter-incl to select specific frame indices per group\n");
+    script.push_str("# This preserves registration metadata (FWHM, star data) for weighting\n");
+    script.push_str(&format!(
+        "# Exposure time grouping: {:?} (tolerance: {})\n\n",
+        config.exptime_tolerance_mode, config.exptime_tolerance_value
+    ));
+
+    // Get stacking groups (grouped by filter AND exposure time)
+    let stacking_groups = plan.stacking_groups(
+        &config.exptime_tolerance_mode,
+        config.exptime_tolerance_value,
+    );
+
+    for group in &stacking_groups {
+        let filter_name = group.filter.as_deref().unwrap_or("Unfiltered");
+        let filter_safe = group.filter
             .as_ref()
             .map(|f| sanitize_folder_name(f))
             .unwrap_or_else(|| "unfiltered".to_string());
 
-        script.push_str(&format!("# --- {} ---\n", filter_name));
-
-        // Get branches for this filter (with at least 2 lights)
-        let filter_branches: Vec<(usize, &CalibrationBranch)> = valid_branches
-            .iter()
-            .filter(|(_, b)| b.filter.as_deref() == filter.as_deref())
-            .copied()
-            .collect();
-
-        if filter_branches.is_empty() {
-            script.push_str("# No valid branches for this filter\n\n");
+        if group.frame_indices.len() < 2 {
+            let display_label = if group.exptime_display.is_empty() {
+                filter_name.to_string()
+            } else {
+                format!("{} ({})", filter_name, group.exptime_display)
+            };
+            script.push_str(&format!(
+                "# --- {} ({} frame) - SKIPPED (need >= 2 frames) ---\n\n",
+                display_label, group.frame_indices.len()
+            ));
             continue;
         }
 
-        // Build list of registered sequence paths for this filter
-        let mut filter_sequences: Vec<String> = Vec::new();
-        for (idx, branch) in &filter_branches {
-            let lights_path = folders.lights_path(branch, *idx);
-            let seq_path = format!("\"{}/r_pp_lights\"", lights_path.to_string_lossy());
-            filter_sequences.push(seq_path);
-        }
-
-        // Merge filter-specific registered sequences
-        let combined_name = format!("combined_{}", filter_safe);
-        script.push_str(&format!(
-            "merge {} {}\n",
-            filter_sequences.join(" "),
-            combined_name
-        ));
-
-        // Stack options
-        let has_osc = filter_branches.iter().any(|(_, b)| b.is_osc());
-        let stack_options = if has_osc {
-            format!(
-                "rej {} {} -norm=addscale -output_norm -rgb_equal",
-                config.rejection_low, config.rejection_high
-            )
+        // Build display label with optional exposure time
+        let display_label = if group.exptime_display.is_empty() {
+            format!("{} ({} frames)", filter_name, group.frame_indices.len())
         } else {
-            format!(
-                "rej {} {} -norm=addscale -output_norm",
-                config.rejection_low, config.rejection_high
-            )
+            format!("{} {} ({} frames)", filter_name, group.exptime_display, group.frame_indices.len())
         };
 
-        // Output path
-        let output_name = format!("{}_stacked", filter_safe);
+        script.push_str(&format!("# --- {} ---\n", display_label));
+
+        // Build the -filter-incl parameter (comma-separated list of frame indices)
+        let filter_incl = group.frame_indices
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Output filename includes exposure time if grouping is enabled
+        let output_name = if group.exptime_display.is_empty() {
+            format!("{}_stacked", filter_safe)
+        } else {
+            format!("{}_{}_stacked", filter_safe, group.exptime_display)
+        };
         let output_path = folders.masters.join(&output_name);
-        script.push_str(&format!(
-            "stack {} {} -out={}\n\n",
-            combined_name,
-            stack_options,
-            output_path.to_string_lossy()
-        ));
+
+        // Build stack command with -filter-incl
+        let mut stack_cmd = format!("stack r_all_lights_");
+
+        // Rejection algorithm
+        let rej_cmd = match config.rejection_algorithm {
+            RejectionAlgorithm::Percentile => {
+                format!(" rej percentile {} {}", config.rejection_low, config.rejection_high)
+            }
+            RejectionAlgorithm::Sigma => {
+                format!(" rej sigma {} {}", config.rejection_low, config.rejection_high)
+            }
+            RejectionAlgorithm::LinearFit => {
+                format!(" rej linear {} {}", config.rejection_low, config.rejection_high)
+            }
+            RejectionAlgorithm::Gesd => {
+                format!(" rej gesd {} {}", config.rejection_low, config.rejection_high)
+            }
+            RejectionAlgorithm::Mad => {
+                format!(" rej mad {} {}", config.rejection_low, config.rejection_high)
+            }
+        };
+        stack_cmd.push_str(&rej_cmd);
+
+        // Filter include
+        stack_cmd.push_str(&format!(" -filter-incl={}", filter_incl));
+
+        // Normalization
+        stack_cmd.push_str(" -norm=addscale -output_norm");
+
+        // Image weighting
+        match config.image_weighting {
+            ImageWeightingMethod::None => {}
+            ImageWeightingMethod::Wfwhm => stack_cmd.push_str(" -weight=wfwhm"),
+            ImageWeightingMethod::Stars => stack_cmd.push_str(" -weight=nbstars"),
+            ImageWeightingMethod::Noise => stack_cmd.push_str(" -weight=noise"),
+            ImageWeightingMethod::ExposureTime => stack_cmd.push_str(" -weight=itime"),
+        }
+
+        // RGB compositing for OSC
+        if group.has_osc {
+            stack_cmd.push_str(" -rgb_equal");
+        }
+
+        // Output path
+        stack_cmd.push_str(&format!(" -out={}", output_path.to_string_lossy()));
+
+        script.push_str(&format!("{}\n\n", stack_cmd));
     }
 
     script.push_str("close\n");
 
     let script_path = folders.root.join("02_register_and_stack.ssf");
     fs::write(&script_path, &script)
-        .with_context(|| format!("Failed to write register script to {:?}", script_path))?;
+        .with_context(|| format!("Failed to write registration/stacking script to {:?}", script_path))?;
 
     println!("  Created: {:?}", script_path);
     Ok(script_path)

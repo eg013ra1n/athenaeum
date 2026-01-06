@@ -9,6 +9,11 @@ import type {
   SirilWorkflow,
   CalibrationRoute,
   ExportGroupsSummary,
+  ReferenceFrameMode,
+  RejectionAlgorithm,
+  ImageWeightingMethod,
+  DrizzleScale,
+  ExptimeToleranceMode,
 } from '../types/export';
 
 interface UseExportDataResult {
@@ -300,6 +305,15 @@ interface ExportV2Config {
   rejectionLow?: number;
   rejectionHigh?: number;
   useSymlinks?: boolean;
+  // Advanced Siril options
+  referenceFrameMode?: ReferenceFrameMode;
+  rejectionAlgorithm?: RejectionAlgorithm;
+  imageWeighting?: ImageWeightingMethod;
+  drizzleEnabled?: boolean;
+  drizzleScale?: DrizzleScale;
+  // Exposure time grouping
+  exptimeToleranceMode?: ExptimeToleranceMode;
+  exptimeToleranceValue?: number;
 }
 
 /**
@@ -323,9 +337,18 @@ export function useExportV2(): UseExportV2Result {
         mode: config.mode,
         target: config.target ?? 'siril',
         createMasters: config.createMasters ?? true,
-        rejectionLow: config.rejectionLow ?? 3.0,
-        rejectionHigh: config.rejectionHigh ?? 3.0,
+        rejectionLow: config.rejectionLow ?? 2.5,
+        rejectionHigh: config.rejectionHigh ?? 2.5,
         useSymlinks: config.useSymlinks ?? false,
+        // Advanced Siril options
+        referenceFrameMode: config.referenceFrameMode ?? 'siril_auto',
+        rejectionAlgorithm: config.rejectionAlgorithm ?? 'sigma',
+        imageWeighting: config.imageWeighting ?? 'wfwhm',
+        drizzleEnabled: config.drizzleEnabled ?? false,
+        drizzleScale: config.drizzleScale ?? 'x2',
+        // Exposure time grouping
+        exptimeToleranceMode: config.exptimeToleranceMode ?? 'disabled',
+        exptimeToleranceValue: config.exptimeToleranceValue ?? 30.0,
       });
 
       setResult(exportResult);

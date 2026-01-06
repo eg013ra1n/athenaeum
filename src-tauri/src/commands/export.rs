@@ -6,11 +6,14 @@
 
 use crate::commands::AppState;
 use crate::export::{
-    collect_export_data, collect_export_data_v3, organize_files, organize_files_v3, organize_files_v4,
+    collect_export_data, collect_export_data_v3, organize_files, organize_files_v4,
+    organize_registered_files, count_registered_files,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
-        ExportConfig, ExportData, ExportDataV3, ExportMode, ExportProgress, ExportResult, ExportStage,
-        ExportTarget, SirilScriptPreview, SirilWorkflow,
+        DrizzleScale, ExportConfig, ExportData, ExportDataV3, ExportMode, ExportProgress,
+        ExportResult, ExportStage, ExportTarget, ExptimeToleranceMode, GlobalRegistrationPlan,
+        ImageWeightingMethod, ReferenceFrameMode, RejectionAlgorithm, SirilScriptPreview,
+        SirilWorkflow,
     },
     siril::{find_siril_cli, generate_scripts, generate_scripts_v2, generate_scripts_v3, run_siril_script},
 };
@@ -79,6 +82,7 @@ pub async fn export_frame_set(
         rejection_low,
         rejection_high,
         use_symlinks,
+        ..Default::default()
     };
 
     // Emit collecting progress
@@ -515,6 +519,7 @@ pub async fn export_frame_set_v2(
         rejection_low,
         rejection_high,
         use_symlinks,
+        ..Default::default()
     };
 
     // Emit collecting progress
@@ -1072,6 +1077,15 @@ pub async fn export_frame_set_v3(
     rejection_low: f64,
     rejection_high: f64,
     use_symlinks: bool,
+    // Advanced Siril options
+    reference_frame_mode: Option<String>,
+    rejection_algorithm: Option<String>,
+    image_weighting: Option<String>,
+    drizzle_enabled: Option<bool>,
+    drizzle_scale: Option<String>,
+    // Exposure time grouping
+    exptime_tolerance_mode: Option<String>,
+    exptime_tolerance_value: Option<f64>,
 ) -> Result<ExportResult, String> {
     // Parse mode
     let export_mode = match mode.as_str() {
@@ -1088,6 +1102,43 @@ pub async fn export_frame_set_v3(
         _ => ExportTarget::Siril,
     };
 
+    // Parse advanced Siril options
+    let ref_mode = match reference_frame_mode.as_deref() {
+        Some("athenaeum_scoring") => ReferenceFrameMode::AtheneumScoring,
+        Some("manual") => ReferenceFrameMode::Manual,
+        _ => ReferenceFrameMode::SirilAuto,
+    };
+
+    let rej_algo = match rejection_algorithm.as_deref() {
+        Some("percentile") => RejectionAlgorithm::Percentile,
+        Some("linear_fit") => RejectionAlgorithm::LinearFit,
+        Some("gesd") => RejectionAlgorithm::Gesd,
+        Some("mad") => RejectionAlgorithm::Mad,
+        _ => RejectionAlgorithm::Sigma,
+    };
+
+    let weighting = match image_weighting.as_deref() {
+        Some("none") => ImageWeightingMethod::None,
+        Some("stars") => ImageWeightingMethod::Stars,
+        Some("noise") => ImageWeightingMethod::Noise,
+        Some("exposure_time") => ImageWeightingMethod::ExposureTime,
+        _ => ImageWeightingMethod::Wfwhm,
+    };
+
+    let drizzle_scl = match drizzle_scale.as_deref() {
+        Some("x3") => DrizzleScale::X3,
+        Some("x2") => DrizzleScale::X2,
+        _ => DrizzleScale::None,
+    };
+
+    // Parse exposure time tolerance settings
+    let exptime_mode = match exptime_tolerance_mode.as_deref() {
+        Some("absolute") => ExptimeToleranceMode::Absolute,
+        Some("relative") => ExptimeToleranceMode::Relative,
+        _ => ExptimeToleranceMode::Disabled,
+    };
+    let exptime_value = exptime_tolerance_value.unwrap_or(30.0);
+
     // Build config
     let config = ExportConfig {
         frame_set_id,
@@ -1099,6 +1150,16 @@ pub async fn export_frame_set_v3(
         rejection_low,
         rejection_high,
         use_symlinks,
+        // Advanced Siril options
+        reference_frame_mode: ref_mode,
+        manual_reference_frame_id: None,
+        rejection_algorithm: rej_algo,
+        image_weighting: weighting,
+        drizzle_enabled: drizzle_enabled.unwrap_or(false),
+        drizzle_scale: drizzle_scl,
+        // Exposure time grouping
+        exptime_tolerance_mode: exptime_mode,
+        exptime_tolerance_value: exptime_value,
     };
 
     // Emit collecting progress
@@ -1279,7 +1340,8 @@ pub async fn export_frame_set_v3(
             .or_else(find_siril_cli)
             .ok_or("Siril CLI not found. Please configure the path in settings.")?;
 
-        // Run scripts in order (masters → calibration → registration/stacking)
+        // Run scripts in order (masters → calibration → registration+stacking)
+        // Script 02 now does both registration AND per-filter stacking using -filter-incl
         for script_path in &result.scripts_generated {
             let _ = app_handle.emit(
                 "export-progress",
@@ -1332,4 +1394,158 @@ pub async fn get_export_preview_v3(
     let conn = db.conn();
 
     collect_export_data_v3(&conn, frame_set_id).map_err(|e| e.to_string())
+}
+
+// ============================================================================
+// Post-Registration File Organization Commands
+// ============================================================================
+
+/// Result of organizing registered files
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeRegisteredResult {
+    pub success: bool,
+    pub files_organized: usize,
+    pub filters_created: Vec<String>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Organize globally registered files into filter-specific folders
+///
+/// This command is called AFTER script 02 (global registration) completes.
+/// It organizes the registered files (r_all_lights_*.fit) into filter-specific
+/// folders so that script 03 can stack them by filter.
+///
+/// # Arguments
+/// * `frame_set_id` - ID of the frame set being exported
+/// * `output_dir` - Root output directory of the export
+/// * `use_symlinks` - Whether to use symlinks instead of copying files
+#[tauri::command]
+pub async fn organize_registered_files_cmd(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+    output_dir: String,
+    use_symlinks: bool,
+) -> Result<OrganizeRegisteredResult, String> {
+    // First, check if registered files exist
+    let output_path = PathBuf::from(&output_dir);
+    let registered_count = count_registered_files(&output_path);
+
+    if registered_count == 0 {
+        return Ok(OrganizeRegisteredResult {
+            success: false,
+            files_organized: 0,
+            filters_created: Vec::new(),
+            warnings: Vec::new(),
+            error: Some("No registered files found. Run script 02_register_globally.ssf first.".to_string()),
+        });
+    }
+
+    // Collect export data to get the GlobalRegistrationPlan
+    let export_data = {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        collect_export_data_v3(&conn, frame_set_id).map_err(|e| e.to_string())?
+    };
+
+    // Create the registration plan
+    let plan = GlobalRegistrationPlan::from_export_data(&export_data);
+
+    // Verify frame counts match
+    if plan.total_frames != registered_count {
+        println!(
+            "Warning: Expected {} registered files, found {}",
+            plan.total_frames, registered_count
+        );
+    }
+
+    // Organize the registered files
+    match organize_registered_files(&output_path, &plan, use_symlinks) {
+        Ok(result) => Ok(OrganizeRegisteredResult {
+            success: true,
+            files_organized: result.files_organized,
+            filters_created: result.filters_created,
+            warnings: result.warnings,
+            error: None,
+        }),
+        Err(e) => Ok(OrganizeRegisteredResult {
+            success: false,
+            files_organized: 0,
+            filters_created: Vec::new(),
+            warnings: Vec::new(),
+            error: Some(format!("Failed to organize registered files: {}", e)),
+        }),
+    }
+}
+
+/// Check the status of registered files after global registration
+///
+/// Returns information about registered files in the process folder.
+#[tauri::command]
+pub async fn get_registered_files_status(
+    output_dir: String,
+) -> Result<RegisteredFilesStatus, String> {
+    let output_path = PathBuf::from(&output_dir);
+    let process_dir = output_path.join("process");
+
+    let total_registered = count_registered_files(&output_path);
+
+    // Check if files have been organized
+    let registered_dir = process_dir.join("registered");
+    let organized = registered_dir.exists();
+
+    let mut organized_by_filter: Vec<FilterOrganizedInfo> = Vec::new();
+    if organized {
+        if let Ok(entries) = std::fs::read_dir(&registered_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    let filter_name = entry.file_name().to_string_lossy().to_string();
+                    let filter_dir = entry.path();
+
+                    let file_count = std::fs::read_dir(&filter_dir)
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok())
+                                .filter(|e| {
+                                    e.path().extension()
+                                        .map(|ext| ext == "fit")
+                                        .unwrap_or(false)
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+
+                    organized_by_filter.push(FilterOrganizedInfo {
+                        filter_name,
+                        file_count,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(RegisteredFilesStatus {
+        total_registered,
+        organized,
+        organized_by_filter,
+    })
+}
+
+/// Status of registered files
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredFilesStatus {
+    pub total_registered: usize,
+    pub organized: bool,
+    pub organized_by_filter: Vec<FilterOrganizedInfo>,
+}
+
+/// Info about files organized for a specific filter
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterOrganizedInfo {
+    pub filter_name: String,
+    pub file_count: usize,
 }
