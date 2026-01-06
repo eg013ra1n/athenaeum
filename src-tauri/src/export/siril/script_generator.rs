@@ -1535,20 +1535,28 @@ requires 1.2.0
                 }
             }
             "Flat" => {
+                // Flat calibration priority:
+                // 1. DarkFlat (same exposure as flat) - best
+                // 2. Dark with matching exposure (±30%) - good
+                // 3. Bias - fallback (minimal subtraction, better than wrong-exposure dark)
+                // 4. No calibration - if nothing available
                 let mut cal_args = String::new();
 
                 if let Some(darkflat_id) = master.apply_darkflat {
+                    // Best: Use DarkFlat (same exposure as flat)
                     let darkflat_master = folders.masters.join(format!("master_darkflat_{}", darkflat_id));
                     cal_args.push_str(&format!(" -dark={}", darkflat_master.to_string_lossy()));
                 } else if let Some(dark_id) = master.apply_dark {
+                    // Good: Use Dark with matching exposure (apply_dark is only set if exposure matches)
                     let dark_master = folders.masters.join(format!("master_dark_{}", dark_id));
                     cal_args.push_str(&format!(" -dark={}", dark_master.to_string_lossy()));
-                }
-
-                if let Some(bias_id) = master.apply_bias {
+                } else if let Some(bias_id) = master.apply_bias {
+                    // Fallback: Use Bias (minimal subtraction - better than over-subtracting with wrong-exposure dark)
+                    // This prevents the bright edges issue caused by using long-exposure darks for short-exposure flats
                     let bias_master = folders.masters.join(format!("master_bias_{}", bias_id));
-                    cal_args.push_str(&format!(" -bias={}", bias_master.to_string_lossy()));
+                    cal_args.push_str(&format!(" -dark={}", bias_master.to_string_lossy()));
                 }
+                // If nothing available, skip calibration entirely
 
                 if !cal_args.is_empty() {
                     script.push_str(&format!("calibrate flat{}\n", cal_args));

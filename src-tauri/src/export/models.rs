@@ -412,9 +412,13 @@ pub struct MasterInfo {
     /// Calibration master to apply: Bias set ID
     pub apply_bias: Option<i64>,
     /// Calibration master to apply: Dark set ID (for lights and darks that need dark calibration)
+    /// For flats, this is only set if the dark exposure time matches the flat exposure (±30%)
     pub apply_dark: Option<i64>,
     /// Calibration master to apply: DarkFlat set ID (for flats - short exposure dark matching flat exposure)
     pub apply_darkflat: Option<i64>,
+    /// Source frame exposure time (for exposure-time matching in flat calibration)
+    #[serde(default)]
+    pub source_exptime: Option<f64>,
 }
 
 // ============================================================================

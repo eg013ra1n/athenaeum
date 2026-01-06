@@ -918,12 +918,25 @@ fn build_master_creation_plan(
             // Get frames for this set
             let frames = get_calibration_set_frames(conn, set_id)?;
 
+            // Calculate source exposure time (average of source frames)
+            let source_exptime = if !frames.is_empty() {
+                let sum: f64 = frames.iter().filter_map(|f| f.exptime).sum();
+                let count = frames.iter().filter(|f| f.exptime.is_some()).count();
+                if count > 0 {
+                    Some(sum / count as f64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Determine dependencies
             let deps = dependencies.get(&set_id).cloned().unwrap_or_default();
 
-            // Determine which calibrations to apply
+            // Determine which calibrations to apply (with exposure matching for flats)
             let (apply_bias, apply_dark, apply_darkflat) =
-                get_calibration_applications(conn, set_id)?;
+                get_calibration_applications(conn, set_id, imagetyp, source_exptime)?;
 
             // Generate output filename
             let output_name = format!("master_{}_{}.fit", imagetyp.to_lowercase(), set_id);
@@ -938,6 +951,7 @@ fn build_master_creation_plan(
                 apply_bias,
                 apply_dark,
                 apply_darkflat,
+                source_exptime,
             });
         }
     }
@@ -1025,14 +1039,52 @@ fn topological_sort(
     result
 }
 
+/// Exposure time tolerance for flat→dark calibration matching (30% = 0.30)
+const FLAT_DARK_EXPOSURE_TOLERANCE: f64 = 0.30;
+
+/// Check if two exposure times are within tolerance
+/// Returns true if they are similar enough for calibration purposes
+fn is_exposure_match(source_exptime: f64, cal_exptime: f64, tolerance_pct: f64) -> bool {
+    if source_exptime <= 0.0 || cal_exptime <= 0.0 {
+        return false;
+    }
+    let max_exp = source_exptime.max(cal_exptime);
+    let diff_ratio = (source_exptime - cal_exptime).abs() / max_exp;
+    diff_ratio <= tolerance_pct
+}
+
+/// Get the average exposure time for a calibration set
+fn get_calibration_set_exptime(conn: &Connection, set_id: i64) -> Result<Option<f64>> {
+    let result: Option<f64> = conn
+        .query_row(
+            "SELECT AVG(f.exptime)
+             FROM frames f
+             JOIN calibration_set_frames csf ON f.id = csf.frame_id
+             WHERE csf.set_id = ?1 AND f.exptime IS NOT NULL",
+            [set_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(result)
+}
+
 /// Get which calibrations should be applied when creating a master
 /// Returns (apply_bias, apply_dark, apply_darkflat) set IDs
 /// Note: Dark and DarkFlat are tracked separately because:
 /// - Dark is used for light frame calibration (long exposure matching lights)
 /// - DarkFlat is used for flat frame calibration (short exposure matching flats)
+///
+/// For Flat calibration:
+/// - Priority 1: DarkFlat (same exposure as flat)
+/// - Priority 2: Dark with matching exposure time (±30%)
+/// - Priority 3: Bias (if no matching dark)
+/// - Otherwise: skip dark calibration
 fn get_calibration_applications(
     conn: &Connection,
     set_id: i64,
+    imagetyp: &str,
+    source_exptime: Option<f64>,
 ) -> Result<(Option<i64>, Option<i64>, Option<i64>)> {
     let mut apply_bias = None;
     let mut apply_dark = None;
@@ -1052,7 +1104,26 @@ fn get_calibration_applications(
     for (cal_id, cal_type) in links {
         match cal_type.as_str() {
             "Bias" => apply_bias = Some(cal_id),
-            "Dark" => apply_dark = Some(cal_id),
+            "Dark" => {
+                // For Flat calibration, only use dark if exposure time matches
+                if imagetyp == "Flat" {
+                    if let Some(flat_exptime) = source_exptime {
+                        if let Ok(Some(dark_exptime)) = get_calibration_set_exptime(conn, cal_id) {
+                            if is_exposure_match(flat_exptime, dark_exptime, FLAT_DARK_EXPOSURE_TOLERANCE) {
+                                apply_dark = Some(cal_id);
+                                println!("    ✓ Flat→Dark exposure match: flat={:.1}s, dark={:.1}s",
+                                        flat_exptime, dark_exptime);
+                            } else {
+                                println!("    ✗ Flat→Dark exposure MISMATCH: flat={:.1}s, dark={:.1}s (skipping, will use bias)",
+                                        flat_exptime, dark_exptime);
+                            }
+                        }
+                    }
+                } else {
+                    // For non-Flat calibration (e.g., Dark→Bias), use dark as-is
+                    apply_dark = Some(cal_id);
+                }
+            }
             "DarkFlat" => apply_darkflat = Some(cal_id),
             _ => {}
         }
@@ -1376,8 +1447,23 @@ fn build_master_plan_from_branches(
         if let Some(imagetyp) = all_sets.get(&set_id) {
             let frames = get_calibration_set_frames(conn, set_id)?;
             let deps = dependencies.get(&set_id).cloned().unwrap_or_default();
+
+            // Calculate source exposure time (average of source frames)
+            let source_exptime = if !frames.is_empty() {
+                let sum: f64 = frames.iter().filter_map(|f| f.exptime).sum();
+                let count = frames.iter().filter(|f| f.exptime.is_some()).count();
+                if count > 0 {
+                    Some(sum / count as f64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Determine which calibrations to apply (with exposure matching for flats)
             let (apply_bias, apply_dark, apply_darkflat) =
-                get_calibration_applications(conn, set_id)?;
+                get_calibration_applications(conn, set_id, imagetyp, source_exptime)?;
 
             let output_name = format!("master_{}_{}.fit", imagetyp.to_lowercase(), set_id);
             master_paths.insert(set_id, output_name.clone());
@@ -1391,6 +1477,7 @@ fn build_master_plan_from_branches(
                 apply_bias,
                 apply_dark,
                 apply_darkflat,
+                source_exptime,
             });
         }
     }
