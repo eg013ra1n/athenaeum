@@ -936,6 +936,35 @@ fn quote_path(path: &std::path::Path) -> String {
     }
 }
 
+/// Convert a list of frame indices to contiguous ranges for Siril select command
+///
+/// Siril's `select` command takes ranges (from, to), so we need to convert
+/// a list like [1,2,3,4,5,51,52,53] into ranges [(1,5), (51,53)]
+fn indices_to_ranges(indices: &[usize]) -> Vec<(usize, usize)> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted: Vec<usize> = indices.to_vec();
+    sorted.sort();
+
+    let mut ranges = Vec::new();
+    let mut start = sorted[0];
+    let mut end = sorted[0];
+
+    for &idx in &sorted[1..] {
+        if idx == end + 1 {
+            end = idx;
+        } else {
+            ranges.push((start, end));
+            start = idx;
+            end = idx;
+        }
+    }
+    ranges.push((start, end));
+    ranges
+}
+
 /// 1. 00_create_masters.ssf - All masters in dependency order
 /// 2. 01_calibrate_lights.ssf - Calibrate all lights by branch
 /// 3. 02_register_and_stack.ssf - Register ALL, stack per filter
@@ -1776,12 +1805,14 @@ cd {}
 
         script.push_str(&format!("# --- {} ---\n", display_label));
 
-        // Build the -filter-incl parameter (comma-separated list of frame indices)
-        let filter_incl = group.frame_indices
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        // Step 1: Unselect all frames first
+        script.push_str(&format!("unselect r_all_lights_ 1 {}\n", plan.total_frames));
+
+        // Step 2: Select only the frames for this group using contiguous ranges
+        let ranges = indices_to_ranges(&group.frame_indices);
+        for (start, end) in &ranges {
+            script.push_str(&format!("select r_all_lights_ {} {}\n", start, end));
+        }
 
         // Output filename includes exposure time if grouping is enabled
         let output_name = if group.exptime_display.is_empty() {
@@ -1791,7 +1822,7 @@ cd {}
         };
         let output_path = folders.masters.join(&output_name);
 
-        // Build stack command with -filter-incl
+        // Step 3: Build stack command with -filter-included flag (no values)
         let mut stack_cmd = format!("stack r_all_lights_");
 
         // Rejection algorithm
@@ -1814,8 +1845,8 @@ cd {}
         };
         stack_cmd.push_str(&rej_cmd);
 
-        // Filter include
-        stack_cmd.push_str(&format!(" -filter-incl={}", filter_incl));
+        // Filter to use only selected frames (flag, no value)
+        stack_cmd.push_str(" -filter-included");
 
         // Normalization
         stack_cmd.push_str(" -norm=addscale -output_norm");
