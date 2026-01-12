@@ -14,9 +14,11 @@ use crate::export::models::{
 };
 use crate::export::siril::templates::{
     get_template, BIAS_SECTION_EMPTY, BIAS_SECTION_TEMPLATE, CALIBRATE_LIGHTS_DARK_ONLY,
-    CALIBRATE_LIGHTS_FLAT_ONLY, CALIBRATE_LIGHTS_FULL, CALIBRATE_LIGHTS_NONE,
-    DARK_SECTION_EMPTY, DARK_SECTION_TEMPLATE, DARK_SECTION_WITH_BIAS_TEMPLATE,
-    FLAT_SECTION_BIAS_ONLY_TEMPLATE, FLAT_SECTION_EMPTY, FLAT_SECTION_TEMPLATE,
+    CALIBRATE_LIGHTS_DARK_ONLY_OSC, CALIBRATE_LIGHTS_FLAT_ONLY, CALIBRATE_LIGHTS_FLAT_ONLY_OSC,
+    CALIBRATE_LIGHTS_FULL, CALIBRATE_LIGHTS_FULL_OSC, CALIBRATE_LIGHTS_NONE,
+    CALIBRATE_LIGHTS_NONE_OSC, DARK_SECTION_EMPTY, DARK_SECTION_TEMPLATE,
+    DARK_SECTION_WITH_BIAS_TEMPLATE, FLAT_SECTION_BIAS_ONLY_TEMPLATE, FLAT_SECTION_EMPTY,
+    FLAT_SECTION_TEMPLATE,
 };
 use anyhow::{Context, Result};
 use std::fs;
@@ -289,14 +291,15 @@ fn generate_osc_script(
         FLAT_SECTION_EMPTY.to_string()
     };
 
+    // Use OSC variants with -debayer flag included
     let calibrate_cmd = if has_dark && has_flat {
-        apply_placeholders(CALIBRATE_LIGHTS_FULL, config, folders, "OSC")
+        apply_placeholders(CALIBRATE_LIGHTS_FULL_OSC, config, folders, "OSC")
     } else if has_dark {
-        apply_placeholders(CALIBRATE_LIGHTS_DARK_ONLY, config, folders, "OSC")
+        apply_placeholders(CALIBRATE_LIGHTS_DARK_ONLY_OSC, config, folders, "OSC")
     } else if has_flat {
-        apply_placeholders(CALIBRATE_LIGHTS_FLAT_ONLY, config, folders, "OSC")
+        apply_placeholders(CALIBRATE_LIGHTS_FLAT_ONLY_OSC, config, folders, "OSC")
     } else {
-        CALIBRATE_LIGHTS_NONE.to_string()
+        CALIBRATE_LIGHTS_NONE_OSC.to_string()
     };
 
     let mut script = template.template.to_string();
@@ -689,13 +692,13 @@ cd {}
                 calibrate_args.push("-cc=dark".to_string());
             }
 
-            if !calibrate_args.is_empty() {
-                script.push_str(&format!("calibrate lights {}\n", calibrate_args.join(" ")));
+            // OSC debayer - add to calibrate command
+            if is_osc {
+                calibrate_args.push("-debayer".to_string());
             }
 
-            // OSC debayer
-            if is_osc {
-                script.push_str("preprocess pp_lights -debayer\n");
+            if !calibrate_args.is_empty() {
+                script.push_str(&format!("calibrate lights {}\n", calibrate_args.join(" ")));
             }
 
             // Register with unique prefix for this subgroup
@@ -791,6 +794,11 @@ cd {}
             calibrate_args.push("-cc=dark".to_string());
         }
 
+        // OSC debayer - add to calibrate command
+        if is_osc {
+            calibrate_args.push("-debayer".to_string());
+        }
+
         if !calibrate_args.is_empty() {
             script.push_str(&format!(
                 "calibrate lights {}\n\n",
@@ -798,19 +806,6 @@ cd {}
             ));
         } else {
             script.push_str("# No calibration masters available - lights not calibrated\n\n");
-        }
-
-        // OSC-specific: Debayer step
-        if is_osc {
-            script.push_str(
-                r#"# ========================================
-# Debayer (OSC cameras)
-# ========================================
-# Note: Siril auto-detects Bayer pattern from FITS header
-preprocess pp_lights -debayer
-
-"#,
-            );
         }
 
         // Registration
@@ -1271,13 +1266,13 @@ requires 1.2.0
             cal_args.push(format!("-flat={}", quote_path(&flat_master)));
         }
 
-        if !cal_args.is_empty() {
-            script.push_str(&format!("calibrate lights {}\n", cal_args.join(" ")));
+        // OSC debayer - add to calibrate command
+        if branch.is_osc() {
+            cal_args.push("-debayer".to_string());
         }
 
-        // OSC debayer
-        if branch.is_osc() {
-            script.push_str("preprocess pp_lights -debayer\n");
+        if !cal_args.is_empty() {
+            script.push_str(&format!("calibrate lights {}\n", cal_args.join(" ")));
         }
 
         script.push_str("\n");
@@ -1660,14 +1655,14 @@ requires 1.2.0
             cal_args.push(format!("-flat={}", flat_master.to_string_lossy()));
         }
 
-        if !cal_args.is_empty() {
-            script.push_str(&format!("calibrate lights {}\n", cal_args.join(" ")));
-        }
-
-        // OSC debayer - ONLY if drizzle is NOT enabled
+        // OSC debayer - add to calibrate command unless drizzle is enabled
         // With drizzle, we preserve the CFA pattern and debayer happens after drizzle stacking
         if is_osc && !config.drizzle_enabled {
-            script.push_str("preprocess pp_lights -debayer\n");
+            cal_args.push("-debayer".to_string());
+        }
+
+        if !cal_args.is_empty() {
+            script.push_str(&format!("calibrate lights {}\n", cal_args.join(" ")));
         }
 
         script.push_str("\n");
@@ -1728,46 +1723,72 @@ cd {}
         folders.process.to_string_lossy()
     ));
 
-    // Step 1: Merge ALL calibrated lights into one global sequence
-    script.push_str("# ========== Step 1: Merge ALL Calibrated Lights ==========\n");
-    script.push_str("# Merging calibrated sequences from all branches:\n");
-
-    // Build list of all calibrated sequence paths in merge order
-    let mut all_sequences: Vec<String> = Vec::new();
-    for merge_info in &plan.merge_order {
-        // Get the branch
+    // Determine sequence name based on number of branches
+    // Single branch: work directly with pp_lights_ (no merge needed)
+    // Multiple branches: merge into all_lights
+    let (sequence_name, registered_sequence_name) = if plan.merge_order.len() == 1 {
+        // Single branch - no merge needed
+        let merge_info = &plan.merge_order[0];
         let branch = &data.branches[merge_info.branch_idx];
         let lights_path = folders.lights_path(branch, merge_info.branch_idx);
-        // Use pp_lights_ (calibrated, not registered)
-        let seq_path = format!("\"{}/pp_lights_\"", lights_path.to_string_lossy());
-        all_sequences.push(seq_path);
 
+        script.push_str("# ========== Step 1: Single Branch - No Merge Needed ==========\n");
         script.push_str(&format!(
-            "#   {} ({} frames, filter: {}, frames {}-{})\n",
+            "# Branch: {} ({} frames, filter: {})\n",
             merge_info.branch_id,
             merge_info.frame_count,
-            merge_info.filter.as_deref().unwrap_or("None"),
-            merge_info.start_frame,
-            merge_info.end_frame
+            merge_info.filter.as_deref().unwrap_or("None")
         ));
-    }
+        script.push_str("# Working directly with calibrated sequence\n\n");
 
-    script.push_str(&format!(
-        "\nmerge {} all_lights\n\n",
-        all_sequences.join(" ")
-    ));
+        // Change to the branch's lights folder where pp_lights_.seq exists
+        script.push_str(&format!("cd {}\n\n", lights_path.to_string_lossy()));
+
+        ("pp_lights_".to_string(), "r_pp_lights_".to_string())
+    } else {
+        // Multiple branches - merge into single sequence
+        script.push_str("# ========== Step 1: Merge ALL Calibrated Lights ==========\n");
+        script.push_str("# Merging calibrated sequences from all branches:\n");
+
+        // Build list of all calibrated sequence paths in merge order
+        let mut all_sequences: Vec<String> = Vec::new();
+        for merge_info in &plan.merge_order {
+            // Get the branch
+            let branch = &data.branches[merge_info.branch_idx];
+            let lights_path = folders.lights_path(branch, merge_info.branch_idx);
+            // Use pp_lights_ (calibrated, not registered)
+            let seq_path = format!("\"{}/pp_lights_\"", lights_path.to_string_lossy());
+            all_sequences.push(seq_path);
+
+            script.push_str(&format!(
+                "#   {} ({} frames, filter: {}, frames {}-{})\n",
+                merge_info.branch_id,
+                merge_info.frame_count,
+                merge_info.filter.as_deref().unwrap_or("None"),
+                merge_info.start_frame,
+                merge_info.end_frame
+            ));
+        }
+
+        script.push_str(&format!(
+            "\nmerge {} all_lights\n\n",
+            all_sequences.join(" ")
+        ));
+
+        ("all_lights".to_string(), "r_all_lights_".to_string())
+    };
 
     // Step 2: Register the global sequence
     script.push_str("# ========== Step 2: Global Registration ==========\n");
     script.push_str("# Finding the single best reference frame across ALL lights\n");
 
-    let register_cmd = build_register_command(config, "all_lights");
+    let register_cmd = build_register_command(config, &sequence_name);
     script.push_str(&format!("{}\n\n", register_cmd));
 
     // Step 3: Apply registration to create aligned files
     script.push_str("# ========== Step 3: Apply Registration ==========\n");
     script.push_str("# Creating aligned files from registration transforms\n");
-    script.push_str("seqapplyreg all_lights -framing=min\n\n");
+    script.push_str(&format!("seqapplyreg {} -framing=min\n\n", sequence_name));
 
     // Step 4: Stack per filter using -filter-incl
     script.push_str("# ========== Step 4: Stack Per Exposure Time Group ==========\n");
@@ -1814,12 +1835,12 @@ cd {}
         script.push_str(&format!("# --- {} ---\n", display_label));
 
         // Step 1: Unselect all frames first
-        script.push_str(&format!("unselect r_all_lights_ 1 {}\n", plan.total_frames));
+        script.push_str(&format!("unselect {} 1 {}\n", registered_sequence_name, plan.total_frames));
 
         // Step 2: Select only the frames for this group using contiguous ranges
         let ranges = indices_to_ranges(&group.frame_indices);
         for (start, end) in &ranges {
-            script.push_str(&format!("select r_all_lights_ {} {}\n", start, end));
+            script.push_str(&format!("select {} {} {}\n", registered_sequence_name, start, end));
         }
 
         // Output filename includes exposure time if grouping is enabled
@@ -1831,7 +1852,7 @@ cd {}
         let output_path = folders.masters.join(&output_name);
 
         // Step 3: Build stack command with -filter-included flag (no values)
-        let mut stack_cmd = format!("stack r_all_lights_");
+        let mut stack_cmd = format!("stack {}", registered_sequence_name);
 
         // Rejection algorithm
         let rej_cmd = match config.rejection_algorithm {
@@ -1892,7 +1913,10 @@ cd {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::export::models::{CalibrationSubgroup, ExportMode};
+    use crate::export::models::{
+        CalibrationSubgroup, DrizzleScale, ExportMode, ExportTarget, ExptimeToleranceMode,
+        ImageWeightingMethod, ReferenceFrameMode,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -1900,12 +1924,21 @@ mod tests {
         ExportConfig {
             frame_set_id: 1,
             output_dir: PathBuf::from("/tmp/export"),
+            target: ExportTarget::Siril,
             mode: ExportMode::OrganizeAndScript,
             workflow: SirilWorkflow::MonoPreprocessing,
             create_masters: true,
             rejection_low: 3.0,
             rejection_high: 3.0,
             use_symlinks: false,
+            reference_frame_mode: ReferenceFrameMode::SirilAuto,
+            manual_reference_frame_id: None,
+            rejection_algorithm: RejectionAlgorithm::Sigma,
+            image_weighting: ImageWeightingMethod::None,
+            drizzle_enabled: false,
+            drizzle_scale: DrizzleScale::None,
+            exptime_tolerance_mode: ExptimeToleranceMode::Disabled,
+            exptime_tolerance_value: 30.0,
         }
     }
 
@@ -1958,6 +1991,8 @@ mod tests {
             depends_on: vec![],
             apply_bias: None,
             apply_dark: None,
+            apply_darkflat: None,
+            source_exptime: None,
         };
 
         let master_plan = MasterCreationPlan {

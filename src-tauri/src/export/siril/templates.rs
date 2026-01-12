@@ -124,19 +124,13 @@ cd {process_dir}
 {calibrate_lights_cmd}
 
 # ========================================
-# Step 5: Debayer (extract CFA)
+# Step 5: Register Light Frames
 # ========================================
-# Note: Siril auto-detects Bayer pattern from FITS header
-# If needed, use: seqextract_Ha lights_calibrated
-preprocess pp_lights -debayer
-
-# ========================================
-# Step 6: Register Light Frames
-# ========================================
+# Note: Debayering is handled by -debayer flag in calibrate command above
 register pp_lights
 
 # ========================================
-# Step 7: Stack Light Frames
+# Step 6: Stack Light Frames
 # ========================================
 stack r_pp_lights rej {rejection_low} {rejection_high} -norm=addscale -output_norm -rgb_equal -out={result_dir}/OSC_stacked
 
@@ -244,6 +238,23 @@ pub const CALIBRATE_LIGHTS_FLAT_ONLY: &str =
 /// Light calibration with no calibration files
 pub const CALIBRATE_LIGHTS_NONE: &str =
     "# No calibration files available - lights not calibrated";
+
+// OSC variants - include -debayer flag for one-shot color cameras
+/// Light calibration command with all calibrations (OSC - includes debayer)
+pub const CALIBRATE_LIGHTS_FULL_OSC: &str =
+    "calibrate pp_lights -dark={masters_dir}/master_dark -flat={masters_dir}/master_flat -cc=dark -debayer";
+
+/// Light calibration with dark only (OSC - includes debayer)
+pub const CALIBRATE_LIGHTS_DARK_ONLY_OSC: &str =
+    "calibrate pp_lights -dark={masters_dir}/master_dark -cc=dark -debayer";
+
+/// Light calibration with flat only (OSC - includes debayer)
+pub const CALIBRATE_LIGHTS_FLAT_ONLY_OSC: &str =
+    "calibrate pp_lights -flat={masters_dir}/master_flat -debayer";
+
+/// Light calibration with no calibration files (OSC - debayer only)
+pub const CALIBRATE_LIGHTS_NONE_OSC: &str =
+    "calibrate pp_lights -debayer";
 
 #[cfg(test)]
 mod tests {

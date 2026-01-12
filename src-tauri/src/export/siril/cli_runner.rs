@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 /// Default Siril CLI executable name
@@ -135,13 +136,56 @@ pub fn run_siril_script(
         }
     }
 
-    // Wait for completion
-    let status = child.wait().context("Failed to wait for Siril to complete")?;
+    println!("  [DEBUG] stdout loop finished, waiting for process to exit...");
 
-    // Get stderr output
-    let stderr_output = stderr_handle.join().unwrap_or_default();
+    // Wait for completion with timeout (Siril on macOS can hang after "closing pipes")
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                println!("  [DEBUG] process exited with status: {:?}", status);
+                break status;
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    println!("  [DEBUG] process timeout after {:?}, killing...", timeout);
+                    let _ = child.kill();
+                    // Wait a bit for kill to take effect
+                    std::thread::sleep(Duration::from_millis(500));
+                    // Try one more time to get status
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        _ => {
+                            // Consider it successful if stdout showed completion
+                            if last_lines.iter().any(|l| l.contains("Script execution finished successfully")) {
+                                println!("  [DEBUG] Script completed but process hung - treating as success");
+                                // Return early with success
+                                emit_progress(
+                                    app_handle,
+                                    ExportProgress {
+                                        stage: ExportStage::Complete,
+                                        progress: 100.0,
+                                        message: "Siril processing complete".to_string(),
+                                        current_file: None,
+                                    },
+                                );
+                                return Ok(());
+                            }
+                            return Err(anyhow::anyhow!("Siril process timed out and could not be killed"));
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(anyhow::anyhow!("Failed to wait for Siril: {}", e)),
+        }
+    };
 
+    // If process exited successfully, don't wait for stderr thread
+    // (Siril on macOS may not close stderr properly)
     if status.success() {
+        println!("  [DEBUG] process succeeded, skipping stderr thread join");
         println!("✅ Siril script completed successfully");
         emit_progress(
             app_handle,
@@ -152,38 +196,51 @@ pub fn run_siril_script(
                 current_file: None,
             },
         );
-        Ok(())
-    } else {
-        // Build detailed error message
-        let mut error_details = format!("Siril exited with code: {:?}\n", status.code());
-
-        if !last_lines.is_empty() {
-            error_details.push_str("\n--- Last stdout lines ---\n");
-            for line in &last_lines {
-                error_details.push_str(&format!("  {}\n", line));
-            }
-        }
-
-        if !stderr_output.is_empty() {
-            error_details.push_str("\n--- Stderr ---\n");
-            for line in &stderr_output {
-                error_details.push_str(&format!("  {}\n", line));
-            }
-        }
-
-        println!("❌ Siril script failed:\n{}", error_details);
-
-        emit_progress(
-            app_handle,
-            ExportProgress {
-                stage: ExportStage::Failed,
-                progress: 0.0,
-                message: error_details.clone(),
-                current_file: None,
-            },
-        );
-        Err(anyhow::anyhow!("{}", error_details))
+        return Ok(());
     }
+
+    // Only wait for stderr on failure (need error details)
+    println!("  [DEBUG] joining stderr thread for error details...");
+    let stderr_output = match stderr_handle.join() {
+        Ok(output) => {
+            println!("  [DEBUG] stderr thread joined successfully");
+            output
+        }
+        Err(_) => {
+            println!("  [DEBUG] stderr thread join failed");
+            Vec::new()
+        }
+    };
+
+    // If we get here, the process failed - build error message
+    let mut error_details = format!("Siril exited with code: {:?}\n", status.code());
+
+    if !last_lines.is_empty() {
+        error_details.push_str("\n--- Last stdout lines ---\n");
+        for line in &last_lines {
+            error_details.push_str(&format!("  {}\n", line));
+        }
+    }
+
+    if !stderr_output.is_empty() {
+        error_details.push_str("\n--- Stderr ---\n");
+        for line in &stderr_output {
+            error_details.push_str(&format!("  {}\n", line));
+        }
+    }
+
+    println!("❌ Siril script failed:\n{}", error_details);
+
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::Failed,
+            progress: 0.0,
+            message: error_details.clone(),
+            current_file: None,
+        },
+    );
+    Err(anyhow::anyhow!("{}", error_details))
 }
 
 /// Parse Siril output to determine current stage
