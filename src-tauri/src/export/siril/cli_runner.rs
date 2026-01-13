@@ -335,7 +335,8 @@ pub struct CollectedFrame {
     pub filename: String,
     /// Filter name (e.g., "L", "Ha", "Red")
     pub filter: Option<String>,
-    /// Exposure time in seconds
+    /// Exposure time in seconds (kept for future use)
+    #[allow(dead_code)]
     pub exptime: Option<f64>,
 }
 

@@ -10,7 +10,6 @@
 
 pub mod cli_runner;
 pub mod script_generator;
-pub mod templates;
 
 #[allow(unused_imports)]
 pub use cli_runner::{
@@ -18,7 +17,4 @@ pub use cli_runner::{
     CollectedFrames, CollectedFrame, FrameGroup, DEFAULT_SIRIL_CLI,
 };
 #[allow(unused_imports)]
-pub use script_generator::{
-    generate_combined_script, generate_scripts, generate_scripts_v2, generate_scripts_v3,
-};
-// Note: templates are used internally by script_generator
+pub use script_generator::generate_scripts_v3;

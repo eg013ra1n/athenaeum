@@ -532,19 +532,7 @@ pub struct ExportDataV3 {
     pub filters: Vec<String>,
 }
 
-impl ExportDataV3 {
-    /// Get all unique filters from branches
-    pub fn unique_filters(&self) -> Vec<Option<String>> {
-        let mut filters: Vec<Option<String>> = self.branches
-            .iter()
-            .map(|b| b.filter.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        filters.sort();
-        filters
-    }
-}
+impl ExportDataV3 {}
 
 // ============================================================================
 // Calibration Route (UI Display)
@@ -918,14 +906,6 @@ impl GlobalRegistrationPlan {
         }
     }
 
-    /// Get branches for a specific filter
-    pub fn branches_for_filter(&self, filter: &Option<String>) -> Vec<&BranchMergeInfo> {
-        self.merge_order
-            .iter()
-            .filter(|b| &b.filter == filter)
-            .collect()
-    }
-
     /// Get branches for a specific filter and camera type
     pub fn branches_for_filter_and_camera(
         &self,
@@ -935,14 +915,6 @@ impl GlobalRegistrationPlan {
         self.merge_order
             .iter()
             .filter(|b| &b.filter == filter && &b.camera_type == camera_type)
-            .collect()
-    }
-
-    /// Get all frame indices for a specific filter (for organizing registered files)
-    pub fn frame_indices_for_filter(&self, filter: &Option<String>) -> Vec<usize> {
-        self.branches_for_filter(filter)
-            .iter()
-            .flat_map(|b| b.start_frame..=b.end_frame)
             .collect()
     }
 

@@ -7,7 +7,6 @@ import type {
   ExportableFrameSet,
   ExportMode,
   ExportTarget,
-  SirilWorkflow,
   CalibrationRoute,
   ExportGroupsSummary,
   ReferenceFrameMode,
@@ -96,61 +95,6 @@ export function useExportableFrameSets(): UseExportableFrameSetsResult {
   }, [loadData]);
 
   return { frameSets, loading, error, refresh: loadData };
-}
-
-interface UseExportResult {
-  execute: (config: ExportExecuteConfig) => Promise<ExportResult>;
-  loading: boolean;
-  error: string | null;
-  result: ExportResult | null;
-}
-
-interface ExportExecuteConfig {
-  frameSetId: number;
-  outputDir: string;
-  mode: ExportMode;
-  workflow: SirilWorkflow;
-  rejectionLow?: number;
-  rejectionHigh?: number;
-  useSymlinks?: boolean;
-}
-
-/**
- * Hook to execute an export operation
- */
-export function useExport(): UseExportResult {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<ExportResult | null>(null);
-
-  const execute = useCallback(async (config: ExportExecuteConfig): Promise<ExportResult> => {
-    try {
-      setLoading(true);
-      setError(null);
-      setResult(null);
-
-      const exportResult = await invoke<ExportResult>('export_frame_set', {
-        frameSetId: config.frameSetId,
-        outputDir: config.outputDir,
-        mode: config.mode,
-        workflow: config.workflow,
-        rejectionLow: config.rejectionLow ?? 3.0,
-        rejectionHigh: config.rejectionHigh ?? 3.0,
-        useSymlinks: config.useSymlinks ?? false,
-      });
-
-      setResult(exportResult);
-      return exportResult;
-    } catch (err) {
-      const errorMessage = err as string;
-      setError(errorMessage);
-      throw new Error(errorMessage);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  return { execute, loading, error, result };
 }
 
 interface UseSirilPathResult {

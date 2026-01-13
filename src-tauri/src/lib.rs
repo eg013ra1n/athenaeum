@@ -155,8 +155,6 @@ pub fn run() {
             commands::manual_assign_subcalibration,
             commands::clear_subcalibration_override,
             commands::get_export_preview,
-            commands::export_frame_set,
-            commands::export_frame_set_v2,
             commands::get_calibration_route,
             commands::get_export_groups_summary,
             commands::get_siril_path,

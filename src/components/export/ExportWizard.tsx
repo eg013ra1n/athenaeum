@@ -1,24 +1,21 @@
 import { useState, useCallback, useEffect } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
-import { Folder, Loader2, Check, AlertCircle, Sparkles, ChevronDown, ChevronRight } from 'lucide-react';
+import { Folder, Loader2, Check, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
 import { ExportModeSelector } from './ExportModeSelector';
-import { WorkflowSelector } from './WorkflowSelector';
 import { CalibrationPreview } from './CalibrationPreview';
 import { CalibrationTreeView } from './CalibrationTreeView';
 import { ExportProgress } from './ExportProgress';
 import {
   useExportableFrameSets,
   useExportData,
-  useExport,
   useCalibrationRoute,
   useExportV2,
 } from '../../hooks/useExportData';
 import type {
   ExportMode,
   ExportTarget,
-  SirilWorkflow,
   ExportProgress as ExportProgressType,
   ExportResult,
   ReferenceFrameMode,
@@ -38,13 +35,11 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   );
   const [exportTarget, setExportTarget] = useState<ExportTarget>('siril');
   const [mode, setMode] = useState<ExportMode>('direct_execution');
-  const [workflow, setWorkflow] = useState<SirilWorkflow>('mono_preprocessing');
   const [outputDir, setOutputDir] = useState<string>('');
   const [rejectionLow, setRejectionLow] = useState(2.5);
   const [rejectionHigh, setRejectionHigh] = useState(2.5);
   const [useSymlinks, setUseSymlinks] = useState(false);
   const [createMasters, setCreateMasters] = useState(true);
-  const [useV2Export, setUseV2Export] = useState(true); // Default to v4 (smart export)
   const [progress, setProgress] = useState<ExportProgressType | null>(null);
   const [result, setResult] = useState<ExportResult | null>(null);
 
@@ -63,13 +58,8 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
   const { data: exportData, loading: loadingExportData } = useExportData(selectedFrameSetId);
-  const { route: calibrationRoute, loading: loadingRoute } = useCalibrationRoute(
-    useV2Export ? selectedFrameSetId : null
-  );
-  const { execute: executeLegacy, loading: executingLegacy } = useExport();
-  const { execute: executeV2, loading: executingV2 } = useExportV2();
-
-  const executing = executingLegacy || executingV2;
+  const { route: calibrationRoute, loading: loadingRoute } = useCalibrationRoute(selectedFrameSetId);
+  const { execute: executeExport, loading: executing } = useExportV2();
 
   // Listen for progress events
   useEffect(() => {
@@ -103,41 +93,25 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     setProgress(null);
 
     try {
-      let exportResult: ExportResult;
-
-      if (useV2Export) {
-        // Use v4 export with auto-detected workflows and flat folder structure
-        exportResult = await executeV2({
-          frameSetId: selectedFrameSetId,
-          outputDir,
-          mode,
-          target: exportTarget,
-          createMasters,
-          rejectionLow,
-          rejectionHigh,
-          useSymlinks,
-          // Advanced Siril options
-          referenceFrameMode,
-          rejectionAlgorithm,
-          imageWeighting,
-          drizzleEnabled,
-          drizzleScale,
-          // Exposure time grouping
-          exptimeToleranceMode: exptimeToleranceEnabled ? 'absolute' : 'disabled',
-          exptimeToleranceValue: exptimeToleranceSeconds,
-        });
-      } else {
-        // Use legacy export with manual workflow selection
-        exportResult = await executeLegacy({
-          frameSetId: selectedFrameSetId,
-          outputDir,
-          mode,
-          workflow,
-          rejectionLow,
-          rejectionHigh,
-          useSymlinks,
-        });
-      }
+      const exportResult = await executeExport({
+        frameSetId: selectedFrameSetId,
+        outputDir,
+        mode,
+        target: exportTarget,
+        createMasters,
+        rejectionLow,
+        rejectionHigh,
+        useSymlinks,
+        // Advanced Siril options
+        referenceFrameMode,
+        rejectionAlgorithm,
+        imageWeighting,
+        drizzleEnabled,
+        drizzleScale,
+        // Exposure time grouping
+        exptimeToleranceMode: exptimeToleranceEnabled ? 'absolute' : 'disabled',
+        exptimeToleranceValue: exptimeToleranceSeconds,
+      });
       setResult(exportResult);
     } catch {
       // Error is handled by the hook
@@ -146,15 +120,12 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     selectedFrameSetId,
     outputDir,
     mode,
-    workflow,
     exportTarget,
     createMasters,
     rejectionLow,
     rejectionHigh,
     useSymlinks,
-    useV2Export,
-    executeLegacy,
-    executeV2,
+    executeExport,
     // Advanced Siril options
     referenceFrameMode,
     rejectionAlgorithm,
@@ -226,29 +197,14 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
       {/* Step 3: Calibration Summary */}
       {selectedFrameSetId && (
         <section className="bg-gray-800 rounded-lg p-4">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-lg font-medium">3. Calibration Summary</h3>
-            {/* V2 Export Toggle */}
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={useV2Export}
-                onChange={(e) => setUseV2Export(e.target.checked)}
-                className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-500 focus:ring-blue-500"
-              />
-              <span className="text-sm text-gray-400 flex items-center gap-1">
-                <Sparkles size={14} className="text-yellow-500" />
-                Smart Export (v4)
-              </span>
-            </label>
-          </div>
+          <h3 className="text-lg font-medium mb-3">3. Calibration Summary</h3>
 
           {loadingExportData || loadingRoute ? (
             <div className="flex items-center gap-2 text-gray-400">
               <Loader2 className="animate-spin" size={16} />
               Loading calibration data...
             </div>
-          ) : useV2Export && calibrationRoute ? (
+          ) : calibrationRoute ? (
             <div className="space-y-4">
               {/* Groups Summary */}
               {exportData && exportData.groups.length > 0 && (
@@ -317,16 +273,8 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         </section>
       )}
 
-      {/* Step 5: Workflow (only in legacy mode) */}
-      {selectedFrameSetId && exportData && exportTarget === 'siril' && !useV2Export && (
-        <section className="bg-gray-800 rounded-lg p-4">
-          <h3 className="text-lg font-medium mb-3">5. Siril Workflow</h3>
-          <WorkflowSelector value={workflow} onChange={setWorkflow} />
-        </section>
-      )}
-
-      {/* V2 Mode: Master creation option (Siril only) */}
-      {selectedFrameSetId && exportData && exportTarget === 'siril' && useV2Export && (
+      {/* Step 5: Processing Options (Siril only) */}
+      {selectedFrameSetId && exportData && exportTarget === 'siril' && (
         <section className="bg-gray-800 rounded-lg p-4">
           <h3 className="text-lg font-medium mb-3">5. Processing Options</h3>
           <div className="p-3 bg-gray-700/50 rounded-lg">

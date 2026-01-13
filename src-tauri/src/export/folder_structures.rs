@@ -4,10 +4,10 @@
 //! - Siril: Flat structure with type-based organization
 //! - PixInsight WBPP: Camera-grouped structure with flats containing lights
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use anyhow::Result;
 
-use super::models::{CalibrationBranch, ExportDataV3, ExportTarget, sanitize_folder_name};
+use super::models::{CalibrationBranch, sanitize_folder_name};
 
 // ============================================================================
 // Siril Folder Structure
@@ -130,11 +130,6 @@ impl WBPPFolders {
         self.flats_path(camera_name, flat_set_id).join("lights")
     }
 
-    /// Get path for lights using CalibrationBranch
-    pub fn lights_path_for_branch(&self, branch: &CalibrationBranch) -> PathBuf {
-        self.lights_path(&branch.camera_folder_name, branch.flat_id)
-    }
-
     /// Create base directories for a camera
     pub fn create_camera_dirs(&self, camera_name: &str) -> Result<()> {
         std::fs::create_dir_all(self.darks_path(camera_name))?;
@@ -150,78 +145,5 @@ impl WBPPFolders {
 }
 
 // ============================================================================
-// Folder Structure Factory
-// ============================================================================
-
-/// Enum to hold either folder structure type
-#[derive(Debug, Clone)]
-pub enum ExportFolders {
-    Siril(SirilFolders),
-    WBPP(WBPPFolders),
-}
-
-impl ExportFolders {
-    /// Create appropriate folder structure based on export target
-    pub fn new(root: PathBuf, target: &ExportTarget) -> Self {
-        match target {
-            ExportTarget::Siril => ExportFolders::Siril(SirilFolders::new(root)),
-            ExportTarget::PixInsightWBPP => ExportFolders::WBPP(WBPPFolders::new(root)),
-        }
-    }
-
-    /// Get root path
-    pub fn root(&self) -> &Path {
-        match self {
-            ExportFolders::Siril(f) => &f.root,
-            ExportFolders::WBPP(f) => &f.root,
-        }
-    }
-
-    /// Get masters path (only for Siril, returns root for WBPP)
-    pub fn masters_path(&self) -> PathBuf {
-        match self {
-            ExportFolders::Siril(f) => f.masters.clone(),
-            ExportFolders::WBPP(f) => f.root.clone(),
-        }
-    }
-}
-
-// ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Get unique camera names from export data (sanitized for folder names)
-pub fn get_unique_cameras(data: &ExportDataV3) -> Vec<String> {
-    let mut cameras: Vec<String> = data.branches
-        .iter()
-        .map(|b| b.camera_folder_name.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    cameras.sort();
-    cameras
-}
-
-/// Get unique flat set IDs per camera
-pub fn get_flat_sets_by_camera(data: &ExportDataV3) -> std::collections::HashMap<String, Vec<i64>> {
-    let mut result: std::collections::HashMap<String, std::collections::HashSet<i64>> =
-        std::collections::HashMap::new();
-
-    for branch in &data.branches {
-        if branch.flat_id > 0 {
-            result
-                .entry(branch.camera_folder_name.clone())
-                .or_default()
-                .insert(branch.flat_id);
-        }
-    }
-
-    result
-        .into_iter()
-        .map(|(camera, ids)| {
-            let mut ids: Vec<i64> = ids.into_iter().collect();
-            ids.sort();
-            (camera, ids)
-        })
-        .collect()
-}

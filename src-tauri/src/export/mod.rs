@@ -14,6 +14,5 @@ pub mod siril;
 
 pub use data_collector::*;
 pub use file_organizer::*;
-pub use folder_structures::*;
 #[allow(unused_imports)]
 pub use models::*;
