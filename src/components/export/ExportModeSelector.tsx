@@ -1,4 +1,4 @@
-import { FileCode, FolderOutput, Play, Files } from 'lucide-react';
+import { Play, Files } from 'lucide-react';
 import type { ExportMode } from '../../types/export';
 
 interface ExportModeSelectorProps {
@@ -8,28 +8,16 @@ interface ExportModeSelectorProps {
 
 const EXPORT_MODES: { mode: ExportMode; label: string; description: string; icon: React.ReactNode }[] = [
   {
-    mode: 'generate_scripts',
-    label: 'Generate scripts only',
-    description: 'Create Siril scripts without copying files',
-    icon: <FileCode size={20} />,
-  },
-  {
-    mode: 'organize_files',
-    label: 'Organize files into folders',
-    description: 'Copy/link files into folder structure',
-    icon: <FolderOutput size={20} />,
+    mode: 'direct_execution',
+    label: 'Direct execution (run Siril)',
+    description: 'Organize files, generate scripts, and automatically run Siril',
+    icon: <Play size={20} />,
   },
   {
     mode: 'organize_and_script',
     label: 'Organize + Generate scripts',
-    description: 'Create folder structure and Siril scripts',
+    description: 'Copy files into folder structure and generate Siril scripts',
     icon: <Files size={20} />,
-  },
-  {
-    mode: 'direct_execution',
-    label: 'Direct execution (run Siril)',
-    description: 'Organize, generate scripts, and run Siril',
-    icon: <Play size={20} />,
   },
 ];
 

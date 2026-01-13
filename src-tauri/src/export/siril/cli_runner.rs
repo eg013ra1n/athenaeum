@@ -1,14 +1,16 @@
 //! Siril CLI runner
 //!
 //! Executes Siril scripts via siril-cli and captures progress.
+//! Also provides pipeline orchestration for complete export workflows.
 
 use crate::export::models::{ExportProgress, ExportStage};
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+use walkdir::WalkDir;
 
 /// Default Siril CLI executable name
 #[cfg(target_os = "macos")]
@@ -282,7 +284,9 @@ fn estimate_progress(stage: &ExportStage, line_count: usize) -> f64 {
         ExportStage::Collecting => 0.0,
         ExportStage::Organizing => 5.0,
         ExportStage::GeneratingScripts => 10.0,
+        ExportStage::SirilCreatingMasters => 15.0,
         ExportStage::SirilCalibrating => 20.0,
+        ExportStage::CollectingCalibratedFrames => 40.0,
         ExportStage::SirilRegistering => 50.0,
         ExportStage::SirilStacking => 80.0,
         ExportStage::Complete => 100.0,
@@ -318,6 +322,676 @@ fn extract_filename(line: &str) -> Option<String> {
 /// Emit a progress event to the frontend
 fn emit_progress(app_handle: &AppHandle, progress: ExportProgress) {
     let _ = app_handle.emit("export-progress", &progress);
+}
+
+// ============================================================================
+// Export Pipeline Orchestration
+// ============================================================================
+
+/// Metadata for a single collected frame
+#[derive(Debug, Clone)]
+pub struct CollectedFrame {
+    /// Filename in the collection directory
+    pub filename: String,
+    /// Filter name (e.g., "L", "Ha", "Red")
+    pub filter: Option<String>,
+    /// Exposure time in seconds
+    pub exptime: Option<f64>,
+}
+
+/// Info about a collected frame group (OSC or Mono)
+/// All frames regardless of dimensions go in the same group
+/// seqapplyreg -framing=max handles dimension differences
+#[derive(Debug, Clone)]
+pub struct FrameGroup {
+    pub dir: PathBuf,
+    pub is_osc: bool,
+    /// Frames in this group with their metadata
+    pub frames: Vec<CollectedFrame>,
+}
+
+impl FrameGroup {
+    pub fn count(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+/// Result of collecting calibrated frames, separated by camera type only
+/// (OSC vs Mono - NOT by dimensions)
+#[derive(Debug, Clone)]
+pub struct CollectedFrames {
+    /// Mono frames group (may be None if no mono frames)
+    pub mono: Option<FrameGroup>,
+    /// OSC frames group (may be None if no OSC frames)
+    pub osc: Option<FrameGroup>,
+}
+
+impl CollectedFrames {
+    pub fn total(&self) -> usize {
+        self.mono_count() + self.osc_count()
+    }
+
+    pub fn mono_count(&self) -> usize {
+        self.mono.as_ref().map(|g| g.count()).unwrap_or(0)
+    }
+
+    pub fn osc_count(&self) -> usize {
+        self.osc.as_ref().map(|g| g.count()).unwrap_or(0)
+    }
+}
+
+/// FITS image metadata needed for stacking
+#[derive(Debug, Clone)]
+struct FitsMetadata {
+    layers: usize,
+    filter: Option<String>,
+    exptime: Option<f64>,
+}
+
+/// Read FITS metadata (layer count, filter, exptime)
+fn get_fits_metadata(path: &Path) -> Result<FitsMetadata> {
+    use fitsio::FitsFile;
+
+    let mut fptr = FitsFile::open(path)
+        .with_context(|| format!("Failed to open FITS file: {:?}", path))?;
+
+    let hdu = fptr.primary_hdu()
+        .with_context(|| format!("Failed to get primary HDU: {:?}", path))?;
+
+    // Read NAXIS to check if 3D (OSC vs Mono)
+    let naxis: i64 = hdu.read_key(&mut fptr, "NAXIS")
+        .with_context(|| format!("Failed to read NAXIS: {:?}", path))?;
+
+    let layers = if naxis < 3 {
+        1
+    } else {
+        hdu.read_key::<i64>(&mut fptr, "NAXIS3").unwrap_or(1) as usize
+    };
+
+    // Read filter (optional) - try multiple common keywords
+    let filter: Option<String> = hdu.read_key(&mut fptr, "FILTER")
+        .ok()
+        .or_else(|| hdu.read_key(&mut fptr, "FILTER1").ok())
+        .map(|s: String| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Read exposure time (optional)
+    let exptime: Option<f64> = hdu.read_key(&mut fptr, "EXPTIME")
+        .ok()
+        .or_else(|| hdu.read_key(&mut fptr, "EXPOSURE").ok());
+
+    Ok(FitsMetadata {
+        layers,
+        filter,
+        exptime,
+    })
+}
+
+/// Collect calibrated frames from branch directories to separate directories
+/// based on camera type (OSC vs Mono) only - NOT by dimensions.
+///
+/// ALL mono frames go to all_lights_mono/ (regardless of camera dimensions)
+/// ALL OSC frames go to all_lights_osc/ (regardless of camera dimensions)
+///
+/// seqapplyreg -framing=max handles different camera dimensions by padding
+/// smaller frames to match the largest.
+///
+/// Directory structure:
+/// - process/all_lights_mono/ - ALL mono frames (1 channel)
+/// - process/all_lights_osc/  - ALL OSC frames (3 channels)
+pub fn collect_calibrated_frames(
+    export_dir: &Path,
+    app_handle: &AppHandle,
+) -> Result<CollectedFrames> {
+    let lights_dir = export_dir.join("lights");
+    let process_dir = export_dir.join("process");
+
+    // Create directories
+    let mono_dir = process_dir.join("all_lights_mono");
+    let osc_dir = process_dir.join("all_lights_osc");
+    std::fs::create_dir_all(&mono_dir)
+        .with_context(|| format!("Failed to create directory: {:?}", mono_dir))?;
+    std::fs::create_dir_all(&osc_dir)
+        .with_context(|| format!("Failed to create directory: {:?}", osc_dir))?;
+
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::CollectingCalibratedFrames,
+            progress: 0.0,
+            message: "Collecting calibrated frames...".to_string(),
+            current_file: None,
+        },
+    );
+
+    let mut mono_frames: Vec<CollectedFrame> = Vec::new();
+    let mut osc_frames: Vec<CollectedFrame> = Vec::new();
+    let mut errors = Vec::new();
+    let mut total_copied = 0;
+
+    // Walk through lights directory looking for branch directories
+    for entry in WalkDir::new(&lights_dir)
+        .min_depth(1)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+
+        // Only process files, not directories
+        if !path.is_file() {
+            continue;
+        }
+
+        // Check if this is a calibrated frame (pp_lights_*.fit)
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("pp_lights_") && (name.ends_with(".fit") || name.ends_with(".fits")) {
+                // Read FITS metadata (layer count, filter, exptime)
+                let metadata = match get_fits_metadata(path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        errors.push(format!("Failed to read metadata for {}: {}", name, e));
+                        continue;
+                    }
+                };
+
+                let is_osc = metadata.layers >= 3;
+                let dest_dir = if is_osc { &osc_dir } else { &mono_dir };
+                let dest = dest_dir.join(name);
+
+                // Copy file
+                match std::fs::copy(path, &dest) {
+                    Ok(_) => {
+                        let frame = CollectedFrame {
+                            filename: name.to_string(),
+                            filter: metadata.filter,
+                            exptime: metadata.exptime,
+                        };
+
+                        if is_osc {
+                            osc_frames.push(frame);
+                        } else {
+                            mono_frames.push(frame);
+                        }
+
+                        total_copied += 1;
+
+                        // Emit progress every 10 frames
+                        if total_copied % 10 == 0 {
+                            emit_progress(
+                                app_handle,
+                                ExportProgress {
+                                    stage: ExportStage::CollectingCalibratedFrames,
+                                    progress: 50.0,
+                                    message: format!("Copied {} frames ({} mono, {} OSC)...",
+                                        total_copied, mono_frames.len(), osc_frames.len()),
+                                    current_file: Some(name.to_string()),
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed to copy {}: {}", name, e));
+                    }
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        println!("⚠️ Some frames failed to process:");
+        for err in &errors {
+            println!("  {}", err);
+        }
+    }
+
+    // Sort frames by filename for consistent sequence ordering
+    mono_frames.sort_by(|a, b| a.filename.cmp(&b.filename));
+    osc_frames.sort_by(|a, b| a.filename.cmp(&b.filename));
+
+    // Build result
+    let mono = if !mono_frames.is_empty() {
+        Some(FrameGroup {
+            dir: mono_dir,
+            is_osc: false,
+            frames: mono_frames,
+        })
+    } else {
+        None
+    };
+
+    let osc = if !osc_frames.is_empty() {
+        Some(FrameGroup {
+            dir: osc_dir,
+            is_osc: true,
+            frames: osc_frames,
+        })
+    } else {
+        None
+    };
+
+    let result = CollectedFrames { mono, osc };
+
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::CollectingCalibratedFrames,
+            progress: 100.0,
+            message: format!("Collected {} frames ({} mono, {} OSC)",
+                total_copied, result.mono_count(), result.osc_count()),
+            current_file: None,
+        },
+    );
+
+    println!("✅ Collected {} calibrated frames:", total_copied);
+    println!("   Mono: {} frames", result.mono_count());
+    println!("   OSC: {} frames", result.osc_count());
+
+    Ok(result)
+}
+
+/// Generate registration and stacking script for OSC and Mono pipelines
+///
+/// This is called AFTER frame collection. Each pipeline (OSC/Mono) processes
+/// ALL frames together regardless of camera dimensions:
+/// 1. convert → create sequence from all collected frames
+/// 2. seqplatesolve → embed WCS coordinates for astrometric alignment
+/// 3. register -2pass → compute registration transforms
+/// 4. seqapplyreg -framing=max → PADS smaller frames to match largest dimensions
+/// 5. convert r_pp_lights → create registered sequence
+/// 6. stack per filter → create one stacked output per filter
+pub fn generate_registration_script(
+    collected: &CollectedFrames,
+    export_dir: &Path,
+    focal_length: f64,
+    pixel_size: f64,
+    rejection_low: f64,
+    rejection_high: f64,
+) -> Result<PathBuf> {
+    use std::fs;
+    use std::collections::HashMap;
+
+    let masters_dir = export_dir.join("masters");
+    fs::create_dir_all(&masters_dir)?;
+
+    let mut script = String::new();
+
+    // Header
+    script.push_str(&format!(
+        r#"############################################
+# Siril Registration and Stacking Script
+# Generated by Athenaeum
+#
+# Mono frames: {}
+# OSC frames: {}
+# Total: {} frames
+#
+# IMPORTANT: All frames (regardless of camera dimensions)
+# are registered together. seqapplyreg -framing=max
+# pads smaller frames to match the largest.
+############################################
+
+requires 1.3.0
+
+"#,
+        collected.mono_count(),
+        collected.osc_count(),
+        collected.total()
+    ));
+
+    // Helper function to generate pipeline for a frame group
+    fn generate_pipeline(
+        script: &mut String,
+        group: &FrameGroup,
+        masters_dir: &Path,
+        focal_length: f64,
+        pixel_size: f64,
+        rejection_low: f64,
+        rejection_high: f64,
+    ) {
+        let camera_type = if group.is_osc { "OSC" } else { "MONO" };
+        let camera_suffix = if group.is_osc { "osc" } else { "mono" };
+
+        script.push_str(&format!(
+            "\n############################################\n"
+        ));
+        script.push_str(&format!(
+            "# {} PIPELINE ({} frames)\n",
+            camera_type, group.count()
+        ));
+        script.push_str(&format!(
+            "############################################\n\n"
+        ));
+
+        // Step 1: Change to directory and convert
+        script.push_str(&format!(
+            "# --- Step 1: Create {} Sequence ---\n",
+            camera_type
+        ));
+        script.push_str(&format!("cd {}\n", group.dir.to_string_lossy()));
+        script.push_str("convert pp_lights -out=. -fitseq\n\n");
+
+        // Step 2: Plate solve for WCS
+        script.push_str(&format!(
+            "# --- Step 2: Plate Solve {} ---\n",
+            camera_type
+        ));
+        script.push_str(&format!(
+            "seqplatesolve pp_lights -focal={:.1} -pixelsize={:.2}\n\n",
+            focal_length, pixel_size
+        ));
+
+        // Step 3: Register
+        script.push_str(&format!(
+            "# --- Step 3: Register {} ---\n",
+            camera_type
+        ));
+        script.push_str("register pp_lights -2pass\n\n");
+
+        // Step 4: Apply registration with max framing
+        script.push_str(&format!(
+            "# --- Step 4: Apply Registration {} ---\n",
+            camera_type
+        ));
+        script.push_str("# -framing=max PADS smaller frames to match largest dimensions\n");
+        script.push_str("seqapplyreg pp_lights -framing=max\n\n");
+
+        // Step 5: Convert registered files to sequence
+        script.push_str(&format!(
+            "# --- Step 5: Create Registered Sequence {} ---\n",
+            camera_type
+        ));
+        script.push_str("convert r_pp_lights -out=. -fitseq\n\n");
+
+        // Step 6: Stack per filter
+        script.push_str(&format!(
+            "# --- Step 6: Stack {} per filter ---\n",
+            camera_type
+        ));
+
+        // Group frames by filter
+        let mut filter_groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, frame) in group.frames.iter().enumerate() {
+            let filter_key = frame.filter.clone().unwrap_or_else(|| "Unfiltered".to_string());
+            filter_groups.entry(filter_key).or_default().push(idx + 1); // Siril is 1-indexed
+        }
+
+        let total_frames = group.count();
+
+        if filter_groups.len() == 1 {
+            // Single filter - stack all frames
+            let filter_name = filter_groups.keys().next().unwrap();
+            let safe_filter = filter_name.to_lowercase().replace(' ', "_");
+            let output_name = format!("{}_{}_stacked", safe_filter, camera_suffix);
+            let output_path = masters_dir.join(&output_name);
+
+            script.push_str(&format!(
+                "# Stack all {} frames (single filter: {})\n",
+                camera_type, filter_name
+            ));
+
+            let mut stack_cmd = format!("stack r_pp_lights");
+            stack_cmd.push_str(&format!(" rej sigma {:.1} {:.1}", rejection_low, rejection_high));
+            stack_cmd.push_str(" -norm=addscale -output_norm -weight=wfwhm");
+            if group.is_osc {
+                stack_cmd.push_str(" -rgb_equal");
+            }
+            stack_cmd.push_str(&format!(" -out={}", output_path.to_string_lossy()));
+            script.push_str(&format!("{}\n\n", stack_cmd));
+        } else {
+            // Multiple filters - stack each filter separately
+            for (filter_name, indices) in &filter_groups {
+                if indices.len() < 2 {
+                    script.push_str(&format!(
+                        "# {} ({} frame) - SKIPPED (need >= 2 frames)\n\n",
+                        filter_name, indices.len()
+                    ));
+                    continue;
+                }
+
+                let safe_filter = filter_name.to_lowercase().replace(' ', "_");
+                let output_name = format!("{}_{}_stacked", safe_filter, camera_suffix);
+                let output_path = masters_dir.join(&output_name);
+
+                script.push_str(&format!(
+                    "# Stack {} {} ({} frames)\n",
+                    camera_type, filter_name, indices.len()
+                ));
+
+                // Unselect all, then select frames for this filter
+                script.push_str(&format!("unselect r_pp_lights 1 {}\n", total_frames));
+
+                let ranges = indices_to_ranges(indices);
+                for (start, end) in &ranges {
+                    script.push_str(&format!("select r_pp_lights {} {}\n", start, end));
+                }
+
+                let mut stack_cmd = format!("stack r_pp_lights");
+                stack_cmd.push_str(&format!(" rej sigma {:.1} {:.1}", rejection_low, rejection_high));
+                stack_cmd.push_str(" -filter-included");
+                stack_cmd.push_str(" -norm=addscale -output_norm -weight=wfwhm");
+                if group.is_osc {
+                    stack_cmd.push_str(" -rgb_equal");
+                }
+                stack_cmd.push_str(&format!(" -out={}", output_path.to_string_lossy()));
+                script.push_str(&format!("{}\n\n", stack_cmd));
+            }
+        }
+    }
+
+    // Process Mono pipeline
+    if let Some(ref mono) = collected.mono {
+        generate_pipeline(
+            &mut script,
+            mono,
+            &masters_dir,
+            focal_length,
+            pixel_size,
+            rejection_low,
+            rejection_high,
+        );
+    }
+
+    // Process OSC pipeline
+    if let Some(ref osc) = collected.osc {
+        generate_pipeline(
+            &mut script,
+            osc,
+            &masters_dir,
+            focal_length,
+            pixel_size,
+            rejection_low,
+            rejection_high,
+        );
+    }
+
+    script.push_str("close\n");
+
+    // Write the script
+    let script_path = export_dir.join("02_register_and_stack.ssf");
+    fs::write(&script_path, &script)
+        .with_context(|| format!("Failed to write registration script to {:?}", script_path))?;
+
+    println!("✅ Generated registration script: {:?}", script_path);
+    Ok(script_path)
+}
+
+/// Convert a list of indices to (start, end) ranges
+fn indices_to_ranges(indices: &[usize]) -> Vec<(usize, usize)> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = indices.to_vec();
+    sorted.sort();
+
+    let mut ranges = Vec::new();
+    let mut start = sorted[0];
+    let mut end = sorted[0];
+
+    for &idx in sorted.iter().skip(1) {
+        if idx == end + 1 {
+            end = idx;
+        } else {
+            ranges.push((start, end));
+            start = idx;
+            end = idx;
+        }
+    }
+    ranges.push((start, end));
+    ranges
+}
+
+/// Run the complete Siril export pipeline
+///
+/// This orchestrates all export steps:
+/// 1. Create masters (if 00_create_masters.ssf exists)
+/// 2. Calibrate light frames (01_calibrate_lights.ssf)
+/// 3. Collect calibrated frames to dimension-based directories
+/// 4. Generate registration script based on actual dimension groups
+/// 5. Register and stack (dynamically generated 02_register_and_stack.ssf)
+pub fn run_export_pipeline(
+    export_dir: &Path,
+    app_handle: &AppHandle,
+) -> Result<()> {
+    println!("🚀 Starting Siril export pipeline for: {:?}", export_dir);
+
+    // Find Siril CLI
+    let siril_cli = find_siril_cli()
+        .ok_or_else(|| anyhow::anyhow!(
+            "Siril CLI not found. Please install Siril or set the path in settings."
+        ))?;
+    println!("  Using Siril CLI: {}", siril_cli);
+
+    // Determine which scripts exist
+    let masters_script = export_dir.join("00_create_masters.ssf");
+    let calibrate_script = export_dir.join("01_calibrate_lights.ssf");
+
+    let has_masters = masters_script.exists();
+    let has_calibrate = calibrate_script.exists();
+
+    if !has_calibrate {
+        return Err(anyhow::anyhow!(
+            "Missing required script: 01_calibrate_lights.ssf"
+        ));
+    }
+
+    // Calculate total steps: masters(opt) + calibrate + collect + generate script + register/stack
+    let total_steps = if has_masters { 5 } else { 4 };
+    let mut current_step = 1;
+
+    // Step 1: Create masters (optional)
+    if has_masters {
+        println!("\n📍 Step {}/{}: Creating calibration masters...", current_step, total_steps);
+        emit_progress(
+            app_handle,
+            ExportProgress {
+                stage: ExportStage::SirilCreatingMasters,
+                progress: (current_step as f64 / total_steps as f64) * 100.0 * 0.1,
+                message: format!("Step {}/{}: Creating calibration masters...", current_step, total_steps),
+                current_file: None,
+            },
+        );
+
+        run_siril_script(&siril_cli, &masters_script, app_handle)?;
+        current_step += 1;
+    }
+
+    // Step 2: Calibrate lights
+    println!("\n📍 Step {}/{}: Calibrating light frames...", current_step, total_steps);
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::SirilCalibrating,
+            progress: (current_step as f64 / total_steps as f64) * 100.0 * 0.3,
+            message: format!("Step {}/{}: Calibrating light frames...", current_step, total_steps),
+            current_file: None,
+        },
+    );
+
+    run_siril_script(&siril_cli, &calibrate_script, app_handle)?;
+    current_step += 1;
+
+    // Step 3: Collect calibrated frames
+    println!("\n📍 Step {}/{}: Collecting calibrated frames...", current_step, total_steps);
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::CollectingCalibratedFrames,
+            progress: (current_step as f64 / total_steps as f64) * 100.0 * 0.5,
+            message: format!("Step {}/{}: Collecting calibrated frames...", current_step, total_steps),
+            current_file: None,
+        },
+    );
+
+    let collected = collect_calibrated_frames(export_dir, app_handle)?;
+    if collected.total() == 0 {
+        return Err(anyhow::anyhow!(
+            "No calibrated frames found. Check calibration script output."
+        ));
+    }
+    println!("   Collected: {} mono, {} OSC frames",
+        collected.mono_count(), collected.osc_count());
+    current_step += 1;
+
+    // Step 4: Generate dimension-aware registration script
+    println!("\n📍 Step {}/{}: Generating registration script...", current_step, total_steps);
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::GeneratingScripts,
+            progress: (current_step as f64 / total_steps as f64) * 100.0 * 0.55,
+            message: format!("Step {}/{}: Generating registration script...",
+                current_step, total_steps),
+            current_file: None,
+        },
+    );
+
+    // Default parameters - these can be made configurable in the future
+    let focal_length = 500.0;  // mm - common default
+    let pixel_size = 3.76;     // um - common for ASI/QHY cameras
+    let rejection_low = 2.5;
+    let rejection_high = 2.5;
+
+    let register_script = generate_registration_script(
+        &collected,
+        export_dir,
+        focal_length,
+        pixel_size,
+        rejection_low,
+        rejection_high,
+    )?;
+    current_step += 1;
+
+    // Step 5: Register and stack
+    println!("\n📍 Step {}/{}: Registering and stacking...", current_step, total_steps);
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::SirilRegistering,
+            progress: (current_step as f64 / total_steps as f64) * 100.0 * 0.7,
+            message: format!("Step {}/{}: Registering and stacking...", current_step, total_steps),
+            current_file: None,
+        },
+    );
+
+    run_siril_script(&siril_cli, &register_script, app_handle)?;
+
+    // Complete!
+    emit_progress(
+        app_handle,
+        ExportProgress {
+            stage: ExportStage::Complete,
+            progress: 100.0,
+            message: "Export pipeline complete!".to_string(),
+            current_file: None,
+        },
+    );
+
+    println!("\n✅ Export pipeline complete!");
+    println!("   Check masters/ directory for stacked results");
+
+    Ok(())
 }
 
 #[cfg(test)]

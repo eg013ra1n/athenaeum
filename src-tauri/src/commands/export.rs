@@ -1323,6 +1323,8 @@ pub async fn export_frame_set_v3(
 
     // Step 3: Execute Siril (if direct execution mode and Siril target)
     if export_target == ExportTarget::Siril && export_mode == ExportMode::DirectExecution {
+        use crate::export::siril::collect_calibrated_frames;
+
         let siril_path = {
             let state_lock = state.db.lock().unwrap();
             let db = state_lock.as_ref().ok_or("Database not initialized")?;
@@ -1340,15 +1342,22 @@ pub async fn export_frame_set_v3(
             .or_else(find_siril_cli)
             .ok_or("Siril CLI not found. Please configure the path in settings.")?;
 
-        // Run scripts in order (masters → calibration → registration+stacking)
-        // Script 02 now does both registration AND per-filter stacking using -filter-incl
+        let output_path = PathBuf::from(&output_dir);
+
+        // Run scripts in order with frame collection between calibration and registration
+        // Order: 00_create_masters → 01_calibrate_lights → [collect frames] → 02_register_and_stack
         for script_path in &result.scripts_generated {
+            let script_name = PathBuf::from(script_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
             let _ = app_handle.emit(
                 "export-progress",
                 ExportProgress {
                     stage: ExportStage::SirilCalibrating,
                     progress: 0.0,
-                    message: format!("Running {}...", script_path),
+                    message: format!("Running {}...", script_name),
                     current_file: Some(script_path.clone()),
                 },
             );
@@ -1359,6 +1368,33 @@ pub async fn export_frame_set_v3(
                 result
                     .warnings
                     .push(format!("Script {} failed: {}", script_path, e));
+                // Don't continue if a script fails
+                break;
+            }
+
+            // After calibration script, collect frames before registration
+            if script_name.contains("01_calibrate") {
+                let _ = app_handle.emit(
+                    "export-progress",
+                    ExportProgress {
+                        stage: ExportStage::CollectingCalibratedFrames,
+                        progress: 0.0,
+                        message: "Collecting calibrated frames...".to_string(),
+                        current_file: None,
+                    },
+                );
+
+                match collect_calibrated_frames(&output_path, &app_handle) {
+                    Ok(collected) => {
+                        println!("✅ Collected {} calibrated frames ({} mono, {} OSC)",
+                            collected.total(), collected.mono_count(), collected.osc_count());
+                    }
+                    Err(e) => {
+                        result.warnings.push(format!("Failed to collect frames: {}", e));
+                        // This is critical - can't continue without collected frames
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1548,4 +1584,38 @@ pub struct RegisteredFilesStatus {
 pub struct FilterOrganizedInfo {
     pub filter_name: String,
     pub file_count: usize,
+}
+
+// ============================================================================
+// Pipeline Execution Commands
+// ============================================================================
+
+/// Run the complete Siril export pipeline automatically
+///
+/// This command orchestrates all export steps in sequence:
+/// 1. Create calibration masters (if 00_create_masters.ssf exists)
+/// 2. Calibrate light frames (01_calibrate_lights.ssf)
+/// 3. Collect calibrated frames to unified directory
+/// 4. Register and stack (02_register_and_stack.ssf)
+///
+/// Progress events are emitted throughout the process.
+#[tauri::command]
+pub async fn run_siril_export_pipeline(
+    app_handle: tauri::AppHandle,
+    export_dir: String,
+) -> Result<String, String> {
+    use crate::export::siril::run_export_pipeline;
+
+    let export_path = PathBuf::from(&export_dir);
+
+    // Verify the directory exists
+    if !export_path.exists() {
+        return Err(format!("Export directory does not exist: {}", export_dir));
+    }
+
+    // Run the pipeline
+    run_export_pipeline(&export_path, &app_handle)
+        .map_err(|e| e.to_string())?;
+
+    Ok("Export pipeline completed successfully".to_string())
 }

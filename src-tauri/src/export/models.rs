@@ -743,8 +743,12 @@ pub enum ExportStage {
     Organizing,
     /// Generating scripts
     GeneratingScripts,
+    /// Creating calibration masters
+    SirilCreatingMasters,
     /// Running Siril calibration
     SirilCalibrating,
+    /// Collecting calibrated frames to unified directory
+    CollectingCalibratedFrames,
     /// Running Siril registration
     SirilRegistering,
     /// Running Siril stacking
@@ -834,21 +838,22 @@ fn format_exptime_display(exptime: f64) -> String {
 
 /// A stacking group for frames with similar exposure times
 ///
-/// Groups frames by filter AND exposure time to ensure only similar
-/// exposures are stacked together.
+/// Groups frames by filter, camera type, AND exposure time to ensure only
+/// compatible frames are stacked together. OSC (3-channel) and Mono (1-channel)
+/// frames cannot be stacked together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExptimeStackGroup {
     /// Filter name for this group
     pub filter: Option<String>,
+    /// Camera type for this group (OSC or Mono) - frames must match
+    pub camera_type: CameraType,
     /// Representative exposure time for this group
     pub exptime: Option<f64>,
     /// Display string for output filename (e.g., "60s", "300s")
     pub exptime_display: String,
     /// Frame indices in the registered sequence (1-based)
     pub frame_indices: Vec<usize>,
-    /// Whether this group has OSC (color) frames
-    pub has_osc: bool,
 }
 
 impl GlobalRegistrationPlan {
@@ -941,11 +946,14 @@ impl GlobalRegistrationPlan {
             .collect()
     }
 
-    /// Group branches into stacking groups by filter and exposure time
+    /// Group branches into stacking groups by filter, camera type, and exposure time
     ///
     /// Returns a list of `ExptimeStackGroup` that can be iterated over for stacking.
-    /// Each group contains frames that share the same filter and have exposure times
-    /// within the specified tolerance.
+    /// Each group contains frames that share the same filter, camera type, and have
+    /// exposure times within the specified tolerance.
+    ///
+    /// **Critical**: OSC (3-channel) and Mono (1-channel) frames cannot be stacked
+    /// together, so camera_type is always used as a grouping dimension.
     pub fn stacking_groups(
         &self,
         mode: &ExptimeToleranceMode,
@@ -953,26 +961,36 @@ impl GlobalRegistrationPlan {
     ) -> Vec<ExptimeStackGroup> {
         let mut groups = Vec::new();
 
+        // Group by filter AND camera type (required - can't mix OSC and Mono)
         for filter in &self.filters {
-            let branches = self.branches_for_filter(filter);
+            for camera_type in &self.camera_types {
+                let branches = self.branches_for_filter_and_camera(filter, camera_type);
 
-            match mode {
-                ExptimeToleranceMode::Disabled => {
-                    // All branches with same filter go in one group
-                    let frame_indices = self.frame_indices_for_filter(filter);
-                    let has_osc = branches.iter().any(|b| b.camera_type == CameraType::Osc);
-
-                    groups.push(ExptimeStackGroup {
-                        filter: filter.clone(),
-                        exptime: None,
-                        exptime_display: String::new(),
-                        frame_indices,
-                        has_osc,
-                    });
+                if branches.is_empty() {
+                    continue;
                 }
-                ExptimeToleranceMode::Absolute | ExptimeToleranceMode::Relative => {
-                    let clustered = self.cluster_by_exptime(&branches, filter, mode, tolerance);
-                    groups.extend(clustered);
+
+                match mode {
+                    ExptimeToleranceMode::Disabled => {
+                        // All branches with same filter + camera_type go in one group
+                        let frame_indices: Vec<usize> = branches
+                            .iter()
+                            .flat_map(|b| b.start_frame..=b.end_frame)
+                            .collect();
+
+                        groups.push(ExptimeStackGroup {
+                            filter: filter.clone(),
+                            camera_type: camera_type.clone(),
+                            exptime: None,
+                            exptime_display: String::new(),
+                            frame_indices,
+                        });
+                    }
+                    ExptimeToleranceMode::Absolute | ExptimeToleranceMode::Relative => {
+                        let clustered =
+                            self.cluster_by_exptime(&branches, filter, camera_type, mode, tolerance);
+                        groups.extend(clustered);
+                    }
                 }
             }
         }
@@ -985,6 +1003,7 @@ impl GlobalRegistrationPlan {
         &self,
         branches: &[&BranchMergeInfo],
         filter: &Option<String>,
+        camera_type: &CameraType,
         mode: &ExptimeToleranceMode,
         tolerance: f64,
     ) -> Vec<ExptimeStackGroup> {
@@ -1003,14 +1022,13 @@ impl GlobalRegistrationPlan {
                 .iter()
                 .flat_map(|b| b.start_frame..=b.end_frame)
                 .collect();
-            let has_osc = branches.iter().any(|b| b.camera_type == CameraType::Osc);
 
             return vec![ExptimeStackGroup {
                 filter: filter.clone(),
+                camera_type: camera_type.clone(),
                 exptime: None,
                 exptime_display: String::new(),
                 frame_indices,
-                has_osc,
             }];
         }
 
@@ -1060,6 +1078,7 @@ impl GlobalRegistrationPlan {
         }
 
         // Convert clusters to ExptimeStackGroups
+        let camera_type = camera_type.clone();
         clusters
             .into_iter()
             .map(|cluster| {
@@ -1067,8 +1086,6 @@ impl GlobalRegistrationPlan {
                     .iter()
                     .flat_map(|b| b.start_frame..=b.end_frame)
                     .collect();
-
-                let has_osc = cluster.iter().any(|b| b.camera_type == CameraType::Osc);
 
                 // Calculate representative exposure time (median of cluster)
                 let mut exptimes: Vec<f64> = cluster.iter().filter_map(|b| b.exptime).collect();
@@ -1086,10 +1103,10 @@ impl GlobalRegistrationPlan {
 
                 ExptimeStackGroup {
                     filter: filter.clone(),
+                    camera_type: camera_type.clone(),
                     exptime,
                     exptime_display,
                     frame_indices,
-                    has_osc,
                 }
             })
             .collect()

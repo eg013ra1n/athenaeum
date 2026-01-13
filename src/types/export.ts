@@ -4,10 +4,8 @@
  * Export operation mode
  */
 export type ExportMode =
-  | 'generate_scripts'
-  | 'organize_files'
-  | 'organize_and_script'
-  | 'direct_execution';
+  | 'direct_execution'
+  | 'organize_and_script';
 
 /**
  * Siril processing workflow type
@@ -389,7 +387,9 @@ export type ExportStage =
   | 'collecting'
   | 'organizing'
   | 'generating_scripts'
+  | 'siril_creating_masters'
   | 'siril_calibrating'
+  | 'collecting_calibrated_frames'
   | 'siril_registering'
   | 'siril_stacking'
   | 'complete'

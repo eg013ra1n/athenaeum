@@ -25,7 +25,6 @@ import type {
   RejectionAlgorithm,
   ImageWeightingMethod,
   DrizzleScale,
-  ExptimeToleranceMode,
 } from '../../types/export';
 
 interface ExportWizardProps {
@@ -38,7 +37,7 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     initialFrameSetId ?? null
   );
   const [exportTarget, setExportTarget] = useState<ExportTarget>('siril');
-  const [mode, setMode] = useState<ExportMode>('organize_and_script');
+  const [mode, setMode] = useState<ExportMode>('direct_execution');
   const [workflow, setWorkflow] = useState<SirilWorkflow>('mono_preprocessing');
   const [outputDir, setOutputDir] = useState<string>('');
   const [rejectionLow, setRejectionLow] = useState(2.5);
@@ -58,8 +57,8 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   const [drizzleScale, setDrizzleScale] = useState<DrizzleScale>('x2');
 
   // Exposure time tolerance (for grouping frames with similar exposures)
-  const [exptimeToleranceMode, setExptimeToleranceMode] = useState<ExptimeToleranceMode>('disabled');
-  const [exptimeToleranceValue, setExptimeToleranceValue] = useState(30);
+  const [exptimeToleranceEnabled, setExptimeToleranceEnabled] = useState(true);
+  const [exptimeToleranceSeconds, setExptimeToleranceSeconds] = useState(3);
 
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
@@ -124,8 +123,8 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
           drizzleEnabled,
           drizzleScale,
           // Exposure time grouping
-          exptimeToleranceMode,
-          exptimeToleranceValue,
+          exptimeToleranceMode: exptimeToleranceEnabled ? 'absolute' : 'disabled',
+          exptimeToleranceValue: exptimeToleranceSeconds,
         });
       } else {
         // Use legacy export with manual workflow selection
@@ -163,8 +162,8 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     drizzleEnabled,
     drizzleScale,
     // Exposure time grouping
-    exptimeToleranceMode,
-    exptimeToleranceValue,
+    exptimeToleranceEnabled,
+    exptimeToleranceSeconds,
   ]);
 
   // Check if ready to export
@@ -518,39 +517,31 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
 
                     {/* Exposure Time Grouping */}
                     <div className="space-y-2">
-                      <label className="block text-sm text-gray-400 mb-1">
-                        Exposure Time Grouping
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={exptimeToleranceEnabled}
+                          onChange={(e) => setExptimeToleranceEnabled(e.target.checked)}
+                          className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-500 focus:ring-blue-500"
+                        />
+                        <span className="text-gray-200">Group frames by exposure time</span>
                       </label>
-                      <select
-                        value={exptimeToleranceMode}
-                        onChange={(e) => setExptimeToleranceMode(e.target.value as ExptimeToleranceMode)}
-                        className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
-                      >
-                        <option value="disabled">Disabled (stack all frames together)</option>
-                        <option value="absolute">Absolute tolerance (seconds)</option>
-                        <option value="relative">Relative tolerance (percent)</option>
-                      </select>
-                      <p className="text-xs text-gray-500">
-                        Group frames with similar exposure times into separate stacks
-                      </p>
-                      {exptimeToleranceMode !== 'disabled' && (
-                        <div className="mt-2">
+                      {exptimeToleranceEnabled && (
+                        <div className="ml-6">
                           <label className="block text-sm text-gray-400 mb-1">
-                            Tolerance {exptimeToleranceMode === 'absolute' ? '(seconds)' : '(%)'}
+                            Tolerance (seconds)
                           </label>
                           <input
                             type="number"
-                            value={exptimeToleranceValue}
-                            onChange={(e) => setExptimeToleranceValue(parseFloat(e.target.value) || 30)}
-                            step={exptimeToleranceMode === 'absolute' ? 1 : 5}
-                            min={exptimeToleranceMode === 'absolute' ? 1 : 1}
-                            max={exptimeToleranceMode === 'absolute' ? 300 : 50}
-                            className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
+                            value={exptimeToleranceSeconds}
+                            onChange={(e) => setExptimeToleranceSeconds(parseFloat(e.target.value) || 3)}
+                            step="1"
+                            min="1"
+                            max="60"
+                            className="w-32 px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-200"
                           />
                           <p className="text-xs text-gray-500 mt-1">
-                            {exptimeToleranceMode === 'absolute'
-                              ? 'Frames within ±X seconds will be stacked together (e.g., 30s groups 55s-85s frames)'
-                              : 'Frames within ±X% will be stacked together (e.g., 10% groups 54s-66s for 60s center)'}
+                            Frames within ±{exptimeToleranceSeconds}s will be stacked together
                           </p>
                         </div>
                       )}

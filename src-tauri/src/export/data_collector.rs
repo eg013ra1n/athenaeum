@@ -58,7 +58,7 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
     let mut all_warnings = Vec::new();
     let mut flats_complete = true;
     let mut darks_complete = true;
-    let bias_complete = true;
+    let mut bias_complete = true;
 
     for (filter, frames) in filter_groups {
         // For each filter group, collect calibrations from the first frame
@@ -106,7 +106,9 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         if dark_sets.is_empty() {
             darks_complete = false;
         }
-        // Bias is optional, so we don't track completeness
+        if bias_sets.is_empty() {
+            bias_complete = false;
+        }
 
         filters.push(FilterExportGroup {
             filter,

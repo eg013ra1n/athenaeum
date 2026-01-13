@@ -63,6 +63,22 @@ function GroupTree({ group }: GroupTreeProps) {
       {/* Tree Content */}
       {expanded && (
         <div className="p-3 bg-gray-900/50">
+          {/* Stacking Summary */}
+          <div className="mb-3 pb-3 border-b border-gray-700">
+            <div className="text-sm text-gray-400">
+              <span className="font-medium text-gray-300">Stacking:</span>{' '}
+              {group.lightCount} light frames ({formatExposure(group.totalExposure)} total)
+              {group.subgroupCount > 1 && (
+                <span className="text-blue-400"> → {group.subgroupCount} separate stacks by exposure time</span>
+              )}
+              {group.subgroupCount === 1 && (
+                <span className="text-green-400"> → 1 combined stack</span>
+              )}
+            </div>
+          </div>
+
+          {/* Calibration Hierarchy */}
+          <div className="text-xs text-gray-500 mb-2 uppercase tracking-wide">Calibration Chain</div>
           {group.calibrationTree.map((node, index) => (
             <TreeNode key={index} node={node} depth={0} />
           ))}
@@ -106,13 +122,16 @@ function TreeNode({ node, depth }: TreeNodeProps) {
         {/* Node Icon */}
         <Icon size={14} className={iconColor} />
 
-        {/* Label */}
+        {/* Label with frame count */}
         <span
           className={`text-sm ${
             node.isMissing ? 'text-red-400 italic' : 'text-gray-200'
           }`}
         >
           {node.label}
+          {node.count > 0 && node.nodeType !== 'Light' && (
+            <span className="text-gray-500 ml-1">({node.count} frames)</span>
+          )}
         </span>
 
         {/* Status indicators */}

@@ -167,6 +167,7 @@ pub fn run() {
             commands::get_export_preview_v3,
             commands::organize_registered_files_cmd,
             commands::get_registered_files_status,
+            commands::run_siril_export_pipeline,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

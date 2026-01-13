@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   ExportData,
   ExportResult,
@@ -14,6 +15,8 @@ import type {
   ImageWeightingMethod,
   DrizzleScale,
   ExptimeToleranceMode,
+  ExportProgress,
+  ExportStage,
 } from '../types/export';
 
 interface UseExportDataResult {
@@ -363,4 +366,126 @@ export function useExportV2(): UseExportV2Result {
   }, []);
 
   return { execute, loading, error, result };
+}
+
+// ============================================================================
+// Pipeline Execution Hook
+// ============================================================================
+
+interface UseExportExecutionResult {
+  /** Current progress state */
+  progress: ExportProgress | null;
+  /** Whether the pipeline is currently running */
+  isRunning: boolean;
+  /** Error message if pipeline failed */
+  error: string | null;
+  /** Start the export pipeline for a given export directory */
+  runPipeline: (exportDir: string) => Promise<void>;
+  /** Clear the progress state */
+  reset: () => void;
+}
+
+/**
+ * Hook to execute the Siril export pipeline and track progress
+ *
+ * This hook:
+ * - Listens for `export-progress` events from the backend
+ * - Provides a `runPipeline` function to start automatic execution
+ * - Tracks progress through all stages (masters → calibrate → collect → register/stack)
+ *
+ * Usage:
+ * ```typescript
+ * const { progress, isRunning, runPipeline, error } = useExportExecution();
+ *
+ * // Start the pipeline
+ * await runPipeline('/path/to/export');
+ *
+ * // Display progress
+ * if (progress) {
+ *   console.log(`${progress.stage}: ${progress.message} (${progress.progress}%)`);
+ * }
+ * ```
+ */
+export function useExportExecution(): UseExportExecutionResult {
+  const [progress, setProgress] = useState<ExportProgress | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Listen for progress events
+  useEffect(() => {
+    let unlisten: UnlistenFn;
+
+    const setupListener = async () => {
+      unlisten = await listen<ExportProgress>('export-progress', (event) => {
+        setProgress(event.payload);
+
+        // Auto-detect completion or failure
+        if (event.payload.stage === 'complete') {
+          setIsRunning(false);
+        } else if (event.payload.stage === 'failed') {
+          setIsRunning(false);
+          setError(event.payload.message);
+        }
+      });
+    };
+
+    setupListener();
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  const runPipeline = useCallback(async (exportDir: string) => {
+    setIsRunning(true);
+    setError(null);
+    setProgress(null);
+
+    try {
+      await invoke<string>('run_siril_export_pipeline', { exportDir });
+    } catch (err) {
+      const errorMessage = err as string;
+      setError(errorMessage);
+      setIsRunning(false);
+      throw new Error(errorMessage);
+    }
+  }, []);
+
+  const reset = useCallback(() => {
+    setProgress(null);
+    setError(null);
+    setIsRunning(false);
+  }, []);
+
+  return { progress, isRunning, error, runPipeline, reset };
+}
+
+/**
+ * Get a human-readable label for an export stage
+ */
+export function getStageLabel(stage: ExportStage): string {
+  switch (stage) {
+    case 'collecting':
+      return 'Collecting frames';
+    case 'organizing':
+      return 'Organizing files';
+    case 'generating_scripts':
+      return 'Generating scripts';
+    case 'siril_creating_masters':
+      return 'Creating calibration masters';
+    case 'siril_calibrating':
+      return 'Calibrating light frames';
+    case 'collecting_calibrated_frames':
+      return 'Collecting calibrated frames';
+    case 'siril_registering':
+      return 'Registering frames';
+    case 'siril_stacking':
+      return 'Stacking frames';
+    case 'complete':
+      return 'Complete';
+    case 'failed':
+      return 'Failed';
+    default:
+      return stage;
+  }
 }
