@@ -108,10 +108,15 @@ impl WBPPFolders {
         Self { root }
     }
 
-    /// Get path for camera root: camera {camera_name}/
-    /// Note: WBPP requires space separator, not underscore
+    /// Get path for camera root: camera_{camera_name}/
+    /// Camera name is lowercased with all non-alphanumeric characters removed
     pub fn camera_path(&self, camera_name: &str) -> PathBuf {
-        self.root.join(format!("camera {}", sanitize_folder_name(camera_name)))
+        let clean_name: String = camera_name
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        self.root.join(format!("camera_{}", clean_name))
     }
 
     /// Get path for darks folder (contains all dark-type frames): {camera}/darks/
