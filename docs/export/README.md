@@ -1,391 +1,366 @@
-# Export Module Documentation
+# Athenaeum Export System Documentation
 
 ## Overview
 
-The Export module enables users to export frame sets with their linked calibration frames for processing in external stacking software. The primary integration is with **Siril**, a free and open-source astronomical image processing application.
-
-## Current State
-
-**Status: Phase 1 Complete (Backend + UI) - Needs Testing**
-
-The export module has been implemented with the following capabilities:
-- Frame set selection with metadata preview
-- Calibration summary display (flats, darks, bias counts)
-- Multiple export modes (scripts only, organize files, direct execution)
-- Multiple Siril workflows (Mono, OSC, LRGB)
-- File organization into standard folder structure
-- Siril script generation (.ssf files)
-
-### Known Issues
-- Light frame detection may have issues with database query execution
-- Direct Siril execution not yet tested
-- Progress events during Siril execution need verification
+The export system prepares astrophotography data for processing in Siril or PixInsight WBPP. It handles:
+- Calibration frame matching and hierarchy building
+- File organization into processing-ready folder structures
+- Siril script generation for automated preprocessing
+- Pipeline execution with progress tracking
 
 ---
 
-## Architecture
-
-### Backend Structure
+## Export Workflow (High-Level)
 
 ```
-src-tauri/src/export/
-├── mod.rs                 # Module exports
-├── models.rs              # Data structures (ExportConfig, ExportData, etc.)
-├── data_collector.rs      # Collects frames + calibrations from database
-├── file_organizer.rs      # Creates folder structure, copies/symlinks files
-└── siril/
-    ├── mod.rs             # Siril submodule exports
-    ├── templates.rs       # Siril script templates
-    ├── script_generator.rs # Generates .ssf scripts from templates
-    └── cli_runner.rs      # Executes siril-cli with progress tracking
-```
-
-### Frontend Structure
-
-```
-src/
-├── types/export.ts                    # TypeScript interfaces
-├── hooks/useExportData.ts             # React hooks for export operations
-├── components/export/
-│   ├── index.ts                       # Component exports
-│   ├── ExportWizard.tsx               # Main wizard component
-│   ├── FrameSetSelector.tsx           # Frame set selection
-│   ├── ExportModeSelector.tsx         # Export mode options
-│   ├── WorkflowSelector.tsx           # Siril workflow selection
-│   ├── CalibrationPreview.tsx         # Calibration summary display
-│   └── ExportProgress.tsx             # Progress indicator
-└── pages/Export.tsx                   # Export page
-```
-
-### Tauri Commands
-
-| Command | Description |
-|---------|-------------|
-| `get_export_preview` | Collect frames and calibrations for preview |
-| `export_frame_set` | Execute export (organize + generate scripts) |
-| `get_siril_path` | Get configured Siril CLI path |
-| `set_siril_path` | Save Siril CLI path to settings |
-| `get_exportable_frame_sets` | List available frame sets |
-
----
-
-## Data Flow
-
-### 1. Frame Collection
-
-```
-Frame Set (frames_set)
-    └── Imaging Nights (imaging_nights)
-        └── Sessions (sessions)
-            └── Session Members (session_members)
-                └── Frames (frames) where imagetyp = 'Light'
-```
-
-The `data_collector.rs` traverses this hierarchy to find all light frames belonging to a frame set.
-
-### 2. Calibration Linking
-
-For each light frame, calibrations are retrieved from `calibration_set_to_frames`:
-
-```
-Light Frame
-    ├── Flat Set (calibration_type = 'Flat')
-    │   └── Sub-calibrations (Dark for Flat, or Bias)
-    ├── Dark Set (calibration_type = 'Dark')
-    │   └── Sub-calibrations (Bias for Dark)
-    └── Bias Set (calibration_type = 'Bias')
-```
-
-### 3. Export Execution
-
-```
-User Selection
-    │
-    ▼
-┌─────────────────────────────────┐
-│  collect_export_data()          │  ← Gather all frames + calibrations
-└─────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────┐
-│  organize_files()               │  ← Create folders, copy/symlink files
-└─────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────┐
-│  generate_scripts()             │  ← Create .ssf Siril scripts
-└─────────────────────────────────┘
-    │
-    ▼ (if DirectExecution mode)
-┌─────────────────────────────────┐
-│  run_siril_script()             │  ← Execute siril-cli
-└─────────────────────────────────┘
+1. User selects Frame Set
+       ↓
+2. Data Collection (collect_export_data_v3)
+   ├─ Query light frames from frame set
+   ├─ Get calibration chain for each light (flat → dark → bias)
+   ├─ Group into "branches" (camera × calibration × filter)
+   └─ Build master creation plan (topological sort)
+       ↓
+3. User Reviews Calibration Tree
+   ├─ See lights grouped by filter/camera
+   ├─ Review calibration completeness
+   └─ Check warnings (missing cals, temp mismatches)
+       ↓
+4. Export Execution (export_frame_set_v3)
+   ├─ Step 1: Organize files into folder structure
+   ├─ Step 2: Generate Siril scripts (3 scripts)
+   └─ Step 3: Execute scripts (DirectExecution mode)
+       ↓
+5. Results
+   ├─ Master calibration frames
+   ├─ Calibrated light frames
+   └─ Stacked images per filter
 ```
 
 ---
 
-## Folder Structure Created
+## Key Concepts
 
-When exporting, the following folder structure is created:
+### What is a "Branch"?
 
-```
-{output_dir}/
-├── Lights/
-│   ├── Ha/              # Lights grouped by filter
-│   ├── OIII/
-│   └── SII/
-├── Calibration/
-│   ├── Darks/
-│   ├── Flats/
-│   │   ├── Ha/          # Flats grouped by filter
-│   │   ├── OIII/
-│   │   └── SII/
-│   ├── Bias/
-│   └── DarkFlats/
-├── masters/             # Generated master calibration frames
-├── process/             # Siril working directory
-├── result/              # Final stacked images
-├── Ha_preprocessing.ssf # Siril script per filter
-├── OIII_preprocessing.ssf
-└── SII_preprocessing.ssf
-```
-
----
-
-## Siril Script Generation
-
-### Workflow Types
-
-1. **Mono Preprocessing** (`mono_preprocessing`)
-   - Processes each filter separately
-   - Best for narrowband imaging or LRGB with mono camera
-   - Generates one script per filter
-
-2. **OSC Preprocessing** (`osc_preprocessing`)
-   - Processes one-shot color camera images
-   - Includes debayering step
-   - Single script for all lights
-
-3. **LRGB Processing** (`lrgb_processing`)
-   - Combines L, R, G, B channels
-   - Assumes individual channels already preprocessed
-   - Creates RGB composite
-
-### Script Template Variables
-
-| Variable | Description |
-|----------|-------------|
-| `{working_dir}` | Base output directory |
-| `{filter}` | Filter name (e.g., "Ha", "OIII") |
-| `{rejection_low}` | Low sigma for stacking rejection |
-| `{rejection_high}` | High sigma for stacking rejection |
-| `{lights_dir}` | Path to light frames |
-| `{darks_dir}` | Path to dark frames |
-| `{flats_dir}` | Path to flat frames |
-| `{bias_dir}` | Path to bias frames |
-| `{masters_dir}` | Path for master frames |
-| `{process_dir}` | Siril working directory |
-| `{result_dir}` | Output directory for stacked images |
-
-### Example Generated Script
+A **CalibrationBranch** represents a unique path through the calibration hierarchy:
 
 ```
-############################################
-# Siril Preprocessing Script - Ha
-# Generated by Athenaeum
-############################################
+Branch = Camera + Bias Set + Dark Set + Flat Set + Filter
 
-requires 1.2.0
-cd /Users/astro/export/M42
+Example branches in a typical export:
+- QHY268M → Bias#23 → Dark#56 → Flat#38 → Ha filter (10 lights)
+- QHY268M → Bias#23 → Dark#56 → Flat#39 → OIII filter (8 lights)
+- ASI2600 → Bias#45 → Dark#67 → Flat#50 → L filter (15 lights)
+```
 
-# Create Master Bias
-cd /Users/astro/export/M42/Calibration/Bias
-convert bias -out=/Users/astro/export/M42/process
-cd /Users/astro/export/M42/process
-stack bias rej 3 3 -nonorm -out=/Users/astro/export/M42/masters/master_bias
+Each branch gets its own folder and calibration workflow.
 
-# Create Master Dark
-cd /Users/astro/export/M42/Calibration/Darks
-convert darks -out=/Users/astro/export/M42/process
-cd /Users/astro/export/M42/process
-stack darks rej 3 3 -nonorm -out=/Users/astro/export/M42/masters/master_dark
+### Camera Type Detection
 
-# Create Master Flat
-cd /Users/astro/export/M42/Calibration/Flats/Ha
-convert flats -out=/Users/astro/export/M42/process
-cd /Users/astro/export/M42/process
-calibrate flats -dark=/Users/astro/export/M42/masters/master_dark
-stack pp_flats rej 3 3 -norm=mul -out=/Users/astro/export/M42/masters/master_flat
+```
+OSC (One-Shot Color): Has Bayer pattern (RGGB, BGGR, etc.)
+Mono: No Bayer pattern or empty BAYERPAT field
+```
 
-# Process Lights
-cd /Users/astro/export/M42/Lights/Ha
-convert lights -out=/Users/astro/export/M42/process
-cd /Users/astro/export/M42/process
-calibrate pp_lights -dark=/Users/astro/export/M42/masters/master_dark -flat=/Users/astro/export/M42/masters/master_flat -cc=dark
+**Critical**: OSC and Mono frames cannot be stacked together (different layer counts). The system creates separate pipelines.
 
-# Register
-register pp_lights
+### Master Creation Plan
 
-# Stack
-stack r_pp_lights rej 3 3 -norm=addscale -output_norm -out=/Users/astro/export/M42/result/Ha_stacked
-
-close
+Masters are created in dependency order:
+```
+1. Bias (no dependencies)
+2. Dark (optionally uses Bias)
+3. DarkFlat (optionally uses Bias)
+4. Flat (uses DarkFlat OR Dark OR Bias - see fallback chain)
 ```
 
 ---
 
-## Export Modes
+## Calibration Hierarchy & Fallback Chains
 
-| Mode | Description | Files Copied | Scripts Generated | Siril Executed |
-|------|-------------|:------------:|:-----------------:|:--------------:|
-| `generate_scripts` | Scripts only | No | Yes | No |
-| `organize_files` | Organize only | Yes | No | No |
-| `organize_and_script` | Both | Yes | Yes | No |
-| `direct_execution` | Full pipeline | Yes | Yes | Yes |
+### For Light Frames
+```
+Light
+├─ Flat (matched by: camera, filter, gain, offset, binning)
+├─ Dark (matched by: camera, exptime, gain, offset, binning, temp)
+└─ Bias (matched by: camera, gain, offset, binning)
+```
+
+### For Flat Masters (Complex!)
+```
+Flat calibration priority:
+1. DarkFlat (same exposure as flat) ← BEST
+2. Dark with exposure match (±30%) ← GOOD
+3. Bias only ← FALLBACK (prevents over-subtraction)
+4. No calibration ← LAST RESORT
+```
+
+**Why this matters**: Using a 300s dark for a 2s flat causes bright edges (over-subtraction). The fallback chain prevents this.
+
+### For Dark Masters
+```
+Dark calibration:
+1. Bias (for dark current optimization)
+2. No calibration (acceptable - darks are stable)
+```
+
+---
+
+## Generated Siril Scripts
+
+### Script 1: `00_create_masters.ssf`
+
+Creates all master calibration frames in dependency order.
+
+```bash
+# For each master in topological order:
+cd biases/set_23/
+convert bias
+stack bias rej sigma 2.5 2.5 -nonorm -out=../masters/master_bias_23.fit
+
+cd ../darks/set_56/
+convert dark
+calibrate dark -bias=../masters/master_bias_23.fit
+stack pp_dark rej sigma 2.5 2.5 -nonorm -out=../masters/master_dark_56.fit
+
+cd ../flats/set_38_ha/
+convert flat
+calibrate flat -dark=../masters/master_dark_56.fit  # Or -bias if no matching dark
+stack pp_flat rej sigma 2.5 2.5 -norm=mul -out=../masters/master_flat_38.fit
+```
+
+### Script 2: `01_calibrate_lights.ssf`
+
+Calibrates all light frames using created masters.
+
+```bash
+# For each branch:
+cd lights/branch_01_ha/
+convert lights
+calibrate lights -flat=../masters/master_flat_38.fit -dark=../masters/master_dark_56.fit -cc=dark
+# Produces: pp_lights_00001.fit, pp_lights_00002.fit, ...
+```
+
+**OSC-specific flags:**
+- `-cfa` for cosmetic correction (preserves Bayer pattern)
+- `-debayer` (unless drizzle enabled)
+
+### Script 3: `02_register_and_stack.ssf`
+
+Registers all lights globally, then stacks per filter.
+
+**Dual Pipeline Architecture** (when both OSC and Mono present):
+```bash
+# MONO PIPELINE
+cd process/all_lights_mono/
+convert pp_lights -out=. -fitseq
+seqplatesolve pp_lights -focal=500.0 -pixelsize=3.76
+register pp_lights -2pass
+convert r_pp_lights -out=. -fitseq
+# Stack per filter using frame selection
+unselect r_pp_lights 1 30
+select r_pp_lights 1 10        # Ha frames
+stack r_pp_lights rej sigma 2.5 2.5 -filter-included -norm=addscale -out=../masters/ha_mono_stacked
+
+# OSC PIPELINE
+cd process/all_lights_osc/
+# Same steps but with -rgb_equal for stacking
+```
+
+---
+
+## Folder Structure
+
+### Siril Export Structure
+```
+export_root/
+├── biases/
+│   └── set_23/           # Bias frames for set #23
+├── darks/
+│   └── set_56/           # Dark frames for set #56
+├── flats/
+│   ├── set_38_ha/        # Flat frames for set #38, Ha filter
+│   └── set_39_oiii/      # Flat frames for set #39, OIII filter
+├── lights/
+│   ├── branch_01_ha/     # Light frames: branch 1, Ha
+│   └── branch_02_oiii/   # Light frames: branch 2, OIII
+├── masters/              # Output: master_bias_23.fit, etc.
+└── process/
+    ├── all_lights_mono/  # Collected calibrated mono frames
+    └── all_lights_osc/   # Collected calibrated OSC frames
+```
+
+### WBPP Export Structure
+```
+export_root/
+└── camera QHY268M/
+    ├── darks/            # All dark-type frames (bias, dark, darkflat)
+    └── flats_38/
+        ├── flat_*.fit    # Flat frames
+        └── lights/
+            └── light_*.fit
+```
+
+---
+
+## Exposure Time Grouping
+
+When enabled, frames are grouped by similar exposure times before stacking:
+
+```
+Mode: Absolute (tolerance: 30s)
+Frames: 60s, 60s, 65s, 300s, 300s, 305s
+Result:
+  - Group 1: 60/60/65 → "60s_stacked"
+  - Group 2: 300/300/305 → "300s_stacked"
+
+Mode: Relative (tolerance: 10%)
+Frames: 30s, 33s, 300s, 330s
+Result:
+  - Group 1: 30/33 (within 10%) → "30s_stacked"
+  - Group 2: 300/330 (within 10%) → "300s_stacked"
+```
+
+---
+
+## Edge Cases & Failure Modes
+
+### 1. Insufficient Frames (< 2)
+**Behavior**: Branch skipped in script with comment
+```bash
+# SKIPPED: Siril requires at least 2 frames
+```
+**Impact**: Incomplete results, user must add more frames
+
+### 2. Missing Calibrations
+| Missing | Behavior | Impact |
+|---------|----------|--------|
+| Flat | Continue with Dark/Bias only | Vignetting not corrected |
+| Dark | Continue with Flat/Bias only | Hot pixels not removed |
+| Bias | Continue without | Acceptable for most sensors |
+| All | Uncalibrated export | Poor quality |
+
+### 3. Mixed Camera Types (OSC + Mono)
+**Behavior**: Separate pipelines created automatically
+**Impact**: Correct results but more complex scripts
+
+### 4. Flat→Dark Exposure Mismatch
+**Scenario**: 2s flats, only 300s darks available
+**Behavior**: Falls back to Bias calibration
+**Impact**: Better than over-subtraction (bright edges)
+
+### 5. Missing FITS Keywords
+| Keyword | Fallback | Impact |
+|---------|----------|--------|
+| INSTRUME | "unknown" | All frames grouped together |
+| FOCALLEN | 500mm | Plate solving may fail |
+| BAYERPAT | Assume Mono | OSC treated as Mono (wrong!) |
+| FILTER | "Unfiltered" | Generic naming |
+
+### 6. Temperature Mismatch
+**Threshold**: Typically 2°C (configurable)
+**Behavior**: Warning shown, export continues
+**Impact**: Potential calibration artifacts
+
+### 7. Date Mismatch
+**Behavior**: Warning shown, export continues
+**Impact**: Calibrations may not match current sensor state
+
+---
+
+## Known Weak Points
+
+### 1. No Quality Scoring for Reference Frame
+Currently uses Siril's `-2pass` auto-selection. The `AtheneumScoring` and `Manual` modes fall back to `-2pass`.
+
+**Planned**: Quality scoring based on FWHM, star count, background level.
+
+### 2. Pixel Size Not Stored
+Defaults to 3.76μm (common for ASI/QHY). Incorrect pixel size breaks plate solving.
+
+**Recommendation**: Store XPIXSZ/PIXSIZE from FITS headers.
+
+### 3. Exposure Tolerance Clustering
+Tolerance is checked against **first cluster member only**, not all members.
+
+```
+Example: 30s, 33s, 36s (each 10% from previous)
+Result: Single cluster (36s is 20% from 30s!)
+```
+
+**Recommendation**: Check against cluster centroid or all members.
+
+### 4. No Validation of Calibration Links
+Database links are trusted without verifying files still exist.
+
+**Failure mode**: Deleted calibration files → script fails at runtime.
+
+### 5. Siril Process Timeout
+macOS Siril can hang after "closing pipes". Current workaround: 30-second timeout.
+
+**Impact**: May incorrectly report failures for long-running scripts.
+
+### 6. No Resume/Retry Logic
+If script fails mid-execution, must restart from beginning.
+
+**Recommendation**: Track completed steps, allow resuming.
+
+### 7. Frame Index Assumptions
+Assumes Siril assigns sequence indices in filename sort order. If pp_lights files have gaps or unusual naming, frame selection may be wrong.
 
 ---
 
 ## Configuration Options
 
-### Export Config
+### Export Modes
+- `generate_scripts` - Scripts only, no file organization
+- `organize_files` - File organization only
+- `organize_and_script` - Both (default)
+- `direct_execution` - Full pipeline with Siril execution
 
-```typescript
-interface ExportConfig {
-  frameSetId: number;       // Frame set to export
-  outputDir: string;        // Output directory path
-  mode: ExportMode;         // Export operation mode
-  workflow: SirilWorkflow;  // Siril workflow type
-  createMasters: boolean;   // Create master calibration frames
-  rejectionLow: number;     // Low rejection sigma (default: 3.0)
-  rejectionHigh: number;    // High rejection sigma (default: 3.0)
-  useSymlinks: boolean;     // Use symlinks instead of copying
-}
-```
+### Siril Options
+| Option | Values | Default |
+|--------|--------|---------|
+| Rejection Algorithm | sigma, percentile, linear_fit, gesd, mad | sigma |
+| Rejection Thresholds | 0.0 - 10.0 | 2.5 / 2.5 |
+| Image Weighting | none, wfwhm, stars, noise, exptime | wfwhm |
+| Reference Frame | siril_auto, athenaeum_scoring, manual | siril_auto |
+| Drizzle | disabled, x2, x3 | disabled |
 
-### Siril Path
-
-The Siril CLI path is stored in the `settings` table with key `siril_cli_path`. If not configured, the application attempts to auto-detect Siril in common locations:
-
-**macOS:**
-- `/Applications/Siril.app/Contents/MacOS/siril-cli`
-- `/usr/local/bin/siril-cli`
-- `/opt/homebrew/bin/siril-cli`
-
-**Linux:**
-- `/usr/bin/siril-cli`
-- `/usr/local/bin/siril-cli`
-
-**Windows:**
-- `siril-cli.exe` (in PATH)
+### Exposure Time Grouping
+| Option | Description |
+|--------|-------------|
+| disabled | Stack all same-filter frames together |
+| absolute | Group frames within N seconds |
+| relative | Group frames within N percent |
 
 ---
 
-## Future Plans
+## Database Tables Involved
 
-### Phase 2: Enhanced Siril Integration
-- [ ] Real-time progress parsing from Siril output
-- [ ] Better error handling and recovery
-- [ ] Support for Siril's native star detection
-- [ ] Drizzle integration for super-resolution
-
-### Phase 3: PixInsight Integration
-- [ ] Generate PixInsight process icons (.xpsm files)
-- [ ] Integration via PixInsight's command-line interface
-- [ ] Support for WBPP (Weighted Batch Preprocessing) workflow
-
-### Phase 4: Advanced Features
-- [ ] Custom script templates (user-defined)
-- [ ] Batch export (multiple frame sets)
-- [ ] Export presets (save/load configurations)
-- [ ] Post-processing scripts integration
-- [ ] Master library reuse (detect existing masters)
-
-### Phase 5: Quality Assurance
-- [ ] Pre-flight checks (verify all files exist)
-- [ ] Calibration quality warnings (age, temperature)
-- [ ] Disk space estimation before export
-- [ ] Export history and logging
+- `frames_set` - Frame set metadata
+- `imaging_nights` - Nights within frame set
+- `sessions` - Camera sessions within nights
+- `session_members` - Frame membership in sessions
+- `frames` - Individual frame metadata
+- `files` - File paths
+- `calibration_set` - Calibration set definitions
+- `calibration_set_frames` - Frames in calibration sets
+- `calibration_set_to_frames` - Calibration links (frame→set, set→set)
 
 ---
 
-## Database Tables Used
+## Key Files
 
-### Primary Tables
-
-- `frames_set` - Top-level frame set info
-- `imaging_nights` - Nights within a frame set
-- `sessions` - Camera sessions within a night
-- `session_members` - Links sessions to frames
-- `frames` - Frame metadata
-- `files` - File paths and info
-
-### Calibration Tables
-
-- `calibration_set` - Calibration set metadata
-- `calibration_set_frames` - Links sets to frames
-- `calibration_set_to_frames` - Links sources to calibration sets
-
-### Settings
-
-- `settings` - Application settings (includes `siril_cli_path`)
-
----
-
-## Troubleshooting
-
-### No frames found in frame set
-
-1. Check that frames have `imagetyp = 'Light'` in the database
-2. Verify the frame set hierarchy exists:
-   - `frames_set` → `imaging_nights` → `sessions` → `session_members` → `frames`
-3. Check console output for debug messages
-
-### Siril not found
-
-1. Install Siril from https://siril.org/
-2. Configure the path in Settings → Export → Siril CLI Path
-3. Or ensure `siril-cli` is in your system PATH
-
-### Scripts not generating
-
-1. Ensure output directory is writable
-2. Check that at least one filter group has light frames
-3. Review console for error messages
-
----
-
-## API Reference
-
-### useExportData Hook
-
-```typescript
-function useExportData(frameSetId: number | null): {
-  data: ExportData | null;
-  loading: boolean;
-  error: string | null;
-  refresh: () => void;
-}
-```
-
-### useExport Hook
-
-```typescript
-function useExport(): {
-  execute: (config: ExportExecuteConfig) => Promise<ExportResult>;
-  loading: boolean;
-  error: string | null;
-  result: ExportResult | null;
-}
-```
-
-### useSirilPath Hook
-
-```typescript
-function useSirilPath(): {
-  path: string | null;
-  loading: boolean;
-  error: string | null;
-  setPath: (path: string) => Promise<void>;
-  refresh: () => void;
-}
-```
+| File | Purpose |
+|------|---------|
+| `commands/export.rs` | Tauri commands (entry points) |
+| `export/data_collector.rs` | Data collection & hierarchy building |
+| `export/models.rs` | Data structures |
+| `export/file_organizer.rs` | File organization |
+| `export/folder_structures.rs` | Folder path utilities |
+| `export/siril/script_generator.rs` | Siril script generation |
+| `export/siril/cli_runner.rs` | Siril execution & progress |
+| `calibration/configurable_matcher.rs` | Calibration matching logic |
+| `calibration/hierarchy.rs` | Hierarchy building |
