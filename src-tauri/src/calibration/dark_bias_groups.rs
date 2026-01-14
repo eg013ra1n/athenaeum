@@ -745,37 +745,41 @@ fn create_bias_group(
 /// # Arguments
 /// * `conn` - Database connection
 /// * `dark_group` - The dark group to convert to a calibration set
+/// * `allow_modify` - If true, add frames to existing sets (scanning context).
+///                    If false, just return existing set ID without modification (find calibration context).
 ///
 /// # Returns
 /// The ID of the created (or existing) calibration set
 pub fn create_dark_calibration_set(
     conn: &Connection,
     dark_group: &DarkGroup,
+    allow_modify: bool,
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_dark_set(conn, dark_group)?;
     println!("    🔍 Existing dark set check: {:?}", existing_set_id);
 
     if let Some(set_id) = existing_set_id {
-        // Set already exists - link new frames to it
-        println!("    ♻️  Reusing existing dark calibration set ID: {}", set_id);
-
-        // Link new frames to existing set (using INSERT OR IGNORE to avoid duplicates)
-        for frame_id in &dark_group.frame_ids {
+        if allow_modify {
+            // Scanning context: link new frames to existing set
+            println!("    ♻️  Reusing existing dark calibration set ID: {}", set_id);
+            for frame_id in &dark_group.frame_ids {
+                conn.execute(
+                    "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                    (set_id, frame_id),
+                )?;
+            }
+            // Update frame_count to reflect actual linked frames
             conn.execute(
-                "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
-                (set_id, frame_id),
+                "UPDATE calibration_set SET frame_count = (
+                    SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1
+                ) WHERE id = ?1",
+                [set_id],
             )?;
+        } else {
+            // Find calibration context: just return existing set ID without modification
+            println!("    ♻️  Found existing dark calibration set ID: {}", set_id);
         }
-
-        // Update frame_count to reflect actual linked frames
-        conn.execute(
-            "UPDATE calibration_set SET frame_count = (
-                SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1
-            ) WHERE id = ?1",
-            [set_id],
-        )?;
-
         return Ok(set_id);
     }
 
@@ -841,37 +845,41 @@ pub fn create_dark_calibration_set(
 /// # Arguments
 /// * `conn` - Database connection
 /// * `bias_group` - The bias group to convert to a calibration set
+/// * `allow_modify` - If true, add frames to existing sets (scanning context).
+///                    If false, just return existing set ID without modification (find calibration context).
 ///
 /// # Returns
 /// The ID of the created (or existing) calibration set
 pub fn create_bias_calibration_set(
     conn: &Connection,
     bias_group: &BiasGroup,
+    allow_modify: bool,
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_bias_set(conn, bias_group)?;
     println!("    🔍 Existing bias set check: {:?}", existing_set_id);
 
     if let Some(set_id) = existing_set_id {
-        // Set already exists - link new frames to it
-        println!("    ♻️  Reusing existing bias calibration set ID: {}", set_id);
-
-        // Link new frames to existing set (using INSERT OR IGNORE to avoid duplicates)
-        for frame_id in &bias_group.frame_ids {
+        if allow_modify {
+            // Scanning context: link new frames to existing set
+            println!("    ♻️  Reusing existing bias calibration set ID: {}", set_id);
+            for frame_id in &bias_group.frame_ids {
+                conn.execute(
+                    "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                    (set_id, frame_id),
+                )?;
+            }
+            // Update frame_count to reflect actual linked frames
             conn.execute(
-                "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
-                (set_id, frame_id),
+                "UPDATE calibration_set SET frame_count = (
+                    SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1
+                ) WHERE id = ?1",
+                [set_id],
             )?;
+        } else {
+            // Find calibration context: just return existing set ID without modification
+            println!("    ♻️  Found existing bias calibration set ID: {}", set_id);
         }
-
-        // Update frame_count to reflect actual linked frames
-        conn.execute(
-            "UPDATE calibration_set SET frame_count = (
-                SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1
-            ) WHERE id = ?1",
-            [set_id],
-        )?;
-
         return Ok(set_id);
     }
 

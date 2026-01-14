@@ -346,8 +346,8 @@ pub fn build_complete_hierarchy(
                 println!("  ✅ Pattern selected match: age={}d, timing={:?}, frames={}",
                     flat_match.age_days, flat_match.timing, flat_match.group.frame_count);
 
-                // Create calibration set from the flat group
-                let set_id = create_flat_calibration_set(conn, &flat_match.group)?;
+                // Find/reuse calibration set from the flat group (don't modify existing sets)
+                let set_id = create_flat_calibration_set(conn, &flat_match.group, false)?;
 
                 // Add age warning if needed (only if threshold is reasonable)
                 // Use config directly for consistency with UI
@@ -746,8 +746,8 @@ fn try_create_dark_for_frame(
     println!("    🎯 Selected best dark group: {} frames, from {} to {}",
         best_group.frame_count, best_group.start_time, best_group.end_time);
 
-    // Create calibration set from best group
-    let set_id = create_dark_calibration_set(conn, best_group)?;
+    // Find/reuse calibration set from best group (don't modify existing sets)
+    let set_id = create_dark_calibration_set(conn, best_group, false)?;
 
     Ok(Some(set_id))
 }
@@ -825,8 +825,8 @@ fn try_create_bias_for_frame(
     println!("    🎯 Selected best bias group: {} frames, from {} to {}",
         best_group.frame_count, best_group.start_time, best_group.end_time);
 
-    // Create calibration set from best group
-    let set_id = create_bias_calibration_set(conn, best_group)?;
+    // Find/reuse calibration set from best group (don't modify existing sets)
+    let set_id = create_bias_calibration_set(conn, best_group, false)?;
 
     Ok(Some(set_id))
 }

@@ -405,37 +405,41 @@ fn create_flat_group(
 /// # Arguments
 /// * `conn` - Database connection
 /// * `flat_group` - The flat group to convert to a calibration set
+/// * `allow_modify` - If true, add frames to existing sets (scanning context).
+///                    If false, just return existing set ID without modification (find calibration context).
 ///
 /// # Returns
 /// The ID of the created (or existing) calibration set
 pub fn create_flat_calibration_set(
     conn: &Connection,
     flat_group: &FlatGroup,
+    allow_modify: bool,
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_flat_set(conn, flat_group)?;
     println!("    🔍 Existing set check: {:?}", existing_set_id);
 
     if let Some(set_id) = existing_set_id {
-        // Set already exists - link new frames to it
-        println!("    ♻️  Reusing existing calibration set ID: {}", set_id);
-
-        // Link new frames to existing set (using INSERT OR IGNORE to avoid duplicates)
-        for frame_id in &flat_group.frame_ids {
+        if allow_modify {
+            // Scanning context: link new frames to existing set
+            println!("    ♻️  Reusing existing calibration set ID: {}", set_id);
+            for frame_id in &flat_group.frame_ids {
+                conn.execute(
+                    "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                    (set_id, frame_id),
+                )?;
+            }
+            // Update frame_count to reflect actual linked frames
             conn.execute(
-                "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
-                (set_id, frame_id),
+                "UPDATE calibration_set SET frame_count = (
+                    SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1
+                ) WHERE id = ?1",
+                [set_id],
             )?;
+        } else {
+            // Find calibration context: just return existing set ID without modification
+            println!("    ♻️  Found existing calibration set ID: {}", set_id);
         }
-
-        // Update frame_count to reflect actual linked frames
-        conn.execute(
-            "UPDATE calibration_set SET frame_count = (
-                SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1
-            ) WHERE id = ?1",
-            [set_id],
-        )?;
-
         return Ok(set_id);
     }
 
