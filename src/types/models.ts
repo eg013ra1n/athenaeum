@@ -187,7 +187,7 @@ export interface ScanProgressEvent {
   current_file: string | null;
   percent: number;
   root_id: number;
-  phase: 'discovery' | 'processing' | 'inserting' | 'calibrating';
+  phase: 'verifying' | 'discovery' | 'processing' | 'inserting' | 'calibrating' | 'caching';
 }
 
 // Scan completion event sent from backend
@@ -371,6 +371,25 @@ export interface OrphanedFile {
   filename: string;
   size: number;
   modified_at: string;
+  has_frame: boolean;
+  object: string | null;
+  date_obs: string | null;
+}
+
+// Missing file record with status from the database
+export interface MissingFileRecord {
+  id: number;
+  file_id: number;
+  scan_root_id: number;
+  detected_at: string;
+  last_checked_at: string;
+  status: 'missing' | 'ignored';
+  // File info
+  path: string;
+  filename: string;
+  size: number;
+  modified_at: string;
+  // Frame info (if exists)
   has_frame: boolean;
   object: string | null;
   date_obs: string | null;

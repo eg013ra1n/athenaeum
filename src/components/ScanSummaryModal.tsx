@@ -1,4 +1,4 @@
-import { X, CheckCircle2, XCircle, Sun, Moon, Aperture, CircleDot, Eclipse, Layers, FileWarning } from 'lucide-react';
+import { X, CheckCircle2, XCircle, Sun, Moon, Aperture, CircleDot, Eclipse, Layers, FileWarning, AlertTriangle } from 'lucide-react';
 import type { ScanResult } from '../types/models';
 
 interface ScanSummaryModalProps {
@@ -6,9 +6,10 @@ interface ScanSummaryModalProps {
   onClose: () => void;
   scanResult: ScanResult;
   rootPath: string;
+  missingFilesCount?: number;
 }
 
-export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath }: ScanSummaryModalProps) {
+export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath, missingFilesCount }: ScanSummaryModalProps) {
   if (!isOpen) return null;
 
   const { cancelled } = scanResult;
@@ -103,6 +104,16 @@ export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath }: Scan
             <div className="p-3 bg-yellow-900/20 border border-yellow-700 rounded-lg">
               <p className="text-sm text-yellow-400">
                 Scan was cancelled. Results below are partial - rescan to process remaining files.
+              </p>
+            </div>
+          )}
+
+          {/* Missing files warning */}
+          {missingFilesCount !== undefined && missingFilesCount > 0 && (
+            <div className="flex items-center gap-3 p-3 bg-orange-900/20 border border-orange-700 rounded-lg">
+              <AlertTriangle className="text-orange-400 flex-shrink-0" size={20} />
+              <p className="text-sm text-orange-400">
+                {missingFilesCount} file{missingFilesCount !== 1 ? 's' : ''} no longer exist{missingFilesCount === 1 ? 's' : ''} on disk
               </p>
             </div>
           )}

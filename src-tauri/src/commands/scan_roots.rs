@@ -2,7 +2,7 @@
 
 use crate::db::{self};
 use crate::models::*;
-use crate::scanner::{scan_directory, scan_directory_parallel};
+use crate::scanner::{scan_directory, scan_directory_parallel, emit_progress};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -299,13 +299,15 @@ pub async fn check_all_scan_roots_availability(
 #[tauri::command]
 pub async fn check_missing_files_in_scan_root(
     root_id: i64,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::OrphanedFile>, String> {
-    println!("🔍 check_missing_files acquiring lock for root_id={}", root_id);
+    // Emit initial "verifying" phase progress
+    emit_progress(&app_handle, root_id, 0, 0, None, "verifying");
+
     // Collect files from database with lock held briefly
     let files = {
         let state_lock = state.db.lock().unwrap();
-        println!("🔍 check_missing_files lock acquired for root_id={}", root_id);
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
 
@@ -347,20 +349,25 @@ pub async fn check_missing_files_in_scan_root(
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        println!("🔍 check_missing_files releasing lock for root_id={}", root_id);
         result
         // Lock is released here when state_lock goes out of scope
     };
 
-    println!("🔍 check_missing_files lock released, checking {} files on disk for root_id={}", files.len(), root_id);
     // Filter to only files that don't exist on disk
     // This is done OUTSIDE the lock since filesystem checks can be slow
-    let missing_files: Vec<crate::models::OrphanedFile> = files
-        .into_iter()
-        .filter(|file| !std::path::Path::new(&file.path).exists())
-        .collect();
+    let total_files = files.len();
+    let mut missing_files: Vec<crate::models::OrphanedFile> = Vec::new();
 
-    println!("Found {} missing files in scan root {}", missing_files.len(), root_id);
+    for (idx, file) in files.into_iter().enumerate() {
+        if !std::path::Path::new(&file.path).exists() {
+            missing_files.push(file);
+        }
+
+        // Emit progress every 100 files or on last file
+        if (idx + 1) % 100 == 0 || idx + 1 == total_files {
+            emit_progress(&app_handle, root_id, idx + 1, total_files, None, "verifying");
+        }
+    }
 
     Ok(missing_files)
 }

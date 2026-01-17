@@ -2,7 +2,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import type { ScanProgressEvent, ScanCompleteEvent, ScanResult } from '../types/models';
+import type { ScanProgressEvent, ScanCompleteEvent, ScanResult, OrphanedFile } from '../types/models';
+
+// Extended result that includes missing files info
+export interface RescanResult extends ScanResult {
+  missingFilesCount: number;
+  missingFiles: OrphanedFile[];
+}
 
 export interface ActiveScan {
   rootId: number;
@@ -132,6 +138,85 @@ export function useScanProgress() {
     []
   );
 
+  // Unified rescan flow: check missing files + scan in one progress modal
+  const startRescanWithProgress = useCallback(
+    async (rootId: number, rootPath: string): Promise<RescanResult> => {
+      // Register scan in state (shows modal immediately)
+      flushSync(() => {
+        setActiveScans((prev) => {
+          const updated = new Map(prev);
+          updated.delete(rootId);
+          updated.set(rootId, {
+            rootId,
+            rootPath,
+            progress: null,
+            isComplete: false,
+            result: null,
+          });
+          return updated;
+        });
+      });
+
+      // Small delay to ensure the progress modal is painted
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      try {
+        // Step 1: Check missing files (backend emits "verifying" phase)
+        const missingFiles = await invoke<OrphanedFile[]>('check_missing_files_in_scan_root', { rootId });
+
+        // Step 2: Persist missing files to database for persistent tracking
+        if (missingFiles.length > 0) {
+          await invoke('sync_missing_files', {
+            rootId,
+            fileIds: missingFiles.map(f => f.id),
+          });
+        } else {
+          // Clear any previously tracked missing files that are now found
+          await invoke('sync_missing_files', {
+            rootId,
+            fileIds: [],
+          });
+        }
+
+        // Step 3: Run scan (backend emits discovery/processing/etc phases)
+        const scanResult = await invoke<ScanResult>('start_scan_with_progress', { rootId });
+
+        // Combine results
+        const result: RescanResult = {
+          ...scanResult,
+          missingFilesCount: missingFiles.length,
+          missingFiles,
+        };
+
+        // Update state with final result
+        setActiveScans((prev) => {
+          const updated = new Map(prev);
+          const existing = updated.get(rootId);
+          if (existing) {
+            updated.set(rootId, {
+              ...existing,
+              isComplete: true,
+              result: scanResult,
+              progress: null,
+            });
+          }
+          return updated;
+        });
+
+        return result;
+      } catch (error) {
+        // Remove from active scans on error
+        setActiveScans((prev) => {
+          const updated = new Map(prev);
+          updated.delete(rootId);
+          return updated;
+        });
+        throw error;
+      }
+    },
+    []
+  );
+
   const cancelScan = useCallback(async (rootId: number) => {
     // Mark as cancelling in local state (for UI feedback)
     setActiveScans((prev) => {
@@ -168,6 +253,7 @@ export function useScanProgress() {
   return {
     activeScans,
     startScanWithProgress,
+    startRescanWithProgress,
     cancelScan,
     dismissCompletedScan,
     isScanning,

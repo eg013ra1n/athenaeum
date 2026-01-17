@@ -238,6 +238,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Missing files table - tracks files that no longer exist on disk
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS missing_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL UNIQUE,
+            scan_root_id INTEGER NOT NULL,
+            detected_at TEXT NOT NULL,
+            last_checked_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'missing',
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (scan_root_id) REFERENCES scan_roots(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Calibration set to frames - links frames/sets to their required calibration sets
     conn.execute(
         "CREATE TABLE IF NOT EXISTS calibration_set_to_frames (
@@ -384,6 +399,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_black_hole_moved_at ON black_hole(moved_at)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missing_files_scan_root ON missing_files(scan_root_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missing_files_status ON missing_files(status)",
         [],
     )?;
     conn.execute(

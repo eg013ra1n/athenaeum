@@ -2,12 +2,12 @@ import { Loader2, FolderSearch, Database, Sparkles, XCircle } from 'lucide-react
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
 
 const phaseConfig: Record<string, { label: string; icon: typeof Loader2 }> = {
+  verifying: { label: 'Verifying existing files...', icon: FolderSearch },
   discovery: { label: 'Discovering files...', icon: FolderSearch },
   processing: { label: 'Processing files', icon: Loader2 },
   inserting: { label: 'Saving to database', icon: Database },
   calibrating: { label: 'Creating calibration sets', icon: Sparkles },
   caching: { label: 'Building duplicate cache...', icon: Database },
-  verifying: { label: 'Verifying files on disk...', icon: FolderSearch },
 };
 
 export function ScanProgressIndicator() {

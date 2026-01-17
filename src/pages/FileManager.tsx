@@ -1,15 +1,17 @@
 import { useState, useEffect } from 'react';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning, Info, AlertCircle } from 'lucide-react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { useScanRootsWithAvailability, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
+import type { RescanResult } from '../hooks/useScanProgress';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
-import type { ScanResult, RelinkResult, OrphanedFile, FileWithFrame } from '../types/models';
+import type { ScanResult, RelinkResult, FileWithFrame, MissingFileRecord } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { ScanSummaryModal } from '../components/ScanSummaryModal';
+import { MissingFilesPanel } from '../components/MissingFilesPanel';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
@@ -18,7 +20,7 @@ type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrume
 export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
   const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, relinkScanRoot } = useScanRootsWithAvailability();
-  const { startScanWithProgress, isScanning } = useScanProgressContext();
+  const { startRescanWithProgress, isScanning } = useScanProgressContext();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
@@ -30,8 +32,6 @@ export default function FileManager() {
   const [movingToBlackHole, setMovingToBlackHole] = useState<Record<string, boolean>>({});
   const [relinkingRootId, setRelinkingRootId] = useState<number | null>(null);
   const [relinkResult, setRelinkResult] = useState<RelinkResult | null>(null);
-  const [missingFilesMap, setMissingFilesMap] = useState<Record<number, OrphanedFile[]>>({});
-  const [checkingMissingFiles, setCheckingMissingFiles] = useState<Record<number, boolean>>({});
   // Missing metadata tab state
   const [missingCategory, setMissingCategory] = useState<MissingCategory>('all');
   const [missingFrames, setMissingFrames] = useState<FileWithFrame[]>([]);
@@ -41,6 +41,7 @@ export default function FileManager() {
     isOpen: boolean;
     rootId: number | null;
     rootPath: string;
+    missingFilesCount?: number;
   }>({
     isOpen: false,
     rootId: null,
@@ -71,25 +72,18 @@ export default function FileManager() {
     variant: 'info',
   });
 
+  // Missing files tracking state
+  const [missingFilesCountMap, setMissingFilesCountMap] = useState<Record<number, number>>({});
+  const [missingFilesMap, setMissingFilesMap] = useState<Record<number, MissingFileRecord[]>>({});
+  const [expandedMissingPanels, setExpandedMissingPanels] = useState<Set<number>>(new Set());
+  const [loadingMissingFiles, setLoadingMissingFiles] = useState<number | null>(null);
+
   const showConfirm = (title: string, message: string, onConfirm: () => void, confirmDanger = false) => {
     setConfirmDialog({ isOpen: true, title, message, onConfirm, confirmDanger });
   };
 
   const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
     setAlertDialog({ isOpen: true, title, message, variant });
-  };
-
-  // Check for missing files in available scan roots
-  const checkMissingFiles = async (rootId: number) => {
-    try {
-      setCheckingMissingFiles(prev => ({ ...prev, [rootId]: true }));
-      const missingFiles = await invoke<OrphanedFile[]>('check_missing_files_in_scan_root', { rootId });
-      setMissingFilesMap(prev => ({ ...prev, [rootId]: missingFiles }));
-    } catch (error) {
-      console.error('Failed to check missing files:', error);
-    } finally {
-      setCheckingMissingFiles(prev => ({ ...prev, [rootId]: false }));
-    }
   };
 
   // Lazy load duplicates when Duplicates tab is clicked
@@ -105,6 +99,59 @@ export default function FileManager() {
       loadFolders();
     }
   }, [activeTab, duplicatesView, loadFolders]);
+
+  // Load missing files counts on mount and when scan roots change
+  useEffect(() => {
+    const loadMissingCounts = async () => {
+      try {
+        const counts = await invoke<Record<number, number>>('get_missing_files_counts');
+        setMissingFilesCountMap(counts);
+      } catch (error) {
+        console.error('Failed to load missing files counts:', error);
+      }
+    };
+    loadMissingCounts();
+  }, [scanRoots, refreshTrigger]);
+
+  // Load missing files for a specific root (when panel is expanded)
+  const loadMissingFilesForRoot = async (rootId: number) => {
+    if (missingFilesMap[rootId]) return; // Already loaded
+    setLoadingMissingFiles(rootId);
+    try {
+      const files = await invoke<MissingFileRecord[]>('get_missing_files', { rootId });
+      setMissingFilesMap(prev => ({ ...prev, [rootId]: files }));
+    } catch (error) {
+      console.error('Failed to load missing files:', error);
+    } finally {
+      setLoadingMissingFiles(null);
+    }
+  };
+
+  // Toggle missing files panel expansion
+  const handleToggleMissingPanel = async (rootId: number) => {
+    const newExpanded = new Set(expandedMissingPanels);
+    if (newExpanded.has(rootId)) {
+      newExpanded.delete(rootId);
+    } else {
+      newExpanded.add(rootId);
+      await loadMissingFilesForRoot(rootId);
+    }
+    setExpandedMissingPanels(newExpanded);
+  };
+
+  // Refresh missing files for a root (called by panel after actions)
+  const handleRefreshMissingFiles = async (rootId: number) => {
+    try {
+      const [files, counts] = await Promise.all([
+        invoke<MissingFileRecord[]>('get_missing_files', { rootId }),
+        invoke<Record<number, number>>('get_missing_files_counts'),
+      ]);
+      setMissingFilesMap(prev => ({ ...prev, [rootId]: files }));
+      setMissingFilesCountMap(counts);
+    } catch (error) {
+      console.error('Failed to refresh missing files:', error);
+    }
+  };
 
   // Load frames with missing metadata
   const loadMissingMetadata = async (category: MissingCategory) => {
@@ -127,32 +174,6 @@ export default function FileManager() {
       loadMissingMetadata(missingCategory);
     }
   }, [activeTab, missingCategory]);
-
-  // Handle deleting missing files
-  const handleDeleteMissingFiles = async (rootId: number) => {
-    const missingFiles = missingFilesMap[rootId];
-    if (!missingFiles || missingFiles.length === 0) return;
-
-    showConfirm(
-      'Delete Missing Files',
-      `Are you sure you want to delete ${missingFiles.length} missing file records from the database?`,
-      async () => {
-        try {
-          const fileIds = missingFiles.map(f => f.id);
-          await invoke('delete_orphaned_files', { fileIds });
-
-          // Update the missing files map
-          setMissingFilesMap(prev => ({ ...prev, [rootId]: [] }));
-
-          // Success - silent update (no alert)
-        } catch (error) {
-          console.error('Failed to delete missing files:', error);
-          showAlert('Delete Failed', typeof error === 'string' ? error : 'Failed to delete missing files', 'error');
-        }
-      },
-      true
-    );
-  };
 
   // Handle adding a new directory
   const handleAddDirectory = async () => {
@@ -190,26 +211,25 @@ export default function FileManager() {
 
   // Handle starting a scan for a specific root
   const handleStartScan = async (rootId: number) => {
-    // Find the root path for the modal
     const root = scanRoots.find(r => r.id === rootId);
-    const rootPath = root?.path || '';
+    if (!root) return;
+    const rootPath = root.path;
 
     try {
       setScanError(null);
-      // Use parallel scan with progress events
-      const result = await startScanWithProgress(rootId, rootPath);
-      setScanResultMap(prev => ({ ...prev, [rootId]: result }));
-      setRefreshTrigger(prev => prev + 1); // Trigger refresh after scanning
 
-      // Open the scan summary modal immediately
+      // Unified rescan: checks missing files then scans (all in one progress modal)
+      const result = await startRescanWithProgress(rootId, rootPath);
+      setScanResultMap(prev => ({ ...prev, [rootId]: result }));
+      setRefreshTrigger(prev => prev + 1);
+
+      // Open the scan summary modal with missing files count
       setScanSummaryModal({
         isOpen: true,
         rootId,
         rootPath,
+        missingFilesCount: result.missingFilesCount,
       });
-
-      // Re-check for missing files in background (don't block UI)
-      checkMissingFiles(rootId);
     } catch (error) {
       console.error('Scan failed:', error);
       setScanError(typeof error === 'string' ? error : 'Scan failed');
@@ -412,36 +432,6 @@ export default function FileManager() {
                       </div>
                     )}
 
-                    {/* Missing Files Warning Banner */}
-                    {!isUnavailable && root.id && missingFilesMap[root.id] && missingFilesMap[root.id].length > 0 && (
-                      <div className="mb-3 p-3 bg-orange-900/30 border border-orange-700 rounded flex items-start gap-3">
-                        <FileWarning className="text-orange-400 flex-shrink-0 mt-0.5" size={20} />
-                        <div className="flex-1">
-                          <p className="font-semibold text-orange-400 mb-1">Missing Files Detected</p>
-                          <p className="text-sm text-orange-300 mb-2">
-                            {missingFilesMap[root.id].length} file{missingFilesMap[root.id].length !== 1 ? 's' : ''} in the database no longer exist on disk.
-                            These files may have been deleted or moved to another location.
-                          </p>
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => root.id && checkMissingFiles(root.id)}
-                              disabled={checkingMissingFiles[root.id]}
-                              className="flex items-center gap-2 px-3 py-1.5 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded text-sm transition"
-                            >
-                              <RefreshCw size={16} className={checkingMissingFiles[root.id] ? 'animate-spin' : ''} />
-                              {checkingMissingFiles[root.id] ? 'Checking...' : 'Recheck'}
-                            </button>
-                            <button
-                              onClick={() => root.id && handleDeleteMissingFiles(root.id)}
-                              className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded text-sm transition"
-                            >
-                              <Trash2 size={16} />
-                              Delete Records
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    )}
 
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex-1">
@@ -530,6 +520,38 @@ export default function FileManager() {
                             </button>
                           </div>
                         </div>
+                      </div>
+                    )}
+
+                    {/* Missing Files Indicator and Panel */}
+                    {root.id && (missingFilesCountMap[root.id] ?? 0) > 0 && (
+                      <div className="mt-3">
+                        <button
+                          onClick={() => root.id && handleToggleMissingPanel(root.id)}
+                          className="flex items-center gap-2 w-full p-2 text-left hover:bg-orange-900/20 rounded-lg transition"
+                        >
+                          {expandedMissingPanels.has(root.id) ? (
+                            <ChevronDown className="text-orange-400" size={16} />
+                          ) : (
+                            <ChevronRight className="text-orange-400" size={16} />
+                          )}
+                          <AlertTriangle className="text-orange-400" size={16} />
+                          <span className="text-sm text-orange-400 font-medium">
+                            {missingFilesCountMap[root.id]} missing file{missingFilesCountMap[root.id] !== 1 ? 's' : ''}
+                          </span>
+                          {loadingMissingFiles === root.id && (
+                            <Loader2 className="animate-spin text-orange-400 ml-2" size={14} />
+                          )}
+                        </button>
+                        {expandedMissingPanels.has(root.id) && missingFilesMap[root.id] && (
+                          <div className="mt-2">
+                            <MissingFilesPanel
+                              rootId={root.id}
+                              missingFiles={missingFilesMap[root.id]}
+                              onRefresh={() => root.id && handleRefreshMissingFiles(root.id)}
+                            />
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -1082,6 +1104,7 @@ export default function FileManager() {
           onClose={() => setScanSummaryModal({ ...scanSummaryModal, isOpen: false })}
           scanResult={scanResultMap[scanSummaryModal.rootId]}
           rootPath={scanSummaryModal.rootPath}
+          missingFilesCount={scanSummaryModal.missingFilesCount}
         />
       )}
     </div>
