@@ -1,4 +1,4 @@
-import { X, CheckCircle2, Sun, Moon, Aperture, CircleDot, Eclipse, Layers, FileWarning } from 'lucide-react';
+import { X, CheckCircle2, XCircle, Sun, Moon, Aperture, CircleDot, Eclipse, Layers, FileWarning } from 'lucide-react';
 import type { ScanResult } from '../types/models';
 
 interface ScanSummaryModalProps {
@@ -11,6 +11,7 @@ interface ScanSummaryModalProps {
 export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath }: ScanSummaryModalProps) {
   if (!isOpen) return null;
 
+  const { cancelled } = scanResult;
   const totalFrames = scanResult.lights_count + scanResult.darks_count +
     scanResult.flats_count + scanResult.bias_count + scanResult.darkflats_count;
 
@@ -73,8 +74,14 @@ export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath }: Scan
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-gray-700">
           <div className="flex items-center gap-3">
-            <CheckCircle2 className="text-green-400" size={24} />
-            <h2 className="text-xl font-semibold">Scan Complete</h2>
+            {cancelled ? (
+              <XCircle className="text-yellow-400" size={24} />
+            ) : (
+              <CheckCircle2 className="text-green-400" size={24} />
+            )}
+            <h2 className="text-xl font-semibold">
+              {cancelled ? 'Scan Cancelled' : 'Scan Complete'}
+            </h2>
           </div>
           <button
             onClick={onClose}
@@ -90,6 +97,15 @@ export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath }: Scan
           <div className="text-sm text-gray-400">
             <span className="font-mono bg-gray-900 px-2 py-1 rounded">{rootPath}</span>
           </div>
+
+          {/* Cancelled notice */}
+          {cancelled && (
+            <div className="p-3 bg-yellow-900/20 border border-yellow-700 rounded-lg">
+              <p className="text-sm text-yellow-400">
+                Scan was cancelled. Results below are partial - rescan to process remaining files.
+              </p>
+            </div>
+          )}
 
           {/* Summary Stats */}
           <div className="grid grid-cols-3 gap-4">

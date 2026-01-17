@@ -201,15 +201,15 @@ export default function FileManager() {
       setScanResultMap(prev => ({ ...prev, [rootId]: result }));
       setRefreshTrigger(prev => prev + 1); // Trigger refresh after scanning
 
-      // Re-check for missing files after scan completes
-      await checkMissingFiles(rootId);
-
-      // Open the scan summary modal
+      // Open the scan summary modal immediately
       setScanSummaryModal({
         isOpen: true,
         rootId,
         rootPath,
       });
+
+      // Re-check for missing files in background (don't block UI)
+      checkMissingFiles(rootId);
     } catch (error) {
       console.error('Scan failed:', error);
       setScanError(typeof error === 'string' ? error : 'Scan failed');

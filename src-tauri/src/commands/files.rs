@@ -112,7 +112,9 @@ pub async fn get_directory_contents(
     }
 
     // Get files from database for this directory
+    println!("📂 get_directory_contents acquiring lock for {}", directory_path);
     let state_lock = state.db.lock().unwrap();
+    println!("📂 get_directory_contents lock acquired for {}", directory_path);
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -126,6 +128,7 @@ pub async fn get_directory_contents(
 
     subdirectories.sort();
 
+    println!("📂 get_directory_contents done, releasing lock");
     Ok(DirectoryContents {
         subdirectories,
         files: files_in_dir,

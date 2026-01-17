@@ -176,6 +176,8 @@ export interface ScanResult {
   darkflats_count: number;
   // Calibration sets created
   calibration_sets_created: number;
+  // Whether scan was cancelled by user
+  cancelled: boolean;
 }
 
 // Scan progress event sent from backend
@@ -201,6 +203,7 @@ export interface ScanCompleteEvent {
   bias_count: number;
   darkflats_count: number;
   calibration_sets_created: number;
+  cancelled: boolean;
 }
 
 export interface FileWithFrame {

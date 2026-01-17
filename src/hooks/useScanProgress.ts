@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { flushSync } from 'react-dom';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import type { ScanProgressEvent, ScanCompleteEvent, ScanResult } from '../types/models';
@@ -8,6 +9,7 @@ export interface ActiveScan {
   rootPath: string;
   progress: ScanProgressEvent | null;
   isComplete: boolean;
+  isCancelling?: boolean;
   result: ScanResult | null;
 }
 
@@ -55,6 +57,7 @@ export function useScanProgress() {
                 bias_count: event.payload.bias_count,
                 darkflats_count: event.payload.darkflats_count,
                 calibration_sets_created: event.payload.calibration_sets_created,
+                cancelled: event.payload.cancelled,
               },
               progress: null,
             });
@@ -74,18 +77,27 @@ export function useScanProgress() {
 
   const startScanWithProgress = useCallback(
     async (rootId: number, rootPath: string): Promise<ScanResult> => {
-      // Register scan in local state
-      setActiveScans((prev) => {
-        const updated = new Map(prev);
-        updated.set(rootId, {
-          rootId,
-          rootPath,
-          progress: null,
-          isComplete: false,
-          result: null,
+      // Register scan in local state (delete any existing entry first to clear stale completed scans)
+      // Use flushSync to ensure the progress modal renders before the scan starts
+      // This prevents a race condition where fast scans complete before the modal shows
+      flushSync(() => {
+        setActiveScans((prev) => {
+          const updated = new Map(prev);
+          updated.delete(rootId);
+          updated.set(rootId, {
+            rootId,
+            rootPath,
+            progress: null,
+            isComplete: false,
+            result: null,
+          });
+          return updated;
         });
-        return updated;
       });
+
+      // Small delay to ensure the progress modal is painted to screen before scan starts
+      // Without this, fast scans (e.g., rescans with 0 new files) complete before the modal renders
+      await new Promise(resolve => setTimeout(resolve, 50));
 
       try {
         // Start scan with progress - this will emit events and return result
@@ -121,15 +133,20 @@ export function useScanProgress() {
   );
 
   const cancelScan = useCallback(async (rootId: number) => {
-    try {
-      await invoke('cancel_scan', { rootId });
-    } finally {
-      setActiveScans((prev) => {
-        const updated = new Map(prev);
-        updated.delete(rootId);
-        return updated;
-      });
-    }
+    // Mark as cancelling in local state (for UI feedback)
+    setActiveScans((prev) => {
+      const updated = new Map(prev);
+      const existing = updated.get(rootId);
+      if (existing) {
+        updated.set(rootId, {
+          ...existing,
+          isCancelling: true,
+        });
+      }
+      return updated;
+    });
+    // Send cancel request to backend - scan will complete with cancelled flag
+    await invoke('cancel_scan', { rootId });
   }, []);
 
   const dismissCompletedScan = useCallback((rootId: number) => {

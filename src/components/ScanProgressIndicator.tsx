@@ -1,4 +1,4 @@
-import { Loader2, FolderSearch, Database, Sparkles } from 'lucide-react';
+import { Loader2, FolderSearch, Database, Sparkles, XCircle } from 'lucide-react';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
 
 const phaseConfig: Record<string, { label: string; icon: typeof Loader2 }> = {
@@ -7,10 +7,11 @@ const phaseConfig: Record<string, { label: string; icon: typeof Loader2 }> = {
   inserting: { label: 'Saving to database', icon: Database },
   calibrating: { label: 'Creating calibration sets', icon: Sparkles },
   caching: { label: 'Building duplicate cache...', icon: Database },
+  verifying: { label: 'Verifying files on disk...', icon: FolderSearch },
 };
 
 export function ScanProgressIndicator() {
-  const { activeScans } = useScanProgressContext();
+  const { activeScans, cancelScan } = useScanProgressContext();
 
   // Find active (non-complete) scans
   const activeScan = Array.from(activeScans.values()).find((s) => !s.isComplete);
@@ -20,12 +21,16 @@ export function ScanProgressIndicator() {
     return null;
   }
 
-  const { rootPath, progress } = activeScan;
+  const { rootId, rootPath, progress, isCancelling } = activeScan;
   const folderName = rootPath.split('/').pop() || rootPath;
 
   const phase = progress?.phase || 'discovery';
   const config = phaseConfig[phase] || phaseConfig.processing;
   const PhaseIcon = config.icon;
+
+  const handleCancel = () => {
+    cancelScan(rootId);
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
@@ -35,8 +40,10 @@ export function ScanProgressIndicator() {
           <div className="p-2 bg-blue-600/20 rounded-lg">
             <PhaseIcon className="text-blue-400 animate-pulse" size={24} />
           </div>
-          <div>
-            <h2 className="text-lg font-semibold text-white">{config.label}</h2>
+          <div className="flex-1">
+            <h2 className="text-lg font-semibold text-white">
+              {isCancelling ? 'Cancelling...' : config.label}
+            </h2>
             <p className="text-sm text-gray-400 truncate" title={rootPath}>
               {folderName}
             </p>
@@ -46,22 +53,32 @@ export function ScanProgressIndicator() {
         {/* Progress section */}
         {progress ? (
           <>
-            {/* Progress bar */}
+            {/* Progress bar - indeterminate during discovery (total=0) */}
             <div className="h-2 bg-gray-700 rounded-full overflow-hidden mb-3">
-              <div
-                className="h-full bg-blue-500 transition-all duration-300"
-                style={{ width: `${progress.percent}%` }}
-              />
+              {progress.total > 0 ? (
+                <div
+                  className={`h-full transition-all duration-300 ${isCancelling ? 'bg-yellow-500' : 'bg-blue-500'}`}
+                  style={{ width: `${progress.percent}%` }}
+                />
+              ) : (
+                <div className="h-full bg-blue-500 animate-pulse" style={{ width: '100%' }} />
+              )}
             </div>
 
             {/* Stats */}
             <div className="flex items-center justify-between text-sm mb-2">
               <span className="text-gray-300">
-                {progress.current.toLocaleString()} / {progress.total.toLocaleString()} files
+                {progress.total > 0 ? (
+                  `${progress.current.toLocaleString()} / ${progress.total.toLocaleString()} files`
+                ) : (
+                  `${progress.current.toLocaleString()} files found`
+                )}
               </span>
-              <span className="text-blue-400 font-medium">
-                {progress.percent.toFixed(1)}%
-              </span>
+              {progress.total > 0 && (
+                <span className={`font-medium ${isCancelling ? 'text-yellow-400' : 'text-blue-400'}`}>
+                  {progress.percent.toFixed(1)}%
+                </span>
+              )}
             </div>
 
             {/* Current file */}
@@ -81,10 +98,21 @@ export function ScanProgressIndicator() {
           </div>
         )}
 
-        {/* Footer message */}
-        <p className="text-xs text-gray-500 mt-4 text-center">
-          Please wait while the scan completes...
-        </p>
+        {/* Footer with cancel button */}
+        <div className="mt-4 flex items-center justify-between">
+          <p className="text-xs text-gray-500">
+            {isCancelling ? 'Stopping scan...' : 'Please wait while the scan completes...'}
+          </p>
+          {!isCancelling && (
+            <button
+              onClick={handleCancel}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded-lg transition"
+            >
+              <XCircle size={16} />
+              Cancel
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

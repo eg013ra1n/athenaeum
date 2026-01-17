@@ -12,7 +12,7 @@ use chrono::Utc;
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use walkdir::WalkDir;
@@ -51,6 +51,7 @@ pub struct ScanCompleteEvent {
     pub bias_count: usize,
     pub darkflats_count: usize,
     pub calibration_sets_created: usize,
+    pub cancelled: bool,
 }
 
 /// Scan a directory for FITS/XISF files
@@ -71,6 +72,7 @@ pub fn scan_directory(
         bias_count: 0,
         darkflats_count: 0,
         calibration_sets_created: 0,
+        cancelled: false,
     };
 
     // Find all FITS/XISF files
@@ -392,6 +394,8 @@ pub struct ScanResult {
     pub darkflats_count: usize,
     // Calibration sets created
     pub calibration_sets_created: usize,
+    // Whether scan was cancelled by user
+    pub cancelled: bool,
 }
 
 #[allow(dead_code)]
@@ -402,7 +406,7 @@ pub struct ScanProgress {
 }
 
 /// Emit progress event to frontend (throttled)
-fn emit_progress(
+pub fn emit_progress(
     app_handle: &tauri::AppHandle,
     root_id: i64,
     current: usize,
@@ -442,6 +446,7 @@ fn emit_scan_complete(app_handle: &tauri::AppHandle, root_id: i64, result: &Scan
         bias_count: result.bias_count,
         darkflats_count: result.darkflats_count,
         calibration_sets_created: result.calibration_sets_created,
+        cancelled: result.cancelled,
     };
 
     let _ = app_handle.emit("scan-complete", &event);
@@ -536,6 +541,7 @@ pub fn scan_directory_parallel(
     conn: &Connection,
     app_handle: &tauri::AppHandle,
     use_content_hash: bool,
+    cancel_flag: Arc<AtomicBool>,
 ) -> ScanResult {
     let mut result = ScanResult {
         files_found: 0,
@@ -548,30 +554,63 @@ pub fn scan_directory_parallel(
         bias_count: 0,
         darkflats_count: 0,
         calibration_sets_created: 0,
+        cancelled: false,
     };
 
-    // Phase 1a: Discovery - collect all file paths
+    // Phase 1a: Discovery - collect all file paths with progress updates
     emit_progress(app_handle, root_id, 0, 0, None, "discovery");
 
-    let files: Vec<PathBuf> = WalkDir::new(root_path)
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut discovery_count = 0usize;
+
+    for entry in WalkDir::new(root_path)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            if let Some(ext) = e.path().extension() {
-                let ext_str = ext.to_string_lossy().to_lowercase();
-                matches!(ext_str.as_str(), "fits" | "fit" | "fts" | "xisf")
-            } else {
-                false
+    {
+        if let Some(ext) = entry.path().extension() {
+            let ext_str = ext.to_string_lossy().to_lowercase();
+            if matches!(ext_str.as_str(), "fits" | "fit" | "fts" | "xisf") {
+                files.push(entry.path().to_path_buf());
+                discovery_count += 1;
+
+                // Emit progress every 100 files discovered
+                if discovery_count % 100 == 0 {
+                    emit_progress(
+                        app_handle,
+                        root_id,
+                        discovery_count,
+                        0, // Total unknown during discovery
+                        entry.path().file_name().map(|n| n.to_string_lossy().to_string()),
+                        "discovery",
+                    );
+                }
             }
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
+        }
+
+        // Check for cancellation during discovery
+        if discovery_count % 500 == 0 && cancel_flag.load(Ordering::SeqCst) {
+            result.cancelled = true;
+            result.files_found = files.len();
+            emit_scan_complete(app_handle, root_id, &result);
+            return result;
+        }
+    }
 
     result.files_found = files.len();
 
+    // Check for cancellation before proceeding
+    if cancel_flag.load(Ordering::SeqCst) {
+        result.cancelled = true;
+        emit_scan_complete(app_handle, root_id, &result);
+        return result;
+    }
+
     if files.is_empty() {
+        // Emit progress showing discovery complete with 0 files
+        emit_progress(app_handle, root_id, 0, 0, None, "processing");
+        std::thread::sleep(std::time::Duration::from_millis(100));
         emit_scan_complete(app_handle, root_id, &result);
         return result;
     }
@@ -595,7 +634,26 @@ pub fn scan_directory_parallel(
 
     result.files_skipped = result.files_found - new_files.len();
 
+    // Check for cancellation before processing
+    if cancel_flag.load(Ordering::SeqCst) {
+        result.cancelled = true;
+        emit_scan_complete(app_handle, root_id, &result);
+        return result;
+    }
+
     if new_files.is_empty() {
+        // Emit progress showing all files were checked (even if all skipped)
+        // This ensures frontend always sees at least one progress event
+        emit_progress(
+            app_handle,
+            root_id,
+            result.files_found,
+            result.files_found,
+            None,
+            "processing",
+        );
+        // Small delay to ensure frontend has time to render progress modal
+        std::thread::sleep(std::time::Duration::from_millis(100));
         emit_scan_complete(app_handle, root_id, &result);
         return result;
     }
@@ -605,10 +663,16 @@ pub fn scan_directory_parallel(
     let total_new = new_files.len();
     let errors = Arc::new(Mutex::new(Vec::new()));
     let app_handle_clone = app_handle.clone();
+    let cancel_flag_clone = cancel_flag.clone();
 
     let processed_results: Vec<FileProcessResult> = new_files
         .par_iter()
         .filter_map(|path| {
+            // Check for cancellation
+            if cancel_flag_clone.load(Ordering::SeqCst) {
+                return None;
+            }
+
             let current = progress_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
             // Emit progress every 10 files or on last file
@@ -636,6 +700,14 @@ pub fn scan_directory_parallel(
         })
         .collect();
 
+    // Check if cancelled during processing phase
+    if cancel_flag.load(Ordering::SeqCst) {
+        result.cancelled = true;
+        result.errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
+        emit_scan_complete(app_handle, root_id, &result);
+        return result;
+    }
+
     // Phase 2: Sequential database inserts in a transaction
     emit_progress(app_handle, root_id, 0, processed_results.len(), None, "inserting");
 
@@ -654,6 +726,12 @@ pub fn scan_directory_parallel(
     let _ = conn.execute("BEGIN TRANSACTION", []);
 
     for (idx, file_result) in processed_results.iter().enumerate() {
+        // Check for cancellation every 10 files
+        if idx % 10 == 0 && cancel_flag.load(Ordering::SeqCst) {
+            result.cancelled = true;
+            break;
+        }
+
         // Emit progress every 50 files during insert phase
         if idx % 50 == 0 || idx == processed_results.len() - 1 {
             emit_progress(
@@ -758,65 +836,68 @@ pub fn scan_directory_parallel(
     result.bias_count = bias_frame_ids.len();
     result.darkflats_count = darkflat_frame_ids.len();
 
-    // Phase 3: Create calibration sets
-    let has_calibration_frames = !flat_frame_ids.is_empty()
-        || !dark_frame_ids.is_empty()
-        || !bias_frame_ids.is_empty()
-        || !darkflat_frame_ids.is_empty();
+    // Skip calibration and caching phases if cancelled
+    if !result.cancelled {
+        // Phase 3: Create calibration sets
+        let has_calibration_frames = !flat_frame_ids.is_empty()
+            || !dark_frame_ids.is_empty()
+            || !bias_frame_ids.is_empty()
+            || !darkflat_frame_ids.is_empty();
 
-    let has_master_frames = !master_dark_ids.is_empty()
-        || !master_flat_ids.is_empty()
-        || !master_bias_ids.is_empty()
-        || !master_darkflat_ids.is_empty();
+        let has_master_frames = !master_dark_ids.is_empty()
+            || !master_flat_ids.is_empty()
+            || !master_bias_ids.is_empty()
+            || !master_darkflat_ids.is_empty();
 
-    if has_calibration_frames || has_master_frames {
-        emit_progress(app_handle, root_id, 0, 0, None, "calibrating");
+        if has_calibration_frames || has_master_frames {
+            emit_progress(app_handle, root_id, 0, 0, None, "calibrating");
 
-        use crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, MasterFrameIds};
+            use crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, MasterFrameIds};
 
-        let master_frame_ids = MasterFrameIds {
-            master_dark_ids,
-            master_flat_ids,
-            master_bias_ids,
-            master_darkflat_ids,
-        };
+            let master_frame_ids = MasterFrameIds {
+                master_dark_ids,
+                master_flat_ids,
+                master_bias_ids,
+                master_darkflat_ids,
+            };
 
-        match create_calibration_sets_from_scan_with_masters(
-            conn,
-            flat_frame_ids,
-            dark_frame_ids,
-            bias_frame_ids,
-            darkflat_frame_ids,
-            master_frame_ids,
-        ) {
-            Ok(cal_result) => {
-                result.calibration_sets_created = cal_result.sets_created as usize;
-            }
-            Err(e) => {
-                result.errors.push(format!("Failed to auto-create calibration sets: {}", e));
+            match create_calibration_sets_from_scan_with_masters(
+                conn,
+                flat_frame_ids,
+                dark_frame_ids,
+                bias_frame_ids,
+                darkflat_frame_ids,
+                master_frame_ids,
+            ) {
+                Ok(cal_result) => {
+                    result.calibration_sets_created = cal_result.sets_created as usize;
+                }
+                Err(e) => {
+                    result.errors.push(format!("Failed to auto-create calibration sets: {}", e));
+                }
             }
         }
-    }
 
-    // Phase 4: Rebuild duplicate caches
-    // This runs once after all scanning to pre-compute duplicate data
-    emit_progress(
-        app_handle,
-        root_id,
-        result.files_processed,
-        result.files_processed,
-        None,
-        "caching",
-    );
+        // Phase 4: Rebuild duplicate caches
+        // This runs once after all scanning to pre-compute duplicate data
+        emit_progress(
+            app_handle,
+            root_id,
+            result.files_processed,
+            result.files_processed,
+            None,
+            "caching",
+        );
 
-    // Rebuild duplicate groups cache (using metadata hash by default)
-    if let Err(e) = rebuild_duplicate_groups_cache(conn, false) {
-        result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
-    }
+        // Rebuild duplicate groups cache (using metadata hash by default)
+        if let Err(e) = rebuild_duplicate_groups_cache(conn, false) {
+            result.errors.push(format!("Failed to rebuild duplicate cache: {}", e));
+        }
 
-    // Rebuild folder similarity cache (threshold 70%)
-    if let Err(e) = rebuild_folder_similarity_cache(conn, 70.0) {
-        result.errors.push(format!("Failed to rebuild folder similarity cache: {}", e));
+        // Rebuild folder similarity cache (threshold 70%)
+        if let Err(e) = rebuild_folder_similarity_cache(conn, 70.0) {
+            result.errors.push(format!("Failed to rebuild folder similarity cache: {}", e));
+        }
     }
 
     // Emit completion

@@ -126,6 +126,7 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
         bias_count: result.bias_count,
         darkflats_count: result.darkflats_count,
         calibration_sets_created: result.calibration_sets_created,
+        cancelled: result.cancelled,
     })
 }
 
@@ -300,50 +301,60 @@ pub async fn check_missing_files_in_scan_root(
     root_id: i64,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::OrphanedFile>, String> {
-    let state_lock = state.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
-    let conn = db.conn();
+    println!("🔍 check_missing_files acquiring lock for root_id={}", root_id);
+    // Collect files from database with lock held briefly
+    let files = {
+        let state_lock = state.db.lock().unwrap();
+        println!("🔍 check_missing_files lock acquired for root_id={}", root_id);
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
 
-    // Get scan root path
-    let path: String = conn
-        .query_row(
-            "SELECT path FROM scan_roots WHERE id = ?1",
-            rusqlite::params![root_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Failed to get scan root: {}", e))?;
+        // Get scan root path
+        let path: String = conn
+            .query_row(
+                "SELECT path FROM scan_roots WHERE id = ?1",
+                rusqlite::params![root_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to get scan root: {}", e))?;
 
-    // Get all files under this scan root
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
-                    EXISTS(SELECT 1 FROM frames fr WHERE fr.file_id = f.id) as has_frame,
-                    (SELECT fr.object FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as object,
-                    (SELECT fr.date_obs FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as date_obs
-             FROM files f
-             WHERE f.path LIKE ?1"
-        )
-        .map_err(|e| e.to_string())?;
+        // Get all files under this scan root
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
+                        EXISTS(SELECT 1 FROM frames fr WHERE fr.file_id = f.id) as has_frame,
+                        (SELECT fr.object FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as object,
+                        (SELECT fr.date_obs FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as date_obs
+                 FROM files f
+                 WHERE f.path LIKE ?1"
+            )
+            .map_err(|e| e.to_string())?;
 
-    let path_prefix = format!("{}%", path);
-    let files = stmt
-        .query_map(rusqlite::params![path_prefix], |row| {
-            Ok(crate::models::OrphanedFile {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                filename: row.get(2)?,
-                size: row.get(3)?,
-                modified_at: row.get(4)?,
-                has_frame: row.get::<_, i64>(5)? != 0,
-                object: row.get(6).ok(),
-                date_obs: row.get(7).ok(),
+        let path_prefix = format!("{}%", path);
+        let result: Vec<crate::models::OrphanedFile> = stmt
+            .query_map(rusqlite::params![path_prefix], |row| {
+                Ok(crate::models::OrphanedFile {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    filename: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: row.get(4)?,
+                    has_frame: row.get::<_, i64>(5)? != 0,
+                    object: row.get(6).ok(),
+                    date_obs: row.get(7).ok(),
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        println!("🔍 check_missing_files releasing lock for root_id={}", root_id);
+        result
+        // Lock is released here when state_lock goes out of scope
+    };
 
+    println!("🔍 check_missing_files lock released, checking {} files on disk for root_id={}", files.len(), root_id);
     // Filter to only files that don't exist on disk
+    // This is done OUTSIDE the lock since filesystem checks can be slow
     let missing_files: Vec<crate::models::OrphanedFile> = files
         .into_iter()
         .filter(|file| !std::path::Path::new(&file.path).exists())
@@ -369,6 +380,8 @@ pub struct ScanResultDto {
     pub darkflats_count: usize,
     // Calibration sets created
     pub calibration_sets_created: usize,
+    // Whether scan was cancelled by user
+    pub cancelled: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -388,10 +401,13 @@ pub async fn start_scan_with_progress(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanResultDto, String> {
+    println!("🔵 start_scan_with_progress called for root_id={}", root_id);
+
     // Check if already scanning this root
     {
         let scans = state.active_scans.lock().unwrap();
         if scans.contains_key(&root_id) {
+            println!("🔴 Scan already in progress for root_id={}", root_id);
             return Err("Scan already in progress for this root".to_string());
         }
     }
@@ -407,8 +423,10 @@ pub async fn start_scan_with_progress(
     }
 
     // Get scan root info and perform scan
+    println!("🔵 Acquiring database lock for root_id={}", root_id);
     let result = {
         let state_lock = state.db.lock().unwrap();
+        println!("🔵 Database lock acquired for root_id={}", root_id);
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
 
@@ -429,13 +447,17 @@ pub async fn start_scan_with_progress(
             &conn,
             &app_handle,
             use_content_hash,
+            cancel_flag.clone(),
         );
 
         // Update last_scan timestamp
         db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
 
+        println!("🔵 Scan complete for root_id={}, releasing lock", root_id);
         result
     };
+
+    println!("🔵 Database lock released for root_id={}", root_id);
 
     // Remove from active scans
     {
@@ -454,6 +476,7 @@ pub async fn start_scan_with_progress(
         bias_count: result.bias_count,
         darkflats_count: result.darkflats_count,
         calibration_sets_created: result.calibration_sets_created,
+        cancelled: result.cancelled,
     })
 }
 
