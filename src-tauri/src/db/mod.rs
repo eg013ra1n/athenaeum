@@ -25,6 +25,20 @@ impl Database {
     /// Create a new database connection
     pub fn new(path: PathBuf) -> Result<Self> {
         let conn = Connection::open(path)?;
+
+        // Performance tuning - safe with WAL mode
+        // synchronous=NORMAL: 2x faster writes, crash-safe with WAL
+        // cache_size=-64000: 64MB cache (default is 2MB)
+        // temp_store=MEMORY: Store temp tables in memory
+        // mmap_size=256MB: Memory-mapped I/O for faster reads
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -64000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA mmap_size = 268435456;",
+        )?;
+
         init_db(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),

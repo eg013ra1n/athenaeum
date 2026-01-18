@@ -665,7 +665,7 @@ pub fn scan_directory_parallel(
     let app_handle_clone = app_handle.clone();
     let cancel_flag_clone = cancel_flag.clone();
 
-    let processed_results: Vec<FileProcessResult> = new_files
+    let mut processed_results: Vec<FileProcessResult> = new_files
         .par_iter()
         .filter_map(|path| {
             // Check for cancellation
@@ -725,7 +725,9 @@ pub fn scan_directory_parallel(
     // Begin transaction for batch insert
     let _ = conn.execute("BEGIN TRANSACTION", []);
 
-    for (idx, file_result) in processed_results.iter().enumerate() {
+    // Use iter_mut to avoid cloning Frame structs during insert
+    let total_results = processed_results.len();
+    for (idx, file_result) in processed_results.iter_mut().enumerate() {
         // Check for cancellation every 10 files
         if idx % 10 == 0 && cancel_flag.load(Ordering::SeqCst) {
             result.cancelled = true;
@@ -733,12 +735,12 @@ pub fn scan_directory_parallel(
         }
 
         // Emit progress every 50 files during insert phase
-        if idx % 50 == 0 || idx == processed_results.len() - 1 {
+        if idx % 50 == 0 || idx == total_results - 1 {
             emit_progress(
                 app_handle,
                 root_id,
                 idx + 1,
-                processed_results.len(),
+                total_results,
                 Some(file_result.file.filename.clone()),
                 "inserting",
             );
@@ -775,11 +777,10 @@ pub fn scan_directory_parallel(
         // Insert file
         match insert_file(conn, &file_result.file) {
             Ok(file_id) => {
-                // Update frame with correct file_id and insert
-                let mut frame = file_result.frame.clone();
-                frame.file_id = file_id;
+                // Update frame file_id in place (avoids clone of 32-field struct)
+                file_result.frame.file_id = file_id;
 
-                match insert_frame(conn, &frame) {
+                match insert_frame(conn, &file_result.frame) {
                     Ok(frame_id) => {
                         result.files_processed += 1;
 

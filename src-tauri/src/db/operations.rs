@@ -6,35 +6,38 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Result};
 
 /// Insert a new file record
+/// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO files (path, filename, size, modified_at, format, created_at, metadata_hash, content_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            file.path,
-            file.filename,
-            file.size,
-            file.modified_at.to_rfc3339(),
-            format!("{:?}", file.format),
-            file.created_at.to_rfc3339(),
-            file.metadata_hash,
-            file.content_hash,
-        ],
     )?;
+    stmt.execute(params![
+        file.path,
+        file.filename,
+        file.size,
+        file.modified_at.to_rfc3339(),
+        format!("{:?}", file.format),
+        file.created_at.to_rfc3339(),
+        file.metadata_hash,
+        file.content_hash,
+    ])?;
     Ok(conn.last_insert_rowid())
 }
 
 /// Insert FITS header with computed fingerprint
+/// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_fits_header(conn: &Connection, file_id: i64, header: &str) -> Result<i64> {
     let fingerprint = compute_header_fingerprint(header);
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
-        params![file_id, header, fingerprint],
     )?;
+    stmt.execute(params![file_id, header, fingerprint])?;
     Ok(conn.last_insert_rowid())
 }
 
 /// Insert a new frame record
+/// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
     let imagetyp_str = frame.imagetyp.as_ref().map(|t| format!("{:?}", t));
     let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
@@ -46,47 +49,47 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 
     let is_master_int = if frame.is_master { 1 } else { 0 };
 
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp, is_master,
          gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, ypixsz,
          naxis1, naxis2, ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, swcreate, bayerpat)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
          ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
-        params![
-            frame.file_id,
-            frame.object,
-            date_obs_str,
-            frame.telescop,
-            frame.instrume,
-            frame.exptime,
-            frame.filter,
-            imagetyp_str,
-            is_master_int,
-            frame.gain,
-            frame.offset,
-            frame.binning,
-            frame.xbinning,
-            frame.ybinning,
-            frame.ccd_temp,
-            frame.set_temp,
-            frame.focallen,
-            frame.xpixsz,
-            frame.ypixsz,
-            frame.naxis1,
-            frame.naxis2,
-            frame.ra,
-            frame.dec,
-            frame.sitelat,
-            frame.lat_obs,
-            frame.sitelong,
-            frame.long_obs,
-            frame.objctra,
-            frame.objctdec,
-            override_int,
-            frame.swcreate,
-            frame.bayerpat,
-        ],
     )?;
+    stmt.execute(params![
+        frame.file_id,
+        frame.object,
+        date_obs_str,
+        frame.telescop,
+        frame.instrume,
+        frame.exptime,
+        frame.filter,
+        imagetyp_str,
+        is_master_int,
+        frame.gain,
+        frame.offset,
+        frame.binning,
+        frame.xbinning,
+        frame.ybinning,
+        frame.ccd_temp,
+        frame.set_temp,
+        frame.focallen,
+        frame.xpixsz,
+        frame.ypixsz,
+        frame.naxis1,
+        frame.naxis2,
+        frame.ra,
+        frame.dec,
+        frame.sitelat,
+        frame.lat_obs,
+        frame.sitelong,
+        frame.long_obs,
+        frame.objctra,
+        frame.objctdec,
+        override_int,
+        frame.swcreate,
+        frame.bayerpat,
+    ])?;
     Ok(conn.last_insert_rowid())
 }
 
