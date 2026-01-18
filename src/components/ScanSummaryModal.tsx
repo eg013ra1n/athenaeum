@@ -95,8 +95,10 @@ export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath, missin
         {/* Content */}
         <div className="p-6 space-y-6">
           {/* Path */}
-          <div className="text-sm text-gray-400">
-            <span className="font-mono bg-gray-900 px-2 py-1 rounded">{rootPath}</span>
+          <div className="text-sm text-gray-400 overflow-hidden">
+            <span className="font-mono bg-gray-900 px-2 py-1 rounded block truncate" title={rootPath}>
+              {rootPath}
+            </span>
           </div>
 
           {/* Cancelled notice */}
@@ -175,14 +177,14 @@ export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath, missin
 
           {/* Errors */}
           {scanResult.errors.length > 0 && (
-            <div className="p-4 bg-red-900/20 border border-red-700 rounded-lg">
-              <div className="flex items-start gap-3">
+            <div className="p-4 bg-red-900/20 border border-red-700 rounded-lg overflow-hidden">
+              <div className="flex items-start gap-3 min-w-0">
                 <FileWarning className="text-red-400 flex-shrink-0" size={20} />
-                <div className="flex-1">
+                <div className="flex-1 min-w-0 overflow-hidden">
                   <p className="font-semibold text-red-400 mb-2">
                     {scanResult.errors.length} Error{scanResult.errors.length !== 1 ? 's' : ''}
                   </p>
-                  <div className="max-h-32 overflow-y-auto">
+                  <div className="max-h-32 overflow-y-auto overflow-x-hidden">
                     <ul className="space-y-1 text-xs text-red-300">
                       {scanResult.errors.slice(0, 10).map((error, idx) => (
                         <li key={idx} className="truncate" title={String(error)}>
