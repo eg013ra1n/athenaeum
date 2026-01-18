@@ -3,6 +3,7 @@
 use crate::db::{self};
 use crate::models::*;
 use crate::scanner::{scan_directory, scan_directory_parallel, emit_progress};
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -321,13 +322,15 @@ pub async fn check_missing_files_in_scan_root(
             .map_err(|e| format!("Failed to get scan root: {}", e))?;
 
         // Get all files under this scan root
+        // Use LEFT JOIN instead of subqueries to avoid N+1 query problem
         let mut stmt = conn
             .prepare(
                 "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
-                        EXISTS(SELECT 1 FROM frames fr WHERE fr.file_id = f.id) as has_frame,
-                        (SELECT fr.object FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as object,
-                        (SELECT fr.date_obs FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as date_obs
+                        CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
+                        fr.object,
+                        fr.date_obs
                  FROM files f
+                 LEFT JOIN frames fr ON fr.file_id = f.id
                  WHERE f.path LIKE ?1"
             )
             .map_err(|e| e.to_string())?;
@@ -353,21 +356,18 @@ pub async fn check_missing_files_in_scan_root(
         // Lock is released here when state_lock goes out of scope
     };
 
-    // Filter to only files that don't exist on disk
+    // Filter to only files that don't exist on disk - done in parallel
     // This is done OUTSIDE the lock since filesystem checks can be slow
     let total_files = files.len();
-    let mut missing_files: Vec<crate::models::OrphanedFile> = Vec::new();
 
-    for (idx, file) in files.into_iter().enumerate() {
-        if !std::path::Path::new(&file.path).exists() {
-            missing_files.push(file);
-        }
+    // Use parallel iteration for filesystem checks (I/O bound operations)
+    let missing_files: Vec<crate::models::OrphanedFile> = files
+        .into_par_iter()
+        .filter(|file| !std::path::Path::new(&file.path).exists())
+        .collect();
 
-        // Emit progress every 100 files or on last file
-        if (idx + 1) % 100 == 0 || idx + 1 == total_files {
-            emit_progress(&app_handle, root_id, idx + 1, total_files, None, "verifying");
-        }
-    }
+    // Emit final progress
+    emit_progress(&app_handle, root_id, total_files, total_files, None, "verifying");
 
     Ok(missing_files)
 }

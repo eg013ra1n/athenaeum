@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use tauri::State;
+use rayon::prelude::*;
 
 use crate::commands::AppState;
 
@@ -225,13 +226,17 @@ pub async fn recheck_missing_files(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        // Check each file and update status
-        let mut found_file_ids = Vec::new();
-        for (mf_id, _file_id, path) in &files {
-            if Path::new(path).exists() {
-                found_file_ids.push(*mf_id);
-            }
-        }
+        // Check each file in parallel - filesystem checks are I/O bound
+        let found_file_ids: Vec<i64> = files
+            .par_iter()
+            .filter_map(|(mf_id, _file_id, path)| {
+                if Path::new(path).exists() {
+                    Some(*mf_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Remove files that now exist
         if !found_file_ids.is_empty() {
