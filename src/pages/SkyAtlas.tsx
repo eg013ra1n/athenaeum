@@ -113,7 +113,8 @@ export default function SkyAtlas() {
             saveViewStateRef.current({
               zoom: currentZoom,
               ra: currentCenter[0],
-              dec: currentCenter[1]
+              dec: currentCenter[1],
+              rotation: currentCenter[2] ?? 0
             });
 
             console.log('💾 Auto-saved view state:', { zoom: currentZoom, center: currentCenter });
@@ -163,7 +164,7 @@ export default function SkyAtlas() {
           projection: 'aitoff',
           transform: 'equatorial',
           center: (savedState.ra !== null && savedState.dec !== null)
-            ? [savedState.ra, savedState.dec, 0]
+            ? [savedState.ra, savedState.dec, savedState.rotation ?? 0]
             : null,
           orientationfixed: false,
           follow: "center",  // Prevents animation when setting initial center
@@ -275,7 +276,7 @@ export default function SkyAtlas() {
     if (restorationDone.current) return; // Only restore once to prevent feedback loop
 
     const viewState = getViewState();
-    const { zoom, ra, dec } = viewState;
+    const { zoom, ra, dec, rotation } = viewState;
 
     // Only restore if we have state to restore
     if (zoom !== null || (ra !== null && dec !== null)) {
@@ -285,8 +286,8 @@ export default function SkyAtlas() {
       requestAnimationFrame(() => {
         // Restore center position
         if (ra !== null && dec !== null && window.Celestial.rotate) {
-          window.Celestial.rotate({ center: [ra, dec, 0] });
-          console.log('📍 Restored center:', [ra, dec]);
+          window.Celestial.rotate({ center: [ra, dec, rotation ?? 0] });
+          console.log('📍 Restored center:', [ra, dec, rotation ?? 0]);
         }
 
         // Restore zoom level
@@ -653,7 +654,8 @@ export default function SkyAtlas() {
                     saveViewState({
                       zoom: currentZoom,
                       ra: currentCenter[0],
-                      dec: currentCenter[1]
+                      dec: currentCenter[1],
+                      rotation: currentCenter[2] ?? 0
                     });
                   }
 

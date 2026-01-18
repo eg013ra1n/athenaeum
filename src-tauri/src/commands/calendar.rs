@@ -1,5 +1,6 @@
 // Calendar view commands - imaging activity by date
 
+use crate::coordinates::{parse_ra_sexagesimal, parse_dec_sexagesimal};
 use crate::models::*;
 use std::collections::HashMap;
 use tauri::State;
@@ -41,8 +42,8 @@ pub async fn get_calendar_month_data(
                 COALESCE(fs.name, fr.object) as object_name,
                 COUNT(DISTINCT fr.id) as frame_count,
                 COALESCE(SUM(fr.exptime), 0) as total_exposure,
-                AVG(fr.ra) as avg_ra,
-                AVG(fr.dec) as avg_dec,
+                fs.objctra as avg_ra,
+                fs.objctdec as avg_dec,
                 GROUP_CONCAT(DISTINCT fr.filter) as filters
             FROM frames fr
             JOIN session_members sm ON sm.frame_id = fr.id
@@ -65,9 +66,13 @@ pub async fn get_calendar_month_data(
             let object_name: Option<String> = row.get(3)?;
             let frame_count: i32 = row.get(4)?;
             let total_exposure: f64 = row.get(5)?;
-            let avg_ra: Option<f64> = row.get(6)?;
-            let avg_dec: Option<f64> = row.get(7)?;
+            let ra_str: Option<String> = row.get(6)?;
+            let dec_str: Option<String> = row.get(7)?;
             let filters_str: Option<String> = row.get(8)?;
+
+            // Parse sexagesimal coordinates to decimal degrees
+            let avg_ra: Option<f64> = ra_str.as_ref().and_then(|s| parse_ra_sexagesimal(s).ok());
+            let avg_dec: Option<f64> = dec_str.as_ref().and_then(|s| parse_dec_sexagesimal(s).ok());
 
             let filters: Vec<String> = filters_str
                 .map(|s| {

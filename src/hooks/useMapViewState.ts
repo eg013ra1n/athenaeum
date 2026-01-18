@@ -5,6 +5,7 @@ export interface MapViewState {
   zoom: number | null;
   ra: number | null;
   dec: number | null;
+  rotation: number | null;
 }
 
 const STORAGE_KEY = 'skyatlas_view_state';
@@ -53,6 +54,7 @@ export function useMapViewState() {
     const zoom = searchParams.get('zoom');
     const ra = searchParams.get('ra');
     const dec = searchParams.get('dec');
+    const rotation = searchParams.get('rotation');
 
     // If URL has params, use them
     if (zoom || ra || dec) {
@@ -60,6 +62,7 @@ export function useMapViewState() {
         zoom: zoom ? parseFloat(zoom) : null,
         ra: ra ? parseFloat(ra) : null,
         dec: dec ? parseFloat(dec) : null,
+        rotation: rotation ? parseFloat(rotation) : null,
       };
     }
 
@@ -75,6 +78,7 @@ export function useMapViewState() {
       zoom: null,
       ra: null,
       dec: null,
+      rotation: null,
     };
   }, [searchParams, loadFromStorage]);
 
@@ -92,6 +96,9 @@ export function useMapViewState() {
 
     // Dec should be -90 to 90 degrees
     if (state.dec !== null && (state.dec < -90 || state.dec > 90)) return false;
+
+    // Rotation should be within reasonable bounds (typically -180 to 180)
+    if (state.rotation !== null && (state.rotation < -360 || state.rotation > 360)) return false;
 
     return true;
   }, []);
@@ -138,6 +145,12 @@ export function useMapViewState() {
       params.delete('dec');
     }
 
+    if (normalizedState.rotation !== null) {
+      params.set('rotation', normalizedState.rotation.toFixed(6));
+    } else {
+      params.delete('rotation');
+    }
+
     // Use replace to avoid cluttering browser history
     setSearchParams(params, { replace });
   }, [searchParams, setSearchParams, validateViewState, saveToStorage]);
@@ -150,6 +163,7 @@ export function useMapViewState() {
     params.delete('zoom');
     params.delete('ra');
     params.delete('dec');
+    params.delete('rotation');
     setSearchParams(params, { replace: true });
   }, [searchParams, setSearchParams]);
 
