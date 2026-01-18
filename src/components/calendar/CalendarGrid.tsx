@@ -13,7 +13,8 @@ interface CalendarGridProps {
   year: number;
   month: number; // 1-12
   events: CalendarDayEvent[];
-  onDayClick: (date: string, events: CalendarDayEvent | null, element: HTMLElement) => void;
+  selectedDate: string | null;
+  onDayClick: (date: string, events: CalendarDayEvent | null) => void;
 }
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -22,6 +23,7 @@ export function CalendarGrid({
   year,
   month,
   events,
+  selectedDate,
   onDayClick,
 }: CalendarGridProps) {
   // Create the month date
@@ -68,6 +70,7 @@ export function CalendarGrid({
               date={day}
               currentMonth={monthDate}
               events={dayEvents}
+              isSelected={dateKey === selectedDate}
               onClick={onDayClick}
             />
           );

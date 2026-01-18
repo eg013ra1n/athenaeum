@@ -1,63 +1,93 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { addMonths, subMonths } from 'date-fns';
+import { addMonths, subMonths, addYears, subYears } from 'date-fns';
 import { Loader2, AlertCircle } from 'lucide-react';
 import { useCalendarData } from '../hooks/useCalendarData';
-import { CalendarMonthNav } from '../components/calendar/CalendarMonthNav';
+import { useCalendarYearData } from '../hooks/useCalendarYearData';
+import { CalendarMonthNav, type CalendarViewMode } from '../components/calendar/CalendarMonthNav';
 import { CalendarGrid } from '../components/calendar/CalendarGrid';
-import { CalendarEventPopup } from '../components/calendar/CalendarEventPopup';
+import { CalendarYearList } from '../components/calendar/CalendarYearList';
+import { CalendarEventPanel } from '../components/calendar/CalendarEventPanel';
 import type { CalendarDayEvent } from '../types/models';
-
-interface PopupState {
-  date: string;
-  events: CalendarDayEvent;
-  element: HTMLElement;
-}
 
 export default function ShootCalendar() {
   const navigate = useNavigate();
 
-  // Current month state
+  // View mode state
+  const [viewMode, setViewMode] = useState<CalendarViewMode>('month');
+
+  // Current date state
   const [currentDate, setCurrentDate] = useState(() => new Date());
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth() + 1; // 1-12
 
-  // Fetch calendar data
-  const { data, loading, error } = useCalendarData(year, month);
+  // Fetch calendar data based on view mode
+  const monthData = useCalendarData(year, month);
+  const yearData = useCalendarYearData(year, viewMode === 'year');
 
-  // Popup state
-  const [popup, setPopup] = useState<PopupState | null>(null);
+  // Use the appropriate data based on view mode
+  const loading = viewMode === 'month' ? monthData.loading : yearData.loading;
+  const error = viewMode === 'month' ? monthData.error : yearData.error;
 
-  // Month navigation handlers
-  const handlePrevMonth = useCallback(() => {
-    setCurrentDate((prev) => subMonths(prev, 1));
-    setPopup(null);
-  }, []);
+  // Selected day state
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
 
-  const handleNextMonth = useCallback(() => {
-    setCurrentDate((prev) => addMonths(prev, 1));
-    setPopup(null);
-  }, []);
+  // Get events for selected date
+  const selectedEvents = useMemo(() => {
+    if (!selectedDate) return null;
 
-  const handleToday = useCallback(() => {
-    setCurrentDate(new Date());
-    setPopup(null);
+    if (viewMode === 'month') {
+      if (!monthData.data?.days) return null;
+      return monthData.data.days.find(d => d.date === selectedDate) || null;
+    } else {
+      // Year view - search through all months
+      if (!yearData.data?.months) return null;
+      for (const m of yearData.data.months) {
+        const found = m.days.find(d => d.date === selectedDate);
+        if (found) return found;
+      }
+      return null;
+    }
+  }, [selectedDate, viewMode, monthData.data?.days, yearData.data?.months]);
+
+  // Navigation handlers
+  const handlePrev = useCallback(() => {
+    if (viewMode === 'month') {
+      setCurrentDate((prev) => subMonths(prev, 1));
+    } else {
+      setCurrentDate((prev) => subYears(prev, 1));
+    }
+    setSelectedDate(null);
+  }, [viewMode]);
+
+  const handleNext = useCallback(() => {
+    if (viewMode === 'month') {
+      setCurrentDate((prev) => addMonths(prev, 1));
+    } else {
+      setCurrentDate((prev) => addYears(prev, 1));
+    }
+    setSelectedDate(null);
+  }, [viewMode]);
+
+  // View mode change handler
+  const handleViewModeChange = useCallback((mode: CalendarViewMode) => {
+    setViewMode(mode);
+    setSelectedDate(null);
   }, []);
 
   // Day click handler
   const handleDayClick = useCallback(
-    (date: string, events: CalendarDayEvent | null, element: HTMLElement) => {
+    (date: string, events: CalendarDayEvent | null) => {
       if (events) {
-        setPopup({ date, events, element });
+        setSelectedDate(date);
       }
     },
     []
   );
 
-  // Navigation handlers
+  // Navigation handlers for panel
   const handleNavigateToSkyAtlas = useCallback(
     (ra: number, dec: number) => {
-      // Navigate to SkyAtlas with coordinates
       navigate(`/skyatlas?ra=${ra}&dec=${dec}&zoom=800`);
     },
     [navigate]
@@ -70,22 +100,36 @@ export default function ShootCalendar() {
     [navigate]
   );
 
-  const handleClosePopup = useCallback(() => {
-    setPopup(null);
-  }, []);
-
-  // Calculate totals for display
-  const totalFrameCount = data?.totalFrameCount ?? 0;
-  const totalExposureHours = (data?.totalExposureSeconds ?? 0) / 3600;
+  // Calculate totals for display based on view mode
+  const totalFrameCount = viewMode === 'month'
+    ? monthData.data?.totalFrameCount ?? 0
+    : yearData.data?.totalFrameCount ?? 0;
+  const totalExposureHours = viewMode === 'month'
+    ? (monthData.data?.totalExposureSeconds ?? 0) / 3600
+    : (yearData.data?.totalExposureSeconds ?? 0) / 3600;
 
   return (
-    <div className="p-6">
+    <div className="p-6 h-full flex flex-col">
       {/* Header */}
-      <div className="mb-6">
+      <div className="flex-shrink-0 mb-4">
         <h2 className="text-3xl font-bold mb-2">Shoot Calendar</h2>
         <p className="text-gray-400">
           Browse captures by date with equipment and target information
         </p>
+      </div>
+
+      {/* Navigation - always visible */}
+      <div className="flex-shrink-0">
+        <CalendarMonthNav
+          year={year}
+          month={month}
+          viewMode={viewMode}
+          onViewModeChange={handleViewModeChange}
+          onPrev={handlePrev}
+          onNext={handleNext}
+          totalFrameCount={totalFrameCount}
+          totalExposureHours={totalExposureHours}
+        />
       </div>
 
       {/* Loading state */}
@@ -109,50 +153,68 @@ export default function ShootCalendar() {
 
       {/* Calendar content */}
       {!loading && !error && (
-        <>
-          {/* Month navigation */}
-          <CalendarMonthNav
-            year={year}
-            month={month}
-            onPrevMonth={handlePrevMonth}
-            onNextMonth={handleNextMonth}
-            onToday={handleToday}
-            totalFrameCount={totalFrameCount}
-            totalExposureHours={totalExposureHours}
-          />
+        <div className="flex gap-4 flex-1 min-h-0 mt-4">
+          {/* Left: Calendar Grid or Year List + Legend */}
+          <div className="flex-[2] flex flex-col min-w-0">
+            {viewMode === 'month' ? (
+              <>
+                <div className="flex-1 overflow-auto">
+                  <CalendarGrid
+                    year={year}
+                    month={month}
+                    events={monthData.data?.days ?? []}
+                    selectedDate={selectedDate}
+                    onDayClick={handleDayClick}
+                  />
+                </div>
 
-          {/* Calendar grid */}
-          <CalendarGrid
-            year={year}
-            month={month}
-            events={data?.days ?? []}
-            onDayClick={handleDayClick}
-          />
+                {/* Legend */}
+                <div className="flex-shrink-0 mt-4 flex items-center gap-6 text-sm text-gray-400">
+                  <div className="flex items-center gap-2">
+                    <span className="w-3 h-3 rounded-full bg-blue-500" />
+                    <span>Frame sets</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-3 h-3 rounded-full bg-yellow-500" />
+                    <span>Unorganized frames</span>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                {yearData.data && (
+                  <CalendarYearList
+                    data={yearData.data}
+                    selectedDate={selectedDate}
+                    onDayClick={handleDayClick}
+                  />
+                )}
 
-          {/* Legend */}
-          <div className="mt-4 flex items-center gap-6 text-sm text-gray-400">
-            <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-full bg-blue-500" />
-              <span>Frame sets</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-full bg-yellow-500" />
-              <span>Unorganized frames</span>
-            </div>
+                {/* Legend for year view */}
+                <div className="flex-shrink-0 mt-4 flex items-center gap-6 text-sm text-gray-400">
+                  <div className="flex items-center gap-2">
+                    <span className="w-3 h-3 rounded-full bg-blue-500" />
+                    <span>Frame sets</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-3 h-3 rounded-full bg-yellow-500" />
+                    <span>Unorganized frames</span>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
-        </>
-      )}
 
-      {/* Event popup */}
-      {popup && (
-        <CalendarEventPopup
-          date={popup.date}
-          events={popup.events}
-          anchorElement={popup.element}
-          onClose={handleClosePopup}
-          onNavigateToSkyAtlas={handleNavigateToSkyAtlas}
-          onNavigateToFrameSet={handleNavigateToFrameSet}
-        />
+          {/* Right: Details Panel */}
+          <div className="w-80 flex-shrink-0">
+            <CalendarEventPanel
+              selectedDate={selectedDate}
+              events={selectedEvents}
+              onNavigateToSkyAtlas={handleNavigateToSkyAtlas}
+              onNavigateToFrameSet={handleNavigateToFrameSet}
+            />
+          </div>
+        </div>
       )}
     </div>
   );

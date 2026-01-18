@@ -767,3 +767,10 @@ export interface CalendarMonthData {
   totalFrameCount: number;
   totalExposureSeconds: number;
 }
+
+export interface CalendarYearData {
+  year: number;
+  months: CalendarMonthData[]; // Only months with data
+  totalFrameCount: number;
+  totalExposureSeconds: number;
+}

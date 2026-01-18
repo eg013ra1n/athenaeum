@@ -5,13 +5,15 @@ interface CalendarDayCellProps {
   date: Date;
   currentMonth: Date;
   events: CalendarDayEvent | null;
-  onClick: (date: string, events: CalendarDayEvent | null, element: HTMLElement) => void;
+  isSelected: boolean;
+  onClick: (date: string, events: CalendarDayEvent | null) => void;
 }
 
 export function CalendarDayCell({
   date,
   currentMonth,
   events,
+  isSelected,
   onClick,
 }: CalendarDayCellProps) {
   const isCurrentMonth = isSameMonth(date, currentMonth);
@@ -20,8 +22,8 @@ export function CalendarDayCell({
   const hasUnorganized = events && events.unorganizedGroups.length > 0;
   const hasEvents = events && (events.frameSets.length > 0 || events.unorganizedGroups.length > 0);
 
-  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    onClick(format(date, 'yyyy-MM-dd'), events, e.currentTarget);
+  const handleClick = () => {
+    onClick(format(date, 'yyyy-MM-dd'), events);
   };
 
   return (
@@ -30,7 +32,7 @@ export function CalendarDayCell({
       className={`
         min-h-[80px] p-2 border border-gray-700 rounded-lg
         ${isCurrentMonth ? 'bg-gray-800' : 'bg-gray-850 opacity-50'}
-        ${isTodayDate ? 'ring-2 ring-blue-500' : ''}
+        ${isSelected ? 'ring-2 ring-blue-400 border-blue-400' : isTodayDate ? 'ring-2 ring-blue-500/50' : ''}
         ${hasEvents ? 'cursor-pointer hover:border-gray-500 transition-colors' : ''}
       `}
     >

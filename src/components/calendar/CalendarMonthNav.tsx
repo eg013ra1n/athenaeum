@@ -1,12 +1,15 @@
-import { ChevronLeft, ChevronRight, Calendar } from 'lucide-react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { format } from 'date-fns';
+
+export type CalendarViewMode = 'month' | 'year';
 
 interface CalendarMonthNavProps {
   year: number;
   month: number; // 1-12
-  onPrevMonth: () => void;
-  onNextMonth: () => void;
-  onToday: () => void;
+  viewMode: CalendarViewMode;
+  onViewModeChange: (mode: CalendarViewMode) => void;
+  onPrev: () => void;
+  onNext: () => void;
   totalFrameCount: number;
   totalExposureHours: number;
 }
@@ -14,9 +17,10 @@ interface CalendarMonthNavProps {
 export function CalendarMonthNav({
   year,
   month,
-  onPrevMonth,
-  onNextMonth,
-  onToday,
+  viewMode,
+  onViewModeChange,
+  onPrev,
+  onNext,
   totalFrameCount,
   totalExposureHours,
 }: CalendarMonthNavProps) {
@@ -28,33 +32,50 @@ export function CalendarMonthNav({
       <div className="flex items-center gap-4">
         <div className="flex items-center gap-1">
           <button
-            onClick={onPrevMonth}
+            onClick={onPrev}
             className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
-            title="Previous month"
+            title={viewMode === 'month' ? 'Previous month' : 'Previous year'}
           >
             <ChevronLeft size={20} />
           </button>
           <button
-            onClick={onNextMonth}
+            onClick={onNext}
             className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
-            title="Next month"
+            title={viewMode === 'month' ? 'Next month' : 'Next year'}
           >
             <ChevronRight size={20} />
           </button>
         </div>
-        <h3 className="text-xl font-semibold">
-          {format(displayDate, 'MMMM yyyy')}
+        <h3 className="text-xl font-semibold min-w-[180px]">
+          {viewMode === 'month' ? format(displayDate, 'MMMM yyyy') : year}
         </h3>
-        <button
-          onClick={onToday}
-          className="flex items-center gap-1 px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
-        >
-          <Calendar size={14} />
-          Today
-        </button>
+
+        {/* View Mode Toggle */}
+        <div className="flex items-center bg-gray-700 rounded-lg p-0.5">
+          <button
+            onClick={() => onViewModeChange('month')}
+            className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
+              viewMode === 'month'
+                ? 'bg-gray-600 text-white'
+                : 'text-gray-400 hover:text-gray-200'
+            }`}
+          >
+            Month
+          </button>
+          <button
+            onClick={() => onViewModeChange('year')}
+            className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
+              viewMode === 'year'
+                ? 'bg-gray-600 text-white'
+                : 'text-gray-400 hover:text-gray-200'
+            }`}
+          >
+            Year
+          </button>
+        </div>
       </div>
 
-      {/* Month stats */}
+      {/* Stats */}
       <div className="flex items-center gap-4 text-sm text-gray-400">
         <span>
           <span className="text-gray-200 font-medium">{totalFrameCount}</span> frames
