@@ -1,4 +1,5 @@
 import { Search, Calendar, Star, MapPin, X } from 'lucide-react';
+import { DateInputGroup, toISODate, isoToDateParts, generateYears } from './DateRangeFilter';
 
 export interface ObjectsFilterState {
   dateFrom: string | null;
@@ -76,20 +77,16 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
             Date Range
           </label>
           <div className="flex items-center gap-2">
-            <input
-              type="date"
-              value={filters.dateFrom || ''}
-              onChange={(e) => updateFilter('dateFrom', e.target.value || null)}
-              max={filters.dateTo || undefined}
-              className={`${inputClass} w-36`}
+            <DateInputGroup
+              value={isoToDateParts(filters.dateFrom)}
+              onChange={(parts) => updateFilter('dateFrom', toISODate(parts))}
+              years={generateYears()}
             />
             <span className="text-gray-500 text-sm">to</span>
-            <input
-              type="date"
-              value={filters.dateTo || ''}
-              onChange={(e) => updateFilter('dateTo', e.target.value || null)}
-              min={filters.dateFrom || undefined}
-              className={`${inputClass} w-36`}
+            <DateInputGroup
+              value={isoToDateParts(filters.dateTo)}
+              onChange={(parts) => updateFilter('dateTo', toISODate(parts))}
+              years={generateYears()}
             />
           </div>
         </div>

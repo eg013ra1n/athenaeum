@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useNavigate } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
@@ -8,8 +8,8 @@ import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { useMapViewState } from '../hooks/useMapViewState';
-import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
+import { DateRangeFilter, DateParts, toISODate } from '../components/DateRangeFilter';
 import '../styles/celestial-overrides.css';
 
 // Declare global Celestial and d3 from d3-celestial
@@ -40,6 +40,10 @@ export default function SkyAtlas() {
   const [selectionResult, setSelectionResult] = useState<SelectionResult | null>(null);
   const [showDialog, setShowDialog] = useState(false);
 
+  // Date filter state
+  const [dateFrom, setDateFrom] = useState<DateParts | null>(null);
+  const [dateTo, setDateTo] = useState<DateParts | null>(null);
+
   // Custom hooks
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
   const coordinateTransform = useCoordinateTransform();
@@ -48,6 +52,25 @@ export default function SkyAtlas() {
   const { getViewState, saveViewState } = useMapViewState();
 
   const navigate = useNavigate();
+
+  // Filter locations by date range
+  const filteredLocations = useMemo(() => {
+    const fromISO = toISODate(dateFrom);
+    const toISO = toISODate(dateTo);
+
+    return locations.filter(loc => {
+      const locStartDate = loc.dateRange[0]?.split('T')[0];
+      const locEndDate = loc.dateRange[1]?.split('T')[0];
+
+      // If filter from is set, location end must be >= filter from
+      if (fromISO && locEndDate && locEndDate < fromISO) return false;
+
+      // If filter to is set, location start must be <= filter to
+      if (toISO && locStartDate && locStartDate > toISO) return false;
+
+      return true;
+    });
+  }, [locations, dateFrom, dateTo]);
 
   // Fetch imaging locations from backend
   useEffect(() => {
@@ -759,11 +782,11 @@ export default function SkyAtlas() {
 
   // Add markers when locations are loaded or zoom level changes
   useEffect(() => {
-    if (mapReady && locations.length > 0 && !loading) {
+    if (mapReady && filteredLocations.length > 0 && !loading) {
       console.log('🎯 Marker useEffect triggered, calling addImagingMarkers');
-      addImagingMarkers(locations);
+      addImagingMarkers(filteredLocations);
     }
-  }, [locations, mapReady, loading, addImagingMarkers]);
+  }, [filteredLocations, mapReady, loading, addImagingMarkers]);
 
   // Manage SVG overlay visibility based on drawing mode
   useEffect(() => {
@@ -869,12 +892,41 @@ export default function SkyAtlas() {
   }
 
   return (
-    <div className="h-screen w-full flex flex-col bg-gray-900">
+    <div className="h-screen w-full flex flex-col bg-gray-900 overflow-hidden">
       {/* Header */}
       <div className="flex-shrink-0 p-4 border-b border-gray-700 bg-gray-800">
-        <h2 className="text-2xl font-bold text-gray-100">Sky Atlas</h2>
+        <div className="flex items-center justify-between">
+          {/* Left: Title */}
+          <h2 className="text-2xl font-bold text-gray-100">Sky Atlas</h2>
+
+          {/* Right: Select button + Date filters */}
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => setDrawingMode(prev => prev === 'rectangle' ? 'none' : 'rectangle')}
+              disabled={!mapReady}
+              title="Select frames in a rectangular region (Press S)"
+              className={`px-3 py-1.5 rounded text-sm font-medium transition ${
+                drawingMode === 'rectangle'
+                  ? 'bg-blue-500 text-white shadow-lg'
+                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+              } ${!mapReady ? 'opacity-50 cursor-not-allowed' : ''}`}
+            >
+              Select
+            </button>
+
+            <div className="w-px h-6 bg-gray-600" />
+
+            <DateRangeFilter
+              dateFrom={dateFrom}
+              dateTo={dateTo}
+              onFromChange={setDateFrom}
+              onToChange={setDateTo}
+            />
+          </div>
+        </div>
         <p className="text-sm text-gray-400 mt-1">
-          Offline interactive sky map • {locations.length} imaging locations
+          Offline interactive sky map • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
+          {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
         </p>
       </div>
 
@@ -885,12 +937,6 @@ export default function SkyAtlas() {
         className="flex-1 w-full overflow-hidden relative"
         style={{ minHeight: 0 }}
       >
-        {/* Selection Toolbar - floating overlay */}
-        <SelectionToolbar
-          activeMode={drawingMode}
-          onModeChange={setDrawingMode}
-          isDisabled={!mapReady}
-        />
       </div>
 
       {/* Selection Results Dialog */}

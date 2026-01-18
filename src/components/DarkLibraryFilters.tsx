@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { X } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
+import { DateInputGroup, toISODate, isoToDateParts, generateYears } from './DateRangeFilter';
 
 export type FilterMode = "darks" | "flats";
 
@@ -207,23 +208,17 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
 
       {/* Date Range - both modes */}
       <div className="flex items-center gap-2">
-        <span className={labelClass}>Date from:</span>
-        <input
-          type="date"
-          value={filters.dateFrom || ""}
-          min={uniqueValues.minDate}
-          max={filters.dateTo || uniqueValues.maxDate}
-          onChange={(e) => handleSelectChange("dateFrom", e.target.value)}
-          className={`${selectClass} w-32`}
+        <span className={labelClass}>Date:</span>
+        <DateInputGroup
+          value={isoToDateParts(filters.dateFrom)}
+          onChange={(parts) => handleSelectChange('dateFrom', toISODate(parts) || '')}
+          years={generateYears()}
         />
-        <span className={labelClass}>to:</span>
-        <input
-          type="date"
-          value={filters.dateTo || ""}
-          min={filters.dateFrom || uniqueValues.minDate}
-          max={uniqueValues.maxDate}
-          onChange={(e) => handleSelectChange("dateTo", e.target.value)}
-          className={`${selectClass} w-32`}
+        <span className="text-gray-500 text-sm">to</span>
+        <DateInputGroup
+          value={isoToDateParts(filters.dateTo)}
+          onChange={(parts) => handleSelectChange('dateTo', toISODate(parts) || '')}
+          years={generateYears()}
         />
       </div>
 
