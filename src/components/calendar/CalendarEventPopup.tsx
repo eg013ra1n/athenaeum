@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react';
-import { X, Map, Eye, Clock, Camera } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { X, Map, Eye, Clock, Camera, Plus } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import type { CalendarDayEvent, CalendarFrameSetSummary, CalendarUnorganizedGroup } from '../../types/models';
 
@@ -86,9 +87,11 @@ function FrameSetCard({
 function UnorganizedCard({
   group,
   onSkyAtlas,
+  onCreateFrameset,
 }: {
   group: CalendarUnorganizedGroup;
   onSkyAtlas: () => void;
+  onCreateFrameset: () => void;
 }) {
   const hasCoordinates = group.ra !== null && group.dec !== null;
   const displayName = group.objectName || 'Unlocated Frames';
@@ -109,17 +112,24 @@ function UnorganizedCard({
           {formatExposure(group.totalExposureSeconds)}
         </span>
       </div>
-      {hasCoordinates && (
-        <div className="pt-1">
+      <div className="pt-1 space-y-2">
+        <button
+          onClick={onCreateFrameset}
+          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-green-600 hover:bg-green-500 text-white rounded text-xs font-medium transition-colors"
+        >
+          <Plus size={12} />
+          Create Frame Set
+        </button>
+        {hasCoordinates && (
           <button
             onClick={onSkyAtlas}
-            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-medium transition-colors"
+            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-gray-600 hover:bg-gray-500 text-white rounded text-xs font-medium transition-colors"
           >
             <Map size={12} />
             Show in SkyAtlas
           </button>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
@@ -133,6 +143,42 @@ export function CalendarEventPopup({
   onNavigateToFrameSet,
 }: CalendarEventPopupProps) {
   const popupRef = useRef<HTMLDivElement>(null);
+
+  // State for frame set creation
+  const [creatingFromGroup, setCreatingFromGroup] = useState<CalendarUnorganizedGroup | null>(null);
+  const [frameSetName, setFrameSetName] = useState('');
+  const [isCreating, setIsCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [createSuccess, setCreateSuccess] = useState(false);
+
+  // Handler for creating frame set
+  const handleCreateFrameset = async () => {
+    if (!creatingFromGroup || !frameSetName.trim()) return;
+
+    setIsCreating(true);
+    setCreateError(null);
+
+    try {
+      await invoke<number>('create_frame_set_from_selection', {
+        name: frameSetName.trim(),
+        frame_ids: creatingFromGroup.frameIds,
+        description: ''
+      });
+
+      // Success
+      setCreateSuccess(true);
+      setTimeout(() => {
+        setCreatingFromGroup(null);
+        setFrameSetName('');
+        setCreateSuccess(false);
+        onClose();
+      }, 1500);
+    } catch (err) {
+      setCreateError(String(err));
+    } finally {
+      setIsCreating(false);
+    }
+  };
 
   // Close on escape key
   useEffect(() => {
@@ -254,6 +300,12 @@ export function CalendarEventPopup({
                       onNavigateToSkyAtlas(group.ra, group.dec);
                     }
                   }}
+                  onCreateFrameset={() => {
+                    setCreatingFromGroup(group);
+                    setFrameSetName(group.objectName || '');
+                    setCreateError(null);
+                    setCreateSuccess(false);
+                  }}
                 />
               ))}
             </div>
@@ -265,6 +317,58 @@ export function CalendarEventPopup({
           Total: {events.totalFrameCount} frames | {formatExposure(events.totalExposureSeconds)}
         </div>
       </div>
+
+      {/* Frame Set Creation Form */}
+      {creatingFromGroup && (
+        <div className="p-3 bg-gray-900 border-t border-gray-700">
+          {createSuccess ? (
+            <div className="text-center text-green-400 py-2">
+              Frame set created successfully!
+            </div>
+          ) : (
+            <>
+              <h5 className="text-sm font-medium text-gray-200 mb-2">
+                Create Frame Set from {creatingFromGroup.frameCount} frames
+              </h5>
+              <input
+                type="text"
+                value={frameSetName}
+                onChange={(e) => setFrameSetName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && frameSetName.trim() && !isCreating) {
+                    handleCreateFrameset();
+                  }
+                }}
+                placeholder="Enter frame set name..."
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500 mb-2"
+                autoFocus
+              />
+              {createError && (
+                <p className="text-red-400 text-xs mb-2">{createError}</p>
+              )}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => {
+                    setCreatingFromGroup(null);
+                    setFrameSetName('');
+                    setCreateError(null);
+                  }}
+                  className="flex-1 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-sm transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleCreateFrameset}
+                  disabled={!frameSetName.trim() || isCreating}
+                  className="flex-1 px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
+                >
+                  {isCreating ? 'Creating...' : 'Create'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
