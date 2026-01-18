@@ -1,9 +1,18 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import {
+  ObjectsFilterPanel,
+  ObjectsFilterState,
+  emptyFilterState,
+  parseRa,
+  parseDec,
+  angularDistance,
+  countActiveFilters,
+} from '../components/ObjectsFilterPanel';
 
 export default function Objects() {
   const navigate = useNavigate();
@@ -43,6 +52,8 @@ export default function Objects() {
   const [defaultThreshold, setDefaultThreshold] = useState<number>(3.0);
   const [deletingAutoSets, setDeletingAutoSets] = useState(false);
   const [showDeleteAutoSetsConfirm, setShowDeleteAutoSetsConfirm] = useState(false);
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
+  const [filters, setFilters] = useState<ObjectsFilterState>(emptyFilterState);
 
   // For now, using project_id = 1 as default
   const PROJECT_ID = 1;
@@ -479,6 +490,63 @@ export default function Objects() {
     return `${hours}h`;
   };
 
+  // Filter frame sets based on active filters
+  const filteredFrameSets = useMemo(() => {
+    let result = frameSets;
+
+    // Name search (case-insensitive contains)
+    if (filters.nameSearch.trim()) {
+      const search = filters.nameSearch.toLowerCase();
+      result = result.filter(fs =>
+        (fs.frames_set.name || '').toLowerCase().includes(search)
+      );
+    }
+
+    // Custom sets only
+    if (filters.showOnlyCustom) {
+      result = result.filter(fs => fs.frames_set.is_custom);
+    }
+
+    // Date range filter
+    if (filters.dateFrom || filters.dateTo) {
+      result = result.filter(fs => {
+        const setStart = fs.frames_set.date_obs_start;
+        const setEnd = fs.frames_set.date_obs_end;
+        if (!setStart) return false;
+
+        const startDate = setStart.split('T')[0];
+        const endDate = (setEnd || setStart).split('T')[0];
+
+        if (filters.dateFrom && endDate < filters.dateFrom) return false;
+        if (filters.dateTo && startDate > filters.dateTo) return false;
+        return true;
+      });
+    }
+
+    // Coordinate filter
+    if (filters.coordEnabled && filters.coordRa && filters.coordDec) {
+      const targetRa = parseRa(filters.coordRa);
+      const targetDec = parseDec(filters.coordDec);
+      const radiusValue = parseFloat(filters.coordRadius) || 60;
+      const radiusDeg = filters.coordRadiusUnit === 'arcmin' ? radiusValue / 60 : radiusValue;
+
+      if (targetRa !== null && targetDec !== null && radiusDeg > 0) {
+        result = result.filter(fs => {
+          const setRa = parseRa(fs.frames_set.objctra || '');
+          const setDec = parseDec(fs.frames_set.objctdec || '');
+          if (setRa === null || setDec === null) return false;
+
+          const distance = angularDistance(targetRa, targetDec, setRa, setDec);
+          return distance <= radiusDeg;
+        });
+      }
+    }
+
+    return result;
+  }, [frameSets, filters]);
+
+  const activeFilterCount = countActiveFilters(filters);
+
   return (
     <div className="p-6">
       <div className="mb-6">
@@ -490,18 +558,6 @@ export default function Objects() {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => setIsMergeMode(prev => !prev)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
-                isMergeMode
-                  ? 'bg-green-600 hover:bg-green-700 text-white'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-              }`}
-              title={`${isMergeMode ? 'Exit' : 'Enter'} Merge Mode (M)`}
-            >
-              <Grip size={18} />
-              {isMergeMode ? 'Exit Merge Mode' : 'Merge Mode'}
-            </button>
             <button
               onClick={handleAutoGenerate}
               disabled={generating}
@@ -520,6 +576,36 @@ export default function Objects() {
               title="Grouping threshold settings"
             >
               <Sliders size={18} />
+            </button>
+            <div className="h-6 w-px bg-gray-600" />
+            <button
+              onClick={() => setShowFilterPanel(prev => !prev)}
+              className={`relative flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
+                showFilterPanel || activeFilterCount > 0
+                  ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                  : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+              }`}
+              title="Filter frame sets"
+            >
+              <Filter size={18} />
+              Filter
+              {activeFilterCount > 0 && (
+                <span className="absolute -top-1 -right-1 bg-orange-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                  {activeFilterCount}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => setIsMergeMode(prev => !prev)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                isMergeMode
+                  ? 'bg-green-600 hover:bg-green-700 text-white'
+                  : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+              }`}
+              title={`${isMergeMode ? 'Exit' : 'Enter'} Merge Mode (M)`}
+            >
+              <Grip size={18} />
+              {isMergeMode ? 'Exit Merge Mode' : 'Merge Mode'}
             </button>
           </div>
         </div>
@@ -576,7 +662,21 @@ export default function Objects() {
             </p>
           </div>
         )}
+
+        {/* Filter Panel */}
+        <ObjectsFilterPanel
+          filters={filters}
+          onChange={setFilters}
+          isOpen={showFilterPanel}
+        />
       </div>
+
+      {/* Results Summary */}
+      {activeFilterCount > 0 && (
+        <div className="mb-4 text-sm text-gray-400">
+          Showing {filteredFrameSets.length} of {frameSets.length} frame set{frameSets.length !== 1 ? 's' : ''}
+        </div>
+      )}
 
       {isMergeMode && (
         <div className="mb-4 p-3 bg-green-900/20 border border-green-800 rounded-lg flex items-center justify-between">
@@ -715,9 +815,22 @@ export default function Objects() {
             No frame sets yet. Use "Auto-Generate Sets" to cluster your LIGHT frames by sky coordinates.
           </p>
         </div>
+      ) : filteredFrameSets.length === 0 ? (
+        <div className="bg-gray-800 rounded-lg p-8 text-center">
+          <Filter className="mx-auto mb-4 text-gray-600" size={48} />
+          <p className="text-gray-400 mb-4">
+            No frame sets match your filters.
+          </p>
+          <button
+            onClick={() => setFilters(emptyFilterState)}
+            className="text-blue-400 hover:text-blue-300 underline text-sm"
+          >
+            Clear all filters
+          </button>
+        </div>
       ) : (
         <div className={`grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
-          {frameSets.map(({ frames_set, member_count }) => (
+          {filteredFrameSets.map(({ frames_set, member_count }) => (
             <div
               key={frames_set.id}
               data-set-id={frames_set.id}

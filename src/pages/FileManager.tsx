@@ -1,10 +1,9 @@
 import { useState, useEffect } from 'react';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, FileWarning, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { useScanRootsWithAvailability, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
-import type { RescanResult } from '../hooks/useScanProgress';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
 import type { ScanResult, RelinkResult, FileWithFrame, MissingFileRecord } from '../types/models';
