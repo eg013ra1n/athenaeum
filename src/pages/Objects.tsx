@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2 } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import {
@@ -13,6 +13,7 @@ import {
   angularDistance,
   countActiveFilters,
 } from '../components/ObjectsFilterPanel';
+import { ObjectsTableView } from '../components/ObjectsTableView';
 
 export default function Objects() {
   const navigate = useNavigate();
@@ -54,6 +55,7 @@ export default function Objects() {
   const [showDeleteAutoSetsConfirm, setShowDeleteAutoSetsConfirm] = useState(false);
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [filters, setFilters] = useState<ObjectsFilterState>(emptyFilterState);
+  const [viewMode, setViewMode] = useState<'cards' | 'table'>('cards');
 
   // For now, using project_id = 1 as default
   const PROJECT_ID = 1;
@@ -61,7 +63,34 @@ export default function Objects() {
   useEffect(() => {
     loadFrameSets();
     loadDefaultThreshold();
+    loadViewMode();
   }, []);
+
+  const loadViewMode = async () => {
+    try {
+      const savedMode = await invoke<string>('get_setting', {
+        key: 'objects.view_mode',
+        defaultValue: 'cards'
+      });
+      if (savedMode === 'cards' || savedMode === 'table') {
+        setViewMode(savedMode);
+      }
+    } catch (err) {
+      console.error('Failed to load view mode:', err);
+    }
+  };
+
+  const handleViewModeChange = async (mode: 'cards' | 'table') => {
+    setViewMode(mode);
+    try {
+      await invoke('set_setting', {
+        key: 'objects.view_mode',
+        value: mode
+      });
+    } catch (err) {
+      console.error('Failed to save view mode:', err);
+    }
+  };
 
   const loadDefaultThreshold = async () => {
     try {
@@ -339,9 +368,14 @@ export default function Objects() {
     }
 
     if (isDragging) {
-      // Find which card is under the mouse
+      // Find which card/row is under the mouse
       const elements = document.elementsFromPoint(e.clientX, e.clientY);
-      const cardElement = elements.find(el => el.hasAttribute('data-set-id'));
+      // Check direct attribute first, then traverse up to find parent with data-set-id
+      // This handles table rows where <td> cells are hit but <tr> has the attribute
+      let cardElement: Element | null = elements.find(el => el.hasAttribute('data-set-id')) || null;
+      if (!cardElement && elements[0]) {
+        cardElement = elements[0].closest('[data-set-id]');
+      }
 
       if (cardElement) {
         const hoveredSetId = parseInt(cardElement.getAttribute('data-set-id') || '');
@@ -578,6 +612,30 @@ export default function Objects() {
               <Sliders size={18} />
             </button>
             <div className="h-6 w-px bg-gray-600" />
+            <div className="flex items-center bg-gray-700 rounded-lg p-1">
+              <button
+                onClick={() => handleViewModeChange('cards')}
+                className={`p-1.5 rounded transition-colors ${
+                  viewMode === 'cards'
+                    ? 'bg-gray-600 text-white'
+                    : 'text-gray-400 hover:text-gray-200'
+                }`}
+                title="Card view"
+              >
+                <LayoutGrid size={18} />
+              </button>
+              <button
+                onClick={() => handleViewModeChange('table')}
+                className={`p-1.5 rounded transition-colors ${
+                  viewMode === 'table'
+                    ? 'bg-gray-600 text-white'
+                    : 'text-gray-400 hover:text-gray-200'
+                }`}
+                title="Table view"
+              >
+                <Table2 size={18} />
+              </button>
+            </div>
             <button
               onClick={() => setShowFilterPanel(prev => !prev)}
               className={`relative flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
@@ -828,6 +886,24 @@ export default function Objects() {
             Clear all filters
           </button>
         </div>
+      ) : viewMode === 'table' ? (
+        <ObjectsTableView
+          frameSets={filteredFrameSets}
+          isMergeMode={isMergeMode}
+          isDragging={isDragging}
+          draggedSetId={draggedSetId}
+          dropTargetId={dropTargetId}
+          editingSetId={editingSetId}
+          editingName={editingName}
+          onMouseDown={handleMouseDown}
+          onView={(setId) => navigate(`/objects/${setId}`)}
+          onDelete={handleDelete}
+          onStartEditing={startEditing}
+          onSaveRename={saveRename}
+          onCancelEditing={cancelEditing}
+          onEditingNameChange={setEditingName}
+          onMarkAsCustom={handleMarkAsCustom}
+        />
       ) : (
         <div className={`grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
           {filteredFrameSets.map(({ frames_set, member_count }) => (
