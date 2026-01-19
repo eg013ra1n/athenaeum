@@ -131,7 +131,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
         )}
 
         <div className="text-xs text-gray-500 mr-2">
-          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed
+          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed | +/-: Zoom | 0: Reset
         </div>
         <button
           onClick={onClose}
