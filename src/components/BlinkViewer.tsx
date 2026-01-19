@@ -344,7 +344,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Zoom out by keyboard (from center)
   const zoomOut = useCallback(() => {
     const oldZoom = zoomRef.current;
-    const newZoom = Math.max(0.1, oldZoom / 1.25);
+    const newZoom = Math.max(1.0, oldZoom / 1.25);
     if (newZoom === oldZoom) return;
 
     zoomRef.current = newZoom;
@@ -530,7 +530,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     // Zoom factor
     const zoomFactor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
     const oldZoom = zoomRef.current;
-    const newZoom = Math.max(0.1, Math.min(20, oldZoom * zoomFactor));
+    const newZoom = Math.max(1.0, Math.min(20, oldZoom * zoomFactor));
 
     if (newZoom === oldZoom) return;
 
