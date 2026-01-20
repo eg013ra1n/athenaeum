@@ -896,40 +896,40 @@ export default function SkyAtlas() {
   return (
     <div className="h-screen w-full flex flex-col bg-surface overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 py-5 px-4 border-b border-border bg-surface-elevated">
-        <div className="flex items-center justify-between">
-          {/* Left: Title */}
+      <div className="flex-shrink-0 py-[14px] px-4 border-b border-border bg-surface-elevated flex items-center justify-between">
+        {/* Left: Title + Subtitle */}
+        <div>
           <h2 className="text-2xl font-bold text-content">Sky Atlas</h2>
-
-          {/* Right: Select button + Date filters */}
-          <div className="flex items-center gap-4">
-            <button
-              onClick={() => setDrawingMode(prev => prev === 'rectangle' ? 'none' : 'rectangle')}
-              disabled={!mapReady}
-              title="Select frames in a rectangular region (Press S)"
-              className={`px-3 py-1.5 rounded text-sm font-medium transition ${
-                drawingMode === 'rectangle'
-                  ? 'bg-accent text-white shadow-lg'
-                  : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
-              } ${!mapReady ? 'opacity-50 cursor-not-allowed' : ''}`}
-            >
-              Select
-            </button>
-
-            <div className="w-px h-6 bg-border" />
-
-            <DateRangeFilter
-              dateFrom={dateFrom}
-              dateTo={dateTo}
-              onFromChange={setDateFrom}
-              onToChange={setDateTo}
-            />
-          </div>
+          <p className="text-sm text-content-muted">
+            Offline interactive sky map • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
+            {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
+          </p>
         </div>
-        <p className="text-sm text-content-muted mt-1">
-          Offline interactive sky map • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
-          {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
-        </p>
+
+        {/* Right: Select button + Date filters (vertically centered) */}
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => setDrawingMode(prev => prev === 'rectangle' ? 'none' : 'rectangle')}
+            disabled={!mapReady}
+            title="Select frames in a rectangular region (Press S)"
+            className={`px-3 py-1.5 rounded text-sm font-medium transition ${
+              drawingMode === 'rectangle'
+                ? 'bg-accent text-white shadow-lg'
+                : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
+            } ${!mapReady ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            Select
+          </button>
+
+          <div className="w-px h-6 bg-border" />
+
+          <DateRangeFilter
+            dateFrom={dateFrom}
+            dateTo={dateTo}
+            onFromChange={setDateFrom}
+            onToChange={setDateTo}
+          />
+        </div>
       </div>
 
       {/* Sky Map - direct flex child, no wrapper */}
