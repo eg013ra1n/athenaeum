@@ -89,3 +89,41 @@ input[type="range"]:hover::-webkit-slider-thumb {
 input[type="range"]:hover::-moz-range-thumb {
   background: #81a1c1;
 }
+
+/* Checkbox styling for Nord theme */
+input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border: 1px solid #4c566a;
+  border-radius: 4px;
+  background: #434c5e;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+input[type="checkbox"]:checked {
+  background: #a3be8c;
+  border-color: #a3be8c;
+}
+
+input[type="checkbox"]:checked::after {
+  content: '';
+  display: block;
+  width: 4px;
+  height: 8px;
+  border: solid #2e3440;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+  margin: 1px 0 0 5px;
+}
+
+input[type="checkbox"]:hover {
+  border-color: #a3be8c;
+}
+
+input[type="checkbox"]:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(163, 190, 140, 0.3);
+}
