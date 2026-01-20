@@ -146,7 +146,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
         <div className="mb-6">
           <button
             onClick={onClose}
-            className="flex items-center gap-2 text-gray-400 hover:text-gray-200 mb-4 transition-colors"
+            className="flex items-center gap-2 text-content-muted hover:text-content mb-4 transition-colors"
           >
             <ArrowLeft size={20} />
             Back to Equipment
@@ -155,14 +155,14 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-3xl font-bold mb-2">Master Dark Library</h2>
-              <p className="text-gray-400">{instrume}</p>
+              <p className="text-content-muted">{instrume}</p>
             </div>
 
             {sets.length > 0 && (
               <button
                 onClick={handleRegenerateLibrary}
                 disabled={creating}
-                className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
                 Regenerate
@@ -178,7 +178,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
           <button
             onClick={handleRegenerateLibrary}
             disabled={creating}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
             Regenerate Master Library
@@ -188,35 +188,35 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
 
       {/* Messages */}
       {error && (
-        <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-4">
-          <p className="text-red-400">{error}</p>
+        <div className="bg-error-muted border border-error/50 rounded-lg p-4 mb-4">
+          <p className="text-error">{error}</p>
         </div>
       )}
 
       {successMessage && (
-        <div className="bg-green-900/20 border border-green-700 rounded-lg p-4 mb-4">
-          <p className="text-green-400">{successMessage}</p>
+        <div className="bg-success-muted border border-success/50 rounded-lg p-4 mb-4">
+          <p className="text-success">{successMessage}</p>
         </div>
       )}
 
       {/* Loading */}
       {loading && (
-        <div className="text-center py-12 text-gray-400">
+        <div className="text-center py-12 text-content-muted">
           Loading master dark library...
         </div>
       )}
 
       {/* Empty state */}
       {!loading && sets.length === 0 && (
-        <div className="bg-gray-800 rounded-lg p-12 text-center">
-          <p className="text-gray-400 mb-6">
+        <div className="bg-surface-elevated rounded-lg p-12 text-center">
+          <p className="text-content-muted mb-6">
             No master dark library created yet. This library organizes your master calibration frames
             (MasterDark, MasterBias, MasterDarkFlat) by date, temperature, gain, offset, and binning.
           </p>
           <button
             onClick={handleCreateLibrary}
             disabled={creating}
-            className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg font-medium"
+            className="inline-flex items-center gap-2 px-6 py-3 bg-accent hover:bg-accent-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg font-medium"
           >
             <Plus size={20} />
             {creating ? "Creating..." : "Create Master Dark Library"}
@@ -234,7 +234,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
           <QuickStats sets={filteredSets} />
 
           {/* Result count */}
-          <div className="mb-4 text-sm text-gray-400">
+          <div className="mb-4 text-sm text-content-muted">
             Showing {filteredSets.length} of {sets.length} master calibration sets
           </div>
 
@@ -242,13 +242,13 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
           {filteredSets.length > 0 ? (
             <CalibrationSetTable sets={filteredSets} />
           ) : (
-            <div className="text-center py-12 bg-gray-800 rounded-lg">
-              <p className="text-gray-400 mb-4">
+            <div className="text-center py-12 bg-surface-elevated rounded-lg">
+              <p className="text-content-muted mb-4">
                 No master calibration sets match your filters
               </p>
               <button
                 onClick={() => setFilters(emptyFilters)}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors"
+                className="px-4 py-2 bg-surface-hover hover:bg-surface-hover text-white rounded-md transition-colors"
               >
                 Clear Filters
               </button>

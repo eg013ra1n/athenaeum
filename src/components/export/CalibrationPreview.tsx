@@ -38,21 +38,21 @@ export function CalibrationPreview({ summary }: CalibrationPreviewProps) {
         {items.map(({ label, count, complete }) => (
           <div
             key={label}
-            className="flex items-center justify-between p-2 bg-gray-700/50 rounded-lg"
+            className="flex items-center justify-between p-2 bg-surface-hover/50 rounded-lg"
           >
             <div className="flex items-center gap-2">
               {count > 0 ? (
                 complete ? (
-                  <Check size={16} className="text-green-500" />
+                  <Check size={16} className="text-success" />
                 ) : (
-                  <AlertTriangle size={16} className="text-yellow-500" />
+                  <AlertTriangle size={16} className="text-warning" />
                 )
               ) : (
-                <X size={16} className="text-red-500" />
+                <X size={16} className="text-error" />
               )}
               <span>{label}</span>
             </div>
-            <span className={count > 0 ? 'text-gray-200' : 'text-gray-500'}>
+            <span className={count > 0 ? 'text-content' : 'text-content-muted'}>
               {count} frames
             </span>
           </div>
@@ -60,12 +60,12 @@ export function CalibrationPreview({ summary }: CalibrationPreviewProps) {
       </div>
 
       {summary.warnings.length > 0 && (
-        <div className="mt-3 p-3 bg-yellow-900/20 border border-yellow-600/30 rounded-lg">
-          <div className="flex items-center gap-2 text-yellow-500 mb-2">
+        <div className="mt-3 p-3 bg-warning-muted border border-warning/30 rounded-lg">
+          <div className="flex items-center gap-2 text-warning mb-2">
             <AlertTriangle size={16} />
             <span className="font-medium">Warnings</span>
           </div>
-          <ul className="text-sm text-yellow-400/80 space-y-1">
+          <ul className="text-sm text-warning/80 space-y-1">
             {summary.warnings.map((warning, index) => (
               <li key={index}>• {warning}</li>
             ))}

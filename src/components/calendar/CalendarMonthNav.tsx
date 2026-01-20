@@ -33,14 +33,14 @@ export function CalendarMonthNav({
         <div className="flex items-center gap-1">
           <button
             onClick={onPrev}
-            className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
+            className="p-2 hover:bg-surface-hover rounded-lg transition-colors"
             title={viewMode === 'month' ? 'Previous month' : 'Previous year'}
           >
             <ChevronLeft size={20} />
           </button>
           <button
             onClick={onNext}
-            className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
+            className="p-2 hover:bg-surface-hover rounded-lg transition-colors"
             title={viewMode === 'month' ? 'Next month' : 'Next year'}
           >
             <ChevronRight size={20} />
@@ -51,13 +51,13 @@ export function CalendarMonthNav({
         </h3>
 
         {/* View Mode Toggle */}
-        <div className="flex items-center bg-gray-700 rounded-lg p-0.5">
+        <div className="flex items-center bg-surface-hover rounded-lg p-0.5">
           <button
             onClick={() => onViewModeChange('month')}
             className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
               viewMode === 'month'
-                ? 'bg-gray-600 text-white'
-                : 'text-gray-400 hover:text-gray-200'
+                ? 'bg-surface-hover text-content'
+                : 'text-content-muted hover:text-content'
             }`}
           >
             Month
@@ -66,8 +66,8 @@ export function CalendarMonthNav({
             onClick={() => onViewModeChange('year')}
             className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
               viewMode === 'year'
-                ? 'bg-gray-600 text-white'
-                : 'text-gray-400 hover:text-gray-200'
+                ? 'bg-surface-hover text-content'
+                : 'text-content-muted hover:text-content'
             }`}
           >
             Year
@@ -76,12 +76,12 @@ export function CalendarMonthNav({
       </div>
 
       {/* Stats */}
-      <div className="flex items-center gap-4 text-sm text-gray-400">
+      <div className="flex items-center gap-4 text-sm text-content-muted">
         <span>
-          <span className="text-gray-200 font-medium">{totalFrameCount}</span> frames
+          <span className="text-content font-medium">{totalFrameCount}</span> frames
         </span>
         <span>
-          <span className="text-gray-200 font-medium">{totalExposureHours.toFixed(1)}</span>h exposure
+          <span className="text-content font-medium">{totalExposureHours.toFixed(1)}</span>h exposure
         </span>
       </div>
     </div>

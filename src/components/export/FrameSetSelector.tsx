@@ -27,15 +27,15 @@ export function FrameSetSelector({
   if (loading) {
     return (
       <div className="flex items-center justify-center py-8">
-        <Loader2 className="h-6 w-6 animate-spin text-blue-500" />
-        <span className="ml-2 text-gray-400">Loading frame sets...</span>
+        <Loader2 className="h-6 w-6 animate-spin text-accent" />
+        <span className="ml-2 text-content-muted">Loading frame sets...</span>
       </div>
     );
   }
 
   if (frameSets.length === 0) {
     return (
-      <div className="text-center py-8 text-gray-400">
+      <div className="text-center py-8 text-content-muted">
         No frame sets available for export. Create frame sets in the Objects view first.
       </div>
     );
@@ -49,8 +49,8 @@ export function FrameSetSelector({
           onClick={() => onSelect(frameSet.id)}
           className={`w-full text-left p-3 rounded-lg border transition-colors ${
             selectedId === frameSet.id
-              ? 'bg-blue-600/20 border-blue-500'
-              : 'bg-gray-700/50 border-gray-600 hover:bg-gray-700 hover:border-gray-500'
+              ? 'bg-accent/20 border-accent'
+              : 'bg-surface-hover/50 border-border hover:bg-surface-hover hover:border-content-muted'
           }`}
         >
           <div className="flex items-center justify-between">
@@ -58,7 +58,7 @@ export function FrameSetSelector({
               <div className="font-medium">
                 {frameSet.name || frameSet.objectName || `Frame Set ${frameSet.id}`}
               </div>
-              <div className="text-sm text-gray-400 mt-1">
+              <div className="text-sm text-content-muted mt-1">
                 {frameSet.frameCount} frames • {formatExposure(frameSet.totalExposureSeconds)}
                 {frameSet.filters.length > 0 && (
                   <span className="ml-2">
@@ -68,7 +68,7 @@ export function FrameSetSelector({
               </div>
             </div>
             {selectedId === frameSet.id && (
-              <div className="w-4 h-4 rounded-full bg-blue-500" />
+              <div className="w-4 h-4 rounded-full bg-accent" />
             )}
           </div>
         </button>

@@ -28,12 +28,12 @@ export function StatusIndicator({ status, compact = false }: StatusIndicatorProp
 
   const getStatusStyles = (has: boolean, warning: boolean): string => {
     if (!has) {
-      return 'bg-red-900/30 text-red-300 border-red-700';
+      return 'bg-error-muted text-error border-error/50';
     }
     if (warning) {
-      return 'bg-amber-900/30 text-amber-300 border-amber-700';
+      return 'bg-warning-muted text-warning border-warning/50';
     }
-    return 'bg-emerald-900/30 text-emerald-300 border-emerald-700';
+    return 'bg-success-muted text-success border-success/50';
   };
 
   const getStatusIcon = (has: boolean, warning: boolean) => {
@@ -112,12 +112,12 @@ export function StatusBadge({
 }) {
   const getStatusStyles = (has: boolean, warning: boolean): string => {
     if (!has) {
-      return 'bg-red-900/30 text-red-300 border-red-700';
+      return 'bg-error-muted text-error border-error/50';
     }
     if (warning) {
-      return 'bg-amber-900/30 text-amber-300 border-amber-700';
+      return 'bg-warning-muted text-warning border-warning/50';
     }
-    return 'bg-emerald-900/30 text-emerald-300 border-emerald-700';
+    return 'bg-success-muted text-success border-success/50';
   };
 
   const getStatusIcon = (has: boolean, warning: boolean) => {

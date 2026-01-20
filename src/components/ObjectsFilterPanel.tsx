@@ -31,8 +31,8 @@ interface ObjectsFilterPanelProps {
   isOpen: boolean;
 }
 
-const inputClass = "px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500";
-const labelClass = "text-xs text-gray-400 mb-1";
+const inputClass = "px-2 py-1.5 bg-surface-hover border border-border rounded text-sm text-content focus:outline-none focus:ring-1 focus:ring-accent";
+const labelClass = "text-xs text-content-muted mb-1";
 
 export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterPanelProps) {
   if (!isOpen) return null;
@@ -53,7 +53,7 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
   };
 
   return (
-    <div className="mb-4 p-4 bg-gray-800 border border-gray-700 rounded-lg">
+    <div className="mb-4 p-4 bg-surface-elevated border border-border rounded-lg">
       <div className="flex flex-wrap gap-6">
         {/* Name Search */}
         <div className="flex flex-col">
@@ -82,7 +82,7 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
               onChange={(parts) => updateFilter('dateFrom', toISODate(parts))}
               years={generateYears()}
             />
-            <span className="text-gray-500 text-sm">to</span>
+            <span className="text-content-muted text-sm">to</span>
             <DateInputGroup
               value={isoToDateParts(filters.dateTo)}
               onChange={(parts) => updateFilter('dateTo', toISODate(parts))}
@@ -101,8 +101,8 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
             onClick={() => updateFilter('showOnlyCustom', !filters.showOnlyCustom)}
             className={`px-3 py-1.5 rounded text-sm transition-colors ${
               filters.showOnlyCustom
-                ? 'bg-orange-600 text-white'
-                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                ? 'bg-orange text-white'
+                : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
             }`}
           >
             {filters.showOnlyCustom ? 'On' : 'Off'}
@@ -120,8 +120,8 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
               onClick={() => updateFilter('coordEnabled', !filters.coordEnabled)}
               className={`px-2 py-1.5 rounded text-sm transition-colors ${
                 filters.coordEnabled
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  ? 'bg-accent text-white'
+                  : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
               }`}
               title="Enable coordinate filtering"
             >
@@ -158,8 +158,8 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
               disabled={!filters.coordEnabled}
               className={`px-2 py-1.5 rounded text-sm transition-colors ${
                 !filters.coordEnabled
-                  ? 'bg-gray-700 text-gray-500 opacity-50'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  ? 'bg-surface-hover text-content-muted opacity-50'
+                  : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
               }`}
               title="Toggle radius unit"
             >
@@ -173,7 +173,7 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
           <div className="flex flex-col justify-end">
             <button
               onClick={clearAllFilters}
-              className="flex items-center gap-1 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded text-sm transition-colors"
+              className="flex items-center gap-1 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover text-content-secondary rounded text-sm transition-colors"
             >
               <X size={14} />
               Clear All

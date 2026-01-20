@@ -66,10 +66,10 @@ function StyledCheckbox({
       onChange={onChange}
       className={`
         w-3.5 h-3.5 cursor-pointer rounded
-        border border-gray-500
+        border border-border
         bg-transparent
-        checked:bg-blue-500 checked:border-blue-500
-        focus:ring-1 focus:ring-blue-500 focus:ring-offset-0
+        checked:bg-accent checked:border-accent
+        focus:ring-1 focus:ring-accent focus:ring-offset-0
         ${className}
       `}
       title={title}
@@ -301,19 +301,19 @@ export function NavigationTree({
 
   return (
     <nav
-      className={`bg-gray-800/50 rounded-lg border border-gray-700/50 overflow-hidden flex flex-col ${className}`}
+      className={`bg-surface-elevated/50 rounded-lg border border-border/50 overflow-hidden flex flex-col ${className}`}
       role="tree"
       aria-label="Calibration session navigation"
     >
       {/* Compact Header with Selection Toggle */}
-      <div className="px-2 py-1.5 border-b border-gray-700/50 flex items-center justify-between">
-        <span className="text-xs text-gray-400">
+      <div className="px-2 py-1.5 border-b border-border/50 flex items-center justify-between">
+        <span className="text-xs text-content-muted">
           {data.date_groups.length} night{data.date_groups.length !== 1 ? 's' : ''} · {data.total_frames} frames
         </span>
         <div className="flex items-center gap-1">
           <button
             onClick={toggleExpandAll}
-            className="p-1 text-gray-500 hover:text-gray-300 hover:bg-gray-700/50 rounded transition-colors"
+            className="p-1 text-content-muted hover:text-content-secondary hover:bg-surface-hover/50 rounded transition-colors"
             title={isAllExpanded ? "Collapse all" : "Expand all"}
           >
             <ChevronsDownUp size={14} className={isAllExpanded ? "rotate-180" : ""} />
@@ -323,8 +323,8 @@ export function NavigationTree({
               onClick={onToggleSelectionMode}
               className={`text-xs px-2 py-0.5 rounded transition-colors ${
                 selectionMode
-                  ? 'bg-blue-500/20 text-blue-400'
-                  : 'text-gray-500 hover:text-gray-300 hover:bg-gray-700/50'
+                  ? 'bg-accent/20 text-accent'
+                  : 'text-content-muted hover:text-content-secondary hover:bg-surface-hover/50'
               }`}
             >
               {selectionMode ? 'Done' : 'Select'}
@@ -350,8 +350,8 @@ export function NavigationTree({
                   w-full py-1 px-2
                   flex items-center gap-1.5
                   transition-colors
-                  hover:bg-gray-700/40
-                  ${isSelected('date', dateKey) ? 'bg-blue-500/15' : ''}
+                  hover:bg-surface-hover/40
+                  ${isSelected('date', dateKey) ? 'bg-accent/15' : ''}
                 `}
               >
                 {selectionMode && onCheckedChange && (
@@ -364,20 +364,20 @@ export function NavigationTree({
                 )}
                 <button
                   onClick={() => toggleDate(dateKey)}
-                  className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 rounded min-h-[26px]"
+                  className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded min-h-[26px]"
                   aria-label={`${dateGroup.date_display}, ${dateGroup.frame_count} frames${dateWarnings > 0 ? `, ${dateWarnings} warnings` : ''}`}
                 >
                   {isDateExpanded ? (
-                    <ChevronDown size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
+                    <ChevronDown size={14} className="text-content-muted flex-shrink-0" aria-hidden="true" />
                   ) : (
-                    <ChevronRight size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
+                    <ChevronRight size={14} className="text-content-muted flex-shrink-0" aria-hidden="true" />
                   )}
-                  <Calendar size={14} className="text-violet-400 flex-shrink-0" aria-hidden="true" />
-                  <span className="flex-1 min-w-0 text-sm text-gray-200 truncate">
+                  <Calendar size={14} className="text-purple flex-shrink-0" aria-hidden="true" />
+                  <span className="flex-1 min-w-0 text-sm text-content truncate">
                     {dateGroup.date_display}
                   </span>
                   {dateWarnings > 0 && <WarningBadge count={dateWarnings} />}
-                  <span className="text-xs text-gray-500 flex-shrink-0 tabular-nums">
+                  <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
                     {dateGroup.frame_count}
                   </span>
                 </button>
@@ -385,7 +385,7 @@ export function NavigationTree({
 
               {/* Camera groups (nested with indent guide) */}
               {isDateExpanded && (
-                <div role="group" className="ml-3 pl-2 border-l border-gray-700/50">
+                <div role="group" className="ml-3 pl-2 border-l border-border/50">
                   {dateGroup.camera_groups.map((cameraGroup) => {
                     const cameraKey = `${dateKey}:${cameraGroup.instrume}`;
                     const isCameraExpanded = expandedCameras.has(cameraKey);
@@ -401,8 +401,8 @@ export function NavigationTree({
                             w-full py-1 px-1
                             flex items-center gap-1.5
                             transition-colors
-                            hover:bg-gray-700/40
-                            ${isSelected('camera', dateKey, cameraGroup.instrume) ? 'bg-blue-500/15' : ''}
+                            hover:bg-surface-hover/40
+                            ${isSelected('camera', dateKey, cameraGroup.instrume) ? 'bg-accent/15' : ''}
                           `}
                         >
                           {selectionMode && onCheckedChange && (
@@ -415,20 +415,20 @@ export function NavigationTree({
                           )}
                           <button
                             onClick={() => toggleCamera(cameraKey)}
-                            className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 rounded min-h-[24px]"
+                            className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded min-h-[24px]"
                             aria-label={`${cameraGroup.instrume}, ${cameraGroup.frame_count} frames${cameraWarnings > 0 ? `, ${cameraWarnings} warnings` : ''}`}
                           >
                             {isCameraExpanded ? (
-                              <ChevronDown size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
+                              <ChevronDown size={14} className="text-content-muted flex-shrink-0" aria-hidden="true" />
                             ) : (
-                              <ChevronRight size={14} className="text-gray-500 flex-shrink-0" aria-hidden="true" />
+                              <ChevronRight size={14} className="text-content-muted flex-shrink-0" aria-hidden="true" />
                             )}
-                            <Camera size={14} className="text-blue-400 flex-shrink-0" aria-hidden="true" />
-                            <span className="flex-1 min-w-0 text-sm text-gray-300 truncate">
+                            <Camera size={14} className="text-accent flex-shrink-0" aria-hidden="true" />
+                            <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
                               {cameraGroup.instrume}
                             </span>
                             {cameraWarnings > 0 && <WarningBadge count={cameraWarnings} />}
-                            <span className="text-xs text-gray-500 flex-shrink-0 tabular-nums">
+                            <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
                               {cameraGroup.frame_count}
                             </span>
                           </button>
@@ -436,7 +436,7 @@ export function NavigationTree({
 
                         {/* Filter groups (leaf level with indent guide) */}
                         {isCameraExpanded && (
-                          <div role="group" className="ml-3 pl-2 border-l border-gray-700/50">
+                          <div role="group" className="ml-3 pl-2 border-l border-border/50">
                             {cameraGroup.filter_groups.map((filterGroup) => {
                               const filterKey = buildFilterKey(filterGroup);
                               const fullKey = `${dateKey}:${cameraGroup.instrume}:${filterKey}`;
@@ -451,8 +451,8 @@ export function NavigationTree({
                                     w-full py-1 px-1
                                     flex items-center gap-1.5
                                     transition-colors
-                                    hover:bg-gray-700/40
-                                    ${isFilterSelected ? 'bg-blue-500/20' : ''}
+                                    hover:bg-surface-hover/40
+                                    ${isFilterSelected ? 'bg-accent/20' : ''}
                                   `}
                                   role="treeitem"
                                   aria-selected={isFilterSelected}
@@ -472,15 +472,15 @@ export function NavigationTree({
                                       filterKey,
                                       data: filterGroup,
                                     })}
-                                    className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 rounded min-h-[24px]"
+                                    className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded min-h-[24px]"
                                     aria-label={`${filterGroup.filter_display}, ${filterGroup.frame_count} frames${filterWarnings > 0 ? `, ${filterWarnings} warnings` : ''}`}
                                   >
-                                    <Aperture size={14} className="text-cyan-400 flex-shrink-0" aria-hidden="true" />
-                                    <span className="flex-1 min-w-0 text-sm text-gray-300 truncate">
+                                    <Aperture size={14} className="text-accent flex-shrink-0" aria-hidden="true" />
+                                    <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
                                       {filterGroup.filter_display}
                                     </span>
                                     {filterWarnings > 0 && <WarningBadge count={filterWarnings} />}
-                                    <span className="text-xs text-gray-500 flex-shrink-0 tabular-nums">
+                                    <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
                                       {filterGroup.frame_count}
                                     </span>
                                   </button>
@@ -500,7 +500,7 @@ export function NavigationTree({
 
         {/* Empty state */}
         {data.date_groups.length === 0 && (
-          <div className="px-2 py-6 text-center text-gray-500">
+          <div className="px-2 py-6 text-center text-content-muted">
             <p className="text-xs">No sessions found</p>
           </div>
         )}

@@ -850,10 +850,10 @@ export default function SkyAtlas() {
 
   if (loading) {
     return (
-      <div className="h-screen flex items-center justify-center bg-gray-900">
+      <div className="h-screen flex items-center justify-center bg-surface">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
-          <p className="text-gray-400">Loading sky atlas...</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto mb-4"></div>
+          <p className="text-content-muted">Loading sky atlas...</p>
         </div>
       </div>
     );
@@ -861,13 +861,13 @@ export default function SkyAtlas() {
 
   if (error) {
     return (
-      <div className="h-screen flex items-center justify-center bg-gray-900">
+      <div className="h-screen flex items-center justify-center bg-surface">
         <div className="text-center max-w-md p-6">
-          <p className="text-red-400 mb-2 font-semibold">Error loading sky atlas</p>
-          <p className="text-gray-400 text-sm mb-4">{error}</p>
+          <p className="text-error mb-2 font-semibold">Error loading sky atlas</p>
+          <p className="text-content-muted text-sm mb-4">{error}</p>
           <button
             onClick={() => window.location.reload()}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition"
+            className="px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
           >
             Retry
           </button>
@@ -878,13 +878,13 @@ export default function SkyAtlas() {
 
   if (locations.length === 0) {
     return (
-      <div className="h-screen flex items-center justify-center bg-gray-900">
+      <div className="h-screen flex items-center justify-center bg-surface">
         <div className="text-center max-w-md p-6">
-          <h3 className="text-xl font-bold text-gray-100 mb-2">No Imaging Locations Found</h3>
-          <p className="text-gray-400 text-sm mb-4">
+          <h3 className="text-xl font-bold text-content mb-2">No Imaging Locations Found</h3>
+          <p className="text-content-muted text-sm mb-4">
             You don't have any LIGHT frames with RA/Dec coordinates yet.
           </p>
-          <p className="text-gray-500 text-sm">
+          <p className="text-content-muted text-sm">
             Once you import FITS/XISF files with coordinate data, they will appear here.
             You can then use the rectangle selection tool (press S) to organize them into frame sets, or go to the Objects page to use "Auto-Generate Frame Sets".
           </p>
@@ -894,12 +894,12 @@ export default function SkyAtlas() {
   }
 
   return (
-    <div className="h-screen w-full flex flex-col bg-gray-900 overflow-hidden">
+    <div className="h-screen w-full flex flex-col bg-surface overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 p-4 border-b border-gray-700 bg-gray-800">
+      <div className="flex-shrink-0 p-4 border-b border-border bg-surface-elevated">
         <div className="flex items-center justify-between">
           {/* Left: Title */}
-          <h2 className="text-2xl font-bold text-gray-100">Sky Atlas</h2>
+          <h2 className="text-2xl font-bold text-content">Sky Atlas</h2>
 
           {/* Right: Select button + Date filters */}
           <div className="flex items-center gap-4">
@@ -909,14 +909,14 @@ export default function SkyAtlas() {
               title="Select frames in a rectangular region (Press S)"
               className={`px-3 py-1.5 rounded text-sm font-medium transition ${
                 drawingMode === 'rectangle'
-                  ? 'bg-blue-500 text-white shadow-lg'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  ? 'bg-accent text-white shadow-lg'
+                  : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
               } ${!mapReady ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               Select
             </button>
 
-            <div className="w-px h-6 bg-gray-600" />
+            <div className="w-px h-6 bg-border" />
 
             <DateRangeFilter
               dateFrom={dateFrom}
@@ -926,7 +926,7 @@ export default function SkyAtlas() {
             />
           </div>
         </div>
-        <p className="text-sm text-gray-400 mt-1">
+        <p className="text-sm text-content-muted mt-1">
           Offline interactive sky map • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
           {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
         </p>

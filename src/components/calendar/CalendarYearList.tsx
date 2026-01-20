@@ -49,14 +49,14 @@ function DateRow({
       className={`
         w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-colors
         ${isSelected
-          ? 'bg-blue-600/30 border border-blue-500'
-          : 'hover:bg-gray-700/50 border border-transparent'
+          ? 'bg-accent/30 border border-accent'
+          : 'hover:bg-surface-hover/50 border border-transparent'
         }
       `}
     >
       {/* Date */}
       <div className="w-16 flex-shrink-0">
-        <span className="text-sm font-medium text-gray-200">
+        <span className="text-sm font-medium text-content">
           {format(date, 'd MMM')}
         </span>
       </div>
@@ -65,13 +65,13 @@ function DateRow({
       <div className="flex items-center gap-1 flex-shrink-0">
         {hasFrameSets && (
           <span
-            className="w-2 h-2 rounded-full bg-blue-500"
+            className="w-2 h-2 rounded-full bg-accent"
             title="Organized frame sets"
           />
         )}
         {hasUnorganized && (
           <span
-            className="w-2 h-2 rounded-full bg-yellow-500"
+            className="w-2 h-2 rounded-full bg-warning"
             title="Unorganized frames"
           />
         )}
@@ -79,16 +79,16 @@ function DateRow({
 
       {/* Object name */}
       <div className="flex-1 min-w-0">
-        <span className="text-sm text-gray-300 truncate block">
+        <span className="text-sm text-content-secondary truncate block">
           {primaryName}
           {additionalCount > 0 && (
-            <span className="text-gray-500"> +{additionalCount}</span>
+            <span className="text-content-muted"> +{additionalCount}</span>
           )}
         </span>
       </div>
 
       {/* Stats */}
-      <div className="flex items-center gap-3 text-xs text-gray-500 flex-shrink-0">
+      <div className="flex items-center gap-3 text-xs text-content-muted flex-shrink-0">
         <span className="flex items-center gap-1">
           <Camera size={12} />
           {day.totalFrameCount}
@@ -114,22 +114,22 @@ export function CalendarYearList({
 }: CalendarYearListProps) {
   if (data.months.length === 0) {
     return (
-      <div className="flex-1 flex items-center justify-center text-gray-500">
+      <div className="flex-1 flex items-center justify-center text-content-muted">
         <p>No imaging data for {data.year}</p>
       </div>
     );
   }
 
   return (
-    <div className="flex-1 overflow-y-auto bg-gray-800 rounded-lg p-4 space-y-6">
+    <div className="flex-1 overflow-y-auto bg-surface-elevated rounded-lg p-4 space-y-6">
       {data.months.map((month) => (
         <div key={month.month}>
           {/* Month header */}
           <div className="flex items-center justify-between mb-2">
-            <h4 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
+            <h4 className="text-sm font-semibold text-content-secondary uppercase tracking-wide">
               {MONTH_NAMES[month.month - 1]}
             </h4>
-            <span className="text-xs text-gray-500">
+            <span className="text-xs text-content-muted">
               {month.totalFrameCount} frames | {formatExposure(month.totalExposureSeconds)}
             </span>
           </div>

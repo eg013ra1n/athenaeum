@@ -328,15 +328,15 @@ export function CalibrationHierarchyView({
       ) : (
         /* Empty State */
         <div className="flex-1 flex items-center justify-center">
-          <div className="text-center py-16 px-8 bg-gray-800 rounded-xl border border-gray-600">
-            <p className="text-lg text-gray-400">No frames found in this frame set.</p>
+          <div className="text-center py-16 px-8 bg-surface-elevated rounded-xl border border-border">
+            <p className="text-lg text-content-muted">No frames found in this frame set.</p>
           </div>
         </div>
       )}
 
       {/* Bottom Action Bar - visible when in selection mode with items selected */}
       {selectionMode && checkedFilters.size > 0 && (onBlinkSelected || onSplit || onCreateCustomSet) && (
-        <div className="mt-3 bg-gray-800/80 rounded-lg p-3 border border-gray-700/50">
+        <div className="mt-3 bg-surface-elevated/80 rounded-lg p-3 border border-border/50">
           <div className="flex items-center justify-between">
             {/* Left side: Action buttons */}
             <div className="flex items-center gap-2">
@@ -347,18 +347,18 @@ export function CalibrationHierarchyView({
                     className="
                       inline-flex items-center gap-1.5
                       px-3 py-1.5
-                      bg-teal-600 hover:bg-teal-700
+                      bg-cyan-600 hover:bg-cyan-700
                       text-white text-sm
                       rounded
                       transition-colors
-                      focus:outline-none focus-visible:ring-1 focus-visible:ring-teal-500
+                      focus:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500
                     "
                   >
                     <Play size={14} aria-hidden="true" />
                     Blink Selected ({selectedFrameCount})
                   </button>
                   {(onSplit || onCreateCustomSet) && (
-                    <span className="text-gray-600">|</span>
+                    <span className="text-content-muted">|</span>
                   )}
                 </>
               )}
@@ -368,11 +368,11 @@ export function CalibrationHierarchyView({
                   className="
                     inline-flex items-center gap-1.5
                     px-3 py-1.5
-                    bg-blue-600 hover:bg-blue-700
+                    bg-accent hover:bg-accent-hover
                     text-white text-sm
                     rounded
                     transition-colors
-                    focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500
+                    focus:outline-none focus-visible:ring-1 focus-visible:ring-accent
                   "
                 >
                   <Scissors size={14} aria-hidden="true" />
@@ -385,11 +385,11 @@ export function CalibrationHierarchyView({
                   className="
                     inline-flex items-center gap-1.5
                     px-3 py-1.5
-                    bg-green-600 hover:bg-green-700
+                    bg-success hover:brightness-90
                     text-white text-sm
                     rounded
                     transition-colors
-                    focus:outline-none focus-visible:ring-1 focus-visible:ring-green-500
+                    focus:outline-none focus-visible:ring-1 focus-visible:ring-success
                   "
                 >
                   <Plus size={14} aria-hidden="true" />
@@ -399,10 +399,10 @@ export function CalibrationHierarchyView({
             </div>
             {/* Right side: Selection info and Cancel */}
             <div className="flex items-center gap-3">
-              <div className="text-sm text-gray-300">
-                <span className="font-medium text-gray-100">{checkedFilters.size}</span>{' '}
+              <div className="text-sm text-content-secondary">
+                <span className="font-medium text-content">{checkedFilters.size}</span>{' '}
                 group{checkedFilters.size !== 1 ? 's' : ''}
-                <span className="text-gray-500 ml-1">
+                <span className="text-content-muted ml-1">
                   ({selectedFrameCount} frame{selectedFrameCount !== 1 ? 's' : ''})
                 </span>
               </div>
@@ -410,11 +410,11 @@ export function CalibrationHierarchyView({
                 onClick={toggleSelectionMode}
                 className="
                   px-3 py-1.5
-                  text-gray-400 hover:text-gray-200
+                  text-content-muted hover:text-content
                   text-sm
                   rounded
                   transition-colors
-                  focus:outline-none focus-visible:ring-1 focus-visible:ring-gray-500
+                  focus:outline-none focus-visible:ring-1 focus-visible:ring-border
                 "
               >
                 Cancel

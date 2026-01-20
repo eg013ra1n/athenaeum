@@ -37,11 +37,11 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-lg p-6 max-w-2xl w-full mx-4 border border-gray-700 shadow-xl">
-        <h3 className="text-xl font-semibold text-gray-100 mb-2">
+      <div className="bg-surface-elevated rounded-lg p-6 max-w-2xl w-full mx-4 border border-border shadow-xl">
+        <h3 className="text-xl font-semibold text-content mb-2">
           Flat Calibration Pattern
         </h3>
-        <p className="text-gray-400 text-sm mb-6">
+        <p className="text-content-muted text-sm mb-6">
           How do you typically take flat frames? This helps us find the best matching flats for your light frames.
         </p>
 
@@ -51,8 +51,8 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
               key={pattern.value}
               className={`block p-4 rounded-lg border-2 cursor-pointer transition-all ${
                 selectedPattern === pattern.value
-                  ? 'border-blue-500 bg-blue-900 bg-opacity-20'
-                  : 'border-gray-600 hover:border-gray-500 bg-gray-700 bg-opacity-30'
+                  ? 'border-accent bg-accent-muted/20'
+                  : 'border-border hover:border-content-muted bg-surface-hover bg-opacity-30'
               }`}
             >
               <div className="flex items-start">
@@ -62,13 +62,13 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
                   value={pattern.value}
                   checked={selectedPattern === pattern.value}
                   onChange={(e) => setSelectedPattern(e.target.value as FlatPattern)}
-                  className="mt-1 mr-3 text-blue-500 focus:ring-blue-500"
+                  className="mt-1 mr-3 text-accent focus:ring-accent"
                 />
                 <div className="flex-1">
-                  <div className="font-medium text-gray-100 mb-1">
+                  <div className="font-medium text-content mb-1">
                     {pattern.label}
                   </div>
-                  <div className="text-sm text-gray-400">
+                  <div className="text-sm text-content-muted">
                     {pattern.description}
                   </div>
                 </div>
@@ -78,12 +78,12 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
         </div>
 
         <div className="mb-6">
-          <label className="flex items-center text-gray-300 cursor-pointer">
+          <label className="flex items-center text-content-secondary cursor-pointer">
             <input
               type="checkbox"
               checked={rememberChoice}
               onChange={(e) => setRememberChoice(e.target.checked)}
-              className="mr-2 rounded text-blue-500 focus:ring-blue-500"
+              className="mr-2 rounded text-accent focus:ring-accent"
             />
             <span className="text-sm">
               Remember this choice for this frame set
@@ -94,13 +94,13 @@ export const FlatPatternModal: React.FC<FlatPatternModalProps> = ({
         <div className="flex gap-3 justify-end">
           <button
             onClick={onCancel}
-            className="px-4 py-2 bg-gray-700 text-gray-200 rounded hover:bg-gray-600 transition-colors"
+            className="px-4 py-2 bg-surface-hover text-content rounded hover:bg-surface-hover transition-colors"
           >
             Cancel
           </button>
           <button
             onClick={handleContinue}
-            className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+            className="px-4 py-2 bg-accent text-surface rounded hover:bg-accent-hover transition-colors"
           >
             Continue
           </button>

@@ -77,7 +77,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
       <div className="mb-6">
         <button
           onClick={onClose}
-          className="flex items-center gap-2 text-gray-400 hover:text-gray-200 mb-4 transition-colors"
+          className="flex items-center gap-2 text-content-muted hover:text-content mb-4 transition-colors"
         >
           <ArrowLeft size={20} />
           Back to Equipment
@@ -87,19 +87,19 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           <div>
             <h2 className="text-3xl font-bold mb-2">Calibration Library</h2>
             <div className="flex items-center gap-4">
-              <span className="text-gray-400">{instrume}</span>
+              <span className="text-content-muted">{instrume}</span>
               {currentStats && currentStats.totalSets > 0 && (
                 <>
                   <div className="flex items-center gap-1.5 text-sm">
-                    <Package className="text-blue-400" size={14} />
-                    <span className="text-gray-400">Sets:</span>
-                    <span className="text-gray-100 font-medium">{currentStats.totalSets}</span>
+                    <Package className="text-accent" size={14} />
+                    <span className="text-content-muted">Sets:</span>
+                    <span className="text-content font-medium">{currentStats.totalSets}</span>
                   </div>
                   {currentStats.dateFrom && currentStats.dateTo && (
                     <div className="flex items-center gap-1.5 text-sm">
-                      <Calendar className="text-orange-400" size={14} />
-                      <span className="text-gray-400">Coverage:</span>
-                      <span className="text-gray-100 font-medium">
+                      <Calendar className="text-orange" size={14} />
+                      <span className="text-content-muted">Coverage:</span>
+                      <span className="text-content font-medium">
                         {format(new Date(currentStats.dateFrom), "MMM yyyy")} - {format(new Date(currentStats.dateTo), "MMM yyyy")}
                       </span>
                     </div>
@@ -112,7 +112,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           <button
             onClick={handleRefreshLibrary}
             disabled={refreshing}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <RefreshCw size={16} className={refreshing ? "animate-spin" : ""} />
             {refreshing ? "Refreshing..." : "Refresh"}
@@ -122,63 +122,63 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
 
       {/* Messages */}
       {error && (
-        <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-4">
-          <p className="text-red-400">{error}</p>
+        <div className="bg-error-muted border border-error/50 rounded-lg p-4 mb-4">
+          <p className="text-error">{error}</p>
         </div>
       )}
 
       {successMessage && (
-        <div className="bg-green-900/20 border border-green-700 rounded-lg p-4 mb-4">
-          <p className="text-green-400">{successMessage}</p>
+        <div className="bg-success-muted border border-success/50 rounded-lg p-4 mb-4">
+          <p className="text-success">{successMessage}</p>
         </div>
       )}
 
       {/* Tabs */}
-      <div className="border-b border-gray-700 mb-6">
+      <div className="border-b border-border mb-6">
         <div className="flex gap-4">
           <button
             onClick={() => setActiveTab("darks")}
             className={`px-4 py-2 border-b-2 transition-colors ${
               activeTab === "darks"
-                ? "border-blue-500 text-blue-400"
-                : "border-transparent text-gray-400 hover:text-gray-200"
+                ? "border-accent text-accent"
+                : "border-transparent text-content-muted hover:text-content"
             }`}
           >
             Darks
-            <span className="text-xs ml-2 text-gray-500">(Dark/Bias/DarkFlat)</span>
+            <span className="text-xs ml-2 text-content-muted">(Dark/Bias/DarkFlat)</span>
           </button>
           <button
             onClick={() => setActiveTab("flats")}
             className={`px-4 py-2 border-b-2 transition-colors ${
               activeTab === "flats"
-                ? "border-blue-500 text-blue-400"
-                : "border-transparent text-gray-400 hover:text-gray-200"
+                ? "border-accent text-accent"
+                : "border-transparent text-content-muted hover:text-content"
             }`}
           >
             Flats
-            <span className="text-xs ml-2 text-gray-500">(Flat Calibration)</span>
+            <span className="text-xs ml-2 text-content-muted">(Flat Calibration)</span>
           </button>
           <button
             onClick={() => setActiveTab("master-darks")}
             className={`px-4 py-2 border-b-2 transition-colors ${
               activeTab === "master-darks"
-                ? "border-purple-500 text-purple-400"
-                : "border-transparent text-gray-400 hover:text-gray-200"
+                ? "border-purple text-purple"
+                : "border-transparent text-content-muted hover:text-content"
             }`}
           >
             Master Darks
-            <span className="text-xs ml-2 text-gray-500">(MasterDark/Bias/DarkFlat)</span>
+            <span className="text-xs ml-2 text-content-muted">(MasterDark/Bias/DarkFlat)</span>
           </button>
           <button
             onClick={() => setActiveTab("master-flats")}
             className={`px-4 py-2 border-b-2 transition-colors ${
               activeTab === "master-flats"
-                ? "border-purple-500 text-purple-400"
-                : "border-transparent text-gray-400 hover:text-gray-200"
+                ? "border-purple text-purple"
+                : "border-transparent text-content-muted hover:text-content"
             }`}
           >
             Master Flats
-            <span className="text-xs ml-2 text-gray-500">(MasterFlat)</span>
+            <span className="text-xs ml-2 text-content-muted">(MasterFlat)</span>
           </button>
         </div>
       </div>

@@ -96,12 +96,12 @@ export function ObjectsTableView({
       : <ChevronDown size={14} className="inline ml-1" />;
   };
 
-  const headerClass = "px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider cursor-pointer hover:text-gray-200 transition-colors select-none";
+  const headerClass = "px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider cursor-pointer hover:text-content transition-colors select-none";
 
   return (
-    <div className={`overflow-x-auto bg-gray-800 rounded-lg border border-gray-700 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
+    <div className={`overflow-x-auto bg-surface-elevated rounded-lg border border-border ${isDragging || isMergeMode ? 'select-none' : ''}`}>
       <table className="w-full">
-        <thead className="bg-gray-900">
+        <thead className="bg-surface">
           <tr>
             <th className={headerClass} onClick={() => handleSort('name')}>
               Name <SortIcon field="name" />
@@ -123,12 +123,12 @@ export function ObjectsTableView({
             <th className={headerClass} onClick={() => handleSort('custom')}>
               <Star size={12} className="inline" /> <SortIcon field="custom" />
             </th>
-            <th className="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase tracking-wider">
+            <th className="px-4 py-3 text-center text-xs font-medium text-content-muted uppercase tracking-wider">
               Actions
             </th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-gray-700">
+        <tbody className="divide-y divide-border">
           {sortedFrameSets.map(({ frames_set, member_count }, index) => {
             const isBeingDragged = isDragging && draggedSetId === frames_set.id;
             const isDropTarget = dropTargetId === frames_set.id;
@@ -139,12 +139,12 @@ export function ObjectsTableView({
                 data-set-id={frames_set.id}
                 onMouseDown={(e) => !editingSetId && isMergeMode && onMouseDown(e, frames_set.id!)}
                 className={`
-                  ${index % 2 === 0 ? 'bg-gray-800' : 'bg-gray-800/50'}
-                  ${isBeingDragged ? 'opacity-40 bg-blue-900/30' : ''}
-                  ${isDropTarget ? 'bg-green-900/30 ring-2 ring-green-500' : ''}
+                  ${index % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface-elevated/50'}
+                  ${isBeingDragged ? 'opacity-40 bg-info-muted' : ''}
+                  ${isDropTarget ? 'bg-success-muted ring-2 ring-success' : ''}
                   ${!editingSetId && isMergeMode && !isDragging ? 'cursor-grab' : ''}
                   ${isDragging ? 'cursor-grabbing' : ''}
-                  hover:bg-gray-700/50 transition-colors
+                  hover:bg-surface-hover/50 transition-colors
                 `}
               >
                 {/* Name */}
@@ -159,19 +159,19 @@ export function ObjectsTableView({
                           if (e.key === 'Enter') onSaveRename(frames_set.id!);
                           else if (e.key === 'Escape') onCancelEditing();
                         }}
-                        className="flex-1 px-2 py-1 bg-gray-700 text-gray-100 rounded border border-gray-600 focus:outline-none focus:border-blue-500 text-sm"
+                        className="flex-1 px-2 py-1 bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent text-sm"
                         autoFocus
                         onClick={(e) => e.stopPropagation()}
                       />
                       <button
                         onClick={(e) => { e.stopPropagation(); onSaveRename(frames_set.id!); }}
-                        className="p-1 text-green-400 hover:text-green-300"
+                        className="p-1 text-success hover:text-success/80"
                       >
                         <Check size={16} />
                       </button>
                       <button
                         onClick={(e) => { e.stopPropagation(); onCancelEditing(); }}
-                        className="p-1 text-red-400 hover:text-red-300"
+                        className="p-1 text-error hover:text-error/80"
                       >
                         <X size={16} />
                       </button>
@@ -179,7 +179,7 @@ export function ObjectsTableView({
                   ) : (
                     <button
                       onClick={(e) => { e.stopPropagation(); onView(frames_set.id!); }}
-                      className="font-medium text-gray-100 hover:text-blue-400 transition-colors text-left"
+                      className="font-medium text-content hover:text-accent transition-colors text-left"
                     >
                       {frames_set.name || 'Untitled'}
                     </button>
@@ -189,37 +189,37 @@ export function ObjectsTableView({
                 {/* Coordinates */}
                 <td className="px-4 py-3 hidden md:table-cell">
                   {frames_set.objctra && frames_set.objctdec ? (
-                    <span className="font-mono text-xs text-gray-400">
+                    <span className="font-mono text-xs text-content-muted">
                       {frames_set.objctra} / {frames_set.objctdec}
                     </span>
                   ) : (
-                    <span className="text-gray-500">-</span>
+                    <span className="text-content-muted">-</span>
                   )}
                 </td>
 
                 {/* Frames */}
-                <td className="px-4 py-3 text-gray-300">
+                <td className="px-4 py-3 text-content-secondary">
                   {member_count}
                 </td>
 
                 {/* Exposure */}
-                <td className="px-4 py-3 hidden lg:table-cell text-gray-300">
+                <td className="px-4 py-3 hidden lg:table-cell text-content-secondary">
                   {formatExposureTime(frames_set.total_exp_time)}
                 </td>
 
                 {/* Date Range */}
-                <td className="px-4 py-3 hidden md:table-cell text-gray-400 text-sm">
+                <td className="px-4 py-3 hidden md:table-cell text-content-muted text-sm">
                   {formatDateRange(frames_set.date_obs_start, frames_set.date_obs_end)}
                 </td>
 
                 {/* Custom Star */}
                 <td className="px-4 py-3 text-center">
                   {frames_set.is_custom ? (
-                    <Star size={16} className="text-orange-500 fill-orange-500 inline" />
+                    <Star size={16} className="text-orange fill-orange inline" />
                   ) : (
                     <button
                       onClick={(e) => { e.stopPropagation(); onMarkAsCustom(frames_set.id!); }}
-                      className="text-gray-400 hover:text-orange-400 transition-colors"
+                      className="text-content-muted hover:text-orange/80 transition-colors"
                       title="Mark as Custom Set"
                     >
                       <Star size={16} />
@@ -232,14 +232,14 @@ export function ObjectsTableView({
                   <div className="flex items-center justify-center gap-2">
                     <button
                       onClick={(e) => { e.stopPropagation(); onStartEditing(frames_set.id!, frames_set.name); }}
-                      className="p-1.5 text-gray-400 hover:text-gray-200 hover:bg-gray-700 rounded transition-colors"
+                      className="p-1.5 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
                       title="Rename"
                     >
                       <Pencil size={14} />
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); onDelete(frames_set.id!, frames_set.name); }}
-                      className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-gray-700 rounded transition-colors"
+                      className="p-1.5 text-content-muted hover:text-error hover:bg-surface-hover rounded transition-colors"
                       title="Delete"
                     >
                       <Trash2 size={14} />

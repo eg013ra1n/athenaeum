@@ -34,26 +34,26 @@ function GroupTree({ group }: GroupTreeProps) {
   const [expanded, setExpanded] = useState(true);
 
   return (
-    <div className="border border-gray-700 rounded-lg overflow-hidden">
+    <div className="border border-border rounded-lg overflow-hidden">
       {/* Group Header */}
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center justify-between p-3 bg-gray-800 hover:bg-gray-750 transition-colors"
+        className="w-full flex items-center justify-between p-3 bg-surface-elevated hover:bg-surface-hover transition-colors"
       >
         <div className="flex items-center gap-2">
           {expanded ? (
-            <ChevronDown size={16} className="text-gray-400" />
+            <ChevronDown size={16} className="text-content-muted" />
           ) : (
-            <ChevronRight size={16} className="text-gray-400" />
+            <ChevronRight size={16} className="text-content-muted" />
           )}
-          <Sun size={16} className="text-yellow-500" />
+          <Sun size={16} className="text-warning" />
           <span className="font-medium">{group.name}</span>
         </div>
-        <div className="flex items-center gap-4 text-sm text-gray-400">
+        <div className="flex items-center gap-4 text-sm text-content-muted">
           <span>{group.lightCount} frames</span>
           <span>{formatExposure(group.totalExposure)}</span>
           {group.subgroupCount > 1 && (
-            <span className="px-2 py-0.5 bg-blue-900/50 text-blue-400 rounded text-xs">
+            <span className="px-2 py-0.5 bg-info-muted text-accent rounded text-xs">
               {group.subgroupCount} subgroups
             </span>
           )}
@@ -62,23 +62,23 @@ function GroupTree({ group }: GroupTreeProps) {
 
       {/* Tree Content */}
       {expanded && (
-        <div className="p-3 bg-gray-900/50">
+        <div className="p-3 bg-surface/50">
           {/* Stacking Summary */}
-          <div className="mb-3 pb-3 border-b border-gray-700">
-            <div className="text-sm text-gray-400">
-              <span className="font-medium text-gray-300">Stacking:</span>{' '}
+          <div className="mb-3 pb-3 border-b border-border">
+            <div className="text-sm text-content-muted">
+              <span className="font-medium text-content-secondary">Stacking:</span>{' '}
               {group.lightCount} light frames ({formatExposure(group.totalExposure)} total)
               {group.subgroupCount > 1 && (
-                <span className="text-blue-400"> → {group.subgroupCount} separate stacks by exposure time</span>
+                <span className="text-accent"> → {group.subgroupCount} separate stacks by exposure time</span>
               )}
               {group.subgroupCount === 1 && (
-                <span className="text-green-400"> → 1 combined stack</span>
+                <span className="text-success"> → 1 combined stack</span>
               )}
             </div>
           </div>
 
           {/* Calibration Hierarchy */}
-          <div className="text-xs text-gray-500 mb-2 uppercase tracking-wide">Calibration Chain</div>
+          <div className="text-xs text-content-muted mb-2 uppercase tracking-wide">Calibration Chain</div>
           {group.calibrationTree.map((node, index) => (
             <TreeNode key={index} node={node} depth={0} />
           ))}
@@ -104,16 +104,16 @@ function TreeNode({ node, depth }: TreeNodeProps) {
     <div style={{ marginLeft: depth * 20 }}>
       <div
         className={`flex items-center gap-2 py-1.5 ${
-          hasChildren ? 'cursor-pointer hover:bg-gray-800/50 rounded' : ''
+          hasChildren ? 'cursor-pointer hover:bg-surface-elevated/50 rounded' : ''
         }`}
         onClick={() => hasChildren && setExpanded(!expanded)}
       >
         {/* Expand/Collapse or spacer */}
         {hasChildren ? (
           expanded ? (
-            <ChevronDown size={14} className="text-gray-500" />
+            <ChevronDown size={14} className="text-content-muted" />
           ) : (
-            <ChevronRight size={14} className="text-gray-500" />
+            <ChevronRight size={14} className="text-content-muted" />
           )
         ) : (
           <span className="w-[14px]" />
@@ -125,12 +125,12 @@ function TreeNode({ node, depth }: TreeNodeProps) {
         {/* Label with frame count */}
         <span
           className={`text-sm ${
-            node.isMissing ? 'text-red-400 italic' : 'text-gray-200'
+            node.isMissing ? 'text-error italic' : 'text-content'
           }`}
         >
           {node.label}
           {node.count > 0 && node.nodeType !== 'Light' && (
-            <span className="text-gray-500 ml-1">({node.count} frames)</span>
+            <span className="text-content-muted ml-1">({node.count} frames)</span>
           )}
         </span>
 
@@ -138,18 +138,18 @@ function TreeNode({ node, depth }: TreeNodeProps) {
         <div className="flex items-center gap-2 ml-auto">
           {node.isShared && (
             <span title="Shared with other groups">
-              <Share2 size={12} className="text-blue-400" />
+              <Share2 size={12} className="text-accent" />
             </span>
           )}
           {node.warnings.length > 0 && (
             <span title={node.warnings.join('\n')}>
-              <AlertTriangle size={12} className="text-yellow-500" />
+              <AlertTriangle size={12} className="text-warning" />
             </span>
           )}
           {!node.isMissing && node.nodeType !== 'Light' && (
-            <Check size={12} className="text-green-500" />
+            <Check size={12} className="text-success" />
           )}
-          {node.isMissing && <X size={12} className="text-red-500" />}
+          {node.isMissing && <X size={12} className="text-error" />}
         </div>
       </div>
 
@@ -181,21 +181,21 @@ function getNodeIcon(nodeType: CalibrationTreeNode['nodeType']) {
 }
 
 function getIconColor(nodeType: CalibrationTreeNode['nodeType'], isMissing: boolean): string {
-  if (isMissing) return 'text-red-500';
+  if (isMissing) return 'text-error';
 
   switch (nodeType) {
     case 'Light':
-      return 'text-yellow-500';
+      return 'text-warning';
     case 'Flat':
-      return 'text-blue-400';
+      return 'text-accent';
     case 'Dark':
-      return 'text-purple-400';
+      return 'text-purple';
     case 'Bias':
-      return 'text-gray-400';
+      return 'text-content-muted';
     case 'DarkFlat':
       return 'text-indigo-400';
     default:
-      return 'text-gray-400';
+      return 'text-content-muted';
   }
 }
 

@@ -587,7 +587,7 @@ export default function Objects() {
         <div className="flex items-center justify-between mb-2">
           <div>
             <h2 className="text-3xl font-bold">Objects Library</h2>
-            <p className="text-gray-400">
+            <p className="text-content-muted">
               Frame sets grouped by sky coordinates
             </p>
           </div>
@@ -595,7 +595,7 @@ export default function Objects() {
             <button
               onClick={handleAutoGenerate}
               disabled={generating}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+              className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-surface rounded-lg transition-colors"
             >
               <Sparkles size={18} />
               {generating ? 'Generating...' : 'Auto-Generate Sets'}
@@ -604,21 +604,21 @@ export default function Objects() {
               onClick={() => setShowThresholdPanel(prev => !prev)}
               className={`flex items-center justify-center py-2 px-2 rounded-lg transition-colors ${
                 showThresholdPanel
-                  ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-400'
+                  ? 'bg-accent hover:bg-accent-hover text-surface'
+                  : 'bg-surface-hover hover:bg-surface-hover text-content-muted'
               }`}
               title="Grouping threshold settings"
             >
               <Sliders size={18} />
             </button>
-            <div className="h-6 w-px bg-gray-600" />
-            <div className="flex items-center bg-gray-700 rounded-lg p-1">
+            <div className="h-6 w-px bg-border" />
+            <div className="flex items-center bg-surface-hover rounded-lg p-1">
               <button
                 onClick={() => handleViewModeChange('cards')}
                 className={`p-1.5 rounded transition-colors ${
                   viewMode === 'cards'
-                    ? 'bg-gray-600 text-white'
-                    : 'text-gray-400 hover:text-gray-200'
+                    ? 'bg-accent text-surface'
+                    : 'text-content-muted hover:text-content'
                 }`}
                 title="Card view"
               >
@@ -628,8 +628,8 @@ export default function Objects() {
                 onClick={() => handleViewModeChange('table')}
                 className={`p-1.5 rounded transition-colors ${
                   viewMode === 'table'
-                    ? 'bg-gray-600 text-white'
-                    : 'text-gray-400 hover:text-gray-200'
+                    ? 'bg-accent text-surface'
+                    : 'text-content-muted hover:text-content'
                 }`}
                 title="Table view"
               >
@@ -640,15 +640,15 @@ export default function Objects() {
               onClick={() => setShowFilterPanel(prev => !prev)}
               className={`relative flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
                 showFilterPanel || activeFilterCount > 0
-                  ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                  ? 'bg-accent hover:bg-accent-hover text-surface'
+                  : 'bg-surface-hover hover:bg-surface-hover text-content-secondary'
               }`}
               title="Filter frame sets"
             >
               <Filter size={18} />
               Filter
               {activeFilterCount > 0 && (
-                <span className="absolute -top-1 -right-1 bg-orange-500 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                <span className="absolute -top-1 -right-1 bg-orange text-surface text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
                   {activeFilterCount}
                 </span>
               )}
@@ -657,8 +657,8 @@ export default function Objects() {
               onClick={() => setIsMergeMode(prev => !prev)}
               className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
                 isMergeMode
-                  ? 'bg-green-600 hover:bg-green-700 text-white'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                  ? 'bg-success hover:brightness-90 text-surface'
+                  : 'bg-surface-hover hover:bg-surface-hover text-content-secondary'
               }`}
               title={`${isMergeMode ? 'Exit' : 'Enter'} Merge Mode (M)`}
             >
@@ -670,16 +670,16 @@ export default function Objects() {
 
         {/* Threshold Settings Panel */}
         {showThresholdPanel && (
-          <div className="mt-4 p-4 bg-gray-800 border border-gray-700 rounded-lg">
+          <div className="mt-4 p-4 bg-surface-elevated border border-border rounded-lg">
             {/* Header with buttons */}
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <label className="text-sm font-medium text-gray-300">
+                <label className="text-sm font-medium text-content-secondary">
                   Grouping Threshold
                 </label>
                 <button
                   onClick={() => setCustomThreshold(defaultThreshold.toFixed(2))}
-                  className="p-1 text-gray-400 hover:text-gray-200 transition-colors"
+                  className="p-1 text-content-muted hover:text-content transition-colors"
                   title="Reset to default"
                 >
                   <RefreshCw size={14} />
@@ -689,7 +689,7 @@ export default function Objects() {
                 <button
                   onClick={handleDeleteAutoGenerated}
                   disabled={deletingAutoSets}
-                  className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-xs rounded transition-colors"
+                  className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white text-xs rounded transition-colors"
                   title={`Delete ${frameSets.filter(fs => !fs.frames_set.is_custom).length} auto-generated set${frameSets.filter(fs => !fs.frames_set.is_custom).length !== 1 ? 's' : ''}`}
                 >
                   <Trash2 size={14} />
@@ -706,13 +706,13 @@ export default function Objects() {
                 onChange={(e) => setCustomThreshold(e.target.value)}
                 step="0.1"
                 min="0"
-                className="w-32 px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-32 px-3 py-2 bg-surface-hover border border-border rounded text-sm text-content focus:outline-none focus:ring-2 focus:ring-accent"
               />
-              <span className="text-sm text-gray-400">degrees</span>
+              <span className="text-sm text-content-muted">degrees</span>
             </div>
 
             {/* Conversion helper */}
-            <p className="mt-2 text-xs text-gray-400">
+            <p className="mt-2 text-xs text-content-muted">
               {!isNaN(parseFloat(customThreshold))
                 ? `${parseFloat(customThreshold).toFixed(2)}° = ${(parseFloat(customThreshold) * 60).toFixed(1)} arcmin`
                 : `${defaultThreshold.toFixed(2)}° = ${(defaultThreshold * 60).toFixed(1)} arcmin`
@@ -731,23 +731,23 @@ export default function Objects() {
 
       {/* Results Summary */}
       {activeFilterCount > 0 && (
-        <div className="mb-4 text-sm text-gray-400">
+        <div className="mb-4 text-sm text-content-muted">
           Showing {filteredFrameSets.length} of {frameSets.length} frame set{frameSets.length !== 1 ? 's' : ''}
         </div>
       )}
 
       {isMergeMode && (
-        <div className="mb-4 p-3 bg-green-900/20 border border-green-800 rounded-lg flex items-center justify-between">
+        <div className="mb-4 p-3 bg-success-muted border border-success/50 rounded-lg flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <Grip className="text-green-500" size={20} />
+            <Grip className="text-success" size={20} />
             <div>
-              <p className="font-medium text-green-400">Merge Mode Active</p>
-              <p className="text-sm text-green-300">Drag and drop frame sets to merge them</p>
+              <p className="font-medium text-success">Merge Mode Active</p>
+              <p className="text-sm text-success/80">Drag and drop frame sets to merge them</p>
             </div>
           </div>
           <button
             onClick={() => setIsMergeMode(false)}
-            className="text-green-400 hover:text-green-300 text-sm underline"
+            className="text-success hover:brightness-110 text-sm underline"
           >
             Exit (M)
           </button>
@@ -755,38 +755,38 @@ export default function Objects() {
       )}
 
       {merging && (
-        <div className="mb-4 p-4 bg-blue-900/20 border border-blue-800 rounded-lg flex items-start gap-3">
-          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-500 flex-shrink-0 mt-0.5"></div>
+        <div className="mb-4 p-4 bg-info-muted border border-info/50 rounded-lg flex items-start gap-3">
+          <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-info flex-shrink-0 mt-0.5"></div>
           <div className="flex-1">
-            <p className="font-medium text-blue-400">Merging Frame Sets</p>
-            <p className="text-sm text-blue-300">Please wait while the frame sets are being merged...</p>
+            <p className="font-medium text-info">Merging Frame Sets</p>
+            <p className="text-sm text-info/80">Please wait while the frame sets are being merged...</p>
           </div>
         </div>
       )}
 
       {error && (
-        <div className="mb-4 p-4 bg-red-900/20 border border-red-800 rounded-lg flex items-start gap-3">
-          <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
+        <div className="mb-4 p-4 bg-error-muted border border-error/50 rounded-lg flex items-start gap-3">
+          <AlertCircle className="text-error flex-shrink-0 mt-0.5" size={20} />
           <div className="flex-1">
-            <p className="font-medium text-red-400">Error</p>
-            <p className="text-sm text-red-300">{String(error)}</p>
+            <p className="font-medium text-error">Error</p>
+            <p className="text-sm text-error/80">{String(error)}</p>
           </div>
         </div>
       )}
 
       {generateResult && (
-        <div className="mb-4 p-4 bg-green-900/20 border border-green-800 rounded-lg">
+        <div className="mb-4 p-4 bg-success-muted border border-success/50 rounded-lg">
           <div className="flex items-start justify-between mb-2">
-            <p className="font-medium text-green-400">Generation Complete</p>
+            <p className="font-medium text-success">Generation Complete</p>
             <button
               onClick={() => setGenerateResult(null)}
-              className="p-1 text-green-400 hover:text-green-300 transition-colors"
+              className="p-1 text-success hover:brightness-110 transition-colors"
               title="Dismiss"
             >
               <X size={18} />
             </button>
           </div>
-          <div className="text-sm text-green-300 space-y-1">
+          <div className="text-sm text-success/80 space-y-1">
             <p>Sets created: {generateResult.sets_created}</p>
             <p>Frames clustered: {generateResult.frames_clustered}</p>
             {generateResult.frames_already_in_sets > 0 && (
@@ -798,15 +798,15 @@ export default function Objects() {
           </div>
           {generateResult.exclusion_reasons.length > 0 && (
             <details className="mt-3">
-              <summary className="text-sm text-green-400 cursor-pointer">
+              <summary className="text-sm text-success cursor-pointer">
                 View exclusion reasons ({generateResult.exclusion_reasons.length})
               </summary>
-              <div className="mt-2 text-xs text-gray-400 max-h-32 overflow-y-auto">
+              <div className="mt-2 text-xs text-content-muted max-h-32 overflow-y-auto">
                 {generateResult.exclusion_reasons.slice(0, 10).map((reason, i) => (
                   <p key={i} className="truncate">{reason}</p>
                 ))}
                 {generateResult.exclusion_reasons.length > 10 && (
-                  <p className="text-gray-500 italic">
+                  <p className="text-content-muted italic">
                     ... and {generateResult.exclusion_reasons.length - 10} more
                   </p>
                 )}
@@ -817,13 +817,13 @@ export default function Objects() {
       )}
 
       {suggestedMerges.length > 0 && (
-        <div className="mb-4 p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
+        <div className="mb-4 p-4 bg-warning-muted border border-warning/50 rounded-lg">
           <div className="flex items-center justify-between mb-3">
-            <p className="font-medium text-yellow-400">Suggested Merges</p>
+            <p className="font-medium text-warning">Suggested Merges</p>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setSuggestedMerges([])}
-                className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm rounded transition-colors"
+                className="px-3 py-1 bg-surface-hover hover:bg-surface-hover text-content-secondary text-sm rounded transition-colors"
                 title="Dismiss all suggestions"
               >
                 Dismiss
@@ -831,7 +831,7 @@ export default function Objects() {
               <button
                 onClick={handleMergeAllSuggestions}
                 disabled={merging}
-                className="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
+                className="px-3 py-1 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-surface text-sm rounded transition-colors"
               >
                 Merge All
               </button>
@@ -839,19 +839,19 @@ export default function Objects() {
           </div>
           <div className="space-y-2">
             {suggestedMerges.map((suggestion, i) => (
-              <div key={i} className="flex items-center justify-between p-3 bg-gray-800/50 rounded">
+              <div key={i} className="flex items-center justify-between p-3 bg-surface-elevated/50 rounded">
                 <div className="flex-1">
-                  <p className="text-sm text-gray-300">
-                    Merge <span className="font-semibold text-blue-400">"{suggestion.sourceName}"</span>
+                  <p className="text-sm text-content-secondary">
+                    Merge <span className="font-semibold text-accent">"{suggestion.sourceName}"</span>
                     {' '}into{' '}
-                    <span className="font-semibold text-blue-400">"{suggestion.targetName}"</span>
+                    <span className="font-semibold text-accent">"{suggestion.targetName}"</span>
                   </p>
-                  <p className="text-xs text-gray-500 mt-1">{suggestion.reason}</p>
+                  <p className="text-xs text-content-muted mt-1">{suggestion.reason}</p>
                 </div>
                 <button
                   onClick={() => handleSuggestedMerge(suggestion.sourceId, suggestion.targetId)}
                   disabled={merging}
-                  className="ml-3 px-3 py-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
+                  className="ml-3 px-3 py-1 bg-success hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-surface text-sm rounded transition-colors"
                 >
                   Merge
                 </button>
@@ -862,26 +862,26 @@ export default function Objects() {
       )}
 
       {loading ? (
-        <div className="text-center py-12 text-gray-400">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
+        <div className="text-center py-12 text-content-muted">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto"></div>
           <p className="mt-4">Loading frame sets...</p>
         </div>
       ) : frameSets.length === 0 ? (
-        <div className="bg-gray-800 rounded-lg p-8 text-center">
-          <Target className="mx-auto mb-4 text-gray-600" size={48} />
-          <p className="text-gray-400 mb-4">
+        <div className="bg-surface-elevated rounded-lg p-8 text-center">
+          <Target className="mx-auto mb-4 text-content-muted" size={48} />
+          <p className="text-content-muted mb-4">
             No frame sets yet. Use "Auto-Generate Sets" to cluster your LIGHT frames by sky coordinates.
           </p>
         </div>
       ) : filteredFrameSets.length === 0 ? (
-        <div className="bg-gray-800 rounded-lg p-8 text-center">
-          <Filter className="mx-auto mb-4 text-gray-600" size={48} />
-          <p className="text-gray-400 mb-4">
+        <div className="bg-surface-elevated rounded-lg p-8 text-center">
+          <Filter className="mx-auto mb-4 text-content-muted" size={48} />
+          <p className="text-content-muted mb-4">
             No frame sets match your filters.
           </p>
           <button
             onClick={() => setFilters(emptyFilterState)}
-            className="text-blue-400 hover:text-blue-300 underline text-sm"
+            className="text-accent hover:text-accent-hover underline text-sm"
           >
             Clear all filters
           </button>
@@ -911,12 +911,12 @@ export default function Objects() {
               key={frames_set.id}
               data-set-id={frames_set.id}
               onMouseDown={(e) => !editingSetId && isMergeMode && handleMouseDown(e, frames_set.id!)}
-              className={`bg-gray-800 rounded-lg p-4 border-2 transition-all duration-200 group ${
+              className={`bg-surface-elevated rounded-lg p-4 border-2 transition-all duration-200 group ${
                 isDragging && draggedSetId === frames_set.id
-                  ? 'opacity-40 border-blue-500 shadow-lg shadow-blue-500/50 cursor-grabbing select-none'
+                  ? 'opacity-40 border-accent shadow-lg shadow-accent/50 cursor-grabbing select-none'
                   : dropTargetId === frames_set.id
-                  ? 'border-green-500 bg-green-900/30 scale-105 shadow-lg shadow-green-500/50'
-                  : 'border-gray-700 hover:border-gray-600'
+                  ? 'border-success bg-success-muted scale-105 shadow-lg shadow-success/50'
+                  : 'border-border hover:border-border'
               } ${!editingSetId && isMergeMode && !isDragging ? 'cursor-grab' : ''} ${isDragging ? 'select-none' : ''}`}
             >
               <div className="flex items-start justify-between mb-3">
@@ -934,19 +934,19 @@ export default function Objects() {
                             cancelEditing();
                           }
                         }}
-                        className="flex-1 px-2 py-1 bg-gray-700 text-gray-100 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                        className="flex-1 px-2 py-1 bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent"
                         autoFocus
                       />
                       <button
                         onClick={() => saveRename(frames_set.id!)}
-                        className="p-1 text-green-400 hover:text-green-300"
+                        className="p-1 text-success hover:text-success/90"
                         title="Save"
                       >
                         <Check size={18} />
                       </button>
                       <button
                         onClick={cancelEditing}
-                        className="p-1 text-red-400 hover:text-red-300"
+                        className="p-1 text-error hover:text-error/90"
                         title="Cancel"
                       >
                         <X size={18} />
@@ -956,7 +956,7 @@ export default function Objects() {
                     <div className="flex items-center gap-2">
                       {frames_set.is_custom ? (
                         <span title="Custom Set">
-                          <Star size={16} className="text-orange-500 fill-orange-500 flex-shrink-0" />
+                          <Star size={16} className="text-orange fill-orange flex-shrink-0" />
                         </span>
                       ) : (
                         <button
@@ -964,13 +964,13 @@ export default function Objects() {
                             e.stopPropagation();
                             handleMarkAsCustom(frames_set.id!);
                           }}
-                          className="p-0 text-gray-400 hover:text-orange-400 transition-colors"
+                          className="p-0 text-content-muted hover:text-orange transition-colors"
                           title="Mark as Custom Set"
                         >
                           <Star size={16} className="flex-shrink-0" />
                         </button>
                       )}
-                      <h3 className="text-lg font-semibold text-gray-100 truncate">
+                      <h3 className="text-lg font-semibold text-content truncate">
                         {frames_set.name || 'Untitled'}
                       </h3>
                       <button
@@ -978,7 +978,7 @@ export default function Objects() {
                           e.stopPropagation();
                           startEditing(frames_set.id!, frames_set.name);
                         }}
-                        className="p-1 text-gray-400 hover:text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity"
+                        className="p-1 text-content-muted hover:text-content opacity-0 group-hover:opacity-100 transition-opacity"
                         title="Rename"
                       >
                         <Pencil size={14} />
@@ -986,7 +986,7 @@ export default function Objects() {
                     </div>
                   )}
                   {frames_set.objctra && frames_set.objctdec && (
-                    <div className="flex items-center gap-1 text-sm text-gray-400 mt-1">
+                    <div className="flex items-center gap-1 text-sm text-content-muted mt-1">
                       <MapPin size={14} />
                       <span className="font-mono text-xs">
                         RA {frames_set.objctra} / Dec {frames_set.objctdec}
@@ -997,23 +997,23 @@ export default function Objects() {
               </div>
 
               <div className="grid grid-cols-2 gap-3 mb-3 text-sm">
-                <div className="bg-gray-900/50 rounded p-2">
-                  <p className="text-gray-500 text-xs">Frames</p>
-                  <p className="text-gray-200 font-medium">{member_count}</p>
+                <div className="bg-surface/50 rounded p-2">
+                  <p className="text-content-muted text-xs">Frames</p>
+                  <p className="text-content font-medium">{member_count}</p>
                 </div>
-                <div className="bg-gray-900/50 rounded p-2">
-                  <p className="text-gray-500 text-xs flex items-center gap-1">
+                <div className="bg-surface/50 rounded p-2">
+                  <p className="text-content-muted text-xs flex items-center gap-1">
                     <Clock size={12} />
                     Total Exp.
                   </p>
-                  <p className="text-gray-200 font-medium">
+                  <p className="text-content font-medium">
                     {formatExposureTime(frames_set.total_exp_time)}
                   </p>
                 </div>
               </div>
 
               {frames_set.date_obs_start && (
-                <p className="text-xs text-gray-500 mb-3">
+                <p className="text-xs text-content-muted mb-3">
                   {frames_set.date_obs_end && frames_set.date_obs_start !== frames_set.date_obs_end
                     ? `${new Date(frames_set.date_obs_start).toLocaleDateString()} - ${new Date(frames_set.date_obs_end).toLocaleDateString()}`
                     : new Date(frames_set.date_obs_start).toLocaleDateString()
@@ -1028,7 +1028,7 @@ export default function Objects() {
                       e.stopPropagation();
                       navigate(`/objects/${frames_set.id}`);
                     }}
-                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded transition-colors text-sm"
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content rounded transition-colors text-sm"
                     title="View members"
                   >
                     <Eye size={16} />
@@ -1039,7 +1039,7 @@ export default function Objects() {
                       e.stopPropagation();
                       handleDelete(frames_set.id!, frames_set.name);
                     }}
-                    className="px-3 py-2 bg-red-900/20 hover:bg-red-900/40 text-red-400 rounded transition-colors"
+                    className="px-3 py-2 bg-error-muted hover:bg-error/30 text-error rounded transition-colors"
                     title="Delete set"
                   >
                     <Trash2 size={16} />
@@ -1054,20 +1054,20 @@ export default function Objects() {
       {/* Merge Confirmation Dialog */}
       {showMergeDialog && pendingMerge && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-800 rounded-lg max-w-md w-full p-6 border border-gray-700">
+          <div className="bg-surface-elevated rounded-lg max-w-md w-full p-6 border border-border">
             <h3 className="text-xl font-bold mb-4 flex items-center gap-2">
-              <AlertTriangle size={20} className="text-yellow-500" />
+              <AlertTriangle size={20} className="text-warning" />
               Merge Frame Sets?
             </h3>
 
-            <div className="mb-4 text-gray-300">
+            <div className="mb-4 text-content-secondary">
               <p className="mb-3">
-                Merge <span className="font-semibold text-blue-400">"{pendingMerge.sourceName}"</span> into <span className="font-semibold text-blue-400">"{pendingMerge.targetName}"</span>?
+                Merge <span className="font-semibold text-accent">"{pendingMerge.sourceName}"</span> into <span className="font-semibold text-accent">"{pendingMerge.targetName}"</span>?
               </p>
 
               <div className="text-sm space-y-1 mb-3">
                 <p>This will:</p>
-                <ul className="list-disc list-inside space-y-1 text-gray-400">
+                <ul className="list-disc list-inside space-y-1 text-content-muted">
                   <li>Combine all imaging nights and sessions</li>
                   <li>Deduplicate frames</li>
                   <li>Delete "{pendingMerge.sourceName}"</li>
@@ -1075,7 +1075,7 @@ export default function Objects() {
                 </ul>
               </div>
 
-              <p className="text-sm text-yellow-400 font-medium">
+              <p className="text-sm text-warning font-medium">
                 This action cannot be undone.
               </p>
             </div>
@@ -1084,14 +1084,14 @@ export default function Objects() {
               <button
                 onClick={handleCancelMerge}
                 disabled={merging}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 disabled:cursor-not-allowed rounded-lg transition"
+                className="px-4 py-2 bg-surface-hover hover:bg-surface-hover disabled:bg-surface-hover disabled:cursor-not-allowed rounded-lg transition"
               >
                 Cancel
               </button>
               <button
                 onClick={handleConfirmMerge}
                 disabled={merging}
-                className="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition flex items-center gap-2"
+                className="px-4 py-2 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition flex items-center gap-2"
               >
                 {merging ? (
                   <>
@@ -1158,25 +1158,25 @@ export default function Objects() {
               transform: 'translate(-50%, -50%)',
             }}
           >
-            <div className="bg-gray-800 rounded-lg p-4 border-2 border-blue-500 shadow-2xl shadow-blue-500/50 opacity-80 w-80">
+            <div className="bg-surface-elevated rounded-lg p-4 border-2 border-accent shadow-2xl shadow-accent/50 opacity-80 w-80">
               <div className="flex items-start justify-between mb-3">
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     {frames_set.is_custom ? (
                       <span title="Custom Set">
-                        <Star size={16} className="text-orange-500 fill-orange-500 flex-shrink-0" />
+                        <Star size={16} className="text-orange fill-orange flex-shrink-0" />
                       </span>
                     ) : (
                       <span title="Auto-Generated Set">
-                        <Star size={16} className="text-gray-400 flex-shrink-0" />
+                        <Star size={16} className="text-content-muted flex-shrink-0" />
                       </span>
                     )}
-                    <h3 className="text-lg font-semibold text-gray-100 truncate">
+                    <h3 className="text-lg font-semibold text-content truncate">
                       {frames_set.name || 'Untitled'}
                     </h3>
                   </div>
                   {frames_set.objctra && frames_set.objctdec && (
-                    <div className="flex items-center gap-1 text-sm text-gray-400 mt-1">
+                    <div className="flex items-center gap-1 text-sm text-content-muted mt-1">
                       <MapPin size={14} />
                       <span className="font-mono text-xs">
                         RA {frames_set.objctra} / Dec {frames_set.objctdec}
@@ -1187,23 +1187,23 @@ export default function Objects() {
               </div>
 
               <div className="grid grid-cols-2 gap-3 mb-3 text-sm">
-                <div className="bg-gray-900/50 rounded p-2">
-                  <p className="text-gray-500 text-xs">Frames</p>
-                  <p className="text-gray-200 font-medium">{member_count}</p>
+                <div className="bg-surface/50 rounded p-2">
+                  <p className="text-content-muted text-xs">Frames</p>
+                  <p className="text-content font-medium">{member_count}</p>
                 </div>
-                <div className="bg-gray-900/50 rounded p-2">
-                  <p className="text-gray-500 text-xs flex items-center gap-1">
+                <div className="bg-surface/50 rounded p-2">
+                  <p className="text-content-muted text-xs flex items-center gap-1">
                     <Clock size={12} />
                     Total Exp.
                   </p>
-                  <p className="text-gray-200 font-medium">
+                  <p className="text-content font-medium">
                     {formatExposureTime(frames_set.total_exp_time)}
                   </p>
                 </div>
               </div>
 
               {frames_set.date_obs_start && (
-                <p className="text-xs text-gray-500">
+                <p className="text-xs text-content-muted">
                   {frames_set.date_obs_end && frames_set.date_obs_start !== frames_set.date_obs_end
                     ? `${new Date(frames_set.date_obs_start).toLocaleDateString()} - ${new Date(frames_set.date_obs_end).toLocaleDateString()}`
                     : new Date(frames_set.date_obs_start).toLocaleDateString()

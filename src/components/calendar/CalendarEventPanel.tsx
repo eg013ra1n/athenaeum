@@ -36,11 +36,11 @@ function FrameSetCard({
   const displayName = frameSet.objectName || frameSet.name || 'Unnamed';
 
   return (
-    <div className="bg-gray-700 rounded-lg p-3 space-y-2">
-      <div className="font-medium text-gray-100 truncate" title={displayName}>
+    <div className="bg-surface-hover rounded-lg p-3 space-y-2">
+      <div className="font-medium text-content truncate" title={displayName}>
         {displayName}
       </div>
-      <div className="flex items-center gap-3 text-xs text-gray-400">
+      <div className="flex items-center gap-3 text-xs text-content-muted">
         <span className="flex items-center gap-1">
           <Camera size={12} />
           {frameSet.frameCount} frames
@@ -50,7 +50,7 @@ function FrameSetCard({
           {formatExposure(frameSet.totalExposureSeconds)}
         </span>
         {frameSet.filters.length > 0 && (
-          <span className="text-gray-500">
+          <span className="text-content-muted">
             {frameSet.filters.filter(f => f).join(', ')}
           </span>
         )}
@@ -58,7 +58,7 @@ function FrameSetCard({
       <div className="flex items-center gap-2 pt-1">
         <button
           onClick={onDetails}
-          className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-medium transition-colors"
+          className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 bg-accent hover:bg-accent-hover text-surface rounded text-xs font-medium transition-colors"
         >
           <Eye size={12} />
           Details
@@ -69,8 +69,8 @@ function FrameSetCard({
           className={`
             flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs font-medium transition-colors
             ${hasCoordinates
-              ? 'bg-gray-600 hover:bg-gray-500 text-white'
-              : 'bg-gray-600 text-gray-400 cursor-not-allowed'}
+              ? 'bg-surface-hover hover:brightness-110 text-content'
+              : 'bg-surface-hover text-content-muted cursor-not-allowed'}
           `}
           title={hasCoordinates ? 'Show in SkyAtlas' : 'No coordinates available'}
         >
@@ -95,12 +95,12 @@ function UnorganizedCard({
   const displayName = group.objectName || 'Unlocated Frames';
 
   return (
-    <div className="bg-gray-700/50 rounded-lg p-3 space-y-2 border border-yellow-500/20">
-      <div className="font-medium text-gray-200 truncate flex items-center gap-2" title={displayName}>
-        <span className="w-2 h-2 rounded-full bg-yellow-500" />
+    <div className="bg-surface-hover/50 rounded-lg p-3 space-y-2 border border-warning/20">
+      <div className="font-medium text-content truncate flex items-center gap-2" title={displayName}>
+        <span className="w-2 h-2 rounded-full bg-warning" />
         {displayName}
       </div>
-      <div className="flex items-center gap-3 text-xs text-gray-400">
+      <div className="flex items-center gap-3 text-xs text-content-muted">
         <span className="flex items-center gap-1">
           <Camera size={12} />
           {group.frameCount} frames
@@ -113,7 +113,7 @@ function UnorganizedCard({
       <div className="pt-1 space-y-2">
         <button
           onClick={onCreateFrameset}
-          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-green-600 hover:bg-green-500 text-white rounded text-xs font-medium transition-colors"
+          className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-success hover:brightness-110 text-white rounded text-xs font-medium transition-colors"
         >
           <Plus size={12} />
           Create Frame Set
@@ -121,7 +121,7 @@ function UnorganizedCard({
         {hasCoordinates && (
           <button
             onClick={onSkyAtlas}
-            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-gray-600 hover:bg-gray-500 text-white rounded text-xs font-medium transition-colors"
+            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface-hover hover:brightness-110 text-content rounded text-xs font-medium transition-colors"
           >
             <Map size={12} />
             Show in SkyAtlas
@@ -176,7 +176,7 @@ export function CalendarEventPanel({
   // Empty state - no day selected
   if (!selectedDate || !events) {
     return (
-      <div className="h-full bg-gray-800 rounded-lg border border-gray-700 flex flex-col items-center justify-center text-gray-500 p-6">
+      <div className="h-full bg-surface-elevated rounded-lg border border-border flex flex-col items-center justify-center text-content-muted p-6">
         <Calendar size={48} className="mb-4 opacity-50" />
         <p className="text-center">Select a day to view details</p>
       </div>
@@ -186,10 +186,10 @@ export function CalendarEventPanel({
   const displayDate = format(parseISO(selectedDate), 'EEEE, MMMM d, yyyy');
 
   return (
-    <div className="h-full bg-gray-800 rounded-lg border border-gray-700 flex flex-col overflow-hidden">
+    <div className="h-full bg-surface-elevated rounded-lg border border-border flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 bg-gray-800 border-b border-gray-700 p-4">
-        <h4 className="font-semibold text-gray-100">{displayDate}</h4>
+      <div className="flex-shrink-0 bg-surface-elevated border-b border-border p-4">
+        <h4 className="font-semibold text-content">{displayDate}</h4>
       </div>
 
       {/* Scrollable content */}
@@ -197,7 +197,7 @@ export function CalendarEventPanel({
         {/* Frame Sets Section */}
         {events.frameSets.length > 0 && (
           <div className="space-y-2">
-            <h5 className="text-xs font-medium text-gray-400 uppercase tracking-wide">
+            <h5 className="text-xs font-medium text-content-muted uppercase tracking-wide">
               Frame Sets
             </h5>
             <div className="space-y-2">
@@ -220,7 +220,7 @@ export function CalendarEventPanel({
         {/* Unorganized Section */}
         {events.unorganizedGroups.length > 0 && (
           <div className="space-y-2">
-            <h5 className="text-xs font-medium text-gray-400 uppercase tracking-wide">
+            <h5 className="text-xs font-medium text-content-muted uppercase tracking-wide">
               Unorganized
             </h5>
             <div className="space-y-2">
@@ -246,21 +246,21 @@ export function CalendarEventPanel({
         )}
 
         {/* Summary */}
-        <div className="pt-2 border-t border-gray-700 text-xs text-gray-400">
+        <div className="pt-2 border-t border-border text-xs text-content-muted">
           Total: {events.totalFrameCount} frames | {formatExposure(events.totalExposureSeconds)}
         </div>
       </div>
 
       {/* Frame Set Creation Form */}
       {creatingFromGroup && (
-        <div className="flex-shrink-0 p-4 bg-gray-900 border-t border-gray-700">
+        <div className="flex-shrink-0 p-4 bg-surface border-t border-border">
           {createSuccess ? (
-            <div className="text-center text-green-400 py-2">
+            <div className="text-center text-success py-2">
               Frame set created successfully!
             </div>
           ) : (
             <>
-              <h5 className="text-sm font-medium text-gray-200 mb-2">
+              <h5 className="text-sm font-medium text-content mb-2">
                 Create Frame Set from {creatingFromGroup.frameCount} frames
               </h5>
               <input
@@ -273,11 +273,11 @@ export function CalendarEventPanel({
                   }
                 }}
                 placeholder="Enter frame set name..."
-                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500 mb-2"
+                className="w-full px-3 py-2 bg-surface-hover border border-border rounded text-sm text-content focus:outline-none focus:ring-1 focus:ring-accent mb-2"
                 autoFocus
               />
               {createError && (
-                <p className="text-red-400 text-xs mb-2">{createError}</p>
+                <p className="text-error text-xs mb-2">{createError}</p>
               )}
               <div className="flex gap-2">
                 <button
@@ -286,14 +286,14 @@ export function CalendarEventPanel({
                     setFrameSetName('');
                     setCreateError(null);
                   }}
-                  className="flex-1 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded text-sm transition-colors"
+                  className="flex-1 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover text-content rounded text-sm transition-colors"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={handleCreateFrameset}
                   disabled={!frameSetName.trim() || isCreating}
-                  className="flex-1 px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
+                  className="flex-1 px-3 py-1.5 bg-success hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
                 >
                   {isCreating ? 'Creating...' : 'Create'}
                 </button>

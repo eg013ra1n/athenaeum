@@ -16,19 +16,19 @@ interface CalibrationSetCardProps {
 
 const typeStyles: Record<CalibrationType, { bg: string; border: string; header: string }> = {
   flat: {
-    bg: 'bg-blue-900/25',
-    border: 'border-blue-600/50',
-    header: 'text-blue-300',
+    bg: 'bg-info-muted',
+    border: 'border-info/50',
+    header: 'text-info',
   },
   dark: {
-    bg: 'bg-violet-900/25',
-    border: 'border-violet-600/50',
-    header: 'text-violet-300',
+    bg: 'bg-purple/25',
+    border: 'border-purple/50',
+    header: 'text-purple',
   },
   bias: {
-    bg: 'bg-emerald-900/25',
-    border: 'border-emerald-600/50',
-    header: 'text-emerald-300',
+    bg: 'bg-success-muted',
+    border: 'border-success/50',
+    header: 'text-success',
   },
 };
 
@@ -79,8 +79,8 @@ interface PropertyRowProps {
 function PropertyRow({ label, value, highlight = false }: PropertyRowProps) {
   return (
     <div className="flex items-baseline gap-1">
-      <dt className="text-xs text-gray-400">{label}:</dt>
-      <dd className={`text-sm font-medium ${highlight ? 'text-amber-300' : 'text-gray-100'}`}>
+      <dt className="text-xs text-content-muted">{label}:</dt>
+      <dd className={`text-sm font-medium ${highlight ? 'text-warning' : 'text-content'}`}>
         {value}
       </dd>
     </div>
@@ -93,9 +93,9 @@ function PropertyRow({ label, value, highlight = false }: PropertyRowProps) {
  */
 function SubCalibrationCard({ sub }: { sub: SubCalibrationDetail }) {
   const subTypeStyles: Record<string, string> = {
-    Dark: 'bg-violet-900/30 border-violet-700/40',
-    DarkFlat: 'bg-indigo-900/30 border-indigo-700/40',
-    Bias: 'bg-emerald-900/30 border-emerald-700/40',
+    Dark: 'bg-purple/20 border-purple/40',
+    DarkFlat: 'bg-info-muted border-info/40',
+    Bias: 'bg-success-muted border-success/40',
   };
 
   const hasWarning = sub.temp_warning || sub.date_warning;
@@ -105,35 +105,35 @@ function SubCalibrationCard({ sub }: { sub: SubCalibrationDetail }) {
 
   return (
     <div
-      className={`border rounded-lg p-2 ${subTypeStyles[sub.calibration_type] || 'bg-gray-800/30 border-gray-700/40'}`}
+      className={`border rounded-lg p-2 ${subTypeStyles[sub.calibration_type] || 'bg-surface-elevated/30 border-border/40'}`}
     >
       <div className="flex items-center justify-between mb-1">
         <div className="flex items-center gap-1.5">
-          <span className="text-xs font-semibold text-gray-200">{sub.calibration_type}</span>
+          <span className="text-xs font-semibold text-content">{sub.calibration_type}</span>
           {sub.set.id !== null && (
-            <span className="text-xs text-gray-500">#{sub.set.id}</span>
+            <span className="text-xs text-content-muted">#{sub.set.id}</span>
           )}
         </div>
-        <span className="text-xs text-gray-400">{sub.set.frame_count} frames</span>
+        <span className="text-xs text-content-muted">{sub.set.frame_count} frames</span>
       </div>
 
       {hasWarning && (
         <div className="flex items-start gap-1.5 mb-1 text-xs">
-          <AlertTriangle size={12} className="text-amber-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
-          <span className="text-amber-300">{warningParts.join(', ')}</span>
+          <AlertTriangle size={12} className="text-warning flex-shrink-0 mt-0.5" aria-hidden="true" />
+          <span className="text-warning">{warningParts.join(', ')}</span>
         </div>
       )}
 
       <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs">
         <div>
-          <span className="text-gray-400">Temp:</span>{' '}
-          <span className={sub.temp_warning ? 'text-amber-300 font-medium' : 'text-gray-200'}>
+          <span className="text-content-muted">Temp:</span>{' '}
+          <span className={sub.temp_warning ? 'text-warning font-medium' : 'text-content'}>
             {formatTemp(sub.set.ccd_temp)}
           </span>
         </div>
         <div>
-          <span className="text-gray-400">Date:</span>{' '}
-          <span className={sub.date_warning ? 'text-amber-300 font-medium' : 'text-gray-200'}>
+          <span className="text-content-muted">Date:</span>{' '}
+          <span className={sub.date_warning ? 'text-warning font-medium' : 'text-content'}>
             {formatDate(sub.set.date_start)}
           </span>
         </div>
@@ -169,7 +169,7 @@ export function CalibrationSetCard({ type, data, onEditSubCalibration }: Calibra
             {getCardTitle(type, set)}
           </h4>
           {set.id !== null && (
-            <span className="text-xs text-gray-500">#{set.id}</span>
+            <span className="text-xs text-content-muted">#{set.id}</span>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -179,14 +179,14 @@ export function CalibrationSetCard({ type, data, onEditSubCalibration }: Calibra
                 e.stopPropagation();
                 onEditSubCalibration(set.id!, type);
               }}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-gray-200 hover:bg-gray-700/50 rounded transition-colors"
+              className="flex items-center gap-1 px-2 py-1 text-xs text-content-muted hover:text-content hover:bg-surface-hover/50 rounded transition-colors"
               title="Edit sub-calibration"
             >
               <Settings size={12} />
               <span>Edit</span>
             </button>
           )}
-          <span className="text-xs text-gray-300">
+          <span className="text-xs text-content-secondary">
             {frame_count} light{frame_count !== 1 ? 's' : ''}
           </span>
         </div>
@@ -194,11 +194,11 @@ export function CalibrationSetCard({ type, data, onEditSubCalibration }: Calibra
 
       {/* Warnings */}
       {warnings.length > 0 && (
-        <div className="mb-2 p-2 bg-amber-900/20 rounded-lg border border-amber-700/50">
+        <div className="mb-2 p-2 bg-warning-muted rounded-lg border border-warning/50">
           {warnings.map((w, i) => (
             <div key={i} className="flex items-start gap-1.5 text-xs">
-              <AlertTriangle size={14} className="text-amber-400 flex-shrink-0 mt-0.5" aria-hidden="true" />
-              <span className="text-amber-200">{w.message}</span>
+              <AlertTriangle size={14} className="text-warning flex-shrink-0 mt-0.5" aria-hidden="true" />
+              <span className="text-warning">{w.message}</span>
             </div>
           ))}
         </div>
@@ -229,8 +229,8 @@ export function CalibrationSetCard({ type, data, onEditSubCalibration }: Calibra
 
       {/* Sub-calibration Section */}
       {sub_calibration && sub_calibration.length > 0 && (
-        <div className="mt-3 pt-3 border-t border-gray-600/50">
-          <h5 className="text-xs font-semibold text-gray-300 mb-2">Sub-calibration</h5>
+        <div className="mt-3 pt-3 border-t border-border/50">
+          <h5 className="text-xs font-semibold text-content-secondary mb-2">Sub-calibration</h5>
           <div className="space-y-1.5">
             {sub_calibration.map((sub, i) => (
               <SubCalibrationCard key={i} sub={sub} />
@@ -260,7 +260,7 @@ export function EmptyCalibrationCard({ type }: { type: CalibrationType }) {
       <span className={`text-base font-semibold ${styles.header} opacity-60`}>
         No {labels[type]}
       </span>
-      <span className="text-xs text-gray-400 mt-0.5">Not linked</span>
+      <span className="text-xs text-content-muted mt-0.5">Not linked</span>
     </div>
   );
 }

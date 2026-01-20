@@ -37,37 +37,37 @@ export function ExportProgress({ progress }: ExportProgressProps) {
   const isFailed = progress.stage === 'failed';
 
   return (
-    <div className="p-4 bg-gray-800 rounded-lg border border-gray-700">
+    <div className="p-4 bg-surface-elevated rounded-lg border border-border">
       <div className="flex items-center gap-3 mb-3">
         {isComplete ? (
-          <Check className="text-green-500" size={24} />
+          <Check className="text-success" size={24} />
         ) : isFailed ? (
-          <X className="text-red-500" size={24} />
+          <X className="text-error" size={24} />
         ) : (
-          <Loader2 className="animate-spin text-blue-500" size={24} />
+          <Loader2 className="animate-spin text-accent" size={24} />
         )}
         <div>
           <div className="font-medium">{getStageLabel(progress.stage)}</div>
-          <div className="text-sm text-gray-400">{progress.message}</div>
+          <div className="text-sm text-content-muted">{progress.message}</div>
         </div>
       </div>
 
       {!isComplete && !isFailed && (
         <>
-          <div className="w-full bg-gray-700 rounded-full h-2 mb-2">
+          <div className="w-full bg-surface-hover rounded-full h-2 mb-2">
             <div
-              className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+              className="bg-accent h-2 rounded-full transition-all duration-300"
               style={{ width: `${progress.progress}%` }}
             />
           </div>
-          <div className="text-sm text-gray-400 text-right">
+          <div className="text-sm text-content-muted text-right">
             {progress.progress.toFixed(0)}%
           </div>
         </>
       )}
 
       {progress.currentFile && (
-        <div className="mt-2 text-sm text-gray-500 truncate">
+        <div className="mt-2 text-sm text-content-muted truncate">
           Processing: {progress.currentFile}
         </div>
       )}

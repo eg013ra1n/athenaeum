@@ -113,7 +113,7 @@ export default function ShootCalendar() {
       {/* Header */}
       <div className="flex-shrink-0 mb-4">
         <h2 className="text-3xl font-bold mb-2">Shoot Calendar</h2>
-        <p className="text-gray-400">
+        <p className="text-content-muted">
           Browse captures by date with equipment and target information
         </p>
       </div>
@@ -135,18 +135,18 @@ export default function ShootCalendar() {
       {/* Loading state */}
       {loading && (
         <div className="flex items-center justify-center py-20">
-          <Loader2 className="h-8 w-8 animate-spin text-blue-500" />
-          <span className="ml-3 text-gray-400">Loading calendar...</span>
+          <Loader2 className="h-8 w-8 animate-spin text-accent" />
+          <span className="ml-3 text-content-muted">Loading calendar...</span>
         </div>
       )}
 
       {/* Error state */}
       {error && (
-        <div className="bg-red-900/20 border border-red-500/50 rounded-lg p-4 flex items-center gap-3">
-          <AlertCircle className="text-red-500 flex-shrink-0" />
+        <div className="bg-error-muted border border-error/50 rounded-lg p-4 flex items-center gap-3">
+          <AlertCircle className="text-error flex-shrink-0" />
           <div>
-            <p className="text-red-400 font-medium">Failed to load calendar</p>
-            <p className="text-red-400/70 text-sm">{error}</p>
+            <p className="text-error font-medium">Failed to load calendar</p>
+            <p className="text-error/70 text-sm">{error}</p>
           </div>
         </div>
       )}
@@ -169,13 +169,13 @@ export default function ShootCalendar() {
                 </div>
 
                 {/* Legend */}
-                <div className="flex-shrink-0 mt-4 flex items-center gap-6 text-sm text-gray-400">
+                <div className="flex-shrink-0 mt-4 flex items-center gap-6 text-sm text-content-muted">
                   <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-blue-500" />
+                    <span className="w-3 h-3 rounded-full bg-accent" />
                     <span>Frame sets</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-yellow-500" />
+                    <span className="w-3 h-3 rounded-full bg-warning" />
                     <span>Unorganized frames</span>
                   </div>
                 </div>
@@ -191,13 +191,13 @@ export default function ShootCalendar() {
                 )}
 
                 {/* Legend for year view */}
-                <div className="flex-shrink-0 mt-4 flex items-center gap-6 text-sm text-gray-400">
+                <div className="flex-shrink-0 mt-4 flex items-center gap-6 text-sm text-content-muted">
                   <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-blue-500" />
+                    <span className="w-3 h-3 rounded-full bg-accent" />
                     <span>Frame sets</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-yellow-500" />
+                    <span className="w-3 h-3 rounded-full bg-warning" />
                     <span>Unorganized frames</span>
                   </div>
                 </div>

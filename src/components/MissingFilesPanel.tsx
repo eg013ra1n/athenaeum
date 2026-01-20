@@ -163,7 +163,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
 
   if (missingFiles.length === 0) {
     return (
-      <div className="flex items-center gap-2 p-3 bg-green-900/20 border border-green-700 rounded-lg text-green-400">
+      <div className="flex items-center gap-2 p-3 bg-success-muted border border-success/50 rounded-lg text-success">
         <CheckCircle2 size={16} />
         <span className="text-sm">All files present</span>
       </div>
@@ -171,15 +171,15 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
   }
 
   return (
-    <div className="border border-orange-700/50 rounded-lg bg-orange-900/10 overflow-hidden">
+    <div className="border border-orange/50 rounded-lg bg-orange/10 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between p-3 bg-orange-900/20 border-b border-orange-700/50">
+      <div className="flex items-center justify-between p-3 bg-orange/20 border-b border-orange/50">
         <div className="flex items-center gap-2">
-          <AlertTriangle className="text-orange-400" size={18} />
-          <span className="font-medium text-orange-400">
+          <AlertTriangle className="text-orange" size={18} />
+          <span className="font-medium text-orange">
             {activeMissing.length} Missing File{activeMissing.length !== 1 ? 's' : ''}
             {ignoredFiles.length > 0 && (
-              <span className="text-gray-400 font-normal ml-2">
+              <span className="text-content-muted font-normal ml-2">
                 ({ignoredFiles.length} ignored)
               </span>
             )}
@@ -188,7 +188,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
         <button
           onClick={handleRecheckAll}
           disabled={isRechecking}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-orange-600 hover:bg-orange-700 disabled:opacity-50 rounded-lg transition"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-orange hover:brightness-90 disabled:opacity-50 rounded-lg transition"
         >
           {isRechecking ? (
             <Loader2 className="animate-spin" size={14} />
@@ -203,7 +203,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       {activeMissing.length > 0 && (
         <div className="max-h-64 overflow-y-auto">
           <table className="w-full text-sm">
-            <thead className="bg-gray-800/50 sticky top-0">
+            <thead className="bg-surface-elevated/50 sticky top-0">
               <tr>
                 <th className="w-8 p-2">
                   <input
@@ -213,16 +213,16 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                     className="rounded"
                   />
                 </th>
-                <th className="text-left p-2 font-medium text-gray-400">File</th>
-                <th className="text-left p-2 font-medium text-gray-400">Object</th>
-                <th className="text-left p-2 font-medium text-gray-400">Size</th>
-                <th className="text-left p-2 font-medium text-gray-400">Detected</th>
+                <th className="text-left p-2 font-medium text-content-muted">File</th>
+                <th className="text-left p-2 font-medium text-content-muted">Object</th>
+                <th className="text-left p-2 font-medium text-content-muted">Size</th>
+                <th className="text-left p-2 font-medium text-content-muted">Detected</th>
                 <th className="w-32 p-2"></th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-700/50">
+            <tbody className="divide-y divide-border/50">
               {activeMissing.map((file) => (
-                <tr key={file.file_id} className="hover:bg-gray-800/30">
+                <tr key={file.file_id} className="hover:bg-surface-elevated/30">
                   <td className="p-2">
                     <input
                       type="checkbox"
@@ -232,17 +232,17 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                     />
                   </td>
                   <td className="p-2">
-                    <div className="font-mono text-xs text-gray-300 truncate max-w-xs" title={file.path}>
+                    <div className="font-mono text-xs text-content-secondary truncate max-w-xs" title={file.path}>
                       {file.filename}
                     </div>
                   </td>
-                  <td className="p-2 text-gray-400">
+                  <td className="p-2 text-content-muted">
                     {file.object || '-'}
                   </td>
-                  <td className="p-2 text-gray-400">
+                  <td className="p-2 text-content-muted">
                     {formatSize(file.size)}
                   </td>
-                  <td className="p-2 text-gray-400">
+                  <td className="p-2 text-content-muted">
                     {formatDate(file.detected_at)}
                   </td>
                   <td className="p-2">
@@ -250,7 +250,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                       <button
                         onClick={() => handleLocate(file)}
                         disabled={actionInProgress === file.file_id}
-                        className="p-1.5 hover:bg-blue-600/30 rounded text-blue-400 transition"
+                        className="p-1.5 hover:bg-accent/30 rounded text-accent transition"
                         title="Locate file"
                       >
                         <FolderSearch size={14} />
@@ -258,7 +258,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                       <button
                         onClick={() => handleIgnore(file.file_id)}
                         disabled={actionInProgress === file.file_id}
-                        className="p-1.5 hover:bg-gray-600/30 rounded text-gray-400 transition"
+                        className="p-1.5 hover:bg-surface-hover/30 rounded text-content-muted transition"
                         title="Ignore"
                       >
                         <EyeOff size={14} />
@@ -266,7 +266,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                       <button
                         onClick={() => handleDelete(file.file_id)}
                         disabled={actionInProgress === file.file_id}
-                        className="p-1.5 hover:bg-red-600/30 rounded text-red-400 transition"
+                        className="p-1.5 hover:bg-error/30 rounded text-error transition"
                         title="Delete from database"
                       >
                         <Trash2 size={14} />
@@ -282,25 +282,25 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
 
       {/* Ignored files section */}
       {ignoredFiles.length > 0 && (
-        <div className="border-t border-gray-700/50">
+        <div className="border-t border-border/50">
           <details className="group">
-            <summary className="flex items-center gap-2 p-3 cursor-pointer text-gray-400 hover:text-gray-300">
+            <summary className="flex items-center gap-2 p-3 cursor-pointer text-content-muted hover:text-content-secondary">
               <EyeOff size={14} />
               <span className="text-sm">{ignoredFiles.length} ignored file{ignoredFiles.length !== 1 ? 's' : ''}</span>
             </summary>
-            <div className="max-h-32 overflow-y-auto border-t border-gray-700/30">
+            <div className="max-h-32 overflow-y-auto border-t border-border/30">
               {ignoredFiles.map((file) => (
                 <div
                   key={file.file_id}
-                  className="flex items-center justify-between p-2 px-3 hover:bg-gray-800/30 text-sm"
+                  className="flex items-center justify-between p-2 px-3 hover:bg-surface-elevated/30 text-sm"
                 >
-                  <span className="font-mono text-xs text-gray-500 truncate flex-1" title={file.path}>
+                  <span className="font-mono text-xs text-content-muted truncate flex-1" title={file.path}>
                     {file.filename}
                   </span>
                   <button
                     onClick={() => handleUnignore(file.file_id)}
                     disabled={actionInProgress === file.file_id}
-                    className="flex items-center gap-1 px-2 py-1 text-xs text-gray-400 hover:text-gray-300 hover:bg-gray-700 rounded transition"
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-content-muted hover:text-content-secondary hover:bg-surface-hover rounded transition"
                   >
                     <Eye size={12} />
                     Unignore
@@ -314,14 +314,14 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
 
       {/* Bulk actions */}
       {selectedIds.size > 0 && (
-        <div className="flex items-center gap-2 p-3 bg-gray-800/50 border-t border-gray-700/50">
-          <span className="text-sm text-gray-400">
+        <div className="flex items-center gap-2 p-3 bg-surface-elevated/50 border-t border-border/50">
+          <span className="text-sm text-content-muted">
             {selectedIds.size} selected
           </span>
           <div className="flex-1" />
           <button
             onClick={handleIgnoreSelected}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-gray-300 hover:bg-gray-700 rounded-lg transition"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover rounded-lg transition"
           >
             <EyeOff size={14} />
             Ignore
@@ -329,7 +329,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
           <button
             onClick={handleDeleteSelected}
             disabled={isDeleting}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-red-400 hover:bg-red-900/30 rounded-lg transition"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-error hover:bg-error-muted rounded-lg transition"
           >
             {isDeleting ? (
               <Loader2 className="animate-spin" size={14} />

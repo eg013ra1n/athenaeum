@@ -30,18 +30,18 @@ export function ExportModeSelector({ value, onChange }: ExportModeSelectorProps)
           onClick={() => onChange(mode)}
           className={`w-full text-left p-3 rounded-lg border transition-colors flex items-start gap-3 ${
             value === mode
-              ? 'bg-blue-600/20 border-blue-500'
-              : 'bg-gray-700/50 border-gray-600 hover:bg-gray-700 hover:border-gray-500'
+              ? 'bg-accent/20 border-accent'
+              : 'bg-surface-hover/50 border-border hover:bg-surface-hover hover:border-content-muted'
           }`}
         >
-          <div className={`mt-0.5 ${value === mode ? 'text-blue-400' : 'text-gray-400'}`}>
+          <div className={`mt-0.5 ${value === mode ? 'text-accent' : 'text-content-muted'}`}>
             {icon}
           </div>
           <div className="flex-1">
             <div className="font-medium">{label}</div>
-            <div className="text-sm text-gray-400 mt-0.5">{description}</div>
+            <div className="text-sm text-content-muted mt-0.5">{description}</div>
           </div>
-          {value === mode && <div className="w-4 h-4 rounded-full bg-blue-500 mt-1" />}
+          {value === mode && <div className="w-4 h-4 rounded-full bg-accent mt-1" />}
         </button>
       ))}
     </div>

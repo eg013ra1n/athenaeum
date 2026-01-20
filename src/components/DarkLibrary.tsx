@@ -170,7 +170,7 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
         <div className="mb-6">
           <button
             onClick={onClose}
-            className="flex items-center gap-2 text-gray-400 hover:text-gray-200 mb-4 transition-colors"
+            className="flex items-center gap-2 text-content-muted hover:text-content mb-4 transition-colors"
           >
             <ArrowLeft size={20} />
             Back to Equipment
@@ -178,29 +178,29 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
 
           <div>
             <h2 className="text-3xl font-bold mb-2">Dark Library</h2>
-            <p className="text-gray-400">{instrume}</p>
+            <p className="text-content-muted">{instrume}</p>
           </div>
         </div>
       )}
 
       {/* Error Message */}
       {error && (
-        <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-4">
-          <p className="text-red-400">{error}</p>
+        <div className="bg-error-muted border border-error/50 rounded-lg p-4 mb-4">
+          <p className="text-error">{error}</p>
         </div>
       )}
 
       {/* Loading */}
       {loading && (
-        <div className="text-center py-12 text-gray-400">
+        <div className="text-center py-12 text-content-muted">
           Loading dark library...
         </div>
       )}
 
       {/* Empty state */}
       {!loading && sets.length === 0 && (
-        <div className="bg-gray-800 rounded-lg p-12 text-center">
-          <p className="text-gray-400">
+        <div className="bg-surface-elevated rounded-lg p-12 text-center">
+          <p className="text-content-muted">
             No calibration sets found. Use the Refresh button above to scan for calibration frames.
           </p>
         </div>
@@ -213,7 +213,7 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
           <DarkLibraryFilters sets={tabFilteredSets} filters={filters} onFilterChange={handleFilterChange} mode={filterMode} />
 
           {/* Result count */}
-          <div className="mb-4 text-sm text-gray-400">
+          <div className="mb-4 text-sm text-content-muted">
             Showing {filteredSets.length} of {tabFilteredSets.length} calibration sets
           </div>
 
@@ -225,13 +225,13 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
               onEditSubCalibration={handleEditSubCalibration}
             />
           ) : (
-            <div className="text-center py-12 bg-gray-800 rounded-lg">
-              <p className="text-gray-400 mb-4">
+            <div className="text-center py-12 bg-surface-elevated rounded-lg">
+              <p className="text-content-muted mb-4">
                 No calibration sets match your filters
               </p>
               <button
                 onClick={() => setFilters(emptyFilters)}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors"
+                className="px-4 py-2 bg-surface-hover hover:bg-surface-hover text-white rounded-md transition-colors"
               >
                 Clear Filters
               </button>

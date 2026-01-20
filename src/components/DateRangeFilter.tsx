@@ -52,11 +52,11 @@ function ComboBox({ value, onChange, options, placeholder, width, maxLength }: C
         onClick={() => setIsOpen(!isOpen)}
         placeholder={placeholder}
         maxLength={maxLength}
-        className={`${width} px-1 py-1 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 text-center focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer`}
+        className={`${width} px-1 py-1 bg-surface-hover border border-border rounded text-sm text-content text-center focus:outline-none focus:ring-1 focus:ring-accent cursor-pointer`}
       />
       {isOpen && (
         <div
-          className="fixed max-h-40 overflow-y-auto bg-gray-800 border border-gray-600 rounded shadow-xl"
+          className="fixed max-h-40 overflow-y-auto bg-surface-elevated border border-border rounded shadow-xl"
           style={{ zIndex: 9999 }}
           ref={(el) => {
             if (el && containerRef.current) {
@@ -75,8 +75,8 @@ function ComboBox({ value, onChange, options, placeholder, width, maxLength }: C
                 onChange(opt);
                 setIsOpen(false);
               }}
-              className={`w-full py-1 text-center text-sm hover:bg-gray-600 ${
-                value === opt ? 'bg-blue-600 text-white' : 'text-gray-100'
+              className={`w-full py-1 text-center text-sm hover:bg-surface-hover ${
+                value === opt ? 'bg-accent text-white' : 'text-content'
               }`}
             >
               {opt}
@@ -126,7 +126,7 @@ export function DateInputGroup({ value, onChange, years }: DateInputGroupProps) 
         maxLength={2}
       />
 
-      <span className="text-gray-500 px-0.5">/</span>
+      <span className="text-content-muted px-0.5">/</span>
 
       <ComboBox
         value={month}
@@ -137,7 +137,7 @@ export function DateInputGroup({ value, onChange, years }: DateInputGroupProps) 
         maxLength={2}
       />
 
-      <span className="text-gray-500 px-0.5">/</span>
+      <span className="text-content-muted px-0.5">/</span>
 
       <ComboBox
         value={year}
@@ -176,7 +176,7 @@ export function DateRangeFilter({
 
   return (
     <div className="flex items-center gap-2">
-      <Calendar size={14} className="text-gray-400 flex-shrink-0" />
+      <Calendar size={14} className="text-content-muted flex-shrink-0" />
 
       <DateInputGroup
         value={dateFrom}
@@ -184,7 +184,7 @@ export function DateRangeFilter({
         years={years}
       />
 
-      <span className="text-gray-500 text-sm">to</span>
+      <span className="text-content-muted text-sm">to</span>
 
       <DateInputGroup
         value={dateTo}
@@ -195,7 +195,7 @@ export function DateRangeFilter({
       {hasFilter && (
         <button
           onClick={clearFilters}
-          className="p-1.5 text-gray-400 hover:text-gray-200 hover:bg-gray-700 rounded transition"
+          className="p-1.5 text-content-muted hover:text-content hover:bg-surface-hover rounded transition"
           title="Clear date filter"
         >
           <X size={16} />

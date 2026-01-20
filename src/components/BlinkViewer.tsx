@@ -699,19 +699,19 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           />
           {/* Zoom indicator */}
           {displayZoom !== 1.0 && (
-            <div className="absolute bottom-4 left-4 bg-gray-900/80 text-white px-3 py-1.5 rounded text-sm font-mono">
+            <div className="absolute bottom-4 left-4 bg-surface/80 text-white px-3 py-1.5 rounded text-sm font-mono">
               {displayZoom < 1
                 ? `${Math.round(displayZoom * 100)}%`
                 : `${displayZoom.toFixed(1)}x`}
             </div>
           )}
           {loadingIndices.has(currentIndex) && (
-            <div className="absolute top-4 right-4 bg-gray-900 bg-opacity-75 rounded-full p-2">
+            <div className="absolute top-4 right-4 bg-surface bg-opacity-75 rounded-full p-2">
               <Loader2 className="animate-spin text-white" size={24} />
             </div>
           )}
           {error && (
-            <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded shadow-lg">
+            <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-error text-white px-4 py-2 rounded shadow-lg">
               {error}
             </div>
           )}
@@ -736,10 +736,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
       {/* Blackhole error notification */}
       {blackholeError && (
-        <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded shadow-lg z-60 flex items-center gap-2">
+        <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-error text-white px-4 py-2 rounded shadow-lg z-60 flex items-center gap-2">
           <AlertTriangle size={18} />
           {blackholeError}
-          <button onClick={() => setBlackholeError(null)} className="ml-2 p-1 hover:bg-red-700 rounded">
+          <button onClick={() => setBlackholeError(null)} className="ml-2 p-1 hover:brightness-90 rounded">
             <X size={16} />
           </button>
         </div>
@@ -748,14 +748,14 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       {/* Blackhole confirmation dialog */}
       {showBlackholeConfirm && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-60">
-          <div className="bg-gray-800 rounded-lg shadow-xl border border-gray-600 p-6 max-w-md w-full mx-4">
+          <div className="bg-surface-elevated rounded-lg shadow-xl border border-border p-6 max-w-md w-full mx-4">
             <div className="flex items-center gap-3 mb-4">
-              <div className="p-2 bg-red-600/20 rounded-full">
-                <Trash2 className="text-red-400" size={24} />
+              <div className="p-2 bg-error/20 rounded-full">
+                <Trash2 className="text-error" size={24} />
               </div>
               <h3 className="text-lg font-semibold text-white">Send to Blackhole?</h3>
             </div>
-            <p className="text-gray-300 mb-6">
+            <p className="text-content-secondary mb-6">
               Are you sure you want to send{" "}
               <span className="font-semibold text-white">{nonBlackholedInSelectionCount} frame{nonBlackholedInSelectionCount !== 1 ? "s" : ""}</span>{" "}
               to the blackhole? This is a soft delete - files can be restored later.
@@ -764,14 +764,14 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               <button
                 onClick={() => setShowBlackholeConfirm(false)}
                 disabled={isBlackholing}
-                className="px-4 py-2 text-gray-300 hover:text-white hover:bg-gray-700 rounded transition-colors disabled:opacity-50"
+                className="px-4 py-2 text-content-secondary hover:text-white hover:bg-surface-hover rounded transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 onClick={handleBlackholeSelected}
                 disabled={isBlackholing}
-                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors disabled:opacity-50"
+                className="flex items-center gap-2 px-4 py-2 bg-error hover:brightness-90 text-white rounded transition-colors disabled:opacity-50"
               >
                 {isBlackholing ? (
                   <><Loader2 className="animate-spin" size={16} />Processing...</>

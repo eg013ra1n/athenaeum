@@ -119,10 +119,10 @@ export function DetailPanel({
   if (!selectedItem || selectedItem.type !== 'filter') {
     return (
       <div
-        className={`bg-gray-800 rounded-xl border border-gray-600 flex items-center justify-center ${className}`}
+        className={`bg-surface-elevated rounded-xl border border-border flex items-center justify-center ${className}`}
       >
         <div className="text-center px-8 py-16">
-          <p className="text-lg text-gray-400">
+          <p className="text-lg text-content-muted">
             Select a filter group from the navigation tree to view calibration details
           </p>
         </div>
@@ -141,16 +141,16 @@ export function DetailPanel({
 
   return (
     <div
-      className={`bg-gray-800 rounded-xl border border-gray-600 overflow-y-auto ${className}`}
+      className={`bg-surface-elevated rounded-xl border border-border overflow-y-auto ${className}`}
     >
       <div className="p-6">
         {/* Header */}
         <header className="flex items-start justify-between gap-4 mb-6">
           <div>
-            <h2 className="text-xl font-bold text-gray-100">
+            <h2 className="text-xl font-bold text-content">
               {filterGroup.filter_display}
             </h2>
-            <p className="text-base text-gray-300 mt-1">
+            <p className="text-base text-content-secondary mt-1">
               {filterGroup.frame_count} light frame{filterGroup.frame_count !== 1 ? 's' : ''}
               {filterGroup.exptime !== null && ` at ${filterGroup.exptime}s`}
             </p>
@@ -163,11 +163,11 @@ export function DetailPanel({
                 className="
                   inline-flex items-center gap-2
                   min-h-[44px] px-4 py-2
-                  bg-blue-600 hover:bg-blue-700
-                  text-white text-sm font-medium
+                  bg-accent hover:bg-accent-hover
+                  text-surface text-sm font-medium
                   rounded-lg
                   transition-colors
-                  focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
+                  focus:outline-none focus-visible:ring-2 focus-visible:ring-accent
                 "
                 title="Open blink viewer for LIGHT frames"
               >
@@ -181,11 +181,11 @@ export function DetailPanel({
               className="
                 inline-flex items-center gap-2
                 min-h-[44px] px-4 py-2
-                bg-gray-700 hover:bg-gray-600
-                text-gray-200 text-sm font-medium
-                rounded-lg border border-gray-600
+                bg-surface-hover hover:bg-surface-hover
+                text-content text-sm font-medium
+                rounded-lg border border-border
                 transition-colors
-                focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
+                focus:outline-none focus-visible:ring-2 focus-visible:ring-accent
               "
             >
               <Settings size={18} aria-hidden="true" />
@@ -203,7 +203,7 @@ export function DetailPanel({
 
         {/* Calibration Sets Section */}
         <section>
-          <h3 className="text-lg font-semibold text-gray-100 mb-4">
+          <h3 className="text-lg font-semibold text-content mb-4">
             Calibration Sets
           </h3>
 

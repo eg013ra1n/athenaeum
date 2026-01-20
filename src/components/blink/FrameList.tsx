@@ -21,24 +21,24 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
   onClearSelection,
 }) {
   return (
-    <div className="w-1/4 bg-gray-900 border-l border-gray-700 flex flex-col">
+    <div className="w-1/4 bg-surface border-l border-border flex flex-col">
       {/* List header with selection controls */}
-      <div className="p-2 border-b border-gray-700">
+      <div className="p-2 border-b border-border">
         <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-gray-400">
+          <h3 className="text-sm font-semibold text-content-muted">
             Frames ({frames.length})
           </h3>
           <div className="flex items-center gap-1">
             <button
               onClick={onSelectAll}
-              className="p-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded transition-colors"
+              className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
               title="Select all (Ctrl+A)"
             >
               <CheckSquare size={16} />
             </button>
             <button
               onClick={onClearSelection}
-              className="p-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded transition-colors"
+              className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
               title="Clear selection"
             >
               <XSquare size={16} />
@@ -58,20 +58,20 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
             // Determine row styling based on state combinations
             let rowClasses = "flex items-center gap-2 px-2 py-2 rounded text-sm cursor-pointer transition-colors";
             if (isBlackholed && isSelected) {
-              // Blackholed + selected: orange/amber tint with yellow ring
-              rowClasses += " bg-orange-900/40 text-orange-200 ring-2 ring-yellow-400 hover:bg-orange-900/50";
+              // Blackholed + selected: orange/amber tint with warning ring
+              rowClasses += " bg-warning-muted text-warning ring-2 ring-warning hover:brightness-110";
             } else if (isBlackholed) {
               // Blackholed only
-              rowClasses += " bg-red-900/30 text-gray-500 hover:bg-red-900/40";
+              rowClasses += " bg-error-muted text-content-muted hover:brightness-110";
             } else if (isCurrent) {
               // Current frame
-              rowClasses += " bg-blue-600 text-white";
+              rowClasses += " bg-accent text-surface";
             } else if (isSelected) {
               // Selected only
-              rowClasses += " bg-yellow-600/30 text-yellow-100 hover:bg-yellow-600/40";
+              rowClasses += " bg-warning-muted text-warning hover:brightness-110";
             } else {
               // Default
-              rowClasses += " bg-gray-800 text-gray-300 hover:bg-gray-700";
+              rowClasses += " bg-surface-elevated text-content-secondary hover:bg-surface-hover";
             }
 
             return (
@@ -84,7 +84,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                 {isBlackholed ? (
                   <button
                     onClick={(e) => onCheckboxClick(index, e)}
-                    className={`flex-shrink-0 p-0.5 rounded transition-colors ${isSelected ? 'text-yellow-400' : 'text-red-400 hover:text-red-300'}`}
+                    className={`flex-shrink-0 p-0.5 rounded transition-colors ${isSelected ? 'text-warning' : 'text-error hover:brightness-110'}`}
                     title={isSelected ? "Click to unselect" : "Click to select"}
                   >
                     {isSelected ? <CheckSquare size={16} /> : <Trash2 size={16} />}
@@ -94,8 +94,8 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                     onClick={(e) => onCheckboxClick(index, e)}
                     className={`flex-shrink-0 p-0.5 rounded transition-colors ${
                       isSelected
-                        ? "text-yellow-400"
-                        : "text-gray-500 hover:text-gray-300"
+                        ? "text-warning"
+                        : "text-content-muted hover:text-content-secondary"
                     }`}
                   >
                     {isSelected ? (
@@ -119,7 +119,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                       <span className="ml-2">{frame.frame.exptime}s</span>
                     )}
                     {isBlackholed && (
-                      <span className="ml-2 text-red-400">(blackholed)</span>
+                      <span className="ml-2 text-error">(blackholed)</span>
                     )}
                   </div>
                 </div>
