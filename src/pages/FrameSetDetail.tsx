@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Clock, MapPin, AlertCircle, Scissors } from 'lucide-react';
+import { ArrowLeft, Clock, MapPin, AlertCircle, Scissors, Play } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -136,6 +136,21 @@ export default function FrameSetDetail() {
     }
     return frameIds;
   }, [calibrationHierarchy, buildFilterKey]);
+
+  // Get all LIGHT frame IDs from the calibration hierarchy
+  const getAllLightFrameIds = useCallback((): number[] => {
+    if (!calibrationHierarchy) return [];
+
+    const frameIds: number[] = [];
+    for (const dateGroup of calibrationHierarchy.date_groups) {
+      for (const cameraGroup of dateGroup.camera_groups) {
+        for (const filterGroup of cameraGroup.filter_groups) {
+          frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
+        }
+      }
+    }
+    return frameIds;
+  }, [calibrationHierarchy]);
 
   // Handle blink from CalibrationHierarchyView - load full frame data
   const handleBlink = useCallback(async (frameIds: number[]) => {
@@ -365,11 +380,22 @@ export default function FrameSetDetail() {
               </div>
             )}
           </div>
-          <CalibrationFinderButton
-            frameSetId={parseInt(id!)}
-            frameSetName={detail.frames_set?.name || 'Untitled'}
-            onComplete={loadData}
-          />
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => handleBlink(getAllLightFrameIds())}
+              disabled={!calibrationHierarchy || getAllLightFrameIds().length === 0}
+              className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition text-sm"
+              title="Blink through all LIGHT frames in this frame set"
+            >
+              <Play size={16} />
+              Blink All
+            </button>
+            <CalibrationFinderButton
+              frameSetId={parseInt(id!)}
+              frameSetName={detail.frames_set?.name || 'Untitled'}
+              onComplete={loadData}
+            />
+          </div>
         </div>
 
         {/* Stats Row */}
@@ -422,6 +448,7 @@ export default function FrameSetDetail() {
             data={calibrationHierarchy}
             onRefresh={refreshCalibrationHierarchy}
             onBlink={handleBlink}
+            onBlinkSelected={handleBlink}
             onSplit={handleOpenSplitDialog}
             onCreateCustomSet={handleOpenCreateDialog}
           />

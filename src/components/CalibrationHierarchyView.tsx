@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Scissors, Plus } from 'lucide-react';
+import { Scissors, Plus, Play } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   CalibrationFilterGroup,
@@ -20,6 +20,8 @@ interface CalibrationHierarchyViewProps {
   onRefresh?: () => void;
   /** Callback when Blink button is clicked with frame IDs */
   onBlink?: (frameIds: number[]) => void;
+  /** Callback when "Blink Selected" is clicked in the action bar with frame IDs from checked filter groups */
+  onBlinkSelected?: (frameIds: number[]) => void;
   /** Callback to open split dialog with selected filter keys */
   onSplit?: (selectedFilterKeys: Set<string>) => void;
   /** Callback to open create custom set dialog with selected filter keys */
@@ -88,6 +90,7 @@ export function CalibrationHierarchyView({
   useBiasForDarkOptimization = false,
   onRefresh,
   onBlink,
+  onBlinkSelected,
   onSplit,
   onCreateCustomSet,
 }: CalibrationHierarchyViewProps) {
@@ -218,6 +221,28 @@ export function CalibrationHierarchyView({
     }
   }, [onCreateCustomSet, checkedFilters]);
 
+  // Handle blink selected button click - collect frame IDs from checked filter groups
+  const handleBlinkSelected = useCallback(() => {
+    if (!onBlinkSelected || checkedFilters.size === 0) return;
+
+    const frameIds: number[] = [];
+    for (const dateGroup of data.date_groups) {
+      for (const cameraGroup of dateGroup.camera_groups) {
+        for (const filterGroup of cameraGroup.filter_groups) {
+          const filterKey = buildFilterKey(filterGroup);
+          const fullKey = `${dateGroup.date}:${cameraGroup.instrume}:${filterKey}`;
+          if (checkedFilters.has(fullKey)) {
+            frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
+          }
+        }
+      }
+    }
+
+    if (frameIds.length > 0) {
+      onBlinkSelected(frameIds);
+    }
+  }, [onBlinkSelected, checkedFilters, data]);
+
   // Open manual calibration modal for a filter group
   const openManualCalibrationModal = useCallback((filterGroup: CalibrationFilterGroup) => {
     const frameIds = filterGroup.light_frames.map((f) => f.frame_id);
@@ -310,30 +335,33 @@ export function CalibrationHierarchyView({
       )}
 
       {/* Bottom Action Bar - visible when in selection mode with items selected */}
-      {selectionMode && checkedFilters.size > 0 && (onSplit || onCreateCustomSet) && (
+      {selectionMode && checkedFilters.size > 0 && (onBlinkSelected || onSplit || onCreateCustomSet) && (
         <div className="mt-3 bg-gray-800/80 rounded-lg p-3 border border-gray-700/50">
           <div className="flex items-center justify-between">
-            <div className="text-sm text-gray-300">
-              <span className="font-medium text-gray-100">{checkedFilters.size}</span>{' '}
-              filter group{checkedFilters.size !== 1 ? 's' : ''} selected
-              <span className="text-gray-500 ml-2">
-                ({selectedFrameCount} frame{selectedFrameCount !== 1 ? 's' : ''})
-              </span>
-            </div>
+            {/* Left side: Action buttons */}
             <div className="flex items-center gap-2">
-              <button
-                onClick={toggleSelectionMode}
-                className="
-                  px-3 py-1.5
-                  text-gray-400 hover:text-gray-200
-                  text-sm
-                  rounded
-                  transition-colors
-                  focus:outline-none focus-visible:ring-1 focus-visible:ring-gray-500
-                "
-              >
-                Cancel
-              </button>
+              {onBlinkSelected && (
+                <>
+                  <button
+                    onClick={handleBlinkSelected}
+                    className="
+                      inline-flex items-center gap-1.5
+                      px-3 py-1.5
+                      bg-teal-600 hover:bg-teal-700
+                      text-white text-sm
+                      rounded
+                      transition-colors
+                      focus:outline-none focus-visible:ring-1 focus-visible:ring-teal-500
+                    "
+                  >
+                    <Play size={14} aria-hidden="true" />
+                    Blink Selected ({selectedFrameCount})
+                  </button>
+                  {(onSplit || onCreateCustomSet) && (
+                    <span className="text-gray-600">|</span>
+                  )}
+                </>
+              )}
               {onSplit && (
                 <button
                   onClick={handleSplit}
@@ -368,6 +396,29 @@ export function CalibrationHierarchyView({
                   Create Set
                 </button>
               )}
+            </div>
+            {/* Right side: Selection info and Cancel */}
+            <div className="flex items-center gap-3">
+              <div className="text-sm text-gray-300">
+                <span className="font-medium text-gray-100">{checkedFilters.size}</span>{' '}
+                group{checkedFilters.size !== 1 ? 's' : ''}
+                <span className="text-gray-500 ml-1">
+                  ({selectedFrameCount} frame{selectedFrameCount !== 1 ? 's' : ''})
+                </span>
+              </div>
+              <button
+                onClick={toggleSelectionMode}
+                className="
+                  px-3 py-1.5
+                  text-gray-400 hover:text-gray-200
+                  text-sm
+                  rounded
+                  transition-colors
+                  focus:outline-none focus-visible:ring-1 focus-visible:ring-gray-500
+                "
+              >
+                Cancel
+              </button>
             </div>
           </div>
         </div>
