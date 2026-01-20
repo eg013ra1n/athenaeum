@@ -6,6 +6,9 @@ export default {
   ],
   theme: {
     extend: {
+      fontFamily: {
+        antiqua: ['"Book Antiqua"', 'Palatino', '"Palatino Linotype"', 'serif'],
+      },
       colors: {
         // Polar Night (backgrounds)
         surface: {

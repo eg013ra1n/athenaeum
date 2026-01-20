@@ -896,7 +896,7 @@ export default function SkyAtlas() {
   return (
     <div className="h-screen w-full flex flex-col bg-surface overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 p-4 border-b border-border bg-surface-elevated">
+      <div className="flex-shrink-0 py-5 px-4 border-b border-border bg-surface-elevated">
         <div className="flex items-center justify-between">
           {/* Left: Title */}
           <h2 className="text-2xl font-bold text-content">Sky Atlas</h2>
