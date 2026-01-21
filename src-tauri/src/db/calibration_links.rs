@@ -1175,7 +1175,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     result
                 } else {
                     // No split needed - single group with all frames
-                    vec![(None, raw_frames.iter().collect())]
+                    // Use the common exptime from first frame (all frames have same exptime)
+                    let common_exptime = raw_frames.first().and_then(|f| f.exptime);
+                    vec![(common_exptime, raw_frames.iter().collect())]
                 };
 
                 // Process each exptime sub-group
@@ -1292,15 +1294,11 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         camera_has_warnings = true;
                     }
 
-                    // Build filter display string - include exptime if split
+                    // Build filter display string - always include exptime when available
                     let base_filter_display = filter.clone().unwrap_or_else(|| "No Filter".to_string());
-                    let filter_display = if should_split {
-                        match group_exptime {
-                            Some(exp) => format!("{} ({}s)", base_filter_display, exp),
-                            None => format!("{} (unknown exp)", base_filter_display),
-                        }
-                    } else {
-                        base_filter_display
+                    let filter_display = match group_exptime {
+                        Some(exp) => format!("{} ({}s)", base_filter_display, exp),
+                        None => base_filter_display,
                     };
 
                     filter_groups.push(CalibrationFilterGroup {
