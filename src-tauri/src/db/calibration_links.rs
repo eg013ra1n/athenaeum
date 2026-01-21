@@ -575,22 +575,32 @@ fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<Calibrat
         let imagetyp_str: String = row.get(1)?;
         let imagetyp = ImageType::from_str(&imagetyp_str).unwrap_or(ImageType::Light);
 
+        // Handle potentially NULL values with defaults
+        // Master calibration sets may have NULL for these columns
+        let ccd_temp: f64 = row.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
+        let temp_min: f64 = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+        let temp_max: f64 = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
+        let date_start: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
+        let date_end: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+        let date_display: String = row.get::<_, Option<String>>(13)?.unwrap_or_default();
+        let frame_count: i64 = row.get::<_, Option<i64>>(14)?.unwrap_or(0);
+
         Ok(CalibrationSetDetail {
             id: Some(row.get(0)?),
             imagetyp,
             exptime: row.get(2)?,
-            ccd_temp: row.get(3)?,
-            temp_min: row.get(4)?,
-            temp_max: row.get(5)?,
+            ccd_temp,
+            temp_min,
+            temp_max,
             gain: row.get(6)?,
             offset: row.get(7)?,
             binning: row.get(8)?,
             instrume: row.get(9)?,
             filter: row.get(10)?,
-            date_start: row.get(11)?,
-            date_end: row.get(12)?,
-            date_display: row.get(13)?,
-            frame_count: row.get(14)?,
+            date_start,
+            date_end,
+            date_display,
+            frame_count,
             is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
         })
     })
