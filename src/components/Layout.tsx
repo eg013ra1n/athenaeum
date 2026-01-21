@@ -22,7 +22,7 @@ export default function Layout() {
         {/* Sidebar Navigation */}
         <aside className="w-64 bg-surface-elevated border-r border-border">
           <div className="p-4 border-b border-border flex items-center gap-3">
-            <img src={Logo} alt="Athenaeum" className="w-12 h-12" />
+            <img src={Logo} alt="Athenaeum" className="w-12" />
             <div>
               <h1 className="text-2xl font-medium text-success font-antiqua tracking-wide">ATHENAEUM</h1>
               <p className="text-xs text-content-muted">Astrophotography Library</p>
