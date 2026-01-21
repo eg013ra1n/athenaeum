@@ -115,7 +115,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
 fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<CalibrationSetDetail> {
     let mut stmt = conn.prepare(
         "SELECT id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
-                binning, instrume, filter, date_start, date_end, date, frame_count
+                binning, instrume, filter, date_start, date_end, date, frame_count, is_master_library
          FROM calibration_set
          WHERE id = ?1"
     )?;
@@ -139,6 +139,7 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
             date_end: row.get(12)?,
             date_display: row.get(13)?,
             frame_count: row.get(14)?,
+            is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
         })
     })?;
 

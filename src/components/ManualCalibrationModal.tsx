@@ -193,6 +193,9 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
             {isCurrent && (
               <span className="text-xs px-2 py-0.5 rounded bg-surface-hover text-content-secondary">Current</span>
             )}
+            {set.is_master && (
+              <span className="text-xs px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-400">Master</span>
+            )}
           </div>
           <div className={`text-sm font-medium ${scoreInfo.color}`}>
             {Math.round(match_score * 100)}% {scoreInfo.label}

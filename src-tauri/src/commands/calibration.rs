@@ -791,26 +791,26 @@ pub async fn get_calibration_sets_for_manual_selection(
     // Get light frame parameters first
     let params = get_light_params_internal(&conn, &frame_ids)?;
 
-    // Get all calibration sets of the specified type
-    let imagetyp = match calibration_type.to_lowercase().as_str() {
-        "flat" => "FLAT",
-        "dark" => "DARK",
-        "bias" => "BIAS",
-        "darkflat" => "DARKFLAT",
+    // Get all calibration sets of the specified type (including masters)
+    let (regular_type, master_type) = match calibration_type.to_lowercase().as_str() {
+        "flat" => ("Flat", "MasterFlat"),
+        "dark" => ("Dark", "MasterDark"),
+        "bias" => ("Bias", "MasterBias"),
+        "darkflat" => ("DarkFlat", "MasterDarkFlat"),
         _ => return Err(format!("Invalid calibration type: {}", calibration_type)),
     };
 
-    // Query all sets of this type
+    // Query all sets of this type (both regular and master)
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
-                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library
          FROM calibration_set cs
-         WHERE UPPER(cs.imagetyp) = ?1
-         ORDER BY cs.date_start DESC"
+         WHERE cs.imagetyp IN (?1, ?2)
+         ORDER BY cs.is_master_library ASC, cs.date_start DESC"
     ).map_err(|e| e.to_string())?;
 
-    let sets_iter = stmt.query_map([imagetyp], |row| {
+    let sets_iter = stmt.query_map([regular_type, master_type], |row| {
         Ok(CalibrationSetDetail {
             id: row.get(0)?,
             imagetyp: ImageType::from_str(row.get::<_, String>(1)?.as_str())
@@ -828,6 +828,7 @@ pub async fn get_calibration_sets_for_manual_selection(
             temp_max: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
             frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
             date_display: "".to_string(),  // Will be calculated
+            is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
         })
     }).map_err(|e| e.to_string())?;
 
@@ -1655,25 +1656,25 @@ pub async fn get_subcalibration_sets_for_manual_selection(
         current_bias_set_id: None,
     };
 
-    // Get target calibration type
-    let imagetyp = match calibration_type.to_lowercase().as_str() {
-        "dark" => "DARK",
-        "darkflat" => "DARKFLAT",
-        "bias" => "BIAS",
+    // Get target calibration type (including masters)
+    let (regular_type, master_type) = match calibration_type.to_lowercase().as_str() {
+        "dark" => ("Dark", "MasterDark"),
+        "darkflat" => ("DarkFlat", "MasterDarkFlat"),
+        "bias" => ("Bias", "MasterBias"),
         _ => return Err(format!("Invalid calibration type for sub-calibration: {}", calibration_type)),
     };
 
-    // Query all sets of this type
+    // Query all sets of this type (both regular and master)
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
-                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library
          FROM calibration_set cs
-         WHERE UPPER(cs.imagetyp) = ?1
-         ORDER BY cs.date_start DESC"
+         WHERE cs.imagetyp IN (?1, ?2)
+         ORDER BY cs.is_master_library ASC, cs.date_start DESC"
     ).map_err(|e| e.to_string())?;
 
-    let sets_iter = stmt.query_map([imagetyp], |row| {
+    let sets_iter = stmt.query_map([regular_type, master_type], |row| {
         Ok(CalibrationSetDetail {
             id: row.get(0)?,
             imagetyp: ImageType::from_str(row.get::<_, String>(1)?.as_str())
@@ -1691,6 +1692,7 @@ pub async fn get_subcalibration_sets_for_manual_selection(
             temp_max: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
             frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
             date_display: "".to_string(),
+            is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
         })
     }).map_err(|e| e.to_string())?;
 

@@ -340,6 +340,7 @@ export interface CalibrationSetDetail {
   date_end: string;
   date_display: string;
   frame_count: number;
+  is_master: boolean;  // True if this is a master calibration set
 }
 
 export interface DarkLibraryResult {

@@ -246,6 +246,7 @@ pub struct CalibrationSetDetail {
     pub date_end: String,        // ISO 8601
     pub date_display: String,    // e.g., "2025-10"
     pub frame_count: i64,
+    pub is_master: bool,         // True if this is a master calibration set
 }
 
 /// Result of dark library creation

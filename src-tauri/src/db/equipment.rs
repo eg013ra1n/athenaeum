@@ -96,6 +96,7 @@ pub fn get_camera_dark_library(
                 date_end,
                 date_display,
                 frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+                is_master: false,  // Regular calibration sets only
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -203,6 +204,7 @@ pub fn get_camera_master_dark_library(
                 date_end,
                 date_display,
                 frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+                is_master: true,  // Master calibration sets
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -283,6 +285,7 @@ pub fn get_camera_master_flat_library(
                 date_end,
                 date_display,
                 frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+                is_master: true,  // Master calibration sets
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
