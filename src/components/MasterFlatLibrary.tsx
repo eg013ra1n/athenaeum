@@ -4,7 +4,6 @@ import { ArrowLeft, Plus, RefreshCw, Pencil } from "lucide-react";
 import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
-import QuickStats from "./QuickStats";
 import { ConfirmDialog } from "./ConfirmDialog";
 import BulkEditMetadataModal from "./BulkEditMetadataModal";
 
@@ -193,28 +192,6 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
         </div>
       )}
 
-      {/* In tab view, show action buttons at the top */}
-      {isTabView && sets.length > 0 && (
-        <div className="mb-4 flex justify-end gap-2">
-          <button
-            onClick={() => setShowBulkEdit(true)}
-            disabled={creating}
-            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <Pencil size={16} />
-            Edit Metadata
-          </button>
-          <button
-            onClick={handleRegenerateLibrary}
-            disabled={creating}
-            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
-            Regenerate Master Library
-          </button>
-        </div>
-      )}
-
       {/* Messages */}
       {error && (
         <div className="bg-error-muted border border-error/50 rounded-lg p-4 mb-4">
@@ -257,10 +234,32 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
       {!loading && sets.length > 0 && (
         <div>
           {/* Filters */}
-          <DarkLibraryFilters sets={sets} filters={filters} onFilterChange={handleFilterChange} mode={filterMode} />
-
-          {/* Quick Stats */}
-          <QuickStats sets={filteredSets} />
+          <DarkLibraryFilters
+            sets={sets}
+            filters={filters}
+            onFilterChange={handleFilterChange}
+            mode={filterMode}
+            actions={isTabView ? (
+              <>
+                <button
+                  onClick={() => setShowBulkEdit(true)}
+                  disabled={creating}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:brightness-110 text-white rounded text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Pencil size={14} />
+                  Edit Metadata
+                </button>
+                <button
+                  onClick={handleRegenerateLibrary}
+                  disabled={creating}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:brightness-110 text-white rounded text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <RefreshCw size={14} className={creating ? "animate-spin" : ""} />
+                  Regenerate
+                </button>
+              </>
+            ) : undefined}
+          />
 
           {/* Result count */}
           <div className="mb-4 text-sm text-content-muted">

@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, ReactNode } from "react";
 import { X } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
 import { DateInputGroup, toISODate, isoToDateParts, generateYears } from './DateRangeFilter';
@@ -21,6 +21,7 @@ interface DarkLibraryFiltersProps {
   filters: FilterState;
   onFilterChange: (filters: FilterState) => void;
   mode: FilterMode;
+  actions?: ReactNode;
 }
 
 export const emptyFilters: FilterState = {
@@ -34,7 +35,7 @@ export const emptyFilters: FilterState = {
   dateTo: null,
 };
 
-export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode }: DarkLibraryFiltersProps) {
+export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode, actions }: DarkLibraryFiltersProps) {
   // Extract unique values from sets
   const uniqueValues = useMemo(() => {
     const types = Array.from(new Set(sets.map(s => s.imagetyp))).sort();
@@ -232,6 +233,13 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
           <X size={14} />
           Clear
         </button>
+      )}
+
+      {/* Actions (pushed to the right) */}
+      {actions && (
+        <div className="ml-auto flex items-center gap-2">
+          {actions}
+        </div>
       )}
     </div>
   );
