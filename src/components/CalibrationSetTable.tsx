@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star } from "lucide-react";
+import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star, Pencil } from "lucide-react";
 import { CalibrationSetDetail, FileWithFrame, ImageType, isMasterType } from "../types/models";
 import { format } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
@@ -10,12 +10,14 @@ interface CalibrationSetTableProps {
   showFilterColumn?: boolean;
   /** Callback to edit sub-calibration for a set (for flat/dark sets only) */
   onEditSubCalibration?: (setId: number, setType: 'flat' | 'dark') => void;
+  /** Set IDs that have custom metadata edits */
+  customMetadataSetIds?: number[];
 }
 
 type SortField = "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
 type SortDirection = "asc" | "desc";
 
-export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration }: CalibrationSetTableProps) {
+export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration, customMetadataSetIds = [] }: CalibrationSetTableProps) {
   const [sortField, setSortField] = useState<SortField>("exptime");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
@@ -220,6 +222,11 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     <div className="flex items-center gap-1">
                       {isMasterType(set.imagetyp) && (
                         <Star size={12} className="text-warning fill-warning" />
+                      )}
+                      {customMetadataSetIds.includes(set.id!) && (
+                        <span title="Custom metadata">
+                          <Pencil size={12} className="text-info" />
+                        </span>
                       )}
                       <span
                         className={`px-2 py-1 rounded text-xs font-medium ${

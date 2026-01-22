@@ -202,10 +202,10 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           />
         )}
         {activeTab === "master-darks" && (
-          <MasterDarkLibrary instrume={instrume} />
+          <MasterDarkLibrary instrume={instrume} isTabView={true} />
         )}
         {activeTab === "master-flats" && (
-          <MasterFlatLibrary instrume={instrume} />
+          <MasterFlatLibrary instrume={instrume} isTabView={true} />
         )}
       </div>
 

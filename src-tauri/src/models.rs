@@ -636,3 +636,30 @@ pub struct CalendarMonthData {
     pub total_frame_count: i32,
     pub total_exposure_seconds: f64,
 }
+
+// ========== Calibration Set Metadata Editing ==========
+
+/// Edits to apply to calibration set metadata (selective fields)
+/// None means don't change that field
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationMetadataEdits {
+    pub ccd_temp: Option<f64>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    pub binning: Option<String>,
+    pub exptime: Option<f64>,
+}
+
+/// Original calibration set metadata values (backed up before editing)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSetOriginals {
+    pub set_id: i64,
+    pub ccd_temp: Option<f64>,
+    pub temp_min: Option<f64>,
+    pub temp_max: Option<f64>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    pub binning: Option<String>,
+    pub exptime: Option<f64>,
+    pub saved_at: String,  // ISO 8601
+}

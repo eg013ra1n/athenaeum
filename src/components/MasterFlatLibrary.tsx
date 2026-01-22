@@ -1,11 +1,12 @@
 import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Plus, RefreshCw } from "lucide-react";
+import { ArrowLeft, Plus, RefreshCw, Pencil } from "lucide-react";
 import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
 import QuickStats from "./QuickStats";
 import { ConfirmDialog } from "./ConfirmDialog";
+import BulkEditMetadataModal from "./BulkEditMetadataModal";
 
 interface MasterFlatLibraryProps {
   instrume: string;
@@ -21,6 +22,8 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [showConfirm, setShowConfirm] = useState(false);
   const [filters, setFilters] = useState<FilterState>(emptyFilters);
+  const [showBulkEdit, setShowBulkEdit] = useState(false);
+  const [customMetadataSetIds, setCustomMetadataSetIds] = useState<number[]>([]);
 
   useEffect(() => {
     checkAndLoadLibrary();
@@ -47,8 +50,13 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
       if (hasLibrary) {
         const result = await invoke<CalibrationSetDetail[]>("get_master_flat_library", { instrume });
         setSets(result);
+
+        // Load custom metadata set IDs
+        const customIds = await invoke<number[]>("get_custom_metadata_set_ids", { instrume });
+        setCustomMetadataSetIds(customIds);
       } else {
         setSets([]);
+        setCustomMetadataSetIds([]);
       }
     } catch (err) {
       setError(err as string);
@@ -162,26 +170,44 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
             </div>
 
             {sets.length > 0 && (
-              <button
-                onClick={handleRegenerateLibrary}
-                disabled={creating}
-                className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
-                Regenerate
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowBulkEdit(true)}
+                  disabled={creating}
+                  className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Pencil size={16} />
+                  Edit Metadata
+                </button>
+                <button
+                  onClick={handleRegenerateLibrary}
+                  disabled={creating}
+                  className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
+                  Regenerate
+                </button>
+              </div>
             )}
           </div>
         </div>
       )}
 
-      {/* In tab view, show regenerate button at the top */}
+      {/* In tab view, show action buttons at the top */}
       {isTabView && sets.length > 0 && (
-        <div className="mb-4 flex justify-end">
+        <div className="mb-4 flex justify-end gap-2">
+          <button
+            onClick={() => setShowBulkEdit(true)}
+            disabled={creating}
+            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Pencil size={16} />
+            Edit Metadata
+          </button>
           <button
             onClick={handleRegenerateLibrary}
             disabled={creating}
-            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
             Regenerate Master Library
@@ -243,7 +269,7 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
 
           {/* Table */}
           {filteredSets.length > 0 ? (
-            <CalibrationSetTable sets={filteredSets} />
+            <CalibrationSetTable sets={filteredSets} customMetadataSetIds={customMetadataSetIds} />
           ) : (
             <div className="text-center py-12 bg-surface-elevated rounded-lg">
               <p className="text-content-muted mb-4">
@@ -264,9 +290,22 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
       <ConfirmDialog
         isOpen={showConfirm}
         title="Regenerate Master Library"
-        message="This will delete the existing master flat library and recreate it. Continue?"
+        message={
+          customMetadataSetIds.length > 0
+            ? "This will delete the existing master flat library and recreate it from FITS files. WARNING: All custom metadata edits will be reset to original FITS header values. Continue?"
+            : "This will delete the existing master flat library and recreate it. Continue?"
+        }
         onConfirm={confirmRegenerate}
         onCancel={() => setShowConfirm(false)}
+      />
+
+      {/* Bulk Edit Modal */}
+      <BulkEditMetadataModal
+        isOpen={showBulkEdit}
+        sets={sets}
+        customMetadataSetIds={customMetadataSetIds}
+        onClose={() => setShowBulkEdit(false)}
+        onSave={async () => { await checkAndLoadLibrary(); }}
       />
     </div>
   );

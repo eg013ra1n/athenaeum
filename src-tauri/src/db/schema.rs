@@ -569,5 +569,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Calibration set originals table - stores original metadata values before custom edits
+    // Used to backup original FITS header values when user edits calibration set metadata
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS calibration_set_originals (
+            set_id INTEGER PRIMARY KEY,
+            ccd_temp REAL,
+            temp_min REAL,
+            temp_max REAL,
+            gain REAL,
+            offset REAL,
+            binning TEXT,
+            exptime REAL,
+            saved_at TEXT NOT NULL,
+            FOREIGN KEY (set_id) REFERENCES calibration_set(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     Ok(())
 }

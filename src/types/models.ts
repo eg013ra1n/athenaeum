@@ -775,3 +775,27 @@ export interface CalendarYearData {
   totalFrameCount: number;
   totalExposureSeconds: number;
 }
+
+// ========== Calibration Set Metadata Editing ==========
+
+/** Edits to apply to calibration set metadata (selective fields) */
+export interface CalibrationMetadataEdits {
+  ccd_temp?: number | null;
+  gain?: number | null;
+  offset?: number | null;
+  binning?: string | null;
+  exptime?: number | null;
+}
+
+/** Original calibration set metadata values (backed up before editing) */
+export interface CalibrationSetOriginals {
+  set_id: number;
+  ccd_temp: number | null;
+  temp_min: number | null;
+  temp_max: number | null;
+  gain: number | null;
+  offset: number | null;
+  binning: string | null;
+  exptime: number | null;
+  saved_at: string;  // ISO 8601
+}
