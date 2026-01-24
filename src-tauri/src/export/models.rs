@@ -263,6 +263,8 @@ pub struct ExportFrame {
     pub date_obs: Option<String>,
     /// Focal length in mm
     pub focallen: Option<f64>,
+    /// Pixel size in micrometers (from XPIXSZ or PIXSIZE1 FITS header)
+    pub xpixsz: Option<f64>,
     /// Bayer pattern for OSC detection (e.g., "RGGB")
     pub bayerpat: Option<String>,
     /// Camera/instrument name

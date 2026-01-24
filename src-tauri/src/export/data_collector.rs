@@ -224,7 +224,7 @@ fn get_export_frame_by_id(conn: &Connection, frame_id: i64) -> Result<ExportFram
     conn.query_row(
         "SELECT f.id, f.file_id, fi.path, fi.filename,
                 f.exptime, f.filter, f.ccd_temp, f.gain, f.offset,
-                f.binning, f.date_obs, f.focallen, f.bayerpat, f.instrume
+                f.binning, f.date_obs, f.focallen, f.xpixsz, f.bayerpat, f.instrume
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          WHERE f.id = ?1",
@@ -243,8 +243,9 @@ fn get_export_frame_by_id(conn: &Connection, frame_id: i64) -> Result<ExportFram
                 binning: row.get(9)?,
                 date_obs: row.get(10)?,
                 focallen: row.get(11)?,
-                bayerpat: row.get(12)?,
-                instrume: row.get(13)?,
+                xpixsz: row.get(12)?,
+                bayerpat: row.get(13)?,
+                instrume: row.get(14)?,
             })
         },
     ).context(format!("Failed to get frame by ID: {}", frame_id))
@@ -349,7 +350,7 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
     let mut stmt = conn.prepare(
         "SELECT f.id, f.file_id, fi.path, fi.filename,
                 f.exptime, f.filter, f.ccd_temp, f.gain, f.offset,
-                f.binning, f.date_obs, f.focallen, f.bayerpat, f.instrume
+                f.binning, f.date_obs, f.focallen, f.xpixsz, f.bayerpat, f.instrume
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          JOIN calibration_set_frames csf ON f.id = csf.frame_id
@@ -372,8 +373,9 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
                 binning: row.get(9)?,
                 date_obs: row.get(10)?,
                 focallen: row.get(11)?,
-                bayerpat: row.get(12)?,
-                instrume: row.get(13)?,
+                xpixsz: row.get(12)?,
+                bayerpat: row.get(13)?,
+                instrume: row.get(14)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

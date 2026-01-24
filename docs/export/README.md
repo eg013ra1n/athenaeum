@@ -83,8 +83,7 @@ Masters are created in dependency order:
 ```
 Light
 ├─ Flat (matched by: camera, filter, gain, offset, binning)
-├─ Dark (matched by: camera, exptime, gain, offset, binning, temp)
-└─ Bias (matched by: camera, gain, offset, binning)
+└─ Dark (matched by: camera, exptime, gain, offset, binning, temp)
 ```
 
 ### For Flat Masters (Complex!)
@@ -95,8 +94,6 @@ Flat calibration priority:
 3. Bias only ← FALLBACK (prevents over-subtraction)
 4. No calibration ← LAST RESORT
 ```
-
-**Why this matters**: Using a 300s dark for a 2s flat causes bright edges (over-subtraction). The fallback chain prevents this.
 
 ### For Dark Masters
 ```
@@ -351,6 +348,159 @@ Assumes Siril assigns sequence indices in filename sort order. If pp_lights file
 
 ---
 
+---
+
+## Pipeline Execution System
+
+### Overview
+
+The pipeline system provides:
+- **Database-backed job tracking** with step-by-step progress
+- **Resume/retry capability** for failed steps
+- **File validation** before processing
+- **Real-time progress monitoring** in the UI
+
+### Pipeline Steps
+
+| Step | Script | Description |
+|------|--------|-------------|
+| `validate_sources` | - | Verify all source files exist on disk |
+| `organize_files` | - | Create folder structure, copy/symlink files, generate scripts |
+| `create_masters` | `00_create_masters.ssf` | Create bias, dark, darkflat, flat masters |
+| `calibrate_lights` | `01_calibrate_lights.ssf` | Calibrate all light frames with masters |
+| `collect_calibrated` | - | Collect pp_lights to all_lights_mono/ and/or all_lights_osc/ |
+| `generate_registration` | - | Create registration script based on collected frames |
+| `register_and_stack` | `02_register_and_stack.ssf` | Register globally, stack per filter |
+
+### Pipeline Execution Flow
+
+```
+User clicks "Validate & Export"
+       ↓
+1. validate_sources
+   └─ Check all light and calibration files exist
+       ↓
+2. organize_files
+   ├─ Create folder structure (biases/, darks/, flats/, lights/)
+   ├─ Copy/symlink files into folders
+   └─ Generate 00_create_masters.ssf and 01_calibrate_lights.ssf
+       ↓
+3. create_masters (runs 00_create_masters.ssf)
+   ├─ Create master_bias_*.fit
+   ├─ Create master_dark_*.fit
+   ├─ Create master_darkflat_*.fit (if available)
+   └─ Create master_flat_*.fit
+       ↓
+4. calibrate_lights (runs 01_calibrate_lights.ssf)
+   └─ Create pp_lights_*.fit in each branch folder
+       ↓
+5. collect_calibrated
+   ├─ Scan for pp_lights_*.fit files
+   ├─ Detect OSC vs Mono by NAXIS/layer count
+   └─ Copy to process/all_lights_mono/ and/or process/all_lights_osc/
+       ↓
+6. generate_registration
+   └─ Create 02_register_and_stack.ssf based on collected frames
+       ↓
+7. register_and_stack (runs 02_register_and_stack.ssf)
+   ├─ Register all frames globally (per camera type)
+   └─ Stack per filter with frame selection
+       ↓
+Done! Stacked outputs in masters/*_stacked.fit
+```
+
+### Database Tables
+
+```sql
+-- Main job tracking
+CREATE TABLE export_jobs (
+    id INTEGER PRIMARY KEY,
+    frame_set_id INTEGER NOT NULL,
+    output_dir TEXT NOT NULL,
+    target TEXT NOT NULL,           -- 'siril' or 'pixinsight_wbpp'
+    config_json TEXT NOT NULL,      -- Full ExportConfig as JSON
+    status TEXT NOT NULL,           -- pending/running/paused/completed/failed/cancelled
+    created_at TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    error_message TEXT,
+    total_steps INTEGER,
+    completed_steps INTEGER
+);
+
+-- Step tracking
+CREATE TABLE export_job_steps (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL,
+    step_order INTEGER NOT NULL,
+    step_type TEXT NOT NULL,        -- validate_sources, organize_files, etc.
+    step_name TEXT NOT NULL,        -- Human-readable name
+    step_data_json TEXT,            -- Step-specific data
+    status TEXT NOT NULL,           -- pending/running/completed/failed/skipped
+    started_at TEXT,
+    completed_at TEXT,
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    output_files_json TEXT          -- List of files created by this step
+);
+```
+
+### Job Status Flow
+```
+pending → running → completed
+              ↓
+           failed ──(retry)──→ running
+              ↓
+          paused ──(resume)─→ running
+              ↓
+        cancelled (terminal)
+```
+
+### Step Status Flow
+```
+pending → running → completed
+              ↓
+           failed ──(retry)──→ pending (increments retry_count)
+              ↓
+          skipped (prerequisites not met or already done)
+```
+
+### Progress Events
+
+The pipeline emits real-time progress events that the UI listens to:
+
+```typescript
+// Tauri event: 'pipeline-progress'
+interface PipelineProgress {
+  jobId: number;
+  stepId?: number;
+  stepOrder: number;
+  totalSteps: number;
+  stepType: StepType;
+  stepProgress: number;      // 0.0 to 1.0 for current step
+  overallProgress: number;   // 0.0 to 1.0 for entire job
+  message: string;           // Current activity description
+  currentFile?: string;      // File being processed
+  isResumable: boolean;      // Can resume from this step
+  canRetry: boolean;         // Can retry if failed
+}
+```
+
+### Resume/Retry Logic
+
+**Resuming a paused or failed job:**
+1. Scan output directory for existing work
+2. Mark steps as `skipped` if outputs already exist
+3. Resume from first `pending` step
+
+**Retrying a failed step:**
+1. Reset step status to `pending`
+2. Increment `retry_count`
+3. Clear error message
+4. Job status returns to `running`
+
+---
+
 ## Key Files
 
 | File | Purpose |
@@ -362,5 +512,10 @@ Assumes Siril assigns sequence indices in filename sort order. If pp_lights file
 | `export/folder_structures.rs` | Folder path utilities |
 | `export/siril/script_generator.rs` | Siril script generation |
 | `export/siril/cli_runner.rs` | Siril execution & progress |
+| `export/pipeline/models.rs` | Job, Step, Status types |
+| `export/pipeline/state_machine.rs` | Job/step CRUD operations |
+| `export/pipeline/step_executor.rs` | Step execution logic |
+| `export/pipeline/validation.rs` | File validation, plan building |
+| `export/pipeline/resume.rs` | Resume/retry logic |
 | `calibration/configurable_matcher.rs` | Calibration matching logic |
 | `calibration/hierarchy.rs` | Hierarchy building |

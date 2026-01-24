@@ -1,27 +1,36 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
-import { Folder, Loader2, Check, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { Folder, Loader2, Check, AlertCircle, ChevronDown, ChevronRight, Play, FileCheck } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
 import { ExportModeSelector } from './ExportModeSelector';
 import { CalibrationPreview } from './CalibrationPreview';
 import { CalibrationTreeView } from './CalibrationTreeView';
 import { ExportProgress } from './ExportProgress';
+import { PipelineVisualizer, PipelineStepsSummary } from './PipelineVisualizer';
+import { ValidationWarnings } from './ValidationWarnings';
 import {
   useExportableFrameSets,
   useExportData,
   useCalibrationRoute,
   useExportV2,
 } from '../../hooks/useExportData';
+import {
+  useExportJobCreate,
+  usePipelinePlan,
+  useExportPipeline,
+} from '../../hooks/useExportPipeline';
 import type {
   ExportMode,
   ExportTarget,
   ExportProgress as ExportProgressType,
   ExportResult,
+  ExportConfig,
   ReferenceFrameMode,
   RejectionAlgorithm,
   ImageWeightingMethod,
   DrizzleScale,
+  SirilWorkflow,
 } from '../../types/export';
 
 interface ExportWizardProps {
@@ -55,11 +64,65 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   const [exptimeToleranceEnabled, setExptimeToleranceEnabled] = useState(true);
   const [exptimeToleranceSeconds, setExptimeToleranceSeconds] = useState(3);
 
+  // Pipeline job state
+  const [activeJobId, setActiveJobId] = useState<number | null>(null);
+  const [showValidation, setShowValidation] = useState(false);
+  const [usePipelineMode, setUsePipelineMode] = useState(true); // New pipeline mode by default
+
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
   const { data: exportData, loading: loadingExportData } = useExportData(selectedFrameSetId);
   const { route: calibrationRoute, loading: loadingRoute } = useCalibrationRoute(selectedFrameSetId);
   const { execute: executeExport, loading: executing } = useExportV2();
+
+  // Pipeline hooks
+  const { create: createJob, loading: creatingJob } = useExportJobCreate();
+
+  // Build export config for pipeline plan
+  const exportConfig: ExportConfig | null = useMemo(() => {
+    if (!selectedFrameSetId) return null;
+    return {
+      frameSetId: selectedFrameSetId,
+      outputDir,
+      target: exportTarget,
+      mode,
+      workflow: 'mono_preprocessing' as SirilWorkflow, // Auto-detected per group
+      createMasters,
+      rejectionLow,
+      rejectionHigh,
+      useSymlinks,
+      referenceFrameMode,
+      rejectionAlgorithm,
+      imageWeighting,
+      drizzleEnabled,
+      drizzleScale,
+      exptimeToleranceMode: exptimeToleranceEnabled ? 'absolute' : 'disabled',
+      exptimeToleranceValue: exptimeToleranceSeconds,
+    };
+  }, [
+    selectedFrameSetId, outputDir, exportTarget, mode, createMasters,
+    rejectionLow, rejectionHigh, useSymlinks, referenceFrameMode,
+    rejectionAlgorithm, imageWeighting, drizzleEnabled, drizzleScale,
+    exptimeToleranceEnabled, exptimeToleranceSeconds,
+  ]);
+
+  const { plan: pipelinePlan, loading: loadingPlan } = usePipelinePlan(
+    showValidation ? selectedFrameSetId : null,
+    showValidation ? exportConfig : null
+  );
+
+  // Pipeline execution
+  const {
+    job: activeJob,
+    startJob,
+    pauseJob,
+    resumeJob,
+    cancelJob,
+    retryStep,
+    progress: pipelineProgress,
+    isRunning: jobRunning,
+    isComplete: jobComplete,
+  } = useExportPipeline(activeJobId);
 
   // Listen for progress events
   useEffect(() => {
@@ -85,7 +148,34 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     }
   }, []);
 
-  // Handle export
+  // Handle validate (show validation step)
+  const handleValidate = useCallback(() => {
+    setShowValidation(true);
+  }, []);
+
+  // Handle start pipeline job
+  const handleStartPipeline = useCallback(async () => {
+    if (!selectedFrameSetId || !outputDir || !exportConfig) return;
+
+    setResult(null);
+    setProgress(null);
+
+    try {
+      const job = await createJob({
+        frameSetId: selectedFrameSetId,
+        outputDir,
+        config: exportConfig,
+      });
+      setActiveJobId(job.id);
+      setShowValidation(false);
+      // Start the job with the explicit job ID (don't rely on state which hasn't updated yet)
+      await startJob(job.id);
+    } catch {
+      // Error is handled by the hook
+    }
+  }, [selectedFrameSetId, outputDir, exportConfig, createJob, startJob]);
+
+  // Handle legacy export (non-pipeline mode)
   const handleExport = useCallback(async () => {
     if (!selectedFrameSetId || !outputDir) return;
 
@@ -137,12 +227,30 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     exptimeToleranceSeconds,
   ]);
 
+  // Handle cancel validation
+  const handleCancelValidation = useCallback(() => {
+    setShowValidation(false);
+  }, []);
+
+  // Handle reset (after job complete)
+  const handleReset = useCallback(() => {
+    setActiveJobId(null);
+    setShowValidation(false);
+    setResult(null);
+    setProgress(null);
+  }, []);
+
   // Check if ready to export
   const canExport =
     selectedFrameSetId !== null &&
     outputDir !== '' &&
     !executing &&
-    !loadingExportData;
+    !loadingExportData &&
+    !jobRunning &&
+    !creatingJob;
+
+  // Check if a job is active (running or complete)
+  const hasActiveJob = activeJobId !== null && activeJob !== null;
 
   return (
     <div className="space-y-6">
@@ -515,13 +623,71 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         </section>
       )}
 
-      {/* Progress */}
-      {(executing || progress) && (
+      {/* Validation Step (Pipeline Mode) */}
+      {showValidation && pipelinePlan && (
+        <section className="bg-surface-elevated rounded-lg p-4">
+          <h3 className="text-lg font-medium mb-3">
+            {exportTarget === 'siril' ? '7' : '5'}. Validate Export
+          </h3>
+          <ValidationWarnings
+            plan={pipelinePlan}
+            onContinue={handleStartPipeline}
+            onCancel={handleCancelValidation}
+            showActions={true}
+          />
+          {!pipelinePlan.hasBlockingErrors && (
+            <div className="mt-4">
+              <h4 className="text-sm font-medium text-content-muted mb-2">Pipeline Steps Preview</h4>
+              <PipelineStepsSummary steps={pipelinePlan.steps} />
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Loading Validation */}
+      {showValidation && loadingPlan && (
+        <section className="bg-surface-elevated rounded-lg p-4">
+          <h3 className="text-lg font-medium mb-3">Validating...</h3>
+          <div className="flex items-center gap-2 text-content-muted">
+            <Loader2 className="animate-spin" size={16} />
+            Checking source files and calibration links...
+          </div>
+        </section>
+      )}
+
+      {/* Pipeline Progress (Active Job) */}
+      {hasActiveJob && (
+        <section className="bg-surface-elevated rounded-lg p-4">
+          <h3 className="text-lg font-medium mb-3">Export Progress</h3>
+          <PipelineVisualizer
+            job={activeJob}
+            progress={pipelineProgress}
+            onPause={pauseJob}
+            onResume={() => resumeJob()}
+            onCancel={cancelJob}
+            onRetryStep={retryStep}
+            showControls={true}
+          />
+          {jobComplete && (
+            <div className="mt-4 flex justify-end">
+              <button
+                onClick={handleReset}
+                className="px-4 py-2 text-sm font-medium bg-accent text-white rounded-lg hover:bg-accent/90"
+              >
+                Start New Export
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Legacy Progress (non-pipeline mode) */}
+      {!usePipelineMode && (executing || progress) && (
         <ExportProgress progress={progress} />
       )}
 
-      {/* Result */}
-      {result && (
+      {/* Result (Legacy mode) */}
+      {!usePipelineMode && result && (
         <div
           className={`p-4 rounded-lg border ${
             result.success
@@ -561,26 +727,68 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         </div>
       )}
 
-      {/* Export button */}
-      {selectedFrameSetId && exportData && (
-        <button
-          onClick={handleExport}
-          disabled={!canExport}
-          className={`w-full py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${
-            canExport
-              ? 'bg-accent hover:bg-accent-hover'
-              : 'bg-surface-hover cursor-not-allowed text-content-muted'
-          }`}
-        >
-          {executing ? (
-            <>
-              <Loader2 className="animate-spin" size={20} />
-              Exporting...
-            </>
+      {/* Export buttons */}
+      {selectedFrameSetId && exportData && !showValidation && !hasActiveJob && (
+        <div className="space-y-3">
+          {/* Pipeline Mode Toggle */}
+          <div className="flex items-center justify-between p-3 bg-surface-elevated rounded-lg border border-border">
+            <div>
+              <div className="font-medium text-content">Pipeline Mode</div>
+              <div className="text-sm text-content-muted">
+                {usePipelineMode
+                  ? 'Validate files, track progress step-by-step, and resume on failure'
+                  : 'Direct execution (legacy mode)'}
+              </div>
+            </div>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={usePipelineMode}
+                onChange={(e) => setUsePipelineMode(e.target.checked)}
+                className="sr-only peer"
+              />
+              <div className="w-11 h-6 bg-surface-hover peer-focus:ring-2 peer-focus:ring-accent rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-accent"></div>
+            </label>
+          </div>
+
+          {/* Export Button */}
+          {usePipelineMode ? (
+            <button
+              onClick={handleValidate}
+              disabled={!canExport}
+              className={`w-full py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${
+                canExport
+                  ? 'bg-accent hover:bg-accent-hover'
+                  : 'bg-surface-hover cursor-not-allowed text-content-muted'
+              }`}
+            >
+              <FileCheck size={20} />
+              Validate & Export
+            </button>
           ) : (
-            'Export'
+            <button
+              onClick={handleExport}
+              disabled={!canExport}
+              className={`w-full py-3 rounded-lg font-medium flex items-center justify-center gap-2 ${
+                canExport
+                  ? 'bg-accent hover:bg-accent-hover'
+                  : 'bg-surface-hover cursor-not-allowed text-content-muted'
+              }`}
+            >
+              {executing ? (
+                <>
+                  <Loader2 className="animate-spin" size={20} />
+                  Exporting...
+                </>
+              ) : (
+                <>
+                  <Play size={20} />
+                  Export (Direct)
+                </>
+              )}
+            </button>
           )}
-        </button>
+        </div>
       )}
     </div>
   );

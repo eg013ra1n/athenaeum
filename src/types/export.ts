@@ -406,3 +406,248 @@ export interface ExportableFrameSet {
   objectName: string | null;
   filters: string[];
 }
+
+// ============================================================================
+// Pipeline Job Management Types
+// ============================================================================
+
+/**
+ * Status of an export job
+ */
+export type JobStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+/**
+ * Status of a pipeline step
+ */
+export type StepStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'skipped';
+
+/**
+ * Type of pipeline step
+ *
+ * Steps are aligned with actual Siril script execution:
+ *
+ * Pre-processing:
+ * - validate_sources: Check all source files exist
+ * - organize_files: Create folder structure and generate per-step scripts
+ *
+ * Per-master creation (NEW - granular control):
+ * - create_master_bias: Create a single master bias
+ * - create_master_dark: Create a single master dark
+ * - create_master_darkflat: Create a single master darkflat
+ * - create_master_flat: Create a single master flat
+ *
+ * Per-branch calibration (NEW - granular control):
+ * - calibrate_branch: Calibrate lights for a single branch
+ *
+ * Per-branch registration (NEW - multi-group fix):
+ * - register_branch: Register a single branch with its own focal/pixelsize
+ *
+ * Collection:
+ * - collect_registered: Collect r_pp_lights to unified folders (mono/osc)
+ * - collect_calibrated: (legacy) Collect pp_lights to unified folders
+ *
+ * Global registration (NEW - multi-group fix):
+ * - global_registration: Global homography -2pass registration for mono or osc
+ *
+ * Prepare stacking (NEW - multi-group fix):
+ * - prepare_stacking: Copy globally registered frames to stacking directories
+ *
+ * Per-group stacking (NEW - granular control):
+ * - stack_group: Stack a single filter+camera group
+ *
+ * Legacy types (backward compatibility):
+ * - register_frames: Register all frames for a camera type
+ * - create_masters: Run 00_create_masters.ssf (all masters in one step)
+ * - calibrate_lights: Run 01_calibrate_lights.ssf (all lights in one step)
+ * - generate_registration: Create 02_register_and_stack.ssf
+ * - register_and_stack: Run 02_register_and_stack.ssf (combined register + stack)
+ */
+export type StepType =
+  // Pre-processing
+  | 'validate_sources'
+  | 'organize_files'
+  // Per-master steps (new)
+  | 'create_master_bias'
+  | 'create_master_dark'
+  | 'create_master_darkflat'
+  | 'create_master_flat'
+  // Per-branch calibration (new)
+  | 'calibrate_branch'
+  // Per-branch registration (multi-group fix)
+  | 'register_branch'
+  // Collection
+  | 'collect_registered'
+  | 'collect_calibrated'
+  // Global registration (multi-group fix)
+  | 'global_registration'
+  // Prepare stacking (multi-group fix)
+  | 'prepare_stacking'
+  // Per-group stacking (new)
+  | 'stack_group'
+  // Legacy per-camera registration
+  | 'register_frames'
+  // Legacy types (backward compatibility)
+  | 'create_masters'
+  | 'calibrate_lights'
+  | 'generate_registration'
+  | 'register_and_stack';
+
+/**
+ * Phase grouping for UI display
+ */
+export type StepPhase =
+  | 'preparation'
+  | 'masters'
+  | 'calibration'
+  | 'branch_registration'
+  | 'collection'
+  | 'global_registration'
+  | 'prepare_stacking'
+  | 'stacking';
+
+/**
+ * Step-specific metadata
+ */
+export interface StepData {
+  /** Calibration set ID (for master creation steps) */
+  setId?: number;
+  /** Branch ID (for calibrate_branch step) */
+  branchId?: string;
+  /** Branch index (0-based, for calibrate_branch step) */
+  branchIndex?: number;
+  /** Filter name (for stack_group step) */
+  filter?: string;
+  /** Camera type (for register_frames and stack_group steps) */
+  cameraType?: CameraType;
+  /** Number of frames to process */
+  frameCount?: number;
+  /** Path to generated Siril script */
+  sirilScriptPath?: string;
+  /** Master file output path */
+  outputPath?: string;
+  /** Calibration set name for display */
+  setName?: string;
+  /** List of input file paths */
+  inputFiles?: string[];
+  /** Master type (Bias, Dark, DarkFlat, Flat) for per-master steps */
+  masterType?: string;
+  /** Step orders this step depends on (for dependency tracking) */
+  dependsOnSteps?: number[];
+  /** Exposure time display string (for stack_group with exptime grouping) */
+  exptimeDisplay?: string;
+  /** Stack group key (for stack_group step) */
+  groupKey?: string;
+  /** Output folder path (for calibrate_branch - where pp_ files will be created) */
+  outputFolderPath?: string;
+  /** Focal length in mm (for register_branch step) */
+  focalLength?: number;
+  /** Pixel size in micrometers (for register_branch step) */
+  pixelSize?: number;
+}
+
+/**
+ * A single step in an export job
+ */
+export interface ExportJobStep {
+  id: number;
+  jobId: number;
+  stepOrder: number;
+  stepType: StepType;
+  stepName: string;
+  stepData: StepData | null;
+  status: StepStatus;
+  startedAt: string | null;
+  completedAt: string | null;
+  errorMessage: string | null;
+  retryCount: number;
+  outputFiles: string[];
+}
+
+/**
+ * Complete export job with all steps
+ */
+export interface ExportJob {
+  id: number;
+  frameSetId: number;
+  outputDir: string;
+  target: string;
+  config: ExportConfig;
+  status: JobStatus;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  errorMessage: string | null;
+  totalSteps: number;
+  completedSteps: number;
+  steps: ExportJobStep[];
+}
+
+/**
+ * File type for validation tracking
+ */
+export type FileType = 'source' | 'calibration' | 'output' | 'intermediate';
+
+/**
+ * Validation result for a single file
+ */
+export interface FileValidation {
+  path: string;
+  exists: boolean;
+  size?: number;
+  error?: string;
+  fileType: FileType;
+}
+
+/**
+ * A planned step before job creation
+ */
+export interface PlannedStep {
+  stepType: StepType;
+  stepName: string;
+  stepData?: StepData;
+  dependsOn: number[];
+  canResumeFrom: boolean;
+}
+
+/**
+ * Complete pipeline plan with all steps and validations
+ */
+export interface PipelinePlan {
+  steps: PlannedStep[];
+  sourceValidations: FileValidation[];
+  calibrationValidations: FileValidation[];
+  totalSourceFiles: number;
+  totalCalibrationFiles: number;
+  missingSourceFiles: number;
+  missingCalibrationFiles: number;
+  hasBlockingErrors: boolean;
+  warnings: string[];
+}
+
+/**
+ * Enhanced export progress for pipeline execution
+ */
+export interface PipelineProgress {
+  jobId: number;
+  stepId?: number;
+  stepOrder: number;
+  totalSteps: number;
+  stepType: StepType;
+  stepProgress: number;
+  overallProgress: number;
+  message: string;
+  currentFile?: string;
+  isResumable: boolean;
+  canRetry: boolean;
+}

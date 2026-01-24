@@ -19,12 +19,13 @@ use std::sync::Mutex;
 /// Database connection wrapper
 pub struct Database {
     conn: Mutex<Connection>,
+    path: PathBuf,
 }
 
 impl Database {
     /// Create a new database connection
     pub fn new(path: PathBuf) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(&path)?;
 
         // Performance tuning - safe with WAL mode
         // synchronous=NORMAL: 2x faster writes, crash-safe with WAL
@@ -42,11 +43,17 @@ impl Database {
         init_db(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path,
         })
     }
 
     /// Get a connection lock
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
+    }
+
+    /// Get the database file path
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }

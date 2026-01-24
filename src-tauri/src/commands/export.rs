@@ -1130,7 +1130,7 @@ pub struct FilterOrganizedInfo {
 // Pipeline Execution Commands
 // ============================================================================
 
-/// Run the complete Siril export pipeline automatically
+/// Run the complete Siril export pipeline automatically (LEGACY)
 ///
 /// This command orchestrates all export steps in sequence:
 /// 1. Create calibration masters (if 00_create_masters.ssf exists)
@@ -1139,6 +1139,9 @@ pub struct FilterOrganizedInfo {
 /// 4. Register and stack (02_register_and_stack.ssf)
 ///
 /// Progress events are emitted throughout the process.
+///
+/// **NOTE**: For multi-group scenarios (different telescopes/cameras), use
+/// `run_siril_export_pipeline_v2` instead.
 #[tauri::command]
 pub async fn run_siril_export_pipeline(
     app_handle: tauri::AppHandle,
@@ -1158,4 +1161,271 @@ pub async fn run_siril_export_pipeline(
         .map_err(|e| e.to_string())?;
 
     Ok("Export pipeline completed successfully".to_string())
+}
+
+/// Run the complete Siril export pipeline V2 (MULTI-GROUP FIX)
+///
+/// This command handles multi-group scenarios (different telescopes, cameras, focal lengths)
+/// correctly by using per-branch registration with branch-specific optical parameters.
+///
+/// Steps:
+/// 1. Create calibration masters (if 00_create_masters.ssf exists)
+/// 2. Calibrate light frames (01_calibrate_lights.ssf)
+/// 3. Per-branch registration (02_register_branches.ssf) - KEY FIX!
+/// 4. Collect and group registered frames by (filter, camera_type, exptime)
+/// 5. Prepare stacking directories (copy files with sequential naming)
+/// 6. Generate per-group stacking scripts dynamically
+/// 7. Run each stacking script
+///
+/// Progress events are emitted throughout the process.
+///
+/// **CRITICAL**: Uses per-branch plate solving with branch-specific focal length
+/// and pixel size, preventing "Cannot add an image with different properties" errors.
+#[tauri::command]
+pub async fn run_siril_export_pipeline_v2(
+    app_handle: tauri::AppHandle,
+    export_dir: String,
+    config: ExportConfig,
+) -> Result<String, String> {
+    use crate::export::siril::run_export_pipeline_v2;
+
+    let export_path = PathBuf::from(&export_dir);
+
+    // Verify the directory exists
+    if !export_path.exists() {
+        return Err(format!("Export directory does not exist: {}", export_dir));
+    }
+
+    // Run the V2 pipeline with per-branch registration
+    run_export_pipeline_v2(&export_path, &config, &app_handle)
+        .map_err(|e| e.to_string())?;
+
+    Ok("Export pipeline V2 completed successfully".to_string())
+}
+
+// ============================================================================
+// Pipeline Job Management Commands
+// ============================================================================
+
+use crate::export::pipeline::{
+    models::{ExportJob, FileValidation, PipelinePlan, JobStatus as PipelineJobStatus},
+    state_machine, validation, step_executor, resume,
+};
+
+/// Create a new export job with all planned steps
+#[tauri::command]
+pub async fn create_export_job(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+    output_dir: String,
+    config: ExportConfig,
+) -> Result<ExportJob, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Build the pipeline plan
+    let plan = validation::build_pipeline_plan(&conn, frame_set_id, &config)
+        .map_err(|e| e.to_string())?;
+
+    // Create the job
+    state_machine::create_export_job(&conn, frame_set_id, &output_dir, &config, &plan)
+        .map_err(|e| e.to_string())
+}
+
+/// Get an export job with all its steps
+#[tauri::command]
+pub async fn get_export_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> Result<ExportJob, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    state_machine::get_job_with_steps(&conn, job_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Get all export jobs (optionally filtered by frame set)
+#[tauri::command]
+pub async fn get_export_jobs(
+    state: State<'_, AppState>,
+    frame_set_id: Option<i64>,
+) -> Result<Vec<ExportJob>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    state_machine::get_jobs_for_frame_set(&conn, frame_set_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Start executing a pending export job
+#[tauri::command]
+pub async fn start_export_job(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    job_id: i64,
+) -> Result<(), String> {
+    // First check the job status and get the database path
+    let db_path = {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+
+        let job = state_machine::get_job_with_steps(&conn, job_id)
+            .map_err(|e| e.to_string())?;
+
+        if job.status != PipelineJobStatus::Pending {
+            return Err(format!("Job is not in pending status: {:?}", job.status));
+        }
+
+        db.path().to_string_lossy().to_string()
+    };
+
+    // Spawn the job execution in a background thread so we can return immediately
+    std::thread::spawn(move || {
+        // Open a new database connection for this thread
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to open database for job execution: {}", e);
+                return;
+            }
+        };
+
+        // Run the job
+        if let Err(e) = step_executor::run_job(&conn, &app_handle, job_id) {
+            eprintln!("Job {} failed: {}", job_id, e);
+        }
+    });
+
+    // Return immediately - job runs in background
+    Ok(())
+}
+
+/// Pause a running export job
+#[tauri::command]
+pub async fn pause_export_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    state_machine::update_job_status(&conn, job_id, PipelineJobStatus::Paused, None)
+        .map_err(|e| e.to_string())
+}
+
+/// Cancel an export job
+#[tauri::command]
+pub async fn cancel_export_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    state_machine::update_job_status(&conn, job_id, PipelineJobStatus::Cancelled, None)
+        .map_err(|e| e.to_string())
+}
+
+/// Resume a failed or paused export job
+#[tauri::command]
+pub async fn resume_export_job(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    job_id: i64,
+    from_step_order: Option<i32>,
+) -> Result<(), String> {
+    // Prepare the resume
+    {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+
+        resume::prepare_resume(&conn, job_id, from_step_order)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Then start the job
+    start_export_job(state, app_handle, job_id).await
+}
+
+/// Retry a failed step
+#[tauri::command]
+pub async fn retry_failed_step(
+    state: State<'_, AppState>,
+    step_id: i64,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    if !resume::can_retry_step(&conn, step_id).map_err(|e| e.to_string())? {
+        return Err("Step cannot be retried (max retries reached or not failed)".to_string());
+    }
+
+    resume::retry_step(&conn, step_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Validate source files for a frame set
+#[tauri::command]
+pub async fn validate_export_sources(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+) -> Result<Vec<FileValidation>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    validation::validate_source_files(&conn, frame_set_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Get a pipeline plan preview for a frame set
+#[tauri::command]
+pub async fn get_pipeline_plan(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+    config: ExportConfig,
+) -> Result<PipelinePlan, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    validation::build_pipeline_plan(&conn, frame_set_id, &config)
+        .map_err(|e| e.to_string())
+}
+
+/// Delete an export job
+#[tauri::command]
+pub async fn delete_export_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    state_machine::delete_job(&conn, job_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Get recent export job history
+#[tauri::command]
+pub async fn get_job_history(
+    state: State<'_, AppState>,
+    limit: Option<i32>,
+) -> Result<Vec<ExportJob>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    state_machine::get_job_history(&conn, limit)
+        .map_err(|e| e.to_string())
 }

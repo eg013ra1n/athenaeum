@@ -178,6 +178,20 @@ pub fn run() {
             commands::organize_registered_files_cmd,
             commands::get_registered_files_status,
             commands::run_siril_export_pipeline,
+            commands::run_siril_export_pipeline_v2,
+            // Pipeline job management commands
+            commands::create_export_job,
+            commands::get_export_job,
+            commands::get_export_jobs,
+            commands::start_export_job,
+            commands::pause_export_job,
+            commands::cancel_export_job,
+            commands::resume_export_job,
+            commands::retry_failed_step,
+            commands::validate_export_sources,
+            commands::get_pipeline_plan,
+            commands::delete_export_job,
+            commands::get_job_history,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

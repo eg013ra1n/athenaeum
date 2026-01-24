@@ -86,10 +86,21 @@ fn indices_to_ranges(indices: &[usize]) -> Vec<(usize, usize)> {
 
 /// Generate Siril scripts for V3 export
 ///
-/// Creates three scripts:
+/// Creates these monolithic scripts:
 /// 1. 00_create_masters.ssf - All masters in dependency order
 /// 2. 01_calibrate_lights.ssf - Calibrate all lights by branch
-/// 3. 02_register_and_stack.ssf - Register ALL, stack per filter
+/// 3. 02_register_branches.ssf - Per-branch registration with branch-specific optics (NEW!)
+/// 4. 02_register_and_stack.ssf - Legacy global registration (kept for backward compatibility)
+///
+/// Also generates per-step scripts in subdirectories (V5 mode):
+/// - scripts/00_masters/01_master_bias_XX.ssf
+/// - scripts/01_calibrate/01_calibrate_branch_XX.ssf
+/// - scripts/02_register/01_register_mono.ssf
+/// - scripts/03_stack/01_stack_ha_mono.ssf
+///
+/// MULTI-GROUP FIX: The pipeline now uses 02_register_branches.ssf for per-branch
+/// registration with branch-specific focal length and pixel size, then the stacking
+/// scripts are generated dynamically after frame collection.
 pub fn generate_scripts_v3(config: &ExportConfig, data: &ExportDataV3) -> Result<Vec<PathBuf>> {
     println!("📝 Generating V3 Siril scripts (flat structure)");
     println!("  Output dir: {:?}", config.output_dir);
@@ -98,23 +109,675 @@ pub fn generate_scripts_v3(config: &ExportConfig, data: &ExportDataV3) -> Result
     let folders = SirilFolders::new(config.output_dir.clone());
     let mut scripts = Vec::new();
 
-    // Script 1: Create all masters
+    // Generate per-step scripts (V5 mode) in addition to monolithic scripts
+    let per_step_scripts = generate_per_step_scripts(config, &folders, data)?;
+    scripts.extend(per_step_scripts);
+
+    // Script 1: Create all masters (legacy monolithic - kept for backward compatibility)
     if !data.master_plan.masters.is_empty() && config.create_masters {
         let script = generate_master_script_v4(config, &folders, data)?;
         scripts.push(script);
     }
 
-    // Script 2: Calibrate all lights
+    // Script 2: Calibrate all lights (legacy monolithic)
     let calibrate_script = generate_calibrate_lights_script_v4(config, &folders, data)?;
     scripts.push(calibrate_script);
 
-    // Script 3: Register ALL lights globally and stack per filter
-    // Uses -filter-incl to preserve registration metadata (FWHM, star data) for weighting
+    // Script 3: Per-branch registration with branch-specific optics (NEW!)
+    // This is the key fix for multi-group scenarios - each branch gets its own
+    // focal length and pixel size for plate solving
+    let register_branches_script = generate_register_branches_script(config, &folders, data)?;
+    scripts.push(register_branches_script);
+
+    // Script 4: Legacy global registration (kept for backward compatibility)
+    // This can still be used when all branches share the same optical setup
     let register_and_stack_script = generate_register_and_stack_script_v4(config, &folders, data)?;
     scripts.push(register_and_stack_script);
 
-    println!("  Generated {} scripts", scripts.len());
+    println!("  Generated {} scripts ({} per-step + 4 monolithic)",
+        scripts.len(), scripts.len() - 4);
     Ok(scripts)
+}
+
+// ============================================================================
+// V5: Per-Step Script Generation (Granular Control)
+// ============================================================================
+
+/// Generate all per-step scripts for V5 granular pipeline
+///
+/// Creates scripts in subdirectories:
+/// - scripts/00_masters/   - One script per master
+/// - scripts/01_calibrate/ - One script per branch
+/// - scripts/02_register/  - One script per camera type
+/// - scripts/03_stack/     - One script per filter+camera
+pub fn generate_per_step_scripts(
+    config: &ExportConfig,
+    folders: &SirilFolders,
+    data: &ExportDataV3,
+) -> Result<Vec<PathBuf>> {
+    let mut scripts = Vec::new();
+
+    // Create scripts subdirectory
+    let scripts_dir = folders.root.join("scripts");
+    fs::create_dir_all(&scripts_dir)?;
+
+    // Create phase subdirectories
+    let masters_dir = scripts_dir.join("00_masters");
+    let calibrate_dir = scripts_dir.join("01_calibrate");
+    let register_dir = scripts_dir.join("02_register");
+    let stack_dir = scripts_dir.join("03_stack");
+
+    fs::create_dir_all(&masters_dir)?;
+    fs::create_dir_all(&calibrate_dir)?;
+    fs::create_dir_all(&register_dir)?;
+    fs::create_dir_all(&stack_dir)?;
+
+    // Generate per-master scripts
+    if config.create_masters {
+        for (idx, master) in data.master_plan.masters.iter().enumerate() {
+            let script = generate_single_master_script(config, folders, master, idx, &masters_dir)?;
+            scripts.push(script);
+        }
+    }
+
+    // Generate per-branch calibration scripts
+    for (idx, branch) in data.branches.iter().enumerate() {
+        let script = generate_branch_calibration_script(config, folders, branch, idx, &calibrate_dir)?;
+        scripts.push(script);
+    }
+
+    // Generate registration scripts by camera type
+    let has_mono = data.branches.iter().any(|b| !b.is_osc());
+    let has_osc = data.branches.iter().any(|b| b.is_osc());
+
+    if has_mono {
+        let script = generate_registration_script(
+            config, folders, data, CameraType::Mono, &register_dir
+        )?;
+        scripts.push(script);
+    }
+
+    if has_osc {
+        let script = generate_registration_script(
+            config, folders, data, CameraType::Osc, &register_dir
+        )?;
+        scripts.push(script);
+    }
+
+    // Generate per-group stacking scripts
+    use crate::export::models::GlobalRegistrationPlan;
+    let plan = GlobalRegistrationPlan::from_export_data(data);
+    let stacking_groups = plan.stacking_groups(
+        &config.exptime_tolerance_mode,
+        config.exptime_tolerance_value,
+    );
+
+    for (idx, group) in stacking_groups.iter().enumerate() {
+        let script = generate_stacking_script(config, folders, group, idx, &stack_dir)?;
+        scripts.push(script);
+    }
+
+    println!("  Generated {} per-step scripts", scripts.len());
+    Ok(scripts)
+}
+
+/// Generate a single master creation script
+pub fn generate_single_master_script(
+    config: &ExportConfig,
+    folders: &SirilFolders,
+    master: &crate::export::models::MasterInfo,
+    _index: usize,
+    output_dir: &std::path::Path,
+) -> Result<PathBuf> {
+    let mut script = String::new();
+
+    let type_lower = master.master_type.to_lowercase();
+    // Deterministic naming based on set_id only (not iteration index)
+    let script_name = format!("master_{}_{}.ssf", type_lower, master.set_id);
+
+    script.push_str(&format!(
+        r#"############################################
+# Siril Master Creation Script (Per-Step)
+# Generated by Athenaeum
+#
+# Master Type: {}
+# Set ID: {}
+# Source Frames: {}
+############################################
+
+requires 1.2.0
+
+"#,
+        master.master_type,
+        master.set_id,
+        master.source_frames.len()
+    ));
+
+    // Work folder path based on master type
+    let work_folder = match master.master_type.as_str() {
+        "Bias" => folders.bias_set_path(master.set_id),
+        "Dark" | "DarkFlat" => folders.dark_set_path(master.set_id),
+        "Flat" => {
+            let filter = master.source_frames.first().and_then(|f| f.filter.as_deref());
+            folders.flat_set_path(master.set_id, filter)
+        }
+        _ => folders.process.clone(),
+    };
+
+    let output_path = folders.masters.join(&master.output_name);
+
+    script.push_str(&format!(
+        "cd {}\nconvert {}\n",
+        work_folder.to_string_lossy(),
+        type_lower
+    ));
+
+    // Apply calibrations based on type (same logic as monolithic script)
+    match master.master_type.as_str() {
+        "Bias" => {
+            script.push_str(&format!(
+                "stack {} rej {} {} -nonorm -out={}\n",
+                type_lower,
+                config.rejection_low,
+                config.rejection_high,
+                output_path.to_string_lossy()
+            ));
+        }
+        "Dark" | "DarkFlat" => {
+            if let Some(bias_id) = master.apply_bias {
+                let bias_master = folders.masters.join(format!("master_bias_{}", bias_id));
+                script.push_str(&format!(
+                    "calibrate {} -bias={}\n",
+                    type_lower,
+                    bias_master.to_string_lossy()
+                ));
+                script.push_str(&format!(
+                    "stack pp_{} rej {} {} -nonorm -out={}\n",
+                    type_lower,
+                    config.rejection_low,
+                    config.rejection_high,
+                    output_path.to_string_lossy()
+                ));
+            } else {
+                script.push_str(&format!(
+                    "stack {} rej {} {} -nonorm -out={}\n",
+                    type_lower,
+                    config.rejection_low,
+                    config.rejection_high,
+                    output_path.to_string_lossy()
+                ));
+            }
+        }
+        "Flat" => {
+            let mut cal_args = String::new();
+
+            if let Some(darkflat_id) = master.apply_darkflat {
+                let darkflat_master = folders.masters.join(format!("master_darkflat_{}", darkflat_id));
+                cal_args.push_str(&format!(" -dark={}", darkflat_master.to_string_lossy()));
+            } else if let Some(dark_id) = master.apply_dark {
+                let dark_master = folders.masters.join(format!("master_dark_{}", dark_id));
+                cal_args.push_str(&format!(" -dark={}", dark_master.to_string_lossy()));
+            } else if let Some(bias_id) = master.apply_bias {
+                let bias_master = folders.masters.join(format!("master_bias_{}", bias_id));
+                cal_args.push_str(&format!(" -dark={}", bias_master.to_string_lossy()));
+            }
+
+            if !cal_args.is_empty() {
+                script.push_str(&format!("calibrate flat{}\n", cal_args));
+                script.push_str(&format!(
+                    "stack pp_flat rej {} {} -norm=mul -out={}\n",
+                    config.rejection_low,
+                    config.rejection_high,
+                    output_path.to_string_lossy()
+                ));
+            } else {
+                script.push_str(&format!(
+                    "stack flat rej {} {} -norm=mul -out={}\n",
+                    config.rejection_low,
+                    config.rejection_high,
+                    output_path.to_string_lossy()
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    script.push_str("close\n");
+
+    let script_path = output_dir.join(&script_name);
+    fs::write(&script_path, &script)
+        .with_context(|| format!("Failed to write master script to {:?}", script_path))?;
+
+    Ok(script_path)
+}
+
+/// Generate a branch calibration script
+pub fn generate_branch_calibration_script(
+    config: &ExportConfig,
+    folders: &SirilFolders,
+    branch: &crate::export::models::CalibrationBranch,
+    index: usize,
+    output_dir: &std::path::Path,
+) -> Result<PathBuf> {
+    let mut script = String::new();
+
+    let _filter_safe = branch.filter.as_ref()
+        .map(|f| sanitize_folder_name(f))
+        .unwrap_or_else(|| "unfiltered".to_string());
+
+    // Deterministic naming based on branch_id (not iteration index)
+    let branch_id_safe = sanitize_folder_name(&branch.branch_id);
+    let script_name = format!("calibrate_{}.ssf", branch_id_safe);
+
+    script.push_str(&format!(
+        r#"############################################
+# Siril Branch Calibration Script (Per-Step)
+# Generated by Athenaeum
+#
+# Branch: {}
+# Camera: {}
+# Filter: {}
+# Light Frames: {}
+############################################
+
+requires 1.2.0
+
+"#,
+        branch.branch_id,
+        branch.camera_name,
+        branch.filter.as_deref().unwrap_or("None"),
+        branch.light_frames.len()
+    ));
+
+    // Skip branches with < 2 lights
+    if branch.light_frames.len() < 2 {
+        script.push_str("# SKIPPED: Siril requires at least 2 frames\n");
+        script.push_str("# This script is a placeholder\nclose\n");
+
+        let script_path = output_dir.join(&script_name);
+        fs::write(&script_path, &script)?;
+        return Ok(script_path);
+    }
+
+    // Path to lights
+    let lights_path = folders.lights_path(branch, index);
+
+    script.push_str(&format!("cd {}\n", lights_path.to_string_lossy()));
+    script.push_str("convert lights\n");
+
+    // Build calibrate command
+    let mut cal_args = Vec::new();
+    let is_osc = branch.is_osc();
+
+    if branch.dark_id > 0 {
+        let dark_master = folders.masters.join(format!("master_dark_{}", branch.dark_id));
+        cal_args.push(format!("-dark={}", dark_master.to_string_lossy()));
+        cal_args.push("-cc=dark".to_string());
+        if is_osc {
+            cal_args.push("-cfa".to_string());
+        }
+    }
+
+    if branch.flat_id > 0 {
+        let flat_master = folders.masters.join(format!("master_flat_{}", branch.flat_id));
+        cal_args.push(format!("-flat={}", flat_master.to_string_lossy()));
+    }
+
+    if is_osc && !config.drizzle_enabled {
+        cal_args.push("-debayer".to_string());
+    }
+
+    if cal_args.is_empty() {
+        script.push_str("calibrate lights\n");
+    } else {
+        script.push_str(&format!("calibrate lights {}\n", cal_args.join(" ")));
+    }
+
+    script.push_str("close\n");
+
+    let script_path = output_dir.join(&script_name);
+    fs::write(&script_path, &script)
+        .with_context(|| format!("Failed to write calibration script to {:?}", script_path))?;
+
+    Ok(script_path)
+}
+
+/// Generate a registration script for a specific camera type
+pub fn generate_registration_script(
+    _config: &ExportConfig,
+    folders: &SirilFolders,
+    data: &ExportDataV3,
+    camera_type: CameraType,
+    output_dir: &std::path::Path,
+) -> Result<PathBuf> {
+    let mut script = String::new();
+
+    let camera_suffix = camera_type.display_name().to_lowercase();
+    let script_name = format!("01_register_{}.ssf", camera_suffix);
+
+    // Count frames for this camera type
+    let frame_count: usize = data.branches.iter()
+        .filter(|b| if camera_type == CameraType::Osc { b.is_osc() } else { !b.is_osc() })
+        .map(|b| b.light_frames.len())
+        .sum();
+
+    // Get focal length and pixel size
+    let (focal_length, pixel_size) = get_optics_params(data);
+
+    script.push_str(&format!(
+        r#"############################################
+# Siril Registration Script (Per-Step)
+# Generated by Athenaeum
+#
+# Camera Type: {}
+# Frame Count: {}
+############################################
+
+requires 1.3.0
+
+"#,
+        camera_suffix.to_uppercase(),
+        frame_count
+    ));
+
+    let lights_dir = folders.process.join(format!("all_lights_{}", camera_suffix));
+
+    script.push_str(&format!("cd {}\n", lights_dir.to_string_lossy()));
+    script.push_str("convert pp_lights -out=. -fitseq\n\n");
+
+    script.push_str(&format!(
+        "seqplatesolve pp_lights -focal={:.1} -pixelsize={:.2}\n\n",
+        focal_length, pixel_size
+    ));
+
+    script.push_str("register pp_lights -2pass\n\n");
+    script.push_str("convert r_pp_lights -out=. -fitseq\n");
+
+    script.push_str("close\n");
+
+    let script_path = output_dir.join(&script_name);
+    fs::write(&script_path, &script)
+        .with_context(|| format!("Failed to write registration script to {:?}", script_path))?;
+
+    Ok(script_path)
+}
+
+/// Generate a stacking script for a specific filter+camera group
+pub fn generate_stacking_script(
+    config: &ExportConfig,
+    folders: &SirilFolders,
+    group: &crate::export::models::ExptimeStackGroup,
+    _index: usize,
+    output_dir: &std::path::Path,
+) -> Result<PathBuf> {
+    let mut script = String::new();
+
+    let filter_safe = group.filter.as_ref()
+        .map(|f| sanitize_folder_name(f))
+        .unwrap_or_else(|| "unfiltered".to_string());
+    let camera_suffix = group.camera_type.display_name().to_lowercase();
+
+    // Deterministic naming based on filter+camera (not iteration index)
+    let script_name = format!("stack_{}_{}.ssf", filter_safe, camera_suffix);
+
+    let filter_name = group.filter.as_deref().unwrap_or("Unfiltered");
+
+    script.push_str(&format!(
+        r#"############################################
+# Siril Stacking Script (Per-Step)
+# Generated by Athenaeum
+#
+# Filter: {}
+# Camera Type: {}
+# Frame Count: {}
+# Exptime: {}
+############################################
+
+requires 1.3.0
+
+"#,
+        filter_name,
+        camera_suffix.to_uppercase(),
+        group.frame_indices.len(),
+        if group.exptime_display.is_empty() { "Mixed" } else { &group.exptime_display }
+    ));
+
+    // Skip groups with < 2 frames
+    if group.frame_indices.len() < 2 {
+        script.push_str("# SKIPPED: Need >= 2 frames for stacking\nclose\n");
+        let script_path = output_dir.join(&script_name);
+        fs::write(&script_path, &script)?;
+        return Ok(script_path);
+    }
+
+    let lights_dir = folders.process.join(format!("all_lights_{}", camera_suffix));
+    let registered_sequence_name = "r_pp_lights";
+
+    script.push_str(&format!("cd {}\n\n", lights_dir.to_string_lossy()));
+
+    // Calculate total frames for unselect
+    // Note: This assumes all frames for this camera type are in the sequence
+    let total_frames = group.frame_indices.iter().max().unwrap_or(&0) + 1;
+
+    script.push_str(&format!("unselect {} 1 {}\n", registered_sequence_name, total_frames));
+
+    let ranges = indices_to_ranges(&group.frame_indices);
+    for (start, end) in &ranges {
+        script.push_str(&format!("select {} {} {}\n", registered_sequence_name, start, end));
+    }
+
+    // Output filename
+    let output_name = if group.exptime_display.is_empty() {
+        format!("{}_{}_stacked", filter_safe, camera_suffix)
+    } else {
+        format!("{}_{}_{}_stacked", filter_safe, camera_suffix, group.exptime_display)
+    };
+    let output_path = folders.masters.join(&output_name);
+
+    // Build stack command
+    let mut stack_cmd = format!("stack {}", registered_sequence_name);
+
+    let rej_cmd = match config.rejection_algorithm {
+        RejectionAlgorithm::Percentile => {
+            format!(" rej percentile {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::Sigma => {
+            format!(" rej sigma {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::LinearFit => {
+            format!(" rej linear {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::Gesd => {
+            format!(" rej gesd {} {}", config.rejection_low, config.rejection_high)
+        }
+        RejectionAlgorithm::Mad => {
+            format!(" rej mad {} {}", config.rejection_low, config.rejection_high)
+        }
+    };
+    stack_cmd.push_str(&rej_cmd);
+    stack_cmd.push_str(" -filter-included");
+    stack_cmd.push_str(" -norm=addscale -output_norm");
+
+    match config.image_weighting {
+        ImageWeightingMethod::None => {}
+        ImageWeightingMethod::Wfwhm => stack_cmd.push_str(" -weight=wfwhm"),
+        ImageWeightingMethod::Stars => stack_cmd.push_str(" -weight=nbstars"),
+        ImageWeightingMethod::Noise => stack_cmd.push_str(" -weight=noise"),
+        ImageWeightingMethod::ExposureTime => stack_cmd.push_str(" -weight=itime"),
+    }
+
+    if group.camera_type == CameraType::Osc {
+        stack_cmd.push_str(" -rgb_equal");
+    }
+
+    stack_cmd.push_str(&format!(" -out={}", output_path.to_string_lossy()));
+    script.push_str(&format!("{}\n", stack_cmd));
+
+    script.push_str("close\n");
+
+    let script_path = output_dir.join(&script_name);
+    fs::write(&script_path, &script)
+        .with_context(|| format!("Failed to write stacking script to {:?}", script_path))?;
+
+    Ok(script_path)
+}
+
+/// Get information about generated per-step scripts for pipeline building
+pub struct PerStepScriptInfo {
+    /// Path to the script
+    pub script_path: PathBuf,
+    /// Master set ID (for master scripts)
+    pub set_id: Option<i64>,
+    /// Master type (Bias, Dark, DarkFlat, Flat)
+    pub master_type: Option<String>,
+    /// Branch index (for calibration scripts)
+    pub branch_index: Option<usize>,
+    /// Branch ID
+    pub branch_id: Option<String>,
+    /// Camera type (for registration/stacking scripts)
+    pub camera_type: Option<CameraType>,
+    /// Filter (for stacking scripts)
+    pub filter: Option<String>,
+    /// Frame count
+    pub frame_count: usize,
+    /// Step dependencies (set IDs that must complete first)
+    pub depends_on_sets: Vec<i64>,
+}
+
+/// Get script info for all per-step scripts without generating them
+pub fn get_per_step_script_info(
+    config: &ExportConfig,
+    folders: &SirilFolders,
+    data: &ExportDataV3,
+) -> Vec<PerStepScriptInfo> {
+    let mut info = Vec::new();
+
+    let scripts_dir = folders.root.join("scripts");
+    let masters_dir = scripts_dir.join("00_masters");
+    let calibrate_dir = scripts_dir.join("01_calibrate");
+    let register_dir = scripts_dir.join("02_register");
+    let stack_dir = scripts_dir.join("03_stack");
+
+    // Master script info
+    if config.create_masters {
+        for (_idx, master) in data.master_plan.masters.iter().enumerate() {
+            let type_lower = master.master_type.to_lowercase();
+            // Deterministic naming based on set_id (not iteration index)
+            let script_name = format!("master_{}_{}.ssf", type_lower, master.set_id);
+
+            info.push(PerStepScriptInfo {
+                script_path: masters_dir.join(&script_name),
+                set_id: Some(master.set_id),
+                master_type: Some(master.master_type.clone()),
+                branch_index: None,
+                branch_id: None,
+                camera_type: None,
+                filter: None,
+                frame_count: master.source_frames.len(),
+                depends_on_sets: master.depends_on.clone(),
+            });
+        }
+    }
+
+    // Branch calibration script info
+    for (idx, branch) in data.branches.iter().enumerate() {
+        // Deterministic naming based on branch_id (not iteration index)
+        let branch_id_safe = sanitize_folder_name(&branch.branch_id);
+        let script_name = format!("calibrate_{}.ssf", branch_id_safe);
+
+        // Collect dependencies - all masters used by this branch
+        let mut depends = Vec::new();
+        if branch.bias_id > 0 { depends.push(branch.bias_id); }
+        if branch.dark_id > 0 { depends.push(branch.dark_id); }
+        if branch.flat_id > 0 { depends.push(branch.flat_id); }
+        if branch.darkflat_id > 0 { depends.push(branch.darkflat_id); }
+
+        info.push(PerStepScriptInfo {
+            script_path: calibrate_dir.join(&script_name),
+            set_id: None,
+            master_type: None,
+            branch_index: Some(idx),
+            branch_id: Some(branch.branch_id.clone()),
+            camera_type: Some(if branch.is_osc() { CameraType::Osc } else { CameraType::Mono }),
+            filter: branch.filter.clone(),
+            frame_count: branch.light_frames.len(),
+            depends_on_sets: depends,
+        });
+    }
+
+    // Registration script info
+    let has_mono = data.branches.iter().any(|b| !b.is_osc());
+    let has_osc = data.branches.iter().any(|b| b.is_osc());
+
+    if has_mono {
+        let frame_count: usize = data.branches.iter()
+            .filter(|b| !b.is_osc())
+            .map(|b| b.light_frames.len())
+            .sum();
+
+        info.push(PerStepScriptInfo {
+            script_path: register_dir.join("01_register_mono.ssf"),
+            set_id: None,
+            master_type: None,
+            branch_index: None,
+            branch_id: None,
+            camera_type: Some(CameraType::Mono),
+            filter: None,
+            frame_count,
+            depends_on_sets: Vec::new(), // Depends on all calibration branches (tracked at step level)
+        });
+    }
+
+    if has_osc {
+        let frame_count: usize = data.branches.iter()
+            .filter(|b| b.is_osc())
+            .map(|b| b.light_frames.len())
+            .sum();
+
+        info.push(PerStepScriptInfo {
+            script_path: register_dir.join("01_register_osc.ssf"),
+            set_id: None,
+            master_type: None,
+            branch_index: None,
+            branch_id: None,
+            camera_type: Some(CameraType::Osc),
+            filter: None,
+            frame_count,
+            depends_on_sets: Vec::new(),
+        });
+    }
+
+    // Stacking script info
+    use crate::export::models::GlobalRegistrationPlan;
+    let plan = GlobalRegistrationPlan::from_export_data(data);
+    let stacking_groups = plan.stacking_groups(
+        &config.exptime_tolerance_mode,
+        config.exptime_tolerance_value,
+    );
+
+    for (_idx, group) in stacking_groups.iter().enumerate() {
+        let filter_safe = group.filter.as_ref()
+            .map(|f| sanitize_folder_name(f))
+            .unwrap_or_else(|| "unfiltered".to_string());
+        let camera_suffix = group.camera_type.display_name().to_lowercase();
+
+        // Deterministic naming based on filter+camera (not iteration index)
+        let script_name = format!("stack_{}_{}.ssf", filter_safe, camera_suffix);
+
+        info.push(PerStepScriptInfo {
+            script_path: stack_dir.join(&script_name),
+            set_id: None,
+            master_type: None,
+            branch_index: None,
+            branch_id: None,
+            camera_type: Some(group.camera_type.clone()),
+            filter: group.filter.clone(),
+            frame_count: group.frame_indices.len(),
+            depends_on_sets: Vec::new(), // Depends on registration (tracked at step level)
+        });
+    }
+
+    info
 }
 
 // ============================================================================
@@ -361,6 +1024,107 @@ requires 1.2.0
     let script_path = folders.root.join("01_calibrate_lights.ssf");
     fs::write(&script_path, &script)
         .with_context(|| format!("Failed to write calibration script to {:?}", script_path))?;
+
+    println!("  Created: {:?}", script_path);
+    Ok(script_path)
+}
+
+/// Generate 02_register_branches.ssf - Per-branch registration with branch-specific optics
+///
+/// This script handles the CRITICAL FIX for multi-group scenarios:
+/// - Each branch is plate-solved and registered with ITS OWN focal length and pixel size
+/// - This prevents the "Cannot add an image with different properties" error
+/// - After this script runs, each branch has r_pp_lights_*.fit files ready for merge
+///
+/// Workflow per branch:
+/// 1. cd to branch directory
+/// 2. convert pp_lights to create sequence
+/// 3. seqplatesolve with BRANCH-SPECIFIC focal/pixelsize
+/// 4. register -2pass (auto-selects best reference frame within branch)
+/// 5. seqapplyreg -framing=max (creates r_pp_lights_*.fit files)
+pub fn generate_register_branches_script(
+    config: &ExportConfig,
+    folders: &SirilFolders,
+    data: &ExportDataV3,
+) -> Result<PathBuf> {
+    let mut script = String::new();
+
+    // Count branches with >= 2 frames (Siril requirement)
+    let valid_branches: Vec<_> = data.branches.iter()
+        .enumerate()
+        .filter(|(_, b)| b.light_frames.len() >= 2)
+        .collect();
+
+    let total_frames: usize = valid_branches.iter()
+        .map(|(_, b)| b.light_frames.len())
+        .sum();
+
+    script.push_str(&format!(
+        r#"############################################
+# Siril Per-Branch Registration Script
+# Generated by Athenaeum
+#
+# MULTI-GROUP FIX: Each branch is registered with its own
+# focal length and pixel size, preventing "different properties" errors.
+#
+# Branches: {} (with >= 2 frames)
+# Total frames: {}
+############################################
+
+requires 1.3.0
+
+"#,
+        valid_branches.len(),
+        total_frames
+    ));
+
+    // Process each branch with its own optical parameters
+    for (idx, branch) in &valid_branches {
+        let (focal_length, pixel_size) = get_branch_optics(branch);
+        let lights_path = folders.lights_path(branch, *idx);
+
+        script.push_str(&format!(
+            "# ========== Branch {} of {}: {} ==========\n",
+            idx + 1,
+            valid_branches.len(),
+            branch.branch_id
+        ));
+        script.push_str(&format!("# Camera: {}\n", branch.camera_name));
+        script.push_str(&format!(
+            "# Filter: {}\n",
+            branch.filter.as_deref().unwrap_or("None")
+        ));
+        script.push_str(&format!("# Frames: {}\n", branch.light_frames.len()));
+        script.push_str(&format!("# Focal: {:.1}mm, Pixel: {:.2}µm\n", focal_length, pixel_size));
+        script.push_str("\n");
+
+        // Step 1: cd to branch directory
+        script.push_str(&format!("cd {}\n", lights_path.to_string_lossy()));
+
+        // Step 2: Convert to sequence
+        script.push_str("convert pp_lights -out=. -fitseq\n\n");
+
+        // Step 3: Plate solve with BRANCH-SPECIFIC optics
+        script.push_str(&format!(
+            "seqplatesolve pp_lights -focal={:.1} -pixelsize={:.2}\n\n",
+            focal_length, pixel_size
+        ));
+
+        // Step 4: Register with -2pass
+        script.push_str("# -2pass auto-selects best reference frame within this branch\n");
+        let register_cmd = build_register_command(config, "pp_lights");
+        script.push_str(&format!("{}\n\n", register_cmd));
+
+        // Step 5: Apply registration with max framing
+        script.push_str("# Apply registration - creates r_pp_lights_*.fit files\n");
+        script.push_str("seqapplyreg pp_lights -framing=max\n\n");
+    }
+
+    script.push_str("close\n");
+
+    let script_path = folders.root.join("02_register_branches.ssf");
+    fs::write(&script_path, &script)
+        .with_context(|| format!("Failed to write per-branch registration script to {:?}", script_path))?;
 
     println!("  Created: {:?}", script_path);
     Ok(script_path)
@@ -701,22 +1465,33 @@ fn generate_stack_commands_for_groups(
     }
 }
 
-/// Get focal length and pixel size from export data
+/// Get focal length and pixel size from export data (global, uses first available)
 /// Falls back to reasonable defaults if not available
 ///
-/// Note: Pixel size is not currently stored in ExportFrame, so we use defaults
-/// based on common camera sensors. For accurate plate solving, users should
-/// ensure FOCALLEN is set in their FITS headers.
+/// Note: For multi-telescope setups, use `get_branch_optics()` instead to get
+/// per-branch optical parameters.
 fn get_optics_params(data: &ExportDataV3) -> (f64, f64) {
     // Try to get focal length from first branch with valid data
     let mut focal = 0.0;
+    let mut pixel_size = 0.0;
     for branch in &data.branches {
         if let Some(frame) = branch.light_frames.first() {
-            if let Some(f) = frame.focallen {
-                if f > 0.0 {
-                    focal = f;
-                    break;
+            if focal <= 0.0 {
+                if let Some(f) = frame.focallen {
+                    if f > 0.0 {
+                        focal = f;
+                    }
                 }
+            }
+            if pixel_size <= 0.0 {
+                if let Some(p) = frame.xpixsz {
+                    if p > 0.0 {
+                        pixel_size = p;
+                    }
+                }
+            }
+            if focal > 0.0 && pixel_size > 0.0 {
+                break;
             }
         }
     }
@@ -732,7 +1507,29 @@ fn get_optics_params(data: &ExportDataV3) -> (f64, f64) {
     // ASI533/QHY533: 3.76um
     // ASI294/QHY294: 4.63um
     // ASI1600/QHY163: 3.8um
-    let pixel_size = 3.76;
+    if pixel_size <= 0.0 {
+        pixel_size = 3.76;
+    }
+
+    (focal, pixel_size)
+}
+
+/// Get focal length and pixel size for a specific calibration branch
+///
+/// Each branch may have different optical parameters (different telescope, camera).
+/// Returns (focal_length_mm, pixel_size_um) with fallback to defaults.
+fn get_branch_optics(branch: &crate::export::models::CalibrationBranch) -> (f64, f64) {
+    // Get focal length from branch's first light frame
+    let focal = branch.light_frames.first()
+        .and_then(|f| f.focallen)
+        .filter(|&f| f > 0.0)
+        .unwrap_or(500.0);  // Default fallback
+
+    // Get pixel size from branch's first light frame
+    let pixel_size = branch.light_frames.first()
+        .and_then(|f| f.xpixsz)
+        .filter(|&p| p > 0.0)
+        .unwrap_or(3.76);  // Default fallback
 
     (focal, pixel_size)
 }
