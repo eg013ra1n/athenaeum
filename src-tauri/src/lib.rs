@@ -17,6 +17,7 @@ mod selection;
 mod frames_set_metadata;
 mod frames_set_merge;
 mod export;
+mod stacking;
 
 // Commands (Tauri API endpoints)
 mod commands;
