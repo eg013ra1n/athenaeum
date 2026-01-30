@@ -672,5 +672,60 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Stacking jobs table - tracks stacking pipeline executions
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_set_id INTEGER NOT NULL,
+            output_dir TEXT NOT NULL,
+            config TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT,
+            completed_at TEXT,
+            error_message TEXT,
+            FOREIGN KEY (frame_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Stacking steps table - granular step tracking for stacking pipeline
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stacking_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            step_order INTEGER NOT NULL,
+            step_type TEXT NOT NULL,
+            step_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed', 'skipped')),
+            started_at TEXT,
+            completed_at TEXT,
+            error_message TEXT,
+            output_files TEXT,
+            stats TEXT,
+            FOREIGN KEY (job_id) REFERENCES stacking_jobs(id) ON DELETE CASCADE,
+            UNIQUE(job_id, step_order)
+        )",
+        [],
+    )?;
+
+    // Indexes for stacking pipeline tables
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stacking_jobs_frame_set ON stacking_jobs(frame_set_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stacking_jobs_status ON stacking_jobs(status)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stacking_steps_job ON stacking_steps(job_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stacking_steps_status ON stacking_steps(status)",
+        [],
+    )?;
+
     Ok(())
 }

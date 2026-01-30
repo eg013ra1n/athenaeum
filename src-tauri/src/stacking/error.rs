@@ -28,6 +28,12 @@ pub enum StackingError {
     #[error("Image dimensions mismatch: expected {expected}, got {actual}")]
     DimensionsMismatch { expected: String, actual: String },
 
+    #[error("Dimension mismatch: expected {expected}, got {actual}")]
+    DimensionMismatch { expected: String, actual: String },
+
+    #[error("Process execution failed: {0}")]
+    ProcessError(String),
+
     // Memory Errors
     #[error("Memory allocation failed")]
     AllocationError,

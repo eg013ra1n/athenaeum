@@ -193,6 +193,15 @@ pub fn run() {
             commands::get_pipeline_plan,
             commands::delete_export_job,
             commands::get_job_history,
+            // Stacking commands
+            commands::check_stacking_available,
+            commands::get_default_stacking_config,
+            commands::create_stacking_job,
+            commands::get_stacking_job,
+            commands::get_stacking_jobs,
+            commands::start_stacking_job,
+            commands::cancel_stacking_job,
+            commands::delete_stacking_job,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

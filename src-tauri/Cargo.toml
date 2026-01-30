@@ -14,16 +14,8 @@ edition = "2021"
 name = "athenaeum_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-default = []
-# Enable direct FFI to Siril C stacking library (requires compiled C library)
-siril-ffi = []
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# Will be enabled later for C compilation:
-# cc = "1"
-# bindgen = "0.69"
 
 [dependencies]
 tauri = { version = "2", features = [] }
