@@ -41,14 +41,15 @@ pub fn organize_files_wbpp(
     for group in &data.groups {
         for subgroup in &group.subgroups {
             // Get camera name from first frame
-            let camera = subgroup
+            let camera_name = subgroup
                 .frames
                 .first()
                 .and_then(|f| f.instrume.as_ref())
                 .map(|s| sanitize_folder_name(s))
-                .unwrap_or_else(|| "unknown_camera".to_string());
+                .unwrap_or_else(|| "unknown".to_string());
+            let camera_folder = format!("camera_{}", camera_name);
 
-            let camera_dir = output_dir.join(&camera);
+            let camera_dir = output_dir.join(&camera_folder);
             let darks_dir = camera_dir.join("darks");
 
             // Create camera directories

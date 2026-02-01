@@ -409,3 +409,233 @@ pub struct ExportResult {
     /// Error message if failed
     pub error: Option<String>,
 }
+
+// ============================================================================
+// Export Summary Models (Enhanced UI)
+// ============================================================================
+
+/// Complete export summary for the enhanced UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSummary {
+    /// Frame set ID
+    pub frame_set_id: i64,
+    /// Frame set name
+    pub frame_set_name: String,
+    /// Object name (target)
+    pub object_name: Option<String>,
+    /// Unique cameras used
+    pub cameras: Vec<String>,
+    /// Unique telescopes used
+    pub telescopes: Vec<String>,
+    /// Date range of sessions (start, end)
+    pub date_range: Option<(String, String)>,
+    /// Filter groups with full breakdown
+    pub filter_groups: Vec<FilterGroupSummary>,
+    /// Folder structure preview
+    pub folder_preview: FolderPreview,
+    /// Detailed warnings
+    pub warnings: Vec<DetailedWarning>,
+    /// Total file count
+    pub total_files: i32,
+    /// Estimated total size in bytes
+    pub estimated_size_bytes: u64,
+}
+
+/// Summary for a single filter group (filter + camera type combination)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterGroupSummary {
+    /// Filter name (None for unfiltered/luminance)
+    pub filter: Option<String>,
+    /// Camera type (OSC or Mono)
+    pub camera_type: CameraType,
+    /// Camera/instrument name
+    pub camera: Option<String>,
+    /// Telescope name
+    pub telescope: Option<String>,
+    /// Gain setting
+    pub gain: Option<f64>,
+    /// Offset setting
+    pub offset: Option<f64>,
+    /// Binning mode (e.g., "1x1")
+    pub binning: Option<String>,
+    /// Average CCD temperature
+    pub avg_temp: Option<f64>,
+    /// Exposure breakdown by exposure time
+    pub exposure_groups: Vec<ExposureGroup>,
+    /// Total exposure time in seconds
+    pub total_exposure: f64,
+    /// Total frame count
+    pub frame_count: i32,
+    /// Linked flat calibration info
+    pub flat_info: Option<CalibrationDetail>,
+    /// Linked dark calibration info
+    pub dark_info: Option<CalibrationDetail>,
+    /// Linked bias calibration info
+    pub bias_info: Option<CalibrationDetail>,
+    /// All frames in this group (for expandable list)
+    pub frames: Vec<FrameDetail>,
+}
+
+/// Exposure time group (frames with same exposure)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposureGroup {
+    /// Exposure time in seconds
+    pub exptime: f64,
+    /// Number of frames with this exposure
+    pub count: i32,
+    /// Total exposure time for this group (exptime * count)
+    pub total_seconds: f64,
+}
+
+/// Detailed calibration information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationDetail {
+    /// Calibration set ID
+    pub set_id: i64,
+    /// Calibration type (Flat, Dark, Bias, DarkFlat)
+    pub calibration_type: String,
+    /// Number of calibration frames
+    pub frame_count: i32,
+    /// Average exposure time (for darks/flats)
+    pub avg_exptime: Option<f64>,
+    /// Average CCD temperature
+    pub avg_temp: Option<f64>,
+    /// Match quality score (0.0 - 1.0)
+    pub match_score: f64,
+    /// Date range of calibration frames (start, end)
+    pub date_range: Option<(String, String)>,
+    /// Specific warnings for this calibration
+    pub warnings: Vec<String>,
+    /// Sub-calibrations (e.g., Flat -> Dark -> Bias chain)
+    pub sub_calibrations: Vec<CalibrationDetail>,
+}
+
+/// Individual frame detail for expandable list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameDetail {
+    /// Frame ID
+    pub frame_id: i64,
+    /// Filename
+    pub filename: String,
+    /// Full file path
+    pub file_path: String,
+    /// Date observed
+    pub date_obs: Option<String>,
+    /// Exposure time in seconds
+    pub exptime: Option<f64>,
+    /// CCD temperature
+    pub temp: Option<f64>,
+    /// Gain setting
+    pub gain: Option<f64>,
+    /// Offset setting
+    pub offset: Option<f64>,
+    /// Calibration chain description (e.g., "Flat #12 → Dark #8 → Bias #3")
+    pub calibration_chain: String,
+    /// File size in bytes (if known)
+    pub file_size: Option<u64>,
+}
+
+/// Folder structure preview for export
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderPreview {
+    /// Root folder name
+    pub root_name: String,
+    /// Folder structure tree
+    pub structure: Vec<FolderNode>,
+    /// Total file count
+    pub total_files: i32,
+    /// Estimated total size (human readable)
+    pub estimated_size: String,
+}
+
+/// A node in the folder structure tree
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderNode {
+    /// Node name (folder or file name)
+    pub name: String,
+    /// Node type
+    pub node_type: FolderNodeType,
+    /// File count (for folders)
+    pub file_count: Option<i32>,
+    /// Description (e.g., "← 50 darks, 100 bias")
+    pub description: Option<String>,
+    /// Child nodes
+    pub children: Vec<FolderNode>,
+}
+
+/// Type of folder node
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderNodeType {
+    /// A folder
+    Folder,
+    /// A file
+    File,
+    /// Placeholder for multiple files (e.g., "... 50 more files")
+    Ellipsis,
+}
+
+/// Detailed warning with full context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailedWarning {
+    /// Warning type
+    pub warning_type: WarningType,
+    /// Warning severity
+    pub severity: WarningSeverity,
+    /// Short title
+    pub title: String,
+    /// Detailed description
+    pub description: String,
+    /// Related calibration set ID (if applicable)
+    pub set_id: Option<i64>,
+    /// Related filter (if applicable)
+    pub filter: Option<String>,
+    /// Actual value (for mismatches)
+    pub actual_value: Option<String>,
+    /// Expected value (for mismatches)
+    pub expected_value: Option<String>,
+    /// Delta/difference (for numeric comparisons)
+    pub delta: Option<String>,
+    /// Recommendation text
+    pub recommendation: Option<String>,
+}
+
+/// Warning type categories
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningType {
+    /// Temperature mismatch between lights and calibration
+    TemperatureMismatch,
+    /// Calibration frames are old compared to lights
+    CalibrationAge,
+    /// Missing calibration (using fallback)
+    MissingCalibration,
+    /// Gain/offset mismatch
+    GainOffsetMismatch,
+    /// Binning mismatch
+    BinningMismatch,
+    /// Exposure time mismatch
+    ExposureMismatch,
+    /// General warning
+    General,
+}
+
+/// Warning severity levels
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningSeverity {
+    /// Informational (won't affect results much)
+    Info,
+    /// Warning (may affect results)
+    Warning,
+    /// Error (likely to cause issues)
+    Error,
+}

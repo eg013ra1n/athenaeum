@@ -3,11 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Folder, Loader2, Check, AlertCircle, Play } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
-import { CalibrationTreeView } from './CalibrationTreeView';
-import {
-  useExportableFrameSets,
-  useCalibrationRoute,
-} from '../../hooks/useExportData';
+import { ExportSummary } from './ExportSummary';
+import { useExportableFrameSets } from '../../hooks/useExportData';
 import type { ExportResult } from '../../types/export';
 
 interface ExportWizardProps {
@@ -26,7 +23,6 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
 
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
-  const { route: calibrationRoute, loading: loadingRoute } = useCalibrationRoute(selectedFrameSetId);
 
   // Handle folder selection
   const handleSelectFolder = useCallback(async () => {
@@ -88,63 +84,11 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         />
       </section>
 
-      {/* Step 2: Calibration Summary */}
+      {/* Step 2: Export Summary */}
       {selectedFrameSetId && (
         <section className="bg-surface-elevated rounded-lg p-4">
-          <h3 className="text-lg font-medium mb-3">2. Calibration Summary</h3>
-
-          {loadingRoute ? (
-            <div className="flex items-center gap-2 text-content-muted">
-              <Loader2 className="animate-spin" size={16} />
-              Loading calibration data...
-            </div>
-          ) : calibrationRoute ? (
-            <div className="space-y-4">
-              {/* Summary Stats */}
-              <div className="mb-4">
-                <div className="text-sm text-content-muted mb-2">
-                  {calibrationRoute.summary.totalLights} light frames in{' '}
-                  {calibrationRoute.summary.groupCount} groups •{' '}
-                  {(calibrationRoute.summary.totalExposure / 3600).toFixed(1)}h total
-                </div>
-                {/* Completeness badges */}
-                <div className="flex gap-2">
-                  <StatusBadge
-                    label="Flats"
-                    complete={calibrationRoute.summary.flatsComplete}
-                  />
-                  <StatusBadge
-                    label="Darks"
-                    complete={calibrationRoute.summary.darksComplete}
-                  />
-                  <StatusBadge
-                    label="Bias"
-                    complete={calibrationRoute.summary.biasComplete}
-                  />
-                </div>
-              </div>
-
-              {/* Calibration Tree */}
-              <CalibrationTreeView groups={calibrationRoute.groups} />
-
-              {/* Warnings */}
-              {calibrationRoute.summary.warnings.length > 0 && (
-                <div className="p-3 bg-warning-muted border border-warning/30 rounded-lg">
-                  <div className="flex items-center gap-2 text-warning mb-2">
-                    <AlertCircle size={16} />
-                    <span className="font-medium">Warnings</span>
-                  </div>
-                  <ul className="text-sm text-warning/80 space-y-1">
-                    {calibrationRoute.summary.warnings.map((warning, index) => (
-                      <li key={index}>• {warning}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="text-content-muted">No calibration data available</div>
-          )}
+          <h3 className="text-lg font-medium mb-3">2. Export Summary</h3>
+          <ExportSummary frameSetId={selectedFrameSetId} />
         </section>
       )}
 
@@ -272,25 +216,5 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
         </button>
       )}
     </div>
-  );
-}
-
-// Helper component for calibration status badges
-interface StatusBadgeProps {
-  label: string;
-  complete: boolean;
-}
-
-function StatusBadge({ label, complete }: StatusBadgeProps) {
-  return (
-    <span
-      className={`px-2 py-1 rounded text-xs font-medium ${
-        complete
-          ? 'bg-success-muted text-success'
-          : 'bg-error-muted text-error'
-      }`}
-    >
-      {label}: {complete ? <Check size={12} className="inline" /> : '—'}
-    </span>
   );
 }

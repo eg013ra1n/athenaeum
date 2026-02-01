@@ -4,6 +4,7 @@ import type {
   ExportData,
   ExportableFrameSet,
   CalibrationRoute,
+  ExportSummary,
 } from '../types/export';
 
 interface UseExportDataResult {
@@ -127,4 +128,48 @@ export function useCalibrationRoute(frameSetId: number | null): UseCalibrationRo
   }, [loadData]);
 
   return { route, loading, error, refresh: loadData };
+}
+
+interface UseExportSummaryResult {
+  summary: ExportSummary | null;
+  loading: boolean;
+  error: string | null;
+  refresh: () => void;
+}
+
+/**
+ * Hook to fetch enhanced export summary for the new UI
+ * Returns comprehensive data with equipment info, filter breakdowns, and detailed warnings
+ */
+export function useExportSummary(frameSetId: number | null): UseExportSummaryResult {
+  const [summary, setSummary] = useState<ExportSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadData = useCallback(async () => {
+    if (frameSetId === null) {
+      setSummary(null);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+      const result = await invoke<ExportSummary>('get_export_summary', {
+        frameSetId,
+      });
+      setSummary(result);
+    } catch (err) {
+      setError(err as string);
+      setSummary(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [frameSetId]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  return { summary, loading, error, refresh: loadData };
 }

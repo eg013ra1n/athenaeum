@@ -4,10 +4,10 @@
 
 use crate::commands::AppState;
 use crate::export::{
-    collect_export_data, organize_files_wbpp,
+    collect_export_data, collect_export_summary, organize_files_wbpp,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
-        ExportData, ExportResult, SirilScriptPreview,
+        ExportData, ExportResult, ExportSummary, SirilScriptPreview,
     },
 };
 use std::path::PathBuf;
@@ -377,4 +377,24 @@ pub async fn export_to_wbpp(
             error: Some(format!("Failed to organize files: {}", e)),
         }),
     }
+}
+
+/// Get enhanced export summary for the new UI
+///
+/// Returns comprehensive export data with:
+/// - Equipment info (cameras, telescopes, date range)
+/// - Filter groups with exposure breakdown
+/// - Calibration details with match quality
+/// - Folder structure preview
+/// - Detailed warnings with context
+#[tauri::command]
+pub async fn get_export_summary(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+) -> Result<ExportSummary, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    collect_export_summary(&conn, frame_set_id).map_err(|e| e.to_string())
 }

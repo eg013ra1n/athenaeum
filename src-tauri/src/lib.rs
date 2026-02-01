@@ -171,6 +171,7 @@ pub fn run() {
             commands::get_exportable_frame_sets,
             commands::get_calibration_route,
             commands::export_to_wbpp,
+            commands::get_export_summary,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())
