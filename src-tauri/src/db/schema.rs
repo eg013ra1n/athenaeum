@@ -317,65 +317,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Export jobs table - tracks export pipeline executions with checkpoint support
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS export_jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            frame_set_id INTEGER NOT NULL,
-            output_dir TEXT NOT NULL,
-            target TEXT NOT NULL CHECK(target IN ('siril', 'pixinsight_wbpp')),
-            config_json TEXT NOT NULL,
-            status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'paused', 'completed', 'failed', 'cancelled')),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            started_at TEXT,
-            completed_at TEXT,
-            error_message TEXT,
-            total_steps INTEGER NOT NULL DEFAULT 0,
-            completed_steps INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (frame_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
-        )",
-        [],
-    )?;
-
-    // Export job steps table - granular step tracking for resume/retry capability
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS export_job_steps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id INTEGER NOT NULL,
-            step_order INTEGER NOT NULL,
-            step_type TEXT NOT NULL,
-            step_name TEXT NOT NULL,
-            step_data_json TEXT,
-            status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed', 'skipped')),
-            started_at TEXT,
-            completed_at TEXT,
-            error_message TEXT,
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            output_files_json TEXT,
-            FOREIGN KEY (job_id) REFERENCES export_jobs(id) ON DELETE CASCADE,
-            UNIQUE(job_id, step_order)
-        )",
-        [],
-    )?;
-
-    // Export job files table - tracks source/output files for validation
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS export_job_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id INTEGER NOT NULL,
-            step_id INTEGER,
-            file_type TEXT NOT NULL CHECK(file_type IN ('source', 'calibration', 'output', 'intermediate')),
-            file_path TEXT NOT NULL,
-            expected_path TEXT,
-            file_exists INTEGER NOT NULL DEFAULT 0,
-            file_size INTEGER,
-            validated_at TEXT,
-            FOREIGN KEY (job_id) REFERENCES export_jobs(id) ON DELETE CASCADE,
-            FOREIGN KEY (step_id) REFERENCES export_job_steps(id) ON DELETE CASCADE
-        )",
-        [],
-    )?;
-
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -504,32 +445,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_members_frame ON session_members(frame_id)",
-        [],
-    )?;
-
-    // Indexes for export pipeline tables
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_export_jobs_status ON export_jobs(status)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_export_jobs_frame_set ON export_jobs(frame_set_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_export_job_steps_job ON export_job_steps(job_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_export_job_steps_status ON export_job_steps(status)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_export_job_files_job ON export_job_files(job_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_export_job_files_step ON export_job_files(step_id)",
         [],
     )?;
 
@@ -669,61 +584,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             saved_at TEXT NOT NULL,
             FOREIGN KEY (set_id) REFERENCES calibration_set(id) ON DELETE CASCADE
         )",
-        [],
-    )?;
-
-    // Stacking jobs table - tracks stacking pipeline executions
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS stacking_jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            frame_set_id INTEGER NOT NULL,
-            output_dir TEXT NOT NULL,
-            config TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'paused', 'completed', 'failed', 'cancelled')),
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            started_at TEXT,
-            completed_at TEXT,
-            error_message TEXT,
-            FOREIGN KEY (frame_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
-        )",
-        [],
-    )?;
-
-    // Stacking steps table - granular step tracking for stacking pipeline
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS stacking_steps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_id INTEGER NOT NULL,
-            step_order INTEGER NOT NULL,
-            step_type TEXT NOT NULL,
-            step_name TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed', 'skipped')),
-            started_at TEXT,
-            completed_at TEXT,
-            error_message TEXT,
-            output_files TEXT,
-            stats TEXT,
-            FOREIGN KEY (job_id) REFERENCES stacking_jobs(id) ON DELETE CASCADE,
-            UNIQUE(job_id, step_order)
-        )",
-        [],
-    )?;
-
-    // Indexes for stacking pipeline tables
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_stacking_jobs_frame_set ON stacking_jobs(frame_set_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_stacking_jobs_status ON stacking_jobs(status)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_stacking_steps_job ON stacking_steps(job_id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_stacking_steps_status ON stacking_steps(status)",
         [],
     )?;
 

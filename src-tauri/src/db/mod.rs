@@ -19,7 +19,6 @@ use std::sync::Mutex;
 /// Database connection wrapper
 pub struct Database {
     conn: Mutex<Connection>,
-    path: PathBuf,
 }
 
 impl Database {
@@ -43,17 +42,11 @@ impl Database {
         init_db(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            path,
         })
     }
 
     /// Get a connection lock
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
-    }
-
-    /// Get the database file path
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
     }
 }

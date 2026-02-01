@@ -1,5 +1,5 @@
 import { Outlet, NavLink } from 'react-router-dom';
-import { Files, Calendar, Target, Map, Camera, Upload, Settings, Trash2 } from 'lucide-react';
+import { Files, Calendar, Target, Map, Camera, Layers, Settings, Trash2 } from 'lucide-react';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
 import Logo from '../assets/athenaeum.svg';
@@ -11,7 +11,7 @@ export default function Layout() {
     { to: '/objects', icon: Target, label: 'Objects' },
     { to: '/skyatlas', icon: Map, label: 'Sky Atlas' },
     { to: '/equipment', icon: Camera, label: 'Equipment' },
-    { to: '/export', icon: Upload, label: 'Export' },
+    { to: '/export', icon: Layers, label: 'Export' },
     { to: '/blackhole', icon: Trash2, label: 'Black Hole' },
     { to: '/settings', icon: Settings, label: 'Settings' },
   ];

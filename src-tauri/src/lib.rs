@@ -17,7 +17,6 @@ mod selection;
 mod frames_set_metadata;
 mod frames_set_merge;
 mod export;
-mod stacking;
 
 // Commands (Tauri API endpoints)
 mod commands;
@@ -167,41 +166,11 @@ pub fn run() {
             commands::bulk_restore_calibration_metadata,
             commands::get_custom_metadata_set_ids,
             commands::get_calibration_set_originals,
+            // Export commands
             commands::get_export_preview,
-            commands::get_calibration_route,
-            commands::get_export_groups_summary,
-            commands::get_siril_path,
-            commands::set_siril_path,
             commands::get_exportable_frame_sets,
-            commands::diagnose_calibration_links,
-            commands::export_frame_set_v3,
-            commands::get_export_preview_v3,
-            commands::organize_registered_files_cmd,
-            commands::get_registered_files_status,
-            commands::run_siril_export_pipeline,
-            commands::run_siril_export_pipeline_v2,
-            // Pipeline job management commands
-            commands::create_export_job,
-            commands::get_export_job,
-            commands::get_export_jobs,
-            commands::start_export_job,
-            commands::pause_export_job,
-            commands::cancel_export_job,
-            commands::resume_export_job,
-            commands::retry_failed_step,
-            commands::validate_export_sources,
-            commands::get_pipeline_plan,
-            commands::delete_export_job,
-            commands::get_job_history,
-            // Stacking commands
-            commands::check_stacking_available,
-            commands::get_default_stacking_config,
-            commands::create_stacking_job,
-            commands::get_stacking_job,
-            commands::get_stacking_jobs,
-            commands::start_stacking_job,
-            commands::cancel_stacking_job,
-            commands::delete_stacking_job,
+            commands::get_calibration_route,
+            commands::export_to_wbpp,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

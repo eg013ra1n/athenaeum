@@ -4,12 +4,11 @@ export default function Export() {
   return (
     <div className="p-6">
       <div className="mb-6">
-        <h2 className="text-3xl font-bold mb-2">Export to Siril</h2>
+        <h2 className="text-3xl font-bold mb-2">Export</h2>
         <p className="text-content-muted">
-          Export frame sets for processing with Siril - organize files, generate scripts, and run calibration
+          Organize frame sets into PixInsight WBPP folder structure
         </p>
       </div>
-
       <ExportWizard />
     </div>
   );

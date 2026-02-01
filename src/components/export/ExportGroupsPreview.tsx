@@ -8,43 +8,40 @@ import {
   AlertTriangle,
   Layers,
 } from 'lucide-react';
-import type { ExportGroupsSummary, ExportGroupInfo } from '../../types/export';
+import type { ExportGroup } from '../../types/export';
 
 interface ExportGroupsPreviewProps {
-  summary: ExportGroupsSummary;
+  groups: ExportGroup[];
+  totalFrames: number;
+  totalExposure: number;
 }
 
-export function ExportGroupsPreview({ summary }: ExportGroupsPreviewProps) {
+export function ExportGroupsPreview({ groups, totalFrames, totalExposure }: ExportGroupsPreviewProps) {
   return (
     <div className="space-y-4">
       {/* Overall Summary */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         <SummaryCard
           icon={<Layers size={16} />}
           label="Groups"
-          value={summary.totalGroups}
+          value={groups.length}
         />
         <SummaryCard
           icon={<Sun size={16} />}
           label="Frames"
-          value={summary.totalFrames}
+          value={totalFrames}
         />
         <SummaryCard
           icon={<Camera size={16} />}
           label="Exposure"
-          value={formatExposure(summary.totalExposure)}
-        />
-        <SummaryCard
-          icon={<Moon size={16} />}
-          label="Masters"
-          value={summary.mastersToCreate}
+          value={formatExposure(totalExposure)}
         />
       </div>
 
       {/* Group Cards */}
       <div className="space-y-2">
         <h4 className="text-sm font-medium text-content-muted">Export Groups</h4>
-        {summary.groups.map((group) => (
+        {groups.map((group) => (
           <GroupCard key={group.groupKey} group={group} />
         ))}
       </div>
@@ -71,11 +68,16 @@ function SummaryCard({ icon, label, value }: SummaryCardProps) {
 }
 
 interface GroupCardProps {
-  group: ExportGroupInfo;
+  group: ExportGroup;
 }
 
 function GroupCard({ group }: GroupCardProps) {
-  const isOsc = group.cameraType === 'OSC';
+  const isOsc = group.cameraType === 'osc';
+
+  // Check calibration availability from subgroups
+  const hasFlat = group.subgroups.some(sg => sg.flat !== null);
+  const hasDark = group.subgroups.some(sg => sg.dark !== null);
+  const hasBias = group.subgroups.some(sg => sg.bias !== null);
 
   return (
     <div className="p-3 bg-surface-elevated/50 border border-border rounded-lg">
@@ -95,11 +97,11 @@ function GroupCard({ group }: GroupCardProps) {
           <div>
             <div className="font-medium text-content">{group.displayName}</div>
             <div className="flex items-center gap-3 text-sm text-content-muted">
-              <span>{group.frameCount} frames</span>
+              <span>{group.totalFrames} frames</span>
               <span>{formatExposure(group.totalExposure)}</span>
-              {group.subgroupCount > 1 && (
+              {group.subgroups.length > 1 && (
                 <span className="text-accent">
-                  {group.subgroupCount} subgroups
+                  {group.subgroups.length} subgroups
                 </span>
               )}
             </div>
@@ -110,17 +112,17 @@ function GroupCard({ group }: GroupCardProps) {
         <div className="flex items-center gap-2">
           <CalibrationBadge
             type="Flat"
-            available={group.hasFlat}
+            available={hasFlat}
             icon={<Circle size={12} />}
           />
           <CalibrationBadge
             type="Dark"
-            available={group.hasDark}
+            available={hasDark}
             icon={<Moon size={12} />}
           />
           <CalibrationBadge
             type="Bias"
-            available={group.hasBias}
+            available={hasBias}
             icon={<Circle size={12} />}
           />
         </div>
@@ -131,7 +133,7 @@ function GroupCard({ group }: GroupCardProps) {
         <div className="mt-2 flex items-start gap-2 p-2 bg-warning-muted rounded">
           <AlertTriangle size={14} className="text-warning mt-0.5 flex-shrink-0" />
           <div className="text-xs text-warning">
-            {group.warnings.map((w, i) => (
+            {group.warnings.map((w: string, i: number) => (
               <div key={i}>{w}</div>
             ))}
           </div>
