@@ -14,7 +14,7 @@ interface CalibrationSetTableProps {
   customMetadataSetIds?: number[];
 }
 
-type SortField = "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
+type SortField = "id" | "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
 type SortDirection = "asc" | "desc";
 
 export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration, customMetadataSetIds = [] }: CalibrationSetTableProps) {
@@ -117,6 +117,15 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
           <tr>
             <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
+                onClick={() => handleSort("id")}
+                className="flex items-center gap-1 hover:text-content transition-colors"
+              >
+                ID
+                <SortIcon field="id" />
+              </button>
+            </th>
+            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+              <button
                 onClick={() => handleSort("imagetyp")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
               >
@@ -217,6 +226,11 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     index % 2 === 0 ? "bg-surface-elevated" : "bg-surface"
                   } hover:bg-surface-hover cursor-pointer transition-colors`}
                 >
+                  {/* ID */}
+                  <td className="px-4 py-3 text-sm text-content-muted">
+                    {set.id ?? "—"}
+                  </td>
+
                   {/* Type */}
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1">
@@ -339,7 +353,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     key={`${rowId}-expanded`}
                     className="bg-surface border-t border-border"
                   >
-                    <td colSpan={showFilterColumn ? 10 : 9} className="px-4 py-4">
+                    <td colSpan={showFilterColumn ? 11 : 10} className="px-4 py-4">
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                         <div>
                           <span className="text-content-muted">Set ID:</span>
