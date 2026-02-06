@@ -800,13 +800,18 @@ pub async fn get_calibration_sets_for_manual_selection(
         _ => return Err(format!("Invalid calibration type: {}", calibration_type)),
     };
 
-    // Query all sets of this type (both regular and master)
+    // Query all sets of this type (both regular and master) with frame metadata
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
-                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library,
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
          FROM calibration_set cs
+         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+         LEFT JOIN frames f ON f.id = csf.frame_id
+         LEFT JOIN files fi ON fi.id = f.file_id
          WHERE cs.imagetyp IN (?1, ?2)
+         GROUP BY cs.id
          ORDER BY cs.is_master_library ASC, cs.date_start DESC"
     ).map_err(|e| e.to_string())?;
 
@@ -829,6 +834,12 @@ pub async fn get_calibration_sets_for_manual_selection(
             frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
             date_display: "".to_string(),  // Will be calculated
             is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
+            naxis1: row.get(16)?,
+            naxis2: row.get(17)?,
+            bayerpat: row.get(18)?,
+            swcreate: row.get(19)?,
+            xpixsz: row.get(20)?,
+            format: row.get(21)?,
         })
     }).map_err(|e| e.to_string())?;
 
@@ -1664,13 +1675,18 @@ pub async fn get_subcalibration_sets_for_manual_selection(
         _ => return Err(format!("Invalid calibration type for sub-calibration: {}", calibration_type)),
     };
 
-    // Query all sets of this type (both regular and master)
+    // Query all sets of this type (both regular and master) with frame metadata
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
-                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library,
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
          FROM calibration_set cs
+         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+         LEFT JOIN frames f ON f.id = csf.frame_id
+         LEFT JOIN files fi ON fi.id = f.file_id
          WHERE cs.imagetyp IN (?1, ?2)
+         GROUP BY cs.id
          ORDER BY cs.is_master_library ASC, cs.date_start DESC"
     ).map_err(|e| e.to_string())?;
 
@@ -1693,6 +1709,12 @@ pub async fn get_subcalibration_sets_for_manual_selection(
             frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
             date_display: "".to_string(),
             is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
+            naxis1: row.get(16)?,
+            naxis2: row.get(17)?,
+            bayerpat: row.get(18)?,
+            swcreate: row.get(19)?,
+            xpixsz: row.get(20)?,
+            format: row.get(21)?,
         })
     }).map_err(|e| e.to_string())?;
 

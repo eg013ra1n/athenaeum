@@ -247,6 +247,13 @@ pub struct CalibrationSetDetail {
     pub date_display: String,    // e.g., "2025-10"
     pub frame_count: i64,
     pub is_master: bool,         // True if this is a master calibration set
+    // Extended fields from frame metadata
+    pub naxis1: Option<i32>,     // Image width
+    pub naxis2: Option<i32>,     // Image height
+    pub bayerpat: Option<String>, // Bayer pattern (e.g., "RGGB") or None for mono
+    pub swcreate: Option<String>, // Software that created the file
+    pub xpixsz: Option<f64>,     // Pixel size in microns
+    pub format: Option<String>,  // File format (FITS, XISF)
 }
 
 /// Result of dark library creation

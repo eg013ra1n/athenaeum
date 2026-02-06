@@ -40,27 +40,38 @@ pub fn get_camera_dark_library(
     conn: &Connection,
     instrume: &str,
 ) -> Result<Vec<CalibrationSetDetail>> {
+    // Query calibration sets with extended frame metadata from first frame in each set
     let mut stmt = conn.prepare(
         "SELECT
-            id,
-            imagetyp,
-            exptime,
-            ccd_temp,
-            temp_min,
-            temp_max,
-            gain,
-            offset,
-            binning,
-            instrume,
-            filter,
-            date_start,
-            date_end,
-            date,
-            frame_count
-        FROM calibration_set
-        WHERE instrume = ?1
-        AND is_master_library = 0
-        ORDER BY imagetyp, exptime, ccd_temp"
+            cs.id,
+            cs.imagetyp,
+            cs.exptime,
+            cs.ccd_temp,
+            cs.temp_min,
+            cs.temp_max,
+            cs.gain,
+            cs.offset,
+            cs.binning,
+            cs.instrume,
+            cs.filter,
+            cs.date_start,
+            cs.date_end,
+            cs.date,
+            cs.frame_count,
+            f.naxis1,
+            f.naxis2,
+            f.bayerpat,
+            f.swcreate,
+            f.xpixsz,
+            fi.format
+        FROM calibration_set cs
+        LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+        LEFT JOIN frames f ON f.id = csf.frame_id
+        LEFT JOIN files fi ON fi.id = f.file_id
+        WHERE cs.instrume = ?1
+        AND cs.is_master_library = 0
+        GROUP BY cs.id
+        ORDER BY cs.imagetyp, cs.exptime, cs.ccd_temp"
     )?;
 
     let sets = stmt
@@ -97,6 +108,13 @@ pub fn get_camera_dark_library(
                 date_display,
                 frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
                 is_master: false,  // Regular calibration sets only
+                // Extended fields from frame metadata
+                naxis1: row.get(15)?,
+                naxis2: row.get(16)?,
+                bayerpat: row.get(17)?,
+                swcreate: row.get(18)?,
+                xpixsz: row.get(19)?,
+                format: row.get(20)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -149,26 +167,36 @@ pub fn get_camera_master_dark_library(
 ) -> Result<Vec<CalibrationSetDetail>> {
     let mut stmt = conn.prepare(
         "SELECT
-            id,
-            imagetyp,
-            exptime,
-            ccd_temp,
-            temp_min,
-            temp_max,
-            gain,
-            offset,
-            binning,
-            instrume,
-            filter,
-            date_start,
-            date_end,
-            date,
-            frame_count
-        FROM calibration_set
-        WHERE instrume = ?1
-        AND is_master_library = 1
-        AND imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')
-        ORDER BY imagetyp, exptime, ccd_temp"
+            cs.id,
+            cs.imagetyp,
+            cs.exptime,
+            cs.ccd_temp,
+            cs.temp_min,
+            cs.temp_max,
+            cs.gain,
+            cs.offset,
+            cs.binning,
+            cs.instrume,
+            cs.filter,
+            cs.date_start,
+            cs.date_end,
+            cs.date,
+            cs.frame_count,
+            f.naxis1,
+            f.naxis2,
+            f.bayerpat,
+            f.swcreate,
+            f.xpixsz,
+            fi.format
+        FROM calibration_set cs
+        LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+        LEFT JOIN frames f ON f.id = csf.frame_id
+        LEFT JOIN files fi ON fi.id = f.file_id
+        WHERE cs.instrume = ?1
+        AND cs.is_master_library = 1
+        AND cs.imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')
+        GROUP BY cs.id
+        ORDER BY cs.imagetyp, cs.exptime, cs.ccd_temp"
     )?;
 
     let sets = stmt
@@ -205,6 +233,12 @@ pub fn get_camera_master_dark_library(
                 date_display,
                 frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
                 is_master: true,  // Master calibration sets
+                naxis1: row.get(15)?,
+                naxis2: row.get(16)?,
+                bayerpat: row.get(17)?,
+                swcreate: row.get(18)?,
+                xpixsz: row.get(19)?,
+                format: row.get(20)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -230,26 +264,36 @@ pub fn get_camera_master_flat_library(
 ) -> Result<Vec<CalibrationSetDetail>> {
     let mut stmt = conn.prepare(
         "SELECT
-            id,
-            imagetyp,
-            exptime,
-            ccd_temp,
-            temp_min,
-            temp_max,
-            gain,
-            offset,
-            binning,
-            instrume,
-            filter,
-            date_start,
-            date_end,
-            date,
-            frame_count
-        FROM calibration_set
-        WHERE instrume = ?1
-        AND is_master_library = 1
-        AND imagetyp = 'MasterFlat'
-        ORDER BY filter, exptime, ccd_temp"
+            cs.id,
+            cs.imagetyp,
+            cs.exptime,
+            cs.ccd_temp,
+            cs.temp_min,
+            cs.temp_max,
+            cs.gain,
+            cs.offset,
+            cs.binning,
+            cs.instrume,
+            cs.filter,
+            cs.date_start,
+            cs.date_end,
+            cs.date,
+            cs.frame_count,
+            f.naxis1,
+            f.naxis2,
+            f.bayerpat,
+            f.swcreate,
+            f.xpixsz,
+            fi.format
+        FROM calibration_set cs
+        LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+        LEFT JOIN frames f ON f.id = csf.frame_id
+        LEFT JOIN files fi ON fi.id = f.file_id
+        WHERE cs.instrume = ?1
+        AND cs.is_master_library = 1
+        AND cs.imagetyp = 'MasterFlat'
+        GROUP BY cs.id
+        ORDER BY cs.filter, cs.exptime, cs.ccd_temp"
     )?;
 
     let sets = stmt
@@ -286,6 +330,12 @@ pub fn get_camera_master_flat_library(
                 date_display,
                 frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
                 is_master: true,  // Master calibration sets
+                naxis1: row.get(15)?,
+                naxis2: row.get(16)?,
+                bayerpat: row.get(17)?,
+                swcreate: row.get(18)?,
+                xpixsz: row.get(19)?,
+                format: row.get(20)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

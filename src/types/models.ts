@@ -341,6 +341,13 @@ export interface CalibrationSetDetail {
   date_display: string;
   frame_count: number;
   is_master: boolean;  // True if this is a master calibration set
+  // Extended fields from frame metadata
+  naxis1: number | null;      // Image width
+  naxis2: number | null;      // Image height
+  bayerpat: string | null;    // Bayer pattern (e.g., "RGGB") or null for mono
+  swcreate: string | null;    // Software that created the file
+  xpixsz: number | null;      // Pixel size in microns
+  format: string | null;      // File format (FITS, XISF)
 }
 
 export interface DarkLibraryResult {

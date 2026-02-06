@@ -353,46 +353,36 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     key={`${rowId}-expanded`}
                     className="bg-surface border-t border-border"
                   >
-                    <td colSpan={showFilterColumn ? 11 : 10} className="px-4 py-4">
-                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                    <td colSpan={showFilterColumn ? 11 : 10} className="px-4 py-3">
+                      <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
                         <div>
-                          <span className="text-content-muted">Set ID:</span>
-                          <span className="ml-2 text-content">{set.id}</span>
-                        </div>
-                        {showFilterColumn && set.filter && (
-                          <div>
-                            <span className="text-content-muted">Filter:</span>
-                            <span className="ml-2 text-content">{set.filter}</span>
-                          </div>
-                        )}
-                        <div>
-                          <span className="text-content-muted">Avg Temp:</span>
+                          <span className="text-content-muted">Resolution:</span>
                           <span className="ml-2 text-content">
-                            {formatTemp(set.ccd_temp)}
+                            {set.naxis1 && set.naxis2 ? `${set.naxis1} × ${set.naxis2}` : "—"}
                           </span>
                         </div>
                         <div>
-                          <span className="text-content-muted">Min Temp:</span>
+                          <span className="text-content-muted">Bayer:</span>
                           <span className="ml-2 text-content">
-                            {formatTemp(set.temp_min)}
+                            {set.bayerpat || "Mono"}
                           </span>
                         </div>
                         <div>
-                          <span className="text-content-muted">Max Temp:</span>
+                          <span className="text-content-muted">Pixel Size:</span>
                           <span className="ml-2 text-content">
-                            {formatTemp(set.temp_max)}
+                            {set.xpixsz ? `${set.xpixsz}µm` : "—"}
                           </span>
                         </div>
                         <div>
-                          <span className="text-content-muted">Start Date:</span>
+                          <span className="text-content-muted">Format:</span>
                           <span className="ml-2 text-content">
-                            {formatDate(set.date_start)}
+                            {set.format || "—"}
                           </span>
                         </div>
                         <div>
-                          <span className="text-content-muted">End Date:</span>
+                          <span className="text-content-muted">Software:</span>
                           <span className="ml-2 text-content">
-                            {formatDate(set.date_end)}
+                            {set.swcreate || "—"}
                           </span>
                         </div>
                         <div className="md:hidden">
