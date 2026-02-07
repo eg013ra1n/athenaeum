@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useNavigate } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
@@ -8,8 +8,8 @@ import { useCoordinateTransform } from '../hooks/useCoordinateTransform';
 import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { useMapViewState } from '../hooks/useMapViewState';
-import { SelectionToolbar } from '../components/SelectionToolbar';
 import { SelectionDialog } from '../components/SelectionDialog';
+import { DateRangeFilter, DateParts, toISODate } from '../components/DateRangeFilter';
 import '../styles/celestial-overrides.css';
 
 // Declare global Celestial and d3 from d3-celestial
@@ -40,6 +40,10 @@ export default function SkyAtlas() {
   const [selectionResult, setSelectionResult] = useState<SelectionResult | null>(null);
   const [showDialog, setShowDialog] = useState(false);
 
+  // Date filter state
+  const [dateFrom, setDateFrom] = useState<DateParts | null>(null);
+  const [dateTo, setDateTo] = useState<DateParts | null>(null);
+
   // Custom hooks
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
   const coordinateTransform = useCoordinateTransform();
@@ -48,6 +52,25 @@ export default function SkyAtlas() {
   const { getViewState, saveViewState } = useMapViewState();
 
   const navigate = useNavigate();
+
+  // Filter locations by date range
+  const filteredLocations = useMemo(() => {
+    const fromISO = toISODate(dateFrom);
+    const toISO = toISODate(dateTo);
+
+    return locations.filter(loc => {
+      const locStartDate = loc.dateRange[0]?.split('T')[0];
+      const locEndDate = loc.dateRange[1]?.split('T')[0];
+
+      // If filter from is set, location end must be >= filter from
+      if (fromISO && locEndDate && locEndDate < fromISO) return false;
+
+      // If filter to is set, location start must be <= filter to
+      if (toISO && locStartDate && locStartDate > toISO) return false;
+
+      return true;
+    });
+  }, [locations, dateFrom, dateTo]);
 
   // Fetch imaging locations from backend
   useEffect(() => {
@@ -90,7 +113,8 @@ export default function SkyAtlas() {
             saveViewStateRef.current({
               zoom: currentZoom,
               ra: currentCenter[0],
-              dec: currentCenter[1]
+              dec: currentCenter[1],
+              rotation: currentCenter[2] ?? 0
             });
 
             console.log('💾 Auto-saved view state:', { zoom: currentZoom, center: currentCenter });
@@ -140,7 +164,7 @@ export default function SkyAtlas() {
           projection: 'aitoff',
           transform: 'equatorial',
           center: (savedState.ra !== null && savedState.dec !== null)
-            ? [savedState.ra, savedState.dec, 0]
+            ? [savedState.ra, savedState.dec, savedState.rotation ?? 0]
             : null,
           orientationfixed: false,
           follow: "center",  // Prevents animation when setting initial center
@@ -252,7 +276,7 @@ export default function SkyAtlas() {
     if (restorationDone.current) return; // Only restore once to prevent feedback loop
 
     const viewState = getViewState();
-    const { zoom, ra, dec } = viewState;
+    const { zoom, ra, dec, rotation } = viewState;
 
     // Only restore if we have state to restore
     if (zoom !== null || (ra !== null && dec !== null)) {
@@ -262,8 +286,8 @@ export default function SkyAtlas() {
       requestAnimationFrame(() => {
         // Restore center position
         if (ra !== null && dec !== null && window.Celestial.rotate) {
-          window.Celestial.rotate({ center: [ra, dec, 0] });
-          console.log('📍 Restored center:', [ra, dec]);
+          window.Celestial.rotate({ center: [ra, dec, rotation ?? 0] });
+          console.log('📍 Restored center:', [ra, dec, rotation ?? 0]);
         }
 
         // Restore zoom level
@@ -630,7 +654,8 @@ export default function SkyAtlas() {
                     saveViewState({
                       zoom: currentZoom,
                       ra: currentCenter[0],
-                      dec: currentCenter[1]
+                      dec: currentCenter[1],
+                      rotation: currentCenter[2] ?? 0
                     });
                   }
 
@@ -759,11 +784,11 @@ export default function SkyAtlas() {
 
   // Add markers when locations are loaded or zoom level changes
   useEffect(() => {
-    if (mapReady && locations.length > 0 && !loading) {
+    if (mapReady && filteredLocations.length > 0 && !loading) {
       console.log('🎯 Marker useEffect triggered, calling addImagingMarkers');
-      addImagingMarkers(locations);
+      addImagingMarkers(filteredLocations);
     }
-  }, [locations, mapReady, loading, addImagingMarkers]);
+  }, [filteredLocations, mapReady, loading, addImagingMarkers]);
 
   // Manage SVG overlay visibility based on drawing mode
   useEffect(() => {
@@ -825,10 +850,10 @@ export default function SkyAtlas() {
 
   if (loading) {
     return (
-      <div className="h-screen flex items-center justify-center bg-gray-900">
+      <div className="h-screen flex items-center justify-center bg-surface">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
-          <p className="text-gray-400">Loading sky atlas...</p>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto mb-4"></div>
+          <p className="text-content-muted">Loading sky atlas...</p>
         </div>
       </div>
     );
@@ -836,13 +861,13 @@ export default function SkyAtlas() {
 
   if (error) {
     return (
-      <div className="h-screen flex items-center justify-center bg-gray-900">
+      <div className="h-screen flex items-center justify-center bg-surface">
         <div className="text-center max-w-md p-6">
-          <p className="text-red-400 mb-2 font-semibold">Error loading sky atlas</p>
-          <p className="text-gray-400 text-sm mb-4">{error}</p>
+          <p className="text-error mb-2 font-semibold">Error loading sky atlas</p>
+          <p className="text-content-muted text-sm mb-4">{error}</p>
           <button
             onClick={() => window.location.reload()}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition"
+            className="px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
           >
             Retry
           </button>
@@ -853,13 +878,13 @@ export default function SkyAtlas() {
 
   if (locations.length === 0) {
     return (
-      <div className="h-screen flex items-center justify-center bg-gray-900">
+      <div className="h-screen flex items-center justify-center bg-surface">
         <div className="text-center max-w-md p-6">
-          <h3 className="text-xl font-bold text-gray-100 mb-2">No Imaging Locations Found</h3>
-          <p className="text-gray-400 text-sm mb-4">
+          <h3 className="text-xl font-bold text-content mb-2">No Imaging Locations Found</h3>
+          <p className="text-content-muted text-sm mb-4">
             You don't have any LIGHT frames with RA/Dec coordinates yet.
           </p>
-          <p className="text-gray-500 text-sm">
+          <p className="text-content-muted text-sm">
             Once you import FITS/XISF files with coordinate data, they will appear here.
             You can then use the rectangle selection tool (press S) to organize them into frame sets, or go to the Objects page to use "Auto-Generate Frame Sets".
           </p>
@@ -869,13 +894,42 @@ export default function SkyAtlas() {
   }
 
   return (
-    <div className="h-screen w-full flex flex-col bg-gray-900">
+    <div className="h-screen w-full flex flex-col bg-surface overflow-hidden">
       {/* Header */}
-      <div className="flex-shrink-0 p-4 border-b border-gray-700 bg-gray-800">
-        <h2 className="text-2xl font-bold text-gray-100">Sky Atlas</h2>
-        <p className="text-sm text-gray-400 mt-1">
-          Offline interactive sky map • {locations.length} imaging locations
-        </p>
+      <div className="flex-shrink-0 py-[14px] px-4 border-b border-border bg-surface-elevated flex items-center justify-between">
+        {/* Left: Title + Subtitle */}
+        <div>
+          <h2 className="text-2xl font-bold text-content">Sky Atlas</h2>
+          <p className="text-sm text-content-muted">
+            Offline interactive sky map • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
+            {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
+          </p>
+        </div>
+
+        {/* Right: Select button + Date filters (vertically centered) */}
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => setDrawingMode(prev => prev === 'rectangle' ? 'none' : 'rectangle')}
+            disabled={!mapReady}
+            title="Select frames in a rectangular region (Press S)"
+            className={`px-3 py-1.5 rounded text-sm font-medium transition ${
+              drawingMode === 'rectangle'
+                ? 'bg-accent text-white shadow-lg'
+                : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
+            } ${!mapReady ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            Select
+          </button>
+
+          <div className="w-px h-6 bg-border" />
+
+          <DateRangeFilter
+            dateFrom={dateFrom}
+            dateTo={dateTo}
+            onFromChange={setDateFrom}
+            onToChange={setDateTo}
+          />
+        </div>
       </div>
 
       {/* Sky Map - direct flex child, no wrapper */}
@@ -885,12 +939,6 @@ export default function SkyAtlas() {
         className="flex-1 w-full overflow-hidden relative"
         style={{ minHeight: 0 }}
       >
-        {/* Selection Toolbar - floating overlay */}
-        <SelectionToolbar
-          activeMode={drawingMode}
-          onModeChange={setDrawingMode}
-          isDisabled={!mapReady}
-        />
       </div>
 
       {/* Selection Results Dialog */}

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Clock, MapPin, AlertCircle, Scissors } from 'lucide-react';
+import { ArrowLeft, Clock, MapPin, AlertCircle, Scissors, Play } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -136,6 +136,21 @@ export default function FrameSetDetail() {
     }
     return frameIds;
   }, [calibrationHierarchy, buildFilterKey]);
+
+  // Get all LIGHT frame IDs from the calibration hierarchy
+  const getAllLightFrameIds = useCallback((): number[] => {
+    if (!calibrationHierarchy) return [];
+
+    const frameIds: number[] = [];
+    for (const dateGroup of calibrationHierarchy.date_groups) {
+      for (const cameraGroup of dateGroup.camera_groups) {
+        for (const filterGroup of cameraGroup.filter_groups) {
+          frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
+        }
+      }
+    }
+    return frameIds;
+  }, [calibrationHierarchy]);
 
   // Handle blink from CalibrationHierarchyView - load full frame data
   const handleBlink = useCallback(async (frameIds: number[]) => {
@@ -286,8 +301,8 @@ export default function FrameSetDetail() {
   if (loading) {
     return (
       <div className="p-6">
-        <div className="text-center py-12 text-gray-400">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
+        <div className="text-center py-12 text-content-muted">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto"></div>
           <p className="mt-4">Loading frame set details...</p>
         </div>
       </div>
@@ -300,18 +315,18 @@ export default function FrameSetDetail() {
         <div className="mb-4">
           <button
             onClick={() => navigate('/objects')}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
           >
             <ArrowLeft size={18} />
             Back to Objects
           </button>
         </div>
-        <div className="bg-red-900/20 border border-red-800 rounded-lg p-6">
+        <div className="bg-error-muted border border-error/50 rounded-lg p-6">
           <div className="flex items-start gap-3">
-            <AlertCircle size={20} className="text-red-400 flex-shrink-0 mt-0.5" />
+            <AlertCircle size={20} className="text-error flex-shrink-0 mt-0.5" />
             <div className="flex-1">
-              <h3 className="text-red-400 font-semibold mb-2">Error Loading Frame Set</h3>
-              <p className="text-red-300 text-sm">{error}</p>
+              <h3 className="text-error font-semibold mb-2">Error Loading Frame Set</h3>
+              <p className="text-error/80 text-sm">{error}</p>
             </div>
           </div>
         </div>
@@ -325,13 +340,13 @@ export default function FrameSetDetail() {
         <div className="mb-4">
           <button
             onClick={() => navigate('/objects')}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+            className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
           >
             <ArrowLeft size={18} />
             Back to Objects
           </button>
         </div>
-        <div className="bg-gray-800 rounded-lg p-6 text-center text-gray-400">
+        <div className="bg-surface-elevated rounded-lg p-6 text-center text-content-muted">
           No data available
         </div>
       </div>
@@ -344,7 +359,7 @@ export default function FrameSetDetail() {
       <div className="mb-6 flex items-center justify-between flex-shrink-0">
         <button
           onClick={() => navigate('/objects')}
-          className="flex items-center gap-2 px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+          className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
         >
           <ArrowLeft size={18} />
           Back to Objects
@@ -352,12 +367,12 @@ export default function FrameSetDetail() {
       </div>
 
       {/* Frame Set Header - Combined with Stats */}
-      <div className="bg-gray-800 rounded-lg p-5 mb-4 border border-gray-700 flex-shrink-0">
+      <div className="bg-surface-elevated rounded-lg p-5 mb-4 border border-border flex-shrink-0">
         <div className="flex items-start justify-between mb-4">
           <div className="flex items-center gap-4">
             <h1 className="text-2xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
             {detail.frames_set?.objctra && detail.frames_set?.objctdec && (
-              <div className="flex items-center gap-2 text-gray-400">
+              <div className="flex items-center gap-2 text-content-muted">
                 <MapPin size={16} />
                 <span className="font-mono text-sm">
                   {detail.frames_set.objctra} / {detail.frames_set.objctdec}
@@ -365,44 +380,55 @@ export default function FrameSetDetail() {
               </div>
             )}
           </div>
-          <CalibrationFinderButton
-            frameSetId={parseInt(id!)}
-            frameSetName={detail.frames_set?.name || 'Untitled'}
-            onComplete={loadData}
-          />
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => handleBlink(getAllLightFrameIds())}
+              disabled={!calibrationHierarchy || getAllLightFrameIds().length === 0}
+              className="flex items-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition text-sm"
+              title="Blink through all LIGHT frames in this frame set"
+            >
+              <Play size={16} />
+              Blink All
+            </button>
+            <CalibrationFinderButton
+              frameSetId={parseInt(id!)}
+              frameSetName={detail.frames_set?.name || 'Untitled'}
+              onComplete={loadData}
+            />
+          </div>
         </div>
 
         {/* Stats Row */}
         <div className="grid grid-cols-5 gap-4 text-center">
-          <div className="bg-gray-900/50 rounded p-3">
-            <div className="text-2xl font-bold text-gray-100">
+          <div className="bg-surface/50 rounded p-3">
+            <div className="text-2xl font-bold text-content">
               {calibrationHierarchy?.total_frames ?? '-'}
             </div>
-            <div className="text-xs text-gray-400 mt-1">Total Frames</div>
+            <div className="text-xs text-content-muted mt-1">Total Frames</div>
           </div>
-          <div className="bg-gray-900/50 rounded p-3">
-            <div className="text-2xl font-bold text-emerald-400">
+          <div className="bg-surface/50 rounded p-3">
+            <div className="text-2xl font-bold text-success">
               {calibrationHierarchy?.calibrated_frames ?? '-'}
             </div>
-            <div className="text-xs text-gray-400 mt-1">Calibrated</div>
+            <div className="text-xs text-content-muted mt-1">Calibrated</div>
           </div>
-          <div className="bg-gray-900/50 rounded p-3">
-            <div className="text-2xl font-bold text-amber-400">
+          <div className="bg-surface/50 rounded p-3">
+            <div className="text-2xl font-bold text-warning">
               {calibrationHierarchy?.uncalibrated_frames ?? '-'}
             </div>
-            <div className="text-xs text-gray-400 mt-1">Uncalibrated</div>
+            <div className="text-xs text-content-muted mt-1">Uncalibrated</div>
           </div>
-          <div className="bg-gray-900/50 rounded p-3">
-            <div className="text-2xl font-bold text-blue-400">
+          <div className="bg-surface/50 rounded p-3">
+            <div className="text-2xl font-bold text-accent">
               {calibrationHierarchy?.date_groups.length ?? '-'}
             </div>
-            <div className="text-xs text-gray-400 mt-1">Sessions</div>
+            <div className="text-xs text-content-muted mt-1">Sessions</div>
           </div>
-          <div className="bg-gray-900/50 rounded p-3">
-            <div className="text-2xl font-bold text-gray-200">
+          <div className="bg-surface/50 rounded p-3">
+            <div className="text-2xl font-bold text-content">
               {formatExposureTime(detail.frames_set?.total_exp_time)}
             </div>
-            <div className="text-xs text-gray-400 mt-1 flex items-center justify-center gap-1">
+            <div className="text-xs text-content-muted mt-1 flex items-center justify-center gap-1">
               <Clock size={12} />
               Exposure
             </div>
@@ -414,23 +440,24 @@ export default function FrameSetDetail() {
       <div className="flex-1 min-h-0">
         {loadingCalibration ? (
           <div className="text-center py-12">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
-            <p className="text-gray-400">Loading calibration data...</p>
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto mb-4"></div>
+            <p className="text-content-muted">Loading calibration data...</p>
           </div>
         ) : calibrationHierarchy ? (
           <CalibrationHierarchyViewComponent
             data={calibrationHierarchy}
             onRefresh={refreshCalibrationHierarchy}
             onBlink={handleBlink}
+            onBlinkSelected={handleBlink}
             onSplit={handleOpenSplitDialog}
             onCreateCustomSet={handleOpenCreateDialog}
           />
         ) : (
-          <div className="text-center py-12 text-gray-400">
+          <div className="text-center py-12 text-content-muted">
             <p>Failed to load calibration data.</p>
             <button
               onClick={handleDeleteClick}
-              className="mt-4 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
+              className="mt-4 px-4 py-2 bg-error hover:brightness-90 text-white rounded-lg transition"
             >
               Delete Frame Set
             </button>
@@ -441,11 +468,11 @@ export default function FrameSetDetail() {
       {/* Create Custom Set Dialog */}
       {showCreateDialog && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-800 rounded-lg max-w-md w-full p-6 border border-gray-700">
+          <div className="bg-surface-elevated rounded-lg max-w-md w-full p-6 border border-border">
             <h3 className="text-xl font-bold mb-4">Create Custom Set</h3>
 
             <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 Set Name
               </label>
               <input
@@ -453,12 +480,12 @@ export default function FrameSetDetail() {
                 value={customSetName}
                 onChange={(e) => setCustomSetName(e.target.value)}
                 placeholder="Enter custom set name"
-                className="w-full px-3 py-2 bg-gray-700 text-gray-100 rounded-lg border border-gray-600 focus:outline-none focus:border-blue-500"
+                className="w-full px-3 py-2 bg-surface-hover text-content rounded-lg border border-border focus:outline-none focus:border-accent"
                 autoFocus
               />
             </div>
 
-            <div className="mb-6 text-sm text-gray-400">
+            <div className="mb-6 text-sm text-content-muted">
               {selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be included in the new set
             </div>
 
@@ -468,14 +495,14 @@ export default function FrameSetDetail() {
                   setShowCreateDialog(false);
                   setCustomSetName('');
                 }}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+                className="px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
               >
                 Cancel
               </button>
               <button
                 onClick={handleCreateCustomSet}
                 disabled={creating || !customSetName.trim()}
-                className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition"
+                className="px-4 py-2 bg-success hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition"
               >
                 {creating ? 'Creating...' : 'Create'}
               </button>
@@ -487,14 +514,14 @@ export default function FrameSetDetail() {
       {/* Split Frame Set Dialog */}
       {showSplitDialog && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-800 rounded-lg max-w-md w-full p-6 border border-gray-700">
+          <div className="bg-surface-elevated rounded-lg max-w-md w-full p-6 border border-border">
             <h3 className="text-xl font-bold mb-4 flex items-center gap-2">
-              <Scissors size={20} className="text-blue-400" />
+              <Scissors size={20} className="text-accent" />
               Split Frame Set
             </h3>
 
             <div className="mb-4">
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 New Set Name
               </label>
               <input
@@ -502,14 +529,14 @@ export default function FrameSetDetail() {
                 value={splitName}
                 onChange={(e) => setSplitName(e.target.value)}
                 placeholder="Enter name for split set"
-                className="w-full px-3 py-2 bg-gray-700 text-gray-100 rounded-lg border border-gray-600 focus:outline-none focus:border-blue-500"
+                className="w-full px-3 py-2 bg-surface-hover text-content rounded-lg border border-border focus:outline-none focus:border-accent"
                 autoFocus
               />
             </div>
 
-            <div className="mb-6 text-sm text-gray-400 space-y-2">
+            <div className="mb-6 text-sm text-content-muted space-y-2">
               <p>{selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be split into the new set</p>
-              <p className="text-yellow-400">
+              <p className="text-warning">
                 The selected frames will be removed from "{detail?.frames_set?.name || 'this set'}" and moved to the new set.
               </p>
             </div>
@@ -520,14 +547,14 @@ export default function FrameSetDetail() {
                   setShowSplitDialog(false);
                   setSplitName('');
                 }}
-                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition"
+                className="px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
               >
                 Cancel
               </button>
               <button
                 onClick={handleSplit}
                 disabled={splitting || !splitName.trim()}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition"
+                className="px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition"
               >
                 {splitting ? 'Splitting...' : 'Split'}
               </button>

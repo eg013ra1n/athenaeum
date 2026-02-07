@@ -155,9 +155,9 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
   const breadcrumbs = getBreadcrumbs();
 
   return (
-    <div className="bg-gray-800 rounded-lg overflow-hidden">
+    <div className="bg-surface-elevated rounded-lg overflow-hidden">
       {/* Header with navigation */}
-      <div className="bg-gray-750 border-b border-gray-700 p-4">
+      <div className="bg-surface border-b border-border p-4">
         {/* Root selector */}
         <div className="flex gap-2 flex-wrap mb-3">
           {scanRoots.map(root => (
@@ -168,14 +168,14 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
               title={!root.is_available ? 'Directory not available - go to Monitored Directories to relink' : undefined}
               className={`px-3 py-1.5 rounded text-sm transition relative ${
                 currentPath === root.path
-                  ? 'bg-blue-600 text-white'
+                  ? 'bg-accent text-white'
                   : root.is_available
-                    ? 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                    : 'bg-gray-800 text-gray-500 cursor-not-allowed opacity-50'
+                    ? 'bg-surface-hover text-content-secondary hover:brightness-110'
+                    : 'bg-surface-elevated text-content-muted cursor-not-allowed opacity-50'
               }`}
             >
               {!root.is_available && (
-                <AlertTriangle size={12} className="inline mr-1 text-yellow-500" />
+                <AlertTriangle size={12} className="inline mr-1 text-warning" />
               )}
               {root.path.split('/').pop() || root.path}
             </button>
@@ -186,13 +186,13 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
           <button
             onClick={goUp}
             disabled={isAtRoot || loading}
-            className="flex items-center gap-2 px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-2 px-3 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <ArrowLeft size={16} />
             Back
           </button>
           <div className="flex-1 flex items-center gap-2 min-w-0">
-            <Folder size={20} className="text-blue-400 flex-shrink-0" />
+            <Folder size={20} className="text-accent flex-shrink-0" />
             {breadcrumbs.length > 0 ? (
               <div className="flex items-center gap-1 font-mono text-sm min-w-0 flex-wrap">
                 {breadcrumbs.map((crumb, index) => (
@@ -200,35 +200,35 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                     {crumb.isClickable ? (
                       <button
                         onClick={() => loadDirectory(crumb.path)}
-                        className="text-blue-400 hover:text-blue-300 hover:underline transition"
+                        className="text-accent hover:brightness-110 hover:underline transition"
                         title={`Navigate to ${crumb.path}`}
                       >
                         {crumb.label}
                       </button>
                     ) : (
-                      <span className={crumb.path === currentPath ? 'text-gray-200' : 'text-gray-500'}>
+                      <span className={crumb.path === currentPath ? 'text-content' : 'text-content-muted'}>
                         {crumb.label}
                       </span>
                     )}
                     {index < breadcrumbs.length - 1 && (
-                      <span className="text-gray-600">/</span>
+                      <span className="text-content-muted">/</span>
                     )}
                   </div>
                 ))}
               </div>
             ) : (
-              <span className="font-mono text-sm text-gray-300">Select a directory</span>
+              <span className="font-mono text-sm text-content-secondary">Select a directory</span>
             )}
             {currentPath && (
               <button
                 onClick={copyPathToClipboard}
-                className="flex items-center gap-1 px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs transition flex-shrink-0"
+                className="flex items-center gap-1 px-2 py-1 bg-surface-hover hover:bg-surface-hover rounded text-xs transition flex-shrink-0"
                 title="Copy path to clipboard"
               >
                 {copied ? (
                   <>
-                    <Check size={14} className="text-green-400" />
-                    <span className="text-green-400">Copied!</span>
+                    <Check size={14} className="text-success" />
+                    <span className="text-success">Copied!</span>
                   </>
                 ) : (
                   <>
@@ -240,7 +240,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
             )}
           </div>
           {contents && (
-            <span className="text-sm text-gray-400 flex-shrink-0">
+            <span className="text-sm text-content-muted flex-shrink-0">
               {contents.subdirectories.length} folders, {contents.files.length} files
             </span>
           )}
@@ -250,14 +250,14 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
       {/* Content area */}
       <div className="p-4">
         {loading && (
-          <div className="text-center py-12 text-gray-400">
+          <div className="text-center py-12 text-content-muted">
             Loading directory...
           </div>
         )}
 
         {error && (
-          <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 mb-4">
-            <div className="flex items-center gap-2 text-red-400">
+          <div className="bg-error-muted border border-error/50 rounded-lg p-4 mb-4">
+            <div className="flex items-center gap-2 text-error">
               <AlertCircle size={20} />
               <span>Error: {String(error)}</span>
             </div>
@@ -275,10 +275,10 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                     <button
                       key={subdir}
                       onClick={() => navigateToDirectory(subdir)}
-                      className="flex items-center gap-3 w-full px-3 py-2 hover:bg-gray-700 transition text-left group border-b border-gray-800"
+                      className="flex items-center gap-3 w-full px-3 py-2 hover:bg-surface-hover transition text-left group border-b border-border"
                     >
-                      <Folder size={18} className="text-blue-400 flex-shrink-0" />
-                      <span className="text-sm truncate font-mono group-hover:text-blue-300">
+                      <Folder size={18} className="text-accent flex-shrink-0" />
+                      <span className="text-sm truncate font-mono group-hover:text-accent">
                         {subdir.split('/').pop()}
                       </span>
                     </button>
@@ -298,18 +298,18 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                         key={item.file.id || idx}
                         onMouseEnter={() => setHoveredFile(item)}
                         onMouseLeave={() => setHoveredFile(null)}
-                        className={`flex items-center gap-3 w-full px-3 py-2 transition text-left border-b border-gray-800 ${
-                          hoveredFile?.file.id === item.file.id ? 'bg-gray-700' : 'hover:bg-gray-750'
+                        className={`flex items-center gap-3 w-full px-3 py-2 transition text-left border-b border-border ${
+                          hoveredFile?.file.id === item.file.id ? 'bg-surface-hover' : 'hover:bg-surface'
                         } ${isBlackholed ? 'opacity-60' : ''}`}
                       >
-                        <FileIcon size={16} className={`flex-shrink-0 ${isBlackholed ? 'text-red-500' : 'text-gray-500'}`} />
+                        <FileIcon size={16} className={`flex-shrink-0 ${isBlackholed ? 'text-error' : 'text-content-muted'}`} />
                         {hasDuplicate && (
                           <span title="Duplicate file">
-                            <AlertCircle size={14} className="text-yellow-500 flex-shrink-0" />
+                            <AlertCircle size={14} className="text-warning flex-shrink-0" />
                           </span>
                         )}
                         <span
-                          className={`text-sm truncate font-mono ${isBlackholed ? 'line-through text-red-400' : ''}`}
+                          className={`text-sm truncate font-mono ${isBlackholed ? 'line-through text-error' : ''}`}
                           title={isBlackholed ? `${item.file.filename} (blackholed)` : item.file.filename}
                         >
                           {item.file.filename}
@@ -322,19 +322,19 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
 
               {/* Empty state */}
               {contents.subdirectories.length === 0 && contents.files.length === 0 && (
-                <div className="text-center py-12 text-gray-500">
+                <div className="text-center py-12 text-content-muted">
                   No folders or files found in this directory.
                 </div>
               )}
             </div>
 
             {/* Right Panel - Metadata */}
-            <div className="w-80 bg-gray-750 rounded-lg p-4 flex-shrink-0 overflow-y-auto flex flex-col">
+            <div className="w-80 bg-surface rounded-lg p-4 flex-shrink-0 overflow-y-auto flex flex-col">
               {/* Blink button */}
               {imageFiles.length > 0 && (
                 <button
                   onClick={() => setShowBlinkViewer(true)}
-                  className="mb-4 flex items-center justify-center gap-2 w-full px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition"
+                  className="mb-4 flex items-center justify-center gap-2 w-full px-4 py-2 bg-accent hover:brightness-110 text-white rounded-lg transition"
                 >
                   <Play size={18} />
                   <span>Blink ({imageFiles.length})</span>
@@ -347,13 +347,13 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                   {/* File Name */}
                   <div>
                     <div className="flex items-center gap-2 mb-2">
-                      <FileIcon size={20} className="text-gray-400" />
-                      <h3 className="font-semibold text-gray-200 text-sm break-all">
+                      <FileIcon size={20} className="text-content-muted" />
+                      <h3 className="font-semibold text-content text-sm break-all">
                         {hoveredFile.file.filename}
                       </h3>
                     </div>
                     {duplicateFilenames.has(hoveredFile.file.filename) && (
-                      <div className="flex items-center gap-2 px-2 py-1 bg-yellow-900/30 border border-yellow-700 rounded text-xs text-yellow-400">
+                      <div className="flex items-center gap-2 px-2 py-1 bg-warning-muted border border-warning/50 rounded text-xs text-warning">
                         <AlertCircle size={14} />
                         <span>Duplicate file detected</span>
                       </div>
@@ -365,16 +365,16 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                       {/* Object & Type */}
                       {(hoveredFile.frame.object || hoveredFile.frame.imagetyp) && (
                         <div>
-                          <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Target</div>
+                          <div className="text-xs font-semibold text-content-muted uppercase mb-2">Target</div>
                           <div className="space-y-1">
                             {hoveredFile.frame.object && (
-                              <div className="text-sm text-gray-200 font-medium">{hoveredFile.frame.object}</div>
+                              <div className="text-sm text-content font-medium">{hoveredFile.frame.object}</div>
                             )}
                             {hoveredFile.frame.imagetyp && (
                               <span className={`inline-block px-2 py-0.5 rounded text-xs ${
                                 hoveredFile.frame.imagetyp === 'Light'
-                                  ? 'bg-blue-900 text-blue-200'
-                                  : 'bg-gray-700 text-gray-300'
+                                  ? 'bg-info-muted text-accent'
+                                  : 'bg-surface-hover text-content-secondary'
                               }`}>
                                 {hoveredFile.frame.imagetyp}
                               </span>
@@ -386,18 +386,18 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                       {/* Exposure Details */}
                       {(hoveredFile.frame.exptime || hoveredFile.frame.filter) && (
                         <div>
-                          <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Exposure</div>
+                          <div className="text-xs font-semibold text-content-muted uppercase mb-2">Exposure</div>
                           <div className="space-y-1 text-sm">
                             {hoveredFile.frame.exptime && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Duration:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.exptime}s</span>
+                                <span className="text-content-muted">Duration:</span>
+                                <span className="text-content">{hoveredFile.frame.exptime}s</span>
                               </div>
                             )}
                             {hoveredFile.frame.filter && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Filter:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.filter}</span>
+                                <span className="text-content-muted">Filter:</span>
+                                <span className="text-content">{hoveredFile.frame.filter}</span>
                               </div>
                             )}
                           </div>
@@ -407,24 +407,24 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                       {/* Equipment */}
                       {(hoveredFile.frame.telescop || hoveredFile.frame.instrume || hoveredFile.frame.focallen) && (
                         <div>
-                          <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Equipment</div>
+                          <div className="text-xs font-semibold text-content-muted uppercase mb-2">Equipment</div>
                           <div className="space-y-1 text-sm">
                             {hoveredFile.frame.telescop && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Telescope:</span>
-                                <span className="text-gray-200 truncate ml-2">{hoveredFile.frame.telescop}</span>
+                                <span className="text-content-muted">Telescope:</span>
+                                <span className="text-content truncate ml-2">{hoveredFile.frame.telescop}</span>
                               </div>
                             )}
                             {hoveredFile.frame.instrume && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Camera:</span>
-                                <span className="text-gray-200 truncate ml-2">{hoveredFile.frame.instrume}</span>
+                                <span className="text-content-muted">Camera:</span>
+                                <span className="text-content truncate ml-2">{hoveredFile.frame.instrume}</span>
                               </div>
                             )}
                             {hoveredFile.frame.focallen && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Focal Length:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.focallen}mm</span>
+                                <span className="text-content-muted">Focal Length:</span>
+                                <span className="text-content">{hoveredFile.frame.focallen}mm</span>
                               </div>
                             )}
                           </div>
@@ -435,24 +435,24 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                       {(hoveredFile.frame.gain !== null || hoveredFile.frame.offset !== null ||
                         hoveredFile.frame.ccd_temp !== null) && (
                         <div>
-                          <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Camera Settings</div>
+                          <div className="text-xs font-semibold text-content-muted uppercase mb-2">Camera Settings</div>
                           <div className="space-y-1 text-sm">
                             {hoveredFile.frame.gain !== null && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Gain:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.gain}</span>
+                                <span className="text-content-muted">Gain:</span>
+                                <span className="text-content">{hoveredFile.frame.gain}</span>
                               </div>
                             )}
                             {hoveredFile.frame.offset !== null && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Offset:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.offset}</span>
+                                <span className="text-content-muted">Offset:</span>
+                                <span className="text-content">{hoveredFile.frame.offset}</span>
                               </div>
                             )}
                             {hoveredFile.frame.ccd_temp !== null && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Temperature:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.ccd_temp}°C</span>
+                                <span className="text-content-muted">Temperature:</span>
+                                <span className="text-content">{hoveredFile.frame.ccd_temp}°C</span>
                               </div>
                             )}
                           </div>
@@ -462,18 +462,18 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                       {/* Coordinates */}
                       {(hoveredFile.frame.ra !== null || hoveredFile.frame.dec !== null) && (
                         <div>
-                          <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Coordinates</div>
+                          <div className="text-xs font-semibold text-content-muted uppercase mb-2">Coordinates</div>
                           <div className="space-y-1 text-sm font-mono">
                             {hoveredFile.frame.ra !== null && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">RA:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.ra.toFixed(4)}°</span>
+                                <span className="text-content-muted">RA:</span>
+                                <span className="text-content">{hoveredFile.frame.ra.toFixed(4)}°</span>
                               </div>
                             )}
                             {hoveredFile.frame.dec !== null && (
                               <div className="flex justify-between">
-                                <span className="text-gray-400">Dec:</span>
-                                <span className="text-gray-200">{hoveredFile.frame.dec.toFixed(4)}°</span>
+                                <span className="text-content-muted">Dec:</span>
+                                <span className="text-content">{hoveredFile.frame.dec.toFixed(4)}°</span>
                               </div>
                             )}
                           </div>
@@ -483,8 +483,8 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                       {/* Date */}
                       {hoveredFile.frame.date_obs && (
                         <div>
-                          <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Date</div>
-                          <div className="text-sm text-gray-200">
+                          <div className="text-xs font-semibold text-content-muted uppercase mb-2">Date</div>
+                          <div className="text-sm text-content">
                             {new Date(hoveredFile.frame.date_obs).toLocaleString('en-US', {
                               year: 'numeric',
                               month: 'short',
@@ -499,13 +499,13 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                       )}
                     </>
                   ) : (
-                    <div className="text-sm text-gray-500">
+                    <div className="text-sm text-content-muted">
                       No metadata available for this file.
                     </div>
                   )}
                 </div>
               ) : (
-                <div className="flex items-center justify-center h-full text-gray-500 text-sm text-center">
+                <div className="flex items-center justify-center h-full text-content-muted text-sm text-center">
                   Hover over a file to see its metadata
                 </div>
               )}

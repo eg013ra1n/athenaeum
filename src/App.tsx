@@ -33,13 +33,13 @@ function App() {
 
   if (initError) {
     return (
-      <div className="min-h-screen bg-gray-900 flex items-center justify-center">
+      <div className="min-h-screen bg-surface flex items-center justify-center">
         <div className="text-center max-w-md">
-          <h1 className="text-2xl font-bold text-red-400 mb-4">Database Initialization Error</h1>
-          <p className="text-gray-400 mb-4">{initError}</p>
+          <h1 className="text-2xl font-bold text-error mb-4">Database Initialization Error</h1>
+          <p className="text-content-muted mb-4">{initError}</p>
           <button
             onClick={() => window.location.reload()}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition"
+            className="px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
           >
             Retry
           </button>

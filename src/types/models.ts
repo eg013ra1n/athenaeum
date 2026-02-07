@@ -118,6 +118,7 @@ export interface ScanRoot {
   path: string;
   enabled: boolean;
   find_duplicates: boolean;
+  unique_camera: boolean;
   last_scan: string | null; // ISO 8601 datetime
 }
 
@@ -176,6 +177,12 @@ export interface ScanResult {
   darkflats_count: number;
   // Calibration sets created
   calibration_sets_created: number;
+  // Unique camera reconciliation stats (non-zero when instrume suffix state changed during rescan)
+  frames_renamed: number;
+  calibration_sets_deleted: number;
+  sessions_updated: number;
+  // Whether scan was cancelled by user
+  cancelled: boolean;
 }
 
 // Scan progress event sent from backend
@@ -185,7 +192,7 @@ export interface ScanProgressEvent {
   current_file: string | null;
   percent: number;
   root_id: number;
-  phase: 'discovery' | 'processing' | 'inserting' | 'calibrating';
+  phase: 'verifying' | 'discovery' | 'processing' | 'inserting' | 'calibrating' | 'caching';
 }
 
 // Scan completion event sent from backend
@@ -201,6 +208,10 @@ export interface ScanCompleteEvent {
   bias_count: number;
   darkflats_count: number;
   calibration_sets_created: number;
+  frames_renamed?: number;
+  calibration_sets_deleted?: number;
+  sessions_updated?: number;
+  cancelled: boolean;
 }
 
 export interface FileWithFrame {
@@ -337,6 +348,14 @@ export interface CalibrationSetDetail {
   date_end: string;
   date_display: string;
   frame_count: number;
+  is_master: boolean;  // True if this is a master calibration set
+  // Extended fields from frame metadata
+  naxis1: number | null;      // Image width
+  naxis2: number | null;      // Image height
+  bayerpat: string | null;    // Bayer pattern (e.g., "RGGB") or null for mono
+  swcreate: string | null;    // Software that created the file
+  xpixsz: number | null;      // Pixel size in microns
+  format: string | null;      // File format (FITS, XISF)
 }
 
 export interface DarkLibraryResult {
@@ -368,6 +387,25 @@ export interface OrphanedFile {
   filename: string;
   size: number;
   modified_at: string;
+  has_frame: boolean;
+  object: string | null;
+  date_obs: string | null;
+}
+
+// Missing file record with status from the database
+export interface MissingFileRecord {
+  id: number;
+  file_id: number;
+  scan_root_id: number;
+  detected_at: string;
+  last_checked_at: string;
+  status: 'missing' | 'ignored';
+  // File info
+  path: string;
+  filename: string;
+  size: number;
+  modified_at: string;
+  // Frame info (if exists)
   has_frame: boolean;
   object: string | null;
   date_obs: string | null;
@@ -744,4 +782,35 @@ export interface CalendarMonthData {
   days: CalendarDayEvent[];
   totalFrameCount: number;
   totalExposureSeconds: number;
+}
+
+export interface CalendarYearData {
+  year: number;
+  months: CalendarMonthData[]; // Only months with data
+  totalFrameCount: number;
+  totalExposureSeconds: number;
+}
+
+// ========== Calibration Set Metadata Editing ==========
+
+/** Edits to apply to calibration set metadata (selective fields) */
+export interface CalibrationMetadataEdits {
+  ccd_temp?: number | null;
+  gain?: number | null;
+  offset?: number | null;
+  binning?: string | null;
+  exptime?: number | null;
+}
+
+/** Original calibration set metadata values (backed up before editing) */
+export interface CalibrationSetOriginals {
+  set_id: number;
+  ccd_temp: number | null;
+  temp_min: number | null;
+  temp_max: number | null;
+  gain: number | null;
+  offset: number | null;
+  binning: string | null;
+  exptime: number | null;
+  saved_at: string;  // ISO 8601
 }

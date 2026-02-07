@@ -10,8 +10,8 @@ export function CalibrationStatusBadges({ status, loading }: CalibrationStatusBa
   if (loading) {
     return (
       <div className="flex items-center gap-2">
-        <Loader2 size={16} className="text-gray-400 animate-spin" />
-        <span className="text-xs text-gray-400">Loading calibration status...</span>
+        <Loader2 size={16} className="text-content-muted animate-spin" />
+        <span className="text-xs text-content-muted">Loading calibration status...</span>
       </div>
     );
   }
@@ -19,7 +19,7 @@ export function CalibrationStatusBadges({ status, loading }: CalibrationStatusBa
   if (!status) {
     return (
       <div className="flex items-center gap-1">
-        <div className="px-2 py-0.5 bg-gray-700 text-gray-400 text-xs rounded flex items-center gap-1">
+        <div className="px-2 py-0.5 bg-surface-hover text-content-muted text-xs rounded flex items-center gap-1">
           <span>No calibration</span>
         </div>
       </div>
@@ -81,13 +81,13 @@ export function CalibrationStatusBadges({ status, loading }: CalibrationStatusBa
   const getStatusColors = (badgeStatus: string) => {
     switch (badgeStatus) {
       case 'success':
-        return 'bg-green-900/30 text-green-400 border-green-700';
+        return 'bg-success-muted text-success border-success';
       case 'warning':
-        return 'bg-yellow-900/30 text-yellow-400 border-yellow-700';
+        return 'bg-warning-muted text-warning border-warning';
       case 'missing':
-        return 'bg-red-900/30 text-red-400 border-red-700';
+        return 'bg-error-muted text-error border-error';
       default:
-        return 'bg-gray-700 text-gray-400 border-gray-600';
+        return 'bg-surface-hover text-content-muted border-border';
     }
   };
 
@@ -107,7 +107,7 @@ export function CalibrationStatusBadges({ status, loading }: CalibrationStatusBa
         );
       })}
       {(status.flats_warning || status.darks_warning || status.bias_warning) && (
-        <span className="text-xs text-yellow-400" title="Has warnings">
+        <span className="text-xs text-warning" title="Has warnings">
           (⚠)
         </span>
       )}

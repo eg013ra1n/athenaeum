@@ -22,7 +22,7 @@ export function SelectionToolbar({
 }: SelectionToolbarProps) {
   return (
     <div className="absolute bottom-4 left-4 z-20 flex items-center gap-2">
-      <span className="text-sm font-medium text-gray-300">Select</span>
+      <span className="text-sm font-medium text-content-secondary">Select</span>
 
       <button
         onClick={() => onModeChange(activeMode === 'rectangle' ? 'none' : 'rectangle')}
@@ -30,8 +30,8 @@ export function SelectionToolbar({
         title="Select frames in a rectangular region (Press S)"
         className={`w-10 h-10 rounded transition flex items-center justify-center ${
           activeMode === 'rectangle'
-            ? 'bg-blue-500 text-white shadow-lg'
-            : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+            ? 'bg-accent text-surface shadow-lg'
+            : 'bg-surface-hover text-content-secondary hover:brightness-110'
         } ${isDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
       >
         <div className="relative w-[18px] h-[18px] flex items-center justify-center">

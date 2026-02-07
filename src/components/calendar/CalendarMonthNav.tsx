@@ -1,12 +1,15 @@
-import { ChevronLeft, ChevronRight, Calendar } from 'lucide-react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { format } from 'date-fns';
+
+export type CalendarViewMode = 'month' | 'year';
 
 interface CalendarMonthNavProps {
   year: number;
   month: number; // 1-12
-  onPrevMonth: () => void;
-  onNextMonth: () => void;
-  onToday: () => void;
+  viewMode: CalendarViewMode;
+  onViewModeChange: (mode: CalendarViewMode) => void;
+  onPrev: () => void;
+  onNext: () => void;
   totalFrameCount: number;
   totalExposureHours: number;
 }
@@ -14,9 +17,10 @@ interface CalendarMonthNavProps {
 export function CalendarMonthNav({
   year,
   month,
-  onPrevMonth,
-  onNextMonth,
-  onToday,
+  viewMode,
+  onViewModeChange,
+  onPrev,
+  onNext,
   totalFrameCount,
   totalExposureHours,
 }: CalendarMonthNavProps) {
@@ -28,39 +32,56 @@ export function CalendarMonthNav({
       <div className="flex items-center gap-4">
         <div className="flex items-center gap-1">
           <button
-            onClick={onPrevMonth}
-            className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
-            title="Previous month"
+            onClick={onPrev}
+            className="p-2 hover:bg-surface-hover rounded-lg transition-colors"
+            title={viewMode === 'month' ? 'Previous month' : 'Previous year'}
           >
             <ChevronLeft size={20} />
           </button>
           <button
-            onClick={onNextMonth}
-            className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
-            title="Next month"
+            onClick={onNext}
+            className="p-2 hover:bg-surface-hover rounded-lg transition-colors"
+            title={viewMode === 'month' ? 'Next month' : 'Next year'}
           >
             <ChevronRight size={20} />
           </button>
         </div>
-        <h3 className="text-xl font-semibold">
-          {format(displayDate, 'MMMM yyyy')}
+        <h3 className="text-xl font-semibold min-w-[180px]">
+          {viewMode === 'month' ? format(displayDate, 'MMMM yyyy') : year}
         </h3>
-        <button
-          onClick={onToday}
-          className="flex items-center gap-1 px-3 py-1.5 text-sm bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors"
-        >
-          <Calendar size={14} />
-          Today
-        </button>
+
+        {/* View Mode Toggle */}
+        <div className="flex items-center bg-surface-hover rounded-lg p-0.5">
+          <button
+            onClick={() => onViewModeChange('month')}
+            className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
+              viewMode === 'month'
+                ? 'bg-surface-hover text-content'
+                : 'text-content-muted hover:text-content'
+            }`}
+          >
+            Month
+          </button>
+          <button
+            onClick={() => onViewModeChange('year')}
+            className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
+              viewMode === 'year'
+                ? 'bg-surface-hover text-content'
+                : 'text-content-muted hover:text-content'
+            }`}
+          >
+            Year
+          </button>
+        </div>
       </div>
 
-      {/* Month stats */}
-      <div className="flex items-center gap-4 text-sm text-gray-400">
+      {/* Stats */}
+      <div className="flex items-center gap-4 text-sm text-content-muted">
         <span>
-          <span className="text-gray-200 font-medium">{totalFrameCount}</span> frames
+          <span className="text-content font-medium">{totalFrameCount}</span> frames
         </span>
         <span>
-          <span className="text-gray-200 font-medium">{totalExposureHours.toFixed(1)}</span>h exposure
+          <span className="text-content font-medium">{totalExposureHours.toFixed(1)}</span>h exposure
         </span>
       </div>
     </div>

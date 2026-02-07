@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
+import { open } from '@tauri-apps/plugin-dialog';
+import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair, Terminal, FolderOpen, Wand2 } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
@@ -42,13 +43,84 @@ export default function Settings() {
   const [rescanningContentHash, setRescanningContentHash] = useState(false);
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
+  // Siril CLI path state
+  const [sirilPath, setSirilPath] = useState<string>('');
+  const [sirilPathSaving, setSirilPathSaving] = useState(false);
+  const [sirilPathSuccess, setSirilPathSuccess] = useState(false);
+  const [autoDetecting, setAutoDetecting] = useState(false);
+  const [autoDetectResult, setAutoDetectResult] = useState<string | null>(null);
+
   // Tab state
   const [activeTab, setActiveTab] = useState<'general' | 'calibration'>('general');
 
   useEffect(() => {
     loadSettings();
     loadCacheStats();
+    loadSirilPath();
   }, []);
+
+  const loadSirilPath = async () => {
+    try {
+      const path = await invoke<string | null>('get_siril_path');
+      setSirilPath(path || '');
+    } catch (err) {
+      console.error('Failed to load Siril path:', err);
+    }
+  };
+
+  const handleSaveSirilPath = async () => {
+    try {
+      setSirilPathSaving(true);
+      setSirilPathSuccess(false);
+      await invoke('set_siril_path', { path: sirilPath });
+      setSirilPathSuccess(true);
+      setTimeout(() => setSirilPathSuccess(false), 3000);
+    } catch (err) {
+      setError(err as string);
+    } finally {
+      setSirilPathSaving(false);
+    }
+  };
+
+  const handleAutoDetectSiril = async () => {
+    try {
+      setAutoDetecting(true);
+      setAutoDetectResult(null);
+      // Clear the saved path first to trigger fresh auto-detection
+      await invoke('set_siril_path', { path: '' });
+      const detectedPath = await invoke<string | null>('get_siril_path');
+      if (detectedPath) {
+        setSirilPath(detectedPath);
+        setAutoDetectResult(`Found: ${detectedPath}`);
+        // Save the detected path
+        await invoke('set_siril_path', { path: detectedPath });
+      } else {
+        setAutoDetectResult('Siril CLI not found in common locations');
+      }
+      setTimeout(() => setAutoDetectResult(null), 5000);
+    } catch (err) {
+      setError(err as string);
+    } finally {
+      setAutoDetecting(false);
+    }
+  };
+
+  const handleBrowseSirilPath = async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        title: 'Select Siril CLI Executable',
+        filters: [
+          { name: 'Executable', extensions: ['', 'exe'] }
+        ]
+      });
+      if (selected && typeof selected === 'string') {
+        setSirilPath(selected);
+      }
+    } catch (err) {
+      console.error('Failed to browse for Siril:', err);
+    }
+  };
 
   const loadSettings = async () => {
     try {
@@ -315,8 +387,8 @@ export default function Settings() {
   if (loading) {
     return (
       <div className="p-6">
-        <div className="text-center py-12 text-gray-400">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto"></div>
+        <div className="text-center py-12 text-content-muted">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto"></div>
           <p className="mt-4">Loading settings...</p>
         </div>
       </div>
@@ -327,17 +399,17 @@ export default function Settings() {
     <div className="p-6 max-w-4xl">
       <div className="mb-6">
         <h2 className="text-3xl font-bold">Settings</h2>
-        <p className="text-gray-400">Configure application settings</p>
+        <p className="text-content-muted">Configure application settings</p>
       </div>
 
       {/* Tab Navigation */}
-      <div className="flex gap-1 mb-6 border-b border-gray-700">
+      <div className="flex gap-1 mb-6 border-b border-border">
         <button
           onClick={() => setActiveTab('general')}
           className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
             activeTab === 'general'
-              ? 'bg-gray-800 text-white border-b-2 border-blue-500'
-              : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+              ? 'bg-surface-elevated text-white border-b-2 border-accent'
+              : 'text-content-muted hover:text-content hover:bg-surface-elevated/50'
           }`}
         >
           <SettingsIcon size={18} />
@@ -347,8 +419,8 @@ export default function Settings() {
           onClick={() => setActiveTab('calibration')}
           className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
             activeTab === 'calibration'
-              ? 'bg-gray-800 text-white border-b-2 border-blue-500'
-              : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'
+              ? 'bg-surface-elevated text-white border-b-2 border-accent'
+              : 'text-content-muted hover:text-content hover:bg-surface-elevated/50'
           }`}
         >
           <Crosshair size={18} />
@@ -358,9 +430,9 @@ export default function Settings() {
 
       {/* Calibration Matching Tab */}
       {activeTab === 'calibration' && (
-        <div className="bg-gray-800 rounded-lg p-6">
+        <div className="bg-surface-elevated rounded-lg p-6">
           <h3 className="text-xl font-semibold mb-4">Calibration Matching Configuration</h3>
-          <p className="text-gray-400 mb-6">
+          <p className="text-content-muted mb-6">
             Configure how calibration frames (Flats, Darks, Bias) are matched to source frames.
             Define which parameters must match exactly, warn on threshold, or be ignored.
           </p>
@@ -372,32 +444,32 @@ export default function Settings() {
       {activeTab === 'general' && (
         <>
           {error && (
-            <div className="mb-4 p-4 bg-red-900/20 border border-red-800 rounded-lg flex items-start gap-3">
-              <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
+            <div className="mb-4 p-4 bg-error-muted border border-error/50 rounded-lg flex items-start gap-3">
+              <AlertCircle className="text-error flex-shrink-0 mt-0.5" size={20} />
               <div className="flex-1">
-                <p className="font-medium text-red-400">Error</p>
-                <p className="text-sm text-red-300">{String(error)}</p>
+                <p className="font-medium text-error">Error</p>
+                <p className="text-sm text-error/80">{String(error)}</p>
               </div>
             </div>
           )}
 
           {success && (
-            <div className="mb-4 p-4 bg-green-900/20 border border-green-800 rounded-lg flex items-start gap-3">
-              <CheckCircle className="text-green-500 flex-shrink-0 mt-0.5" size={20} />
+            <div className="mb-4 p-4 bg-success-muted border border-success/50 rounded-lg flex items-start gap-3">
+              <CheckCircle className="text-success flex-shrink-0 mt-0.5" size={20} />
               <div className="flex-1">
-                <p className="font-medium text-green-400">Settings saved successfully</p>
+                <p className="font-medium text-success">Settings saved successfully</p>
               </div>
             </div>
           )}
 
-          <div className="bg-gray-800 rounded-lg p-6 space-y-6">
+          <div className="bg-surface-elevated rounded-lg p-6 space-y-6">
         <div>
           <h3 className="text-lg font-semibold mb-4">Clustering Parameters</h3>
 
           <div className="space-y-4">
             {/* Threshold Value and Unit */}
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 Grouping Threshold
               </label>
               <div className="flex gap-3">
@@ -407,19 +479,19 @@ export default function Settings() {
                   onChange={(e) => setThresholdValue(e.target.value)}
                   step="0.1"
                   min="0"
-                  className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+                  className="flex-1 bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
                 />
                 <select
                   value={thresholdUnit}
                   onChange={(e) => setThresholdUnit(e.target.value as ThresholdUnit)}
-                  className="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+                  className="bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
                 >
                   <option value="arcsec">arcseconds</option>
                   <option value="arcmin">arcminutes</option>
                   <option value="deg">degrees</option>
                 </select>
               </div>
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-content-muted mt-2">
                 Frames within this angular distance will be grouped together.
                 Current value: {getThresholdInDegrees()}° (decimal degrees)
               </p>
@@ -433,7 +505,7 @@ export default function Settings() {
           <div className="space-y-4">
             {/* Session Gap Threshold */}
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 Session Gap Threshold (hours)
               </label>
               <input
@@ -442,9 +514,9 @@ export default function Settings() {
                 onChange={(e) => setSessionGapHours(e.target.value)}
                 step="0.5"
                 min="0"
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
               />
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-content-muted mt-2">
                 Time gap to detect imaging night boundaries. If more than this many hours pass
                 between frames, they will be grouped into separate imaging nights. Typical night
                 sessions can span midnight (e.g., 19:00 Day 1 → 03:00 Day 2 = one night). Default
@@ -455,31 +527,106 @@ export default function Settings() {
         </div>
 
         <div>
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <Terminal size={20} />
+            Siril Integration
+          </h3>
+
+          <div className="space-y-4">
+            {/* Siril CLI Path */}
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Siril CLI Path
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={sirilPath}
+                  onChange={(e) => setSirilPath(e.target.value)}
+                  placeholder="/path/to/siril-cli"
+                  className="flex-1 bg-surface-hover border border-border rounded-lg px-4 py-2 text-content placeholder-gray-500 focus:outline-none focus:border-accent"
+                />
+                <button
+                  onClick={handleBrowseSirilPath}
+                  className="px-3 py-2 bg-surface-hover hover:brightness-110 rounded-lg transition-colors"
+                  title="Browse for Siril CLI"
+                >
+                  <FolderOpen size={18} />
+                </button>
+                <button
+                  onClick={handleAutoDetectSiril}
+                  disabled={autoDetecting}
+                  className="px-3 py-2 bg-purple hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed rounded-lg transition-colors flex items-center gap-2"
+                  title="Auto-detect Siril CLI"
+                >
+                  <Wand2 size={18} className={autoDetecting ? 'animate-pulse' : ''} />
+                  {autoDetecting ? 'Detecting...' : 'Auto-detect'}
+                </button>
+              </div>
+              <p className="text-xs text-content-muted mt-2">
+                Path to the Siril command-line interface. On macOS, it's typically at{' '}
+                <code className="bg-surface-hover px-1 rounded">/Applications/Siril.app/Contents/MacOS/siril-cli</code>
+              </p>
+
+              {autoDetectResult && (
+                <div className={`mt-2 flex items-center gap-2 text-sm ${
+                  autoDetectResult.startsWith('Found') ? 'text-success' : 'text-warning'
+                }`}>
+                  {autoDetectResult.startsWith('Found') ? (
+                    <CheckCircle size={16} />
+                  ) : (
+                    <AlertCircle size={16} />
+                  )}
+                  {autoDetectResult}
+                </div>
+              )}
+
+              <div className="mt-3 flex items-center gap-2">
+                <button
+                  onClick={handleSaveSirilPath}
+                  disabled={sirilPathSaving || !sirilPath}
+                  className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors text-sm"
+                >
+                  <Save size={16} />
+                  {sirilPathSaving ? 'Saving...' : 'Save Siril Path'}
+                </button>
+                {sirilPathSuccess && (
+                  <div className="flex items-center gap-2 text-success text-sm">
+                    <CheckCircle size={16} />
+                    Saved!
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div>
           <h3 className="text-lg font-semibold mb-4">Blink Viewer</h3>
 
           <div className="space-y-4">
             {/* Resolution */}
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 Image Resolution
               </label>
               <select
                 value={blinkResolution}
                 onChange={(e) => setBlinkResolution(e.target.value)}
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:border-blue-500"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
               >
                 <option value="thumbnail">Thumbnail (4x downscale)</option>
                 <option value="preview">Preview (2x2 binning)</option>
                 <option value="full">Full Resolution</option>
               </select>
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-content-muted mt-2">
                 Resolution for blink viewer images. Thumbnail is fastest, Preview balances speed and quality, Full shows maximum detail. Note: Changing this will cache images separately for each resolution.
               </p>
             </div>
 
             {/* Thumbnail JPEG Quality */}
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 Thumbnail JPEG Quality ({qualityThumbnail})
               </label>
               <input
@@ -491,18 +638,18 @@ export default function Settings() {
                 step="1"
                 className="w-full"
               />
-              <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <div className="flex justify-between text-xs text-content-muted mt-1">
                 <span>1 (Smallest)</span>
                 <span>100 (Highest Quality)</span>
               </div>
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-content-muted mt-2">
                 JPEG quality for thumbnail images. Default: 70. Lower values = smaller files, faster loading.
               </p>
             </div>
 
             {/* Preview JPEG Quality */}
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 Preview JPEG Quality ({qualityPreview})
               </label>
               <input
@@ -514,18 +661,18 @@ export default function Settings() {
                 step="1"
                 className="w-full"
               />
-              <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <div className="flex justify-between text-xs text-content-muted mt-1">
                 <span>1 (Smallest)</span>
                 <span>100 (Highest Quality)</span>
               </div>
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-content-muted mt-2">
                 JPEG quality for preview/blink viewer images. Default: 85. Good balance of quality and file size.
               </p>
             </div>
 
             {/* Full JPEG Quality */}
             <div>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label className="block text-sm font-medium text-content-secondary mb-2">
                 Full Resolution JPEG Quality ({qualityFull})
               </label>
               <input
@@ -537,11 +684,11 @@ export default function Settings() {
                 step="1"
                 className="w-full"
               />
-              <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <div className="flex justify-between text-xs text-content-muted mt-1">
                 <span>1 (Smallest)</span>
                 <span>100 (Highest Quality)</span>
               </div>
-              <p className="text-xs text-gray-500 mt-2">
+              <p className="text-xs text-content-muted mt-2">
                 JPEG quality for full resolution images. Default: 95. Highest quality for detailed viewing.
               </p>
             </div>
@@ -560,16 +707,16 @@ export default function Settings() {
                   type="checkbox"
                   checked={useContentHash}
                   onChange={(e) => setUseContentHash(e.target.checked)}
-                  className="w-5 h-5 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-2 focus:ring-blue-500 focus:ring-offset-0"
+                  className="w-5 h-5 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0"
                 />
                 <div>
-                  <span className="block text-sm font-medium text-gray-300">
+                  <span className="block text-sm font-medium text-content-secondary">
                     Use File Content Hash (XXHash)
                   </span>
-                  <span className="block text-xs text-gray-500 mt-1">
+                  <span className="block text-xs text-content-muted mt-1">
                     When enabled, duplicate detection will use XXHash sampling (1.5MB per file) instead of metadata-based hashing. More accurate for finding true duplicates.
                     <br />
-                    <span className="text-yellow-400 font-medium">⚠️ Not recommended for NAS or slow network storage</span> - hash computation requires reading file data which may be slow over network.
+                    <span className="text-warning font-medium">⚠️ Not recommended for NAS or slow network storage</span> - hash computation requires reading file data which may be slow over network.
                   </span>
                 </div>
               </label>
@@ -577,20 +724,20 @@ export default function Settings() {
 
             {/* Rescan Warning */}
             {useContentHash && !contentHashRescanned && (
-              <div className="p-4 bg-yellow-900/20 border border-yellow-800 rounded-lg">
-                <p className="text-sm text-yellow-300">
+              <div className="p-4 bg-warning-muted border border-warning/50 rounded-lg">
+                <p className="text-sm text-warning/80">
                   ⚠️ After enabling content hash, you must rescan all files to compute their hashes. New files scanned after enabling this will automatically have their content hashes computed.
                 </p>
                 <button
                   onClick={handleRescanContentHash}
                   disabled={rescanningContentHash}
-                  className="mt-3 flex items-center gap-2 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+                  className="mt-3 flex items-center gap-2 px-4 py-2 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
                 >
                   <RefreshCw size={18} className={rescanningContentHash ? 'animate-spin' : ''} />
                   {rescanningContentHash ? 'Computing Hashes...' : 'Rescan All Files for Content Hash'}
                 </button>
                 {rescanSuccess !== null && (
-                  <div className="mt-2 flex items-center gap-2 text-green-400">
+                  <div className="mt-2 flex items-center gap-2 text-success">
                     <CheckCircle size={18} />
                     <span>Updated {rescanSuccess.updated} of {rescanSuccess.total} files</span>
                   </div>
@@ -600,12 +747,12 @@ export default function Settings() {
           </div>
         </div>
 
-        <div className="pt-4 border-t border-gray-700">
+        <div className="pt-4 border-t border-border">
           <div className="flex items-center gap-4">
             <button
               onClick={handleSave}
               disabled={saving}
-              className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+              className="flex items-center gap-2 px-6 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
             >
               <Save size={18} />
               {saving ? 'Saving...' : 'Save Settings'}
@@ -614,7 +761,7 @@ export default function Settings() {
             <button
               onClick={handleClearCache}
               disabled={clearingCache}
-              className="flex items-center gap-2 px-6 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+              className="flex items-center gap-2 px-6 py-2 bg-error hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
             >
               <Trash2 size={18} />
               {clearingCache
@@ -624,7 +771,7 @@ export default function Settings() {
             </button>
 
             {cacheSuccess && (
-              <div className="flex items-center gap-2 text-green-400">
+              <div className="flex items-center gap-2 text-success">
                 <CheckCircle size={18} />
                 <span>Cache cleared!</span>
               </div>
@@ -634,26 +781,26 @@ export default function Settings() {
       </div>
 
       {/* Database Maintenance Section */}
-      <div className="mt-6 bg-gray-800 rounded-lg p-6">
+      <div className="mt-6 bg-surface-elevated rounded-lg p-6">
         <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
           <Database size={20} />
           Database Maintenance
         </h3>
         <div className="space-y-4">
           <div>
-            <p className="text-sm text-gray-400 mb-3">
+            <p className="text-sm text-content-muted mb-3">
               Backfill header fingerprints for existing FITS files. This is required for file relinking when directories are moved.
             </p>
             <button
               onClick={handleBackfillFingerprints}
               disabled={backfillingFingerprints}
-              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+              className="flex items-center gap-2 px-4 py-2 bg-purple hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
             >
               <RefreshCw size={18} className={backfillingFingerprints ? 'animate-spin' : ''} />
               {backfillingFingerprints ? 'Computing...' : 'Backfill Header Fingerprints'}
             </button>
             {backfillSuccess !== null && (
-              <div className="mt-2 flex items-center gap-2 text-green-400">
+              <div className="mt-2 flex items-center gap-2 text-success">
                 <CheckCircle size={18} />
                 <span>Processed {backfillSuccess} headers</span>
               </div>
@@ -662,9 +809,9 @@ export default function Settings() {
         </div>
       </div>
 
-      <div className="mt-6 bg-gray-800 rounded-lg p-6">
+      <div className="mt-6 bg-surface-elevated rounded-lg p-6">
         <h3 className="text-lg font-semibold mb-3">About Frame Set Grouping</h3>
-        <div className="text-sm text-gray-400 space-y-2">
+        <div className="text-sm text-content-muted space-y-2">
           <p>
             Frame sets are automatically created by clustering LIGHT frames based on their sky
             coordinates (RA/Dec).

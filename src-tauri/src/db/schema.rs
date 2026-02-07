@@ -65,6 +65,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             path TEXT NOT NULL UNIQUE,
             enabled INTEGER NOT NULL DEFAULT 1,
             find_duplicates INTEGER NOT NULL DEFAULT 1,
+            unique_camera INTEGER NOT NULL DEFAULT 0,
             last_scan TEXT
         )",
         [],
@@ -238,6 +239,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Missing files table - tracks files that no longer exist on disk
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS missing_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL UNIQUE,
+            scan_root_id INTEGER NOT NULL,
+            detected_at TEXT NOT NULL,
+            last_checked_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'missing',
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY (scan_root_id) REFERENCES scan_roots(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Calibration set to frames - links frames/sets to their required calibration sets
     conn.execute(
         "CREATE TABLE IF NOT EXISTS calibration_set_to_frames (
@@ -387,6 +403,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missing_files_scan_root ON missing_files(scan_root_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_missing_files_status ON missing_files(status)",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_fits_header_fingerprint ON fits_header(header_fingerprint)",
         [],
     )?;
@@ -530,6 +554,52 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+
+    // Add unique_camera to scan_roots table (migration for existing databases)
+    let has_unique_camera: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_roots') WHERE name='unique_camera'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_unique_camera {
+        conn.execute(
+            "ALTER TABLE scan_roots ADD COLUMN unique_camera INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Add bayerpat to frames table (migration for existing databases)
+    // Used to distinguish OSC (one-shot color) cameras from mono cameras
+    // OSC cameras have a Bayer pattern (e.g., "RGGB", "BGGR")
+    let has_bayerpat: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name='bayerpat'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_bayerpat {
+        conn.execute(
+            "ALTER TABLE frames ADD COLUMN bayerpat TEXT",
+            [],
+        )?;
+    }
+
+    // Calibration set originals table - stores original metadata values before custom edits
+    // Used to backup original FITS header values when user edits calibration set metadata
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS calibration_set_originals (
+            set_id INTEGER PRIMARY KEY,
+            ccd_temp REAL,
+            temp_min REAL,
+            temp_max REAL,
+            gain REAL,
+            offset REAL,
+            binning TEXT,
+            exptime REAL,
+            saved_at TEXT NOT NULL,
+            FOREIGN KEY (set_id) REFERENCES calibration_set(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
 
     Ok(())
 }

@@ -83,17 +83,17 @@ export function SelectionDialog({
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-gray-800 rounded-lg shadow-lg max-w-md w-full mx-4">
+      <div className="bg-surface-elevated rounded-lg shadow-lg max-w-md w-full mx-4">
         {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b border-gray-700">
-          <h2 className="text-lg font-semibold text-gray-100">
+        <div className="flex items-center justify-between p-6 border-b border-border">
+          <h2 className="text-lg font-semibold text-content">
             {selectionType === 'rectangle'
               ? 'Rectangle Selection Results'
               : 'Selection Results'}
           </h2>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-gray-200 transition"
+            className="text-content-muted hover:text-content transition"
           >
             <X size={20} />
           </button>
@@ -104,27 +104,27 @@ export function SelectionDialog({
           {/* Results Summary */}
           {!success ? (
             <>
-              <div className="bg-gray-700 rounded p-4 space-y-2">
+              <div className="bg-surface-hover rounded p-4 space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-300">Frames Found:</span>
-                  <span className="text-blue-400 font-semibold">{result.count}</span>
+                  <span className="text-content-secondary">Frames Found:</span>
+                  <span className="text-accent font-semibold">{result.count}</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-300">Total Exposure:</span>
-                  <span className="text-blue-400 font-semibold">{totalHours}h</span>
+                  <span className="text-content-secondary">Total Exposure:</span>
+                  <span className="text-accent font-semibold">{totalHours}h</span>
                 </div>
               </div>
 
               {/* Description */}
               {selectionDescription && (
-                <div className="text-sm text-gray-400 p-3 bg-gray-700 rounded">
+                <div className="text-sm text-content-muted p-3 bg-surface-hover rounded">
                   {selectionDescription}
                 </div>
               )}
 
               {/* Frame Set Name Input */}
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
+                <label className="block text-sm font-medium text-content-secondary mb-2">
                   Create Frame Set
                 </label>
                 <input
@@ -135,13 +135,13 @@ export function SelectionDialog({
                     setError(null);
                   }}
                   placeholder="e.g., M31 Imaging Session"
-                  className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500 transition"
+                  className="w-full px-3 py-2 bg-surface-hover border border-border rounded text-content placeholder-content-muted focus:outline-none focus:border-accent transition"
                 />
               </div>
 
               {/* Error Message */}
               {error && (
-                <div className="flex items-center gap-2 text-red-400 text-sm p-3 bg-red-950 rounded">
+                <div className="flex items-center gap-2 text-error text-sm p-3 bg-error-muted rounded">
                   <AlertCircle size={16} />
                   <span>{error}</span>
                 </div>
@@ -151,14 +151,14 @@ export function SelectionDialog({
               <div className="flex gap-2 pt-4">
                 <button
                   onClick={onClose}
-                  className="flex-1 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-100 rounded transition"
+                  className="flex-1 px-4 py-2 bg-surface-hover hover:bg-surface-hover text-content rounded transition"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={handleCreateFrameSet}
                   disabled={isCreating || !frameSetName.trim()}
-                  className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-900 text-white rounded transition flex items-center justify-center gap-2"
+                  className="flex-1 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-surface rounded transition flex items-center justify-center gap-2"
                 >
                   {isCreating ? (
                     <>
@@ -178,13 +178,13 @@ export function SelectionDialog({
             /* Success State */
             <div className="text-center space-y-4">
               <div className="flex justify-center">
-                <div className="w-12 h-12 bg-green-900 rounded-full flex items-center justify-center">
-                  <Check className="text-green-400" size={24} />
+                <div className="w-12 h-12 bg-success-muted rounded-full flex items-center justify-center">
+                  <Check className="text-success" size={24} />
                 </div>
               </div>
               <div>
-                <h3 className="text-lg font-semibold text-green-400">Frame Set Created</h3>
-                <p className="text-sm text-gray-400 mt-1">
+                <h3 className="text-lg font-semibold text-success">Frame Set Created</h3>
+                <p className="text-sm text-content-muted mt-1">
                   {result.count} frames grouped successfully
                 </p>
               </div>

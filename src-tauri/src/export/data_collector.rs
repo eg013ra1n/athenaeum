@@ -4,16 +4,19 @@
 //! to prepare data for export.
 
 use crate::export::models::{
-    CalibrationSummary, ExportCalibrationSet, ExportData, ExportFrame, FilterExportGroup,
+    CalibrationDetail, CalibrationSetInfo, CalibrationSubgroup, CalibrationSummary, CameraType,
+    DetailedWarning, ExportCalibrationSet, ExportData, ExportFrame, ExportGroup, ExportSummary,
+    ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode, FolderNodeType,
+    FolderPreview, FrameDetail, MasterCreationPlan, MasterInfo, WarningSeverity, WarningType,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Collect all export data for a frame set
 ///
 /// This traverses the frame set hierarchy to get all light frames,
-/// groups them by filter, and retrieves their calibration links.
+/// groups them by filter and camera type, and retrieves their calibration links.
 pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<ExportData> {
     println!("📦 Collecting export data for frame set {}", frame_set_id);
 
@@ -25,7 +28,18 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
     let light_frames = get_light_frames_for_frame_set(conn, frame_set_id)?;
     println!("  Found {} light frames", light_frames.len());
 
-    // Group frames by filter
+    // =========================================================================
+    // Phase 3: Build new export groups with subgroups
+    // =========================================================================
+    let groups = build_export_groups(conn, &light_frames)?;
+    let master_plan = build_master_creation_plan(conn, &groups)?;
+
+    println!("  Built {} export groups with {} masters to create",
+             groups.len(), master_plan.masters.len());
+
+    // =========================================================================
+    // Legacy: Build filter groups for backwards compatibility
+    // =========================================================================
     let mut filter_groups: HashMap<Option<String>, Vec<ExportFrame>> = HashMap::new();
     for frame in &light_frames {
         filter_groups
@@ -34,7 +48,7 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
             .push(frame.clone());
     }
 
-    // Build filter export groups with calibrations
+    // Build filter export groups with calibrations (legacy format)
     let mut filters = Vec::new();
     let mut total_flat_count = 0;
     let mut total_dark_count = 0;
@@ -43,7 +57,7 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
     let mut all_warnings = Vec::new();
     let mut flats_complete = true;
     let mut darks_complete = true;
-    let bias_complete = true;
+    let mut bias_complete = true;
 
     for (filter, frames) in filter_groups {
         // For each filter group, collect calibrations from the first frame
@@ -58,11 +72,11 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         for flat in &flat_sets {
             total_flat_count += flat.frames.len() as i32;
             for sub in &flat.sub_calibrations {
-                if sub.imagetyp == "DARKFLAT" {
+                if sub.imagetyp == "DarkFlat" {
                     total_dark_flat_count += sub.frames.len() as i32;
-                } else if sub.imagetyp == "DARK" {
+                } else if sub.imagetyp == "Dark" {
                     total_dark_count += sub.frames.len() as i32;
-                } else if sub.imagetyp == "BIAS" {
+                } else if sub.imagetyp == "Bias" {
                     total_bias_count += sub.frames.len() as i32;
                 }
             }
@@ -72,7 +86,7 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         for dark in &dark_sets {
             total_dark_count += dark.frames.len() as i32;
             for sub in &dark.sub_calibrations {
-                if sub.imagetyp == "BIAS" {
+                if sub.imagetyp == "Bias" {
                     total_bias_count += sub.frames.len() as i32;
                 }
             }
@@ -91,7 +105,9 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         if dark_sets.is_empty() {
             darks_complete = false;
         }
-        // Bias is optional, so we don't track completeness
+        if bias_sets.is_empty() {
+            bias_complete = false;
+        }
 
         filters.push(FilterExportGroup {
             filter,
@@ -122,6 +138,8 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         frame_set_id,
         frame_set_name,
         object_name,
+        groups,
+        master_plan,
         filters,
         calibration_summary: CalibrationSummary {
             flat_count: total_flat_count,
@@ -190,8 +208,8 @@ fn get_light_frames_for_frame_set(conn: &Connection, frame_set_id: i64) -> Resul
 
     // Now get full frame info for each ID
     let mut frames = Vec::new();
-    for frame_id in frame_ids {
-        if let Ok(frame) = get_export_frame_by_id(conn, frame_id) {
+    for frame_id in &frame_ids {
+        if let Ok(frame) = get_export_frame_by_id(conn, *frame_id) {
             frames.push(frame);
         }
     }
@@ -205,7 +223,7 @@ fn get_export_frame_by_id(conn: &Connection, frame_id: i64) -> Result<ExportFram
     conn.query_row(
         "SELECT f.id, f.file_id, fi.path, fi.filename,
                 f.exptime, f.filter, f.ccd_temp, f.gain, f.offset,
-                f.binning, f.date_obs
+                f.binning, f.date_obs, f.focallen, f.xpixsz, f.bayerpat, f.instrume
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          WHERE f.id = ?1",
@@ -223,9 +241,13 @@ fn get_export_frame_by_id(conn: &Connection, frame_id: i64) -> Result<ExportFram
                 offset: row.get(8)?,
                 binning: row.get(9)?,
                 date_obs: row.get(10)?,
+                focallen: row.get(11)?,
+                xpixsz: row.get(12)?,
+                bayerpat: row.get(13)?,
+                instrume: row.get(14)?,
             })
         },
-    ).context("Failed to get frame by ID")
+    ).context(format!("Failed to get frame by ID: {}", frame_id))
 }
 
 /// Collect calibrations for a single frame
@@ -327,7 +349,7 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
     let mut stmt = conn.prepare(
         "SELECT f.id, f.file_id, fi.path, fi.filename,
                 f.exptime, f.filter, f.ccd_temp, f.gain, f.offset,
-                f.binning, f.date_obs
+                f.binning, f.date_obs, f.focallen, f.xpixsz, f.bayerpat, f.instrume
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          JOIN calibration_set_frames csf ON f.id = csf.frame_id
@@ -349,6 +371,10 @@ fn get_calibration_set_frames(conn: &Connection, set_id: i64) -> Result<Vec<Expo
                 offset: row.get(8)?,
                 binning: row.get(9)?,
                 date_obs: row.get(10)?,
+                focallen: row.get(11)?,
+                xpixsz: row.get(12)?,
+                bayerpat: row.get(13)?,
+                instrume: row.get(14)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -428,13 +454,1540 @@ fn build_calibration_set_shallow(
     })
 }
 
+// ============================================================================
+// Phase 3: New Export Group Building Logic
+// ============================================================================
+
+/// Calibration links for a single frame
+#[derive(Debug, Clone)]
+struct FrameCalibrationLinks {
+    #[allow(dead_code)]
+    frame_id: i64,
+    flat_id: Option<i64>,
+    dark_id: Option<i64>,
+    bias_id: Option<i64>,
+}
+
+impl FrameCalibrationLinks {
+    /// Generate a subgroup key from calibration set IDs
+    fn subgroup_key(&self) -> String {
+        format!(
+            "f{}_d{}_b{}",
+            self.flat_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+            self.dark_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+            self.bias_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+        )
+    }
+}
+
+/// Get calibration links for a single frame
+fn get_frame_calibration_links(conn: &Connection, frame_id: i64) -> Result<FrameCalibrationLinks> {
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'frame'",
+    )?;
+
+    let links: Vec<(i64, String)> = stmt
+        .query_map([frame_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut flat_id = None;
+    let mut dark_id = None;
+    let mut bias_id = None;
+
+    for (set_id, cal_type) in links {
+        match cal_type.as_str() {
+            "Flat" => flat_id = Some(set_id),
+            "Dark" => dark_id = Some(set_id),
+            "Bias" => bias_id = Some(set_id),
+            _ => {}
+        }
+    }
+
+    Ok(FrameCalibrationLinks {
+        frame_id,
+        flat_id,
+        dark_id,
+        bias_id,
+    })
+}
+
+/// Build CalibrationSetInfo with recursive sub-calibrations
+fn build_calibration_set_info(
+    conn: &Connection,
+    set_id: i64,
+    match_score: Option<f64>,
+    date_warning: bool,
+    temp_warning: bool,
+) -> Result<CalibrationSetInfo> {
+    // Get calibration set info
+    let imagetyp: String = conn
+        .query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .context("Failed to get calibration set")?;
+
+    // Get frames in the calibration set
+    let frames = get_calibration_set_frames(conn, set_id)?;
+    let frame_count = frames.len() as i32;
+
+    // Build warnings list
+    let mut warnings = Vec::new();
+    if date_warning {
+        warnings.push("Date warning: calibration may be too old".to_string());
+    }
+    if temp_warning {
+        warnings.push("Temperature warning: temperature mismatch detected".to_string());
+    }
+
+    // Get sub-calibrations for this set
+    let mut dark_flat: Option<Box<CalibrationSetInfo>> = None;
+    let mut dark: Option<Box<CalibrationSetInfo>> = None;
+    let mut bias: Option<Box<CalibrationSetInfo>> = None;
+
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type, match_score, date_warning, temp_warning
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'calibration_set'",
+    )?;
+
+    let sub_links: Vec<(i64, String, Option<f64>, bool, bool)> = stmt
+        .query_map([set_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get::<_, i32>(3)? != 0,
+                row.get::<_, i32>(4)? != 0,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (sub_set_id, cal_type, sub_score, sub_date_warn, sub_temp_warn) in sub_links {
+        // Build sub-calibration (one level deep to avoid infinite recursion)
+        let sub_info = build_calibration_set_info_shallow(conn, sub_set_id, sub_score, sub_date_warn, sub_temp_warn)?;
+
+        match cal_type.as_str() {
+            "DarkFlat" => dark_flat = Some(Box::new(sub_info)),
+            "Dark" => dark = Some(Box::new(sub_info)),
+            "Bias" => bias = Some(Box::new(sub_info)),
+            _ => {}
+        }
+    }
+
+    Ok(CalibrationSetInfo {
+        set_id,
+        imagetyp,
+        frames,
+        frame_count,
+        dark_flat,
+        dark,
+        bias,
+        match_score,
+        warnings,
+    })
+}
+
+/// Build CalibrationSetInfo without deep recursion (for sub-calibrations)
+fn build_calibration_set_info_shallow(
+    conn: &Connection,
+    set_id: i64,
+    match_score: Option<f64>,
+    date_warning: bool,
+    temp_warning: bool,
+) -> Result<CalibrationSetInfo> {
+    let imagetyp: String = conn
+        .query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .context("Failed to get calibration set")?;
+
+    let frames = get_calibration_set_frames(conn, set_id)?;
+    let frame_count = frames.len() as i32;
+
+    let mut warnings = Vec::new();
+    if date_warning {
+        warnings.push("Date warning: calibration may be too old".to_string());
+    }
+    if temp_warning {
+        warnings.push("Temperature warning: temperature mismatch detected".to_string());
+    }
+
+    // Get sub-calibrations (bias for darks)
+    let mut bias: Option<Box<CalibrationSetInfo>> = None;
+
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type, match_score, date_warning, temp_warning
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'calibration_set' AND calibration_type = 'Bias'",
+    )?;
+
+    if let Ok((bias_id, _, bias_score, bias_date, bias_temp)) = stmt.query_row([set_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<f64>>(2)?,
+            row.get::<_, i32>(3)? != 0,
+            row.get::<_, i32>(4)? != 0,
+        ))
+    }) {
+        // Build bias (terminal node, no further sub-calibrations)
+        let bias_info = build_calibration_set_info_terminal(conn, bias_id, bias_score, bias_date, bias_temp)?;
+        bias = Some(Box::new(bias_info));
+    }
+
+    Ok(CalibrationSetInfo {
+        set_id,
+        imagetyp,
+        frames,
+        frame_count,
+        dark_flat: None,
+        dark: None,
+        bias,
+        match_score,
+        warnings,
+    })
+}
+
+/// Build CalibrationSetInfo as terminal node (no sub-calibrations)
+fn build_calibration_set_info_terminal(
+    conn: &Connection,
+    set_id: i64,
+    match_score: Option<f64>,
+    date_warning: bool,
+    temp_warning: bool,
+) -> Result<CalibrationSetInfo> {
+    let imagetyp: String = conn
+        .query_row(
+            "SELECT imagetyp FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .context("Failed to get calibration set")?;
+
+    let frames = get_calibration_set_frames(conn, set_id)?;
+    let frame_count = frames.len() as i32;
+
+    let mut warnings = Vec::new();
+    if date_warning {
+        warnings.push("Date warning: calibration may be too old".to_string());
+    }
+    if temp_warning {
+        warnings.push("Temperature warning: temperature mismatch detected".to_string());
+    }
+
+    Ok(CalibrationSetInfo {
+        set_id,
+        imagetyp,
+        frames,
+        frame_count,
+        dark_flat: None,
+        dark: None,
+        bias: None,
+        match_score,
+        warnings,
+    })
+}
+
+/// Get CalibrationSetInfo for a frame's calibration link
+fn get_calibration_set_info_for_frame(
+    conn: &Connection,
+    frame_id: i64,
+    cal_type: &str,
+) -> Result<Option<CalibrationSetInfo>> {
+    let result: Option<(i64, Option<f64>, bool, bool)> = conn
+        .query_row(
+            "SELECT calibration_set_id, match_score, date_warning, temp_warning
+             FROM calibration_set_to_frames
+             WHERE source_id = ?1 AND source_type = 'frame' AND calibration_type = ?2",
+            rusqlite::params![frame_id, cal_type],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, i32>(2)? != 0,
+                    row.get::<_, i32>(3)? != 0,
+                ))
+            },
+        )
+        .ok();
+
+    match result {
+        Some((set_id, match_score, date_warning, temp_warning)) => {
+            let info = build_calibration_set_info(conn, set_id, match_score, date_warning, temp_warning)?;
+            Ok(Some(info))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Build export groups from light frames
+/// Groups by (filter, camera_type) and creates subgroups by calibration links
+fn build_export_groups(conn: &Connection, light_frames: &[ExportFrame]) -> Result<Vec<ExportGroup>> {
+    println!("  📊 Building export groups from {} light frames", light_frames.len());
+
+    // Group key: (filter, camera_type)
+    type GroupKey = (Option<String>, CameraType);
+    let mut groups_map: HashMap<GroupKey, Vec<&ExportFrame>> = HashMap::new();
+
+    // Group frames by filter and camera type
+    for frame in light_frames {
+        let camera_type = CameraType::from_bayerpat(frame.bayerpat.as_deref());
+        let key = (frame.filter.clone(), camera_type);
+        groups_map.entry(key).or_default().push(frame);
+    }
+
+    println!("  Found {} distinct (filter, camera_type) groups", groups_map.len());
+
+    let mut export_groups = Vec::new();
+
+    for ((filter, camera_type), frames) in groups_map {
+        let group_key = ExportGroup::make_group_key(filter.as_deref(), &camera_type);
+        let display_name = ExportGroup::make_display_name(filter.as_deref(), &camera_type);
+
+        println!("  Building group: {} with {} frames", display_name, frames.len());
+
+        // Build subgroups within this group
+        let subgroups = build_calibration_subgroups(conn, &frames)?;
+
+        // Calculate totals
+        let total_frames = frames.len() as i32;
+        let total_exposure: f64 = frames.iter().filter_map(|f| f.exptime).sum();
+
+        // Collect warnings
+        let mut warnings = Vec::new();
+        for subgroup in &subgroups {
+            warnings.extend(subgroup.warnings.clone());
+        }
+
+        export_groups.push(ExportGroup {
+            group_key,
+            filter,
+            camera_type,
+            display_name,
+            subgroups,
+            total_frames,
+            total_exposure,
+            warnings,
+        });
+    }
+
+    // Sort groups by display name for consistent ordering
+    export_groups.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+    Ok(export_groups)
+}
+
+/// Build calibration subgroups within an export group
+/// Groups frames by their linked calibration set IDs
+fn build_calibration_subgroups(
+    conn: &Connection,
+    frames: &[&ExportFrame],
+) -> Result<Vec<CalibrationSubgroup>> {
+    // Get calibration links for each frame
+    let mut frame_links: HashMap<i64, FrameCalibrationLinks> = HashMap::new();
+    for frame in frames {
+        let links = get_frame_calibration_links(conn, frame.frame_id)?;
+        frame_links.insert(frame.frame_id, links);
+    }
+
+    // Group frames by subgroup key (combination of calibration set IDs)
+    let mut subgroup_map: HashMap<String, Vec<&ExportFrame>> = HashMap::new();
+    for frame in frames {
+        if let Some(links) = frame_links.get(&frame.frame_id) {
+            let key = links.subgroup_key();
+            subgroup_map.entry(key).or_default().push(*frame);
+        }
+    }
+
+    let subgroup_count = subgroup_map.len();
+    println!("    Found {} calibration subgroups", subgroup_count);
+
+    let mut subgroups = Vec::new();
+    let mut subgroup_index = 1;
+
+    for (subgroup_key, subgroup_frames) in subgroup_map {
+        // Get the calibration links from the first frame (all frames in subgroup share the same links)
+        let first_frame = subgroup_frames.first().unwrap();
+        let links = frame_links.get(&first_frame.frame_id).unwrap();
+
+        // Build CalibrationSetInfo for each calibration type
+        let flat = if links.flat_id.is_some() {
+            get_calibration_set_info_for_frame(conn, first_frame.frame_id, "Flat")?
+        } else {
+            None
+        };
+
+        let dark = if links.dark_id.is_some() {
+            get_calibration_set_info_for_frame(conn, first_frame.frame_id, "Dark")?
+        } else {
+            None
+        };
+
+        let bias = if links.bias_id.is_some() {
+            get_calibration_set_info_for_frame(conn, first_frame.frame_id, "Bias")?
+        } else {
+            None
+        };
+
+        // Generate display name
+        let display_name = if subgroup_count == 1 {
+            "Default".to_string()
+        } else {
+            format!("Subgroup {}", subgroup_index)
+        };
+
+        // Collect warnings
+        let mut warnings = Vec::new();
+        if let Some(ref f) = flat {
+            warnings.extend(f.warnings.clone());
+        }
+        if let Some(ref d) = dark {
+            warnings.extend(d.warnings.clone());
+        }
+        if let Some(ref b) = bias {
+            warnings.extend(b.warnings.clone());
+        }
+
+        subgroups.push(CalibrationSubgroup {
+            subgroup_key,
+            display_name,
+            frames: subgroup_frames.iter().map(|f| (*f).clone()).collect(),
+            flat,
+            dark,
+            bias,
+            warnings,
+        });
+
+        subgroup_index += 1;
+    }
+
+    // Sort subgroups by display name
+    subgroups.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+    Ok(subgroups)
+}
+
+/// Build the master creation plan from export groups
+/// Collects all unique calibration sets and topologically sorts by dependencies
+fn build_master_creation_plan(
+    conn: &Connection,
+    groups: &[ExportGroup],
+) -> Result<MasterCreationPlan> {
+    println!("  🔧 Building master creation plan");
+
+    // Collect all unique calibration set IDs with their types
+    let mut all_sets: HashMap<i64, String> = HashMap::new(); // set_id -> imagetyp
+    let mut dependencies: HashMap<i64, Vec<i64>> = HashMap::new(); // set_id -> depends on set_ids
+
+    // Traverse all groups and subgroups to collect calibration sets
+    for group in groups {
+        for subgroup in &group.subgroups {
+            // Collect from flat
+            if let Some(ref flat) = subgroup.flat {
+                collect_calibration_sets_recursive(flat, &mut all_sets, &mut dependencies);
+            }
+            // Collect from dark
+            if let Some(ref dark) = subgroup.dark {
+                collect_calibration_sets_recursive(dark, &mut all_sets, &mut dependencies);
+            }
+            // Collect from bias
+            if let Some(ref bias) = subgroup.bias {
+                collect_calibration_sets_recursive(bias, &mut all_sets, &mut dependencies);
+            }
+        }
+    }
+
+    println!("    Found {} unique calibration sets", all_sets.len());
+
+    // Topological sort to determine creation order
+    let sorted_ids = topological_sort(&all_sets, &dependencies);
+
+    println!("    Topological sort complete, {} masters to create", sorted_ids.len());
+
+    // Build MasterInfo for each set
+    let mut masters = Vec::new();
+    let mut master_paths: HashMap<i64, String> = HashMap::new();
+
+    for set_id in sorted_ids {
+        if let Some(imagetyp) = all_sets.get(&set_id) {
+            // Get frames for this set
+            let frames = get_calibration_set_frames(conn, set_id)?;
+
+            // Calculate source exposure time (average of source frames)
+            let source_exptime = if !frames.is_empty() {
+                let sum: f64 = frames.iter().filter_map(|f| f.exptime).sum();
+                let count = frames.iter().filter(|f| f.exptime.is_some()).count();
+                if count > 0 {
+                    Some(sum / count as f64)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Determine dependencies
+            let deps = dependencies.get(&set_id).cloned().unwrap_or_default();
+
+            // Determine which calibrations to apply (with exposure matching for flats)
+            let (apply_bias, apply_dark, apply_darkflat) =
+                get_calibration_applications(conn, set_id, imagetyp, source_exptime)?;
+
+            // Generate output filename
+            let output_name = format!("master_{}_{}.fit", imagetyp.to_lowercase(), set_id);
+            master_paths.insert(set_id, output_name.clone());
+
+            masters.push(MasterInfo {
+                set_id,
+                master_type: imagetyp.clone(),
+                output_name,
+                source_frames: frames,
+                depends_on: deps,
+                apply_bias,
+                apply_dark,
+                apply_darkflat,
+                source_exptime,
+            });
+        }
+    }
+
+    Ok(MasterCreationPlan {
+        masters,
+        master_paths,
+    })
+}
+
+/// Recursively collect calibration sets from a CalibrationSetInfo hierarchy
+fn collect_calibration_sets_recursive(
+    info: &CalibrationSetInfo,
+    all_sets: &mut HashMap<i64, String>,
+    dependencies: &mut HashMap<i64, Vec<i64>>,
+) {
+    // Add this set
+    all_sets.insert(info.set_id, info.imagetyp.clone());
+
+    // Track dependencies
+    let mut deps = Vec::new();
+
+    // Recurse into sub-calibrations
+    if let Some(ref dark_flat) = info.dark_flat {
+        deps.push(dark_flat.set_id);
+        collect_calibration_sets_recursive(dark_flat, all_sets, dependencies);
+    }
+    if let Some(ref dark) = info.dark {
+        deps.push(dark.set_id);
+        collect_calibration_sets_recursive(dark, all_sets, dependencies);
+    }
+    if let Some(ref bias) = info.bias {
+        deps.push(bias.set_id);
+        collect_calibration_sets_recursive(bias, all_sets, dependencies);
+    }
+
+    if !deps.is_empty() {
+        dependencies.insert(info.set_id, deps);
+    }
+}
+
+/// Topological sort of calibration sets by dependencies
+/// Returns set IDs in order they should be created (dependencies first)
+fn topological_sort(
+    all_sets: &HashMap<i64, String>,
+    dependencies: &HashMap<i64, Vec<i64>>,
+) -> Vec<i64> {
+    let mut result = Vec::new();
+    let mut visited: HashSet<i64> = HashSet::new();
+    let mut temp_mark: HashSet<i64> = HashSet::new();
+
+    fn visit(
+        node: i64,
+        dependencies: &HashMap<i64, Vec<i64>>,
+        visited: &mut HashSet<i64>,
+        temp_mark: &mut HashSet<i64>,
+        result: &mut Vec<i64>,
+    ) {
+        if visited.contains(&node) {
+            return;
+        }
+        if temp_mark.contains(&node) {
+            // Cycle detected, skip (shouldn't happen with proper calibration hierarchy)
+            return;
+        }
+
+        temp_mark.insert(node);
+
+        // Visit dependencies first
+        if let Some(deps) = dependencies.get(&node) {
+            for dep in deps {
+                visit(*dep, dependencies, visited, temp_mark, result);
+            }
+        }
+
+        temp_mark.remove(&node);
+        visited.insert(node);
+        result.push(node);
+    }
+
+    for &set_id in all_sets.keys() {
+        visit(set_id, dependencies, &mut visited, &mut temp_mark, &mut result);
+    }
+
+    result
+}
+
+/// Exposure time tolerance for flat→dark calibration matching (30% = 0.30)
+const FLAT_DARK_EXPOSURE_TOLERANCE: f64 = 0.30;
+
+/// Check if two exposure times are within tolerance
+/// Returns true if they are similar enough for calibration purposes
+fn is_exposure_match(source_exptime: f64, cal_exptime: f64, tolerance_pct: f64) -> bool {
+    if source_exptime <= 0.0 || cal_exptime <= 0.0 {
+        return false;
+    }
+    let max_exp = source_exptime.max(cal_exptime);
+    let diff_ratio = (source_exptime - cal_exptime).abs() / max_exp;
+    diff_ratio <= tolerance_pct
+}
+
+/// Get the average exposure time for a calibration set
+fn get_calibration_set_exptime(conn: &Connection, set_id: i64) -> Result<Option<f64>> {
+    let result: Option<f64> = conn
+        .query_row(
+            "SELECT AVG(f.exptime)
+             FROM frames f
+             JOIN calibration_set_frames csf ON f.id = csf.frame_id
+             WHERE csf.set_id = ?1 AND f.exptime IS NOT NULL",
+            [set_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(result)
+}
+
+/// Get which calibrations should be applied when creating a master
+/// Returns (apply_bias, apply_dark, apply_darkflat) set IDs
+/// Note: Dark and DarkFlat are tracked separately because:
+/// - Dark is used for light frame calibration (long exposure matching lights)
+/// - DarkFlat is used for flat frame calibration (short exposure matching flats)
+///
+/// For Flat calibration:
+/// - Priority 1: DarkFlat (same exposure as flat)
+/// - Priority 2: Dark with matching exposure time (±30%)
+/// - Priority 3: Bias (if no matching dark)
+/// - Otherwise: skip dark calibration
+fn get_calibration_applications(
+    conn: &Connection,
+    set_id: i64,
+    imagetyp: &str,
+    source_exptime: Option<f64>,
+) -> Result<(Option<i64>, Option<i64>, Option<i64>)> {
+    let mut apply_bias = None;
+    let mut apply_dark = None;
+    let mut apply_darkflat = None;
+
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id, calibration_type
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1 AND source_type = 'calibration_set'",
+    )?;
+
+    let links: Vec<(i64, String)> = stmt
+        .query_map([set_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (cal_id, cal_type) in links {
+        match cal_type.as_str() {
+            "Bias" => apply_bias = Some(cal_id),
+            "Dark" => {
+                // For Flat calibration, only use dark if exposure time matches
+                if imagetyp == "Flat" {
+                    if let Some(flat_exptime) = source_exptime {
+                        if let Ok(Some(dark_exptime)) = get_calibration_set_exptime(conn, cal_id) {
+                            if is_exposure_match(flat_exptime, dark_exptime, FLAT_DARK_EXPOSURE_TOLERANCE) {
+                                apply_dark = Some(cal_id);
+                                println!("    ✓ Flat→Dark exposure match: flat={:.1}s, dark={:.1}s",
+                                        flat_exptime, dark_exptime);
+                            } else {
+                                println!("    ✗ Flat→Dark exposure MISMATCH: flat={:.1}s, dark={:.1}s (skipping, will use bias)",
+                                        flat_exptime, dark_exptime);
+                            }
+                        }
+                    }
+                } else {
+                    // For non-Flat calibration (e.g., Dark→Bias), use dark as-is
+                    apply_dark = Some(cal_id);
+                }
+            }
+            "DarkFlat" => apply_darkflat = Some(cal_id),
+            _ => {}
+        }
+    }
+
+    Ok((apply_bias, apply_dark, apply_darkflat))
+}
+
+// ============================================================================
+// Export Summary Builder (Enhanced UI)
+// ============================================================================
+
+/// Collect enhanced export summary for the new UI
+pub fn collect_export_summary(conn: &Connection, frame_set_id: i64) -> Result<ExportSummary> {
+    println!("📊 Building export summary for frame set {}", frame_set_id);
+
+    // Get basic export data first
+    let export_data = collect_export_data(conn, frame_set_id)?;
+
+    // Collect equipment info from all frames
+    let (cameras, telescopes, date_range) = collect_equipment_info(conn, frame_set_id)?;
+    println!(
+        "  Equipment: {} cameras, {} telescopes",
+        cameras.len(),
+        telescopes.len()
+    );
+
+    // Build filter group summaries
+    let filter_groups = build_filter_group_summaries(conn, &export_data)?;
+    println!("  Built {} filter groups", filter_groups.len());
+
+    // Build folder preview
+    let folder_preview = build_folder_preview(&export_data)?;
+
+    // Build detailed warnings
+    let warnings = build_detailed_warnings(&export_data, &filter_groups)?;
+    println!("  Generated {} warnings", warnings.len());
+
+    // Calculate totals
+    let total_files = calculate_total_files(&export_data);
+    let estimated_size_bytes = estimate_total_size(conn, &export_data)?;
+
+    Ok(ExportSummary {
+        frame_set_id,
+        frame_set_name: export_data.frame_set_name.clone(),
+        object_name: export_data.object_name.clone(),
+        cameras,
+        telescopes,
+        date_range,
+        filter_groups,
+        folder_preview,
+        warnings,
+        total_files,
+        estimated_size_bytes,
+    })
+}
+
+/// Collect unique equipment (cameras, telescopes) and date range from a frame set
+fn collect_equipment_info(
+    conn: &Connection,
+    frame_set_id: i64,
+) -> Result<(Vec<String>, Vec<String>, Option<(String, String)>)> {
+    // Get unique cameras
+    let mut cameras_stmt = conn.prepare(
+        "SELECT DISTINCT f.instrume
+         FROM frames f
+         JOIN session_members sm ON f.id = sm.frame_id
+         JOIN sessions s ON sm.session_id = s.id
+         JOIN imaging_nights n ON s.imaging_night_id = n.id
+         WHERE n.frames_set_id = ?1 AND f.instrume IS NOT NULL
+         ORDER BY f.instrume",
+    )?;
+    let cameras: Vec<String> = cameras_stmt
+        .query_map([frame_set_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Get unique telescopes
+    let mut telescopes_stmt = conn.prepare(
+        "SELECT DISTINCT f.telescop
+         FROM frames f
+         JOIN session_members sm ON f.id = sm.frame_id
+         JOIN sessions s ON sm.session_id = s.id
+         JOIN imaging_nights n ON s.imaging_night_id = n.id
+         WHERE n.frames_set_id = ?1 AND f.telescop IS NOT NULL
+         ORDER BY f.telescop",
+    )?;
+    let telescopes: Vec<String> = telescopes_stmt
+        .query_map([frame_set_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Get date range
+    let date_range: Option<(String, String)> = conn
+        .query_row(
+            "SELECT MIN(f.date_obs), MAX(f.date_obs)
+             FROM frames f
+             JOIN session_members sm ON f.id = sm.frame_id
+             JOIN sessions s ON sm.session_id = s.id
+             JOIN imaging_nights n ON s.imaging_night_id = n.id
+             WHERE n.frames_set_id = ?1 AND f.date_obs IS NOT NULL",
+            [frame_set_id],
+            |row| {
+                let min: Option<String> = row.get(0)?;
+                let max: Option<String> = row.get(1)?;
+                Ok(min.and_then(|m| max.map(|x| (m, x))))
+            },
+        )
+        .ok()
+        .flatten();
+
+    Ok((cameras, telescopes, date_range))
+}
+
+/// Build filter group summaries from export data
+fn build_filter_group_summaries(
+    conn: &Connection,
+    export_data: &ExportData,
+) -> Result<Vec<FilterGroupSummary>> {
+    let mut summaries = Vec::new();
+
+    for group in &export_data.groups {
+        // Get all frames from all subgroups
+        let all_frames: Vec<&ExportFrame> = group.subgroups.iter().flat_map(|sg| &sg.frames).collect();
+
+        if all_frames.is_empty() {
+            continue;
+        }
+
+        // Build exposure groups
+        let exposure_groups = build_exposure_groups(&all_frames);
+
+        // Get representative frame for equipment info
+        let rep_frame = all_frames.first().unwrap();
+
+        // Calculate average temperature
+        let temps: Vec<f64> = all_frames.iter().filter_map(|f| f.ccd_temp).collect();
+        let avg_temp = if !temps.is_empty() {
+            Some(temps.iter().sum::<f64>() / temps.len() as f64)
+        } else {
+            None
+        };
+
+        // Build calibration details from first subgroup (representative)
+        let (flat_info, dark_info, bias_info) = if let Some(subgroup) = group.subgroups.first() {
+            (
+                subgroup
+                    .flat
+                    .as_ref()
+                    .map(|f| build_calibration_detail(conn, f)),
+                subgroup
+                    .dark
+                    .as_ref()
+                    .map(|d| build_calibration_detail(conn, d)),
+                subgroup
+                    .bias
+                    .as_ref()
+                    .map(|b| build_calibration_detail(conn, b)),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        // Build frame details for expandable list
+        let frames = build_frame_details(conn, &all_frames, group.subgroups.first())?;
+
+        // Get telescope from frame
+        let telescope = get_frame_telescope(conn, rep_frame.frame_id)?;
+
+        summaries.push(FilterGroupSummary {
+            filter: group.filter.clone(),
+            camera_type: group.camera_type.clone(),
+            camera: rep_frame.instrume.clone(),
+            telescope,
+            gain: rep_frame.gain,
+            offset: rep_frame.offset,
+            binning: rep_frame.binning.clone(),
+            avg_temp,
+            exposure_groups,
+            total_exposure: group.total_exposure,
+            frame_count: group.total_frames,
+            flat_info,
+            dark_info,
+            bias_info,
+            frames,
+        });
+    }
+
+    Ok(summaries)
+}
+
+/// Build exposure groups from frames (group by exposure time)
+fn build_exposure_groups(frames: &[&ExportFrame]) -> Vec<ExposureGroup> {
+    let mut exp_counts: HashMap<i64, i32> = HashMap::new();
+
+    for frame in frames {
+        if let Some(exptime) = frame.exptime {
+            // Round to nearest second for grouping
+            let rounded = (exptime * 10.0).round() as i64; // 0.1s precision
+            *exp_counts.entry(rounded).or_insert(0) += 1;
+        }
+    }
+
+    let mut groups: Vec<ExposureGroup> = exp_counts
+        .into_iter()
+        .map(|(rounded, count)| {
+            let exptime = rounded as f64 / 10.0;
+            ExposureGroup {
+                exptime,
+                count,
+                total_seconds: exptime * count as f64,
+            }
+        })
+        .collect();
+
+    // Sort by exposure time (longest first)
+    groups.sort_by(|a, b| b.exptime.partial_cmp(&a.exptime).unwrap());
+
+    groups
+}
+
+/// Build calibration detail from CalibrationSetInfo
+fn build_calibration_detail(conn: &Connection, info: &CalibrationSetInfo) -> CalibrationDetail {
+    // Calculate average exptime
+    let avg_exptime = if !info.frames.is_empty() {
+        let exps: Vec<f64> = info.frames.iter().filter_map(|f| f.exptime).collect();
+        if !exps.is_empty() {
+            Some(exps.iter().sum::<f64>() / exps.len() as f64)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Calculate average temperature
+    let avg_temp = if !info.frames.is_empty() {
+        let temps: Vec<f64> = info.frames.iter().filter_map(|f| f.ccd_temp).collect();
+        if !temps.is_empty() {
+            Some(temps.iter().sum::<f64>() / temps.len() as f64)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Get date range
+    let date_range = get_date_range_from_frames(&info.frames);
+
+    // Build sub-calibration details (recursive)
+    let mut sub_calibrations = Vec::new();
+    if let Some(ref dark_flat) = info.dark_flat {
+        sub_calibrations.push(build_calibration_detail(conn, dark_flat));
+    }
+    if let Some(ref dark) = info.dark {
+        sub_calibrations.push(build_calibration_detail(conn, dark));
+    }
+    if let Some(ref bias) = info.bias {
+        sub_calibrations.push(build_calibration_detail(conn, bias));
+    }
+
+    CalibrationDetail {
+        set_id: info.set_id,
+        calibration_type: info.imagetyp.clone(),
+        frame_count: info.frame_count,
+        avg_exptime,
+        avg_temp,
+        match_score: info.match_score.unwrap_or(0.0),
+        date_range,
+        warnings: info.warnings.clone(),
+        sub_calibrations,
+    }
+}
+
+/// Get date range from a list of frames
+fn get_date_range_from_frames(frames: &[ExportFrame]) -> Option<(String, String)> {
+    let dates: Vec<&String> = frames.iter().filter_map(|f| f.date_obs.as_ref()).collect();
+    if dates.len() >= 2 {
+        let mut sorted = dates.clone();
+        sorted.sort();
+        Some((sorted.first().unwrap().to_string(), sorted.last().unwrap().to_string()))
+    } else if dates.len() == 1 {
+        Some((dates[0].clone(), dates[0].clone()))
+    } else {
+        None
+    }
+}
+
+/// Get telescope name for a frame
+fn get_frame_telescope(conn: &Connection, frame_id: i64) -> Result<Option<String>> {
+    let telescope: Option<String> = conn
+        .query_row(
+            "SELECT telescop FROM frames WHERE id = ?1",
+            [frame_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(telescope)
+}
+
+/// Build frame details for expandable list
+fn build_frame_details(
+    conn: &Connection,
+    frames: &[&ExportFrame],
+    subgroup: Option<&CalibrationSubgroup>,
+) -> Result<Vec<FrameDetail>> {
+    let mut details = Vec::new();
+
+    // Build calibration chain string once
+    let calibration_chain = build_calibration_chain_string(subgroup);
+
+    for frame in frames {
+        // Get file size if available
+        let file_size: Option<u64> = conn
+            .query_row(
+                "SELECT size FROM files WHERE id = ?1",
+                [frame.file_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|s| s as u64);
+
+        details.push(FrameDetail {
+            frame_id: frame.frame_id,
+            filename: frame.filename.clone(),
+            file_path: frame.file_path.clone(),
+            date_obs: frame.date_obs.clone(),
+            exptime: frame.exptime,
+            temp: frame.ccd_temp,
+            gain: frame.gain,
+            offset: frame.offset,
+            calibration_chain: calibration_chain.clone(),
+            file_size,
+        });
+    }
+
+    // Sort by date
+    details.sort_by(|a, b| a.date_obs.cmp(&b.date_obs));
+
+    Ok(details)
+}
+
+/// Build calibration chain string (e.g., "Flat #12 → Dark #8 → Bias #3")
+fn build_calibration_chain_string(subgroup: Option<&CalibrationSubgroup>) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(sg) = subgroup {
+        if let Some(ref flat) = sg.flat {
+            parts.push(format!("Flat #{}", flat.set_id));
+        }
+        if let Some(ref dark) = sg.dark {
+            parts.push(format!("Dark #{}", dark.set_id));
+        }
+        if let Some(ref bias) = sg.bias {
+            parts.push(format!("Bias #{}", bias.set_id));
+        }
+    }
+
+    if parts.is_empty() {
+        "No calibration".to_string()
+    } else {
+        parts.join(" → ")
+    }
+}
+
+/// Build folder preview structure
+fn build_folder_preview(export_data: &ExportData) -> Result<FolderPreview> {
+    use crate::export::models::sanitize_folder_name;
+
+    let root_name = export_data
+        .object_name
+        .clone()
+        .unwrap_or_else(|| export_data.frame_set_name.clone());
+    let root_name = format!("{}_Export", sanitize_folder_name(&root_name));
+
+    let mut root_children: Vec<FolderNode> = Vec::new();
+    let mut total_files = 0;
+
+    // Group by camera
+    let mut cameras_map: HashMap<String, Vec<&ExportGroup>> = HashMap::new();
+    for group in &export_data.groups {
+        // Get camera name from first frame
+        let camera_name = group
+            .subgroups
+            .first()
+            .and_then(|sg| sg.frames.first())
+            .and_then(|f| f.instrume.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        cameras_map.entry(camera_name).or_default().push(group);
+    }
+
+    for (camera, groups) in &cameras_map {
+        let camera_folder_name = format!("camera_{}", sanitize_folder_name(camera));
+        let mut camera_children: Vec<FolderNode> = Vec::new();
+
+        // Track calibration files for darks folder (use HashSet to avoid counting duplicates)
+        let mut counted_bias_sets: HashSet<i64> = HashSet::new();
+        let mut counted_dark_sets: HashSet<i64> = HashSet::new();
+        let mut counted_darkflat_sets: HashSet<i64> = HashSet::new();
+
+        let mut darks_count = 0;
+        let mut bias_count = 0;
+        let mut darkflat_count = 0;
+
+        // Track example filenames for calibrations
+        let mut first_bias_filename: Option<String> = None;
+        let mut first_dark_filename: Option<String> = None;
+        let mut first_darkflat_filename: Option<String> = None;
+
+        for group in groups {
+            let filter_name = group.filter.clone().unwrap_or_else(|| "luminance".to_string());
+            let filter_folder_name = format!("flats_{}", sanitize_folder_name(&filter_name));
+            let mut filter_children: Vec<FolderNode> = Vec::new();
+
+            // Count and collect flats (track by set_id to avoid duplicates)
+            let mut counted_flat_sets: HashSet<i64> = HashSet::new();
+            let mut flat_count = 0;
+            let mut first_flat_filename: Option<String> = None;
+
+            for subgroup in &group.subgroups {
+                if let Some(ref flat) = subgroup.flat {
+                    // Only count if we haven't seen this flat set yet
+                    if counted_flat_sets.insert(flat.set_id) {
+                        flat_count += flat.frame_count;
+
+                        // Get first flat filename
+                        if first_flat_filename.is_none() {
+                            first_flat_filename = flat.frames.first().map(|f| f.filename.clone());
+                        }
+                    }
+
+                    // Count and collect sub-calibrations (only if not already counted)
+                    if let Some(ref dark_flat) = flat.dark_flat {
+                        if counted_darkflat_sets.insert(dark_flat.set_id) {
+                            darkflat_count += dark_flat.frame_count;
+                            if first_darkflat_filename.is_none() {
+                                first_darkflat_filename = dark_flat.frames.first().map(|f| f.filename.clone());
+                            }
+                        }
+                    }
+                    if let Some(ref dark) = flat.dark {
+                        if counted_dark_sets.insert(dark.set_id) {
+                            darks_count += dark.frame_count;
+                            if first_dark_filename.is_none() {
+                                first_dark_filename = dark.frames.first().map(|f| f.filename.clone());
+                            }
+                        }
+                        if let Some(ref bias) = dark.bias {
+                            if counted_bias_sets.insert(bias.set_id) {
+                                bias_count += bias.frame_count;
+                                if first_bias_filename.is_none() {
+                                    first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ref bias) = flat.bias {
+                        if counted_bias_sets.insert(bias.set_id) {
+                            bias_count += bias.frame_count;
+                            if first_bias_filename.is_none() {
+                                first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Count darks and bias for lights (only if not already counted)
+                if let Some(ref dark) = subgroup.dark {
+                    if counted_dark_sets.insert(dark.set_id) {
+                        darks_count += dark.frame_count;
+                        if first_dark_filename.is_none() {
+                            first_dark_filename = dark.frames.first().map(|f| f.filename.clone());
+                        }
+                    }
+                    if let Some(ref bias) = dark.bias {
+                        if counted_bias_sets.insert(bias.set_id) {
+                            bias_count += bias.frame_count;
+                            if first_bias_filename.is_none() {
+                                first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
+                            }
+                        }
+                    }
+                }
+                if let Some(ref bias) = subgroup.bias {
+                    if counted_bias_sets.insert(bias.set_id) {
+                        bias_count += bias.frame_count;
+                        if first_bias_filename.is_none() {
+                            first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
+                        }
+                    }
+                }
+            }
+
+            // Add flat file examples using actual filename
+            if flat_count > 0 {
+                let flat_example = first_flat_filename.unwrap_or_else(|| "flat_001.fits".to_string());
+                filter_children.push(FolderNode {
+                    name: flat_example,
+                    node_type: FolderNodeType::File,
+                    file_count: None,
+                    description: None,
+                    children: vec![],
+                });
+                if flat_count > 1 {
+                    filter_children.push(FolderNode {
+                        name: format!("... {} more flat frames", flat_count - 1),
+                        node_type: FolderNodeType::Ellipsis,
+                        file_count: Some(flat_count),
+                        description: None,
+                        children: vec![],
+                    });
+                }
+            }
+
+            // Lights subfolder
+            let lights_count = group.total_frames;
+            let mut lights_children: Vec<FolderNode> = Vec::new();
+
+            // Add light file examples
+            let example_filename = group
+                .subgroups
+                .first()
+                .and_then(|sg| sg.frames.first())
+                .map(|f| f.filename.clone())
+                .unwrap_or_else(|| "light_001.fits".to_string());
+
+            lights_children.push(FolderNode {
+                name: example_filename,
+                node_type: FolderNodeType::File,
+                file_count: None,
+                description: None,
+                children: vec![],
+            });
+            if lights_count > 1 {
+                lights_children.push(FolderNode {
+                    name: format!("... {} more light frames", lights_count - 1),
+                    node_type: FolderNodeType::Ellipsis,
+                    file_count: Some(lights_count),
+                    description: None,
+                    children: vec![],
+                });
+            }
+
+            filter_children.push(FolderNode {
+                name: "lights".to_string(),
+                node_type: FolderNodeType::Folder,
+                file_count: Some(lights_count),
+                description: Some(format!("← {} lights", lights_count)),
+                children: lights_children,
+            });
+
+            total_files += lights_count + flat_count;
+
+            camera_children.push(FolderNode {
+                name: filter_folder_name,
+                node_type: FolderNodeType::Folder,
+                file_count: Some(flat_count + lights_count),
+                description: Some(format!("← {} flats + lights", flat_count)),
+                children: filter_children,
+            });
+        }
+
+        // Add darks folder if we have calibration files
+        let total_calibrations = darks_count + bias_count + darkflat_count;
+        if total_calibrations > 0 {
+            let mut darks_children: Vec<FolderNode> = Vec::new();
+
+            if bias_count > 0 {
+                let bias_example = first_bias_filename.unwrap_or_else(|| "bias_001.fits".to_string());
+                darks_children.push(FolderNode {
+                    name: bias_example,
+                    node_type: FolderNodeType::File,
+                    file_count: None,
+                    description: None,
+                    children: vec![],
+                });
+                if bias_count > 1 {
+                    darks_children.push(FolderNode {
+                        name: format!("... {} more bias frames", bias_count - 1),
+                        node_type: FolderNodeType::Ellipsis,
+                        file_count: Some(bias_count),
+                        description: None,
+                        children: vec![],
+                    });
+                }
+            }
+            if darks_count > 0 {
+                let dark_example = first_dark_filename.unwrap_or_else(|| "dark_001.fits".to_string());
+                darks_children.push(FolderNode {
+                    name: dark_example,
+                    node_type: FolderNodeType::File,
+                    file_count: None,
+                    description: None,
+                    children: vec![],
+                });
+                if darks_count > 1 {
+                    darks_children.push(FolderNode {
+                        name: format!("... {} more dark frames", darks_count - 1),
+                        node_type: FolderNodeType::Ellipsis,
+                        file_count: Some(darks_count),
+                        description: None,
+                        children: vec![],
+                    });
+                }
+            }
+            if darkflat_count > 0 {
+                let darkflat_example = first_darkflat_filename.unwrap_or_else(|| "darkflat_001.fits".to_string());
+                darks_children.push(FolderNode {
+                    name: darkflat_example,
+                    node_type: FolderNodeType::File,
+                    file_count: None,
+                    description: None,
+                    children: vec![],
+                });
+                if darkflat_count > 1 {
+                    darks_children.push(FolderNode {
+                        name: format!("... {} more darkflat frames", darkflat_count - 1),
+                        node_type: FolderNodeType::Ellipsis,
+                        file_count: Some(darkflat_count),
+                        description: None,
+                        children: vec![],
+                    });
+                }
+            }
+
+            camera_children.insert(
+                0,
+                FolderNode {
+                    name: "darks".to_string(),
+                    node_type: FolderNodeType::Folder,
+                    file_count: Some(total_calibrations),
+                    description: Some(format!(
+                        "← {} darks, {} bias",
+                        darks_count + darkflat_count,
+                        bias_count
+                    )),
+                    children: darks_children,
+                },
+            );
+
+            total_files += total_calibrations;
+        }
+
+        root_children.push(FolderNode {
+            name: camera_folder_name,
+            node_type: FolderNodeType::Folder,
+            file_count: None,
+            description: None,
+            children: camera_children,
+        });
+    }
+
+    Ok(FolderPreview {
+        root_name,
+        structure: root_children,
+        total_files,
+        estimated_size: format_bytes_human(0), // Will be calculated separately
+    })
+}
+
+/// Build detailed warnings from export data
+fn build_detailed_warnings(
+    export_data: &ExportData,
+    filter_groups: &[FilterGroupSummary],
+) -> Result<Vec<DetailedWarning>> {
+    let mut warnings = Vec::new();
+
+    for group in filter_groups {
+        let filter_name = group.filter.clone().unwrap_or_else(|| "Unfiltered".to_string());
+
+        // Check temperature mismatches
+        if let Some(ref dark_info) = group.dark_info {
+            if let (Some(light_temp), Some(dark_temp)) = (group.avg_temp, dark_info.avg_temp) {
+                let delta = (light_temp - dark_temp).abs();
+                if delta > 2.0 {
+                    warnings.push(DetailedWarning {
+                        warning_type: WarningType::TemperatureMismatch,
+                        severity: if delta > 5.0 {
+                            WarningSeverity::Error
+                        } else {
+                            WarningSeverity::Warning
+                        },
+                        title: format!("Temperature Mismatch: Dark Set #{}", dark_info.set_id),
+                        description: format!(
+                            "Dark frames and light frames have different temperatures"
+                        ),
+                        set_id: Some(dark_info.set_id),
+                        filter: Some(filter_name.clone()),
+                        actual_value: Some(format!("{:.1}°C", dark_temp)),
+                        expected_value: Some(format!("{:.1}°C", light_temp)),
+                        delta: Some(format!("{:.1}°C", delta)),
+                        recommendation: Some(
+                            "For best results, darks should match light frame temperature within 1°C"
+                                .to_string(),
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Check for missing calibrations
+        if group.flat_info.is_none() {
+            warnings.push(DetailedWarning {
+                warning_type: WarningType::MissingCalibration,
+                severity: WarningSeverity::Warning,
+                title: format!("Missing Flat Calibration: {}", filter_name),
+                description: "No flat frames are linked to this filter's light frames".to_string(),
+                set_id: None,
+                filter: Some(filter_name.clone()),
+                actual_value: None,
+                expected_value: None,
+                delta: None,
+                recommendation: Some(
+                    "Add flat frames for this filter to improve image quality".to_string(),
+                ),
+            });
+        }
+
+        if group.dark_info.is_none() {
+            warnings.push(DetailedWarning {
+                warning_type: WarningType::MissingCalibration,
+                severity: WarningSeverity::Warning,
+                title: format!("Missing Dark Calibration: {}", filter_name),
+                description: "No dark frames are linked to this filter's light frames".to_string(),
+                set_id: None,
+                filter: Some(filter_name.clone()),
+                actual_value: None,
+                expected_value: None,
+                delta: None,
+                recommendation: Some(
+                    "Add matching dark frames to remove thermal noise".to_string(),
+                ),
+            });
+        }
+
+        // Check calibration age
+        if let Some(ref flat_info) = group.flat_info {
+            if !flat_info.warnings.is_empty() {
+                for warning_text in &flat_info.warnings {
+                    if warning_text.contains("age") || warning_text.contains("old") {
+                        warnings.push(DetailedWarning {
+                            warning_type: WarningType::CalibrationAge,
+                            severity: WarningSeverity::Info,
+                            title: format!("Calibration Age: Flat Set #{}", flat_info.set_id),
+                            description: warning_text.clone(),
+                            set_id: Some(flat_info.set_id),
+                            filter: Some(filter_name.clone()),
+                            actual_value: None,
+                            expected_value: None,
+                            delta: None,
+                            recommendation: Some(
+                                "Consider using flats from the same imaging session".to_string(),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Add warnings from the calibration summary
+    for warning in &export_data.calibration_summary.warnings {
+        // Only add if not already covered above
+        let already_covered = warnings
+            .iter()
+            .any(|w| warning.contains(&w.title) || w.description.contains(warning));
+        if !already_covered {
+            warnings.push(DetailedWarning {
+                warning_type: WarningType::General,
+                severity: WarningSeverity::Info,
+                title: "Calibration Warning".to_string(),
+                description: warning.clone(),
+                set_id: None,
+                filter: None,
+                actual_value: None,
+                expected_value: None,
+                delta: None,
+                recommendation: None,
+            });
+        }
+    }
+
+    Ok(warnings)
+}
+
+/// Calculate total file count for export
+fn calculate_total_files(export_data: &ExportData) -> i32 {
+    let mut total = 0;
+
+    // Light frames
+    total += export_data.total_light_frames;
+
+    // Calibration frames
+    total += export_data.calibration_summary.flat_count;
+    total += export_data.calibration_summary.dark_count;
+    total += export_data.calibration_summary.bias_count;
+    total += export_data.calibration_summary.dark_flat_count;
+
+    total
+}
+
+/// Estimate total size of export in bytes
+fn estimate_total_size(conn: &Connection, export_data: &ExportData) -> Result<u64> {
+    let mut total_size: u64 = 0;
+
+    // Get average file size from light frames in this set
+    let avg_size: Option<i64> = conn
+        .query_row(
+            "SELECT AVG(fi.size)
+             FROM files fi
+             JOIN frames f ON fi.id = f.file_id
+             JOIN session_members sm ON f.id = sm.frame_id
+             JOIN sessions s ON sm.session_id = s.id
+             JOIN imaging_nights n ON s.imaging_night_id = n.id
+             WHERE n.frames_set_id = ?1 AND fi.size IS NOT NULL",
+            [export_data.frame_set_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    let avg_size = avg_size.unwrap_or(50_000_000) as u64; // Default 50MB
+
+    // Estimate total
+    total_size += export_data.total_light_frames as u64 * avg_size;
+    total_size += export_data.calibration_summary.flat_count as u64 * avg_size;
+    total_size += export_data.calibration_summary.dark_count as u64 * avg_size;
+    total_size += export_data.calibration_summary.bias_count as u64 * avg_size;
+    total_size += export_data.calibration_summary.dark_flat_count as u64 * avg_size;
+
+    Ok(total_size)
+}
+
+/// Format bytes to human-readable string
+fn format_bytes_human(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+
+    if bytes >= TB {
+        format!("{:.1} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_filter_sorting() {
-        let mut filters = vec![
+        let mut filters: Vec<(Option<String>, Vec<i64>)> = vec![
             (Some("R".to_string()), vec![]),
             (None, vec![]),
             (Some("Ha".to_string()), vec![]),
@@ -452,5 +2005,34 @@ mod tests {
         assert_eq!(filters[1].0, Some("G".to_string()));
         assert_eq!(filters[2].0, Some("Ha".to_string()));
         assert_eq!(filters[3].0, Some("R".to_string()));
+    }
+
+    #[test]
+    fn test_subgroup_key_generation() {
+        use super::FrameCalibrationLinks;
+
+        let links = FrameCalibrationLinks {
+            frame_id: 1,
+            flat_id: Some(5),
+            dark_id: Some(3),
+            bias_id: Some(1),
+        };
+        assert_eq!(links.subgroup_key(), "f5_d3_b1");
+
+        let links_partial = FrameCalibrationLinks {
+            frame_id: 2,
+            flat_id: Some(5),
+            dark_id: None,
+            bias_id: Some(1),
+        };
+        assert_eq!(links_partial.subgroup_key(), "f5_dnone_b1");
+
+        let links_none = FrameCalibrationLinks {
+            frame_id: 3,
+            flat_id: None,
+            dark_id: None,
+            bias_id: None,
+        };
+        assert_eq!(links_none.subgroup_key(), "fnone_dnone_bnone");
     }
 }

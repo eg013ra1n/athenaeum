@@ -1,6 +1,7 @@
-import { useMemo } from "react";
+import { useMemo, ReactNode } from "react";
 import { X } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
+import { DateInputGroup, toISODate, isoToDateParts, generateYears } from './DateRangeFilter';
 
 export type FilterMode = "darks" | "flats";
 
@@ -20,6 +21,7 @@ interface DarkLibraryFiltersProps {
   filters: FilterState;
   onFilterChange: (filters: FilterState) => void;
   mode: FilterMode;
+  actions?: ReactNode;
 }
 
 export const emptyFilters: FilterState = {
@@ -33,7 +35,7 @@ export const emptyFilters: FilterState = {
   dateTo: null,
 };
 
-export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode }: DarkLibraryFiltersProps) {
+export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode, actions }: DarkLibraryFiltersProps) {
   // Extract unique values from sets
   const uniqueValues = useMemo(() => {
     const types = Array.from(new Set(sets.map(s => s.imagetyp))).sort();
@@ -79,12 +81,12 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
 
   const hasActiveFilters = Object.values(filters).some(v => v !== null);
 
-  const selectClass = "px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer";
-  const inputClass = "px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-sm text-gray-100 focus:outline-none focus:ring-1 focus:ring-blue-500 w-20";
-  const labelClass = "text-xs text-gray-400 mr-1";
+  const selectClass = "px-2 py-1.5 bg-surface-hover border border-border rounded text-sm text-content focus:outline-none focus:ring-1 focus:ring-accent cursor-pointer";
+  const inputClass = "px-2 py-1.5 bg-surface-hover border border-border rounded text-sm text-content focus:outline-none focus:ring-1 focus:ring-accent w-20";
+  const labelClass = "text-xs text-content-muted mr-1";
 
   return (
-    <div className="flex flex-wrap items-center gap-3 mb-4 p-3 bg-gray-800/50 rounded-lg border border-gray-700">
+    <div className="flex flex-wrap items-center gap-3 mb-4 p-3 bg-surface-elevated/50 rounded-lg border border-border">
       {/* DARKS MODE: Type, Temp, Exp (dropdown), Date range */}
       {mode === "darks" && (
         <>
@@ -200,30 +202,24 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
               onChange={(e) => handleSelectChange("expTo", e.target.value)}
               className={inputClass}
             />
-            <span className="text-xs text-gray-500">s</span>
+            <span className="text-xs text-content-muted">s</span>
           </div>
         </>
       )}
 
       {/* Date Range - both modes */}
       <div className="flex items-center gap-2">
-        <span className={labelClass}>Date from:</span>
-        <input
-          type="date"
-          value={filters.dateFrom || ""}
-          min={uniqueValues.minDate}
-          max={filters.dateTo || uniqueValues.maxDate}
-          onChange={(e) => handleSelectChange("dateFrom", e.target.value)}
-          className={`${selectClass} w-32`}
+        <span className={labelClass}>Date:</span>
+        <DateInputGroup
+          value={isoToDateParts(filters.dateFrom)}
+          onChange={(parts) => handleSelectChange('dateFrom', toISODate(parts) || '')}
+          years={generateYears()}
         />
-        <span className={labelClass}>to:</span>
-        <input
-          type="date"
-          value={filters.dateTo || ""}
-          min={filters.dateFrom || uniqueValues.minDate}
-          max={uniqueValues.maxDate}
-          onChange={(e) => handleSelectChange("dateTo", e.target.value)}
-          className={`${selectClass} w-32`}
+        <span className="text-content-muted text-sm">to</span>
+        <DateInputGroup
+          value={isoToDateParts(filters.dateTo)}
+          onChange={(parts) => handleSelectChange('dateTo', toISODate(parts) || '')}
+          years={generateYears()}
         />
       </div>
 
@@ -231,12 +227,19 @@ export default function DarkLibraryFilters({ sets, filters, onFilterChange, mode
       {hasActiveFilters && (
         <button
           onClick={handleClearAll}
-          className="flex items-center gap-1 px-2 py-1.5 bg-red-900/30 hover:bg-red-900/50 text-red-400 rounded text-sm transition-colors"
+          className="flex items-center gap-1 px-2 py-1.5 bg-error-muted hover:bg-error/30 text-error rounded text-sm transition-colors"
           title="Clear all filters"
         >
           <X size={14} />
           Clear
         </button>
+      )}
+
+      {/* Actions (pushed to the right) */}
+      {actions && (
+        <div className="ml-auto flex items-center gap-2">
+          {actions}
+        </div>
       )}
     </div>
   );

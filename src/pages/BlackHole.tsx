@@ -304,18 +304,18 @@ export default function BlackHole() {
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-3xl font-bold">Black Hole</h2>
-            <p className="text-gray-400 mt-1">
+            <p className="text-content-muted mt-1">
               {entries.length} file{entries.length !== 1 ? 's' : ''} • {formatSize(totalSize)} total
             </p>
           </div>
 
           {/* Filter */}
           <div className="flex items-center gap-3">
-            <Filter size={20} className="text-gray-400" />
+            <Filter size={20} className="text-content-muted" />
             <select
               value={filter || ''}
               onChange={(e) => setFilter(e.target.value || null)}
-              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="bg-surface-elevated border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
             >
               <option value="">All sources</option>
               {sources.map(source => (
@@ -330,9 +330,9 @@ export default function BlackHole() {
 
       {/* Selection Toolbar - appears when items selected */}
       {selectionCount > 0 && (
-        <div className="mb-4 flex-shrink-0 bg-gray-800 border border-gray-700 rounded-lg p-3 flex items-center justify-between">
+        <div className="mb-4 flex-shrink-0 bg-surface-elevated border border-border rounded-lg p-3 flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <span className="text-yellow-400 font-medium">
+            <span className="text-warning font-medium">
               {selectionCount} selected
             </span>
           </div>
@@ -340,7 +340,7 @@ export default function BlackHole() {
             <button
               onClick={handleRestoreSelected}
               disabled={progress !== null}
-              className="flex items-center gap-2 px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+              className="flex items-center gap-2 px-3 py-1.5 bg-success hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <RotateCcw size={16} />
               Restore Selected
@@ -348,7 +348,7 @@ export default function BlackHole() {
             <button
               onClick={handleVoidSelected}
               disabled={progress !== null}
-              className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+              className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <Trash2 size={16} />
               Send to Void
@@ -356,7 +356,7 @@ export default function BlackHole() {
             <button
               onClick={handleClearSelection}
               disabled={progress !== null}
-              className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+              className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <XSquare size={16} />
               Clear
@@ -367,16 +367,16 @@ export default function BlackHole() {
 
       {/* Progress indicator */}
       {progress && (
-        <div className="mb-4 flex-shrink-0 bg-blue-900/30 border border-blue-700 rounded-lg p-3">
+        <div className="mb-4 flex-shrink-0 bg-info-muted border border-info/50 rounded-lg p-3">
           <div className="flex items-center gap-3">
-            <Loader2 className="animate-spin text-blue-400" size={20} />
-            <span className="text-blue-300">
+            <Loader2 className="animate-spin text-accent" size={20} />
+            <span className="text-info/80">
               {progress.action === 'restore' ? 'Restoring' : 'Deleting'} {progress.current}/{progress.total}...
             </span>
           </div>
-          <div className="mt-2 h-2 bg-gray-700 rounded-full overflow-hidden">
+          <div className="mt-2 h-2 bg-surface-hover rounded-full overflow-hidden">
             <div
-              className="h-full bg-blue-500 transition-all duration-200"
+              className="h-full bg-accent transition-all duration-200"
               style={{ width: `${(progress.current / progress.total) * 100}%` }}
             />
           </div>
@@ -385,8 +385,8 @@ export default function BlackHole() {
 
       {/* Error Alert */}
       {error && (
-        <div className="mb-4 flex-shrink-0 p-4 bg-red-900/30 border border-red-700 rounded-lg">
-          <p className="text-red-400">Error: {error}</p>
+        <div className="mb-4 flex-shrink-0 p-4 bg-error-muted border border-error/50 rounded-lg">
+          <p className="text-error">Error: {error}</p>
         </div>
       )}
 
@@ -395,13 +395,13 @@ export default function BlackHole() {
         {loading ? (
           <div className="flex items-center justify-center py-12">
             <Loader2 className="animate-spin mr-2" size={24} />
-            <span className="text-gray-400">Loading...</span>
+            <span className="text-content-muted">Loading...</span>
           </div>
         ) : entries.length === 0 ? (
-          <div className="bg-gray-800 rounded-lg p-12 text-center">
-            <RotateCcw className="mx-auto mb-4 text-gray-600" size={64} />
-            <p className="text-gray-500 text-lg font-semibold mb-2">Black hole is empty</p>
-            <p className="text-gray-600 text-sm">
+          <div className="bg-surface-elevated rounded-lg p-12 text-center">
+            <RotateCcw className="mx-auto mb-4 text-content-muted" size={64} />
+            <p className="text-content-muted text-lg font-semibold mb-2">Black hole is empty</p>
+            <p className="text-content-muted text-sm">
               Files moved to the black hole will appear here
             </p>
           </div>
@@ -413,22 +413,22 @@ export default function BlackHole() {
               const someSelected = group.files.some(f => selectedIds.has(f.file_id));
 
               return (
-                <div key={group.path} className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+                <div key={group.path} className="bg-surface-elevated rounded-lg border border-border overflow-hidden">
                   {/* Folder Header */}
                   <div
-                    className="flex items-center gap-3 px-4 py-3 bg-gray-750 cursor-pointer hover:bg-gray-700 transition"
+                    className="flex items-center gap-3 px-4 py-3 bg-surface-hover cursor-pointer hover:bg-surface-hover transition"
                     onClick={() => toggleFolder(group.path)}
                   >
                     {isExpanded ? (
-                      <ChevronDown size={18} className="text-gray-400 flex-shrink-0" />
+                      <ChevronDown size={18} className="text-content-muted flex-shrink-0" />
                     ) : (
-                      <ChevronRight size={18} className="text-gray-400 flex-shrink-0" />
+                      <ChevronRight size={18} className="text-content-muted flex-shrink-0" />
                     )}
-                    <Folder size={18} className="text-blue-400 flex-shrink-0" />
+                    <Folder size={18} className="text-accent flex-shrink-0" />
                     <span className="font-mono text-sm truncate flex-1" title={group.path}>
                       {group.path}
                     </span>
-                    <span className="text-gray-400 text-sm flex-shrink-0">
+                    <span className="text-content-muted text-sm flex-shrink-0">
                       {group.files.length} file{group.files.length !== 1 ? 's' : ''} • {formatSize(group.totalSize)}
                     </span>
                     {/* Select All checkbox */}
@@ -439,10 +439,10 @@ export default function BlackHole() {
                       }}
                       className={`flex-shrink-0 p-1 rounded transition-colors ${
                         allSelected
-                          ? 'text-yellow-400'
+                          ? 'text-warning'
                           : someSelected
-                            ? 'text-yellow-400/50'
-                            : 'text-gray-500 hover:text-gray-300'
+                            ? 'text-warning/50'
+                            : 'text-content-muted hover:text-content-secondary'
                       }`}
                       title={allSelected ? 'Deselect all in folder' : 'Select all in folder'}
                     >
@@ -452,7 +452,7 @@ export default function BlackHole() {
 
                   {/* File List */}
                   {isExpanded && (
-                    <div className="divide-y divide-gray-700">
+                    <div className="divide-y divide-border">
                       {group.files.map((entry) => {
                         const isSelected = selectedIds.has(entry.file_id);
 
@@ -460,7 +460,7 @@ export default function BlackHole() {
                           <div
                             key={entry.id}
                             className={`flex items-center gap-3 px-4 py-2 transition ${
-                              isSelected ? 'bg-yellow-600/20' : 'hover:bg-gray-750'
+                              isSelected ? 'bg-warning/20' : 'hover:bg-surface-hover'
                             }`}
                           >
                             {/* Checkbox */}
@@ -468,8 +468,8 @@ export default function BlackHole() {
                               onClick={(e) => handleCheckboxClick(entry.file_id, group.files, e)}
                               className={`flex-shrink-0 p-0.5 rounded transition-colors ${
                                 isSelected
-                                  ? 'text-yellow-400'
-                                  : 'text-gray-500 hover:text-gray-300'
+                                  ? 'text-warning'
+                                  : 'text-content-muted hover:text-content-secondary'
                               }`}
                             >
                               {isSelected ? <CheckSquare size={16} /> : <Square size={16} />}
@@ -481,17 +481,17 @@ export default function BlackHole() {
                             </span>
 
                             {/* Source badge */}
-                            <span className="px-2 py-0.5 bg-purple-900/40 text-purple-300 text-xs rounded flex-shrink-0">
+                            <span className="px-2 py-0.5 bg-purple/25 text-purple text-xs rounded flex-shrink-0">
                               {entry.from_where}
                             </span>
 
                             {/* Size */}
-                            <span className="text-gray-400 text-xs w-20 text-right flex-shrink-0">
+                            <span className="text-content-muted text-xs w-20 text-right flex-shrink-0">
                               {formatSize(entry.file_size)}
                             </span>
 
                             {/* Date */}
-                            <span className="text-gray-500 text-xs w-32 text-right flex-shrink-0">
+                            <span className="text-content-muted text-xs w-32 text-right flex-shrink-0">
                               {format(new Date(entry.moved_at), 'MMM d, yyyy')}
                             </span>
                           </div>

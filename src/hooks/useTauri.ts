@@ -104,6 +104,21 @@ export function useScanRoots() {
     }
   }, []);
 
+  const toggleUniqueCameraFlag = useCallback(async (id: number, enabled: boolean): Promise<void> => {
+    try {
+      await invoke('set_scan_root_unique_camera_flag', { id, enabled });
+      setScanRoots((prev) =>
+        prev.map((root) =>
+          root.id === id ? { ...root, unique_camera: enabled } : root
+        )
+      );
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    }
+  }, []);
+
   useEffect(() => {
     fetchScanRoots();
   }, [fetchScanRoots]);
@@ -115,6 +130,7 @@ export function useScanRoots() {
     addScanRoot,
     deleteScanRoot,
     toggleDuplicatesFlag,
+    toggleUniqueCameraFlag,
     refresh: fetchScanRoots,
   };
 }
@@ -196,6 +212,21 @@ export function useScanRootsWithAvailability() {
     }
   }, []);
 
+  const toggleUniqueCameraFlag = useCallback(async (id: number, enabled: boolean): Promise<void> => {
+    try {
+      await invoke('set_scan_root_unique_camera_flag', { id, enabled });
+      setScanRoots((prev) =>
+        prev.map((root) =>
+          root.id === id ? { ...root, unique_camera: enabled } : root
+        )
+      );
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    }
+  }, []);
+
   const relinkScanRoot = useCallback(async (rootId: number, newPath: string) => {
     try {
       setLoading(true);
@@ -232,6 +263,7 @@ export function useScanRootsWithAvailability() {
     addScanRoot,
     deleteScanRoot,
     toggleDuplicatesFlag,
+    toggleUniqueCameraFlag,
     relinkScanRoot,
     refresh: fetchScanRootsWithAvailability,
   };

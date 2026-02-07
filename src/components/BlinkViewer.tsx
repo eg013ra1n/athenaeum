@@ -51,6 +51,20 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const loadedImagesRef = useRef(loadedImages);
   const renderLockRef = useRef(false);
 
+  // Zoom and pan refs (using refs for performance during rapid updates)
+  const zoomRef = useRef<number>(1.0);
+  const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const isPanningRef = useRef<boolean>(false);
+  const lastMousePosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const imageSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const currentImageRef = useRef<HTMLImageElement | null>(null);
+
+  // For UI indicator (debounced to avoid excessive re-renders)
+  const [displayZoom, setDisplayZoom] = useState<number>(1.0);
+  const zoomDisplayTimeoutRef = useRef<number | null>(null);
+  // Cursor state for panning (separate from ref to trigger re-render for cursor change)
+  const [isPanning, setIsPanning] = useState(false);
+
   // Keep refs updated
   currentIndexRef.current = currentIndex;
   loadedImagesRef.current = loadedImages;
@@ -122,7 +136,63 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     }
   }, [fitsFrames]);
 
-  // Render image to canvas
+  // Helper to update zoom display with debouncing
+  const updateZoomDisplay = useCallback((zoom: number) => {
+    if (zoomDisplayTimeoutRef.current) {
+      clearTimeout(zoomDisplayTimeoutRef.current);
+    }
+    zoomDisplayTimeoutRef.current = setTimeout(() => {
+      setDisplayZoom(zoom);
+    }, 50) as unknown as number;
+  }, []);
+
+  // Draw image to canvas with current zoom and pan
+  const drawImageToCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    const img = currentImageRef.current;
+    if (!canvas || !img || !canvas.width || !canvas.height) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx || (ctx as any).isContextLost?.()) return;
+
+    if (!img.width || !img.height) return;
+
+    const canvasAspect = canvas.width / canvas.height;
+    const imageAspect = img.width / img.height;
+
+    if (!isFinite(canvasAspect) || !isFinite(imageAspect)) return;
+
+    // Calculate fit-to-view dimensions (base dimensions at zoom 1.0)
+    let baseWidth, baseHeight;
+    if (imageAspect > canvasAspect) {
+      baseWidth = canvas.width;
+      baseHeight = canvas.width / imageAspect;
+    } else {
+      baseHeight = canvas.height;
+      baseWidth = canvas.height * imageAspect;
+    }
+
+    // Store base dimensions for pan constraint calculations
+    imageSizeRef.current = { width: baseWidth, height: baseHeight };
+
+    // Apply zoom
+    const zoom = zoomRef.current;
+    const renderWidth = baseWidth * zoom;
+    const renderHeight = baseHeight * zoom;
+
+    // Calculate center position with pan offset
+    const centerX = canvas.width / 2 + panRef.current.x;
+    const centerY = canvas.height / 2 + panRef.current.y;
+    const offsetX = centerX - renderWidth / 2;
+    const offsetY = centerY - renderHeight / 2;
+
+    // Draw
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
+  }, []);
+
+  // Render image to canvas (loads image if needed)
   const renderImage = useCallback((imageUrl: string) => {
     const canvas = canvasRef.current;
     if (!canvas || !canvas.width || !canvas.height) return;
@@ -130,35 +200,19 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx || (ctx as any).isContextLost?.() || renderLockRef.current) return;
 
+    // If the image is already loaded for this URL, just redraw
+    if (currentImageRef.current && currentImageRef.current.src === imageUrl) {
+      drawImageToCanvas();
+      return;
+    }
+
     renderLockRef.current = true;
     const img = new Image();
 
     img.onload = () => {
       try {
-        if (!img.width || !img.height) return;
-
-        const canvasAspect = canvas.width / canvas.height;
-        const imageAspect = img.width / img.height;
-
-        if (!isFinite(canvasAspect) || !isFinite(imageAspect)) return;
-
-        let renderWidth, renderHeight, offsetX, offsetY;
-
-        if (imageAspect > canvasAspect) {
-          renderWidth = canvas.width;
-          renderHeight = canvas.width / imageAspect;
-          offsetX = 0;
-          offsetY = (canvas.height - renderHeight) / 2;
-        } else {
-          renderHeight = canvas.height;
-          renderWidth = canvas.height * imageAspect;
-          offsetX = (canvas.width - renderWidth) / 2;
-          offsetY = 0;
-        }
-
-        ctx.fillStyle = "#000000";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
+        currentImageRef.current = img;
+        drawImageToCanvas();
       } finally {
         renderLockRef.current = false;
       }
@@ -170,7 +224,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
 
     img.src = imageUrl;
-  }, []);
+  }, [drawImageToCanvas]);
 
   // Load current and preload next images
   useEffect(() => {
@@ -242,6 +296,63 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setLastSelectedIndex(currentIndex);
   }, [currentIndex]);
 
+  // Constrain pan to keep at least 10% of image visible
+  const constrainPan = useCallback((newPan: { x: number; y: number }) => {
+    const canvas = canvasRef.current;
+    const imageSize = imageSizeRef.current;
+    if (!canvas || !imageSize) return newPan;
+
+    const zoom = zoomRef.current;
+    const renderWidth = imageSize.width * zoom;
+    const renderHeight = imageSize.height * zoom;
+
+    // Allow panning only when zoomed in
+    if (zoom <= 1.0) {
+      return { x: 0, y: 0 };
+    }
+
+    // Calculate max pan (keep 10% of image visible)
+    const marginX = Math.max(0, (renderWidth - canvas.width) / 2 + canvas.width * 0.1);
+    const marginY = Math.max(0, (renderHeight - canvas.height) / 2 + canvas.height * 0.1);
+
+    return {
+      x: Math.max(-marginX, Math.min(marginX, newPan.x)),
+      y: Math.max(-marginY, Math.min(marginY, newPan.y)),
+    };
+  }, []);
+
+  // Reset zoom and pan to fit-to-view
+  const resetZoom = useCallback(() => {
+    zoomRef.current = 1.0;
+    panRef.current = { x: 0, y: 0 };
+    updateZoomDisplay(1.0);
+    drawImageToCanvas();
+  }, [updateZoomDisplay, drawImageToCanvas]);
+
+  // Zoom in by keyboard (from center)
+  const zoomIn = useCallback(() => {
+    const oldZoom = zoomRef.current;
+    const newZoom = Math.min(20, oldZoom * 1.25);
+    if (newZoom === oldZoom) return;
+
+    zoomRef.current = newZoom;
+    panRef.current = constrainPan(panRef.current);
+    updateZoomDisplay(newZoom);
+    drawImageToCanvas();
+  }, [constrainPan, updateZoomDisplay, drawImageToCanvas]);
+
+  // Zoom out by keyboard (from center)
+  const zoomOut = useCallback(() => {
+    const oldZoom = zoomRef.current;
+    const newZoom = Math.max(1.0, oldZoom / 1.25);
+    if (newZoom === oldZoom) return;
+
+    zoomRef.current = newZoom;
+    panRef.current = constrainPan(panRef.current);
+    updateZoomDisplay(newZoom);
+    drawImageToCanvas();
+  }, [constrainPan, updateZoomDisplay, drawImageToCanvas]);
+
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyPress = (e: KeyboardEvent) => {
@@ -282,12 +393,27 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
             setSelectedFrames(new Set(fitsFrames.map((_, i) => i)));
           }
           break;
+        // Zoom controls
+        case "+":
+        case "=":
+          e.preventDefault();
+          zoomIn();
+          break;
+        case "-":
+          e.preventDefault();
+          zoomOut();
+          break;
+        case "0":
+        case "Home":
+          e.preventDefault();
+          resetZoom();
+          break;
       }
     };
 
     window.addEventListener("keydown", handleKeyPress);
     return () => window.removeEventListener("keydown", handleKeyPress);
-  }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames]);
+  }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames, zoomIn, zoomOut, resetZoom]);
 
   // Auto-cache on mount
   useEffect(() => {
@@ -386,6 +512,82 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setLastSelectedIndex(null);
   }, []);
 
+  // Handle mouse wheel for zoom
+  const handleWheel = useCallback((e: React.WheelEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    // Calculate cursor position relative to canvas center
+    const cursorOffsetX = mouseX - canvas.width / 2;
+    const cursorOffsetY = mouseY - canvas.height / 2;
+
+    // Zoom factor
+    const zoomFactor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const oldZoom = zoomRef.current;
+    const newZoom = Math.max(1.0, Math.min(20, oldZoom * zoomFactor));
+
+    if (newZoom === oldZoom) return;
+
+    // Zoom toward cursor: adjust pan so cursor stays over same image point
+    const zoomRatio = newZoom / oldZoom;
+    const newPan = {
+      x: cursorOffsetX - (cursorOffsetX - panRef.current.x) * zoomRatio,
+      y: cursorOffsetY - (cursorOffsetY - panRef.current.y) * zoomRatio,
+    };
+
+    zoomRef.current = newZoom;
+    panRef.current = constrainPan(newPan);
+    updateZoomDisplay(newZoom);
+    drawImageToCanvas();
+  }, [constrainPan, updateZoomDisplay, drawImageToCanvas]);
+
+  // Handle mouse down for pan start
+  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (zoomRef.current <= 1.0) return; // Only pan when zoomed in
+    if (e.button !== 0) return; // Only left click
+
+    isPanningRef.current = true;
+    setIsPanning(true);
+    lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+    e.preventDefault();
+  }, []);
+
+  // Handle mouse move for panning
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isPanningRef.current) return;
+
+    const deltaX = e.clientX - lastMousePosRef.current.x;
+    const deltaY = e.clientY - lastMousePosRef.current.y;
+
+    lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+
+    const newPan = {
+      x: panRef.current.x + deltaX,
+      y: panRef.current.y + deltaY,
+    };
+
+    panRef.current = constrainPan(newPan);
+    drawImageToCanvas();
+  }, [constrainPan, drawImageToCanvas]);
+
+  // Handle mouse up for pan end
+  const handleMouseUp = useCallback(() => {
+    isPanningRef.current = false;
+    setIsPanning(false);
+  }, []);
+
+  // Handle mouse leave (end panning if cursor leaves canvas)
+  const handleMouseLeave = useCallback(() => {
+    isPanningRef.current = false;
+    setIsPanning(false);
+  }, []);
+
   const handleBlackholeSelected = useCallback(async () => {
     if (selectedFrames.size === 0) return;
     setIsBlackholing(true);
@@ -482,14 +684,34 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       <div className="flex-1 flex overflow-hidden">
         {/* Canvas area */}
         <div className="flex-1 relative bg-black flex items-center justify-center">
-          <canvas ref={canvasRef} className="max-w-full max-h-full" style={{ imageRendering: "pixelated" }} />
+          <canvas
+            ref={canvasRef}
+            className="max-w-full max-h-full"
+            style={{
+              imageRendering: "pixelated",
+              cursor: displayZoom > 1 ? (isPanning ? "grabbing" : "grab") : "default",
+            }}
+            onWheel={handleWheel}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseLeave}
+          />
+          {/* Zoom indicator */}
+          {displayZoom !== 1.0 && (
+            <div className="absolute bottom-4 left-4 bg-surface/80 text-white px-3 py-1.5 rounded text-sm font-mono">
+              {displayZoom < 1
+                ? `${Math.round(displayZoom * 100)}%`
+                : `${displayZoom.toFixed(1)}x`}
+            </div>
+          )}
           {loadingIndices.has(currentIndex) && (
-            <div className="absolute top-4 right-4 bg-gray-900 bg-opacity-75 rounded-full p-2">
+            <div className="absolute top-4 right-4 bg-surface bg-opacity-75 rounded-full p-2">
               <Loader2 className="animate-spin text-white" size={24} />
             </div>
           )}
           {error && (
-            <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded shadow-lg">
+            <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-error text-white px-4 py-2 rounded shadow-lg">
               {error}
             </div>
           )}
@@ -514,10 +736,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
       {/* Blackhole error notification */}
       {blackholeError && (
-        <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded shadow-lg z-60 flex items-center gap-2">
+        <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-error text-white px-4 py-2 rounded shadow-lg z-60 flex items-center gap-2">
           <AlertTriangle size={18} />
           {blackholeError}
-          <button onClick={() => setBlackholeError(null)} className="ml-2 p-1 hover:bg-red-700 rounded">
+          <button onClick={() => setBlackholeError(null)} className="ml-2 p-1 hover:brightness-90 rounded">
             <X size={16} />
           </button>
         </div>
@@ -526,14 +748,14 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       {/* Blackhole confirmation dialog */}
       {showBlackholeConfirm && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-60">
-          <div className="bg-gray-800 rounded-lg shadow-xl border border-gray-600 p-6 max-w-md w-full mx-4">
+          <div className="bg-surface-elevated rounded-lg shadow-xl border border-border p-6 max-w-md w-full mx-4">
             <div className="flex items-center gap-3 mb-4">
-              <div className="p-2 bg-red-600/20 rounded-full">
-                <Trash2 className="text-red-400" size={24} />
+              <div className="p-2 bg-error/20 rounded-full">
+                <Trash2 className="text-error" size={24} />
               </div>
               <h3 className="text-lg font-semibold text-white">Send to Blackhole?</h3>
             </div>
-            <p className="text-gray-300 mb-6">
+            <p className="text-content-secondary mb-6">
               Are you sure you want to send{" "}
               <span className="font-semibold text-white">{nonBlackholedInSelectionCount} frame{nonBlackholedInSelectionCount !== 1 ? "s" : ""}</span>{" "}
               to the blackhole? This is a soft delete - files can be restored later.
@@ -542,14 +764,14 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               <button
                 onClick={() => setShowBlackholeConfirm(false)}
                 disabled={isBlackholing}
-                className="px-4 py-2 text-gray-300 hover:text-white hover:bg-gray-700 rounded transition-colors disabled:opacity-50"
+                className="px-4 py-2 text-content-secondary hover:text-white hover:bg-surface-hover rounded transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 onClick={handleBlackholeSelected}
                 disabled={isBlackholing}
-                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors disabled:opacity-50"
+                className="flex items-center gap-2 px-4 py-2 bg-error hover:brightness-90 text-white rounded transition-colors disabled:opacity-50"
               >
                 {isBlackholing ? (
                   <><Loader2 className="animate-spin" size={16} />Processing...</>

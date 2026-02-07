@@ -25,8 +25,8 @@ export default function BehavioralOptionsPanel({
   };
 
   return (
-    <div className="bg-gray-800/50 rounded-lg p-4">
-      <h4 className="text-sm font-medium text-gray-300 mb-3">Options</h4>
+    <div className="bg-surface-elevated/50 rounded-lg p-4">
+      <h4 className="text-sm font-medium text-content-secondary mb-3">Options</h4>
       <div className="space-y-3">
         {sourceType === "darks" && (
           <label className="flex items-center gap-3 cursor-pointer">
@@ -40,13 +40,13 @@ export default function BehavioralOptionsPanel({
                   e.target.checked
                 )
               }
-              className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-2 focus:ring-blue-500"
+              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent"
             />
             <div>
-              <span className="text-sm text-gray-200">
+              <span className="text-sm text-content">
                 Use BIAS for Dark Optimization
               </span>
-              <p className="text-xs text-gray-500">
+              <p className="text-xs text-content-muted">
                 Link Bias sets as sub-calibration to Dark sets
               </p>
             </div>
@@ -61,13 +61,13 @@ export default function BehavioralOptionsPanel({
               onChange={(e) =>
                 onUpdate(sourceType, "use_bias_if_no_darks", e.target.checked)
               }
-              className="w-4 h-4 rounded border-gray-600 bg-gray-700 text-blue-600 focus:ring-2 focus:ring-blue-500"
+              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent"
             />
             <div>
-              <span className="text-sm text-gray-200">
+              <span className="text-sm text-content">
                 Use BIAS if no Darks Found
               </span>
-              <p className="text-xs text-gray-500">
+              <p className="text-xs text-content-muted">
                 Fallback to Bias if Dark calibration is not available
               </p>
             </div>
@@ -75,7 +75,7 @@ export default function BehavioralOptionsPanel({
         )}
 
         {showFallbackInfo && safeOptions.fallback_chain.length > 0 && (
-          <div className="mt-2 p-2 bg-gray-700/50 rounded text-xs text-gray-400">
+          <div className="mt-2 p-2 bg-surface-hover/50 rounded text-xs text-content-muted">
             <span className="font-medium">Fallback Chain:</span>{" "}
             {safeOptions.fallback_chain.map((type, i) => (
               <span key={type}>
@@ -83,7 +83,7 @@ export default function BehavioralOptionsPanel({
                 {i < safeOptions.fallback_chain.length - 1 && " -> "}
               </span>
             ))}
-            <p className="mt-1 text-gray-500">
+            <p className="mt-1 text-content-muted">
               For Flats, the system will try DarkFlat first, then Dark, then
               Bias
             </p>

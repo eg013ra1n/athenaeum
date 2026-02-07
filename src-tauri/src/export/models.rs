@@ -1,67 +1,36 @@
 //! Data models for the export module
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
 
-/// Export operation mode
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// ============================================================================
+// Camera Type Detection
+// ============================================================================
+
+/// Camera type based on Bayer pattern presence
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum ExportMode {
-    /// Only generate Siril scripts without copying files
-    GenerateScripts,
-    /// Only organize files into folder structure
-    OrganizeFiles,
-    /// Organize files and generate scripts
-    OrganizeAndScript,
-    /// Full execution: organize, generate scripts, and run Siril
-    DirectExecution,
+pub enum CameraType {
+    /// One-shot color camera (has Bayer pattern like RGGB, BGGR)
+    Osc,
+    /// Monochrome camera (no Bayer pattern)
+    Mono,
 }
 
-/// Siril processing workflow type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum SirilWorkflow {
-    /// Process each filter separately (mono cameras or narrowband)
-    MonoPreprocessing,
-    /// One-shot color camera processing
-    OscPreprocessing,
-    /// LRGB combination workflow
-    LrgbProcessing,
-}
+impl CameraType {
+    /// Determine camera type from BAYERPAT FITS keyword
+    pub fn from_bayerpat(bayerpat: Option<&str>) -> Self {
+        match bayerpat {
+            Some(pattern) if !pattern.trim().is_empty() => CameraType::Osc,
+            _ => CameraType::Mono,
+        }
+    }
 
-/// Configuration for an export operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportConfig {
-    /// Frame set to export
-    pub frame_set_id: i64,
-    /// Output directory path
-    pub output_dir: PathBuf,
-    /// Export operation mode
-    pub mode: ExportMode,
-    /// Siril workflow type
-    pub workflow: SirilWorkflow,
-    /// Whether to create master calibration frames
-    pub create_masters: bool,
-    /// Low rejection sigma for stacking
-    pub rejection_low: f64,
-    /// High rejection sigma for stacking
-    pub rejection_high: f64,
-    /// Use symbolic links instead of copying files
-    pub use_symlinks: bool,
-}
-
-impl Default for ExportConfig {
-    fn default() -> Self {
-        Self {
-            frame_set_id: 0,
-            output_dir: PathBuf::new(),
-            mode: ExportMode::OrganizeAndScript,
-            workflow: SirilWorkflow::MonoPreprocessing,
-            create_masters: true,
-            rejection_low: 3.0,
-            rejection_high: 3.0,
-            use_symlinks: false,
+    /// Get display name for this camera type
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            CameraType::Osc => "OSC",
+            CameraType::Mono => "Mono",
         }
     }
 }
@@ -85,16 +54,24 @@ pub struct ExportFrame {
     /// CCD temperature
     pub ccd_temp: Option<f64>,
     /// Gain setting
-    pub gain: Option<i32>,
+    pub gain: Option<f64>,
     /// Offset setting
-    pub offset: Option<i32>,
+    pub offset: Option<f64>,
     /// Binning (e.g., "1x1")
     pub binning: Option<String>,
     /// Date observed
     pub date_obs: Option<String>,
+    /// Focal length in mm
+    pub focallen: Option<f64>,
+    /// Pixel size in micrometers (from XPIXSZ or PIXSIZE1 FITS header)
+    pub xpixsz: Option<f64>,
+    /// Bayer pattern for OSC detection (e.g., "RGGB")
+    pub bayerpat: Option<String>,
+    /// Camera/instrument name
+    pub instrume: Option<String>,
 }
 
-/// A calibration set with its frames
+/// A calibration set with its frames (legacy - kept for compatibility)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportCalibrationSet {
@@ -112,7 +89,247 @@ pub struct ExportCalibrationSet {
     pub warnings: Vec<String>,
 }
 
-/// Group of light frames by filter with their calibrations
+// ============================================================================
+// New Export Models (Phase 2 Refactoring)
+// ============================================================================
+
+/// Information about a calibration set and its sub-calibrations (recursive)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSetInfo {
+    /// Calibration set ID
+    pub set_id: i64,
+    /// Image type (FLAT, DARK, BIAS, DARKFLAT)
+    pub imagetyp: String,
+    /// Frames in this calibration set
+    pub frames: Vec<ExportFrame>,
+    /// Frame count
+    pub frame_count: i32,
+    /// Sub-calibration: DarkFlat set (for Flats)
+    pub dark_flat: Option<Box<CalibrationSetInfo>>,
+    /// Sub-calibration: Dark set (for Flats or Lights)
+    pub dark: Option<Box<CalibrationSetInfo>>,
+    /// Sub-calibration: Bias set (for Flats, Darks, or Lights)
+    pub bias: Option<Box<CalibrationSetInfo>>,
+    /// Match quality score (0.0 - 1.0)
+    pub match_score: Option<f64>,
+    /// Warnings (date, temperature mismatch, etc.)
+    pub warnings: Vec<String>,
+}
+
+/// A subgroup of frames that share the same calibration set links
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSubgroup {
+    /// Unique subgroup key (hash of calibration set IDs)
+    pub subgroup_key: String,
+    /// Display name (e.g., "Night 1 - Camera X" or auto-generated)
+    pub display_name: String,
+    /// Light frames in this subgroup
+    pub frames: Vec<ExportFrame>,
+    /// Linked Flat calibration set (with its own sub-calibrations)
+    pub flat: Option<CalibrationSetInfo>,
+    /// Linked Dark calibration set (with its own sub-calibrations)
+    pub dark: Option<CalibrationSetInfo>,
+    /// Linked Bias calibration set
+    pub bias: Option<CalibrationSetInfo>,
+    /// Warnings for this subgroup
+    pub warnings: Vec<String>,
+}
+
+/// An export group - frames that will be stacked into one master light
+/// Groups frames by filter AND camera type (OSC vs Mono)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportGroup {
+    /// Unique group key for identification (e.g., "Ha_Mono")
+    pub group_key: String,
+    /// Filter name (None for unfiltered/OSC luminance)
+    pub filter: Option<String>,
+    /// Camera type (OSC or Mono)
+    pub camera_type: CameraType,
+    /// Display name for UI (e.g., "Ha (Mono)", "Luminance (OSC)")
+    pub display_name: String,
+    /// Calibration subgroups - frames grouped by their linked calibration sets
+    pub subgroups: Vec<CalibrationSubgroup>,
+    /// Total light frame count across all subgroups
+    pub total_frames: i32,
+    /// Total exposure time across all subgroups (seconds)
+    pub total_exposure: f64,
+    /// Warnings specific to this group
+    pub warnings: Vec<String>,
+}
+
+impl ExportGroup {
+    /// Generate a group key from filter and camera type
+    pub fn make_group_key(filter: Option<&str>, camera_type: &CameraType) -> String {
+        let filter_part = filter.unwrap_or("Unfiltered");
+        format!("{}_{}", filter_part, camera_type.display_name())
+    }
+
+    /// Generate display name from filter and camera type
+    pub fn make_display_name(filter: Option<&str>, camera_type: &CameraType) -> String {
+        let filter_part = filter.unwrap_or("Luminance");
+        format!("{} ({})", filter_part, camera_type.display_name())
+    }
+}
+
+// ============================================================================
+// Master Creation Plan
+// ============================================================================
+
+/// Plan for creating all required master calibration files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterCreationPlan {
+    /// Ordered list of masters to create (respects dependencies)
+    pub masters: Vec<MasterInfo>,
+    /// Map of set_id → master file path for reference
+    pub master_paths: HashMap<i64, String>,
+}
+
+impl Default for MasterCreationPlan {
+    fn default() -> Self {
+        Self {
+            masters: Vec::new(),
+            master_paths: HashMap::new(),
+        }
+    }
+}
+
+/// Information about a master calibration file to create
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterInfo {
+    /// Calibration set ID
+    pub set_id: i64,
+    /// Master type (Bias, Dark, DarkFlat, Flat)
+    pub master_type: String,
+    /// Output filename (e.g., "master_bias_3.fit")
+    pub output_name: String,
+    /// Source frames for this master
+    pub source_frames: Vec<ExportFrame>,
+    /// Dependencies - set IDs of masters needed before this one
+    pub depends_on: Vec<i64>,
+    /// Calibration master to apply: Bias set ID
+    pub apply_bias: Option<i64>,
+    /// Calibration master to apply: Dark set ID (for lights and darks that need dark calibration)
+    /// For flats, this is only set if the dark exposure time matches the flat exposure (±30%)
+    pub apply_dark: Option<i64>,
+    /// Calibration master to apply: DarkFlat set ID (for flats - short exposure dark matching flat exposure)
+    pub apply_darkflat: Option<i64>,
+    /// Source frame exposure time (for exposure-time matching in flat calibration)
+    #[serde(default)]
+    pub source_exptime: Option<f64>,
+}
+
+/// Sanitize a name for use in folder paths
+/// Replaces spaces and special characters with underscores
+pub fn sanitize_folder_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+// ============================================================================
+// Calibration Route (UI Display)
+// ============================================================================
+
+/// Calibration route for UI display - shows complete hierarchy and script preview
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationRoute {
+    /// Export groups and their calibration trees
+    pub groups: Vec<CalibrationRouteGroup>,
+    /// Generated Siril script previews (kept for type compatibility)
+    pub script_preview: Vec<SirilScriptPreview>,
+    /// Overall summary
+    pub summary: CalibrationRouteSummary,
+}
+
+/// A group in the calibration route display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationRouteGroup {
+    /// Group display name (e.g., "Ha (Mono)")
+    pub name: String,
+    /// Number of light frames
+    pub light_count: i32,
+    /// Total exposure time (seconds)
+    pub total_exposure: f64,
+    /// Number of subgroups
+    pub subgroup_count: i32,
+    /// Calibration tree nodes
+    pub calibration_tree: Vec<CalibrationTreeNode>,
+}
+
+/// A node in the calibration tree for UI display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationTreeNode {
+    /// Node type: "Light", "Flat", "Dark", "Bias", "DarkFlat"
+    pub node_type: String,
+    /// Display label (e.g., "Flat Set 5 (30 frames)")
+    pub label: String,
+    /// Calibration set ID (None for Light nodes)
+    pub set_id: Option<i64>,
+    /// Frame count
+    pub count: i32,
+    /// Child nodes (sub-calibrations)
+    pub children: Vec<CalibrationTreeNode>,
+    /// Warnings for this node
+    pub warnings: Vec<String>,
+    /// Whether this node is missing/incomplete
+    pub is_missing: bool,
+    /// Whether this set is shared with other subgroups/groups
+    pub is_shared: bool,
+}
+
+/// Preview of a Siril script (kept for type compatibility)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SirilScriptPreview {
+    /// Script name (e.g., "00_create_masters.ssf")
+    pub name: String,
+    /// Script purpose description
+    pub description: String,
+    /// Full script content
+    pub content: String,
+}
+
+/// Summary of the calibration route
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationRouteSummary {
+    /// Total export groups
+    pub group_count: i32,
+    /// Total light frames
+    pub total_lights: i32,
+    /// Total exposure time (seconds)
+    pub total_exposure: f64,
+    /// Number of unique calibration sets
+    pub unique_calibration_sets: i32,
+    /// Number of masters to create
+    pub masters_to_create: i32,
+    /// Calibration completeness flags
+    pub flats_complete: bool,
+    pub darks_complete: bool,
+    pub bias_complete: bool,
+    /// Overall warnings
+    pub warnings: Vec<String>,
+}
+
+// ============================================================================
+// Legacy Models (Kept for Backwards Compatibility)
+// ============================================================================
+
+/// Group of light frames by filter with their calibrations (legacy)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterExportGroup {
@@ -160,7 +377,12 @@ pub struct ExportData {
     pub frame_set_name: String,
     /// Object name
     pub object_name: Option<String>,
-    /// Filter groups with their calibrations
+    /// Export groups (new structure with subgroups)
+    pub groups: Vec<ExportGroup>,
+    /// Master creation plan (ordered list of masters to create)
+    pub master_plan: MasterCreationPlan,
+    /// Filter groups with their calibrations (legacy - kept for compatibility)
+    #[serde(default)]
     pub filters: Vec<FilterExportGroup>,
     /// Overall calibration summary
     pub calibration_summary: CalibrationSummary,
@@ -188,38 +410,232 @@ pub struct ExportResult {
     pub error: Option<String>,
 }
 
-/// Progress update during export or Siril execution
+// ============================================================================
+// Export Summary Models (Enhanced UI)
+// ============================================================================
+
+/// Complete export summary for the enhanced UI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExportProgress {
-    /// Current stage of the export
-    pub stage: ExportStage,
-    /// Progress percentage (0-100)
-    pub progress: f64,
-    /// Current status message
-    pub message: String,
-    /// Current file being processed (if applicable)
-    pub current_file: Option<String>,
+pub struct ExportSummary {
+    /// Frame set ID
+    pub frame_set_id: i64,
+    /// Frame set name
+    pub frame_set_name: String,
+    /// Object name (target)
+    pub object_name: Option<String>,
+    /// Unique cameras used
+    pub cameras: Vec<String>,
+    /// Unique telescopes used
+    pub telescopes: Vec<String>,
+    /// Date range of sessions (start, end)
+    pub date_range: Option<(String, String)>,
+    /// Filter groups with full breakdown
+    pub filter_groups: Vec<FilterGroupSummary>,
+    /// Folder structure preview
+    pub folder_preview: FolderPreview,
+    /// Detailed warnings
+    pub warnings: Vec<DetailedWarning>,
+    /// Total file count
+    pub total_files: i32,
+    /// Estimated total size in bytes
+    pub estimated_size_bytes: u64,
 }
 
-/// Export operation stages
+/// Summary for a single filter group (filter + camera type combination)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterGroupSummary {
+    /// Filter name (None for unfiltered/luminance)
+    pub filter: Option<String>,
+    /// Camera type (OSC or Mono)
+    pub camera_type: CameraType,
+    /// Camera/instrument name
+    pub camera: Option<String>,
+    /// Telescope name
+    pub telescope: Option<String>,
+    /// Gain setting
+    pub gain: Option<f64>,
+    /// Offset setting
+    pub offset: Option<f64>,
+    /// Binning mode (e.g., "1x1")
+    pub binning: Option<String>,
+    /// Average CCD temperature
+    pub avg_temp: Option<f64>,
+    /// Exposure breakdown by exposure time
+    pub exposure_groups: Vec<ExposureGroup>,
+    /// Total exposure time in seconds
+    pub total_exposure: f64,
+    /// Total frame count
+    pub frame_count: i32,
+    /// Linked flat calibration info
+    pub flat_info: Option<CalibrationDetail>,
+    /// Linked dark calibration info
+    pub dark_info: Option<CalibrationDetail>,
+    /// Linked bias calibration info
+    pub bias_info: Option<CalibrationDetail>,
+    /// All frames in this group (for expandable list)
+    pub frames: Vec<FrameDetail>,
+}
+
+/// Exposure time group (frames with same exposure)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposureGroup {
+    /// Exposure time in seconds
+    pub exptime: f64,
+    /// Number of frames with this exposure
+    pub count: i32,
+    /// Total exposure time for this group (exptime * count)
+    pub total_seconds: f64,
+}
+
+/// Detailed calibration information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationDetail {
+    /// Calibration set ID
+    pub set_id: i64,
+    /// Calibration type (Flat, Dark, Bias, DarkFlat)
+    pub calibration_type: String,
+    /// Number of calibration frames
+    pub frame_count: i32,
+    /// Average exposure time (for darks/flats)
+    pub avg_exptime: Option<f64>,
+    /// Average CCD temperature
+    pub avg_temp: Option<f64>,
+    /// Match quality score (0.0 - 1.0)
+    pub match_score: f64,
+    /// Date range of calibration frames (start, end)
+    pub date_range: Option<(String, String)>,
+    /// Specific warnings for this calibration
+    pub warnings: Vec<String>,
+    /// Sub-calibrations (e.g., Flat -> Dark -> Bias chain)
+    pub sub_calibrations: Vec<CalibrationDetail>,
+}
+
+/// Individual frame detail for expandable list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameDetail {
+    /// Frame ID
+    pub frame_id: i64,
+    /// Filename
+    pub filename: String,
+    /// Full file path
+    pub file_path: String,
+    /// Date observed
+    pub date_obs: Option<String>,
+    /// Exposure time in seconds
+    pub exptime: Option<f64>,
+    /// CCD temperature
+    pub temp: Option<f64>,
+    /// Gain setting
+    pub gain: Option<f64>,
+    /// Offset setting
+    pub offset: Option<f64>,
+    /// Calibration chain description (e.g., "Flat #12 → Dark #8 → Bias #3")
+    pub calibration_chain: String,
+    /// File size in bytes (if known)
+    pub file_size: Option<u64>,
+}
+
+/// Folder structure preview for export
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderPreview {
+    /// Root folder name
+    pub root_name: String,
+    /// Folder structure tree
+    pub structure: Vec<FolderNode>,
+    /// Total file count
+    pub total_files: i32,
+    /// Estimated total size (human readable)
+    pub estimated_size: String,
+}
+
+/// A node in the folder structure tree
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderNode {
+    /// Node name (folder or file name)
+    pub name: String,
+    /// Node type
+    pub node_type: FolderNodeType,
+    /// File count (for folders)
+    pub file_count: Option<i32>,
+    /// Description (e.g., "← 50 darks, 100 bias")
+    pub description: Option<String>,
+    /// Child nodes
+    pub children: Vec<FolderNode>,
+}
+
+/// Type of folder node
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum ExportStage {
-    /// Collecting frame data
-    Collecting,
-    /// Organizing files into folders
-    Organizing,
-    /// Generating scripts
-    GeneratingScripts,
-    /// Running Siril calibration
-    SirilCalibrating,
-    /// Running Siril registration
-    SirilRegistering,
-    /// Running Siril stacking
-    SirilStacking,
-    /// Export complete
-    Complete,
-    /// Export failed
-    Failed,
+pub enum FolderNodeType {
+    /// A folder
+    Folder,
+    /// A file
+    File,
+    /// Placeholder for multiple files (e.g., "... 50 more files")
+    Ellipsis,
+}
+
+/// Detailed warning with full context
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailedWarning {
+    /// Warning type
+    pub warning_type: WarningType,
+    /// Warning severity
+    pub severity: WarningSeverity,
+    /// Short title
+    pub title: String,
+    /// Detailed description
+    pub description: String,
+    /// Related calibration set ID (if applicable)
+    pub set_id: Option<i64>,
+    /// Related filter (if applicable)
+    pub filter: Option<String>,
+    /// Actual value (for mismatches)
+    pub actual_value: Option<String>,
+    /// Expected value (for mismatches)
+    pub expected_value: Option<String>,
+    /// Delta/difference (for numeric comparisons)
+    pub delta: Option<String>,
+    /// Recommendation text
+    pub recommendation: Option<String>,
+}
+
+/// Warning type categories
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningType {
+    /// Temperature mismatch between lights and calibration
+    TemperatureMismatch,
+    /// Calibration frames are old compared to lights
+    CalibrationAge,
+    /// Missing calibration (using fallback)
+    MissingCalibration,
+    /// Gain/offset mismatch
+    GainOffsetMismatch,
+    /// Binning mismatch
+    BinningMismatch,
+    /// Exposure time mismatch
+    ExposureMismatch,
+    /// General warning
+    General,
+}
+
+/// Warning severity levels
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningSeverity {
+    /// Informational (won't affect results much)
+    Info,
+    /// Warning (may affect results)
+    Warning,
+    /// Error (likely to cause issues)
+    Error,
 }

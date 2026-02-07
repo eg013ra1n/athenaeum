@@ -1,7 +1,8 @@
 import { Outlet, NavLink } from 'react-router-dom';
-import { Files, Calendar, Target, Map, Camera, Upload, Settings, Trash2 } from 'lucide-react';
+import { Files, Calendar, Target, Map, Camera, Layers, Settings, Trash2 } from 'lucide-react';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
+import Logo from '../assets/athenaeum.svg';
 
 export default function Layout() {
   const navItems = [
@@ -10,19 +11,22 @@ export default function Layout() {
     { to: '/objects', icon: Target, label: 'Objects' },
     { to: '/skyatlas', icon: Map, label: 'Sky Atlas' },
     { to: '/equipment', icon: Camera, label: 'Equipment' },
-    { to: '/export', icon: Upload, label: 'Export' },
+    { to: '/export', icon: Layers, label: 'Export' },
     { to: '/blackhole', icon: Trash2, label: 'Black Hole' },
     { to: '/settings', icon: Settings, label: 'Settings' },
   ];
 
   return (
     <ScanProgressProvider>
-      <div className="flex h-screen bg-gray-900 text-gray-100">
+      <div className="flex h-screen bg-surface text-content">
         {/* Sidebar Navigation */}
-        <aside className="w-64 bg-gray-800 border-r border-gray-700">
-          <div className="p-4 border-b border-gray-700">
-            <h1 className="text-2xl font-bold text-blue-400">Athenaeum</h1>
-            <p className="text-xs text-gray-400 mt-1">Astrophotography Library Manager</p>
+        <aside className="w-64 bg-surface-elevated border-r border-border">
+          <div className="p-4 border-b border-border flex items-center gap-3">
+            <img src={Logo} alt="Athenaeum" className="w-12" />
+            <div>
+              <h1 className="text-2xl font-medium text-success font-antiqua tracking-wide">ATHENAEUM</h1>
+              <p className="text-xs text-content-muted">Astrophotography Library</p>
+            </div>
           </div>
 
           <nav className="p-4 space-y-2">
@@ -33,8 +37,8 @@ export default function Layout() {
                 className={({ isActive }) =>
                   `flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
                     isActive
-                      ? 'bg-blue-600 text-white'
-                      : 'text-gray-300 hover:bg-gray-700'
+                      ? 'bg-accent text-surface'
+                      : 'text-content-secondary hover:bg-surface-hover'
                   }`
                 }
               >

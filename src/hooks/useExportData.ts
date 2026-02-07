@@ -2,10 +2,9 @@ import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type {
   ExportData,
-  ExportResult,
   ExportableFrameSet,
-  ExportMode,
-  SirilWorkflow,
+  CalibrationRoute,
+  ExportSummary,
 } from '../types/export';
 
 interface UseExportDataResult {
@@ -87,104 +86,90 @@ export function useExportableFrameSets(): UseExportableFrameSetsResult {
   return { frameSets, loading, error, refresh: loadData };
 }
 
-interface UseExportResult {
-  execute: (config: ExportExecuteConfig) => Promise<ExportResult>;
+interface UseCalibrationRouteResult {
+  route: CalibrationRoute | null;
   loading: boolean;
   error: string | null;
-  result: ExportResult | null;
-}
-
-interface ExportExecuteConfig {
-  frameSetId: number;
-  outputDir: string;
-  mode: ExportMode;
-  workflow: SirilWorkflow;
-  rejectionLow?: number;
-  rejectionHigh?: number;
-  useSymlinks?: boolean;
-}
-
-/**
- * Hook to execute an export operation
- */
-export function useExport(): UseExportResult {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<ExportResult | null>(null);
-
-  const execute = useCallback(async (config: ExportExecuteConfig): Promise<ExportResult> => {
-    try {
-      setLoading(true);
-      setError(null);
-      setResult(null);
-
-      const exportResult = await invoke<ExportResult>('export_frame_set', {
-        frameSetId: config.frameSetId,
-        outputDir: config.outputDir,
-        mode: config.mode,
-        workflow: config.workflow,
-        rejectionLow: config.rejectionLow ?? 3.0,
-        rejectionHigh: config.rejectionHigh ?? 3.0,
-        useSymlinks: config.useSymlinks ?? false,
-      });
-
-      setResult(exportResult);
-      return exportResult;
-    } catch (err) {
-      const errorMessage = err as string;
-      setError(errorMessage);
-      throw new Error(errorMessage);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  return { execute, loading, error, result };
-}
-
-interface UseSirilPathResult {
-  path: string | null;
-  loading: boolean;
-  error: string | null;
-  setPath: (path: string) => Promise<void>;
   refresh: () => void;
 }
 
 /**
- * Hook to manage Siril CLI path setting
+ * Hook to fetch the calibration route for UI display
+ * Shows complete calibration hierarchy
  */
-export function useSirilPath(): UseSirilPathResult {
-  const [path, setPathState] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+export function useCalibrationRoute(frameSetId: number | null): UseCalibrationRouteResult {
+  const [route, setRoute] = useState<CalibrationRoute | null>(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadPath = useCallback(async () => {
+  const loadData = useCallback(async () => {
+    if (frameSetId === null) {
+      setRoute(null);
+      return;
+    }
+
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<string | null>('get_siril_path');
-      setPathState(result);
+      const result = await invoke<CalibrationRoute>('get_calibration_route', {
+        frameSetId,
+      });
+      setRoute(result);
     } catch (err) {
       setError(err as string);
+      setRoute(null);
     } finally {
       setLoading(false);
     }
-  }, []);
-
-  const setPath = useCallback(async (newPath: string) => {
-    try {
-      setError(null);
-      await invoke('set_siril_path', { path: newPath });
-      setPathState(newPath);
-    } catch (err) {
-      setError(err as string);
-      throw err;
-    }
-  }, []);
+  }, [frameSetId]);
 
   useEffect(() => {
-    loadPath();
-  }, [loadPath]);
+    loadData();
+  }, [loadData]);
 
-  return { path, loading, error, setPath, refresh: loadPath };
+  return { route, loading, error, refresh: loadData };
+}
+
+interface UseExportSummaryResult {
+  summary: ExportSummary | null;
+  loading: boolean;
+  error: string | null;
+  refresh: () => void;
+}
+
+/**
+ * Hook to fetch enhanced export summary for the new UI
+ * Returns comprehensive data with equipment info, filter breakdowns, and detailed warnings
+ */
+export function useExportSummary(frameSetId: number | null): UseExportSummaryResult {
+  const [summary, setSummary] = useState<ExportSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadData = useCallback(async () => {
+    if (frameSetId === null) {
+      setSummary(null);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setError(null);
+      const result = await invoke<ExportSummary>('get_export_summary', {
+        frameSetId,
+      });
+      setSummary(result);
+    } catch (err) {
+      setError(err as string);
+      setSummary(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [frameSetId]);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  return { summary, loading, error, refresh: loadData };
 }

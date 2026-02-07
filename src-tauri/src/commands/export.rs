@@ -1,12 +1,14 @@
 //! Export-related Tauri commands
 //!
-//! Commands for exporting frame sets to external processing tools like Siril.
+//! Commands for exporting frame sets to PixInsight WBPP folder structure.
 
 use crate::commands::AppState;
 use crate::export::{
-    collect_export_data, organize_files,
-    models::{ExportConfig, ExportData, ExportMode, ExportResult, SirilWorkflow},
-    siril::{find_siril_cli, generate_scripts, run_siril_script},
+    collect_export_data, collect_export_summary, organize_files_wbpp,
+    models::{
+        CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
+        ExportData, ExportResult, ExportSummary, SirilScriptPreview,
+    },
 };
 use std::path::PathBuf;
 use tauri::State;
@@ -24,196 +26,6 @@ pub async fn get_export_preview(
     let conn = db.conn();
 
     collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())
-}
-
-/// Export a frame set with the given configuration
-///
-/// Depending on the mode, this will:
-/// - GenerateScripts: Only generate Siril scripts
-/// - OrganizeFiles: Only organize files into folders
-/// - OrganizeAndScript: Organize files and generate scripts
-/// - DirectExecution: Organize, generate scripts, and run Siril
-#[tauri::command]
-pub async fn export_frame_set(
-    state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-    frame_set_id: i64,
-    output_dir: String,
-    mode: String,
-    workflow: String,
-    rejection_low: f64,
-    rejection_high: f64,
-    use_symlinks: bool,
-) -> Result<ExportResult, String> {
-    // Parse mode
-    let export_mode = match mode.as_str() {
-        "generate_scripts" => ExportMode::GenerateScripts,
-        "organize_files" => ExportMode::OrganizeFiles,
-        "organize_and_script" => ExportMode::OrganizeAndScript,
-        "direct_execution" => ExportMode::DirectExecution,
-        _ => return Err(format!("Invalid export mode: {}", mode)),
-    };
-
-    // Parse workflow
-    let siril_workflow = match workflow.as_str() {
-        "mono_preprocessing" => SirilWorkflow::MonoPreprocessing,
-        "osc_preprocessing" => SirilWorkflow::OscPreprocessing,
-        "lrgb_processing" => SirilWorkflow::LrgbProcessing,
-        _ => return Err(format!("Invalid workflow: {}", workflow)),
-    };
-
-    // Build config
-    let config = ExportConfig {
-        frame_set_id,
-        output_dir: PathBuf::from(&output_dir),
-        mode: export_mode.clone(),
-        workflow: siril_workflow,
-        create_masters: true,
-        rejection_low,
-        rejection_high,
-        use_symlinks,
-    };
-
-    // Collect export data
-    let export_data = {
-        let state_lock = state.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
-        let conn = db.conn();
-        collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?
-    };
-
-    let mut result = ExportResult {
-        success: true,
-        output_dir: output_dir.clone(),
-        files_organized: 0,
-        scripts_generated: Vec::new(),
-        warnings: Vec::new(),
-        error: None,
-    };
-
-    // Step 1: Organize files (if needed)
-    if matches!(
-        export_mode,
-        ExportMode::OrganizeFiles | ExportMode::OrganizeAndScript | ExportMode::DirectExecution
-    ) {
-        match organize_files(&config, &export_data) {
-            Ok(org_result) => {
-                result.files_organized = org_result.files_organized;
-                result.warnings.extend(org_result.warnings);
-            }
-            Err(e) => {
-                return Ok(ExportResult {
-                    success: false,
-                    output_dir,
-                    files_organized: 0,
-                    scripts_generated: Vec::new(),
-                    warnings: Vec::new(),
-                    error: Some(format!("Failed to organize files: {}", e)),
-                });
-            }
-        }
-    }
-
-    // Step 2: Generate scripts (if needed)
-    if matches!(
-        export_mode,
-        ExportMode::GenerateScripts | ExportMode::OrganizeAndScript | ExportMode::DirectExecution
-    ) {
-        match generate_scripts(&config, &export_data) {
-            Ok(scripts) => {
-                result.scripts_generated = scripts
-                    .iter()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .collect();
-            }
-            Err(e) => {
-                return Ok(ExportResult {
-                    success: false,
-                    output_dir,
-                    files_organized: result.files_organized,
-                    scripts_generated: Vec::new(),
-                    warnings: result.warnings,
-                    error: Some(format!("Failed to generate scripts: {}", e)),
-                });
-            }
-        }
-    }
-
-    // Step 3: Execute Siril (if direct execution mode)
-    if export_mode == ExportMode::DirectExecution {
-        // Get Siril path from settings or auto-detect
-        let siril_path = {
-            let state_lock = state.db.lock().unwrap();
-            let db = state_lock.as_ref().ok_or("Database not initialized")?;
-            let conn = db.conn();
-
-            // Try to get from settings first
-            conn.query_row(
-                "SELECT value FROM settings WHERE key = 'siril_cli_path'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-        };
-
-        let siril_path = siril_path
-            .or_else(find_siril_cli)
-            .ok_or("Siril CLI not found. Please configure the path in settings.")?;
-
-        // Run each script
-        for script_path in &result.scripts_generated {
-            if let Err(e) = run_siril_script(&siril_path, &PathBuf::from(script_path), &app_handle)
-            {
-                result.warnings.push(format!(
-                    "Script {} failed: {}",
-                    script_path,
-                    e
-                ));
-            }
-        }
-    }
-
-    Ok(result)
-}
-
-/// Get the configured or auto-detected Siril CLI path
-#[tauri::command]
-pub async fn get_siril_path(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let state_lock = state.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Try settings first
-    let from_settings = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'siril_cli_path'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok();
-
-    if from_settings.is_some() {
-        return Ok(from_settings);
-    }
-
-    // Auto-detect
-    Ok(find_siril_cli())
-}
-
-/// Set the Siril CLI path in settings
-#[tauri::command]
-pub async fn set_siril_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let state_lock = state.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('siril_cli_path', ?1, datetime('now'))",
-        [&path],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(())
 }
 
 /// Get a list of available frame sets for export
@@ -282,4 +94,307 @@ pub struct ExportableFrameSet {
     pub frame_count: i32,
     pub object_name: Option<String>,
     pub filters: Vec<String>,
+}
+
+/// Get calibration route for UI display
+///
+/// Returns a structured view of the export groups and their calibration trees,
+/// suitable for displaying in the UI.
+#[tauri::command]
+pub async fn get_calibration_route(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+) -> Result<CalibrationRoute, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Collect export data
+    let export_data = collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?;
+
+    // Build calibration route from export data
+    let mut groups = Vec::new();
+    let mut total_lights = 0;
+    let mut total_exposure = 0.0;
+    let mut unique_calibration_sets = std::collections::HashSet::new();
+    let mut all_warnings = Vec::new();
+
+    for group in &export_data.groups {
+        let mut calibration_tree = Vec::new();
+
+        // Build calibration tree for this group
+        // Start with Light node
+        let mut light_children = Vec::new();
+
+        // Get calibration info from first subgroup
+        if let Some(subgroup) = group.subgroups.first() {
+            // Flat branch
+            if let Some(ref flat) = subgroup.flat {
+                unique_calibration_sets.insert(flat.set_id);
+                let mut flat_children = Vec::new();
+
+                // DarkFlat under Flat
+                if let Some(ref dark_flat) = flat.dark_flat {
+                    unique_calibration_sets.insert(dark_flat.set_id);
+                    flat_children.push(CalibrationTreeNode {
+                        node_type: "DarkFlat".to_string(),
+                        label: format!("DarkFlat Set {} ({} frames)", dark_flat.set_id, dark_flat.frame_count),
+                        set_id: Some(dark_flat.set_id),
+                        count: dark_flat.frame_count,
+                        children: vec![],
+                        warnings: dark_flat.warnings.clone(),
+                        is_missing: false,
+                        is_shared: false,
+                    });
+                }
+
+                // Dark under Flat (alternative to DarkFlat)
+                if let Some(ref dark) = flat.dark {
+                    unique_calibration_sets.insert(dark.set_id);
+                    let mut dark_children = Vec::new();
+
+                    if let Some(ref bias) = dark.bias {
+                        unique_calibration_sets.insert(bias.set_id);
+                        dark_children.push(CalibrationTreeNode {
+                            node_type: "Bias".to_string(),
+                            label: format!("Bias Set {} ({} frames)", bias.set_id, bias.frame_count),
+                            set_id: Some(bias.set_id),
+                            count: bias.frame_count,
+                            children: vec![],
+                            warnings: bias.warnings.clone(),
+                            is_missing: false,
+                            is_shared: false,
+                        });
+                    }
+
+                    flat_children.push(CalibrationTreeNode {
+                        node_type: "Dark".to_string(),
+                        label: format!("Dark Set {} ({} frames)", dark.set_id, dark.frame_count),
+                        set_id: Some(dark.set_id),
+                        count: dark.frame_count,
+                        children: dark_children,
+                        warnings: dark.warnings.clone(),
+                        is_missing: false,
+                        is_shared: false,
+                    });
+                }
+
+                // Bias under Flat
+                if let Some(ref bias) = flat.bias {
+                    unique_calibration_sets.insert(bias.set_id);
+                    flat_children.push(CalibrationTreeNode {
+                        node_type: "Bias".to_string(),
+                        label: format!("Bias Set {} ({} frames)", bias.set_id, bias.frame_count),
+                        set_id: Some(bias.set_id),
+                        count: bias.frame_count,
+                        children: vec![],
+                        warnings: bias.warnings.clone(),
+                        is_missing: false,
+                        is_shared: false,
+                    });
+                }
+
+                light_children.push(CalibrationTreeNode {
+                    node_type: "Flat".to_string(),
+                    label: format!("Flat Set {} ({} frames)", flat.set_id, flat.frame_count),
+                    set_id: Some(flat.set_id),
+                    count: flat.frame_count,
+                    children: flat_children,
+                    warnings: flat.warnings.clone(),
+                    is_missing: false,
+                    is_shared: false,
+                });
+            }
+
+            // Dark branch (direct for lights)
+            if let Some(ref dark) = subgroup.dark {
+                unique_calibration_sets.insert(dark.set_id);
+                let mut dark_children = Vec::new();
+
+                if let Some(ref bias) = dark.bias {
+                    unique_calibration_sets.insert(bias.set_id);
+                    dark_children.push(CalibrationTreeNode {
+                        node_type: "Bias".to_string(),
+                        label: format!("Bias Set {} ({} frames)", bias.set_id, bias.frame_count),
+                        set_id: Some(bias.set_id),
+                        count: bias.frame_count,
+                        children: vec![],
+                        warnings: bias.warnings.clone(),
+                        is_missing: false,
+                        is_shared: false,
+                    });
+                }
+
+                light_children.push(CalibrationTreeNode {
+                    node_type: "Dark".to_string(),
+                    label: format!("Dark Set {} ({} frames)", dark.set_id, dark.frame_count),
+                    set_id: Some(dark.set_id),
+                    count: dark.frame_count,
+                    children: dark_children,
+                    warnings: dark.warnings.clone(),
+                    is_missing: false,
+                    is_shared: false,
+                });
+            }
+
+            // Bias branch (direct for lights)
+            if let Some(ref bias) = subgroup.bias {
+                unique_calibration_sets.insert(bias.set_id);
+                light_children.push(CalibrationTreeNode {
+                    node_type: "Bias".to_string(),
+                    label: format!("Bias Set {} ({} frames)", bias.set_id, bias.frame_count),
+                    set_id: Some(bias.set_id),
+                    count: bias.frame_count,
+                    children: vec![],
+                    warnings: bias.warnings.clone(),
+                    is_missing: false,
+                    is_shared: false,
+                });
+            }
+
+            all_warnings.extend(subgroup.warnings.clone());
+        }
+
+        // Add missing calibration warnings
+        let has_flat = group.subgroups.first().and_then(|s| s.flat.as_ref()).is_some();
+        let has_dark = group.subgroups.first().and_then(|s| s.dark.as_ref()).is_some();
+
+        if !has_flat {
+            light_children.push(CalibrationTreeNode {
+                node_type: "Flat".to_string(),
+                label: "No flat calibration".to_string(),
+                set_id: None,
+                count: 0,
+                children: vec![],
+                warnings: vec!["Missing flat calibration".to_string()],
+                is_missing: true,
+                is_shared: false,
+            });
+        }
+
+        if !has_dark {
+            light_children.push(CalibrationTreeNode {
+                node_type: "Dark".to_string(),
+                label: "No dark calibration".to_string(),
+                set_id: None,
+                count: 0,
+                children: vec![],
+                warnings: vec!["Missing dark calibration".to_string()],
+                is_missing: true,
+                is_shared: false,
+            });
+        }
+
+        calibration_tree.push(CalibrationTreeNode {
+            node_type: "Light".to_string(),
+            label: format!("{} ({} frames)", group.display_name, group.total_frames),
+            set_id: None,
+            count: group.total_frames,
+            children: light_children,
+            warnings: group.warnings.clone(),
+            is_missing: false,
+            is_shared: false,
+        });
+
+        total_lights += group.total_frames;
+        total_exposure += group.total_exposure;
+        all_warnings.extend(group.warnings.clone());
+
+        groups.push(CalibrationRouteGroup {
+            name: group.display_name.clone(),
+            light_count: group.total_frames,
+            total_exposure: group.total_exposure,
+            subgroup_count: group.subgroups.len() as i32,
+            calibration_tree,
+        });
+    }
+
+    // Build summary
+    let summary = CalibrationRouteSummary {
+        group_count: export_data.groups.len() as i32,
+        total_lights,
+        total_exposure,
+        unique_calibration_sets: unique_calibration_sets.len() as i32,
+        masters_to_create: export_data.master_plan.masters.len() as i32,
+        flats_complete: export_data.calibration_summary.flats_complete,
+        darks_complete: export_data.calibration_summary.darks_complete,
+        bias_complete: export_data.calibration_summary.bias_complete,
+        warnings: all_warnings,
+    };
+
+    Ok(CalibrationRoute {
+        groups,
+        script_preview: Vec::<SirilScriptPreview>::new(),
+        summary,
+    })
+}
+
+/// Export a frame set to PixInsight WBPP folder structure
+///
+/// Creates a folder structure optimized for PixInsight's Weighted Batch Preprocessing (WBPP):
+/// ```
+/// output/
+/// └── camera_{name}/
+///     ├── darks/
+///     │   └── (bias, dark, darkflat files)
+///     └── flats_{filter}/
+///         └── lights/
+///             └── (light frames)
+/// ```
+#[tauri::command]
+pub async fn export_to_wbpp(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+    output_dir: String,
+    use_symlinks: bool,
+) -> Result<ExportResult, String> {
+    // Collect export data
+    let export_data = {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?
+    };
+
+    let output_path = PathBuf::from(&output_dir);
+
+    // Organize files into WBPP structure
+    match organize_files_wbpp(&output_path, &export_data, use_symlinks) {
+        Ok(org_result) => Ok(ExportResult {
+            success: true,
+            output_dir,
+            files_organized: org_result.files_organized,
+            scripts_generated: Vec::new(),
+            warnings: org_result.warnings,
+            error: None,
+        }),
+        Err(e) => Ok(ExportResult {
+            success: false,
+            output_dir,
+            files_organized: 0,
+            scripts_generated: Vec::new(),
+            warnings: Vec::new(),
+            error: Some(format!("Failed to organize files: {}", e)),
+        }),
+    }
+}
+
+/// Get enhanced export summary for the new UI
+///
+/// Returns comprehensive export data with:
+/// - Equipment info (cameras, telescopes, date range)
+/// - Filter groups with exposure breakdown
+/// - Calibration details with match quality
+/// - Folder structure preview
+/// - Detailed warnings with context
+#[tauri::command]
+pub async fn get_export_summary(
+    state: State<'_, AppState>,
+    frame_set_id: i64,
+) -> Result<ExportSummary, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    collect_export_summary(&conn, frame_set_id).map_err(|e| e.to_string())
 }

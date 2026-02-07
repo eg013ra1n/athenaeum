@@ -21,12 +21,12 @@ export default function SortableColumnHeader({
 
   const SortIcon = () => {
     if (!isActive) {
-      return <ChevronsUpDown size={14} className="text-gray-600" />;
+      return <ChevronsUpDown size={14} className="text-content-muted" />;
     }
     return sortDirection === "asc" ? (
-      <ChevronUp size={14} className="text-blue-400" />
+      <ChevronUp size={14} className="text-accent" />
     ) : (
-      <ChevronDown size={14} className="text-blue-400" />
+      <ChevronDown size={14} className="text-accent" />
     );
   };
 
@@ -35,7 +35,7 @@ export default function SortableColumnHeader({
   return (
     <button
       onClick={() => onSort(field)}
-      className={`flex items-center gap-1 hover:text-gray-200 transition-colors w-full ${alignClass}`}
+      className={`flex items-center gap-1 hover:text-content transition-colors w-full ${alignClass}`}
     >
       {label}
       <SortIcon />

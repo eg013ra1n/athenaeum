@@ -49,26 +49,26 @@ export default function Equipment() {
     <div className="p-6">
       <div className="mb-6">
         <h2 className="text-3xl font-bold mb-2">Equipment Library</h2>
-        <p className="text-gray-400">
+        <p className="text-content-muted">
           Browse instruments with captured frames and dark library management
         </p>
       </div>
 
       {loading && (
-        <div className="text-center py-12 text-gray-400">
+        <div className="text-center py-12 text-content-muted">
           Loading equipment...
         </div>
       )}
 
       {error && (
-        <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-4">
-          <p className="text-red-400">{error}</p>
+        <div className="bg-error-muted border border-error/50 rounded-lg p-4 mb-4">
+          <p className="text-error">{error}</p>
         </div>
       )}
 
       {!loading && !error && cameras.length === 0 && (
-        <div className="bg-gray-800 rounded-lg p-8 text-center">
-          <p className="text-gray-400">
+        <div className="bg-surface-elevated rounded-lg p-8 text-center">
+          <p className="text-content-muted">
             No cameras found. Scan some directories to populate your equipment library.
           </p>
         </div>

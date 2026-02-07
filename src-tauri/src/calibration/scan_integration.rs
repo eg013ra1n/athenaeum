@@ -301,7 +301,7 @@ fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
 
         for cluster in clusters {
             let flat_group = create_flat_group_from_cluster(&key, &cluster);
-            match create_flat_calibration_set(conn, &flat_group) {
+            match create_flat_calibration_set(conn, &flat_group, true) {
                 Ok(_set_id) => {
                     sets_created += 1;
                 }
@@ -402,7 +402,7 @@ fn create_bias_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
 
         for cluster in clusters {
             let bias_group = create_bias_group_from_cluster(&key, &cluster);
-            match create_bias_calibration_set(conn, &bias_group) {
+            match create_bias_calibration_set(conn, &bias_group, true) {
                 Ok(_set_id) => {
                     sets_created += 1;
                 }

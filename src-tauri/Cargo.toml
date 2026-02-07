@@ -31,7 +31,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 walkdir = "2"
-fitsio = "0.21"
+fitsio = { version = "0.21", features = ["fitsio-src"] }
 anyhow = "1"
 thiserror = "2"
 quick-xml = "0.36"

@@ -56,6 +56,9 @@ pub struct Frame {
     pub objctdec: Option<String>,
     pub override_: bool,
     pub swcreate: Option<String>,
+    /// Bayer pattern for OSC cameras (e.g., "RGGB", "BGGR")
+    /// None indicates a mono camera
+    pub bayerpat: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -105,6 +108,7 @@ pub struct ScanRoot {
     pub path: String,
     pub enabled: bool,
     pub find_duplicates: bool,
+    pub unique_camera: bool,
     pub last_scan: Option<DateTime<Utc>>,
 }
 
@@ -243,6 +247,14 @@ pub struct CalibrationSetDetail {
     pub date_end: String,        // ISO 8601
     pub date_display: String,    // e.g., "2025-10"
     pub frame_count: i64,
+    pub is_master: bool,         // True if this is a master calibration set
+    // Extended fields from frame metadata
+    pub naxis1: Option<i32>,     // Image width
+    pub naxis2: Option<i32>,     // Image height
+    pub bayerpat: Option<String>, // Bayer pattern (e.g., "RGGB") or None for mono
+    pub swcreate: Option<String>, // Software that created the file
+    pub xpixsz: Option<f64>,     // Pixel size in microns
+    pub format: Option<String>,  // File format (FITS, XISF)
 }
 
 /// Result of dark library creation
@@ -631,4 +643,31 @@ pub struct CalendarMonthData {
     pub days: Vec<CalendarDayEvent>,
     pub total_frame_count: i32,
     pub total_exposure_seconds: f64,
+}
+
+// ========== Calibration Set Metadata Editing ==========
+
+/// Edits to apply to calibration set metadata (selective fields)
+/// None means don't change that field
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationMetadataEdits {
+    pub ccd_temp: Option<f64>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    pub binning: Option<String>,
+    pub exptime: Option<f64>,
+}
+
+/// Original calibration set metadata values (backed up before editing)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSetOriginals {
+    pub set_id: i64,
+    pub ccd_temp: Option<f64>,
+    pub temp_min: Option<f64>,
+    pub temp_max: Option<f64>,
+    pub gain: Option<f64>,
+    pub offset: Option<f64>,
+    pub binning: Option<String>,
+    pub exptime: Option<f64>,
+    pub saved_at: String,  // ISO 8601
 }

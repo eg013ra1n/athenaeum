@@ -104,6 +104,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
             },
             is_master: row.get::<_, i32>(30)? != 0,
             swcreate: None,
+            bayerpat: None,
         })
     })?;
 
@@ -113,10 +114,15 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
 /// Get calibration set detail by ID
 fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<CalibrationSetDetail> {
     let mut stmt = conn.prepare(
-        "SELECT id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
-                binning, instrume, filter, date_start, date_end, date, frame_count
-         FROM calibration_set
-         WHERE id = ?1"
+        "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.temp_min, cs.temp_max, cs.gain, cs.offset,
+                cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end, cs.date, cs.frame_count, cs.is_master_library,
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
+         FROM calibration_set cs
+         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+         LEFT JOIN frames f ON f.id = csf.frame_id
+         LEFT JOIN files fi ON fi.id = f.file_id
+         WHERE cs.id = ?1
+         LIMIT 1"
     )?;
 
     let set = stmt.query_row([set_id], |row| {
@@ -138,6 +144,13 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
             date_end: row.get(12)?,
             date_display: row.get(13)?,
             frame_count: row.get(14)?,
+            is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
+            naxis1: row.get(16)?,
+            naxis2: row.get(17)?,
+            bayerpat: row.get(18)?,
+            swcreate: row.get(19)?,
+            xpixsz: row.get(20)?,
+            format: row.get(21)?,
         })
     })?;
 
@@ -345,8 +358,8 @@ pub fn build_complete_hierarchy(
                 println!("  ✅ Pattern selected match: age={}d, timing={:?}, frames={}",
                     flat_match.age_days, flat_match.timing, flat_match.group.frame_count);
 
-                // Create calibration set from the flat group
-                let set_id = create_flat_calibration_set(conn, &flat_match.group)?;
+                // Find/reuse calibration set from the flat group (don't modify existing sets)
+                let set_id = create_flat_calibration_set(conn, &flat_match.group, false)?;
 
                 // Add age warning if needed (only if threshold is reasonable)
                 // Use config directly for consistency with UI
@@ -745,8 +758,8 @@ fn try_create_dark_for_frame(
     println!("    🎯 Selected best dark group: {} frames, from {} to {}",
         best_group.frame_count, best_group.start_time, best_group.end_time);
 
-    // Create calibration set from best group
-    let set_id = create_dark_calibration_set(conn, best_group)?;
+    // Find/reuse calibration set from best group (don't modify existing sets)
+    let set_id = create_dark_calibration_set(conn, best_group, false)?;
 
     Ok(Some(set_id))
 }
@@ -824,8 +837,8 @@ fn try_create_bias_for_frame(
     println!("    🎯 Selected best bias group: {} frames, from {} to {}",
         best_group.frame_count, best_group.start_time, best_group.end_time);
 
-    // Create calibration set from best group
-    let set_id = create_bias_calibration_set(conn, best_group)?;
+    // Find/reuse calibration set from best group (don't modify existing sets)
+    let set_id = create_bias_calibration_set(conn, best_group, false)?;
 
     Ok(Some(set_id))
 }

@@ -23,22 +23,22 @@ export const DetailsBar: React.FC<DetailsBarProps> = memo(function DetailsBar({
   currentFrame,
 }) {
   return (
-    <div className="bg-gray-900 border-t border-gray-700 px-4 py-3">
+    <div className="bg-surface border-t border-border px-4 py-3">
       <div className="flex items-center justify-between text-sm">
         {/* Left side: File info */}
         <div className="flex items-center gap-6">
           {/* Filename */}
           <div>
-            <span className="text-gray-500">File: </span>
-            <span className="text-white font-medium">
+            <span className="text-content-muted">File: </span>
+            <span className="text-content font-medium">
               {currentFrame?.file.filename || "-"}
             </span>
           </div>
 
           {/* Date */}
           <div>
-            <span className="text-gray-500">Date: </span>
-            <span className="text-gray-300">
+            <span className="text-content-muted">Date: </span>
+            <span className="text-content-secondary">
               {formatDate(currentFrame?.frame?.date_obs)}
             </span>
           </div>
@@ -46,16 +46,16 @@ export const DetailsBar: React.FC<DetailsBarProps> = memo(function DetailsBar({
           {/* Telescope */}
           {currentFrame?.frame?.telescop && (
             <div>
-              <span className="text-gray-500">Telescope: </span>
-              <span className="text-gray-300">{currentFrame.frame.telescop}</span>
+              <span className="text-content-muted">Telescope: </span>
+              <span className="text-content-secondary">{currentFrame.frame.telescop}</span>
             </div>
           )}
 
           {/* Camera */}
           {currentFrame?.frame?.instrume && (
             <div>
-              <span className="text-gray-500">Camera: </span>
-              <span className="text-gray-300">{currentFrame.frame.instrume}</span>
+              <span className="text-content-muted">Camera: </span>
+              <span className="text-content-secondary">{currentFrame.frame.instrume}</span>
             </div>
           )}
         </div>
@@ -65,17 +65,17 @@ export const DetailsBar: React.FC<DetailsBarProps> = memo(function DetailsBar({
           {/* Gain/Offset */}
           {(currentFrame?.frame?.gain !== null || currentFrame?.frame?.offset !== null) && (
             <div>
-              <span className="text-gray-500">Gain: </span>
-              <span className="text-gray-300">{currentFrame?.frame?.gain ?? "-"}</span>
-              <span className="text-gray-500 ml-2">Offset: </span>
-              <span className="text-gray-300">{currentFrame?.frame?.offset ?? "-"}</span>
+              <span className="text-content-muted">Gain: </span>
+              <span className="text-content-secondary">{currentFrame?.frame?.gain ?? "-"}</span>
+              <span className="text-content-muted ml-2">Offset: </span>
+              <span className="text-content-secondary">{currentFrame?.frame?.offset ?? "-"}</span>
             </div>
           )}
 
           {/* Temperature */}
           <div>
-            <span className="text-gray-500">Temp: </span>
-            <span className="text-gray-300">
+            <span className="text-content-muted">Temp: </span>
+            <span className="text-content-secondary">
               {formatTemp(currentFrame?.frame?.ccd_temp)}
             </span>
           </div>
@@ -84,14 +84,14 @@ export const DetailsBar: React.FC<DetailsBarProps> = memo(function DetailsBar({
           <div>
             {currentFrame?.frame?.filter && (
               <>
-                <span className="text-gray-500">Filter: </span>
-                <span className="text-gray-300">{currentFrame.frame.filter}</span>
+                <span className="text-content-muted">Filter: </span>
+                <span className="text-content-secondary">{currentFrame.frame.filter}</span>
               </>
             )}
             {currentFrame?.frame?.exptime && (
               <>
-                <span className="text-gray-500 ml-3">Exp: </span>
-                <span className="text-gray-300">{currentFrame.frame.exptime}s</span>
+                <span className="text-content-muted ml-3">Exp: </span>
+                <span className="text-content-secondary">{currentFrame.frame.exptime}s</span>
               </>
             )}
           </div>

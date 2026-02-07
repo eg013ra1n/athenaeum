@@ -61,14 +61,14 @@ function SortableHeader({
     <button
       onClick={() => onSort(field)}
       className={`
-        flex items-center gap-1 text-sm font-semibold text-gray-300
-        hover:text-gray-100 transition-colors
+        flex items-center gap-1 text-sm font-semibold text-content-secondary
+        hover:text-content transition-colors
         ${alignmentClass}
       `}
     >
       {label}
       {isActive && (
-        <span className="text-blue-400">
+        <span className="text-accent">
           {currentDirection === 'asc' ? '↑' : '↓'}
         </span>
       )}
@@ -98,16 +98,16 @@ function CopyButton({ text }: { text: string }) {
       onClick={handleCopy}
       className="
         inline-flex items-center gap-1 px-2 py-1
-        text-xs text-gray-400 hover:text-gray-100
-        bg-gray-700 hover:bg-gray-600
+        text-xs text-content-muted hover:text-content
+        bg-surface-hover hover:bg-surface-hover
         rounded transition-colors
       "
       title={text}
     >
       {copied ? (
         <>
-          <Check size={14} className="text-emerald-400" />
-          <span className="text-emerald-400">Copied</span>
+          <Check size={14} className="text-success" />
+          <span className="text-success">Copied</span>
         </>
       ) : (
         <>
@@ -193,22 +193,22 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
         className="
           w-full flex items-center gap-3
           text-left py-2 px-1
-          hover:bg-gray-800/50 rounded-lg
-          focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500
+          hover:bg-surface-elevated/50 rounded-lg
+          focus:outline-none focus-visible:ring-2 focus-visible:ring-accent
           transition-colors
         "
         aria-expanded={isExpanded}
         aria-controls="light-frames-table"
       >
         {isExpanded ? (
-          <ChevronDown size={20} className="text-gray-400" aria-hidden="true" />
+          <ChevronDown size={20} className="text-content-muted" aria-hidden="true" />
         ) : (
-          <ChevronRight size={20} className="text-gray-400" aria-hidden="true" />
+          <ChevronRight size={20} className="text-content-muted" aria-hidden="true" />
         )}
-        <h3 className="text-lg font-semibold text-gray-100">
+        <h3 className="text-lg font-semibold text-content">
           Light Frames
         </h3>
-        <span className="text-sm text-gray-400">
+        <span className="text-sm text-content-muted">
           ({frames.length} frame{frames.length !== 1 ? 's' : ''})
         </span>
       </button>
@@ -217,10 +217,10 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
       {isExpanded && (
         <div
           id="light-frames-table"
-          className="mt-3 border border-gray-600 rounded-xl overflow-hidden"
+          className="mt-3 border border-border rounded-xl overflow-hidden"
         >
           <table className="w-full" role="table">
-            <thead className="bg-gray-900">
+            <thead className="bg-surface">
               <tr>
                 <th scope="col" className="w-24 px-4 py-3 text-left">
                   <SortableHeader
@@ -231,7 +231,7 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
                     onSort={handleSort}
                   />
                 </th>
-                <th scope="col" className="w-20 px-4 py-3 text-center text-sm font-semibold text-gray-300">
+                <th scope="col" className="w-20 px-4 py-3 text-center text-sm font-semibold text-content-secondary">
                   Calibration
                 </th>
                 <th scope="col" className="px-4 py-3">
@@ -264,15 +264,15 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
                     align="center"
                   />
                 </th>
-                <th scope="col" className="px-4 py-3 text-center text-sm font-semibold text-gray-300">
+                <th scope="col" className="px-4 py-3 text-center text-sm font-semibold text-content-secondary">
                   Temp
                 </th>
-                <th scope="col" className="w-20 px-2 py-3 text-center text-sm font-semibold text-gray-300">
+                <th scope="col" className="w-20 px-2 py-3 text-center text-sm font-semibold text-content-secondary">
                   Path
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-700">
+            <tbody className="divide-y divide-border">
               {sortedFrames.map((frame, idx) => {
                 const isFrameExpanded = expandedFrames.has(frame.frame_id);
                 const isBlackholed = blackholedFileIds.has(frame.file_id);
@@ -283,27 +283,27 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
                       key={frame.frame_id}
                       onClick={() => toggleFrameExpansion(frame.frame_id)}
                       className={`
-                        ${idx % 2 === 0 ? 'bg-gray-800' : 'bg-gray-850'}
-                        hover:bg-gray-700 cursor-pointer transition-colors
+                        ${idx % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface'}
+                        hover:bg-surface-hover cursor-pointer transition-colors
                         ${isBlackholed ? 'opacity-50' : ''}
                       `}
                     >
-                      <td className={`w-24 px-4 py-3 text-sm text-gray-300 ${isBlackholed ? 'line-through' : ''}`}>
+                      <td className={`w-24 px-4 py-3 text-sm text-content-secondary ${isBlackholed ? 'line-through' : ''}`}>
                         {formatTime(frame.date_obs)}
                       </td>
                       <td className="w-20 px-4 py-3 text-center">
                         <StatusIndicator status={frame.calibration_status} compact />
                       </td>
-                      <td className={`px-4 py-3 text-sm text-gray-300 text-center ${isBlackholed ? 'line-through' : ''}`}>
+                      <td className={`px-4 py-3 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                         {frame.telescop ?? '-'}
                       </td>
-                      <td className={`px-4 py-3 text-sm text-gray-300 text-center ${isBlackholed ? 'line-through' : ''}`}>
+                      <td className={`px-4 py-3 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                         {frame.focallen !== null ? `${frame.focallen}mm` : '-'}
                       </td>
-                      <td className={`px-4 py-3 text-sm text-gray-300 text-center ${isBlackholed ? 'line-through' : ''}`}>
+                      <td className={`px-4 py-3 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                         {frame.exptime !== null ? `${frame.exptime}s` : '-'}
                       </td>
-                      <td className={`px-4 py-3 text-sm text-gray-300 text-center ${isBlackholed ? 'line-through' : ''}`}>
+                      <td className={`px-4 py-3 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                         {frame.ccd_temp !== null ? `${frame.ccd_temp.toFixed(1)}°C` : '-'}
                       </td>
                       <td className="w-20 px-2 py-3 text-center">
@@ -313,47 +313,47 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
 
                     {/* Expanded frame details */}
                     {isFrameExpanded && (
-                      <tr key={`${frame.frame_id}-details`} className="bg-gray-900 border-t border-gray-700">
+                      <tr key={`${frame.frame_id}-details`} className="bg-surface border-t border-border">
                         <td colSpan={7} className="px-4 py-2">
                           <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
                             <div className="flex items-center gap-2">
-                              <span className="text-gray-400">Gain:</span>
-                              <span className="text-gray-100">
+                              <span className="text-content-muted">Gain:</span>
+                              <span className="text-content">
                                 {frame.gain !== null ? frame.gain : '-'}
                               </span>
                             </div>
                             <div className="flex items-center gap-2">
-                              <span className="text-gray-400">Offset:</span>
-                              <span className="text-gray-100">
+                              <span className="text-content-muted">Offset:</span>
+                              <span className="text-content">
                                 {frame.offset !== null ? frame.offset : '-'}
                               </span>
                             </div>
                             <div className="flex items-center gap-2">
-                              <span className="text-gray-400">Binning:</span>
-                              <span className="text-gray-100">{frame.binning ?? '-'}</span>
+                              <span className="text-content-muted">Binning:</span>
+                              <span className="text-content">{frame.binning ?? '-'}</span>
                             </div>
                             <div className="flex items-center gap-2">
-                              <span className="text-gray-400">Software:</span>
-                              <span className="text-gray-100">{frame.swcreate ?? '-'}</span>
+                              <span className="text-content-muted">Software:</span>
+                              <span className="text-content">{frame.swcreate ?? '-'}</span>
                             </div>
-                            <div className="border-l border-gray-600 pl-6 flex items-center gap-4">
-                              <span className="text-gray-500 text-xs uppercase tracking-wide">Linked:</span>
+                            <div className="border-l border-border pl-6 flex items-center gap-4">
+                              <span className="text-content-muted text-xs uppercase tracking-wide">Linked:</span>
                               <div className="flex items-center gap-2">
-                                <span className="text-gray-400">Flat:</span>
-                                <span className={frame.calibration_status.flat_set_id ? 'text-emerald-400' : 'text-gray-500'}>
+                                <span className="text-content-muted">Flat:</span>
+                                <span className={frame.calibration_status.flat_set_id ? 'text-success' : 'text-content-muted'}>
                                   {frame.calibration_status.flat_set_id ? `#${frame.calibration_status.flat_set_id}` : 'None'}
                                 </span>
                               </div>
                               <div className="flex items-center gap-2">
-                                <span className="text-gray-400">Dark:</span>
-                                <span className={frame.calibration_status.dark_set_id ? 'text-emerald-400' : 'text-gray-500'}>
+                                <span className="text-content-muted">Dark:</span>
+                                <span className={frame.calibration_status.dark_set_id ? 'text-success' : 'text-content-muted'}>
                                   {frame.calibration_status.dark_set_id ? `#${frame.calibration_status.dark_set_id}` : 'None'}
                                 </span>
                               </div>
                               {frame.calibration_status.bias_set_id && (
                                 <div className="flex items-center gap-2">
-                                  <span className="text-gray-400">Bias:</span>
-                                  <span className="text-emerald-400">#{frame.calibration_status.bias_set_id}</span>
+                                  <span className="text-content-muted">Bias:</span>
+                                  <span className="text-success">#{frame.calibration_status.bias_set_id}</span>
                                 </div>
                               )}
                             </div>
@@ -369,7 +369,7 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
 
           {/* Empty state */}
           {frames.length === 0 && (
-            <div className="px-4 py-8 text-center text-gray-400">
+            <div className="px-4 py-8 text-center text-content-muted">
               <p className="text-sm">No light frames in this group</p>
             </div>
           )}
@@ -378,7 +378,7 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
 
       {/* Summary when collapsed */}
       {!isExpanded && frames.length > 0 && (
-        <div className="mt-2 px-4 py-3 bg-gray-800/50 rounded-lg">
+        <div className="mt-2 px-4 py-3 bg-surface-elevated/50 rounded-lg">
           <FrameSummary frames={frames} />
         </div>
       )}
@@ -411,27 +411,27 @@ function FrameSummary({ frames }: { frames: LightFrameWithCalibration[] }) {
   return (
     <div className="flex items-center gap-6 text-sm">
       <div className="flex items-center gap-2">
-        <span className="w-3 h-3 rounded-full bg-emerald-500" aria-hidden="true" />
-        <span className="text-gray-300">
-          <span className="font-medium text-gray-100">{stats.complete}</span> complete
+        <span className="w-3 h-3 rounded-full bg-success" aria-hidden="true" />
+        <span className="text-content-secondary">
+          <span className="font-medium text-content">{stats.complete}</span> complete
         </span>
       </div>
       <div className="flex items-center gap-2">
-        <span className="w-3 h-3 rounded-full bg-amber-500" aria-hidden="true" />
-        <span className="text-gray-300">
-          <span className="font-medium text-gray-100">{stats.partial}</span> partial
+        <span className="w-3 h-3 rounded-full bg-warning" aria-hidden="true" />
+        <span className="text-content-secondary">
+          <span className="font-medium text-content">{stats.partial}</span> partial
         </span>
       </div>
       <div className="flex items-center gap-2">
-        <span className="w-3 h-3 rounded-full bg-red-500" aria-hidden="true" />
-        <span className="text-gray-300">
-          <span className="font-medium text-gray-100">{stats.none}</span> none
+        <span className="w-3 h-3 rounded-full bg-error" aria-hidden="true" />
+        <span className="text-content-secondary">
+          <span className="font-medium text-content">{stats.none}</span> none
         </span>
       </div>
       {stats.warnings > 0 && (
         <div className="flex items-center gap-2">
-          <span className="w-3 h-3 rounded-full bg-amber-400" aria-hidden="true" />
-          <span className="text-amber-300">
+          <span className="w-3 h-3 rounded-full bg-warning" aria-hidden="true" />
+          <span className="text-warning">
             <span className="font-medium">{stats.warnings}</span> with warnings
           </span>
         </div>

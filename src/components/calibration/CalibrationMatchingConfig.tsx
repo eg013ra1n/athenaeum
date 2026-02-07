@@ -247,8 +247,8 @@ export default function CalibrationMatchingConfig() {
 
   if (loading) {
     return (
-      <div className="text-center py-8 text-gray-400">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500 mx-auto"></div>
+      <div className="text-center py-8 text-content-muted">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-accent mx-auto"></div>
         <p className="mt-4">Loading calibration config...</p>
       </div>
     );
@@ -256,8 +256,8 @@ export default function CalibrationMatchingConfig() {
 
   if (!config) {
     return (
-      <div className="p-4 bg-red-900/20 border border-red-800 rounded-lg">
-        <p className="text-red-400">Failed to load calibration configuration</p>
+      <div className="p-4 bg-error-muted border border-error/50 rounded-lg">
+        <p className="text-error">Failed to load calibration configuration</p>
       </div>
     );
   }
@@ -265,23 +265,23 @@ export default function CalibrationMatchingConfig() {
   return (
     <div className="space-y-4">
       {error && (
-        <div className="p-4 bg-red-900/20 border border-red-800 rounded-lg flex items-start gap-3">
-          <AlertCircle className="text-red-500 flex-shrink-0 mt-0.5" size={20} />
+        <div className="p-4 bg-error-muted border border-error/50 rounded-lg flex items-start gap-3">
+          <AlertCircle className="text-error flex-shrink-0 mt-0.5" size={20} />
           <div className="flex-1">
-            <p className="font-medium text-red-400">Error</p>
-            <p className="text-sm text-red-300">{error}</p>
+            <p className="font-medium text-error">Error</p>
+            <p className="text-sm text-error/80">{error}</p>
           </div>
         </div>
       )}
 
       {success && (
-        <div className="p-4 bg-green-900/20 border border-green-800 rounded-lg flex items-start gap-3">
+        <div className="p-4 bg-success-muted border border-success/50 rounded-lg flex items-start gap-3">
           <CheckCircle
-            className="text-green-500 flex-shrink-0 mt-0.5"
+            className="text-success flex-shrink-0 mt-0.5"
             size={20}
           />
           <div className="flex-1">
-            <p className="font-medium text-green-400">
+            <p className="font-medium text-success">
               Configuration saved successfully
             </p>
           </div>
@@ -289,10 +289,10 @@ export default function CalibrationMatchingConfig() {
       )}
 
       {/* Lights Section */}
-      <div className="bg-gray-750 rounded-lg border border-gray-700">
+      <div className="bg-surface rounded-lg border border-border">
         <button
           onClick={() => toggleSection("lights")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
+          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
         >
           <span className="font-semibold text-lg">For Lights</span>
           {expandedSections.lights ? (
@@ -318,10 +318,10 @@ export default function CalibrationMatchingConfig() {
       </div>
 
       {/* Flats Section */}
-      <div className="bg-gray-750 rounded-lg border border-gray-700">
+      <div className="bg-surface rounded-lg border border-border">
         <button
           onClick={() => toggleSection("flats")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
+          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
         >
           <span className="font-semibold text-lg">For Flats</span>
           {expandedSections.flats ? (
@@ -348,10 +348,10 @@ export default function CalibrationMatchingConfig() {
       </div>
 
       {/* Darks Section */}
-      <div className="bg-gray-750 rounded-lg border border-gray-700">
+      <div className="bg-surface rounded-lg border border-border">
         <button
           onClick={() => toggleSection("darks")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
+          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
         >
           <span className="font-semibold text-lg">For Darks</span>
           {expandedSections.darks ? (
@@ -377,10 +377,10 @@ export default function CalibrationMatchingConfig() {
       </div>
 
       {/* Clustering Parameters */}
-      <div className="bg-gray-750 rounded-lg border border-gray-700">
+      <div className="bg-surface rounded-lg border border-border">
         <button
           onClick={() => toggleSection("clustering")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
+          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
         >
           <span className="font-semibold text-lg">
             Clustering Parameters & Thresholds
@@ -404,10 +404,10 @@ export default function CalibrationMatchingConfig() {
       </div>
 
       {/* Date Warning Thresholds */}
-      <div className="bg-gray-750 rounded-lg border border-gray-700">
+      <div className="bg-surface rounded-lg border border-border">
         <button
           onClick={() => toggleSection("warnings")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
+          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
         >
           <span className="font-semibold text-lg">Date Warning Thresholds</span>
           {expandedSections.warnings ? (
@@ -418,12 +418,12 @@ export default function CalibrationMatchingConfig() {
         </button>
         {expandedSections.warnings && (
           <div className="px-4 pt-2 pb-4">
-            <p className="text-sm text-gray-400 mb-4">
+            <p className="text-sm text-content-muted mb-4">
               Warn when calibration frames are older than these thresholds.
             </p>
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
+                <label className="block text-sm font-medium text-content-secondary mb-2">
                   Flat Date Warning (days)
                 </label>
                 <input
@@ -436,15 +436,15 @@ export default function CalibrationMatchingConfig() {
                     )
                   }
                   min="1"
-                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
+                  className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content"
                 />
-                <p className="text-xs text-gray-500 mt-2">
+                <p className="text-xs text-content-muted mt-2">
                   Warn if flat frames are older than this many days
                 </p>
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
+                <label className="block text-sm font-medium text-content-secondary mb-2">
                   Dark Date Warning (days)
                 </label>
                 <input
@@ -457,15 +457,15 @@ export default function CalibrationMatchingConfig() {
                     )
                   }
                   min="1"
-                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
+                  className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content"
                 />
-                <p className="text-xs text-gray-500 mt-2">
+                <p className="text-xs text-content-muted mt-2">
                   Warn if dark frames are older than this many days
                 </p>
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
+                <label className="block text-sm font-medium text-content-secondary mb-2">
                   DarkFlat Date Warning (days)
                 </label>
                 <input
@@ -478,9 +478,9 @@ export default function CalibrationMatchingConfig() {
                     )
                   }
                   min="1"
-                  className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
+                  className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content"
                 />
-                <p className="text-xs text-gray-500 mt-2">
+                <p className="text-xs text-content-muted mt-2">
                   Warn if darkflat frames are older than this many days
                 </p>
               </div>
@@ -490,10 +490,10 @@ export default function CalibrationMatchingConfig() {
       </div>
 
       {/* Master Preferences */}
-      <div className="bg-gray-750 rounded-lg border border-gray-700">
+      <div className="bg-surface rounded-lg border border-border">
         <button
           onClick={() => toggleSection("preferences")}
-          className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-700/50 rounded-t-lg"
+          className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface-hover/50 rounded-t-lg"
         >
           <span className="font-semibold text-lg">Master Preferences</span>
           {expandedSections.preferences ? (
@@ -504,14 +504,14 @@ export default function CalibrationMatchingConfig() {
         </button>
         {expandedSections.preferences && (
           <div className="px-4 pt-2 pb-4">
-            <p className="text-sm text-gray-400 mb-4">
+            <p className="text-sm text-content-muted mb-4">
               Choose whether to prefer Master calibration frames or frame sets
               when both are available.
             </p>
             <div className="grid grid-cols-2 gap-4">
               {["flat", "dark", "bias", "darkflat"].map((type) => (
                 <div key={type}>
-                  <label className="block text-sm font-medium text-gray-300 mb-2 capitalize">
+                  <label className="block text-sm font-medium text-content-secondary mb-2 capitalize">
                     {type}
                   </label>
                   <select
@@ -522,7 +522,7 @@ export default function CalibrationMatchingConfig() {
                     onChange={(e) =>
                       updateMasterPreference(type, e.target.value as MasterPreference)
                     }
-                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100 text-sm"
+                    className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content text-sm"
                   >
                     <option value={MasterPreference.NoPreference}>
                       No Preference
@@ -546,7 +546,7 @@ export default function CalibrationMatchingConfig() {
         <button
           onClick={handleSave}
           disabled={saving}
-          className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+          className="flex items-center gap-2 px-6 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
         >
           <Save size={18} />
           {saving ? "Saving..." : "Save Configuration"}
@@ -555,7 +555,7 @@ export default function CalibrationMatchingConfig() {
         <button
           onClick={handleReset}
           disabled={loading}
-          className="flex items-center gap-2 px-6 py-2 bg-gray-600 hover:bg-gray-700 disabled:bg-gray-700 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+          className="flex items-center gap-2 px-6 py-2 bg-surface-hover hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
         >
           <RefreshCw size={18} />
           Reset to Defaults

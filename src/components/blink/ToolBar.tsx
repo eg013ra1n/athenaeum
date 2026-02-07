@@ -32,39 +32,39 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   onClose,
 }) {
   return (
-    <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-700">
+    <div className="flex items-center justify-between px-4 py-2 bg-surface border-b border-border">
       {/* Left: Playback controls */}
       <div className="flex items-center gap-2">
         <button
           onClick={onPrevious}
           disabled={currentIndex === 0}
-          className="p-2 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          className="p-2 rounded bg-surface-elevated hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
-          <ChevronLeft className="text-white" size={20} />
+          <ChevronLeft className="text-content" size={20} />
         </button>
 
         <button
           onClick={onTogglePlay}
-          className="p-2 rounded bg-blue-600 hover:bg-blue-700 transition-colors"
+          className="p-2 rounded bg-accent hover:bg-accent-hover transition-colors"
         >
           {isPlaying ? (
-            <Pause className="text-white" size={20} />
+            <Pause className="text-surface" size={20} />
           ) : (
-            <Play className="text-white" size={20} />
+            <Play className="text-surface" size={20} />
           )}
         </button>
 
         <button
           onClick={onNext}
           disabled={currentIndex === totalFrames - 1}
-          className="p-2 rounded bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          className="p-2 rounded bg-surface-elevated hover:bg-surface-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
-          <ChevronRight className="text-white" size={20} />
+          <ChevronRight className="text-content" size={20} />
         </button>
 
         {/* Speed control */}
         <div className="flex items-center gap-2 ml-4">
-          <label className="text-sm text-gray-400">Speed:</label>
+          <label className="text-sm text-content-muted">Speed:</label>
           <input
             type="range"
             min="0.5"
@@ -74,25 +74,25 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
             onChange={(e) => onSpeedChange(parseFloat(e.target.value))}
             className="w-24"
           />
-          <span className="text-sm text-white w-14">{blinkSpeed} FPS</span>
+          <span className="text-sm text-content w-14">{blinkSpeed} FPS</span>
         </div>
       </div>
 
       {/* Center: Frame counter + selection count + caching progress */}
       <div className="flex items-center gap-4">
-        <div className="text-white text-sm">
+        <div className="text-content text-sm">
           <span className="font-semibold">{currentIndex + 1}</span>
-          <span className="text-gray-400"> / {totalFrames}</span>
+          <span className="text-content-muted"> / {totalFrames}</span>
         </div>
 
         {selectionCount > 0 && (
-          <div className="text-sm text-yellow-400 font-medium">
+          <div className="text-sm text-warning font-medium">
             {selectionCount} selected
           </div>
         )}
 
         {isCaching && (
-          <div className="flex items-center gap-2 text-sm text-gray-400">
+          <div className="flex items-center gap-2 text-sm text-content-muted">
             <Loader2 className="animate-spin" size={14} />
             <span>Caching {cacheProgress.current}/{cacheProgress.total}</span>
           </div>
@@ -109,7 +109,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
               <button
                 onClick={onRestore}
                 disabled={isBlackholing}
-                className="flex items-center gap-1 px-3 py-1.5 text-sm bg-green-600 hover:bg-green-700 text-white rounded transition-colors disabled:opacity-50"
+                className="flex items-center gap-1 px-3 py-1.5 text-sm bg-success hover:brightness-110 text-surface rounded transition-colors disabled:opacity-50"
                 title="Restore selected blackholed frames"
               >
                 <RotateCcw size={16} />
@@ -120,7 +120,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
             {nonBlackholedInSelectionCount > 0 && (
               <button
                 onClick={onBlackhole}
-                className="flex items-center gap-1 px-3 py-1.5 text-sm bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
+                className="flex items-center gap-1 px-3 py-1.5 text-sm bg-error hover:brightness-110 text-white rounded transition-colors"
                 title="Send selected frames to blackhole"
               >
                 <Trash2 size={16} />
@@ -130,14 +130,14 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           </>
         )}
 
-        <div className="text-xs text-gray-500 mr-2">
-          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed
+        <div className="text-xs text-content-muted mr-2">
+          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed | +/-: Zoom | 0: Reset
         </div>
         <button
           onClick={onClose}
-          className="p-2 hover:bg-gray-800 rounded transition-colors"
+          className="p-2 hover:bg-surface-elevated rounded transition-colors"
         >
-          <X className="text-white" size={20} />
+          <X className="text-content" size={20} />
         </button>
       </div>
     </div>

@@ -194,10 +194,10 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
 
   const formatMatchScore = (score: number) => {
     const percent = Math.round(score * 100);
-    if (percent >= 80) return { label: 'Excellent', color: 'text-green-400' };
-    if (percent >= 60) return { label: 'Good', color: 'text-blue-400' };
-    if (percent >= 40) return { label: 'Fair', color: 'text-yellow-400' };
-    return { label: 'Poor', color: 'text-orange-400' };
+    if (percent >= 80) return { label: 'Excellent', color: 'text-success' };
+    if (percent >= 60) return { label: 'Good', color: 'text-accent' };
+    if (percent >= 40) return { label: 'Fair', color: 'text-warning' };
+    return { label: 'Poor', color: 'text-orange' };
   };
 
   // Calibration set row component
@@ -220,19 +220,19 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
         onClick={onSelect}
         className={`p-3 rounded-lg border-2 cursor-pointer transition-all ${
           isSelected
-            ? 'border-blue-500 bg-blue-900/20'
-            : 'border-gray-700 hover:border-gray-600 bg-gray-800/30'
+            ? 'border-accent bg-accent-muted/20'
+            : 'border-border hover:border-border bg-surface-elevated/30'
         }`}
       >
         <div className="flex items-start justify-between mb-2">
           <div className="flex items-center gap-2">
-            {isSelected && <Check className="w-4 h-4 text-blue-400" />}
-            <span className="font-medium text-gray-200">
+            {isSelected && <Check className="w-4 h-4 text-accent" />}
+            <span className="font-medium text-content">
               Set #{set.id}
               {set.exptime !== null && ` (${set.exptime}s)`}
             </span>
             {isCurrent && (
-              <span className="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300">Current</span>
+              <span className="text-xs px-2 py-0.5 rounded bg-surface-hover text-content-secondary">Current</span>
             )}
           </div>
           <div className={`text-sm font-medium ${scoreInfo.color}`}>
@@ -241,26 +241,26 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
         </div>
 
         <div className="grid grid-cols-2 gap-2 text-sm">
-          <div className="flex items-center gap-2 text-gray-400">
+          <div className="flex items-center gap-2 text-content-muted">
             <Camera className="w-3 h-3" />
-            <span className={match_details.instrume_match ? 'text-gray-300' : 'text-orange-400'}>
+            <span className={match_details.instrume_match ? 'text-content-secondary' : 'text-orange'}>
               {set.instrume || 'Unknown'}
               {!match_details.instrume_match && ' (mismatch)'}
             </span>
           </div>
-          <div className="flex items-center gap-2 text-gray-400">
+          <div className="flex items-center gap-2 text-content-muted">
             <Hash className="w-3 h-3" />
-            <span className={match_details.binning_match ? 'text-gray-300' : 'text-orange-400'}>
+            <span className={match_details.binning_match ? 'text-content-secondary' : 'text-orange'}>
               {set.binning || 'N/A'}
               {!match_details.binning_match && ' (mismatch)'}
             </span>
           </div>
-          <div className="flex items-center gap-2 text-gray-400">
+          <div className="flex items-center gap-2 text-content-muted">
             <Thermometer className="w-3 h-3" />
-            <span className="text-gray-300">
+            <span className="text-content-secondary">
               {formatTemp(set.ccd_temp)}
               {match_details.temp_diff !== null && (
-                <span className={match_details.temp_diff > 2 ? 'text-orange-400' : 'text-gray-500'}>
+                <span className={match_details.temp_diff > 2 ? 'text-orange' : 'text-content-muted'}>
                   {' '}
                   ({match_details.temp_diff > 0 ? '+' : ''}
                   {match_details.temp_diff?.toFixed(1)}°C)
@@ -268,25 +268,25 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
               )}
             </span>
           </div>
-          <div className="flex items-center gap-2 text-gray-400">
+          <div className="flex items-center gap-2 text-content-muted">
             <Calendar className="w-3 h-3" />
-            <span className={match_details.date_diff_days > 30 ? 'text-orange-400' : 'text-gray-300'}>
+            <span className={match_details.date_diff_days > 30 ? 'text-orange' : 'text-content-secondary'}>
               {set.date_start ? new Date(set.date_start).toLocaleDateString('en-GB') : set.date_display}
               {match_details.date_diff_days > 0 && ` (${match_details.date_diff_days}d)`}
             </span>
           </div>
           {set.gain !== null && (
-            <div className="flex items-center gap-2 text-gray-400">
-              <span className="text-gray-500 text-xs">Gain:</span>
-              <span className={match_details.gain_match ? 'text-gray-300' : 'text-orange-400'}>
+            <div className="flex items-center gap-2 text-content-muted">
+              <span className="text-content-muted text-xs">Gain:</span>
+              <span className={match_details.gain_match ? 'text-content-secondary' : 'text-orange'}>
                 {set.gain}
                 {!match_details.gain_match && ' (mismatch)'}
               </span>
             </div>
           )}
-          <div className="flex items-center gap-2 text-gray-400">
-            <span className="text-gray-500 text-xs">Frames:</span>
-            <span className="text-gray-300">{set.frame_count}</span>
+          <div className="flex items-center gap-2 text-content-muted">
+            <span className="text-content-muted text-xs">Frames:</span>
+            <span className="text-content-secondary">{set.frame_count}</span>
           </div>
         </div>
       </div>
@@ -348,118 +348,118 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 overflow-y-auto">
-      <div className="bg-gray-800 rounded-lg w-full max-w-5xl mx-4 my-8 border border-gray-700 shadow-xl flex flex-col max-h-[90vh]">
+      <div className="bg-surface-elevated rounded-lg w-full max-w-5xl mx-4 my-8 border border-border shadow-xl flex flex-col max-h-[90vh]">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
           <div>
-            <h2 className="text-xl font-semibold text-gray-100">
+            <h2 className="text-xl font-semibold text-content">
               Sub-Calibration for {sourceType === 'flat' ? 'Flat' : 'Dark'} Set #{sourceSetId}
             </h2>
-            <p className="text-sm text-gray-400 mt-1">
+            <p className="text-sm text-content-muted mt-1">
               Select {sourceType === 'flat' ? 'Dark/DarkFlat/Bias' : 'Bias'} calibration for this set
             </p>
           </div>
           <button
             onClick={onClose}
-            className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
+            className="p-2 hover:bg-surface-hover rounded-lg transition-colors"
           >
-            <X className="w-5 h-5 text-gray-400" />
+            <X className="w-5 h-5 text-content-muted" />
           </button>
         </div>
 
         {/* Content */}
         <div className="flex flex-1 overflow-hidden">
           {/* Left Panel - Source Set Parameters */}
-          <div className="w-72 border-r border-gray-700 p-4 bg-gray-850 overflow-y-auto">
-            <h3 className="font-medium text-gray-200 mb-4">
+          <div className="w-72 border-r border-border p-4 bg-surface overflow-y-auto">
+            <h3 className="font-medium text-content mb-4">
               {sourceType === 'flat' ? 'Flat' : 'Dark'} Set Parameters
             </h3>
 
             {loading && !setParams ? (
-              <div className="text-gray-400 text-sm">Loading...</div>
+              <div className="text-content-muted text-sm">Loading...</div>
             ) : error ? (
-              <div className="text-red-400 text-sm">{error}</div>
+              <div className="text-error text-sm">{error}</div>
             ) : setParams ? (
               <div className="space-y-3 text-sm">
                 <div className="flex items-center gap-2">
-                  <Camera className="w-4 h-4 text-gray-500" />
-                  <span className="text-gray-400">Camera:</span>
-                  <span className="text-gray-200">{setParams.instrume || 'Unknown'}</span>
+                  <Camera className="w-4 h-4 text-content-muted" />
+                  <span className="text-content-muted">Camera:</span>
+                  <span className="text-content">{setParams.instrume || 'Unknown'}</span>
                 </div>
                 {setParams.filter && (
                   <div className="flex items-center gap-2">
-                    <Aperture className="w-4 h-4 text-gray-500" />
-                    <span className="text-gray-400">Filter:</span>
-                    <span className="text-gray-200">{setParams.filter}</span>
+                    <Aperture className="w-4 h-4 text-content-muted" />
+                    <span className="text-content-muted">Filter:</span>
+                    <span className="text-content">{setParams.filter}</span>
                   </div>
                 )}
                 <div className="flex items-center gap-2">
-                  <Hash className="w-4 h-4 text-gray-500" />
-                  <span className="text-gray-400">Binning:</span>
-                  <span className="text-gray-200">{setParams.binning || 'N/A'}</span>
+                  <Hash className="w-4 h-4 text-content-muted" />
+                  <span className="text-content-muted">Binning:</span>
+                  <span className="text-content">{setParams.binning || 'N/A'}</span>
                 </div>
                 {setParams.gain !== null && (
                   <div className="flex items-center gap-2">
-                    <span className="text-gray-400 ml-6">Gain:</span>
-                    <span className="text-gray-200">{setParams.gain}</span>
+                    <span className="text-content-muted ml-6">Gain:</span>
+                    <span className="text-content">{setParams.gain}</span>
                   </div>
                 )}
                 {setParams.offset !== null && (
                   <div className="flex items-center gap-2">
-                    <span className="text-gray-400 ml-6">Offset:</span>
-                    <span className="text-gray-200">{setParams.offset}</span>
+                    <span className="text-content-muted ml-6">Offset:</span>
+                    <span className="text-content">{setParams.offset}</span>
                   </div>
                 )}
                 <div className="flex items-center gap-2">
-                  <Thermometer className="w-4 h-4 text-gray-500" />
-                  <span className="text-gray-400">Temp:</span>
-                  <span className="text-gray-200">{formatTemp(setParams.ccd_temp)}</span>
+                  <Thermometer className="w-4 h-4 text-content-muted" />
+                  <span className="text-content-muted">Temp:</span>
+                  <span className="text-content">{formatTemp(setParams.ccd_temp)}</span>
                 </div>
                 {setParams.exptime !== null && (
                   <div className="flex items-center gap-2">
-                    <Clock className="w-4 h-4 text-gray-500" />
-                    <span className="text-gray-400">Exposure:</span>
-                    <span className="text-gray-200">{setParams.exptime}s</span>
+                    <Clock className="w-4 h-4 text-content-muted" />
+                    <span className="text-content-muted">Exposure:</span>
+                    <span className="text-content">{setParams.exptime}s</span>
                   </div>
                 )}
                 <div className="flex items-center gap-2">
-                  <Calendar className="w-4 h-4 text-gray-500" />
-                  <span className="text-gray-400">Date:</span>
+                  <Calendar className="w-4 h-4 text-content-muted" />
+                  <span className="text-content-muted">Date:</span>
                 </div>
-                <div className="text-gray-200 text-xs ml-6">
+                <div className="text-content text-xs ml-6">
                   {setParams.date_start?.substring(0, 10) || 'N/A'}
                 </div>
                 <div className="flex items-center gap-2">
-                  <Hash className="w-4 h-4 text-gray-500" />
-                  <span className="text-gray-400">Frames:</span>
-                  <span className="text-gray-200">{setParams.frame_count}</span>
+                  <Hash className="w-4 h-4 text-content-muted" />
+                  <span className="text-content-muted">Frames:</span>
+                  <span className="text-content">{setParams.frame_count}</span>
                 </div>
 
                 {/* Current Sub-Calibration Links */}
-                <div className="pt-4 border-t border-gray-700 mt-4">
-                  <h4 className="text-gray-400 text-xs uppercase mb-2">Current Sub-Cal Links</h4>
+                <div className="pt-4 border-t border-border mt-4">
+                  <h4 className="text-content-muted text-xs uppercase mb-2">Current Sub-Cal Links</h4>
                   <div className="space-y-1 text-xs">
                     {sourceType === 'flat' && (
                       <>
                         <div className="flex items-center gap-2">
                           {setParams.current_darkflat_set_id ? (
-                            <CheckCircle className="w-3 h-3 text-green-400" />
+                            <CheckCircle className="w-3 h-3 text-success" />
                           ) : (
-                            <AlertTriangle className="w-3 h-3 text-gray-500" />
+                            <AlertTriangle className="w-3 h-3 text-content-muted" />
                           )}
-                          <span className="text-gray-400">DarkFlat:</span>
-                          <span className="text-gray-200">
+                          <span className="text-content-muted">DarkFlat:</span>
+                          <span className="text-content">
                             {setParams.current_darkflat_set_id ? `Set #${setParams.current_darkflat_set_id}` : 'None'}
                           </span>
                         </div>
                         <div className="flex items-center gap-2">
                           {setParams.current_dark_set_id ? (
-                            <CheckCircle className="w-3 h-3 text-green-400" />
+                            <CheckCircle className="w-3 h-3 text-success" />
                           ) : (
-                            <AlertTriangle className="w-3 h-3 text-gray-500" />
+                            <AlertTriangle className="w-3 h-3 text-content-muted" />
                           )}
-                          <span className="text-gray-400">Dark:</span>
-                          <span className="text-gray-200">
+                          <span className="text-content-muted">Dark:</span>
+                          <span className="text-content">
                             {setParams.current_dark_set_id ? `Set #${setParams.current_dark_set_id}` : 'None'}
                           </span>
                         </div>
@@ -467,12 +467,12 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                     )}
                     <div className="flex items-center gap-2">
                       {setParams.current_bias_set_id ? (
-                        <CheckCircle className="w-3 h-3 text-green-400" />
+                        <CheckCircle className="w-3 h-3 text-success" />
                       ) : (
-                        <AlertTriangle className="w-3 h-3 text-gray-500" />
+                        <AlertTriangle className="w-3 h-3 text-content-muted" />
                       )}
-                      <span className="text-gray-400">Bias:</span>
-                      <span className="text-gray-200">
+                      <span className="text-content-muted">Bias:</span>
+                      <span className="text-content">
                         {setParams.current_bias_set_id ? `Set #${setParams.current_bias_set_id}` : 'None'}
                       </span>
                     </div>
@@ -485,20 +485,20 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
           {/* Right Panel - Sub-Calibration Sets */}
           <div className="flex-1 flex flex-col overflow-hidden">
             {/* Tabs */}
-            <div className="flex border-b border-gray-700">
+            <div className="flex border-b border-border">
               {sourceType === 'flat' && (
                 <>
                   <button
                     onClick={() => setActiveTab('darkflat')}
                     className={`px-6 py-3 font-medium text-sm transition-colors ${
                       activeTab === 'darkflat'
-                        ? 'text-indigo-400 border-b-2 border-indigo-400 bg-gray-750'
-                        : 'text-gray-400 hover:text-gray-200'
+                        ? 'text-info border-b-2 border-info bg-surface-elevated'
+                        : 'text-content-muted hover:text-content'
                     }`}
                   >
                     DarkFlats
                     {darkflatSets.length > 0 && (
-                      <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-gray-700">
+                      <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-surface-hover">
                         {darkflatSets.length}
                       </span>
                     )}
@@ -507,13 +507,13 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                     onClick={() => setActiveTab('dark')}
                     className={`px-6 py-3 font-medium text-sm transition-colors ${
                       activeTab === 'dark'
-                        ? 'text-purple-400 border-b-2 border-purple-400 bg-gray-750'
-                        : 'text-gray-400 hover:text-gray-200'
+                        ? 'text-purple border-b-2 border-purple bg-surface-elevated'
+                        : 'text-content-muted hover:text-content'
                     }`}
                   >
                     Darks
                     {darkSets.length > 0 && (
-                      <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-gray-700">
+                      <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-surface-hover">
                         {darkSets.length}
                       </span>
                     )}
@@ -524,13 +524,13 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                 onClick={() => setActiveTab('bias')}
                 className={`px-6 py-3 font-medium text-sm transition-colors ${
                   activeTab === 'bias'
-                    ? 'text-emerald-400 border-b-2 border-emerald-400 bg-gray-750'
-                    : 'text-gray-400 hover:text-gray-200'
+                    ? 'text-success border-b-2 border-success bg-surface-elevated'
+                    : 'text-content-muted hover:text-content'
                 }`}
               >
                 Bias
                 {biasSets.length > 0 && (
-                  <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-gray-700">
+                  <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-surface-hover">
                     {biasSets.length}
                   </span>
                 )}
@@ -542,8 +542,8 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                   onClick={() => setShowAll(!showAll)}
                   className={`flex items-center gap-2 px-3 py-1.5 rounded text-sm transition-colors ${
                     showAll
-                      ? 'bg-blue-900/30 text-blue-300'
-                      : 'bg-gray-700 text-gray-400 hover:text-gray-200'
+                      ? 'bg-info-muted text-info'
+                      : 'bg-surface-hover text-content-muted hover:text-content'
                   }`}
                 >
                   {showAll ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
@@ -555,15 +555,15 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
             {/* Sets List */}
             <div className="flex-1 overflow-y-auto p-4">
               {loading ? (
-                <div className="flex items-center justify-center h-full text-gray-400">
+                <div className="flex items-center justify-center h-full text-content-muted">
                   Loading calibration sets...
                 </div>
               ) : error ? (
-                <div className="flex items-center justify-center h-full text-red-400">
+                <div className="flex items-center justify-center h-full text-error">
                   {error}
                 </div>
               ) : sets.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full text-gray-400">
+                <div className="flex flex-col items-center justify-center h-full text-content-muted">
                   <p>No {activeTab} calibration sets found.</p>
                   {!showAll && (
                     <p className="text-sm mt-2">
@@ -589,10 +589,10 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-6 py-4 border-t border-gray-700 bg-gray-850">
-          <div className="text-sm text-gray-400">
+        <div className="flex items-center justify-between px-6 py-4 border-t border-border bg-surface">
+          <div className="text-sm text-content-muted">
             {hasChanges ? (
-              <span className="text-yellow-400">You have unsaved changes</span>
+              <span className="text-warning">You have unsaved changes</span>
             ) : (
               'Select sub-calibration to apply'
             )}
@@ -600,7 +600,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
           <div className="flex gap-3">
             <button
               onClick={onClose}
-              className="px-4 py-2 bg-gray-700 text-gray-200 rounded hover:bg-gray-600 transition-colors"
+              className="px-4 py-2 bg-surface-hover text-content rounded hover:bg-surface-hover transition-colors"
             >
               Cancel
             </button>
@@ -609,8 +609,8 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
               disabled={!hasChanges || saving}
               className={`px-4 py-2 rounded transition-colors ${
                 hasChanges && !saving
-                  ? 'bg-blue-600 text-white hover:bg-blue-700'
-                  : 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                  ? 'bg-accent text-surface hover:bg-accent-hover'
+                  : 'bg-surface-hover text-content-muted cursor-not-allowed'
               }`}
             >
               {saving ? 'Saving...' : 'Apply Selection'}

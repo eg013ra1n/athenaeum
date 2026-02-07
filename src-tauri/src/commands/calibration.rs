@@ -397,6 +397,7 @@ pub async fn get_frame_calibration_hierarchy(
             long_obs: row.get(28)?,
             override_: false,
             swcreate: None,
+            bayerpat: None,
         })
     }).map_err(|e| format!("Frame not found: {}", e))?;
 
@@ -790,26 +791,31 @@ pub async fn get_calibration_sets_for_manual_selection(
     // Get light frame parameters first
     let params = get_light_params_internal(&conn, &frame_ids)?;
 
-    // Get all calibration sets of the specified type
-    let imagetyp = match calibration_type.to_lowercase().as_str() {
-        "flat" => "FLAT",
-        "dark" => "DARK",
-        "bias" => "BIAS",
-        "darkflat" => "DARKFLAT",
+    // Get all calibration sets of the specified type (including masters)
+    let (regular_type, master_type) = match calibration_type.to_lowercase().as_str() {
+        "flat" => ("Flat", "MasterFlat"),
+        "dark" => ("Dark", "MasterDark"),
+        "bias" => ("Bias", "MasterBias"),
+        "darkflat" => ("DarkFlat", "MasterDarkFlat"),
         _ => return Err(format!("Invalid calibration type: {}", calibration_type)),
     };
 
-    // Query all sets of this type
+    // Query all sets of this type (both regular and master) with frame metadata
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
-                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library,
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
          FROM calibration_set cs
-         WHERE UPPER(cs.imagetyp) = ?1
-         ORDER BY cs.date_start DESC"
+         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+         LEFT JOIN frames f ON f.id = csf.frame_id
+         LEFT JOIN files fi ON fi.id = f.file_id
+         WHERE cs.imagetyp IN (?1, ?2)
+         GROUP BY cs.id
+         ORDER BY cs.is_master_library ASC, cs.date_start DESC"
     ).map_err(|e| e.to_string())?;
 
-    let sets_iter = stmt.query_map([imagetyp], |row| {
+    let sets_iter = stmt.query_map([regular_type, master_type], |row| {
         Ok(CalibrationSetDetail {
             id: row.get(0)?,
             imagetyp: ImageType::from_str(row.get::<_, String>(1)?.as_str())
@@ -827,6 +833,13 @@ pub async fn get_calibration_sets_for_manual_selection(
             temp_max: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
             frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
             date_display: "".to_string(),  // Will be calculated
+            is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
+            naxis1: row.get(16)?,
+            naxis2: row.get(17)?,
+            bayerpat: row.get(18)?,
+            swcreate: row.get(19)?,
+            xpixsz: row.get(20)?,
+            format: row.get(21)?,
         })
     }).map_err(|e| e.to_string())?;
 
@@ -1654,25 +1667,30 @@ pub async fn get_subcalibration_sets_for_manual_selection(
         current_bias_set_id: None,
     };
 
-    // Get target calibration type
-    let imagetyp = match calibration_type.to_lowercase().as_str() {
-        "dark" => "DARK",
-        "darkflat" => "DARKFLAT",
-        "bias" => "BIAS",
+    // Get target calibration type (including masters)
+    let (regular_type, master_type) = match calibration_type.to_lowercase().as_str() {
+        "dark" => ("Dark", "MasterDark"),
+        "darkflat" => ("DarkFlat", "MasterDarkFlat"),
+        "bias" => ("Bias", "MasterBias"),
         _ => return Err(format!("Invalid calibration type for sub-calibration: {}", calibration_type)),
     };
 
-    // Query all sets of this type
+    // Query all sets of this type (both regular and master) with frame metadata
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
-                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen
+                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library,
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
          FROM calibration_set cs
-         WHERE UPPER(cs.imagetyp) = ?1
-         ORDER BY cs.date_start DESC"
+         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+         LEFT JOIN frames f ON f.id = csf.frame_id
+         LEFT JOIN files fi ON fi.id = f.file_id
+         WHERE cs.imagetyp IN (?1, ?2)
+         GROUP BY cs.id
+         ORDER BY cs.is_master_library ASC, cs.date_start DESC"
     ).map_err(|e| e.to_string())?;
 
-    let sets_iter = stmt.query_map([imagetyp], |row| {
+    let sets_iter = stmt.query_map([regular_type, master_type], |row| {
         Ok(CalibrationSetDetail {
             id: row.get(0)?,
             imagetyp: ImageType::from_str(row.get::<_, String>(1)?.as_str())
@@ -1690,6 +1708,13 @@ pub async fn get_subcalibration_sets_for_manual_selection(
             temp_max: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
             frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
             date_display: "".to_string(),
+            is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
+            naxis1: row.get(16)?,
+            naxis2: row.get(17)?,
+            bayerpat: row.get(18)?,
+            swcreate: row.get(19)?,
+            xpixsz: row.get(20)?,
+            format: row.get(21)?,
         })
     }).map_err(|e| e.to_string())?;
 
@@ -1909,4 +1934,216 @@ pub async fn clear_subcalibration_override(
     );
 
     Ok(deleted)
+}
+
+// ========== Custom Metadata Editing Commands ==========
+
+/// Bulk update calibration set metadata
+/// Saves original values to calibration_set_originals table before updating
+#[tauri::command]
+pub async fn bulk_update_calibration_metadata(
+    set_ids: Vec<i64>,
+    edits: crate::models::CalibrationMetadataEdits,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    if set_ids.is_empty() {
+        return Err("No set IDs provided".to_string());
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let mut updated_count = 0;
+
+    for set_id in &set_ids {
+        // First, check if we already have originals saved for this set
+        let has_originals: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM calibration_set_originals WHERE set_id = ?1",
+            [set_id],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        // If no originals exist, save current values before editing
+        if !has_originals {
+            conn.execute(
+                "INSERT INTO calibration_set_originals (set_id, ccd_temp, temp_min, temp_max, gain, offset, binning, exptime, saved_at)
+                 SELECT id, ccd_temp, temp_min, temp_max, gain, offset, binning, exptime, ?2
+                 FROM calibration_set WHERE id = ?1",
+                rusqlite::params![set_id, now],
+            ).map_err(|e| format!("Failed to save originals for set {}: {}", set_id, e))?;
+        }
+
+        // Build update statements for each field that should be changed
+        let mut any_update = false;
+
+        if let Some(temp) = edits.ccd_temp {
+            conn.execute(
+                "UPDATE calibration_set SET ccd_temp = ?1, temp_min = ?1, temp_max = ?1 WHERE id = ?2",
+                rusqlite::params![temp, set_id],
+            ).map_err(|e| format!("Failed to update temp for set {}: {}", set_id, e))?;
+            any_update = true;
+            println!("📝 Updated ccd_temp to {} for set #{}", temp, set_id);
+        }
+
+        if let Some(gain) = edits.gain {
+            conn.execute(
+                "UPDATE calibration_set SET gain = ?1 WHERE id = ?2",
+                rusqlite::params![gain, set_id],
+            ).map_err(|e| format!("Failed to update gain for set {}: {}", set_id, e))?;
+            any_update = true;
+            println!("📝 Updated gain to {} for set #{}", gain, set_id);
+        }
+
+        if let Some(offset) = edits.offset {
+            conn.execute(
+                "UPDATE calibration_set SET offset = ?1 WHERE id = ?2",
+                rusqlite::params![offset, set_id],
+            ).map_err(|e| format!("Failed to update offset for set {}: {}", set_id, e))?;
+            any_update = true;
+            println!("📝 Updated offset to {} for set #{}", offset, set_id);
+        }
+
+        if let Some(ref binning) = edits.binning {
+            conn.execute(
+                "UPDATE calibration_set SET binning = ?1 WHERE id = ?2",
+                rusqlite::params![binning, set_id],
+            ).map_err(|e| format!("Failed to update binning for set {}: {}", set_id, e))?;
+            any_update = true;
+            println!("📝 Updated binning to {} for set #{}", binning, set_id);
+        }
+
+        if let Some(exptime) = edits.exptime {
+            conn.execute(
+                "UPDATE calibration_set SET exptime = ?1 WHERE id = ?2",
+                rusqlite::params![exptime, set_id],
+            ).map_err(|e| format!("Failed to update exptime for set {}: {}", set_id, e))?;
+            any_update = true;
+            println!("📝 Updated exptime to {} for set #{}", exptime, set_id);
+        }
+
+        if !any_update {
+            continue; // No fields to update
+        }
+
+        updated_count += 1;
+    }
+
+    println!(
+        "✅ Updated metadata for {} calibration sets",
+        updated_count
+    );
+
+    Ok(updated_count)
+}
+
+/// Bulk restore calibration set metadata from originals
+#[tauri::command]
+pub async fn bulk_restore_calibration_metadata(
+    set_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    if set_ids.is_empty() {
+        return Err("No set IDs provided".to_string());
+    }
+
+    let mut restored_count = 0;
+
+    for set_id in &set_ids {
+        // Restore from originals
+        let rows_affected = conn.execute(
+            "UPDATE calibration_set SET
+                ccd_temp = (SELECT ccd_temp FROM calibration_set_originals WHERE set_id = ?1),
+                temp_min = (SELECT temp_min FROM calibration_set_originals WHERE set_id = ?1),
+                temp_max = (SELECT temp_max FROM calibration_set_originals WHERE set_id = ?1),
+                gain = (SELECT gain FROM calibration_set_originals WHERE set_id = ?1),
+                offset = (SELECT offset FROM calibration_set_originals WHERE set_id = ?1),
+                binning = (SELECT binning FROM calibration_set_originals WHERE set_id = ?1),
+                exptime = (SELECT exptime FROM calibration_set_originals WHERE set_id = ?1)
+             WHERE id = ?1 AND EXISTS (SELECT 1 FROM calibration_set_originals WHERE set_id = ?1)",
+            rusqlite::params![set_id],
+        ).map_err(|e| format!("Failed to restore set {}: {}", set_id, e))?;
+
+        if rows_affected > 0 {
+            // Delete the originals entry after successful restore
+            conn.execute(
+                "DELETE FROM calibration_set_originals WHERE set_id = ?1",
+                rusqlite::params![set_id],
+            ).map_err(|e| format!("Failed to delete originals for set {}: {}", set_id, e))?;
+
+            restored_count += 1;
+        }
+    }
+
+    println!(
+        "✅ Restored original metadata for {} calibration sets",
+        restored_count
+    );
+
+    Ok(restored_count)
+}
+
+/// Get all set IDs that have custom metadata edits for a given camera
+#[tauri::command]
+pub async fn get_custom_metadata_set_ids(
+    instrume: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<i64>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let mut stmt = conn.prepare(
+        "SELECT cso.set_id FROM calibration_set_originals cso
+         JOIN calibration_set cs ON cs.id = cso.set_id
+         WHERE cs.instrume = ?1"
+    ).map_err(|e| e.to_string())?;
+
+    let ids: Vec<i64> = stmt.query_map([&instrume], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(ids)
+}
+
+/// Get original metadata values for a calibration set (if they exist)
+#[tauri::command]
+pub async fn get_calibration_set_originals(
+    set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Option<crate::models::CalibrationSetOriginals>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let mut stmt = conn.prepare(
+        "SELECT set_id, ccd_temp, temp_min, temp_max, gain, offset, binning, exptime, saved_at
+         FROM calibration_set_originals WHERE set_id = ?1"
+    ).map_err(|e| e.to_string())?;
+
+    let result = stmt.query_row([set_id], |row| {
+        Ok(crate::models::CalibrationSetOriginals {
+            set_id: row.get(0)?,
+            ccd_temp: row.get(1)?,
+            temp_min: row.get(2)?,
+            temp_max: row.get(3)?,
+            gain: row.get(4)?,
+            offset: row.get(5)?,
+            binning: row.get(6)?,
+            exptime: row.get(7)?,
+            saved_at: row.get(8)?,
+        })
+    });
+
+    match result {
+        Ok(originals) => Ok(Some(originals)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }

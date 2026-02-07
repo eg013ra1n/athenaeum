@@ -6,35 +6,38 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Result};
 
 /// Insert a new file record
+/// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO files (path, filename, size, modified_at, format, created_at, metadata_hash, content_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            file.path,
-            file.filename,
-            file.size,
-            file.modified_at.to_rfc3339(),
-            format!("{:?}", file.format),
-            file.created_at.to_rfc3339(),
-            file.metadata_hash,
-            file.content_hash,
-        ],
     )?;
+    stmt.execute(params![
+        file.path,
+        file.filename,
+        file.size,
+        file.modified_at.to_rfc3339(),
+        format!("{:?}", file.format),
+        file.created_at.to_rfc3339(),
+        file.metadata_hash,
+        file.content_hash,
+    ])?;
     Ok(conn.last_insert_rowid())
 }
 
 /// Insert FITS header with computed fingerprint
+/// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_fits_header(conn: &Connection, file_id: i64, header: &str) -> Result<i64> {
     let fingerprint = compute_header_fingerprint(header);
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, ?3)",
-        params![file_id, header, fingerprint],
     )?;
+    stmt.execute(params![file_id, header, fingerprint])?;
     Ok(conn.last_insert_rowid())
 }
 
 /// Insert a new frame record
+/// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
     let imagetyp_str = frame.imagetyp.as_ref().map(|t| format!("{:?}", t));
     let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
@@ -46,57 +49,58 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 
     let is_master_int = if frame.is_master { 1 } else { 0 };
 
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp, is_master,
          gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, ypixsz,
-         naxis1, naxis2, ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, swcreate)
+         naxis1, naxis2, ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, swcreate, bayerpat)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
-        params![
-            frame.file_id,
-            frame.object,
-            date_obs_str,
-            frame.telescop,
-            frame.instrume,
-            frame.exptime,
-            frame.filter,
-            imagetyp_str,
-            is_master_int,
-            frame.gain,
-            frame.offset,
-            frame.binning,
-            frame.xbinning,
-            frame.ybinning,
-            frame.ccd_temp,
-            frame.set_temp,
-            frame.focallen,
-            frame.xpixsz,
-            frame.ypixsz,
-            frame.naxis1,
-            frame.naxis2,
-            frame.ra,
-            frame.dec,
-            frame.sitelat,
-            frame.lat_obs,
-            frame.sitelong,
-            frame.long_obs,
-            frame.objctra,
-            frame.objctdec,
-            override_int,
-            frame.swcreate,
-        ],
+         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)",
     )?;
+    stmt.execute(params![
+        frame.file_id,
+        frame.object,
+        date_obs_str,
+        frame.telescop,
+        frame.instrume,
+        frame.exptime,
+        frame.filter,
+        imagetyp_str,
+        is_master_int,
+        frame.gain,
+        frame.offset,
+        frame.binning,
+        frame.xbinning,
+        frame.ybinning,
+        frame.ccd_temp,
+        frame.set_temp,
+        frame.focallen,
+        frame.xpixsz,
+        frame.ypixsz,
+        frame.naxis1,
+        frame.naxis2,
+        frame.ra,
+        frame.dec,
+        frame.sitelat,
+        frame.lat_obs,
+        frame.sitelong,
+        frame.long_obs,
+        frame.objctra,
+        frame.objctdec,
+        override_int,
+        frame.swcreate,
+        frame.bayerpat,
+    ])?;
     Ok(conn.last_insert_rowid())
 }
 
 /// Get all scan roots
 pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, enabled, find_duplicates, last_scan FROM scan_roots ORDER BY path"
+        "SELECT id, path, enabled, find_duplicates, unique_camera, last_scan FROM scan_roots ORDER BY path"
     )?;
 
     let roots = stmt.query_map([], |row| {
-        let last_scan_str: Option<String> = row.get(4)?;
+        let last_scan_str: Option<String> = row.get(5)?;
         let last_scan = last_scan_str
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc));
@@ -106,6 +110,7 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
             path: row.get(1)?,
             enabled: row.get::<_, i32>(2)? == 1,
             find_duplicates: row.get::<_, i32>(3)? == 1,
+            unique_camera: row.get::<_, i32>(4)? == 1,
             last_scan,
         })
     })?;
@@ -137,6 +142,188 @@ pub fn update_scan_root_duplicates_flag(conn: &Connection, id: i64, enabled: boo
         params![if enabled { 1 } else { 0 }, id],
     )?;
     Ok(())
+}
+
+/// Toggle unique_camera flag with cascade: updates frames.instrume, deletes affected
+/// calibration sets, clears calibration links, and updates sessions in a single transaction.
+/// Result of reconciling unique_camera instrume suffix state
+#[derive(Debug)]
+pub struct ReconcileResult {
+    pub frames_renamed: usize,
+    pub calibration_sets_deleted: usize,
+    pub sessions_updated: usize,
+}
+
+/// Set unique_camera flag for a scan root (flag-only, no cascade)
+pub fn set_unique_camera_flag(
+    conn: &Connection,
+    root_id: i64,
+    enabled: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE scan_roots SET unique_camera = ?1 WHERE id = ?2",
+        params![if enabled { 1 } else { 0 }, root_id],
+    )?;
+    Ok(())
+}
+
+/// Delete calibration sets for frames under a scan root
+pub fn delete_calibration_sets_for_root(
+    conn: &Connection,
+    root_id: i64,
+) -> Result<usize> {
+    // Get root path
+    let root_path: String = conn.query_row(
+        "SELECT path FROM scan_roots WHERE id = ?1",
+        params![root_id],
+        |row| row.get(0),
+    )?;
+
+    let like_pattern = format!("{}%", root_path);
+
+    // Find affected calibration set IDs (sets containing frames under this root)
+    let affected_set_ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT csf.set_id
+             FROM calibration_set_frames csf
+             JOIN frames fr ON csf.frame_id = fr.id
+             JOIN files f ON fr.file_id = f.id
+             WHERE f.path LIKE ?1"
+        )?;
+        let rows = stmt.query_map(params![like_pattern], |row| row.get(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let calibration_sets_deleted = affected_set_ids.len();
+
+    // Explicit cascade delete for affected calibration sets
+    if !affected_set_ids.is_empty() {
+        let placeholders: String = affected_set_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let set_values: Vec<rusqlite::types::Value> = affected_set_ids
+            .iter()
+            .map(|id| rusqlite::types::Value::Integer(*id))
+            .collect();
+
+        // calibration_set_frames
+        let sql = format!("DELETE FROM calibration_set_frames WHERE set_id IN ({})", placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
+
+        // calibration_set_to_frames — as target (calibration_set_id)
+        let sql = format!("DELETE FROM calibration_set_to_frames WHERE calibration_set_id IN ({})", placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
+
+        // calibration_set_to_frames — as source (source_type='calibration_set')
+        let sql = format!(
+            "DELETE FROM calibration_set_to_frames WHERE source_type = 'calibration_set' AND source_id IN ({})",
+            placeholders
+        );
+        conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
+
+        // calibration_set_originals
+        let sql = format!("DELETE FROM calibration_set_originals WHERE set_id IN ({})", placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
+
+        // calibration_set
+        let sql = format!("DELETE FROM calibration_set WHERE id IN ({})", placeholders);
+        conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
+    }
+
+    // Clear calibration links for affected light frames (source_type='frame')
+    conn.execute(
+        "DELETE FROM calibration_set_to_frames
+         WHERE source_type = 'frame'
+           AND source_id IN (
+             SELECT fr.id FROM frames fr
+             JOIN files f ON fr.file_id = f.id
+             WHERE f.path LIKE ?1
+           )",
+        params![like_pattern],
+    )?;
+
+    Ok(calibration_sets_deleted)
+}
+
+/// Reconcile unique_camera instrume suffix state for a scan root
+/// Idempotent: if frames already match the flag, returns all zeros
+pub fn reconcile_unique_camera_instrume(
+    conn: &Connection,
+    root_id: i64,
+) -> Result<ReconcileResult> {
+    // Read current flag and path
+    let (unique_camera, root_path): (bool, String) = conn.query_row(
+        "SELECT unique_camera, path FROM scan_roots WHERE id = ?1",
+        params![root_id],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+    )?;
+
+    let suffix = format!(" N{}", root_id);
+    let like_pattern = format!("{}%", root_path);
+
+    conn.execute("BEGIN TRANSACTION", [])?;
+
+    // Update frames.instrume based on flag state
+    let frames_renamed = if unique_camera {
+        // Add suffix — skip NULL instrume and already-suffixed
+        conn.execute(
+            "UPDATE frames SET instrume = instrume || ?1
+             WHERE instrume IS NOT NULL
+               AND instrume NOT LIKE '%' || ?1
+               AND id IN (
+                 SELECT fr.id FROM frames fr
+                 JOIN files f ON fr.file_id = f.id
+                 WHERE f.path LIKE ?2
+               )",
+            params![suffix, like_pattern],
+        )?
+    } else {
+        // Strip suffix — only from frames that have it
+        let suffix_len = suffix.len() as i64;
+        conn.execute(
+            "UPDATE frames SET instrume = SUBSTR(instrume, 1, LENGTH(instrume) - ?1)
+             WHERE instrume IS NOT NULL
+               AND instrume LIKE '%' || ?2
+               AND id IN (
+                 SELECT fr.id FROM frames fr
+                 JOIN files f ON fr.file_id = f.id
+                 WHERE f.path LIKE ?3
+               )",
+            params![suffix_len, suffix, like_pattern],
+        )?
+    };
+
+    let mut calibration_sets_deleted = 0;
+    let mut sessions_updated = 0;
+
+    // Only cascade if frames were actually changed
+    if frames_renamed > 0 {
+        // Delete affected calibration sets
+        calibration_sets_deleted = delete_calibration_sets_for_root(conn, root_id)?;
+
+        // Update sessions.instrume to match updated frame values
+        sessions_updated = conn.execute(
+            "UPDATE sessions SET instrume = (
+               SELECT fr.instrume FROM session_members sm
+               JOIN frames fr ON sm.frame_id = fr.id
+               WHERE sm.session_id = sessions.id AND fr.instrume IS NOT NULL
+               LIMIT 1
+             )
+             WHERE id IN (
+               SELECT DISTINCT sm.session_id FROM session_members sm
+               JOIN frames fr ON sm.frame_id = fr.id
+               JOIN files f ON fr.file_id = f.id
+               WHERE f.path LIKE ?1
+             )",
+            params![like_pattern],
+        )?;
+    }
+
+    conn.execute("COMMIT", [])?;
+
+    Ok(ReconcileResult {
+        frames_renamed,
+        calibration_sets_deleted,
+        sessions_updated,
+    })
 }
 
 /// Update scan root last_scan timestamp
@@ -305,7 +492,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          ORDER BY f.created_at DESC
@@ -372,6 +559,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 objctdec: row.get(37).ok(),
                 override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
                 swcreate: row.get(39).ok(),
+                bayerpat: row.get(40).ok(),
             })
         } else {
             None
@@ -401,7 +589,7 @@ pub fn get_files_by_directory(
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          WHERE f.path LIKE ?1 || '/%'
@@ -471,6 +659,7 @@ pub fn get_files_by_directory(
                 objctdec: row.get(37).ok(),
                 override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
                 swcreate: row.get(39).ok(),
+                bayerpat: row.get(40).ok(),
             })
         } else {
             None
@@ -501,7 +690,7 @@ pub fn get_frames_with_missing_metadata(
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
          WHERE UPPER(fr.imagetyp) = 'LIGHT' AND ({})
@@ -567,6 +756,7 @@ pub fn get_frames_with_missing_metadata(
             objctdec: row.get(37).ok(),
             override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
             swcreate: row.get(39).ok(),
+            bayerpat: row.get(40).ok(),
         };
 
         Ok((file, frame))
@@ -1047,6 +1237,7 @@ pub fn get_light_frames_for_project(
             objctdec: row.get(30)?,
             override_: row.get::<_, i32>(31)? == 1,
             swcreate: None,
+            bayerpat: None,
         };
 
         Ok((file_id, frame))
@@ -1367,6 +1558,7 @@ pub fn get_frames_with_files_for_set(
             objctdec: row.get(38)?,
             override_: row.get::<_, i32>(39)? == 1,
             swcreate: None,
+            bayerpat: None,
         };
 
         // Debug: Check date_obs in database
@@ -1480,6 +1672,7 @@ pub fn get_frames_with_files_by_ids(
             objctdec: row.get(38)?,
             override_: row.get::<_, i32>(39)? == 1,
             swcreate: None,
+            bayerpat: None,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -1618,6 +1811,7 @@ pub fn get_imaging_nights_with_sessions(
                     objctdec: row.get(38)?,
                     override_: row.get::<_, i32>(39)? == 1,
                     swcreate: None,
+                    bayerpat: None,
                 };
 
                 Ok(crate::models::FileWithFrame {

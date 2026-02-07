@@ -2,7 +2,8 @@
 
 use crate::db::{self};
 use crate::models::*;
-use crate::scanner::{scan_directory, scan_directory_parallel};
+use crate::scanner::{scan_directory, scan_directory_parallel, emit_progress};
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -69,6 +70,7 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
         path: path_str,
         enabled: true,
         find_duplicates: true,
+        unique_camera: false,
         last_scan: None,
     })
 }
@@ -97,6 +99,10 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
+    // Reconcile unique_camera instrume suffix state before scanning
+    let reconcile = db::reconcile_unique_camera_instrume(&conn, root_id)
+        .map_err(|e| format!("Reconciliation failed: {}", e))?;
+
     // Get the scan root path
     let roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
     let root = roots
@@ -110,7 +116,16 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
         .unwrap_or(false);
 
     // Perform the scan
-    let result = scan_directory(Path::new(&root.path), &conn, None, use_content_hash);
+    let mut result = scan_directory(Path::new(&root.path), &conn, None, use_content_hash, root.unique_camera, root_id);
+
+    // If reconciliation changed frames, wipe and rebuild calibration sets
+    if reconcile.frames_renamed > 0 {
+        db::delete_calibration_sets_for_root(&conn, root_id)
+            .map_err(|e| format!("Failed to delete cal sets: {}", e))?;
+        let cal_sets_created = recreate_calibration_sets_for_root(&conn, root_id)
+            .map_err(|e| format!("Failed to recreate cal sets: {}", e))?;
+        result.calibration_sets_created = cal_sets_created;
+    }
 
     // Update last_scan timestamp
     db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
@@ -126,6 +141,10 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
         bias_count: result.bias_count,
         darkflats_count: result.darkflats_count,
         calibration_sets_created: result.calibration_sets_created,
+        cancelled: result.cancelled,
+        frames_renamed: reconcile.frames_renamed,
+        calibration_sets_deleted: reconcile.calibration_sets_deleted,
+        sessions_updated: reconcile.sessions_updated,
     })
 }
 
@@ -298,58 +317,74 @@ pub async fn check_all_scan_roots_availability(
 #[tauri::command]
 pub async fn check_missing_files_in_scan_root(
     root_id: i64,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::OrphanedFile>, String> {
-    let state_lock = state.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
-    let conn = db.conn();
+    // Emit initial "verifying" phase progress
+    emit_progress(&app_handle, root_id, 0, 0, None, "verifying");
 
-    // Get scan root path
-    let path: String = conn
-        .query_row(
-            "SELECT path FROM scan_roots WHERE id = ?1",
-            rusqlite::params![root_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Failed to get scan root: {}", e))?;
+    // Collect files from database with lock held briefly
+    let files = {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
 
-    // Get all files under this scan root
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
-                    EXISTS(SELECT 1 FROM frames fr WHERE fr.file_id = f.id) as has_frame,
-                    (SELECT fr.object FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as object,
-                    (SELECT fr.date_obs FROM frames fr WHERE fr.file_id = f.id LIMIT 1) as date_obs
-             FROM files f
-             WHERE f.path LIKE ?1"
-        )
-        .map_err(|e| e.to_string())?;
+        // Get scan root path
+        let path: String = conn
+            .query_row(
+                "SELECT path FROM scan_roots WHERE id = ?1",
+                rusqlite::params![root_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to get scan root: {}", e))?;
 
-    let path_prefix = format!("{}%", path);
-    let files = stmt
-        .query_map(rusqlite::params![path_prefix], |row| {
-            Ok(crate::models::OrphanedFile {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                filename: row.get(2)?,
-                size: row.get(3)?,
-                modified_at: row.get(4)?,
-                has_frame: row.get::<_, i64>(5)? != 0,
-                object: row.get(6).ok(),
-                date_obs: row.get(7).ok(),
+        // Get all files under this scan root
+        // Use LEFT JOIN instead of subqueries to avoid N+1 query problem
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
+                        CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
+                        fr.object,
+                        fr.date_obs
+                 FROM files f
+                 LEFT JOIN frames fr ON fr.file_id = f.id
+                 WHERE f.path LIKE ?1"
+            )
+            .map_err(|e| e.to_string())?;
+
+        let path_prefix = format!("{}%", path);
+        let result: Vec<crate::models::OrphanedFile> = stmt
+            .query_map(rusqlite::params![path_prefix], |row| {
+                Ok(crate::models::OrphanedFile {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    filename: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: row.get(4)?,
+                    has_frame: row.get::<_, i64>(5)? != 0,
+                    object: row.get(6).ok(),
+                    date_obs: row.get(7).ok(),
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        result
+        // Lock is released here when state_lock goes out of scope
+    };
 
-    // Filter to only files that don't exist on disk
+    // Filter to only files that don't exist on disk - done in parallel
+    // This is done OUTSIDE the lock since filesystem checks can be slow
+    let total_files = files.len();
+
+    // Use parallel iteration for filesystem checks (I/O bound operations)
     let missing_files: Vec<crate::models::OrphanedFile> = files
-        .into_iter()
+        .into_par_iter()
         .filter(|file| !std::path::Path::new(&file.path).exists())
         .collect();
 
-    println!("Found {} missing files in scan root {}", missing_files.len(), root_id);
+    // Emit final progress
+    emit_progress(&app_handle, root_id, total_files, total_files, None, "verifying");
 
     Ok(missing_files)
 }
@@ -369,6 +404,12 @@ pub struct ScanResultDto {
     pub darkflats_count: usize,
     // Calibration sets created
     pub calibration_sets_created: usize,
+    // Whether scan was cancelled by user
+    pub cancelled: bool,
+    // Unique camera reconciliation (only non-zero when instrume suffix state changed)
+    pub frames_renamed: usize,
+    pub calibration_sets_deleted: usize,
+    pub sessions_updated: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -380,6 +421,96 @@ pub struct RescanResultDto {
     pub errors: Vec<String>,
 }
 
+/// Toggle unique_camera flag (flag-only, cascade happens on re-scan)
+#[tauri::command]
+pub async fn set_scan_root_unique_camera_flag(
+    id: i64,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::set_unique_camera_flag(&conn, id, enabled)
+        .map_err(|e| e.to_string())?;
+
+    println!("unique_camera flag set for root {}: enabled={}", id, enabled);
+
+    Ok(())
+}
+
+/// Query calibration frame IDs under a scan root and recreate calibration sets
+fn recreate_calibration_sets_for_root(
+    conn: &rusqlite::Connection,
+    root_id: i64,
+) -> anyhow::Result<usize> {
+    use crate::calibration::scan_integration::{
+        create_calibration_sets_from_scan_with_masters, MasterFrameIds,
+    };
+
+    // Get root path
+    let root_path: String = conn.query_row(
+        "SELECT path FROM scan_roots WHERE id = ?1",
+        rusqlite::params![root_id],
+        |row| row.get(0),
+    )?;
+
+    let like_pattern = format!("{}%", root_path);
+
+    // Query all calibration frame IDs under this root, grouped by imagetyp
+    let mut stmt = conn.prepare(
+        "SELECT fr.id, fr.imagetyp FROM frames fr
+         JOIN files f ON fr.file_id = f.id
+         WHERE f.path LIKE ?1
+           AND fr.imagetyp IN ('Flat','Dark','Bias','DarkFlat','MasterFlat','MasterDark','MasterBias','MasterDarkFlat')"
+    )?;
+
+    let mut flat_ids = Vec::new();
+    let mut dark_ids = Vec::new();
+    let mut bias_ids = Vec::new();
+    let mut darkflat_ids = Vec::new();
+    let mut master_ids = MasterFrameIds::default();
+
+    let rows = stmt.query_map(rusqlite::params![like_pattern], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    for row in rows {
+        let (frame_id, imagetyp) = row?;
+        match imagetyp.as_str() {
+            "Flat" => flat_ids.push(frame_id),
+            "Dark" => dark_ids.push(frame_id),
+            "Bias" => bias_ids.push(frame_id),
+            "DarkFlat" => darkflat_ids.push(frame_id),
+            "MasterFlat" => master_ids.master_flat_ids.push(frame_id),
+            "MasterDark" => master_ids.master_dark_ids.push(frame_id),
+            "MasterBias" => master_ids.master_bias_ids.push(frame_id),
+            "MasterDarkFlat" => master_ids.master_darkflat_ids.push(frame_id),
+            _ => {}
+        }
+    }
+
+    let total_cal_frames = flat_ids.len() + dark_ids.len() + bias_ids.len()
+        + darkflat_ids.len() + master_ids.total_count();
+
+    if total_cal_frames == 0 {
+        return Ok(0);
+    }
+
+    println!(
+        "Recreating calibration sets for root {}: {} flats, {} darks, {} bias, {} darkflats, {} masters",
+        root_id, flat_ids.len(), dark_ids.len(), bias_ids.len(),
+        darkflat_ids.len(), master_ids.total_count()
+    );
+
+    let scan_result = create_calibration_sets_from_scan_with_masters(
+        conn, flat_ids, dark_ids, bias_ids, darkflat_ids, master_ids,
+    )?;
+
+    Ok(scan_result.sets_created as usize)
+}
+
 /// Start a scan with progress events - runs synchronously but emits progress events
 /// The frontend should call this and listen to scan-progress/scan-complete events
 #[tauri::command]
@@ -388,10 +519,13 @@ pub async fn start_scan_with_progress(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanResultDto, String> {
+    println!("🔵 start_scan_with_progress called for root_id={}", root_id);
+
     // Check if already scanning this root
     {
         let scans = state.active_scans.lock().unwrap();
         if scans.contains_key(&root_id) {
+            println!("🔴 Scan already in progress for root_id={}", root_id);
             return Err("Scan already in progress for this root".to_string());
         }
     }
@@ -407,10 +541,16 @@ pub async fn start_scan_with_progress(
     }
 
     // Get scan root info and perform scan
-    let result = {
+    println!("🔵 Acquiring database lock for root_id={}", root_id);
+    let (result, reconcile) = {
         let state_lock = state.db.lock().unwrap();
+        println!("🔵 Database lock acquired for root_id={}", root_id);
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
+
+        // Reconcile unique_camera instrume suffix state before scanning
+        let reconcile = db::reconcile_unique_camera_instrume(&conn, root_id)
+            .map_err(|e| format!("Reconciliation failed: {}", e))?;
 
         let roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
         let root = roots
@@ -423,19 +563,33 @@ pub async fn start_scan_with_progress(
             .unwrap_or(false);
 
         // Perform the parallel scan with progress events
-        let result = scan_directory_parallel(
+        let mut result = scan_directory_parallel(
             Path::new(&root.path),
             root_id,
             &conn,
             &app_handle,
             use_content_hash,
+            cancel_flag.clone(),
+            root.unique_camera,
         );
+
+        // If reconciliation changed frames, wipe and rebuild calibration sets
+        if reconcile.frames_renamed > 0 {
+            db::delete_calibration_sets_for_root(&conn, root_id)
+                .map_err(|e| format!("Failed to delete cal sets: {}", e))?;
+            let cal_sets_created = recreate_calibration_sets_for_root(&conn, root_id)
+                .map_err(|e| format!("Failed to recreate cal sets: {}", e))?;
+            result.calibration_sets_created = cal_sets_created;
+        }
 
         // Update last_scan timestamp
         db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
 
-        result
+        println!("🔵 Scan complete for root_id={}, releasing lock", root_id);
+        (result, reconcile)
     };
+
+    println!("🔵 Database lock released for root_id={}", root_id);
 
     // Remove from active scans
     {
@@ -454,6 +608,10 @@ pub async fn start_scan_with_progress(
         bias_count: result.bias_count,
         darkflats_count: result.darkflats_count,
         calibration_sets_created: result.calibration_sets_created,
+        cancelled: result.cancelled,
+        frames_renamed: reconcile.frames_renamed,
+        calibration_sets_deleted: reconcile.calibration_sets_deleted,
+        sessions_updated: reconcile.sessions_updated,
     })
 }
 

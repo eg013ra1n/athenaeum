@@ -565,32 +565,54 @@ pub fn get_calibration_groups_for_frame_set(
 /// Helper: Get detailed info for a calibration set
 fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<CalibrationSetDetail> {
     let mut stmt = conn.prepare(
-        "SELECT id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
-                binning, instrume, filter, date_start, date_end, date, frame_count
-         FROM calibration_set
-         WHERE id = ?1"
+        "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.temp_min, cs.temp_max, cs.gain, cs.offset,
+                cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end, cs.date, cs.frame_count, cs.is_master_library,
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
+         FROM calibration_set cs
+         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
+         LEFT JOIN frames f ON f.id = csf.frame_id
+         LEFT JOIN files fi ON fi.id = f.file_id
+         WHERE cs.id = ?1
+         LIMIT 1"
     )?;
 
     stmt.query_row([set_id], |row| {
         let imagetyp_str: String = row.get(1)?;
         let imagetyp = ImageType::from_str(&imagetyp_str).unwrap_or(ImageType::Light);
 
+        // Handle potentially NULL values with defaults
+        // Master calibration sets may have NULL for these columns
+        let ccd_temp: f64 = row.get::<_, Option<f64>>(3)?.unwrap_or(0.0);
+        let temp_min: f64 = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+        let temp_max: f64 = row.get::<_, Option<f64>>(5)?.unwrap_or(0.0);
+        let date_start: String = row.get::<_, Option<String>>(11)?.unwrap_or_default();
+        let date_end: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+        let date_display: String = row.get::<_, Option<String>>(13)?.unwrap_or_default();
+        let frame_count: i64 = row.get::<_, Option<i64>>(14)?.unwrap_or(0);
+
         Ok(CalibrationSetDetail {
             id: Some(row.get(0)?),
             imagetyp,
             exptime: row.get(2)?,
-            ccd_temp: row.get(3)?,
-            temp_min: row.get(4)?,
-            temp_max: row.get(5)?,
+            ccd_temp,
+            temp_min,
+            temp_max,
             gain: row.get(6)?,
             offset: row.get(7)?,
             binning: row.get(8)?,
             instrume: row.get(9)?,
             filter: row.get(10)?,
-            date_start: row.get(11)?,
-            date_end: row.get(12)?,
-            date_display: row.get(13)?,
-            frame_count: row.get(14)?,
+            date_start,
+            date_end,
+            date_display,
+            frame_count,
+            is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
+            naxis1: row.get(16)?,
+            naxis2: row.get(17)?,
+            bayerpat: row.get(18)?,
+            swcreate: row.get(19)?,
+            xpixsz: row.get(20)?,
+            format: row.get(21)?,
         })
     })
 }
@@ -1164,7 +1186,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     result
                 } else {
                     // No split needed - single group with all frames
-                    vec![(None, raw_frames.iter().collect())]
+                    // Use the common exptime from first frame (all frames have same exptime)
+                    let common_exptime = raw_frames.first().and_then(|f| f.exptime);
+                    vec![(common_exptime, raw_frames.iter().collect())]
                 };
 
                 // Process each exptime sub-group
@@ -1281,15 +1305,11 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         camera_has_warnings = true;
                     }
 
-                    // Build filter display string - include exptime if split
+                    // Build filter display string - always include exptime when available
                     let base_filter_display = filter.clone().unwrap_or_else(|| "No Filter".to_string());
-                    let filter_display = if should_split {
-                        match group_exptime {
-                            Some(exp) => format!("{} ({}s)", base_filter_display, exp),
-                            None => format!("{} (unknown exp)", base_filter_display),
-                        }
-                    } else {
-                        base_filter_display
+                    let filter_display = match group_exptime {
+                        Some(exp) => format!("{} ({}s)", base_filter_display, exp),
+                        None => base_filter_display,
                     };
 
                     filter_groups.push(CalibrationFilterGroup {

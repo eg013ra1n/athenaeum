@@ -258,6 +258,9 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let focallen = read_keyword_f64(&mut fitsfile, &hdu, "FOCALLEN").ok();
     let swcreate = read_keyword_string(&mut fitsfile, &hdu, "SWCREATE").ok();
 
+    // Bayer pattern for OSC (one-shot color) cameras
+    let bayerpat = read_keyword_string(&mut fitsfile, &hdu, "BAYERPAT").ok();
+
     // Pixel size
     let xpixsz = read_keyword_f64(&mut fitsfile, &hdu, "XPIXSZ").ok();
     let ypixsz = read_keyword_f64(&mut fitsfile, &hdu, "YPIXSZ").ok();
@@ -363,6 +366,7 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
         objctdec,
         override_: false,
         swcreate,
+        bayerpat,
     })
 }
 
@@ -476,6 +480,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let focallen = fits_keywords.get("FOCALLEN")
         .and_then(|s| s.parse::<f64>().ok());
     let swcreate = fits_keywords.get("SWCREATE").cloned();
+    let bayerpat = fits_keywords.get("BAYERPAT").cloned();
     let xpixsz = fits_keywords.get("XPIXSZ")
         .and_then(|s| s.parse::<f64>().ok());
     let ypixsz = fits_keywords.get("YPIXSZ")
@@ -585,6 +590,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         objctdec,
         override_: false,
         swcreate,
+        bayerpat,
     })
 }
 

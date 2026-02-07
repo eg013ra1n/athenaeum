@@ -35,23 +35,23 @@ export default function ClusteringParametersPanel({
     <div className="space-y-6">
       {/* Clustering per calibration type */}
       <div>
-        <h4 className="text-sm font-medium text-gray-300 mb-4">
+        <h4 className="text-sm font-medium text-content-secondary mb-4">
           Clustering Settings per Calibration Type
         </h4>
         <div className="overflow-x-auto">
           <table className="w-full border-collapse text-sm">
             <thead>
-              <tr className="bg-gray-700/50">
-                <th className="p-3 border border-gray-700 text-left font-medium">
+              <tr className="bg-surface-hover/50">
+                <th className="p-3 border border-border text-left font-medium">
                   Calibration Type
                 </th>
-                <th className="p-3 border border-gray-700 text-center font-medium">
+                <th className="p-3 border border-border text-center font-medium">
                   Max Age (days)
                 </th>
-                <th className="p-3 border border-gray-700 text-center font-medium">
+                <th className="p-3 border border-border text-center font-medium">
                   Time Cluster
                 </th>
-                <th className="p-3 border border-gray-700 text-center font-medium">
+                <th className="p-3 border border-border text-center font-medium">
                   Temp Threshold (°C)
                 </th>
               </tr>
@@ -60,11 +60,11 @@ export default function ClusteringParametersPanel({
               {calibrationTypes.map((type) => {
                 const config = getClusteringConfig(type);
                 return (
-                  <tr key={type} className="hover:bg-gray-700/30">
-                    <td className="p-3 border border-gray-700 font-medium capitalize">
+                  <tr key={type} className="hover:bg-surface-hover/30">
+                    <td className="p-3 border border-border font-medium capitalize">
                       {type === "darkflat" ? "DarkFlat" : type}
                     </td>
-                    <td className="p-3 border border-gray-700">
+                    <td className="p-3 border border-border">
                       <input
                         type="number"
                         value={config.max_age_days}
@@ -76,10 +76,10 @@ export default function ClusteringParametersPanel({
                           )
                         }
                         min="1"
-                        className="w-full px-3 py-1 bg-gray-700 border border-gray-600 rounded text-gray-100 text-center"
+                        className="w-full px-3 py-1 bg-surface-hover border border-border rounded text-content text-center"
                       />
                     </td>
-                    <td className="p-3 border border-gray-700">
+                    <td className="p-3 border border-border">
                       <div className="flex items-center gap-2">
                         <input
                           type="number"
@@ -96,14 +96,14 @@ export default function ClusteringParametersPanel({
                             onClusteringUpdate(type, "time_cluster_minutes", minutes);
                           }}
                           min="1"
-                          className="flex-1 px-3 py-1 bg-gray-700 border border-gray-600 rounded text-gray-100 text-center"
+                          className="flex-1 px-3 py-1 bg-surface-hover border border-border rounded text-content text-center"
                         />
-                        <span className="text-xs text-gray-400 w-12">
+                        <span className="text-xs text-content-muted w-12">
                           {usesDaysForTimeCluster(type) ? "days" : "min"}
                         </span>
                       </div>
                     </td>
-                    <td className="p-3 border border-gray-700">
+                    <td className="p-3 border border-border">
                       <input
                         type="number"
                         value={config.temp_threshold_celsius}
@@ -116,7 +116,7 @@ export default function ClusteringParametersPanel({
                         }
                         min="0.1"
                         step="0.1"
-                        className="w-full px-3 py-1 bg-gray-700 border border-gray-600 rounded text-gray-100 text-center"
+                        className="w-full px-3 py-1 bg-surface-hover border border-border rounded text-content text-center"
                       />
                     </td>
                   </tr>
@@ -125,7 +125,7 @@ export default function ClusteringParametersPanel({
             </tbody>
           </table>
         </div>
-        <p className="text-xs text-gray-500 mt-2">
+        <p className="text-xs text-content-muted mt-2">
           <strong>Max Age</strong> = Only consider frames within this many days
           |{" "}
           <strong>Time Cluster</strong> = Group frames captured within this time
@@ -137,18 +137,18 @@ export default function ClusteringParametersPanel({
 
       {/* Scoring parameters */}
       <div>
-        <h4 className="text-sm font-medium text-gray-300 mb-4">
+        <h4 className="text-sm font-medium text-content-secondary mb-4">
           Scoring Parameters
         </h4>
-        <p className="text-xs text-gray-500 mb-4">
+        <p className="text-xs text-content-muted mb-4">
           When linking calibration sets to frames, candidates are scored based on date proximity, temperature match, and exposure time proximity.
           These settings control how temperature and exposure time affect the scoring.
         </p>
-        <div className="bg-gray-800/50 rounded-lg p-4 space-y-4">
+        <div className="bg-surface-elevated/50 rounded-lg p-4 space-y-4">
           {/* Temperature Match Weight */}
           <div>
             <div className="flex items-center gap-4">
-              <label className="text-sm text-gray-300 min-w-48">
+              <label className="text-sm text-content-secondary min-w-48">
                 Temperature Match Weight
               </label>
               <input
@@ -165,11 +165,11 @@ export default function ClusteringParametersPanel({
                 }
                 className="flex-1"
               />
-              <span className="text-sm text-gray-100 w-12 text-right">
+              <span className="text-sm text-content w-12 text-right">
                 {scoring.temperature_match_weight.toFixed(1)}
               </span>
             </div>
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-content-muted mt-1">
               How much temperature affects the score (0 = ignore temperature, 1 = full weight). Default: 0.3
             </p>
           </div>
@@ -177,7 +177,7 @@ export default function ClusteringParametersPanel({
           {/* Temperature Scale */}
           <div>
             <div className="flex items-center gap-4">
-              <label className="text-sm text-gray-300 min-w-48">
+              <label className="text-sm text-content-secondary min-w-48">
                 Temperature Sensitivity (°C)
               </label>
               <input
@@ -194,11 +194,11 @@ export default function ClusteringParametersPanel({
                 }
                 className="flex-1"
               />
-              <span className="text-sm text-gray-100 w-12 text-right">
+              <span className="text-sm text-content w-12 text-right">
                 {scoring.temperature_scale.toFixed(1)}
               </span>
             </div>
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-content-muted mt-1">
               At this temperature difference, the temp score drops to 50%. Higher = more tolerant. Default: 2.0°C
             </p>
           </div>
@@ -206,7 +206,7 @@ export default function ClusteringParametersPanel({
           {/* Exposure Match Weight */}
           <div>
             <div className="flex items-center gap-4">
-              <label className="text-sm text-gray-300 min-w-48">
+              <label className="text-sm text-content-secondary min-w-48">
                 Exposure Match Weight
               </label>
               <input
@@ -223,11 +223,11 @@ export default function ClusteringParametersPanel({
                 }
                 className="flex-1"
               />
-              <span className="text-sm text-gray-100 w-12 text-right">
+              <span className="text-sm text-content w-12 text-right">
                 {scoring.exposure_match_weight.toFixed(1)}
               </span>
             </div>
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-content-muted mt-1">
               How much exposure time affects the score (0 = ignore, 1 = full weight). Default: 0.4
             </p>
           </div>
@@ -235,7 +235,7 @@ export default function ClusteringParametersPanel({
           {/* Exposure Scale */}
           <div>
             <div className="flex items-center gap-4">
-              <label className="text-sm text-gray-300 min-w-48">
+              <label className="text-sm text-content-secondary min-w-48">
                 Exposure Sensitivity (s)
               </label>
               <input
@@ -252,11 +252,11 @@ export default function ClusteringParametersPanel({
                 }
                 className="flex-1"
               />
-              <span className="text-sm text-gray-100 w-12 text-right">
+              <span className="text-sm text-content w-12 text-right">
                 {scoring.exposure_scale.toFixed(1)}
               </span>
             </div>
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-content-muted mt-1">
               At this exposure difference, the exposure score drops to 50%. Higher = more tolerant. Default: 1.0s
             </p>
           </div>

@@ -37,17 +37,17 @@ export default function MatchingMatrixTable({
 
   const getModeColor = (mode: MatchMode, locked: boolean): string => {
     if (locked) {
-      return "bg-gray-600/40 text-gray-400 border-gray-500/50";
+      return "bg-surface-hover/40 text-content-muted border-border/50";
     }
     switch (mode) {
       case MatchMode.Exact:
-        return "bg-green-600/30 text-green-300 border-green-600/50";
+        return "bg-success/30 text-success border-success/50";
       case MatchMode.Warning:
-        return "bg-yellow-600/30 text-yellow-300 border-yellow-600/50";
+        return "bg-warning/30 text-warning border-warning/50";
       case MatchMode.Ignore:
-        return "bg-gray-700/30 text-gray-400 border-gray-600/50";
+        return "bg-surface-hover/30 text-content-muted border-border/50";
       default:
-        return "bg-gray-700/30 text-gray-400 border-gray-600/50";
+        return "bg-surface-hover/30 text-content-muted border-border/50";
     }
   };
 
@@ -125,7 +125,7 @@ export default function MatchingMatrixTable({
           {isLocked && (
             <Lock
               size={10}
-              className="absolute right-6 top-1/2 -translate-y-1/2 text-gray-500"
+              className="absolute right-6 top-1/2 -translate-y-1/2 text-content-muted"
             />
           )}
         </div>
@@ -152,7 +152,7 @@ export default function MatchingMatrixTable({
               className="w-full px-1.5 py-0.5 bg-rose-950/40 border border-rose-700/50 rounded text-xs text-rose-200 placeholder-rose-400/50"
             />
             {validationError && (
-              <div className="flex items-center gap-1 text-red-400 text-xs">
+              <div className="flex items-center gap-1 text-error text-xs">
                 <AlertTriangle size={10} />
                 <span>Warn &lt;= Max</span>
               </div>
@@ -187,24 +187,24 @@ export default function MatchingMatrixTable({
 
   return (
     <div className="overflow-x-auto">
-      <div className="rounded-lg border border-gray-700 overflow-hidden">
+      <div className="rounded-lg border border-border overflow-hidden">
         <table className="w-full border-collapse text-sm table-fixed">
           <thead>
-            <tr className="bg-gray-700/50">
-              <th className="p-2 border-b border-r border-gray-700 text-left font-medium w-[70px]">
+            <tr className="bg-surface-hover/50">
+              <th className="p-2 border-b border-r border-border text-left font-medium w-[70px]">
                 Type
               </th>
               {CONFIGURABLE_PARAMETERS.map((param, idx) => (
                 <th
                   key={param}
-                  className={`p-2 border-b border-gray-700 text-center font-medium ${
+                  className={`p-2 border-b border-border text-center font-medium ${
                     idx < CONFIGURABLE_PARAMETERS.length - 1 ? "border-r" : ""
                   } ${getColumnWidth(param)}`}
                 >
                   <span className="flex items-center justify-center gap-1">
                     {getParameterLabel(param)}
                     {isLockedParameter(param) && (
-                      <Lock size={10} className="text-gray-500" />
+                      <Lock size={10} className="text-content-muted" />
                     )}
                   </span>
                 </th>
@@ -218,8 +218,8 @@ export default function MatchingMatrixTable({
               const isLastRow = rowIdx === types.length - 1;
 
               return (
-                <tr key={calibType} className="hover:bg-gray-700/30">
-                  <td className={`p-2 border-r border-gray-700 font-medium capitalize ${
+                <tr key={calibType} className="hover:bg-surface-hover/30">
+                  <td className={`p-2 border-r border-border font-medium capitalize ${
                     !isLastRow ? "border-b" : ""
                   }`}>
                     {calibType === "darkflat" ? "DarkFlat" : calibType}
@@ -233,7 +233,7 @@ export default function MatchingMatrixTable({
                         key={`${calibType}-${param}`}
                         className={`p-2 ${!isLastRow ? "border-b" : ""} ${
                           !isLastCol ? "border-r" : ""
-                        } border-gray-700`}
+                        } border-border`}
                       >
                         {renderModeCellContent(calibType, param, paramConfig)}
                       </td>
@@ -247,41 +247,41 @@ export default function MatchingMatrixTable({
       </div>
 
       {/* Legend and Explanation */}
-      <div className="mt-3 p-3 bg-gray-800/50 rounded-lg border border-gray-700 space-y-3">
+      <div className="mt-3 p-3 bg-surface-elevated/50 rounded-lg border border-border space-y-3">
         {/* Compact legend */}
-        <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-400">
+        <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-content-muted">
           <div className="flex items-center gap-2">
-            <span className="w-6 h-6 flex items-center justify-center bg-green-600/30 text-green-300 border border-green-600/50 rounded font-bold">=</span>
+            <span className="w-6 h-6 flex items-center justify-center bg-success/30 text-success border border-success/50 rounded font-bold">=</span>
             <span>Exact match</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-6 h-6 flex items-center justify-center bg-yellow-600/30 text-yellow-300 border border-yellow-600/50 rounded font-bold">≈</span>
+            <span className="w-6 h-6 flex items-center justify-center bg-warning/30 text-warning border border-warning/50 rounded font-bold">≈</span>
             <span>Threshold</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-6 h-6 flex items-center justify-center bg-gray-700/30 text-gray-400 border border-gray-600/50 rounded font-bold">-</span>
+            <span className="w-6 h-6 flex items-center justify-center bg-surface-hover/30 text-content-muted border border-border/50 rounded font-bold">-</span>
             <span>Ignored</span>
           </div>
           <div className="flex items-center gap-2">
-            <Lock size={14} className="text-gray-500" />
+            <Lock size={14} className="text-content-muted" />
             <span>Locked</span>
           </div>
         </div>
 
         {/* Detailed explanation */}
-        <div className="text-xs text-gray-500 space-y-1 pt-2 border-t border-gray-700">
+        <div className="text-xs text-content-muted space-y-1 pt-2 border-t border-border">
           <p>
-            <span className="text-green-400 font-medium">=</span> <strong>Exact</strong>:
+            <span className="text-success font-medium">=</span> <strong>Exact</strong>:
             Parameters must match exactly. Locked parameters (Camera, Binning, Gain, Offset)
             cannot be changed — calibration frames must come from the same equipment configuration.
           </p>
           <p>
-            <span className="text-yellow-400 font-medium">≈</span> <strong>Threshold</strong>:
+            <span className="text-warning font-medium">≈</span> <strong>Threshold</strong>:
             Matches within the <span className="text-rose-300">Max</span> threshold, but shows a warning if the <span className="text-orange-300">Warn</span> threshold
             is exceeded. Match is rejected if outside <span className="text-rose-300">Max</span>.
           </p>
           <p>
-            <span className="text-gray-400 font-medium">-</span> <strong>Ignored</strong>:
+            <span className="text-content-muted font-medium">-</span> <strong>Ignored</strong>:
             Parameter is not checked during matching (any value accepted).
           </p>
         </div>

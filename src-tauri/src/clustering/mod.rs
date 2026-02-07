@@ -346,6 +346,7 @@ mod tests {
             objctdec: None,
             override_: false,
             swcreate: None,
+            bayerpat: None,
         }
     }
 
