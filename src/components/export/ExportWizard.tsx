@@ -121,17 +121,30 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
                 </div>
 
                 {/* Use symlinks */}
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={useSymlinks}
-                    onChange={(e) => setUseSymlinks(e.target.checked)}
-                    className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
-                  />
-                  <span className="text-content-secondary">
-                    Use symbolic links instead of copying files
-                  </span>
-                </label>
+                {(() => {
+                  const isWindows = navigator.userAgent.includes('Windows');
+                  return (
+                    <div>
+                      <label className={`flex items-center gap-2 ${isWindows ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}>
+                        <input
+                          type="checkbox"
+                          checked={useSymlinks}
+                          onChange={(e) => setUseSymlinks(e.target.checked)}
+                          disabled={isWindows}
+                          className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+                        />
+                        <span className="text-content-secondary">
+                          Use symbolic links instead of copying files
+                        </span>
+                      </label>
+                      {isWindows && (
+                        <p className="mt-1 ml-6 text-xs text-content-muted">
+                          Symbolic links are only available on macOS and Linux.
+                        </p>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {/* WBPP Setup Guide */}
                 <details className="p-3 bg-surface-hover/50 rounded-lg text-sm text-content-muted">
