@@ -118,6 +118,7 @@ export interface ScanRoot {
   path: string;
   enabled: boolean;
   find_duplicates: boolean;
+  unique_camera: boolean;
   last_scan: string | null; // ISO 8601 datetime
 }
 
@@ -176,6 +177,10 @@ export interface ScanResult {
   darkflats_count: number;
   // Calibration sets created
   calibration_sets_created: number;
+  // Unique camera reconciliation stats (non-zero when instrume suffix state changed during rescan)
+  frames_renamed: number;
+  calibration_sets_deleted: number;
+  sessions_updated: number;
   // Whether scan was cancelled by user
   cancelled: boolean;
 }
@@ -203,6 +208,9 @@ export interface ScanCompleteEvent {
   bias_count: number;
   darkflats_count: number;
   calibration_sets_created: number;
+  frames_renamed?: number;
+  calibration_sets_deleted?: number;
+  sessions_updated?: number;
   cancelled: boolean;
 }
 

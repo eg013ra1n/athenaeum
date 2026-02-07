@@ -18,7 +18,7 @@ type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrume
 
 export default function FileManager() {
   const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
-  const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, relinkScanRoot } = useScanRootsWithAvailability();
+  const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, relinkScanRoot } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning } = useScanProgressContext();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
@@ -457,6 +457,22 @@ export default function FileManager() {
                             className="w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
                           />
                           <span className="text-sm text-content-secondary">Include in duplicates</span>
+                        </label>
+                        <label className="flex items-center gap-2 px-3 py-2 bg-surface-hover rounded cursor-pointer hover:brightness-110 transition" title="Appends a unique suffix to INSTRUME for calibration separation when using identical cameras across scan roots. Re-scan required after toggling.">
+                          <input
+                            type="checkbox"
+                            checked={root.unique_camera}
+                            onChange={async (e) => {
+                              if (!root.id) return;
+                              try {
+                                await toggleUniqueCameraFlag(root.id, e.target.checked);
+                              } catch (err) {
+                                console.error('Failed to toggle unique camera:', err);
+                              }
+                            }}
+                            className="w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
+                          />
+                          <span className="text-sm text-content-secondary">Unique camera</span>
                         </label>
                         <button
                           onClick={() => root.id && handleStartScan(root.id)}

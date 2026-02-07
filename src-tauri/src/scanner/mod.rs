@@ -60,6 +60,8 @@ pub fn scan_directory(
     conn: &Connection,
     progress_callback: Option<Box<dyn Fn(ScanProgress) + Send + Sync>>,
     use_content_hash: bool,
+    unique_camera: bool,
+    root_id: i64,
 ) -> ScanResult {
     let mut result = ScanResult {
         files_found: 0,
@@ -135,7 +137,7 @@ pub fn scan_directory(
             continue;
         }
 
-        match process_file(file_path, conn, use_content_hash) {
+        match process_file(file_path, conn, use_content_hash, unique_camera, root_id) {
             Ok(frame_info) => {
                 *processed.lock().unwrap() += 1;
 
@@ -230,7 +232,7 @@ pub fn scan_directory(
 
 /// Process a single file: hash, parse metadata, insert into database
 /// Returns Some((frame_id, imagetyp)) for successfully processed frames with known imagetyp
-fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> anyhow::Result<Option<(i64, ImageType)>> {
+fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, unique_camera: bool, root_id: i64) -> anyhow::Result<Option<(i64, ImageType)>> {
     // Get file metadata
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len() as i64;
@@ -297,6 +299,35 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> an
                     rusqlite::params![current_path, modified_dt.to_rfc3339(), file_id],
                 )?;
 
+                // Update INSTRUME based on destination root's unique_camera setting
+                // The frame was parsed fresh from disk, so frame.instrume has the raw FITS value
+                let raw_instrume: Option<String> = conn.query_row(
+                    "SELECT instrume FROM frames WHERE file_id = ?1",
+                    rusqlite::params![file_id],
+                    |row| row.get(0),
+                ).optional()?.flatten();
+                // We can't easily get the raw FITS instrume here without re-parsing,
+                // so strip any existing N<id> suffix before reapplying
+                let base_instrume = raw_instrume.as_ref().map(|i| {
+                    // Strip existing " N<digits>" suffix if present
+                    if let Some(pos) = i.rfind(" N") {
+                        let suffix = &i[pos + 2..];
+                        if suffix.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty() {
+                            return i[..pos].to_string();
+                        }
+                    }
+                    i.clone()
+                });
+                let new_instrume = if unique_camera {
+                    base_instrume.map(|i| format!("{} N{}", i, root_id))
+                } else {
+                    base_instrume
+                };
+                let _ = conn.execute(
+                    "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
+                    rusqlite::params![new_instrume, file_id],
+                );
+
                 // File metadata and header already exist, no need to re-insert
                 return Ok(None);
             }
@@ -337,10 +368,17 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool) -> an
     let file_id = insert_file(conn, &file)?;
 
     // Parse and insert frame metadata
-    let frame = match format {
+    let mut frame = match format {
         FileFormat::FITS => parse_fits(path, file_id)?,
         FileFormat::XISF => parse_xisf(path, file_id)?,
     };
+
+    // Apply unique camera suffix to INSTRUME if enabled
+    if unique_camera {
+        if let Some(ref instrume) = frame.instrume {
+            frame.instrume = Some(format!("{} N{}", instrume, root_id));
+        }
+    }
 
     let frame_id = insert_frame(conn, &frame)?;
     let imagetyp = frame.imagetyp.clone();
@@ -542,6 +580,7 @@ pub fn scan_directory_parallel(
     app_handle: &tauri::AppHandle,
     use_content_hash: bool,
     cancel_flag: Arc<AtomicBool>,
+    unique_camera: bool,
 ) -> ScanResult {
     let mut result = ScanResult {
         files_found: 0,
@@ -769,6 +808,20 @@ pub fn scan_directory_parallel(
                             file_id
                         ],
                     );
+
+                    // Update INSTRUME based on destination root's unique_camera setting
+                    // file_result.frame.instrume has the raw FITS header value (no suffix)
+                    let new_instrume = if unique_camera {
+                        file_result.frame.instrume.as_ref()
+                            .map(|i| format!("{} N{}", i, root_id))
+                    } else {
+                        file_result.frame.instrume.clone()
+                    };
+                    let _ = conn.execute(
+                        "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
+                        rusqlite::params![new_instrume, file_id],
+                    );
+
                     continue; // Skip insert, file was moved
                 }
             }
@@ -779,6 +832,13 @@ pub fn scan_directory_parallel(
             Ok(file_id) => {
                 // Update frame file_id in place (avoids clone of 32-field struct)
                 file_result.frame.file_id = file_id;
+
+                // Apply unique camera suffix to INSTRUME if enabled
+                if unique_camera {
+                    if let Some(ref instrume) = file_result.frame.instrume {
+                        file_result.frame.instrume = Some(format!("{} N{}", instrume, root_id));
+                    }
+                }
 
                 match insert_frame(conn, &file_result.frame) {
                     Ok(frame_id) => {

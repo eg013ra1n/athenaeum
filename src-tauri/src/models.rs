@@ -108,6 +108,7 @@ pub struct ScanRoot {
     pub path: String,
     pub enabled: bool,
     pub find_duplicates: bool,
+    pub unique_camera: bool,
     pub last_scan: Option<DateTime<Utc>>,
 }
 

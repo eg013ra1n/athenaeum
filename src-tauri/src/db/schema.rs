@@ -65,6 +65,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             path TEXT NOT NULL UNIQUE,
             enabled INTEGER NOT NULL DEFAULT 1,
             find_duplicates INTEGER NOT NULL DEFAULT 1,
+            unique_camera INTEGER NOT NULL DEFAULT 0,
             last_scan TEXT
         )",
         [],
@@ -550,6 +551,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_telescop {
         conn.execute(
             "ALTER TABLE calibration_set ADD COLUMN telescop TEXT",
+            [],
+        )?;
+    }
+
+    // Add unique_camera to scan_roots table (migration for existing databases)
+    let has_unique_camera: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_roots') WHERE name='unique_camera'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_unique_camera {
+        conn.execute(
+            "ALTER TABLE scan_roots ADD COLUMN unique_camera INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

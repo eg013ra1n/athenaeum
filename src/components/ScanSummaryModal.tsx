@@ -1,4 +1,4 @@
-import { X, CheckCircle2, XCircle, Sun, Moon, Aperture, CircleDot, Eclipse, Layers, FileWarning, AlertTriangle } from 'lucide-react';
+import { X, CheckCircle2, XCircle, Sun, Moon, Aperture, CircleDot, Eclipse, Layers, FileWarning, AlertTriangle, RefreshCw } from 'lucide-react';
 import type { ScanResult } from '../types/models';
 
 interface ScanSummaryModalProps {
@@ -156,6 +156,23 @@ export function ScanSummaryModal({ isOpen, onClose, scanResult, rootPath, missin
                     </div>
                   );
                 })}
+              </div>
+            </div>
+          )}
+
+          {/* Unique Camera Reconciliation */}
+          {scanResult.frames_renamed > 0 && (
+            <div className="flex items-center gap-3 p-4 bg-info-muted border border-info/50 rounded-lg">
+              <RefreshCw className="text-accent" size={24} />
+              <div>
+                <p className="font-semibold text-accent">
+                  Unique Camera Reconciliation
+                </p>
+                <p className="text-xs text-content-muted">
+                  {scanResult.frames_renamed} frame{scanResult.frames_renamed !== 1 ? 's' : ''} renamed
+                  {scanResult.calibration_sets_deleted > 0 && `, ${scanResult.calibration_sets_deleted} cal set${scanResult.calibration_sets_deleted !== 1 ? 's' : ''} rebuilt`}
+                  {scanResult.sessions_updated > 0 && `, ${scanResult.sessions_updated} session${scanResult.sessions_updated !== 1 ? 's' : ''} updated`}
+                </p>
               </div>
             </div>
           )}
