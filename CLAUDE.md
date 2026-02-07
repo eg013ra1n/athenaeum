@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## General rules
+When implementing plans, start with the minimal viable approach. Do NOT over-engineer or try to build/stub entire dependency trees (e.g., don't build all of Siril when only a few C files are needed). Ask for clarification if scope is unclear.
+Never swallow errors silently. When implementing error handling in Rust commands or TypeScript handlers, always log errors to console/stderr before returning. Silent error swallowing has repeatedly caused hours of debugging.
+
+### Testing and Debugging
+
+When debugging, test with real data files (e.g., real FITS files) early rather than spending extended time on synthetic tests. If synthetic tests pass but real-world behavior differs, switch to real data immediately.
+When there are any 
+
+### Communication section
+
+When the user describes a concept (e.g., 'calibration set ID', 'filter field'), ask for clarification if there's any ambiguity rather than assuming a technical interpretation. Do not substitute domain terms (e.g., 'equipment ID' ≠ 'calibration set ID', 'filter' ≠ 'sort').
+
+### Editing Conventions
+
+For multi-file edit sessions, consolidate changes into complete passes rather than making many incremental small edits. When editing large files, be especially careful to preserve file integrity—avoid partial writes or truncation.
+
 ## Project Overview
 
 Athenaeum is a desktop application for astrophotographers to manage FITS/XISF image files. It builds a searchable metadata catalog with specialized astronomy features including:
@@ -35,6 +52,8 @@ npm test
 The SQLite database is created in the user's app data directory by Tauri. Schema initialization happens in `src-tauri/src/db/schema.rs`.
 
 ## Architecture
+
+This project uses a Tauri stack: Rust backend + React/TypeScript frontend. Be aware of serialization boundaries—Rust uses snake_case, TypeScript uses camelCase. Always verify serde attributes and IPC serialization when wiring backend to frontend.
 
 ### Frontend (React + TypeScript)
 
