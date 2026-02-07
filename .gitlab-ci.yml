@@ -22,15 +22,13 @@ build:windows:
       - .npm/
       - node_modules/
   script:
-    - $env:CC = "gcc"
-    - $env:CXX = "g++"
     - npm ci
-    - npm run tauri build
+    - npm run tauri build -- --target x86_64-pc-windows-gnu
   artifacts:
     name: "athenaeum-windows-${CI_COMMIT_SHORT_SHA}"
     paths:
-      - src-tauri/target/release/bundle/msi/*.msi
-      - src-tauri/target/release/bundle/nsis/*.exe
+      - src-tauri/target/x86_64-pc-windows-gnu/release/bundle/msi/*.msi
+      - src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*.exe
     expire_in: 30 days
 
 # --- Release (only on tags) ---
