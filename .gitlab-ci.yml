@@ -22,6 +22,8 @@ build:windows:
       - .npm/
       - node_modules/
   script:
+    - $env:CC = "gcc"
+    - $env:CXX = "g++"
     - npm ci
     - npm run tauri build
   artifacts:
