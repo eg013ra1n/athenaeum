@@ -12,34 +12,6 @@ import type {
 } from '../types/models';
 
 /**
- * Initialize the database
- */
-export function useInitializeDatabase() {
-  const [dbPath, setDbPath] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const init = async () => {
-      try {
-        setLoading(true);
-        const path = await invoke<string>('initialize_database');
-        setDbPath(path);
-        setError(null);
-      } catch (e) {
-        setError(e as string);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    init();
-  }, []);
-
-  return { dbPath, loading, error };
-}
-
-/**
  * Manage scan roots (monitored directories)
  */
 export function useScanRoots() {

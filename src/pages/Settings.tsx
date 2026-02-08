@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
-import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair, Terminal, FolderOpen, Wand2 } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
@@ -43,84 +42,13 @@ export default function Settings() {
   const [rescanningContentHash, setRescanningContentHash] = useState(false);
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
-  // Siril CLI path state
-  const [sirilPath, setSirilPath] = useState<string>('');
-  const [sirilPathSaving, setSirilPathSaving] = useState(false);
-  const [sirilPathSuccess, setSirilPathSuccess] = useState(false);
-  const [autoDetecting, setAutoDetecting] = useState(false);
-  const [autoDetectResult, setAutoDetectResult] = useState<string | null>(null);
-
   // Tab state
   const [activeTab, setActiveTab] = useState<'general' | 'calibration'>('general');
 
   useEffect(() => {
     loadSettings();
     loadCacheStats();
-    loadSirilPath();
   }, []);
-
-  const loadSirilPath = async () => {
-    try {
-      const path = await invoke<string | null>('get_siril_path');
-      setSirilPath(path || '');
-    } catch (err) {
-      console.error('Failed to load Siril path:', err);
-    }
-  };
-
-  const handleSaveSirilPath = async () => {
-    try {
-      setSirilPathSaving(true);
-      setSirilPathSuccess(false);
-      await invoke('set_siril_path', { path: sirilPath });
-      setSirilPathSuccess(true);
-      setTimeout(() => setSirilPathSuccess(false), 3000);
-    } catch (err) {
-      setError(err as string);
-    } finally {
-      setSirilPathSaving(false);
-    }
-  };
-
-  const handleAutoDetectSiril = async () => {
-    try {
-      setAutoDetecting(true);
-      setAutoDetectResult(null);
-      // Clear the saved path first to trigger fresh auto-detection
-      await invoke('set_siril_path', { path: '' });
-      const detectedPath = await invoke<string | null>('get_siril_path');
-      if (detectedPath) {
-        setSirilPath(detectedPath);
-        setAutoDetectResult(`Found: ${detectedPath}`);
-        // Save the detected path
-        await invoke('set_siril_path', { path: detectedPath });
-      } else {
-        setAutoDetectResult('Siril CLI not found in common locations');
-      }
-      setTimeout(() => setAutoDetectResult(null), 5000);
-    } catch (err) {
-      setError(err as string);
-    } finally {
-      setAutoDetecting(false);
-    }
-  };
-
-  const handleBrowseSirilPath = async () => {
-    try {
-      const selected = await open({
-        multiple: false,
-        title: 'Select Siril CLI Executable',
-        filters: [
-          { name: 'Executable', extensions: ['', 'exe'] }
-        ]
-      });
-      if (selected && typeof selected === 'string') {
-        setSirilPath(selected);
-      }
-    } catch (err) {
-      console.error('Failed to browse for Siril:', err);
-    }
-  };
 
   const loadSettings = async () => {
     try {
@@ -522,81 +450,6 @@ export default function Settings() {
                 sessions can span midnight (e.g., 19:00 Day 1 → 03:00 Day 2 = one night). Default
                 is 6 hours.
               </p>
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
-            <Terminal size={20} />
-            Siril Integration
-          </h3>
-
-          <div className="space-y-4">
-            {/* Siril CLI Path */}
-            <div>
-              <label className="block text-sm font-medium text-content-secondary mb-2">
-                Siril CLI Path
-              </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={sirilPath}
-                  onChange={(e) => setSirilPath(e.target.value)}
-                  placeholder="/path/to/siril-cli"
-                  className="flex-1 bg-surface-hover border border-border rounded-lg px-4 py-2 text-content placeholder-gray-500 focus:outline-none focus:border-accent"
-                />
-                <button
-                  onClick={handleBrowseSirilPath}
-                  className="px-3 py-2 bg-surface-hover hover:brightness-110 rounded-lg transition-colors"
-                  title="Browse for Siril CLI"
-                >
-                  <FolderOpen size={18} />
-                </button>
-                <button
-                  onClick={handleAutoDetectSiril}
-                  disabled={autoDetecting}
-                  className="px-3 py-2 bg-purple hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed rounded-lg transition-colors flex items-center gap-2"
-                  title="Auto-detect Siril CLI"
-                >
-                  <Wand2 size={18} className={autoDetecting ? 'animate-pulse' : ''} />
-                  {autoDetecting ? 'Detecting...' : 'Auto-detect'}
-                </button>
-              </div>
-              <p className="text-xs text-content-muted mt-2">
-                Path to the Siril command-line interface. On macOS, it's typically at{' '}
-                <code className="bg-surface-hover px-1 rounded">/Applications/Siril.app/Contents/MacOS/siril-cli</code>
-              </p>
-
-              {autoDetectResult && (
-                <div className={`mt-2 flex items-center gap-2 text-sm ${
-                  autoDetectResult.startsWith('Found') ? 'text-success' : 'text-warning'
-                }`}>
-                  {autoDetectResult.startsWith('Found') ? (
-                    <CheckCircle size={16} />
-                  ) : (
-                    <AlertCircle size={16} />
-                  )}
-                  {autoDetectResult}
-                </div>
-              )}
-
-              <div className="mt-3 flex items-center gap-2">
-                <button
-                  onClick={handleSaveSirilPath}
-                  disabled={sirilPathSaving || !sirilPath}
-                  className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors text-sm"
-                >
-                  <Save size={16} />
-                  {sirilPathSaving ? 'Saving...' : 'Save Siril Path'}
-                </button>
-                {sirilPathSuccess && (
-                  <div className="flex items-center gap-2 text-success text-sm">
-                    <CheckCircle size={16} />
-                    Saved!
-                  </div>
-                )}
-              </div>
             </div>
           </div>
         </div>

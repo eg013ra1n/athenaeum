@@ -7,7 +7,7 @@ use crate::export::{
     collect_export_data, collect_export_summary, organize_files_wbpp,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
-        ExportData, ExportResult, ExportSummary, SirilScriptPreview,
+        ExportData, ExportResult, ExportSummary,
     },
 };
 use std::path::PathBuf;
@@ -324,7 +324,6 @@ pub async fn get_calibration_route(
 
     Ok(CalibrationRoute {
         groups,
-        script_preview: Vec::<SirilScriptPreview>::new(),
         summary,
     })
 }

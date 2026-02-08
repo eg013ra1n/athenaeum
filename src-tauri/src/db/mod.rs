@@ -32,7 +32,8 @@ impl Database {
         // temp_store=MEMORY: Store temp tables in memory
         // mmap_size=256MB: Memory-mapped I/O for faster reads
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            "PRAGMA busy_timeout = 1500;
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -64000;
              PRAGMA temp_store = MEMORY;

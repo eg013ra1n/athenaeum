@@ -23,12 +23,20 @@ pub async fn initialize_database(
     std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
 
     let db_path = app_dir.join("athenaeum.db");
+
+    // Hold the lock for the entire initialization to prevent concurrent
+    // Database::new calls (React StrictMode fires effects twice in dev)
+    let mut db_lock = state.db.lock().unwrap();
+    if db_lock.is_some() {
+        return Ok(db_path.to_string_lossy().to_string());
+    }
+
     let db = Database::new(db_path.clone()).map_err(|e| {
         crate::logging::log("ERROR", &format!("Database init failed: {}", e));
         e.to_string()
     })?;
 
-    *state.db.lock().unwrap() = Some(db);
+    *db_lock = Some(db);
 
     crate::logging::log("INFO", &format!("Database initialized: {}", db_path.display()));
     Ok(db_path.to_string_lossy().to_string())

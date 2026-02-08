@@ -247,8 +247,6 @@ pub fn sanitize_folder_name(name: &str) -> String {
 pub struct CalibrationRoute {
     /// Export groups and their calibration trees
     pub groups: Vec<CalibrationRouteGroup>,
-    /// Generated Siril script previews (kept for type compatibility)
-    pub script_preview: Vec<SirilScriptPreview>,
     /// Overall summary
     pub summary: CalibrationRouteSummary,
 }
@@ -289,18 +287,6 @@ pub struct CalibrationTreeNode {
     pub is_missing: bool,
     /// Whether this set is shared with other subgroups/groups
     pub is_shared: bool,
-}
-
-/// Preview of a Siril script (kept for type compatibility)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SirilScriptPreview {
-    /// Script name (e.g., "00_create_masters.ssf")
-    pub name: String,
-    /// Script purpose description
-    pub description: String,
-    /// Full script content
-    pub content: String,
 }
 
 /// Summary of the calibration route

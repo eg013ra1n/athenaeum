@@ -149,7 +149,6 @@ export interface ExportCalibrationSet {
  */
 export interface CalibrationRoute {
   groups: CalibrationRouteGroup[];
-  scriptPreview: SirilScriptPreview[];
   summary: CalibrationRouteSummary;
 }
 
@@ -176,15 +175,6 @@ export interface CalibrationTreeNode {
   warnings: string[];
   isMissing: boolean;
   isShared: boolean;
-}
-
-/**
- * Preview of a Siril script (kept for type compatibility)
- */
-export interface SirilScriptPreview {
-  name: string;
-  description: string;
-  content: string;
 }
 
 /**

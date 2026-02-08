@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, XCircle, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
-import { useScanRootsWithAvailability, useInitializeDatabase, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
+import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
@@ -17,7 +17,6 @@ type DuplicatesViewMode = 'files' | 'folders';
 type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrument';
 
 export default function FileManager() {
-  const { dbPath, loading: dbLoading, error: dbError } = useInitializeDatabase();
   const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, relinkScanRoot } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning } = useScanProgressContext();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
@@ -262,31 +261,6 @@ export default function FileManager() {
     }
   };
 
-  // Show loading state while database initializes
-  if (dbLoading) {
-    return (
-      <div className="flex items-center justify-center h-screen">
-        <div className="text-center">
-          <Loader2 className="animate-spin mx-auto mb-4" size={48} />
-          <p className="text-content-muted">Initializing database...</p>
-        </div>
-      </div>
-    );
-  }
-
-  // Show error if database initialization failed
-  if (dbError) {
-    return (
-      <div className="flex items-center justify-center h-screen">
-        <div className="text-center text-error">
-          <XCircle className="mx-auto mb-4" size={48} />
-          <p className="font-semibold mb-2">Database initialization failed</p>
-          <p className="text-sm">{String(dbError)}</p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="p-6">
       <div className="mb-6">
@@ -294,9 +268,6 @@ export default function FileManager() {
         <p className="text-content-muted">
           Manage monitored directories and view FITS/XISF metadata
         </p>
-        {dbPath && (
-          <p className="text-xs text-content-muted mt-1">Database: {dbPath}</p>
-        )}
       </div>
 
       {/* Tab Navigation */}
