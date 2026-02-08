@@ -583,7 +583,11 @@ pub fn get_files_by_directory(
     };
 
     // Find files that are directly in this directory (not in subdirectories)
-    // path should start with directory_path/ but not contain additional slashes after that
+    // Use OS path separator for cross-platform compatibility (/ on macOS/Linux, \ on Windows)
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let like_pattern = format!("{}{}%", directory_path, sep);
+    let expected_depth = directory_path.matches(sep.as_str()).count() as i64 + 1;
+
     let query = format!(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
@@ -592,9 +596,8 @@ pub fn get_files_by_directory(
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
-         WHERE f.path LIKE ?1 || '/%'
-           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, '/', ''))) =
-               (LENGTH(?1) - LENGTH(REPLACE(?1, '/', '')) + 1)
+         WHERE f.path LIKE ?1
+           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?2, ''))) = ?3
          ORDER BY f.filename
          {}",
         limit_clause
@@ -602,7 +605,7 @@ pub fn get_files_by_directory(
 
     let mut stmt = conn.prepare(&query)?;
 
-    let results = stmt.query_map(params![directory_path], |row| {
+    let results = stmt.query_map(params![like_pattern, sep, expected_depth], |row| {
         let file = File {
             id: Some(row.get(0)?),
             path: row.get(1)?,

@@ -169,7 +169,10 @@ pub fn scan_directory(
 
     result.files_processed = *processed.lock().unwrap();
     result.files_skipped = *skipped.lock().unwrap();
-    result.errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
+    result.errors = match Arc::try_unwrap(errors) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    };
 
     // Populate frame type counts
     result.lights_count = lights_count;
@@ -496,6 +499,8 @@ fn process_file_parallel(
     path: &PathBuf,
     use_content_hash: bool,
 ) -> Result<FileProcessResult, String> {
+    crate::logging::log("DEBUG", &format!("Processing: {}", path.display()));
+
     // Get file metadata
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let size = metadata.len() as i64;
@@ -547,16 +552,26 @@ fn process_file_parallel(
     };
 
     // Parse FITS/XISF metadata (using file_id=0 as placeholder, will be updated during insert)
-    let frame = match format {
-        FileFormat::FITS => parse_fits(path, 0).map_err(|e| e.to_string())?,
-        FileFormat::XISF => parse_xisf(path, 0).map_err(|e| e.to_string())?,
-    };
+    let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match format {
+            FileFormat::FITS => parse_fits(path, 0),
+            FileFormat::XISF => parse_xisf(path, 0),
+        }
+    }))
+    .map_err(|e| format!("FITS parsing panicked for '{}': {:?}", path.display(), e))?
+    .map_err(|e| e.to_string())?;
 
     // Extract header
-    let header = match format {
-        FileFormat::FITS => extract_fits_header(path).ok(),
-        FileFormat::XISF => extract_xisf_header(path).ok(),
-    };
+    let header = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match format {
+            FileFormat::FITS => extract_fits_header(path).ok(),
+            FileFormat::XISF => extract_xisf_header(path).ok(),
+        }
+    }))
+    .unwrap_or_else(|e| {
+        crate::logging::log("ERROR", &format!("Header extraction panicked for '{}': {:?}", path.display(), e));
+        None
+    });
 
     let imagetyp = frame.imagetyp.clone();
 
@@ -597,6 +612,7 @@ pub fn scan_directory_parallel(
     };
 
     // Phase 1a: Discovery - collect all file paths with progress updates
+    crate::logging::log("INFO", &format!("Phase 1a: Starting file discovery in '{}'", root_path.display()));
     emit_progress(app_handle, root_id, 0, 0, None, "discovery");
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -638,6 +654,7 @@ pub fn scan_directory_parallel(
     }
 
     result.files_found = files.len();
+    crate::logging::log("INFO", &format!("Phase 1a complete: {} files found", files.len()));
 
     // Check for cancellation before proceeding
     if cancel_flag.load(Ordering::SeqCst) {
@@ -655,12 +672,25 @@ pub fn scan_directory_parallel(
     }
 
     // Build a set of existing file paths for quick lookup
+    crate::logging::log("INFO", "Building existing paths set from DB...");
     let existing_paths: std::collections::HashSet<String> = {
         let mut paths = std::collections::HashSet::new();
-        let mut stmt = conn.prepare("SELECT path FROM files").unwrap();
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
-        for path in rows.flatten() {
-            paths.insert(path);
+        match conn.prepare("SELECT path FROM files") {
+            Ok(mut stmt) => {
+                match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    Ok(rows) => {
+                        for path in rows.flatten() {
+                            paths.insert(path);
+                        }
+                    }
+                    Err(e) => {
+                        crate::logging::log("ERROR", &format!("Failed to query existing files: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                crate::logging::log("ERROR", &format!("Failed to prepare existing files query: {}", e));
+            }
         }
         paths
     };
@@ -672,6 +702,7 @@ pub fn scan_directory_parallel(
         .collect();
 
     result.files_skipped = result.files_found - new_files.len();
+    crate::logging::log("INFO", &format!("New files to process: {} (skipped {})", new_files.len(), result.files_skipped));
 
     // Check for cancellation before processing
     if cancel_flag.load(Ordering::SeqCst) {
@@ -698,6 +729,7 @@ pub fn scan_directory_parallel(
     }
 
     // Phase 1b: Parallel processing - extract metadata from all files
+    crate::logging::log("INFO", &format!("Phase 1b: Starting parallel FITS parsing of {} files", new_files.len()));
     let progress_counter = Arc::new(AtomicUsize::new(0));
     let total_new = new_files.len();
     let errors = Arc::new(Mutex::new(Vec::new()));
@@ -739,10 +771,15 @@ pub fn scan_directory_parallel(
         })
         .collect();
 
+    crate::logging::log("INFO", &format!("Phase 1b complete: {} results collected", processed_results.len()));
+
     // Check if cancelled during processing phase
     if cancel_flag.load(Ordering::SeqCst) {
         result.cancelled = true;
-        result.errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
+        result.errors = match Arc::try_unwrap(errors) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
         emit_scan_complete(app_handle, root_id, &result);
         return result;
     }
@@ -762,6 +799,7 @@ pub fn scan_directory_parallel(
     let mut lights_count: usize = 0;
 
     // Begin transaction for batch insert
+    crate::logging::log("INFO", &format!("Phase 2: Starting DB inserts for {} results", processed_results.len()));
     let _ = conn.execute("BEGIN TRANSACTION", []);
 
     // Use iter_mut to avoid cloning Frame structs during insert
@@ -890,7 +928,10 @@ pub fn scan_directory_parallel(
     let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
 
     // Collect errors
-    result.errors = Arc::try_unwrap(errors).unwrap().into_inner().unwrap();
+    result.errors = match Arc::try_unwrap(errors) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    };
     result.lights_count = lights_count;
     result.flats_count = flat_frame_ids.len();
     result.darks_count = dark_frame_ids.len();

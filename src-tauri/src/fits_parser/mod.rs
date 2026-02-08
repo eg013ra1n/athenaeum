@@ -96,8 +96,10 @@ fn validate_dec(dec: f64) -> Result<f64, String> {
 
 /// Extract full FITS header as text
 pub fn extract_fits_header(path: &Path) -> Result<String> {
+    crate::logging::log("DEBUG", &format!("Opening FITS for header: {}", path.display()));
     let mut fitsfile = FitsFile::open(path)
         .with_context(|| format!("Failed to open FITS file: {}", path.display()))?;
+    crate::logging::log("DEBUG", &format!("FITS header open OK: {}", path.display()));
 
     let hdu = fitsfile.primary_hdu()?;
 
@@ -146,6 +148,7 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
     use std::fs::File;
     use std::io::{BufReader, Read};
 
+    crate::logging::log("DEBUG", &format!("Opening XISF for header: {}", path.display()));
     // Read the first 1MB which should contain the XML header
     let file = File::open(path)
         .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
@@ -228,10 +231,11 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
 
 /// Parse FITS file metadata
 pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
-    println!("Parsing FITS file: {}", path.display());
+    crate::logging::log("DEBUG", &format!("Opening FITS for parsing: {}", path.display()));
 
     let mut fitsfile = FitsFile::open(path)
         .with_context(|| format!("Failed to open FITS file: {}", path.display()))?;
+    crate::logging::log("DEBUG", &format!("FITS parse open OK: {}", path.display()));
 
     let hdu = fitsfile.primary_hdu()?;
 
@@ -378,7 +382,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     use std::fs::File;
     use std::io::{BufReader, Read};
 
-    println!("Parsing XISF file: {}", path.display());
+    crate::logging::log("DEBUG", &format!("Opening XISF for parsing: {}", path.display()));
 
     // Read the file
     let file = File::open(path)
