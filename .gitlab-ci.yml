@@ -19,10 +19,7 @@ build:windows:
     paths:
       - .cargo/registry/
       - .cargo/git/
-      - src-tauri/target/release/.fingerprint/
-      - src-tauri/target/release/build/
-      - src-tauri/target/release/deps/
-      - src-tauri/target/release/.cargo-lock
+      - src-tauri/target/
       - .npm/
   script:
     - npm ci
@@ -48,10 +45,7 @@ update-cache:windows:
     paths:
       - .cargo/registry/
       - .cargo/git/
-      - src-tauri/target/release/.fingerprint/
-      - src-tauri/target/release/build/
-      - src-tauri/target/release/deps/
-      - src-tauri/target/release/.cargo-lock
+      - src-tauri/target/
       - .npm/
   script:
     - npm ci

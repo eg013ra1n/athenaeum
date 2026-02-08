@@ -34,7 +34,7 @@ pub fn calculate_fov(
     pixel_size_um: Option<f64>,
     focal_length_mm: Option<f64>,
     naxis: Option<i32>,
-    binning: Option<i32>,
+    _binning: Option<i32>,
 ) -> Option<f64> {
     match (pixel_size_um, focal_length_mm, naxis) {
         (Some(pixel_size), Some(focal_len), Some(sensor_pixels)) if focal_len > 0.0 && sensor_pixels > 0 => {
