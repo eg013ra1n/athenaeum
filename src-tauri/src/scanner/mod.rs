@@ -5,7 +5,7 @@ use crate::db::{
     file_exists, insert_file, insert_frame, insert_fits_header,
     rebuild_duplicate_groups_cache, rebuild_folder_similarity_cache,
 };
-use crate::fits_parser::{parse_fits, parse_xisf, extract_fits_header, extract_xisf_header};
+use crate::fits_parser::{parse_xisf, extract_xisf_header, parse_fits_with_header};
 use crate::duplicates::compute_metadata_hash;
 use crate::models::{File, Frame, FileFormat, ImageType};
 use chrono::Utc;
@@ -269,16 +269,23 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
         return Ok(None);
     }
 
-    // Extract header early to check for moved files
-    let header_result = match format {
-        FileFormat::FITS => extract_fits_header(path),
-        FileFormat::XISF => extract_xisf_header(path),
+    // Parse metadata and header in a single read for FITS files
+    // This also serves for the moved-file fingerprint check
+    let (early_frame, header_text) = match format {
+        FileFormat::FITS => {
+            let (f, h) = parse_fits_with_header(path, 0)?;
+            (Some(f), Some(h))
+        }
+        FileFormat::XISF => {
+            // XISF reads are already bounded to 1MB, no full-file read issue
+            (None, extract_xisf_header(path).ok())
+        }
     };
 
-    if let Ok(header) = header_result {
-        let fingerprint = crate::fingerprint::compute_header_fingerprint(&header);
+    // Check for moved files using the header fingerprint
+    if let Some(ref header) = header_text {
+        let fingerprint = crate::fingerprint::compute_header_fingerprint(header);
 
-        // Check if a file with this fingerprint exists at a different path
         let existing_file: Option<(i64, String)> = conn.query_row(
             "SELECT f.id, f.path FROM files f
              INNER JOIN fits_header fh ON f.id = fh.file_id
@@ -288,13 +295,9 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
         ).optional()?;
 
         if let Some((file_id, old_path)) = existing_file {
-            // Check if the old file still exists on disk
             if std::path::Path::new(&old_path).exists() {
-                // Old file still exists - this is a DUPLICATE, not a move
-                // Continue with normal insertion to create a separate record
                 println!("Detected duplicate file: '{}' and '{}' have identical headers", old_path, current_path);
             } else {
-                // Old file no longer exists - this is a MOVE
                 println!("Detected moved file: '{}' -> '{}' (file_id={})", old_path, current_path, file_id);
 
                 conn.execute(
@@ -302,17 +305,12 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
                     rusqlite::params![current_path, modified_dt.to_rfc3339(), file_id],
                 )?;
 
-                // Update INSTRUME based on destination root's unique_camera setting
-                // The frame was parsed fresh from disk, so frame.instrume has the raw FITS value
                 let raw_instrume: Option<String> = conn.query_row(
                     "SELECT instrume FROM frames WHERE file_id = ?1",
                     rusqlite::params![file_id],
                     |row| row.get(0),
                 ).optional()?.flatten();
-                // We can't easily get the raw FITS instrume here without re-parsing,
-                // so strip any existing N<id> suffix before reapplying
                 let base_instrume = raw_instrume.as_ref().map(|i| {
-                    // Strip existing " N<digits>" suffix if present
                     if let Some(pos) = i.rfind(" N") {
                         let suffix = &i[pos + 2..];
                         if suffix.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty() {
@@ -331,7 +329,6 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
                     rusqlite::params![new_instrume, file_id],
                 );
 
-                // File metadata and header already exist, no need to re-insert
                 return Ok(None);
             }
         }
@@ -340,7 +337,6 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
     // If we get here, it's a truly new file - insert it
     let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
 
-    // Compute content hash if enabled in settings
     let content_hash = if use_content_hash {
         match crate::duplicates::compute_xxhash(path) {
             Ok(hash) => {
@@ -370,10 +366,13 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
 
     let file_id = insert_file(conn, &file)?;
 
-    // Parse and insert frame metadata
-    let mut frame = match format {
-        FileFormat::FITS => parse_fits(path, file_id)?,
-        FileFormat::XISF => parse_xisf(path, file_id)?,
+    // Use already-parsed frame for FITS, or parse fresh for XISF
+    let mut frame = match early_frame {
+        Some(mut f) => {
+            f.file_id = file_id;
+            f
+        }
+        None => parse_xisf(path, file_id)?,
     };
 
     // Apply unique camera suffix to INSTRUME if enabled
@@ -386,34 +385,23 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
     let frame_id = insert_frame(conn, &frame)?;
     let imagetyp = frame.imagetyp.clone();
 
-    // Store full FITS header for future reference
-    if format == FileFormat::FITS {
-        match extract_fits_header(path) {
-            Ok(header) => {
-                println!("Storing FITS header for file_id={}, header length={} bytes", file_id, header.len());
-                if let Err(e) = insert_fits_header(conn, file_id, &header) {
-                    println!("Warning: Failed to store FITS header: {}", e);
-                    // Continue processing - header storage is non-critical
-                }
-            }
-            Err(e) => {
-                println!("Warning: Failed to extract FITS header: {}", e);
-                // Continue processing - header storage is non-critical
-            }
+    // Store header for future reference (already extracted above)
+    if let Some(header) = header_text {
+        println!("Storing header for file_id={}, header length={} bytes", file_id, header.len());
+        if let Err(e) = insert_fits_header(conn, file_id, &header) {
+            println!("Warning: Failed to store header: {}", e);
         }
     } else if format == FileFormat::XISF {
-        // Store XISF header for future reference
+        // XISF header extraction failed earlier, try again
         match extract_xisf_header(path) {
             Ok(header) => {
                 println!("Storing XISF header for file_id={}, header length={} bytes", file_id, header.len());
                 if let Err(e) = insert_fits_header(conn, file_id, &header) {
                     println!("Warning: Failed to store XISF header: {}", e);
-                    // Continue processing - header storage is non-critical
                 }
             }
             Err(e) => {
                 println!("Warning: Failed to extract XISF header: {}", e);
-                // Continue processing - header storage is non-critical
             }
         }
     }
@@ -551,27 +539,18 @@ fn process_file_parallel(
         content_hash,
     };
 
-    // Parse FITS/XISF metadata (using file_id=0 as placeholder, will be updated during insert)
-    let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match format {
-            FileFormat::FITS => parse_fits(path, 0),
-            FileFormat::XISF => parse_xisf(path, 0),
+    // Parse metadata and extract header in a single read for FITS files
+    let (frame, header) = match format {
+        FileFormat::FITS => {
+            let (f, h) = parse_fits_with_header(path, 0).map_err(|e| e.to_string())?;
+            (f, Some(h))
         }
-    }))
-    .map_err(|e| format!("FITS parsing panicked for '{}': {:?}", path.display(), e))?
-    .map_err(|e| e.to_string())?;
-
-    // Extract header
-    let header = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match format {
-            FileFormat::FITS => extract_fits_header(path).ok(),
-            FileFormat::XISF => extract_xisf_header(path).ok(),
+        FileFormat::XISF => {
+            let f = parse_xisf(path, 0).map_err(|e| e.to_string())?;
+            let h = extract_xisf_header(path).ok();
+            (f, h)
         }
-    }))
-    .unwrap_or_else(|e| {
-        crate::logging::log("ERROR", &format!("Header extraction panicked for '{}': {:?}", path.display(), e));
-        None
-    });
+    };
 
     let imagetyp = frame.imagetyp.clone();
 

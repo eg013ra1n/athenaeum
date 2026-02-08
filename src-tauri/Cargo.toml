@@ -37,14 +37,6 @@ quick-xml = "0.36"
 rustafits = "0.2.3"
 base64 = "0.22"
 
-# On macOS/Linux: build cfitsio from source
-[target.'cfg(not(windows))'.dependencies]
-fitsio = { version = "0.21", features = ["fitsio-src"] }
-
-# On Windows: use pre-built cfitsio (via vcpkg)
-[target.'cfg(windows)'.dependencies]
-fitsio = { version = "0.21" }
-
 [profile.release]
 lto = true           # Link-time optimization for cross-function inlining
 codegen-units = 1    # Single compilation unit for better optimization

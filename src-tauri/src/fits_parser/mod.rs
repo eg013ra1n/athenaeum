@@ -1,9 +1,11 @@
 // FITS/XISF metadata parser module
 
+pub(crate) mod fits_header_reader;
+
 use crate::models::{Frame, ImageType};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use fitsio::FitsFile;
+use fits_header_reader::FitsHeader;
 use std::path::Path;
 
 /// Detects if RA is in hours (0-24) or degrees (0-360) and normalizes to degrees
@@ -94,51 +96,20 @@ fn validate_dec(dec: f64) -> Result<f64, String> {
     }
 }
 
-/// Extract full FITS header as text
+/// Extract full FITS header as text (all raw cards, not just a keyword whitelist)
 pub fn extract_fits_header(path: &Path) -> Result<String> {
-    crate::logging::log("DEBUG", &format!("Opening FITS for header: {}", path.display()));
-    let mut fitsfile = FitsFile::open(path)
-        .with_context(|| format!("Failed to open FITS file: {}", path.display()))?;
-    crate::logging::log("DEBUG", &format!("FITS header open OK: {}", path.display()));
+    crate::logging::log("DEBUG", &format!("Reading FITS header: {}", path.display()));
+    let header = FitsHeader::from_path(path)?;
+    Ok(header.to_header_text())
+}
 
-    let hdu = fitsfile.primary_hdu()?;
-
-    // Read all header keywords and format as text
-    let mut header_text = String::new();
-
-    // Try to read common FITS keywords
-    let keywords = vec![
-        "SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3",
-        "EXTEND", "BSCALE", "BZERO", "BUNIT",
-        "OBJECT", "DATE-OBS", "TIME-OBS", "TELESCOP", "INSTRUME",
-        "OBSERVER", "ORIGIN", "REFERENC", "AUTHOR", "DATE",
-        "EXPTIME", "EXPOSURE", "FILTER", "IMAGETYP", "FRAME",
-        "GAIN", "EGAIN", "OFFSET", "PEDESTAL",
-        "XBINNING", "YBINNING", "BINNING",
-        "CCD-TEMP", "SET-TEMP", "TEMP", "COOLTEMP",
-        "FOCALLEN", "XPIXSZ", "YPIXSZ", "PIXSZ", "PIXSCALE",
-        "RA", "DEC", "OBJCTRA", "OBJCTDEC",
-        "EQUINOX", "RADESYS", "CTYPE1", "CTYPE2",
-        "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2",
-        "CD1_1", "CD1_2", "CD2_1", "CD2_2",
-        "CDELT1", "CDELT2", "CROTA1", "CROTA2",
-        "SITELAT", "SITELONG", "LAT-OBS", "LONG-OBS", "ALT-OBS",
-        "AIRMASS", "ALTITUDE", "AZIMUTH",
-        "COMMENT", "HISTORY",
-    ];
-
-    for keyword in keywords {
-        if let Ok(value) = hdu.read_key::<String>(&mut fitsfile, keyword) {
-            header_text.push_str(&format!("{} = {}\n", keyword, value));
-        }
-    }
-
-    // If header is still empty, at least record that we tried
-    if header_text.is_empty() {
-        header_text = format!("Header extracted from: {}\n(No standard keywords found)", path.display());
-    }
-
-    Ok(header_text)
+/// Parse FITS file and return both Frame metadata and raw header text in a single read.
+pub fn parse_fits_with_header(path: &Path, file_id: i64) -> Result<(Frame, String)> {
+    crate::logging::log("DEBUG", &format!("Parsing FITS (combined): {}", path.display()));
+    let header = FitsHeader::from_path(path)?;
+    let header_text = header.to_header_text();
+    let frame = build_frame_from_header(&header, file_id, path)?;
+    Ok((frame, header_text))
 }
 
 /// Extract full XISF header as text
@@ -229,56 +200,56 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
     Ok(header_text)
 }
 
-/// Parse FITS file metadata
+/// Parse FITS file metadata (single-result variant; prefer parse_fits_with_header for scanning)
+#[allow(dead_code)]
 pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
-    crate::logging::log("DEBUG", &format!("Opening FITS for parsing: {}", path.display()));
+    crate::logging::log("DEBUG", &format!("Parsing FITS: {}", path.display()));
+    let header = FitsHeader::from_path(path)?;
+    build_frame_from_header(&header, file_id, path)
+}
 
-    let mut fitsfile = FitsFile::open(path)
-        .with_context(|| format!("Failed to open FITS file: {}", path.display()))?;
-    crate::logging::log("DEBUG", &format!("FITS parse open OK: {}", path.display()));
-
-    let hdu = fitsfile.primary_hdu()?;
-
+/// Build a Frame from an already-parsed FitsHeader.
+fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Result<Frame> {
     // Extract standard FITS keywords
-    let object = read_keyword_string(&mut fitsfile, &hdu, "OBJECT").ok();
-    let date_obs_str = read_keyword_string(&mut fitsfile, &hdu, "DATE-OBS").ok();
-    let time_obs = read_keyword_string(&mut fitsfile, &hdu, "TIME-OBS").ok();
+    let object = header.get_str("OBJECT");
+    let date_obs_str = header.get_str("DATE-OBS");
+    let time_obs = header.get_str("TIME-OBS");
 
     println!("  DATE-OBS from FITS: {:?}", date_obs_str);
     println!("  TIME-OBS from FITS: {:?}", time_obs);
-    let telescop = read_keyword_string(&mut fitsfile, &hdu, "TELESCOP").ok();
-    let instrume = read_keyword_string(&mut fitsfile, &hdu, "INSTRUME").ok();
-    let exptime = read_keyword_f64(&mut fitsfile, &hdu, "EXPTIME").ok();
-    let filter = read_keyword_string(&mut fitsfile, &hdu, "FILTER").ok();
-    let imagetyp_str = read_keyword_string(&mut fitsfile, &hdu, "IMAGETYP").ok();
+    let telescop = header.get_str("TELESCOP");
+    let instrume = header.get_str("INSTRUME");
+    let exptime = header.get_f64("EXPTIME");
+    let filter = header.get_str("FILTER");
+    let imagetyp_str = header.get_str("IMAGETYP");
 
     // Additional metadata
-    let gain = read_keyword_f64(&mut fitsfile, &hdu, "GAIN").ok();
-    let offset = read_keyword_f64(&mut fitsfile, &hdu, "OFFSET").ok();
-    let xbinning = read_keyword_i32(&mut fitsfile, &hdu, "XBINNING").ok();
-    let ybinning = read_keyword_i32(&mut fitsfile, &hdu, "YBINNING").ok();
-    let ccd_temp = read_keyword_f64(&mut fitsfile, &hdu, "CCD-TEMP").ok();
-    let set_temp = read_keyword_f64(&mut fitsfile, &hdu, "SET-TEMP").ok();
-    let focallen = read_keyword_f64(&mut fitsfile, &hdu, "FOCALLEN").ok();
-    let swcreate = read_keyword_string(&mut fitsfile, &hdu, "SWCREATE").ok();
+    let gain = header.get_f64("GAIN");
+    let offset = header.get_f64("OFFSET");
+    let xbinning = header.get_i32("XBINNING");
+    let ybinning = header.get_i32("YBINNING");
+    let ccd_temp = header.get_f64("CCD-TEMP");
+    let set_temp = header.get_f64("SET-TEMP");
+    let focallen = header.get_f64("FOCALLEN");
+    let swcreate = header.get_str("SWCREATE");
 
     // Bayer pattern for OSC (one-shot color) cameras
-    let bayerpat = read_keyword_string(&mut fitsfile, &hdu, "BAYERPAT").ok();
+    let bayerpat = header.get_str("BAYERPAT");
 
     // Pixel size
-    let xpixsz = read_keyword_f64(&mut fitsfile, &hdu, "XPIXSZ").ok();
-    let ypixsz = read_keyword_f64(&mut fitsfile, &hdu, "YPIXSZ").ok();
+    let xpixsz = header.get_f64("XPIXSZ");
+    let ypixsz = header.get_f64("YPIXSZ");
 
     // Image dimensions
-    let naxis1 = read_keyword_i32(&mut fitsfile, &hdu, "NAXIS1").ok();
-    let naxis2 = read_keyword_i32(&mut fitsfile, &hdu, "NAXIS2").ok();
+    let naxis1 = header.get_i32("NAXIS1");
+    let naxis2 = header.get_i32("NAXIS2");
 
     // Astronomical coordinates
     // Read raw values first
-    let ra_raw = read_keyword_f64(&mut fitsfile, &hdu, "RA").ok();
-    let dec_raw = read_keyword_f64(&mut fitsfile, &hdu, "DEC").ok();
-    let objctra = read_keyword_string(&mut fitsfile, &hdu, "OBJCTRA").ok();
-    let objctdec = read_keyword_string(&mut fitsfile, &hdu, "OBJCTDEC").ok();
+    let ra_raw = header.get_f64("RA");
+    let dec_raw = header.get_f64("DEC");
+    let objctra = header.get_str("OBJCTRA");
+    let objctdec = header.get_str("OBJCTDEC");
 
     // Apply unit detection and validation
     // Pass objctra for verification (handles RA=0 and [0,24) ambiguity correctly)
@@ -286,10 +257,10 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     let dec = dec_raw.and_then(|d| validate_dec(d).ok());
 
     // Observatory location
-    let sitelat = read_keyword_f64(&mut fitsfile, &hdu, "SITELAT").ok();
-    let lat_obs = read_keyword_f64(&mut fitsfile, &hdu, "LAT-OBS").ok();
-    let sitelong = read_keyword_f64(&mut fitsfile, &hdu, "SITELONG").ok();
-    let long_obs = read_keyword_f64(&mut fitsfile, &hdu, "LONG-OBS").ok();
+    let sitelat = header.get_f64("SITELAT");
+    let lat_obs = header.get_f64("LAT-OBS");
+    let sitelong = header.get_f64("SITELONG");
+    let long_obs = header.get_f64("LONG-OBS");
 
     // Parse DATE-OBS
     let date_obs = match (date_obs_str.clone(), time_obs.clone()) {
@@ -636,24 +607,6 @@ pub fn parse_date_obs(date_obs: &str, time_obs: Option<&str>) -> Result<DateTime
     }
 
     anyhow::bail!("Failed to parse DATE-OBS: {}", date_obs)
-}
-
-// Helper functions to read FITS keywords
-fn read_keyword_string(fitsfile: &mut FitsFile, hdu: &fitsio::hdu::FitsHdu, key: &str) -> Result<String> {
-    let value: String = hdu.read_key(fitsfile, key)?;
-    Ok(value.trim().to_string())
-}
-
-fn read_keyword_f64(fitsfile: &mut FitsFile, hdu: &fitsio::hdu::FitsHdu, key: &str) -> Result<f64> {
-    let value: f64 = hdu.read_key(fitsfile, key)?;
-    Ok(value)
-}
-
-fn read_keyword_i32(fitsfile: &mut FitsFile, hdu: &fitsio::hdu::FitsHdu, key: &str) -> Result<i32> {
-    // Use i64 to work around fitsio bug: i32 uses fits_read_key_log (boolean)
-    // instead of fits_read_key_lng (integer), causing values like 2 to become 1
-    let value: i64 = hdu.read_key(fitsfile, key)?;
-    Ok(value as i32)
 }
 
 #[cfg(test)]

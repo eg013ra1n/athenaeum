@@ -218,7 +218,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
- "fitsio",
  "quick-xml 0.36.2",
  "rayon",
  "rusqlite",
@@ -271,15 +270,6 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
-
-[[package]]
-name = "autotools"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef941527c41b0fc0dd48511a8154cd5fc7e29200a0ff8b7203c5d777dbc795cf"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "base64"
@@ -1035,26 +1025,6 @@ name = "find-msvc-tools"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52051878f80a721bb68ebfbc930e07b65ba72f2da88968ea5c06fd6ca3d3a127"
-
-[[package]]
-name = "fitsio"
-version = "0.21.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a37418b8a2e67655b4717287f3c170945ca5f453355a02274250b69400148f4"
-dependencies = [
- "fitsio-sys",
- "libc",
-]
-
-[[package]]
-name = "fitsio-sys"
-version = "0.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14929d0b6fa44a87b374a138ea2256c02c1b5beae1dbc98f62a3e132f862fed1"
-dependencies = [
- "autotools",
- "pkg-config",
-]
 
 [[package]]
 name = "flate2"
