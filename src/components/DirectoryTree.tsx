@@ -4,6 +4,25 @@ import { invoke } from '@tauri-apps/api/core';
 import type { ScanRootWithAvailability, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
 import BlinkViewer from './BlinkViewer';
 
+/** Split a file path by either / or \ */
+function splitPath(p: string): string[] {
+  return p.split(/[/\\]/).filter(Boolean);
+}
+
+/** Get parent directory, preserving the original separator */
+function getParentPath(p: string): string {
+  const sep = p.includes('\\') ? '\\' : '/';
+  const parts = p.split(/[/\\]/);
+  parts.pop();
+  return parts.join(sep);
+}
+
+/** Get the last segment (basename) of a path */
+function getBasename(p: string): string {
+  const parts = p.split(/[/\\]/);
+  return parts[parts.length - 1] || p;
+}
+
 interface DirectoryTreeProps {
   scanRoots: ScanRootWithAvailability[];
   duplicates: DuplicateGroup[];
@@ -97,7 +116,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
 
   // Navigate up one level
   const goUp = () => {
-    const parentPath = currentPath.split('/').slice(0, -1).join('/');
+    const parentPath = getParentPath(currentPath);
     if (parentPath) {
       loadDirectory(parentPath);
     }
@@ -131,15 +150,20 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
     if (!matchingRoot) return [];
 
     // Split the path into parts
-    const parts = currentPath.split('/').filter(p => p);
-    const rootParts = matchingRoot.path.split('/').filter(p => p);
+    const parts = splitPath(currentPath);
+    const rootParts = splitPath(matchingRoot.path);
+    const sep = currentPath.includes('\\') ? '\\' : '/';
 
     // Build breadcrumbs
     const breadcrumbs: { label: string; path: string; isClickable: boolean }[] = [];
     let accumulatedPath = '';
 
     parts.forEach((part, index) => {
-      accumulatedPath += '/' + part;
+      if (index === 0) {
+        accumulatedPath = currentPath.startsWith(sep) ? sep + part : part;
+      } else {
+        accumulatedPath += sep + part;
+      }
       const isWithinRoot = index >= rootParts.length - 1; // Can click on root and anything after it
 
       breadcrumbs.push({
@@ -177,7 +201,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
               {!root.is_available && (
                 <AlertTriangle size={12} className="inline mr-1 text-warning" />
               )}
-              {root.path.split('/').pop() || root.path}
+              {getBasename(root.path) || root.path}
             </button>
           ))}
         </div>
@@ -279,7 +303,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                     >
                       <Folder size={18} className="text-accent flex-shrink-0" />
                       <span className="text-sm truncate font-mono group-hover:text-accent">
-                        {subdir.split('/').pop()}
+                        {getBasename(subdir)}
                       </span>
                     </button>
                   ))}

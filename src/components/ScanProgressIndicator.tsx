@@ -22,7 +22,7 @@ export function ScanProgressIndicator() {
   }
 
   const { rootId, rootPath, progress, isCancelling } = activeScan;
-  const folderName = rootPath.split('/').pop() || rootPath;
+  const folderName = rootPath.split(/[/\\]/).pop() || rootPath;
 
   const phase = progress?.phase || 'discovery';
   const config = phaseConfig[phase] || phaseConfig.processing;
