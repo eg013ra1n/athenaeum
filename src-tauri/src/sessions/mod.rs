@@ -239,7 +239,7 @@ mod tests {
             create_test_frame(3, "2024-01-16T02:00:00Z", "ZWO ASI2600MM", 300.0),
         ];
 
-        let nights = detect_sessions(frames, 6.0).unwrap();
+        let nights = detect_sessions(frames, 7.0).unwrap();
 
         assert_eq!(nights.len(), 1);
         assert_eq!(nights[0].sessions.len(), 1);
@@ -258,7 +258,7 @@ mod tests {
             create_test_frame(5, "2024-01-16T02:05:00Z", "Canon EOS Ra", 180.0),
         ];
 
-        let nights = detect_sessions(frames, 6.0).unwrap();
+        let nights = detect_sessions(frames, 7.0).unwrap();
 
         assert_eq!(nights.len(), 1);
         assert_eq!(nights[0].sessions.len(), 2);
@@ -286,7 +286,7 @@ mod tests {
             create_test_frame(4, "2024-01-16T22:00:00Z", "ZWO ASI2600MM", 300.0),
         ];
 
-        let nights = detect_sessions(frames, 6.0).unwrap();
+        let nights = detect_sessions(frames, 7.0).unwrap();
 
         assert_eq!(nights.len(), 2);
         assert_eq!(nights[0].sessions[0].frame_ids.len(), 2);

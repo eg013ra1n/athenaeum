@@ -15,12 +15,15 @@ build:windows:
     - main
   cache:
     key: "${CI_COMMIT_REF_SLUG}-windows"
+    policy: pull
     paths:
       - .cargo/registry/
       - .cargo/git/
-      - src-tauri/target/
+      - src-tauri/target/release/.fingerprint/
+      - src-tauri/target/release/build/
+      - src-tauri/target/release/deps/
+      - src-tauri/target/release/.cargo-lock
       - .npm/
-      - node_modules/
   script:
     - npm ci
     - npm run tauri build
@@ -30,6 +33,29 @@ build:windows:
       - src-tauri/target/release/bundle/msi/*.msi
       - src-tauri/target/release/bundle/nsis/*.exe
     expire_in: 30 days
+
+# --- Cache Warmer (updates cache periodically on main) ---
+update-cache:windows:
+  stage: build
+  tags:
+    - windows
+  only:
+    - main
+  when: manual
+  cache:
+    key: "${CI_COMMIT_REF_SLUG}-windows"
+    policy: push
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - src-tauri/target/release/.fingerprint/
+      - src-tauri/target/release/build/
+      - src-tauri/target/release/deps/
+      - src-tauri/target/release/.cargo-lock
+      - .npm/
+  script:
+    - npm ci
+    - npm run tauri build
 
 # --- Release (only on tags) ---
 release:

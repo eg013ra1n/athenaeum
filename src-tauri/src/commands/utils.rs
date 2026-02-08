@@ -38,13 +38,12 @@ pub fn calculate_fov(
 ) -> Option<f64> {
     match (pixel_size_um, focal_length_mm, naxis) {
         (Some(pixel_size), Some(focal_len), Some(sensor_pixels)) if focal_len > 0.0 && sensor_pixels > 0 => {
-            let bin = binning.unwrap_or(1) as f64;
-
             // Convert pixel size from micrometers to millimeters
             let pixel_size_mm = pixel_size / 1000.0;
 
-            // Calculate sensor dimension in mm (accounting for binning)
-            let sensor_mm = pixel_size_mm * sensor_pixels as f64 * bin;
+            // Calculate sensor dimension in mm
+            // FITS XPIXSZ reports effective pixel size after binning, so no need to multiply by bin
+            let sensor_mm = pixel_size_mm * sensor_pixels as f64;
 
             // FOV formula: FOV = 2 * arctan(sensor_mm / (2 * focal_length_mm)) * (180 / π)
             let fov_radians = 2.0 * (sensor_mm / (2.0 * focal_len)).atan();
@@ -121,7 +120,7 @@ mod tests {
         let fov = calculate_fov(Some(4.63), Some(200.0), Some(4144), Some(1));
         assert!(fov.is_some());
         let fov_val = fov.unwrap();
-        assert!(fov_val > 6.0 && fov_val < 7.0); // Should be ~6.8 degrees
+        assert!(fov_val > 5.0 && fov_val < 6.0); // Should be ~5.49 degrees
     }
 
     #[test]

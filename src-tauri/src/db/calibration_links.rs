@@ -1382,9 +1382,17 @@ mod tests {
         conn
     }
 
+    fn insert_test_calibration_set(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, "Dark", "2024-01-01"],
+        ).unwrap();
+    }
+
     #[test]
     fn test_insert_and_get_link() {
         let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
 
         let link = CalibrationLink {
             id: None,
@@ -1410,6 +1418,8 @@ mod tests {
     #[test]
     fn test_link_upsert() {
         let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
+        insert_test_calibration_set(&conn, 20);
 
         let link1 = CalibrationLink {
             id: None,
@@ -1442,6 +1452,7 @@ mod tests {
     #[test]
     fn test_link_exists() {
         let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
 
         let link = CalibrationLink {
             id: None,
