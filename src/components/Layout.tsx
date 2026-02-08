@@ -2,7 +2,7 @@ import { Outlet, NavLink } from 'react-router-dom';
 import { Files, Calendar, Target, Map, Camera, Layers, Settings, Trash2 } from 'lucide-react';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
-import Logo from '../assets/athenaeum.svg';
+import Logo from '../assets/athenaeum.png';
 
 export default function Layout() {
   const navItems = [
@@ -22,7 +22,7 @@ export default function Layout() {
         {/* Sidebar Navigation */}
         <aside className="w-64 bg-surface-elevated border-r border-border">
           <div className="p-4 border-b border-border flex items-center gap-3">
-            <img src={Logo} alt="Athenaeum" className="w-12 h-auto" />
+            <img src={Logo} alt="Athenaeum" className="w-12 h-auto shrink-0" />
             <div>
               <h1 className="text-2xl font-medium text-success font-antiqua tracking-wide">ATHENAEUM</h1>
               <p className="text-xs text-content-muted">Astrophotography Library</p>
