@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use super::{AppState, ScanHandle};
+use super::utils::normalize_path;
 
 #[tauri::command]
 pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<ScanRoot, String> {
@@ -27,17 +28,22 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
     }
 
     // 2. Canonicalize the new path (resolve symlinks, .., etc.)
-    let new_path = path_buf
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve path: {}", e))?;
+    //    normalize_path strips the \\?\ prefix that Windows canonicalize() adds
+    let new_path = normalize_path(
+        &path_buf
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve path: {}", e))?,
+    );
 
     // 3. Get existing scan roots and check for overlaps
     let existing_roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
 
     for root in existing_roots.iter() {
-        let existing_path = Path::new(&root.path)
-            .canonicalize()
-            .map_err(|e| format!("Failed to resolve existing root path: {}", e))?;
+        let existing_path = normalize_path(
+            &Path::new(&root.path)
+                .canonicalize()
+                .map_err(|e| format!("Failed to resolve existing root path: {}", e))?,
+        );
 
         // Check exact match
         if new_path == existing_path {

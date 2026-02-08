@@ -1,5 +1,25 @@
 // Shared utility functions for commands
 
+/// Strip Windows extended-length path prefix that canonicalize() adds.
+/// Handles three cases:
+///   \\?\C:\...        → C:\...          (local path)
+///   \\?\UNC\server\.. → \\server\..     (network UNC path)
+///   \\server\share\.. → unchanged       (regular UNC, no prefix)
+/// On non-Windows platforms, this is a no-op.
+pub fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{}", stripped));
+        }
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Calculate field of view (FOV) in degrees given camera and telescope parameters
 ///
 /// # Arguments
