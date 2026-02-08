@@ -17,6 +17,7 @@ mod selection;
 mod frames_set_metadata;
 mod frames_set_merge;
 mod export;
+pub mod logging;
 
 // Commands (Tauri API endpoints)
 mod commands;
@@ -28,6 +29,12 @@ use settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+
+/// Initialize file-based logging before Tauri starts.
+/// Called from main() so panics during Tauri init are captured.
+pub fn init_logging() {
+    logging::init();
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -59,6 +66,7 @@ pub fn run() {
                 }
             }
 
+            logging::log("INFO", "Athenaeum started, Tauri setup complete");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -173,6 +181,7 @@ pub fn run() {
             commands::get_calibration_route,
             commands::export_to_wbpp,
             commands::get_export_summary,
+            commands::get_log_path,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

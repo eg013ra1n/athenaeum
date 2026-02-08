@@ -23,9 +23,13 @@ pub async fn initialize_database(
     std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
 
     let db_path = app_dir.join("athenaeum.db");
-    let db = Database::new(db_path.clone()).map_err(|e| e.to_string())?;
+    let db = Database::new(db_path.clone()).map_err(|e| {
+        crate::logging::log("ERROR", &format!("Database init failed: {}", e));
+        e.to_string()
+    })?;
 
     *state.db.lock().unwrap() = Some(db);
 
+    crate::logging::log("INFO", &format!("Database initialized: {}", db_path.display()));
     Ok(db_path.to_string_lossy().to_string())
 }

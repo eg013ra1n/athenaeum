@@ -2,5 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    athenaeum_lib::run()
+    athenaeum_lib::init_logging();
+    athenaeum_lib::run();
 }

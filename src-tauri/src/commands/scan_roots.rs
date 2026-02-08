@@ -69,7 +69,11 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
 
     // 4. Store the canonicalized path
     let path_str = new_path.to_string_lossy().to_string();
-    let id = db::upsert_scan_root(&conn, &path_str).map_err(|e| e.to_string())?;
+    crate::logging::log("INFO", &format!("Adding scan root: {}", path_str));
+    let id = db::upsert_scan_root(&conn, &path_str).map_err(|e| {
+        crate::logging::log("ERROR", &format!("Failed to add scan root '{}': {}", path_str, e));
+        e.to_string()
+    })?;
 
     Ok(ScanRoot {
         id: Some(id),
@@ -526,6 +530,7 @@ pub async fn start_scan_with_progress(
     state: State<'_, AppState>,
 ) -> Result<ScanResultDto, String> {
     println!("🔵 start_scan_with_progress called for root_id={}", root_id);
+    crate::logging::log("INFO", &format!("Scan started for root_id={}", root_id));
 
     // Check if already scanning this root
     {
@@ -602,6 +607,11 @@ pub async fn start_scan_with_progress(
         let mut scans = state.active_scans.lock().unwrap();
         scans.remove(&root_id);
     }
+
+    crate::logging::log("INFO", &format!(
+        "Scan complete for root_id={}: found={}, processed={}, skipped={}, errors={}",
+        root_id, result.files_found, result.files_processed, result.files_skipped, result.errors.len()
+    ));
 
     Ok(ScanResultDto {
         files_found: result.files_found,

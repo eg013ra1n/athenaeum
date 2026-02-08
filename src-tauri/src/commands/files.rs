@@ -225,6 +225,14 @@ pub async fn get_files_with_frames_by_ids(
         .collect())
 }
 
+/// Get the path to the log file
+#[tauri::command]
+pub async fn get_log_path() -> Result<String, String> {
+    crate::logging::get_path()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Log file not initialized".to_string())
+}
+
 // DTOs for files commands
 #[derive(serde::Serialize)]
 pub struct DirectoryContents {
