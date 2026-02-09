@@ -236,9 +236,11 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
     // Bayer pattern for OSC (one-shot color) cameras
     let bayerpat = header.get_str("BAYERPAT");
 
-    // Pixel size
-    let xpixsz = header.get_f64("XPIXSZ");
-    let ypixsz = header.get_f64("YPIXSZ");
+    // Pixel size (with PIXSIZE1/PIXSIZE2 fallback)
+    let xpixsz = header.get_f64("XPIXSZ")
+        .or_else(|| header.get_f64("PIXSIZE1"));
+    let ypixsz = header.get_f64("YPIXSZ")
+        .or_else(|| header.get_f64("PIXSIZE2"));
 
     // Image dimensions
     let naxis1 = header.get_i32("NAXIS1");
@@ -416,6 +418,8 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     reader.config_mut().trim_text(true);
 
     let mut fits_keywords: HashMap<String, String> = HashMap::new();
+    let mut xisf_geometry: Option<(i32, i32)> = None;
+    let mut xisf_properties: HashMap<String, String> = HashMap::new();
     let mut buf = Vec::new();
 
     loop {
@@ -446,6 +450,37 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
                     fits_keywords.insert(name, value);
                 }
             }
+            // Parse <Image geometry="w:h:c"> for NAXIS1/NAXIS2 fallback
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if e.name().as_ref() == b"Image" =>
+            {
+                for attr in e.attributes().flatten() {
+                    if attr.key.as_ref() == b"geometry" {
+                        let geom = String::from_utf8_lossy(&attr.value);
+                        let parts: Vec<&str> = geom.split(':').collect();
+                        if parts.len() >= 2 {
+                            if let (Ok(w), Ok(h)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                                xisf_geometry = Some((w, h));
+                            }
+                        }
+                    }
+                }
+            }
+            // Parse <Property> elements for native XISF metadata
+            Ok(Event::Empty(ref e)) if e.name().as_ref() == b"Property" => {
+                let mut prop_id = String::new();
+                let mut prop_value = String::new();
+                for attr in e.attributes().flatten() {
+                    match attr.key.as_ref() {
+                        b"id" => prop_id = String::from_utf8_lossy(&attr.value).to_string(),
+                        b"value" => prop_value = String::from_utf8_lossy(&attr.value).to_string(),
+                        _ => {}
+                    }
+                }
+                if !prop_id.is_empty() && !prop_value.is_empty() {
+                    xisf_properties.insert(prop_id, prop_value);
+                }
+            }
             Ok(Event::Eof) => break,
             Err(e) => {
                 println!("Error parsing XISF XML at position {}: {}", reader.buffer_position(), e);
@@ -472,9 +507,13 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let offset = fits_keywords.get("OFFSET")
         .and_then(|s| s.parse::<f64>().ok());
     let xbinning = fits_keywords.get("XBINNING")
-        .and_then(|s| s.parse::<i32>().ok());
+        .and_then(|s| s.parse::<i32>().ok())
+        .or_else(|| xisf_properties.get("Instrument:Camera:XBinning")
+            .and_then(|s| s.parse::<i32>().ok()));
     let ybinning = fits_keywords.get("YBINNING")
-        .and_then(|s| s.parse::<i32>().ok());
+        .and_then(|s| s.parse::<i32>().ok())
+        .or_else(|| xisf_properties.get("Instrument:Camera:YBinning")
+            .and_then(|s| s.parse::<i32>().ok()));
     let ccd_temp = fits_keywords.get("CCD-TEMP")
         .and_then(|s| s.parse::<f64>().ok());
     let set_temp = fits_keywords.get("SET-TEMP")
@@ -484,15 +523,23 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let swcreate = fits_keywords.get("SWCREATE").cloned();
     let bayerpat = fits_keywords.get("BAYERPAT").cloned();
     let xpixsz = fits_keywords.get("XPIXSZ")
-        .and_then(|s| s.parse::<f64>().ok());
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| fits_keywords.get("PIXSIZE1").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| xisf_properties.get("Instrument:Sensor:XPixelSize")
+            .and_then(|s| s.parse::<f64>().ok()));
     let ypixsz = fits_keywords.get("YPIXSZ")
-        .and_then(|s| s.parse::<f64>().ok());
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| fits_keywords.get("PIXSIZE2").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| xisf_properties.get("Instrument:Sensor:YPixelSize")
+            .and_then(|s| s.parse::<f64>().ok()));
 
-    // Image dimensions
+    // Image dimensions (with <Image geometry="w:h:c"> fallback)
     let naxis1 = fits_keywords.get("NAXIS1")
-        .and_then(|s| s.parse::<i32>().ok());
+        .and_then(|s| s.parse::<i32>().ok())
+        .or_else(|| xisf_geometry.map(|(w, _)| w));
     let naxis2 = fits_keywords.get("NAXIS2")
-        .and_then(|s| s.parse::<i32>().ok());
+        .and_then(|s| s.parse::<i32>().ok())
+        .or_else(|| xisf_geometry.map(|(_, h)| h));
 
     // Astronomical coordinates
     // Read raw values first
