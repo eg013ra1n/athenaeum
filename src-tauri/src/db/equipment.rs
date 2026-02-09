@@ -430,6 +430,7 @@ pub fn get_frames_for_calibration_set(
             override_: row.get::<_, i32>(39)? == 1,
             swcreate: None,
             bayerpat: None,
+            rotation: None,
         };
 
         Ok(FileWithFrame {

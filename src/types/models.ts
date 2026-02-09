@@ -428,6 +428,7 @@ export interface ImagingLocation {
   cameras: string | null;  // Comma-separated list of camera/instrument names
   focalLengths: string | null;  // Comma-separated list of focal lengths in mm
   isCustom: boolean;  // true for custom frame sets, false for auto-generated or clusters
+  rotation: number | null;  // Average position angle in degrees (N through E)
 }
 
 // Frame Set Refresh

@@ -284,6 +284,17 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
         }
     });
 
+    // Image rotation / position angle
+    // Priority 1: CROTA2 keyword (direct rotation in degrees, N through E)
+    // Priority 2: Compute from CD matrix: atan2(-CD1_2, CD2_2)
+    let rotation = header.get_f64("CROTA2")
+        .or_else(|| {
+            match (header.get_f64("CD1_2"), header.get_f64("CD2_2")) {
+                (Some(cd1_2), Some(cd2_2)) => Some((-cd1_2).atan2(cd2_2).to_degrees()),
+                _ => None,
+            }
+        });
+
     // Observatory location
     let sitelat = header.get_f64("SITELAT");
     let lat_obs = header.get_f64("LAT-OBS");
@@ -371,6 +382,7 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
         override_: false,
         swcreate,
         bayerpat,
+        rotation,
     })
 }
 
@@ -585,6 +597,21 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         }
     });
 
+    // Image rotation / position angle
+    // Priority 1: CROTA2 keyword (direct rotation in degrees, N through E)
+    // Priority 2: Compute from CD matrix: atan2(-CD1_2, CD2_2)
+    let rotation = fits_keywords.get("CROTA2")
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| {
+            match (
+                fits_keywords.get("CD1_2").and_then(|s| s.parse::<f64>().ok()),
+                fits_keywords.get("CD2_2").and_then(|s| s.parse::<f64>().ok()),
+            ) {
+                (Some(cd1_2), Some(cd2_2)) => Some((-cd1_2).atan2(cd2_2).to_degrees()),
+                _ => None,
+            }
+        });
+
     // Observatory location
     let sitelat = fits_keywords.get("SITELAT")
         .and_then(|s| s.parse::<f64>().ok());
@@ -671,6 +698,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         override_: false,
         swcreate,
         bayerpat,
+        rotation,
     })
 }
 

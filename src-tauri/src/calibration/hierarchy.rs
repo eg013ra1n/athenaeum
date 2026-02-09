@@ -105,6 +105,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
             is_master: row.get::<_, i32>(30)? != 0,
             swcreate: None,
             bayerpat: None,
+            rotation: None,
         })
     })?;
 

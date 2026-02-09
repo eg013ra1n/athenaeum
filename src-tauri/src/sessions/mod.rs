@@ -226,6 +226,7 @@ mod tests {
             override_: false,
             swcreate: None,
             bayerpat: None,
+            rotation: None,
         };
 
         (id, file, frame)

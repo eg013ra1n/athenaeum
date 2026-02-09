@@ -445,7 +445,8 @@ export default function SkyAtlas() {
           originalRa: loc.ra,  // Keep original RA for FOV calculations
           cameras: loc.cameras,
           focalLengths: loc.focalLengths,
-          isCustom: loc.isCustom
+          isCustom: loc.isCustom,
+          rotation: loc.rotation
         },
         geometry: {
           type: 'Point',
@@ -528,17 +529,31 @@ export default function SkyAtlas() {
               const markerPath = getMarkerPath(d.properties.locationType);
 
               if (hasFov) {
-                // Draw FOV rectangle
+                // Draw FOV rectangle with rotation and cos(Dec) correction
                 const originalRa = d.properties.originalRa;  // Use original RA (0-360°) for calculations
                 const dec = d.geometry.coordinates[1];
+                const pa = d.properties.rotation ?? 0; // position angle in degrees (N through E)
+                const paRad = (pa * Math.PI) / 180;
+                const cosDec = Math.cos((dec * Math.PI) / 180);
 
-                // Rectangle corners in RA/Dec, converted to GeoJSON format
-                const corners = [
-                  [raToGeoJsonLongitude(originalRa - fovW/2), dec - fovH/2],
-                  [raToGeoJsonLongitude(originalRa + fovW/2), dec - fovH/2],
-                  [raToGeoJsonLongitude(originalRa + fovW/2), dec + fovH/2],
-                  [raToGeoJsonLongitude(originalRa - fovW/2), dec + fovH/2],
+                // Corner offsets in tangent plane (East, North) in degrees
+                const halfW = fovW / 2;
+                const halfH = fovH / 2;
+                const offsets: [number, number][] = [
+                  [-halfW, -halfH], // SW
+                  [+halfW, -halfH], // SE
+                  [+halfW, +halfH], // NE
+                  [-halfW, +halfH], // NW
                 ];
+
+                // Rotate offsets by position angle (N through E = CCW in East/North frame)
+                // Then convert East offset to RA offset (divide by cos(Dec))
+                const corners = offsets.map(([dxi, deta]) => {
+                  const xi  =  dxi * Math.cos(paRad) + deta * Math.sin(paRad);  // East offset (degrees)
+                  const eta = -dxi * Math.sin(paRad) + deta * Math.cos(paRad);  // North offset (degrees)
+                  const dRA = cosDec > 0.01 ? xi / cosDec : xi;  // Convert angular East offset to RA offset
+                  return [raToGeoJsonLongitude(originalRa + dRA), dec + eta] as [number, number];
+                });
 
                 // Project corners and apply scaling
                 const projectedCorners: [number, number][] = [];
@@ -581,9 +596,12 @@ export default function SkyAtlas() {
                   return;
                 }
 
-                // Check for excessive distortion by comparing projected aspect ratio to original
-                // Near projection edges, frames get stretched significantly
-                const originalAspectRatio = fovW / fovH;
+                // Check for excessive distortion by comparing projected aspect ratio to expected
+                // Account for rotation when computing expected bounding box aspect ratio
+                const absPARad = Math.abs(paRad);
+                const expectedBBWidth = fovW * Math.abs(Math.cos(absPARad)) + fovH * Math.abs(Math.sin(absPARad));
+                const expectedBBHeight = fovW * Math.abs(Math.sin(absPARad)) + fovH * Math.abs(Math.cos(absPARad));
+                const originalAspectRatio = expectedBBWidth / Math.max(expectedBBHeight, 0.001);
                 const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
                 const distortionRatio = projectedAspectRatio / originalAspectRatio;
 
@@ -610,10 +628,11 @@ export default function SkyAtlas() {
                   .style('stroke-width', '2px')
                   .style('cursor', d.properties.frameSetId ? 'pointer' : 'default');
 
-                // Store corners and dimensions for redraw
+                // Store corners, dimensions, and rotation for redraw
                 (this as any).__fovCorners = corners;
                 (this as any).__fovWidth = fovW;
                 (this as any).__fovHeight = fovH;
+                (this as any).__rotation = pa;
               } else {
                 // No FOV data: draw star/sparkle marker
                 const pt = window.Celestial.map.projection()(d.geometry.coordinates);
@@ -745,11 +764,15 @@ export default function SkyAtlas() {
               return;
             }
 
-            // Check for excessive distortion by comparing projected aspect ratio to original
+            // Check for excessive distortion by comparing projected aspect ratio to expected
             const storedFovW = (this as any).__fovWidth;
             const storedFovH = (this as any).__fovHeight;
             if (storedFovW && storedFovH) {
-              const originalAspectRatio = storedFovW / storedFovH;
+              const storedRotation = (this as any).__rotation ?? 0;
+              const absPARad = Math.abs(storedRotation * Math.PI / 180);
+              const expectedBBWidth = storedFovW * Math.abs(Math.cos(absPARad)) + storedFovH * Math.abs(Math.sin(absPARad));
+              const expectedBBHeight = storedFovW * Math.abs(Math.sin(absPARad)) + storedFovH * Math.abs(Math.cos(absPARad));
+              const originalAspectRatio = expectedBBWidth / Math.max(expectedBBHeight, 0.001);
               const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
               const distortionRatio = projectedAspectRatio / originalAspectRatio;
 

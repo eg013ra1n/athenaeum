@@ -242,6 +242,7 @@ pub fn detect_flat_groups(
             override_: false,
             swcreate: None,
             bayerpat: None,
+            rotation: None,
         };
 
         frames.push(frame);

@@ -33,6 +33,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             MIN(fr.date_obs) as first_date,
             MAX(fr.date_obs) as last_date,
             AVG(fr.xpixsz) as avg_xpixsz,
+            AVG(fr.ypixsz) as avg_ypixsz,
             AVG(fr.focallen) as avg_focallen,
             AVG(fr.naxis1) as avg_naxis1,
             AVG(fr.naxis2) as avg_naxis2,
@@ -41,7 +42,8 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             'frameset' as location_type,
             GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
             GROUP_CONCAT(DISTINCT CAST(fr.focallen AS TEXT)) as focal_lengths,
-            fs.is_custom as is_custom
+            fs.is_custom as is_custom,
+            AVG(fr.rotation) as avg_rotation
         FROM frames_set fs
         JOIN imaging_nights ino ON ino.frames_set_id = fs.id
         JOIN sessions s ON s.imaging_night_id = ino.id
@@ -67,6 +69,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             MIN(fr.date_obs) as first_date,
             MAX(fr.date_obs) as last_date,
             AVG(fr.xpixsz) as avg_xpixsz,
+            AVG(fr.ypixsz) as avg_ypixsz,
             AVG(fr.focallen) as avg_focallen,
             AVG(fr.naxis1) as avg_naxis1,
             AVG(fr.naxis2) as avg_naxis2,
@@ -75,7 +78,8 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             'cluster' as location_type,
             GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
             GROUP_CONCAT(DISTINCT CAST(fr.focallen AS TEXT)) as focal_lengths,
-            0 as is_custom
+            0 as is_custom,
+            AVG(fr.rotation) as avg_rotation
         FROM frames fr
         WHERE fr.ra IS NOT NULL
           AND fr.dec IS NOT NULL
@@ -98,15 +102,17 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         let first_date: Option<String> = row.get(7)?;
         let last_date: Option<String> = row.get(8)?;
         let avg_xpixsz: Option<f64> = row.get(9)?;
-        let avg_focallen: Option<f64> = row.get(10)?;
-        let avg_naxis1: Option<f64> = row.get(11)?;
-        let avg_naxis2: Option<f64> = row.get(12)?;
-        let avg_xbinning: Option<f64> = row.get(13)?;
-        let avg_ybinning: Option<f64> = row.get(14)?;
-        let location_type: String = row.get(15)?;
-        let cameras_str: Option<String> = row.get(16)?;
-        let focal_lengths_str: Option<String> = row.get(17)?;
-        let is_custom: i64 = row.get(18)?;
+        let avg_ypixsz: Option<f64> = row.get(10)?;
+        let avg_focallen: Option<f64> = row.get(11)?;
+        let avg_naxis1: Option<f64> = row.get(12)?;
+        let avg_naxis2: Option<f64> = row.get(13)?;
+        let avg_xbinning: Option<f64> = row.get(14)?;
+        let avg_ybinning: Option<f64> = row.get(15)?;
+        let location_type: String = row.get(16)?;
+        let cameras_str: Option<String> = row.get(17)?;
+        let focal_lengths_str: Option<String> = row.get(18)?;
+        let is_custom: i64 = row.get(19)?;
+        let avg_rotation: Option<f64> = row.get(20)?;
 
         // Parse filters from comma-separated string
         let filters: Vec<String> = filters_str
@@ -122,7 +128,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         );
 
         let fov_height = calculate_fov(
-            avg_xpixsz,
+            avg_ypixsz.or(avg_xpixsz),
             avg_focallen,
             avg_naxis2.map(|n| n.round() as i32),
             avg_ybinning.map(|b| b.round() as i32),
@@ -155,6 +161,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             cameras: cameras_str,
             focal_lengths: focal_lengths_str,
             is_custom: is_custom != 0,
+            rotation: avg_rotation,
         })
     }).map_err(|e| format!("Failed to query imaging locations: {}", e))?;
 

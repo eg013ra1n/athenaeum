@@ -53,6 +53,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             imagetyp TEXT,
             is_master INTEGER NOT NULL DEFAULT 0,
             swcreate TEXT,
+            rotation REAL,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         )",
         [],
@@ -579,6 +580,20 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if let Ok(0) = has_bayerpat {
         conn.execute(
             "ALTER TABLE frames ADD COLUMN bayerpat TEXT",
+            [],
+        )?;
+    }
+
+    // Add rotation to frames table (migration for existing databases)
+    // Stores image position angle in degrees (N through E), extracted from CROTA2 or CD matrix
+    let has_rotation: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name='rotation'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_rotation {
+        conn.execute(
+            "ALTER TABLE frames ADD COLUMN rotation REAL",
             [],
         )?;
     }

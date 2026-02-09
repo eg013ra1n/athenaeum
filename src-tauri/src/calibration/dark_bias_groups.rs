@@ -383,6 +383,7 @@ fn execute_dark_query(
             override_: false,
             swcreate: None,
             bayerpat: None,
+            rotation: None,
         };
 
         frames.push(frame);
@@ -485,6 +486,7 @@ fn execute_bias_query(
             override_: false,
             swcreate: None,
             bayerpat: None,
+            rotation: None,
         };
 
         frames.push(frame);

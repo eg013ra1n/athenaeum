@@ -398,6 +398,7 @@ pub async fn get_frame_calibration_hierarchy(
             override_: false,
             swcreate: None,
             bayerpat: None,
+            rotation: None,
         })
     }).map_err(|e| format!("Frame not found: {}", e))?;
 

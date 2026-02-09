@@ -59,6 +59,9 @@ pub struct Frame {
     /// Bayer pattern for OSC cameras (e.g., "RGGB", "BGGR")
     /// None indicates a mono camera
     pub bayerpat: Option<String>,
+    /// Image position angle in degrees (North through East)
+    /// Extracted from CROTA2 or computed from CD matrix
+    pub rotation: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -316,6 +319,7 @@ pub struct ImagingLocation {
     pub cameras: Option<String>,  // Comma-separated list of camera/instrument names
     pub focal_lengths: Option<String>,  // Comma-separated list of focal lengths in mm
     pub is_custom: bool,  // true for custom frame sets, false for auto-generated or clusters
+    pub rotation: Option<f64>,  // Average position angle in degrees (N through E)
 }
 
 /// Bounding box for rectangular region selection
