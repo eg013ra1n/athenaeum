@@ -79,16 +79,26 @@ impl ImageType {
     pub fn from_str(s: &str) -> Option<Self> {
         let s_upper = s.to_uppercase();
         match s_upper.as_str() {
-            "LIGHT" => Some(Self::Light),
-            "DARK" => Some(Self::Dark),
-            "FLAT" => Some(Self::Flat),
-            "BIAS" => Some(Self::Bias),
-            "DARKFLAT" | "DARK FLAT" => Some(Self::DarkFlat),
-            "MASTER LIGHT" | "MASTERLIGHT" => Some(Self::MasterLight),
-            "MASTER DARK" | "MASTERDARK" => Some(Self::MasterDark),
-            "MASTER FLAT" | "MASTERFLAT" => Some(Self::MasterFlat),
-            "MASTER BIAS" | "MASTERBIAS" => Some(Self::MasterBias),
-            "MASTER DARK FLAT" | "MASTERDARKFLAT" | "MASTER DARKFLAT" => Some(Self::MasterDarkFlat),
+            // Light frames: IRAF, SBFITSEXT, INDI FRAME keyword
+            "LIGHT" | "LIGHT FRAME" => Some(Self::Light),
+            // Dark frames: IRAF, SBFITSEXT
+            "DARK" | "DARK FRAME" => Some(Self::Dark),
+            // Flat frames: IRAF, SBFITSEXT ("Flat Field"), INDI ("Flat Frame"), observatory variants
+            "FLAT" | "FLAT FIELD" | "FLAT FRAME" | "FLATFIELD"
+                | "SKY FLAT" | "DOME FLAT" | "TWILIGHT FLAT" => Some(Self::Flat),
+            // Bias frames: IRAF, SBFITSEXT, "Offset" alias
+            "BIAS" | "BIAS FRAME" | "OFFSET" | "OFFSET FRAME" => Some(Self::Bias),
+            // Dark flats: various software
+            "DARKFLAT" | "DARK FLAT" | "DARK FLAT FRAME"
+                | "FLATDARK" | "FLAT DARK" | "FLAT DARK FRAME" => Some(Self::DarkFlat),
+            // Master frames
+            "MASTER LIGHT" | "MASTERLIGHT" | "MASTER LIGHT FRAME" => Some(Self::MasterLight),
+            "MASTER DARK" | "MASTERDARK" | "MASTER DARK FRAME" => Some(Self::MasterDark),
+            "MASTER FLAT" | "MASTERFLAT" | "MASTER FLAT FIELD" | "MASTER FLAT FRAME" => Some(Self::MasterFlat),
+            "MASTER BIAS" | "MASTERBIAS" | "MASTER BIAS FRAME"
+                | "MASTER OFFSET" | "MASTEROFFSET" => Some(Self::MasterBias),
+            "MASTER DARK FLAT" | "MASTERDARKFLAT" | "MASTER DARKFLAT"
+                | "MASTER FLAT DARK" | "MASTERFLATDARK" | "MASTER FLATDARK" => Some(Self::MasterDarkFlat),
             _ => None,
         }
     }

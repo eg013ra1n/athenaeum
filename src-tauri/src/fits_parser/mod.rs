@@ -256,6 +256,32 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
     let ra = ra_raw.map(|r| normalize_ra_from_fits(r, dec_raw, objctra.as_deref()));
     let dec = dec_raw.and_then(|d| validate_dec(d).ok());
 
+    // Fallback: parse OBJCTRA/OBJCTDEC if numeric RA/DEC missing
+    let ra = ra.or_else(|| {
+        objctra.as_deref().and_then(|s| crate::coordinates::parse_ra_sexagesimal(s).ok())
+    });
+    let dec = dec.or_else(|| {
+        objctdec.as_deref().and_then(|s| crate::coordinates::parse_dec_sexagesimal(s).ok())
+    });
+
+    // WCS fallback: CRVAL1/CRVAL2 when CTYPE indicates RA/DEC
+    let ra = ra.or_else(|| {
+        let ctype1 = header.get_str("CTYPE1")?;
+        if ctype1.to_uppercase().starts_with("RA") {
+            header.get_f64("CRVAL1").map(|r| crate::coordinates::normalize_ra(r))
+        } else {
+            None
+        }
+    });
+    let dec = dec.or_else(|| {
+        let ctype2 = header.get_str("CTYPE2")?;
+        if ctype2.to_uppercase().starts_with("DEC") {
+            header.get_f64("CRVAL2").and_then(|d| validate_dec(d).ok())
+        } else {
+            None
+        }
+    });
+
     // Observatory location
     let sitelat = header.get_f64("SITELAT");
     let lat_obs = header.get_f64("LAT-OBS");
@@ -283,7 +309,8 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
     };
 
     // Parse IMAGETYP
-    let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
+    let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s))
+        .or_else(|| header.get_str("FRAME").and_then(|s| ImageType::from_str(&s)));
 
     // Determine if this is a master file
     // Priority 1: Check IMAGETYP keyword for "Master" prefix
@@ -481,6 +508,36 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let ra = ra_raw.map(|r| normalize_ra_from_fits(r, dec_raw, objctra.as_deref()));
     let dec = dec_raw.and_then(|d| validate_dec(d).ok());
 
+    // Fallback: parse OBJCTRA/OBJCTDEC if numeric RA/DEC missing
+    let ra = ra.or_else(|| {
+        objctra.as_ref().and_then(|s| crate::coordinates::parse_ra_sexagesimal(s).ok())
+    });
+    let dec = dec.or_else(|| {
+        objctdec.as_ref().and_then(|s| crate::coordinates::parse_dec_sexagesimal(s).ok())
+    });
+
+    // WCS fallback: CRVAL1/CRVAL2 when CTYPE indicates RA/DEC
+    let ra = ra.or_else(|| {
+        let ctype1 = fits_keywords.get("CTYPE1")?;
+        if ctype1.to_uppercase().starts_with("RA") {
+            fits_keywords.get("CRVAL1")
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|r| crate::coordinates::normalize_ra(r))
+        } else {
+            None
+        }
+    });
+    let dec = dec.or_else(|| {
+        let ctype2 = fits_keywords.get("CTYPE2")?;
+        if ctype2.to_uppercase().starts_with("DEC") {
+            fits_keywords.get("CRVAL2")
+                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(|d| validate_dec(d).ok())
+        } else {
+            None
+        }
+    });
+
     // Observatory location
     let sitelat = fits_keywords.get("SITELAT")
         .and_then(|s| s.parse::<f64>().ok());
@@ -508,7 +565,8 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         });
 
     // Parse IMAGETYP
-    let imagetyp = imagetyp_str.as_ref().and_then(|s| ImageType::from_str(s));
+    let imagetyp = imagetyp_str.as_ref().and_then(|s| ImageType::from_str(s))
+        .or_else(|| fits_keywords.get("FRAME").and_then(|s| ImageType::from_str(s)));
 
     // Determine if this is a master file
     let is_master = imagetyp.as_ref().map(|t| t.is_master()).unwrap_or(false);

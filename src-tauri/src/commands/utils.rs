@@ -57,8 +57,6 @@ pub fn calculate_fov(
 
 /// Calculate angular distance between two points on the celestial sphere
 ///
-/// Uses the haversine formula to compute the great circle distance.
-///
 /// # Arguments
 /// * `ra1_deg` - Right Ascension of point 1 in degrees
 /// * `dec1_deg` - Declination of point 1 in degrees
@@ -69,21 +67,7 @@ pub fn calculate_fov(
 /// Angular distance in degrees
 #[allow(dead_code)]
 pub fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
-    let ra1 = ra1_deg.to_radians();
-    let dec1 = dec1_deg.to_radians();
-    let ra2 = ra2_deg.to_radians();
-    let dec2 = dec2_deg.to_radians();
-
-    let delta_ra = ra1 - ra2;
-
-    // Haversine formula
-    let a = ((dec1 - dec2) / 2.0).sin();
-    let b = (delta_ra / 2.0).sin();
-    let c = dec1.cos() * dec2.cos();
-
-    let angular_dist = 2.0 * ((a * a + c * b * b).sqrt()).asin();
-
-    angular_dist.to_degrees()
+    crate::coordinates::angular_distance(ra1_deg, dec1_deg, ra2_deg, dec2_deg)
 }
 
 /// Format byte count into human-readable format

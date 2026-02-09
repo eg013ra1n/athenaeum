@@ -1,6 +1,6 @@
 /// Astronomical algorithms for spatial selection queries
 
-/// Calculate great circle distance between two sky positions using Haversine formula
+/// Calculate great circle distance between two sky positions
 ///
 /// # Arguments
 /// * `ra1` - Right Ascension of point 1 in degrees (0-360 or -180-180)
@@ -11,23 +11,7 @@
 /// # Returns
 /// Angular distance in degrees
 pub fn angular_distance(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
-    // Convert to radians
-    let ra1_rad = ra1.to_radians();
-    let dec1_rad = dec1.to_radians();
-    let ra2_rad = ra2.to_radians();
-    let dec2_rad = dec2.to_radians();
-
-    // Haversine formula
-    let dra = ra2_rad - ra1_rad;
-    let ddec = dec2_rad - dec1_rad;
-
-    let a = (ddec / 2.0).sin().powi(2)
-        + dec1_rad.cos() * dec2_rad.cos() * (dra / 2.0).sin().powi(2);
-
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-
-    // Convert back to degrees
-    c.to_degrees()
+    crate::coordinates::angular_distance(ra1, dec1, ra2, dec2)
 }
 
 /// Test if a point is inside a polygon using ray casting algorithm

@@ -2,7 +2,7 @@
 
 use crate::coordinates::{
     angular_distance, format_dec_sexagesimal, format_ra_sexagesimal,
-    parse_dec_sexagesimal, parse_ra_sexagesimal,
+    parse_dec_sexagesimal, parse_ra_sexagesimal, spherical_mean,
 };
 use crate::models::{Frame, ImageType};
 use anyhow::{anyhow, Result};
@@ -30,6 +30,7 @@ pub struct FrameCluster {
     pub date_obs: Option<String>,  // Earliest date among members
     pub total_exp_time: Option<f64>,
     pub member_frame_ids: Vec<i64>,
+    member_coords: Vec<(f64, f64)>,  // (ra_deg, dec_deg) for spherical mean
 }
 
 impl FrameCluster {
@@ -44,35 +45,27 @@ impl FrameCluster {
             date_obs: seed.date_obs.clone(),
             total_exp_time: None,
             member_frame_ids: vec![seed.frame_id],
+            member_coords: vec![(seed.ra_deg, seed.dec_deg)],
         }
     }
 
-    /// Add a frame to this cluster and update the center
+    /// Add a frame to this cluster and update the center using spherical mean
     pub fn add_member(&mut self, frame: &ClusterableFrame) {
         self.member_frame_ids.push(frame.frame_id);
+        self.member_coords.push((frame.ra_deg, frame.dec_deg));
 
-        // Collect all coordinates including the new one
-        let _coords: Vec<(f64, f64)> = self
-            .member_frame_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if i == self.member_frame_ids.len() - 1 {
-                    (frame.ra_deg, frame.dec_deg)
-                } else {
-                    (self.center_ra_deg, self.center_dec_deg) // Approximate for existing members
-                }
-            })
-            .collect();
+        // Recompute center as proper spherical mean (handles RA wraparound correctly)
+        match spherical_mean(&self.member_coords) {
+            Ok((mean_ra, mean_dec)) => {
+                self.center_ra_deg = mean_ra;
+                self.center_dec_deg = mean_dec;
+            }
+            Err(_) => {
+                // Fallback: keep previous center (extremely unlikely — only if coords are antipodal)
+                eprintln!("Warning: spherical_mean failed for cluster, keeping previous center");
+            }
+        }
 
-        // Recompute center as spherical mean
-        // Note: This is an approximation. For better accuracy, we should store all coordinates.
-        // For now, we'll just use a simple weighted update
-        let n = self.member_frame_ids.len() as f64;
-        self.center_ra_deg = (self.center_ra_deg * (n - 1.0) + frame.ra_deg) / n;
-        self.center_dec_deg = (self.center_dec_deg * (n - 1.0) + frame.dec_deg) / n;
-
-        // Update sexagesimal representation
         self.objctra = format_ra_sexagesimal(self.center_ra_deg);
         self.objctdec = format_dec_sexagesimal(self.center_dec_deg);
 
@@ -445,5 +438,35 @@ mod tests {
         // Second cluster (M33) should have its name
         let m33_cluster = &clusters.iter().find(|c| c.member_frame_ids.len() == 1).unwrap();
         assert_eq!(m33_cluster.name, Some("M33".to_string()));
+    }
+
+    #[test]
+    fn test_cluster_center_ra_wraparound() {
+        // Two frames straddling RA=0h boundary — arithmetic mean would give ~180°
+        let frames = vec![
+            ClusterableFrame {
+                frame_id: 1,
+                ra_deg: 359.0,
+                dec_deg: 45.0,
+                date_obs: None,
+                object: None,
+            },
+            ClusterableFrame {
+                frame_id: 2,
+                ra_deg: 1.0,
+                dec_deg: 45.0,
+                date_obs: None,
+                object: None,
+            },
+        ];
+        let clusters = cluster_frames(frames, 5.0).unwrap();
+        assert_eq!(clusters.len(), 1);
+        let center_ra = clusters[0].center_ra_deg;
+        // Center should be near 0°, NOT near 180°
+        assert!(
+            center_ra > 355.0 || center_ra < 5.0,
+            "Cluster center RA={} should be near 0°, not 180°",
+            center_ra
+        );
     }
 }
