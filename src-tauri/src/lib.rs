@@ -23,7 +23,7 @@ pub mod logging;
 mod commands;
 mod commands_rustafits;
 
-use cache::CacheManager;
+use cache::{CacheManager, MemoryImageCache};
 use commands::AppState;
 use settings::SettingsManager;
 use std::collections::HashMap;
@@ -46,7 +46,21 @@ pub fn run() {
             db: Mutex::new(None),
             settings: Arc::new(SettingsManager::new()),
             cache: Arc::new(Mutex::new(None)),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10))),
             active_scans: Arc::new(Mutex::new(HashMap::new())),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .build()
+                    .expect("Failed to create image processing thread pool"),
+            ),
+            image_semaphore: Arc::new(tokio::sync::Semaphore::new({
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let permits = if cores > 4 { cores - 2 } else { cores };
+                println!("🧵 CPU cores: {}, image semaphore permits: {}", cores, permits);
+                permits
+            })),
         })
         .setup(|app| {
             // Initialize cache manager after app is ready
@@ -55,9 +69,9 @@ pub fn run() {
 
             // Get app data directory for cache
             if let Ok(app_dir) = app_handle.path().app_data_dir() {
-                match CacheManager::new(&app_dir, state.settings.clone()) {
+                match CacheManager::new(&app_dir, state.settings.clone(), state.image_pool.clone()) {
                     Ok(cache_mgr) => {
-                        *state.cache.lock().unwrap() = Some(cache_mgr);
+                        *state.cache.lock().unwrap() = Some(Arc::new(cache_mgr));
                         println!("✅ Cache manager initialized");
                     }
                     Err(e) => {

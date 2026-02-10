@@ -19,6 +19,22 @@ interface BlinkViewerProps {
   onFramesRemoved?: (frameIds: number[]) => void;
 }
 
+/** Decode packed binary from memory-mode backend into ImageData.
+ *  Format: [width: 4B LE u32][height: 4B LE u32][is_color: 1B][RGBA data...]
+ *  Backend sends RGBA directly — zero-copy view over the buffer.
+ */
+function decodeRawPacket(raw: Uint8Array): ImageData {
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const width = dv.getUint32(0, true);
+  const height = dv.getUint32(4, true);
+  const rgbaData = raw.subarray(9);
+  return new ImageData(
+    new Uint8ClampedArray(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength),
+    width,
+    height,
+  );
+}
+
 const BlinkViewer: React.FC<BlinkViewerProps> = ({
   frames,
   initialIndex = 0,
@@ -29,11 +45,15 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [isPlaying, setIsPlaying] = useState(false);
   const [blinkSpeed, setBlinkSpeed] = useState(2);
-  const [loadedImages, setLoadedImages] = useState<Map<number, string>>(new Map());
+  const [loadedImages, setLoadedImages] = useState<Map<number, string | ImageBitmap>>(new Map());
   const [loadingIndices, setLoadingIndices] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [isCaching, setIsCaching] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ current: 0, total: 0 });
+
+  // Cache mode — loaded from settings on mount; images don't load until ready
+  const [cacheMode, setCacheMode] = useState<'file' | 'memory'>('file');
+  const [cacheModeReady, setCacheModeReady] = useState(false);
 
   // Selection state
   const [selectedFrames, setSelectedFrames] = useState<Set<number>>(new Set());
@@ -57,7 +77,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const isPanningRef = useRef<boolean>(false);
   const lastMousePosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const imageSizeRef = useRef<{ width: number; height: number } | null>(null);
-  const currentImageRef = useRef<HTMLImageElement | null>(null);
+  // Holds either an HTMLImageElement (file mode) or an ImageBitmap (memory mode)
+  const currentImageRef = useRef<HTMLImageElement | HTMLCanvasElement | ImageBitmap | null>(null);
 
   // For UI indicator (debounced to avoid excessive re-renders)
   const [displayZoom, setDisplayZoom] = useState<number>(1.0);
@@ -68,6 +89,18 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Keep refs updated
   currentIndexRef.current = currentIndex;
   loadedImagesRef.current = loadedImages;
+
+  // Load cache mode setting on mount — must complete before images start loading
+  useEffect(() => {
+    invoke<string>('get_setting', { key: 'blink.cache_mode', defaultValue: 'file' })
+      .then((mode) => {
+        setCacheMode(mode === 'memory' ? 'memory' : 'file');
+        setCacheModeReady(true);
+      })
+      .catch(() => {
+        setCacheModeReady(true); // Proceed with default 'file' on error
+      });
+  }, []);
 
   // Filter FITS and XISF files
   const fitsFrames = useMemo(
@@ -120,10 +153,17 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         ? imageData
         : new Uint8Array(imageData as number[]);
 
-      const blob = new Blob([binaryData], { type: "image/jpeg" });
-      const url = URL.createObjectURL(blob);
-
-      setLoadedImages((prev) => new Map(prev).set(index, url));
+      if (cacheMode === 'memory') {
+        // Memory mode: decode packed RGBA into ImageBitmap (GPU-resident)
+        const imageData = decodeRawPacket(binaryData);
+        const bitmap = await createImageBitmap(imageData);
+        setLoadedImages((prev) => new Map(prev).set(index, bitmap));
+      } else {
+        // File mode: create blob URL from JPEG
+        const blob = new Blob([binaryData], { type: "image/jpeg" });
+        const url = URL.createObjectURL(blob);
+        setLoadedImages((prev) => new Map(prev).set(index, url));
+      }
     } catch (err) {
       console.error(`Failed to load image ${index}:`, err);
       setError(`Failed to load image: ${err}`);
@@ -134,7 +174,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         return newSet;
       });
     }
-  }, [fitsFrames]);
+  }, [fitsFrames, cacheMode]);
 
   // Helper to update zoom display with debouncing
   const updateZoomDisplay = useCallback((zoom: number) => {
@@ -155,10 +195,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx || (ctx as any).isContextLost?.()) return;
 
-    if (!img.width || !img.height) return;
+    const imgWidth = img.width;
+    const imgHeight = img.height;
+    if (!imgWidth || !imgHeight) return;
 
     const canvasAspect = canvas.width / canvas.height;
-    const imageAspect = img.width / img.height;
+    const imageAspect = imgWidth / imgHeight;
 
     if (!isFinite(canvasAspect) || !isFinite(imageAspect)) return;
 
@@ -192,60 +234,78 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
   }, []);
 
-  // Render image to canvas (loads image if needed)
-  const renderImage = useCallback((imageUrl: string) => {
+  // Render image to canvas — handles both string (blob URL) and ImageBitmap
+  const renderImage = useCallback((imageValue: string | ImageBitmap) => {
     const canvas = canvasRef.current;
     if (!canvas || !canvas.width || !canvas.height) return;
 
     const ctx = canvas.getContext("2d");
     if (!ctx || (ctx as any).isContextLost?.() || renderLockRef.current) return;
 
-    // If the image is already loaded for this URL, just redraw
-    if (currentImageRef.current && currentImageRef.current.src === imageUrl) {
+    if (imageValue instanceof ImageBitmap) {
+      // Memory mode: ImageBitmap is GPU-resident, ctx.drawImage is a fast blit
+      currentImageRef.current = imageValue;
       drawImageToCanvas();
-      return;
-    }
-
-    renderLockRef.current = true;
-    const img = new Image();
-
-    img.onload = () => {
-      try {
-        currentImageRef.current = img;
+    } else {
+      // File mode: load via Image element
+      if (currentImageRef.current instanceof HTMLImageElement && currentImageRef.current.src === imageValue) {
         drawImageToCanvas();
-      } finally {
-        renderLockRef.current = false;
+        return;
       }
-    };
 
-    img.onerror = () => {
-      setError("Failed to load/decode image");
-      renderLockRef.current = false;
-    };
+      renderLockRef.current = true;
+      const img = new Image();
 
-    img.src = imageUrl;
+      img.onload = () => {
+        try {
+          currentImageRef.current = img;
+          drawImageToCanvas();
+        } finally {
+          renderLockRef.current = false;
+        }
+      };
+
+      img.onerror = () => {
+        setError("Failed to load/decode image");
+        renderLockRef.current = false;
+      };
+
+      img.src = imageValue;
+    }
   }, [drawImageToCanvas]);
 
-  // Load current and preload next images
+  // Load current and preload next images sequentially (wait for cache mode to be determined)
   useEffect(() => {
-    loadImage(currentIndex);
-    loadImage(currentIndex + 1);
-    loadImage(currentIndex + 2);
-  }, [currentIndex, loadImage]);
+    if (!cacheModeReady) return;
+    let cancelled = false;
+    const preload = async () => {
+      await loadImage(currentIndex);
+      if (cancelled) return;
+      await loadImage(currentIndex + 1);
+      if (cancelled) return;
+      await loadImage(currentIndex + 2);
+    };
+    preload();
+    return () => { cancelled = true; };
+  }, [currentIndex, loadImage, cacheModeReady]);
 
-  // Cleanup blob URLs on unmount
+  // Cleanup blob URLs and ImageBitmaps on unmount
   useEffect(() => {
     return () => {
-      loadedImagesRef.current.forEach((url) => {
-        if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
+      loadedImagesRef.current.forEach((value) => {
+        if (typeof value === "string" && value.startsWith("blob:")) {
+          URL.revokeObjectURL(value);
+        } else if (value instanceof ImageBitmap) {
+          value.close();
+        }
       });
     };
   }, []);
 
   // Render current image
   useEffect(() => {
-    const imageUrl = loadedImages.get(currentIndex);
-    if (imageUrl) renderImage(imageUrl);
+    const imageValue = loadedImages.get(currentIndex);
+    if (imageValue) renderImage(imageValue);
   }, [currentIndex, loadedImages, renderImage]);
 
   // Handle window resize
@@ -260,8 +320,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       if (canvas.width !== newWidth || canvas.height !== newHeight) {
         canvas.width = newWidth;
         canvas.height = newHeight;
-        const imageUrl = loadedImagesRef.current.get(currentIndexRef.current);
-        if (imageUrl) renderImage(imageUrl);
+        const imageValue = loadedImagesRef.current.get(currentIndexRef.current);
+        if (imageValue) renderImage(imageValue);
       }
     };
 
@@ -415,26 +475,31 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     return () => window.removeEventListener("keydown", handleKeyPress);
   }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames, zoomIn, zoomOut, resetZoom]);
 
-  // Auto-cache on mount
+  // Auto-cache after cache mode is ready
   useEffect(() => {
+    if (!cacheModeReady) return;
     const startCaching = async () => {
       await new Promise((r) => setTimeout(r, 100));
-      const uncached = fitsFrames.map((_, i) => i).filter((i) => !loadedImages.has(i) && i !== currentIndex);
+      const preloadSet = new Set([currentIndex, currentIndex + 1, currentIndex + 2]);
+      const uncached = fitsFrames.map((_, i) => i).filter((i) => !loadedImages.has(i) && !preloadSet.has(i));
       if (uncached.length === 0) return;
 
       setIsCaching(true);
+      let done = 0;
       setCacheProgress({ current: 0, total: uncached.length });
 
-      const BATCH = 4;
-      for (let i = 0; i < uncached.length; i += BATCH) {
-        await Promise.allSettled(uncached.slice(i, i + BATCH).map(loadImage));
-        setCacheProgress({ current: Math.min(i + BATCH, uncached.length), total: uncached.length });
+      const BATCH_SIZE = 16;
+      for (let i = 0; i < uncached.length; i += BATCH_SIZE) {
+        const batch = uncached.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map((idx) => loadImage(idx)));
+        done += batch.length;
+        setCacheProgress({ current: done, total: uncached.length });
       }
       setIsCaching(false);
     };
     startCaching();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [cacheModeReady]);
 
   // Check blackhole status on mount
   useEffect(() => {

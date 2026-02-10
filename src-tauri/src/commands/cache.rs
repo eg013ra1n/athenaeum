@@ -25,24 +25,20 @@ fn format_bytes(bytes: u64) -> String {
 /// Get cache statistics (for display in UI)
 #[tauri::command]
 pub async fn get_cache_stats(state: State<'_, AppState>) -> Result<CacheStats, String> {
-    let cache_arc = state.cache.clone();
-    let stats_result = {
-        let cache_guard = cache_arc.lock().unwrap();
-        if let Some(cache_mgr) = cache_guard.as_ref() {
-            use tokio::runtime::Handle;
-            use tokio::task;
+    let cache_mgr = state.cache.lock().unwrap().clone();
 
-            task::block_in_place(|| {
-                Handle::current().block_on(async {
-                    cache_mgr.get_stats().await
-                })
+    if let Some(cache_mgr) = cache_mgr {
+        use tokio::runtime::Handle;
+        use tokio::task;
+
+        task::block_in_place(|| {
+            Handle::current().block_on(async {
+                cache_mgr.get_stats().await
             })
-        } else {
-            Err(anyhow::anyhow!("Cache manager not available"))
-        }
-    };
-
-    stats_result.map_err(|e| e.to_string())
+        }).map_err(|e| e.to_string())
+    } else {
+        Err("Cache manager not available".to_string())
+    }
 }
 
 /// Clear all cached images
@@ -50,26 +46,19 @@ pub async fn get_cache_stats(state: State<'_, AppState>) -> Result<CacheStats, S
 pub async fn clear_image_cache(state: State<'_, AppState>) -> Result<String, String> {
     println!("🗑️  Clearing image cache...");
 
-    let cache_arc = state.cache.clone();
+    let cache_mgr = state.cache.lock().unwrap().clone();
 
-    // Get cache stats before clearing
-    let stats_result = {
-        let cache_guard = cache_arc.lock().unwrap();
-        if let Some(cache_mgr) = cache_guard.as_ref() {
-            use tokio::runtime::Handle;
-            use tokio::task;
-
-            task::block_in_place(|| {
-                Handle::current().block_on(async {
-                    cache_mgr.get_stats().await
-                })
-            })
-        } else {
-            Err(anyhow::anyhow!("Cache manager not available"))
-        }
+    let Some(cache_mgr) = cache_mgr else {
+        return Err("Cache manager not available".to_string());
     };
 
-    let (total_entries, total_size) = match stats_result {
+    use tokio::runtime::Handle;
+    use tokio::task;
+
+    // Get cache stats before clearing
+    let (total_entries, total_size) = match task::block_in_place(|| {
+        Handle::current().block_on(async { cache_mgr.get_stats().await })
+    }) {
         Ok(stats) => {
             println!("📊 Cache stats: {} entries, {}", stats.total_entries, format_bytes(stats.total_size_bytes));
             (stats.total_entries, stats.total_size_bytes)
@@ -81,23 +70,9 @@ pub async fn clear_image_cache(state: State<'_, AppState>) -> Result<String, Str
     };
 
     // Now clear the cache
-    let result = {
-        let cache_guard = cache_arc.lock().unwrap();
-        if let Some(cache_mgr) = cache_guard.as_ref() {
-            use tokio::runtime::Handle;
-            use tokio::task;
-
-            task::block_in_place(|| {
-                Handle::current().block_on(async {
-                    cache_mgr.invalidate_all().await
-                })
-            })
-        } else {
-            Err(anyhow::anyhow!("Cache manager not available"))
-        }
-    };
-
-    match result {
+    match task::block_in_place(|| {
+        Handle::current().block_on(async { cache_mgr.invalidate_all().await })
+    }) {
         Ok(_) => {
             let msg = if total_size > 0 {
                 format!("Cache cleared successfully. Freed {} ({} entries)",

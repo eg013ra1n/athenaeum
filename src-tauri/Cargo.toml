@@ -32,8 +32,11 @@ rayon = "1.10"
 walkdir = "2"
 anyhow = "1"
 quick-xml = "0.36"
-rustafits = "0.2.3"
+rustafits = "0.4.0"
 base64 = "0.22"
+
+[profile.dev.package."*"]
+opt-level = 2        # Optimize all dependencies in dev builds (image processing, rayon, etc.)
 
 [profile.release]
 lto = "thin"         # Thin LTO: ~95% of fat LTO perf at much faster compile

@@ -5,12 +5,14 @@ pub mod database;
 pub mod models;
 #[allow(dead_code)]
 pub mod storage;
+pub mod memory;
 
 use anyhow::{Context, Result};
 use chrono;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use rayon;
 
 use crate::models::File;
 use crate::rustafits_processor::{self, Resolution};
@@ -20,6 +22,7 @@ pub use models::{
     CacheEntry, CacheStats, StretchMode,
     StretchParams,
 };
+pub use memory::{MemoryImageCache, CachedRawImage};
 
 use database::*;
 use storage::*;
@@ -32,12 +35,13 @@ pub struct CacheManager {
     cache_dir: PathBuf,
     cache_db: Arc<Mutex<Connection>>,
     settings: Arc<SettingsManager>,
+    pool: Arc<rayon::ThreadPool>,
 }
 
 #[allow(dead_code)]
 impl CacheManager {
     /// Create a new cache manager
-    pub fn new(app_dir: &Path, settings: Arc<SettingsManager>) -> Result<Self> {
+    pub fn new(app_dir: &Path, settings: Arc<SettingsManager>, pool: Arc<rayon::ThreadPool>) -> Result<Self> {
         let cache_dir = app_dir.join("cache").join("previews");
         println!("📁 Cache directory: {:?}", cache_dir);
         ensure_cache_dir(&cache_dir)?;
@@ -51,6 +55,7 @@ impl CacheManager {
             cache_dir,
             cache_db: Arc::new(Mutex::new(cache_db)),
             settings,
+            pool,
         })
     }
 
@@ -62,19 +67,11 @@ impl CacheManager {
         stretch_params: &StretchParams,
         quality: Option<u8>,
     ) -> Result<Vec<u8>> {
-        println!("🔍 Cache get_or_create called for: {:?}", file_path);
-        println!("   Stretch params: mode={:?}, bp={}, wp={}, mt={}",
-            stretch_params.mode, stretch_params.black_point,
-            stretch_params.white_point, stretch_params.midtones);
-        println!("   Quality: {:?}", quality);
-
         // Try to get from cache first
         if let Some(data) = self.get_cached(file, stretch_params).await? {
-            println!("   ✅ Returning cached data");
             return Ok(data);
         }
 
-        println!("   ⏳ Creating new cache entry...");
         // Cache miss - create new entry
         self.create_cache_entry(file, file_path, stretch_params, quality).await
     }
@@ -85,7 +82,6 @@ impl CacheManager {
         file: &File,
         stretch_params: &StretchParams,
     ) -> Result<Option<Vec<u8>>> {
-        println!("   🔎 Looking for cache entry for: {}", file.path);
         let conn = self.cache_db.lock().unwrap();
 
         // Look for cache entry in database
@@ -109,13 +105,8 @@ impl CacheManager {
         )?;
 
         let entry = match entry {
-            Some(e) => {
-                println!("   📋 Found cache entry: {}", e.cache_filename);
-                e
-            },
+            Some(e) => e,
             None => {
-                println!("   ❌ No cache entry found in database");
-                // No cache entry found
                 increment_cache_miss(&conn)?;
                 return Ok(None);
             }
@@ -167,8 +158,6 @@ impl CacheManager {
         stretch_params: &StretchParams,
         quality: Option<u8>,
     ) -> Result<Vec<u8>> {
-        println!("❌ Cache miss - processing image...");
-
         // Generate cache filename first
         let cache_filename = generate_cache_filename(&file.path, stretch_params);
         let cache_path = self.cache_dir.join(&cache_filename);
@@ -181,6 +170,7 @@ impl CacheManager {
             &cache_path,
             resolution,
             quality,
+            &self.pool,
         )
         .context("Failed to process FITS image with rustafits")?;
 

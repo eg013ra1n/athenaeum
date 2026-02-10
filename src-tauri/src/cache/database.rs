@@ -178,43 +178,66 @@ pub fn find_cache_entry(
     Ok(entry)
 }
 
-/// Insert a new cache entry
+/// Insert a new cache entry, wrapped in a transaction with stat updates
 pub fn insert_cache_entry(conn: &Connection, entry: &CacheEntry) -> Result<i64> {
     let mode_str = entry.stretch_mode.to_string();
 
-    conn.execute(
-        "INSERT INTO cache_entries (
-            file_id, file_path, file_modified_at, cache_filename, cache_version,
-            stretch_mode, black_point, white_point, midtones, resolution,
-            image_width, image_height, is_color, file_size,
-            created_at, last_accessed_at, access_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-        params![
-            entry.file_id,
-            entry.file_path,
-            entry.file_modified_at,
-            entry.cache_filename,
-            entry.cache_version,
-            mode_str,
-            entry.black_point,
-            entry.white_point,
-            entry.midtones,
-            entry.resolution,
-            entry.image_width,
-            entry.image_height,
-            entry.is_color,
-            entry.file_size,
-            entry.created_at,
-            entry.last_accessed_at,
-            entry.access_count
-        ],
-    )?;
+    conn.execute_batch("BEGIN")?;
 
-    // Update statistics
-    update_stat(conn, "total_entries", |v| (v + 1).to_string())?;
-    update_stat(conn, "total_size_bytes", |v| (v + entry.file_size).to_string())?;
+    let result = (|| -> Result<i64> {
+        conn.execute(
+            "INSERT INTO cache_entries (
+                file_id, file_path, file_modified_at, cache_filename, cache_version,
+                stretch_mode, black_point, white_point, midtones, resolution,
+                image_width, image_height, is_color, file_size,
+                created_at, last_accessed_at, access_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                entry.file_id,
+                entry.file_path,
+                entry.file_modified_at,
+                entry.cache_filename,
+                entry.cache_version,
+                mode_str,
+                entry.black_point,
+                entry.white_point,
+                entry.midtones,
+                entry.resolution,
+                entry.image_width,
+                entry.image_height,
+                entry.is_color,
+                entry.file_size,
+                entry.created_at,
+                entry.last_accessed_at,
+                entry.access_count
+            ],
+        )?;
 
-    Ok(conn.last_insert_rowid())
+        let rowid = conn.last_insert_rowid();
+
+        // Update statistics using atomic SQL arithmetic
+        conn.execute(
+            "UPDATE cache_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = datetime('now') WHERE key = 'total_entries'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE cache_stats SET value = CAST(CAST(value AS INTEGER) + ?1 AS TEXT), updated_at = datetime('now') WHERE key = 'total_size_bytes'",
+            params![entry.file_size],
+        )?;
+
+        Ok(rowid)
+    })();
+
+    match result {
+        Ok(rowid) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(rowid)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 /// Update access time and count for a cache entry
@@ -227,15 +250,21 @@ pub fn update_cache_access(conn: &Connection, cache_id: i64) -> Result<()> {
         params![cache_id],
     )?;
 
-    // Update hit counter
-    update_stat(conn, "cache_hits", |v| (v + 1).to_string())?;
+    // Update hit counter using atomic SQL arithmetic
+    conn.execute(
+        "UPDATE cache_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = datetime('now') WHERE key = 'cache_hits'",
+        [],
+    )?;
 
     Ok(())
 }
 
-/// Update miss counter
+/// Update miss counter using atomic SQL arithmetic
 pub fn increment_cache_miss(conn: &Connection) -> Result<()> {
-    update_stat(conn, "cache_misses", |v| (v + 1).to_string())?;
+    conn.execute(
+        "UPDATE cache_stats SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = datetime('now') WHERE key = 'cache_misses'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -250,11 +279,15 @@ pub fn delete_cache_entry(conn: &Connection, cache_id: i64) -> Result<()> {
 
     conn.execute("DELETE FROM cache_entries WHERE id = ?1", params![cache_id])?;
 
-    // Update statistics
-    update_stat(conn, "total_entries", |v| (v.saturating_sub(1)).to_string())?;
-    update_stat(conn, "total_size_bytes", |v| {
-        (v.saturating_sub(file_size)).to_string()
-    })?;
+    // Update statistics using atomic SQL arithmetic (with MAX to prevent underflow)
+    conn.execute(
+        "UPDATE cache_stats SET value = CAST(MAX(CAST(value AS INTEGER) - 1, 0) AS TEXT), updated_at = datetime('now') WHERE key = 'total_entries'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE cache_stats SET value = CAST(MAX(CAST(value AS INTEGER) - ?1, 0) AS TEXT), updated_at = datetime('now') WHERE key = 'total_size_bytes'",
+        params![file_size],
+    )?;
 
     Ok(())
 }
@@ -347,18 +380,3 @@ fn get_stat(conn: &Connection, key: &str) -> Result<String> {
     .context("Failed to get cache stat")
 }
 
-/// Helper function to update a stat value
-fn update_stat<F>(conn: &Connection, key: &str, updater: F) -> Result<()>
-where
-    F: FnOnce(u64) -> String,
-{
-    let current: u64 = get_stat(conn, key)?.parse().unwrap_or(0);
-    let new_value = updater(current);
-
-    conn.execute(
-        "UPDATE cache_stats SET value = ?1, updated_at = datetime('now') WHERE key = ?2",
-        params![new_value, key],
-    )?;
-
-    Ok(())
-}

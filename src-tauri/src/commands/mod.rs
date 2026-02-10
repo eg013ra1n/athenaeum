@@ -3,7 +3,7 @@
 // This module structure replaces the monolithic commands.rs file (2,878 lines)
 // with focused, domain-specific modules for better maintainability.
 
-use crate::cache::CacheManager;
+use crate::cache::{CacheManager, MemoryImageCache};
 use crate::db::Database;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
@@ -21,8 +21,12 @@ pub struct ScanHandle {
 pub struct AppState {
     pub db: Mutex<Option<Database>>,
     pub settings: Arc<SettingsManager>,
-    pub cache: Arc<Mutex<Option<CacheManager>>>,
+    pub cache: Arc<Mutex<Option<Arc<CacheManager>>>>,
+    pub memory_cache: Arc<Mutex<MemoryImageCache>>,
     pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
+    pub image_pool: Arc<rayon::ThreadPool>,
+    /// Serializes image processing so only one conversion uses the rayon pool at a time
+    pub image_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 pub mod core;

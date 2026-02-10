@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
-use fits_converter::FitsConverter;
+use astroimage::ImageConverter;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
+
+use crate::cache::CachedRawImage;
 
 /// Resolution variants for blink viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +94,7 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     input_path: P,
     resolution: Resolution,
     quality: Option<u8>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<ProcessedImage> {
     let input_path = input_path.as_ref();
 
@@ -115,7 +119,8 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     let output_path = temp_dir.join(temp_filename);
 
     // Build rustafits converter with resolution-specific settings
-    let mut converter = FitsConverter::new()
+    let mut converter = ImageConverter::new()
+        .with_thread_pool(pool.clone())
         .with_quality(resolution.jpeg_quality(quality));
 
     // Apply downscale if needed (for thumbnails)
@@ -172,6 +177,7 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
     output_path: P,
     resolution: Resolution,
     quality: Option<u8>,
+    pool: &Arc<rayon::ThreadPool>,
 ) -> Result<ProcessedImage> {
     let input_path = input_path.as_ref();
     let output_path = output_path.as_ref();
@@ -189,7 +195,8 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
     }
 
     // Build rustafits converter with resolution-specific settings
-    let mut converter = FitsConverter::new()
+    let mut converter = ImageConverter::new()
+        .with_thread_pool(pool.clone())
         .with_quality(resolution.jpeg_quality(quality));
 
     // Apply downscale if needed (for thumbnails)
@@ -229,5 +236,84 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         height,
         format: "jpeg".to_string(),
         is_color: false, // Not used - rustafits handles color internally
+    })
+}
+
+/// Process a FITS/XISF file to raw RGB pixels using rustafits's in-memory API.
+///
+/// Returns a `CachedRawImage` with interleaved RGB bytes.
+/// An optional `memory_downscale` factor (2, 4, etc.) applies additional
+/// block-averaging on the raw pixels to reduce RAM usage.
+pub fn process_fits_to_raw<P: AsRef<Path>>(
+    input_path: P,
+    resolution: Resolution,
+    memory_downscale: usize,
+    pool: &Arc<rayon::ThreadPool>,
+) -> Result<CachedRawImage> {
+    let input_path = input_path.as_ref();
+
+    if !input_path.exists() {
+        anyhow::bail!("Input file does not exist: {}", input_path.display());
+    }
+
+    let mut converter = ImageConverter::new()
+        .with_thread_pool(pool.clone());
+
+    if resolution.downscale_factor() > 1 {
+        converter = converter.with_downscale(resolution.downscale_factor());
+    }
+
+    if resolution.use_preview_mode() {
+        converter = converter.with_preview_mode();
+    }
+
+    let processed = converter
+        .process(input_path)
+        .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
+
+    let mut width = processed.width;
+    let mut height = processed.height;
+    let is_color = processed.is_color;
+    let mut data = processed.data;
+
+    // Apply additional memory downscale by block-averaging NxN pixel blocks
+    if memory_downscale > 1 {
+        let factor = memory_downscale;
+        let new_width = width / factor;
+        let new_height = height / factor;
+        if new_width > 0 && new_height > 0 {
+            let mut downscaled = Vec::with_capacity(new_width * new_height * 3);
+            for by in 0..new_height {
+                for bx in 0..new_width {
+                    let mut r_sum: u32 = 0;
+                    let mut g_sum: u32 = 0;
+                    let mut b_sum: u32 = 0;
+                    let count = (factor * factor) as u32;
+                    for dy in 0..factor {
+                        for dx in 0..factor {
+                            let sx = bx * factor + dx;
+                            let sy = by * factor + dy;
+                            let idx = (sy * width + sx) * 3;
+                            r_sum += data[idx] as u32;
+                            g_sum += data[idx + 1] as u32;
+                            b_sum += data[idx + 2] as u32;
+                        }
+                    }
+                    downscaled.push((r_sum / count) as u8);
+                    downscaled.push((g_sum / count) as u8);
+                    downscaled.push((b_sum / count) as u8);
+                }
+            }
+            data = downscaled;
+            width = new_width;
+            height = new_height;
+        }
+    }
+
+    Ok(CachedRawImage {
+        data,
+        width,
+        height,
+        is_color,
     })
 }
