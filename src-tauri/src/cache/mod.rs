@@ -22,7 +22,7 @@ pub use models::{
     CacheEntry, CacheStats, StretchMode,
     StretchParams,
 };
-pub use memory::{MemoryImageCache, CachedRawImage};
+pub use memory::{MemoryImageCache, CachedImage};
 
 use database::*;
 use storage::*;

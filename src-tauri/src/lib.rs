@@ -46,7 +46,7 @@ pub fn run() {
             db: Mutex::new(None),
             settings: Arc::new(SettingsManager::new()),
             cache: Arc::new(Mutex::new(None)),
-            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10))),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
             active_scans: Arc::new(Mutex::new(HashMap::new())),
             image_pool: Arc::new(
                 rayon::ThreadPoolBuilder::new()

@@ -1,18 +1,18 @@
 // Rustafits-based commands for FITS image processing
 
-use crate::cache::{StretchMode, StretchParams};
+use crate::cache::{CachedImage, StretchMode, StretchParams};
 use crate::commands::AppState;
 use crate::rustafits_processor::{self, Resolution};
 use std::path::PathBuf;
 use tauri::State;
 
-/// Read FITS image and return processed bytes.
+/// Read FITS image and return JPEG bytes.
 ///
-/// When `blink.cache_mode` = "file" (default): returns JPEG bytes via disk cache.
-/// When `blink.cache_mode` = "memory": returns packed binary (9-byte header + RGBA data)
-/// via in-memory LRU cache.
+/// Both cache modes now return JPEG:
+/// - "file" mode: disk-based JPEG cache (persistent across sessions)
+/// - "memory" mode: in-memory JPEG cache (RAM-only, no disk I/O)
 ///
-/// Memory mode uses a fast path: cache hits bypass the semaphore entirely (<1ms).
+/// Both modes use a fast path: cache hits bypass the semaphore entirely (<1ms).
 /// The semaphore is only acquired for cache misses (actual image processing).
 #[tauri::command]
 pub async fn read_fits_image_rustafits(
@@ -26,7 +26,7 @@ pub async fn read_fits_image_rustafits(
     let path_buf = PathBuf::from(&path);
 
     // ── Step 1: Read settings from DB (separate mutex, held <100μs) ──
-    let (resolution_str, cache_mode, memory_downscale, quality, file_info) = {
+    let (resolution_str, cache_mode, quality, file_info) = {
         let state_lock = state.db.lock().unwrap();
         if let Some(db) = state_lock.as_ref() {
             let conn = db.conn();
@@ -42,25 +42,21 @@ pub async fn read_fits_image_rustafits(
                 Ok(Some(value)) => value,
                 _ => "file".to_string(),
             };
-            let downscale = match crate::db::get_setting(&conn, "blink.memory_downscale") {
-                Ok(Some(value)) => value.parse::<usize>().unwrap_or(1),
-                _ => 1,
-            };
 
-            // Pre-read quality setting and file info for file mode
-            let (q, fi) = if mode != "memory" {
-                let res = match res_str.as_str() {
-                    "thumbnail" => Resolution::Thumbnail,
-                    "preview" => Resolution::Preview,
-                    "full" => Resolution::Full,
-                    _ => Resolution::Preview,
-                };
-                let quality_key = res.quality_setting_key();
-                let q = match crate::db::get_setting(&conn, quality_key) {
-                    Ok(Some(value)) => value.parse().ok(),
-                    _ => None,
-                };
-                let fi = match crate::db::get_file_by_path(&conn, &path) {
+            // Read quality setting and file info (needed for both modes now)
+            let res = match res_str.as_str() {
+                "thumbnail" => Resolution::Thumbnail,
+                "preview" => Resolution::Preview,
+                "full" => Resolution::Full,
+                _ => Resolution::Preview,
+            };
+            let quality_key = res.quality_setting_key();
+            let q = match crate::db::get_setting(&conn, quality_key) {
+                Ok(Some(value)) => value.parse().ok(),
+                _ => None,
+            };
+            let fi = if mode != "memory" {
+                match crate::db::get_file_by_path(&conn, &path) {
                     Ok(file) => {
                         Some(file)
                     }
@@ -90,18 +86,16 @@ pub async fn read_fits_image_rustafits(
                             content_hash: None,
                         })
                     }
-                };
-                (q, fi)
+                }
             } else {
-                (None, None)
+                None
             };
 
-            (res_str, mode, downscale, q, fi)
+            (res_str, mode, q, fi)
         } else {
             (
                 resolution.as_deref().unwrap_or("preview").to_string(),
                 "file".to_string(),
-                1usize,
                 None,
                 None,
             )
@@ -116,17 +110,16 @@ pub async fn read_fits_image_rustafits(
         _ => Resolution::Preview,
     };
 
-    // ── Step 2: Memory mode fast path — check cache WITHOUT semaphore ──
+    // ── Step 2: Memory mode — JPEG stored in RAM ──
     if cache_mode == "memory" {
-        let cache_key = format!("{}:{}:{}", path, resolution_str, memory_downscale);
+        let cache_key = format!("{}:{}", path, resolution_str);
 
         // Fast path: cache hit returns instantly, no semaphore needed
         {
             let mut mem_cache = state.memory_cache.lock().unwrap();
             if let Some(cached) = mem_cache.get(&cache_key) {
-                let packed = pack_raw_image(cached.width, cached.height, cached.is_color, &cached.data);
-                println!("⚡ Memory cache hit (fast path, {} bytes) in {:?}", packed.len(), t_start.elapsed());
-                return Ok(packed);
+                println!("⚡ Memory cache hit (fast path, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
+                return Ok(cached.data.clone());
             }
         }
 
@@ -144,35 +137,73 @@ pub async fn read_fits_image_rustafits(
         {
             let mut mem_cache = state.memory_cache.lock().unwrap();
             if let Some(cached) = mem_cache.get(&cache_key) {
-                let packed = pack_raw_image(cached.width, cached.height, cached.is_color, &cached.data);
-                println!("⚡ Memory cache hit (after semaphore, {} bytes) in {:?}", packed.len(), t_start.elapsed());
-                return Ok(packed);
+                println!("⚡ Memory cache hit (after semaphore, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
+                return Ok(cached.data.clone());
             }
         }
 
-        // Cache miss — process image
+        // Cache miss — process FITS to JPEG (same pipeline as file mode)
         println!("⏳ Memory cache miss, processing...");
-        let raw = rustafits_processor::process_fits_to_raw(&path_buf, res, memory_downscale, &state.image_pool)
+        let result = rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.image_pool)
             .map_err(|e| {
                 let error_msg = format!("Failed to process FITS image: {}", e);
                 eprintln!("ERROR: {}", error_msg);
                 error_msg
             })?;
 
-        let packed = pack_raw_image(raw.width, raw.height, raw.is_color, &raw.data);
+        let jpeg_data = result.image_data;
 
-        // Insert into memory cache
+        // Insert JPEG bytes into memory cache
         {
             let mut mem_cache = state.memory_cache.lock().unwrap();
-            mem_cache.insert(cache_key, raw);
+            mem_cache.insert(cache_key, CachedImage { data: jpeg_data.clone() });
         }
 
-        println!("✅ Processed and cached ({} bytes) in {:?}", packed.len(), t_start.elapsed());
-        return Ok(packed);
+        println!("✅ Processed and cached ({} bytes) in {:?}", jpeg_data.len(), t_start.elapsed());
+        return Ok(jpeg_data);
     }
 
-    // ── File mode: disk-based JPEG cache ──
-    // Acquire semaphore for file mode (processing-heavy)
+    // ── Step 3: File mode — disk-based JPEG cache ──
+    // Fast path: check disk cache BEFORE acquiring semaphore
+    let cache_mgr = state.cache.lock().unwrap().clone();
+
+    if let Some(ref cache_mgr) = cache_mgr {
+        if let Some(ref file) = file_info {
+            let stretch_params = StretchParams {
+                mode: StretchMode::Auto,
+                black_point: 0,
+                white_point: 0,
+                midtones: 0.35,
+                resolution: resolution_str.clone(),
+            };
+
+            // Try cache lookup without semaphore
+            use tokio::runtime::Handle;
+            use tokio::task;
+
+            let cached_result = task::block_in_place(|| {
+                Handle::current().block_on(async {
+                    cache_mgr.get_cached(file, &stretch_params).await
+                })
+            });
+
+            match cached_result {
+                Ok(Some(cached_data)) => {
+                    println!("✅ File cache hit: {} bytes in {:?}", cached_data.len(), t_start.elapsed());
+                    return Ok(cached_data);
+                }
+                Ok(None) => {
+                    // Cache miss — fall through to semaphore + processing
+                }
+                Err(e) => {
+                    eprintln!("Cache lookup error: {}", e);
+                    // Fall through to semaphore + processing
+                }
+            }
+        }
+    }
+
+    // Cache miss: acquire semaphore for processing
     let _permit = state.image_semaphore.acquire().await.map_err(|e| e.to_string())?;
 
     // Check if file exists
@@ -181,9 +212,6 @@ pub async fn read_fits_image_rustafits(
         eprintln!("ERROR: {}", error_msg);
         return Err(error_msg);
     }
-
-    // Clone the Arc<CacheManager> so we can drop the outer lock and process concurrently
-    let cache_mgr = state.cache.lock().unwrap().clone();
 
     if let Some(cache_mgr) = cache_mgr {
         if let Some(file) = file_info {
@@ -198,15 +226,28 @@ pub async fn read_fits_image_rustafits(
             use tokio::runtime::Handle;
             use tokio::task;
 
-            let cached_data_result = task::block_in_place(|| {
+            // Double-check cache (another concurrent request may have created it)
+            let cached_result = task::block_in_place(|| {
+                Handle::current().block_on(async {
+                    cache_mgr.get_cached(&file, &stretch_params).await
+                })
+            });
+
+            if let Ok(Some(cached_data)) = cached_result {
+                println!("✅ File cache hit (after semaphore): {} bytes in {:?}", cached_data.len(), t_start.elapsed());
+                return Ok(cached_data);
+            }
+
+            // Process and cache
+            let create_result = task::block_in_place(|| {
                 Handle::current().block_on(async {
                     cache_mgr
-                        .get_or_create(&file, &path_buf, &stretch_params, quality)
+                        .create_cache_entry(&file, &path_buf, &stretch_params, quality)
                         .await
                 })
             });
 
-            match cached_data_result {
+            match create_result {
                 Ok(cached_data) => {
                     println!("✅ File cache: {} bytes in {:?}", cached_data.len(), t_start.elapsed());
                     return Ok(cached_data);
@@ -230,20 +271,4 @@ pub async fn read_fits_image_rustafits(
 
     println!("✅ Processing complete in {:?}", t_start.elapsed());
     Ok(result.image_data)
-}
-
-/// Pack raw image into binary format for IPC:
-/// [width: 4 bytes LE u32][height: 4 bytes LE u32][is_color: 1 byte][RGBA data...]
-/// Converts RGB→RGBA inline so the frontend can create ImageData zero-copy.
-fn pack_raw_image(width: usize, height: usize, is_color: bool, rgb_data: &[u8]) -> Vec<u8> {
-    let pixel_count = width * height;
-    let mut packed = Vec::with_capacity(9 + pixel_count * 4);
-    packed.extend_from_slice(&(width as u32).to_le_bytes());
-    packed.extend_from_slice(&(height as u32).to_le_bytes());
-    packed.push(if is_color { 1 } else { 0 });
-    for chunk in rgb_data.chunks_exact(3) {
-        packed.extend_from_slice(chunk);
-        packed.push(255);
-    }
-    packed
 }

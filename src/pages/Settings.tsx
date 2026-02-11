@@ -24,7 +24,6 @@ export default function Settings() {
   const [qualityFull, setQualityFull] = useState('95');
   const [blinkResolution, setBlinkResolution] = useState('preview');
   const [blinkCacheMode, setBlinkCacheMode] = useState('file');
-  const [blinkMemoryDownscale, setBlinkMemoryDownscale] = useState('1');
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
 
@@ -58,7 +57,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, memoryDownscale, contentHash, contentHashRescanned
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, contentHash, contentHashRescanned
       ] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -93,10 +92,6 @@ export default function Settings() {
           defaultValue: 'file',
         }),
         invoke<string>('get_setting', {
-          key: 'blink.memory_downscale',
-          defaultValue: '1',
-        }),
-        invoke<string>('get_setting', {
           key: 'duplicates.use_content_hash',
           defaultValue: 'false',
         }),
@@ -114,7 +109,6 @@ export default function Settings() {
       setQualityFull(qFull);
       setBlinkResolution(resolution);
       setBlinkCacheMode(cacheMode);
-      setBlinkMemoryDownscale(memoryDownscale);
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
     } catch (err) {
@@ -196,10 +190,6 @@ export default function Settings() {
         invoke('set_setting', {
           key: 'blink.cache_mode',
           value: blinkCacheMode,
-        }),
-        invoke('set_setting', {
-          key: 'blink.memory_downscale',
-          value: blinkMemoryDownscale,
         }),
         invoke('set_setting', {
           key: 'duplicates.use_content_hash',
@@ -508,33 +498,12 @@ export default function Settings() {
                 className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
               >
                 <option value="file">File (disk JPEG)</option>
-                <option value="memory">Memory (in-memory raw)</option>
+                <option value="memory">Memory (in-memory JPEG)</option>
               </select>
               <p className="text-xs text-content-muted mt-2">
-                File mode caches JPEGs on disk. Memory mode keeps ~10 recent images in RAM for instant switching (uses more memory).
+                File mode caches JPEGs on disk (persistent). Memory mode keeps up to 200 images in RAM for instant switching (~60MB).
               </p>
             </div>
-
-            {/* Memory Downscale (only shown in memory mode) */}
-            {blinkCacheMode === 'memory' && (
-              <div>
-                <label className="block text-sm font-medium text-content-secondary mb-2">
-                  Memory Downscale
-                </label>
-                <select
-                  value={blinkMemoryDownscale}
-                  onChange={(e) => setBlinkMemoryDownscale(e.target.value)}
-                  className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
-                >
-                  <option value="1">1x (native)</option>
-                  <option value="2">2x (quarter RAM)</option>
-                  <option value="4">4x (1/16 RAM)</option>
-                </select>
-                <p className="text-xs text-content-muted mt-2">
-                  Additional downscale factor applied in memory mode to reduce RAM usage. 2x reduces memory to ~25%, 4x to ~6%.
-                </p>
-              </div>
-            )}
 
             {/* Thumbnail JPEG Quality */}
             <div>

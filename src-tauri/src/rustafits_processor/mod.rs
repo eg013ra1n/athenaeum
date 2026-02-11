@@ -4,7 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::cache::CachedRawImage;
+/// Raw image data (used by process_fits_to_raw, currently unused)
+#[allow(dead_code)]
+pub struct RawImageData {
+    pub data: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub is_color: bool,
+}
 
 /// Resolution variants for blink viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,15 +248,18 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
 
 /// Process a FITS/XISF file to raw RGB pixels using rustafits's in-memory API.
 ///
-/// Returns a `CachedRawImage` with interleaved RGB bytes.
+/// Returns a `CachedImage` with interleaved RGB bytes.
 /// An optional `memory_downscale` factor (2, 4, etc.) applies additional
 /// block-averaging on the raw pixels to reduce RAM usage.
+///
+/// Note: Currently unused — memory mode now uses JPEG like file mode.
+#[allow(dead_code)]
 pub fn process_fits_to_raw<P: AsRef<Path>>(
     input_path: P,
     resolution: Resolution,
     memory_downscale: usize,
     pool: &Arc<rayon::ThreadPool>,
-) -> Result<CachedRawImage> {
+) -> Result<RawImageData> {
     let input_path = input_path.as_ref();
 
     if !input_path.exists() {
@@ -310,7 +320,7 @@ pub fn process_fits_to_raw<P: AsRef<Path>>(
         }
     }
 
-    Ok(CachedRawImage {
+    Ok(RawImageData {
         data,
         width,
         height,

@@ -19,22 +19,6 @@ interface BlinkViewerProps {
   onFramesRemoved?: (frameIds: number[]) => void;
 }
 
-/** Decode packed binary from memory-mode backend into ImageData.
- *  Format: [width: 4B LE u32][height: 4B LE u32][is_color: 1B][RGBA data...]
- *  Backend sends RGBA directly — zero-copy view over the buffer.
- */
-function decodeRawPacket(raw: Uint8Array): ImageData {
-  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-  const width = dv.getUint32(0, true);
-  const height = dv.getUint32(4, true);
-  const rgbaData = raw.subarray(9);
-  return new ImageData(
-    new Uint8ClampedArray(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength),
-    width,
-    height,
-  );
-}
-
 const BlinkViewer: React.FC<BlinkViewerProps> = ({
   frames,
   initialIndex = 0,
@@ -45,14 +29,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [isPlaying, setIsPlaying] = useState(false);
   const [blinkSpeed, setBlinkSpeed] = useState(2);
-  const [loadedImages, setLoadedImages] = useState<Map<number, string | ImageBitmap>>(new Map());
+  const [loadedImages, setLoadedImages] = useState<Map<number, string>>(new Map());
   const [loadingIndices, setLoadingIndices] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [isCaching, setIsCaching] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ current: 0, total: 0 });
 
-  // Cache mode — loaded from settings on mount; images don't load until ready
-  const [cacheMode, setCacheMode] = useState<'file' | 'memory'>('file');
+  // Gate: wait for backend settings to be ready before loading images
   const [cacheModeReady, setCacheModeReady] = useState(false);
 
   // Selection state
@@ -77,8 +60,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const isPanningRef = useRef<boolean>(false);
   const lastMousePosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const imageSizeRef = useRef<{ width: number; height: number } | null>(null);
-  // Holds either an HTMLImageElement (file mode) or an ImageBitmap (memory mode)
-  const currentImageRef = useRef<HTMLImageElement | HTMLCanvasElement | ImageBitmap | null>(null);
+  const currentImageRef = useRef<HTMLImageElement | HTMLCanvasElement | null>(null);
 
   // For UI indicator (debounced to avoid excessive re-renders)
   const [displayZoom, setDisplayZoom] = useState<number>(1.0);
@@ -91,15 +73,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   loadedImagesRef.current = loadedImages;
 
   // Load cache mode setting on mount — must complete before images start loading
+  // Signal ready after a microtask — backend reads its own settings,
+  // so frontend just needs to ensure the component is mounted.
   useEffect(() => {
-    invoke<string>('get_setting', { key: 'blink.cache_mode', defaultValue: 'file' })
-      .then((mode) => {
-        setCacheMode(mode === 'memory' ? 'memory' : 'file');
-        setCacheModeReady(true);
-      })
-      .catch(() => {
-        setCacheModeReady(true); // Proceed with default 'file' on error
-      });
+    setCacheModeReady(true);
   }, []);
 
   // Filter FITS and XISF files
@@ -153,17 +130,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         ? imageData
         : new Uint8Array(imageData as number[]);
 
-      if (cacheMode === 'memory') {
-        // Memory mode: decode packed RGBA into ImageBitmap (GPU-resident)
-        const imageData = decodeRawPacket(binaryData);
-        const bitmap = await createImageBitmap(imageData);
-        setLoadedImages((prev) => new Map(prev).set(index, bitmap));
-      } else {
-        // File mode: create blob URL from JPEG
-        const blob = new Blob([binaryData], { type: "image/jpeg" });
-        const url = URL.createObjectURL(blob);
-        setLoadedImages((prev) => new Map(prev).set(index, url));
-      }
+      // Both modes now return JPEG — create blob URL
+      const blob = new Blob([binaryData], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      setLoadedImages((prev) => new Map(prev).set(index, url));
     } catch (err) {
       console.error(`Failed to load image ${index}:`, err);
       setError(`Failed to load image: ${err}`);
@@ -174,7 +144,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         return newSet;
       });
     }
-  }, [fitsFrames, cacheMode]);
+  }, [fitsFrames]);
 
   // Helper to update zoom display with debouncing
   const updateZoomDisplay = useCallback((zoom: number) => {
@@ -234,44 +204,38 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
   }, []);
 
-  // Render image to canvas — handles both string (blob URL) and ImageBitmap
-  const renderImage = useCallback((imageValue: string | ImageBitmap) => {
+  // Render image to canvas from blob URL
+  const renderImage = useCallback((imageValue: string) => {
     const canvas = canvasRef.current;
     if (!canvas || !canvas.width || !canvas.height) return;
 
     const ctx = canvas.getContext("2d");
     if (!ctx || (ctx as any).isContextLost?.() || renderLockRef.current) return;
 
-    if (imageValue instanceof ImageBitmap) {
-      // Memory mode: ImageBitmap is GPU-resident, ctx.drawImage is a fast blit
-      currentImageRef.current = imageValue;
+    // Reuse if same blob URL is already loaded
+    if (currentImageRef.current instanceof HTMLImageElement && currentImageRef.current.src === imageValue) {
       drawImageToCanvas();
-    } else {
-      // File mode: load via Image element
-      if (currentImageRef.current instanceof HTMLImageElement && currentImageRef.current.src === imageValue) {
-        drawImageToCanvas();
-        return;
-      }
-
-      renderLockRef.current = true;
-      const img = new Image();
-
-      img.onload = () => {
-        try {
-          currentImageRef.current = img;
-          drawImageToCanvas();
-        } finally {
-          renderLockRef.current = false;
-        }
-      };
-
-      img.onerror = () => {
-        setError("Failed to load/decode image");
-        renderLockRef.current = false;
-      };
-
-      img.src = imageValue;
+      return;
     }
+
+    renderLockRef.current = true;
+    const img = new Image();
+
+    img.onload = () => {
+      try {
+        currentImageRef.current = img;
+        drawImageToCanvas();
+      } finally {
+        renderLockRef.current = false;
+      }
+    };
+
+    img.onerror = () => {
+      setError("Failed to load/decode image");
+      renderLockRef.current = false;
+    };
+
+    img.src = imageValue;
   }, [drawImageToCanvas]);
 
   // Load current and preload next images sequentially (wait for cache mode to be determined)
@@ -289,14 +253,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     return () => { cancelled = true; };
   }, [currentIndex, loadImage, cacheModeReady]);
 
-  // Cleanup blob URLs and ImageBitmaps on unmount
+  // Cleanup blob URLs on unmount
   useEffect(() => {
     return () => {
       loadedImagesRef.current.forEach((value) => {
-        if (typeof value === "string" && value.startsWith("blob:")) {
+        if (value.startsWith("blob:")) {
           URL.revokeObjectURL(value);
-        } else if (value instanceof ImageBitmap) {
-          value.close();
         }
       });
     };
