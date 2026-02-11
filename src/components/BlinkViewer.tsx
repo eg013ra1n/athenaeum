@@ -488,13 +488,33 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       let done = 0;
       setCacheProgress({ current: 0, total: uncached.length });
 
-      const BATCH_SIZE = 16;
-      for (let i = 0; i < uncached.length; i += BATCH_SIZE) {
-        const batch = uncached.slice(i, i + BATCH_SIZE);
-        await Promise.all(batch.map((idx) => loadImage(idx)));
-        done += batch.length;
-        setCacheProgress({ current: done, total: uncached.length });
-      }
+      const MAX_CONCURRENT = 8;
+      await new Promise<void>((resolveAll) => {
+        let nextJob = 0;
+        let running = 0;
+
+        const startNext = () => {
+          while (running < MAX_CONCURRENT && nextJob < uncached.length) {
+            running++;
+            const idx = uncached[nextJob++];
+            loadImage(idx).finally(() => {
+              running--;
+              done++;
+              setCacheProgress({ current: done, total: uncached.length });
+              if (nextJob < uncached.length) {
+                startNext();
+              } else if (running === 0) {
+                resolveAll();
+              }
+            });
+          }
+          if (running === 0 && nextJob >= uncached.length) {
+            resolveAll();
+          }
+        };
+
+        startNext();
+      });
       setIsCaching(false);
     };
     startCaching();
