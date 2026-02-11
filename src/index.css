@@ -124,3 +124,29 @@ input[type="checkbox"]:focus {
   outline: none;
   box-shadow: 0 0 0 2px rgba(163, 190, 140, 0.3);
 }
+
+/* Select dropdown styling for Nord theme (fixes white-on-white on GTK/KDE) */
+select {
+  background-color: #434c5e;
+  color: #eceff4;
+  border: 1px solid #4c566a;
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+select:hover {
+  border-color: #88c0d0;
+}
+
+select:focus {
+  outline: none;
+  border-color: #88c0d0;
+  box-shadow: 0 0 0 2px rgba(136, 192, 208, 0.3);
+}
+
+select option {
+  background-color: #434c5e;
+  color: #eceff4;
+}

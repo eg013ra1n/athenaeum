@@ -28,7 +28,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             AVG(fr.ra) as avg_ra,
             AVG(fr.dec) as avg_dec,
             COUNT(DISTINCT fr.id) as frame_count,
-            SUM(fr.exptime) as total_exposure,
+            COALESCE(SUM(fr.exptime), 0) as total_exposure,
             GROUP_CONCAT(DISTINCT fr.filter) as filters,
             MIN(fr.date_obs) as first_date,
             MAX(fr.date_obs) as last_date,
@@ -64,7 +64,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             AVG(fr.ra) as avg_ra,
             AVG(fr.dec) as avg_dec,
             COUNT(DISTINCT fr.id) as frame_count,
-            SUM(fr.exptime) as total_exposure,
+            COALESCE(SUM(fr.exptime), 0) as total_exposure,
             GROUP_CONCAT(DISTINCT fr.filter) as filters,
             MIN(fr.date_obs) as first_date,
             MAX(fr.date_obs) as last_date,
@@ -178,83 +178,6 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
     Ok(result)
 }
 
-/// Query frames within a circular region of the sky
-///
-/// # Arguments
-/// * `ra` - Right Ascension of circle center (degrees)
-/// * `dec` - Declination of circle center (degrees)
-/// * `radius_degrees` - Radius of circle (degrees)
-///
-/// # Returns
-/// SelectionResult with frame IDs, count, and total exposure time
-#[tauri::command(rename_all = "snake_case")]
-pub async fn query_frames_in_circle(
-    state: State<'_, AppState>,
-    ra: f64,
-    dec: f64,
-    radius_degrees: f64,
-) -> Result<SelectionResult, String> {
-    let state_lock = state.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Query all LIGHT frames with coordinates
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, ra, dec, exptime FROM frames
-             WHERE ra IS NOT NULL
-             AND dec IS NOT NULL
-             AND imagetyp = 'Light'",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let frame_ids: Vec<i64> = stmt
-        .query_map([], |row| {
-            let frame_id: i64 = row.get(0)?;
-            let frame_ra: f64 = row.get(1)?;
-            let frame_dec: f64 = row.get(2)?;
-
-            Ok((frame_id, frame_ra, frame_dec))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|(_, frame_ra, frame_dec)| {
-            let distance = crate::selection::angular_distance(ra, dec, *frame_ra, *frame_dec);
-            distance <= radius_degrees
-        })
-        .map(|(id, _, _)| id)
-        .collect();
-
-    // Calculate total exposure
-    let total_exposure: f64 = if !frame_ids.is_empty() {
-        // Query total exposure by summing selected frames
-        let mut total: f64 = 0.0;
-        let mut stmt = conn
-            .prepare("SELECT COALESCE(exptime, 0) FROM frames WHERE id = ?1")
-            .map_err(|e| e.to_string())?;
-
-        for frame_id in &frame_ids {
-            let exp: f64 = stmt
-                .query_row(rusqlite::params![frame_id], |row| row.get::<_, f64>(0))
-                .unwrap_or(0.0);
-            total += exp;
-        }
-        total
-    } else {
-        0.0
-    };
-
-    let count = frame_ids.len();
-
-    Ok(SelectionResult {
-        frame_ids,
-        count,
-        total_exposure_seconds: total_exposure,
-    })
-}
-
 /// Query frames within a rectangular region of the sky
 ///
 /// Handles RA wrap-around at 0°/360° boundary automatically
@@ -346,79 +269,3 @@ pub async fn query_frames_in_bounds(
     })
 }
 
-/// Query frames within a polygonal region of the sky
-///
-/// Uses point-in-polygon algorithm to test each frame
-///
-/// # Arguments
-/// * `vertices` - List of (RA, Dec) coordinate pairs defining the polygon (min 3 vertices)
-///
-/// # Returns
-/// SelectionResult with frame IDs, count, and total exposure time
-#[tauri::command(rename_all = "snake_case")]
-pub async fn query_frames_in_polygon(
-    state: State<'_, AppState>,
-    vertices: Vec<(f64, f64)>,
-) -> Result<SelectionResult, String> {
-    if vertices.len() < 3 {
-        return Err("Polygon must have at least 3 vertices".to_string());
-    }
-
-    let state_lock = state.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Query all LIGHT frames with coordinates
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, ra, dec, exptime FROM frames
-             WHERE ra IS NOT NULL
-             AND dec IS NOT NULL
-             AND imagetyp = 'Light'",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let frame_ids: Vec<i64> = stmt
-        .query_map([], |row| {
-            let frame_id: i64 = row.get(0)?;
-            let frame_ra: f64 = row.get(1)?;
-            let frame_dec: f64 = row.get(2)?;
-
-            Ok((frame_id, frame_ra, frame_dec))
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|(_, frame_ra, frame_dec)| {
-            crate::selection::point_in_polygon(*frame_ra, *frame_dec, &vertices)
-        })
-        .map(|(id, _, _)| id)
-        .collect();
-
-    // Calculate total exposure
-    let total_exposure: f64 = if !frame_ids.is_empty() {
-        let mut total: f64 = 0.0;
-        let mut stmt = conn
-            .prepare("SELECT COALESCE(exptime, 0) FROM frames WHERE id = ?1")
-            .map_err(|e| e.to_string())?;
-
-        for frame_id in &frame_ids {
-            let exp: f64 = stmt
-                .query_row(rusqlite::params![frame_id], |row| row.get::<_, f64>(0))
-                .unwrap_or(0.0);
-            total += exp;
-        }
-        total
-    } else {
-        0.0
-    };
-
-    let count = frame_ids.len();
-
-    Ok(SelectionResult {
-        frame_ids,
-        count,
-        total_exposure_seconds: total_exposure,
-    })
-}

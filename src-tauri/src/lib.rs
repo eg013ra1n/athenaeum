@@ -13,7 +13,6 @@ mod cache;
 mod rustafits_processor;
 mod fingerprint;
 mod relinking;
-mod selection;
 mod frames_set_metadata;
 mod frames_set_merge;
 mod export;
@@ -160,9 +159,7 @@ pub fn run() {
             commands::get_imaging_locations,
             commands::get_frame_preview,
             commands::get_files_with_frames_by_ids,
-            commands::query_frames_in_circle,
             commands::query_frames_in_bounds,
-            commands::query_frames_in_polygon,
             commands::get_calendar_month_data,
             commands::create_frame_set_from_selection,
             commands::find_calibration_for_frame_set,
