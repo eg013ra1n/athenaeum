@@ -50,6 +50,7 @@ pub fn run() {
             active_scans: Arc::new(Mutex::new(HashMap::new())),
             image_pool: Arc::new(
                 rayon::ThreadPoolBuilder::new()
+                    .num_threads(std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4))
                     .build()
                     .expect("Failed to create image processing thread pool"),
             ),
@@ -57,7 +58,7 @@ pub fn run() {
                 let cores = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4);
-                let permits = if cores > 4 { cores - 2 } else { cores };
+                let permits = cores.min(8);
                 println!("🧵 CPU cores: {}, image semaphore permits: {}", cores, permits);
                 permits
             })),

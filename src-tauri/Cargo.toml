@@ -32,7 +32,7 @@ rayon = "1.10"
 walkdir = "2"
 anyhow = "1"
 quick-xml = "0.36"
-rustafits = "0.4.0"
+rustafits = "0.4.2"
 base64 = "0.22"
 
 [profile.dev.package."*"]
