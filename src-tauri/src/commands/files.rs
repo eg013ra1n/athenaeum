@@ -3,7 +3,7 @@
 use crate::db::{self};
 use crate::models::*;
 use std::path::Path;
-use tauri::State;
+use tauri::{Manager, State};
 
 use super::AppState;
 
@@ -231,6 +231,18 @@ pub async fn get_log_path() -> Result<String, String> {
     crate::logging::get_path()
         .map(|p| p.to_string_lossy().to_string())
         .ok_or_else(|| "Log file not initialized".to_string())
+}
+
+/// Get the path to the database file
+#[tauri::command]
+pub async fn get_database_path(
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let app_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?;
+    Ok(app_dir.join("athenaeum.db").to_string_lossy().to_string())
 }
 
 /// Get all distinct directory paths containing files for a given camera

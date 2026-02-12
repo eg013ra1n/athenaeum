@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
@@ -76,6 +77,11 @@ export default function FileManager() {
   const [expandedMissingPanels, setExpandedMissingPanels] = useState<Set<number>>(new Set());
   const [loadingMissingFiles, setLoadingMissingFiles] = useState<number | null>(null);
 
+  // Data file locations state
+  const [showDataPaths, setShowDataPaths] = useState(false);
+  const [dbPath, setDbPath] = useState<string>('');
+  const [logPath, setLogPath] = useState<string>('');
+
   const showConfirm = (title: string, message: string, onConfirm: () => void, confirmDanger = false) => {
     setConfirmDialog({ isOpen: true, title, message, onConfirm, confirmDanger });
   };
@@ -83,6 +89,12 @@ export default function FileManager() {
   const showAlert = (title: string, message: string, variant: 'error' | 'warning' | 'info' = 'info') => {
     setAlertDialog({ isOpen: true, title, message, variant });
   };
+
+  // Fetch data file locations on mount
+  useEffect(() => {
+    invoke<string>('get_database_path').then(setDbPath).catch(console.error);
+    invoke<string>('get_log_path').then(setLogPath).catch(console.error);
+  }, []);
 
   // Lazy load duplicates when Duplicates tab is clicked
   useEffect(() => {
@@ -268,6 +280,48 @@ export default function FileManager() {
         <p className="text-content-muted">
           Manage monitored directories and view FITS/XISF metadata
         </p>
+      </div>
+
+      {/* Data file locations */}
+      <div className="mb-4">
+        <button
+          onClick={() => setShowDataPaths(!showDataPaths)}
+          className="flex items-center gap-2 text-sm text-content-muted hover:text-content transition"
+        >
+          <Info size={14} />
+          Data file locations
+          {showDataPaths ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </button>
+        {showDataPaths && (
+          <div className="mt-2 bg-surface-secondary rounded p-3 text-sm font-mono space-y-2">
+            <div className="flex items-center gap-2">
+              <span className="text-content-muted min-w-[80px]">Database:</span>
+              <span className="text-content truncate">{dbPath || '—'}</span>
+              {dbPath && (
+                <button
+                  onClick={() => revealItemInDir(dbPath)}
+                  className="text-content-muted hover:text-content transition flex-shrink-0"
+                  title="Reveal in file manager"
+                >
+                  <FolderOpen size={14} />
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-content-muted min-w-[80px]">Log file:</span>
+              <span className="text-content truncate">{logPath || '—'}</span>
+              {logPath && (
+                <button
+                  onClick={() => revealItemInDir(logPath)}
+                  className="text-content-muted hover:text-content transition flex-shrink-0"
+                  title="Reveal in file manager"
+                >
+                  <FolderOpen size={14} />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Tab Navigation */}

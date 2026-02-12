@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Folder, File as FileIcon, ArrowLeft, AlertCircle, Copy, Check, AlertTriangle, Play } from 'lucide-react';
+import { Folder, File as FileIcon, ArrowLeft, AlertCircle, FolderOpen, AlertTriangle, Play } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import type { ScanRootWithAvailability, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
 import BlinkViewer from './BlinkViewer';
 
@@ -36,7 +37,6 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger, i
   const [contents, setContents] = useState<DirectoryContents | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
   const [hoveredFile, setHoveredFile] = useState<FileWithFrame | null>(null);
   const [showBlinkViewer, setShowBlinkViewer] = useState(false);
   const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
@@ -143,14 +143,12 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger, i
     loadDirectory(dirPath);
   };
 
-  // Copy path to clipboard
-  const copyPathToClipboard = async () => {
+  // Reveal path in system file explorer
+  const revealPath = async () => {
     try {
-      await navigator.clipboard.writeText(currentPath);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      await revealItemInDir(currentPath);
     } catch (error) {
-      console.error('Failed to copy path:', error);
+      console.error('Failed to reveal path:', error);
     }
   };
 
@@ -263,15 +261,11 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger, i
             )}
             {currentPath && (
               <button
-                onClick={copyPathToClipboard}
+                onClick={revealPath}
                 className="flex items-center gap-1 px-1.5 py-0.5 bg-surface-hover hover:brightness-110 rounded text-xs transition flex-shrink-0"
-                title="Copy path to clipboard"
+                title="Reveal in file explorer"
               >
-                {copied ? (
-                  <Check size={12} className="text-success" />
-                ) : (
-                  <Copy size={12} className="text-content-muted" />
-                )}
+                <FolderOpen size={12} className="text-content-muted" />
               </button>
             )}
           </div>

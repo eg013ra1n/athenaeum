@@ -201,6 +201,7 @@ pub fn run() {
             commands::export_to_wbpp,
             commands::get_export_summary,
             commands::get_log_path,
+            commands::get_database_path,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

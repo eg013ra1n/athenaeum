@@ -31,7 +31,8 @@
             "dialog:allow-save",
             "dialog:allow-confirm",
             "fs:allow-read-dir",
-            "fs:allow-read-file"
+            "fs:allow-read-file",
+            "opener:default"
           ]
         }
       ]
@@ -46,6 +47,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "scripts/uninstall-macos.sh": "scripts/uninstall-macos.sh",
+      "scripts/uninstall-linux.sh": "scripts/uninstall-linux.sh"
+    }
   }
 }

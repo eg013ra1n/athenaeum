@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback } from 'react';
-import { ChevronDown, ChevronRight, Copy, Check } from 'lucide-react';
+import { ChevronDown, ChevronRight, FolderOpen } from 'lucide-react';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import type { LightFrameWithCalibration } from '../../types/models';
 import { StatusIndicator } from './StatusIndicator';
 
@@ -77,44 +78,31 @@ function SortableHeader({
 }
 
 /**
- * Copy button with feedback.
+ * Reveal file in system file explorer.
  */
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = useCallback(async (e: React.MouseEvent) => {
+function RevealButton({ path }: { path: string }) {
+  const handleReveal = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation(); // Prevent row toggle
     try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      await revealItemInDir(path);
     } catch (err) {
-      console.error('Failed to copy:', err);
+      console.error('Failed to reveal:', err);
     }
-  }, [text]);
+  }, [path]);
 
   return (
     <button
-      onClick={handleCopy}
+      onClick={handleReveal}
       className="
         inline-flex items-center gap-1 px-2 py-1
         text-xs text-content-muted hover:text-content
         bg-surface-hover hover:bg-surface-hover
         rounded transition-colors
       "
-      title={text}
+      title={path}
     >
-      {copied ? (
-        <>
-          <Check size={14} className="text-success" />
-          <span className="text-success">Copied</span>
-        </>
-      ) : (
-        <>
-          <Copy size={14} />
-          <span>Copy</span>
-        </>
-      )}
+      <FolderOpen size={14} />
+      <span>Reveal</span>
     </button>
   );
 }
@@ -128,7 +116,7 @@ function CopyButton({ text }: { text: string }) {
  * - Status indicators with full labels
  * - Minimum 14px text for all content
  * - Columns: Time, Telescope, Focal Length, Exposure, Binning
- * - Expanded details: File path (with copy), Frame ID
+ * - Expanded details: File path (with reveal), Frame ID
  */
 export function LightFrameList({ frames, defaultExpanded = false, blackholedFileIds = new Set() }: LightFrameListProps) {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded);
@@ -307,7 +295,7 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
                         {frame.ccd_temp !== null ? `${frame.ccd_temp.toFixed(1)}°C` : '-'}
                       </td>
                       <td className="w-20 px-2 py-3 text-center">
-                        <CopyButton text={frame.file_path} />
+                        <RevealButton path={frame.file_path} />
                       </td>
                     </tr>
 
