@@ -41,26 +41,29 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .manage(AppState {
-            db: Mutex::new(None),
-            settings: Arc::new(SettingsManager::new()),
-            cache: Arc::new(Mutex::new(None)),
-            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
-            active_scans: Arc::new(Mutex::new(HashMap::new())),
-            image_pool: Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4))
-                    .build()
-                    .expect("Failed to create image processing thread pool"),
-            ),
-            image_semaphore: Arc::new(tokio::sync::Semaphore::new({
-                let cores = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let permits = cores.min(8);
-                println!("🧵 CPU cores: {}, image semaphore permits: {}", cores, permits);
-                permits
-            })),
+        .manage({
+            let max_threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(16))
+                .unwrap_or(4);
+            let default_permits = 4usize;
+            println!("🧵 CPU cores cap: {}, default blink semaphore permits: {}", max_threads, default_permits);
+            AppState {
+                db: Mutex::new(None),
+                settings: Arc::new(SettingsManager::new()),
+                cache: Arc::new(Mutex::new(None)),
+                memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
+                active_scans: Arc::new(Mutex::new(HashMap::new())),
+                image_pool: Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(max_threads)
+                        .build()
+                        .expect("Failed to create image processing thread pool"),
+                ),
+                image_semaphore: std::sync::RwLock::new(Arc::new(
+                    tokio::sync::Semaphore::new(default_permits),
+                )),
+                max_blink_threads: max_threads,
+            }
         })
         .setup(|app| {
             // Initialize cache manager after app is ready
@@ -106,6 +109,8 @@ pub fn run() {
             commands::get_all_settings,
             commands::delete_setting,
             commands::get_grouping_threshold_deg,
+            commands::set_blink_threads,
+            commands::get_blink_threads_max,
             commands::auto_generate_frame_sets,
             commands::get_frames_sets,
             commands::delete_frames_set,

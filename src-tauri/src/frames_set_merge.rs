@@ -116,8 +116,6 @@ pub fn calculate_time_range_union(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-
     #[test]
     fn test_nights_match_same_night() {
         let night_a = ImagingNight {

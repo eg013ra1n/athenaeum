@@ -8,7 +8,7 @@ use crate::db::Database;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Handle to track an active scan operation
 pub struct ScanHandle {
@@ -25,8 +25,11 @@ pub struct AppState {
     pub memory_cache: Arc<Mutex<MemoryImageCache>>,
     pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
-    /// Serializes image processing so only one conversion uses the rayon pool at a time
-    pub image_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
+    /// can be swapped at runtime when the user changes blink.threads.
+    pub image_semaphore: RwLock<Arc<tokio::sync::Semaphore>>,
+    /// CPU-based upper bound for blink threads (min(vCPUs, 16))
+    pub max_blink_threads: usize,
 }
 
 pub mod core;

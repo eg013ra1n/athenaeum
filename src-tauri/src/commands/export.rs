@@ -331,7 +331,7 @@ pub async fn get_calibration_route(
 /// Export a frame set to PixInsight WBPP folder structure
 ///
 /// Creates a folder structure optimized for PixInsight's Weighted Batch Preprocessing (WBPP):
-/// ```
+/// ```text
 /// output/
 /// └── camera_{name}/
 ///     ├── darks/

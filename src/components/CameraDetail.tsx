@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { ArrowLeft, RefreshCw, Package, Calendar, FolderOpen } from "lucide-react";
+import { ArrowLeft, RefreshCw, Package, Calendar } from "lucide-react";
 import DarkLibrary, { LibraryStats } from "./DarkLibrary";
 import MasterDarkLibrary from "./MasterDarkLibrary";
 import MasterFlatLibrary from "./MasterFlatLibrary";

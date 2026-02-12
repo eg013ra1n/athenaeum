@@ -18,7 +18,7 @@ pub struct OrganizeResult {
 /// Organize files for PixInsight WBPP export
 ///
 /// Creates folder structure:
-/// ```
+/// ```text
 /// output/
 /// └── {camera}/
 ///     ├── darks/

@@ -1,6 +1,8 @@
 // Core commands - app initialization and basic operations
 
 use crate::db::Database;
+use crate::settings;
+use std::sync::Arc;
 use tauri::{Manager, State};
 
 use super::AppState;
@@ -37,6 +39,21 @@ pub async fn initialize_database(
     })?;
 
     *db_lock = Some(db);
+
+    // Apply persisted blink.threads setting to the semaphore
+    if let Some(ref db) = *db_lock {
+        let conn = db.conn();
+        let saved = state.settings
+            .get_with_precedence(&conn, settings::keys::BLINK_THREADS, settings::defaults::BLINK_THREADS)
+            .unwrap_or_else(|_| settings::defaults::BLINK_THREADS.to_string());
+        if let Ok(threads) = saved.parse::<usize>() {
+            let max = state.max_blink_threads;
+            let clamped = threads.clamp(1, max);
+            *state.image_semaphore.write().unwrap() =
+                Arc::new(tokio::sync::Semaphore::new(clamped));
+            println!("🧵 Blink semaphore set to {} permits (from DB)", clamped);
+        }
+    }
 
     crate::logging::log("INFO", &format!("Database initialized: {}", db_path.display()));
     Ok(db_path.to_string_lossy().to_string())

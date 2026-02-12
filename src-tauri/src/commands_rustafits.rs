@@ -131,7 +131,8 @@ pub async fn read_fits_image_rustafits(
         }
 
         // Slow path: acquire semaphore for actual processing
-        let _permit = state.image_semaphore.acquire().await.map_err(|e| e.to_string())?;
+        let sem = state.image_semaphore.read().unwrap().clone();
+        let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
 
         // Double-check cache — another request may have filled it while we waited
         {
@@ -204,7 +205,8 @@ pub async fn read_fits_image_rustafits(
     }
 
     // Cache miss: acquire semaphore for processing
-    let _permit = state.image_semaphore.acquire().await.map_err(|e| e.to_string())?;
+    let sem = state.image_semaphore.read().unwrap().clone();
+    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
 
     // Check if file exists
     if !path_buf.exists() {

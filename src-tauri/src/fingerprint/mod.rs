@@ -21,7 +21,7 @@ use xxhash_rust::xxh3::xxh3_64;
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// let header = r#"{"SIMPLE": true, "BITPIX": -32, "NAXIS": 2}"#;
 /// let fingerprint = compute_header_fingerprint(header);
 /// println!("Fingerprint: {}", fingerprint);

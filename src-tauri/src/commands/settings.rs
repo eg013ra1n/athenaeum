@@ -2,6 +2,8 @@
 
 use crate::db;
 use crate::models::Setting;
+use crate::settings;
+use std::sync::Arc;
 use tauri::State;
 
 use super::AppState;
@@ -69,4 +71,40 @@ pub async fn get_grouping_threshold_deg(state: State<'_, AppState>) -> Result<f6
     state.settings
         .get_grouping_threshold_deg(&conn)
         .map_err(|e| e.to_string())
+}
+
+/// Set the number of concurrent blink image processing threads.
+/// Validates 1..=max_blink_threads, persists to DB, and rebuilds the semaphore.
+#[tauri::command]
+pub async fn set_blink_threads(
+    threads: u32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let max = state.max_blink_threads as u32;
+    if threads < 1 || threads > max {
+        return Err(format!("Blink threads must be between 1 and {}", max));
+    }
+
+    // Persist to DB
+    {
+        let state_lock = state.db.lock().unwrap();
+        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        state.settings
+            .persist_setting(&conn, settings::keys::BLINK_THREADS, &threads.to_string())
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Rebuild semaphore — in-flight permits on the old Arc complete naturally
+    *state.image_semaphore.write().unwrap() =
+        Arc::new(tokio::sync::Semaphore::new(threads as usize));
+
+    println!("🧵 Blink semaphore rebuilt with {} permits", threads);
+    Ok(())
+}
+
+/// Returns the CPU-based max so the frontend can set the slider/input max dynamically.
+#[tauri::command]
+pub async fn get_blink_threads_max(state: State<'_, AppState>) -> Result<u32, String> {
+    Ok(state.max_blink_threads as u32)
 }

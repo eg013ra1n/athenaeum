@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_stats_update_full_calibration() {
-        use crate::models::{CalibrationSetWithLinks, CalibrationWarning};
+        use crate::models::CalibrationSetWithLinks;
 
         let mut stats = ProcessingStats::new();
 

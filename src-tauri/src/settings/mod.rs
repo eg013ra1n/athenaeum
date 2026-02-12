@@ -26,6 +26,9 @@ pub mod defaults {
     // Used by frontend via get_setting/set_setting as a UI flag (not directly in Rust)
     #[allow(dead_code)]
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "false";
+
+    // Blink viewer
+    pub const BLINK_THREADS: &str = "4";
 }
 
 /// Setting keys used throughout the application
@@ -45,6 +48,9 @@ pub mod keys {
     // Used by frontend via get_setting/set_setting as a UI flag (not directly in Rust)
     #[allow(dead_code)]
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "duplicates.content_hash_rescanned";
+
+    // Blink viewer
+    pub const BLINK_THREADS: &str = "blink.threads";
 }
 
 /// Runtime overrides for settings (session-specific)

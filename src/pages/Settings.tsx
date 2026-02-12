@@ -24,6 +24,8 @@ export default function Settings() {
   const [qualityFull, setQualityFull] = useState('95');
   const [blinkResolution, setBlinkResolution] = useState('preview');
   const [blinkCacheMode, setBlinkCacheMode] = useState('file');
+  const [blinkThreads, setBlinkThreads] = useState('4');
+  const [blinkThreadsMax, setBlinkThreadsMax] = useState(4);
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
 
@@ -49,6 +51,7 @@ export default function Settings() {
   useEffect(() => {
     loadSettings();
     loadCacheStats();
+    invoke<number>('get_blink_threads_max').then(setBlinkThreadsMax).catch(console.error);
   }, []);
 
   const loadSettings = async () => {
@@ -57,7 +60,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, contentHash, contentHashRescanned
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, blinkThreadsVal, contentHash, contentHashRescanned
       ] = await Promise.all([
         invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -92,6 +95,10 @@ export default function Settings() {
           defaultValue: 'file',
         }),
         invoke<string>('get_setting', {
+          key: 'blink.threads',
+          defaultValue: '4',
+        }),
+        invoke<string>('get_setting', {
           key: 'duplicates.use_content_hash',
           defaultValue: 'false',
         }),
@@ -109,6 +116,7 @@ export default function Settings() {
       setQualityFull(qFull);
       setBlinkResolution(resolution);
       setBlinkCacheMode(cacheMode);
+      setBlinkThreads(blinkThreadsVal);
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
     } catch (err) {
@@ -157,6 +165,14 @@ export default function Settings() {
         setError('Full quality must be between 1 and 100');
         return;
       }
+
+      // Save blink threads via dedicated command (rebuilds semaphore immediately)
+      const blinkThreadsNum = parseInt(blinkThreads);
+      if (isNaN(blinkThreadsNum) || blinkThreadsNum < 1 || blinkThreadsNum > blinkThreadsMax) {
+        setError(`Concurrent threads must be between 1 and ${blinkThreadsMax}`);
+        return;
+      }
+      await invoke('set_blink_threads', { threads: blinkThreadsNum });
 
       await Promise.all([
         invoke('set_setting', {
@@ -502,6 +518,25 @@ export default function Settings() {
               </select>
               <p className="text-xs text-content-muted mt-2">
                 File mode caches JPEGs on disk (persistent). Memory mode keeps up to 200 images in RAM for instant switching (~60MB).
+              </p>
+            </div>
+
+            {/* Concurrent Threads */}
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Concurrent Processing Threads ({blinkThreads})
+              </label>
+              <input
+                type="number"
+                value={blinkThreads}
+                onChange={(e) => setBlinkThreads(e.target.value)}
+                min="1"
+                max={blinkThreadsMax}
+                step="1"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-2">
+                Number of concurrent image processing threads (1–{blinkThreadsMax}). Lower values use less memory, higher values process faster.
               </p>
             </div>
 
