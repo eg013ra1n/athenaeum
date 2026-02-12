@@ -27,9 +27,11 @@ interface DirectoryTreeProps {
   scanRoots: ScanRootWithAvailability[];
   duplicates: DuplicateGroup[];
   refreshTrigger: number;
+  instrume?: string;
+  cameraDirectories?: string[];
 }
 
-export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }: DirectoryTreeProps) {
+export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger, instrume, cameraDirectories }: DirectoryTreeProps) {
   const [currentPath, setCurrentPath] = useState<string>('');
   const [contents, setContents] = useState<DirectoryContents | null>(null);
   const [loading, setLoading] = useState(false);
@@ -38,6 +40,14 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
   const [hoveredFile, setHoveredFile] = useState<FileWithFrame | null>(null);
   const [showBlinkViewer, setShowBlinkViewer] = useState(false);
   const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
+
+  // When camera-filtered, only show scan roots that contain files for this camera
+  const effectiveRoots = useMemo(() => {
+    if (!instrume || !cameraDirectories) return scanRoots;
+    return scanRoots.filter(root =>
+      cameraDirectories.some(dir => dir.startsWith(root.path))
+    );
+  }, [scanRoots, instrume, cameraDirectories]);
 
   // Create a set of filenames that have duplicates for quick lookup
   const duplicateFilenames = useMemo(() => {
@@ -87,9 +97,15 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
     setError(null);
 
     try {
-      const result = await invoke<DirectoryContents>('get_directory_contents', {
-        directoryPath: path
-      });
+      const result = instrume && cameraDirectories
+        ? await invoke<DirectoryContents>('get_camera_directory_contents', {
+            directoryPath: path,
+            instrume,
+            cameraDirectories,
+          })
+        : await invoke<DirectoryContents>('get_directory_contents', {
+            directoryPath: path,
+          });
       setContents(result);
       setCurrentPath(path);
     } catch (e) {
@@ -98,14 +114,14 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [instrume, cameraDirectories]);
 
   // Initialize with first scan root
   useEffect(() => {
-    if (scanRoots.length > 0 && !currentPath) {
-      loadDirectory(scanRoots[0].path);
+    if (effectiveRoots.length > 0 && !currentPath) {
+      loadDirectory(effectiveRoots[0].path);
     }
-  }, [scanRoots, currentPath, loadDirectory]);
+  }, [effectiveRoots, currentPath, loadDirectory]);
 
   // Refresh when trigger changes
   useEffect(() => {
@@ -139,14 +155,14 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
   };
 
   // Check if current path is a root path
-  const isAtRoot = scanRoots.some(root => root.path === currentPath);
+  const isAtRoot = effectiveRoots.some(root => root.path === currentPath);
 
   // Generate breadcrumb parts from current path
   const getBreadcrumbs = () => {
     if (!currentPath) return [];
 
     // Find which root this path belongs to
-    const matchingRoot = scanRoots.find(root => currentPath.startsWith(root.path));
+    const matchingRoot = effectiveRoots.find(root => currentPath.startsWith(root.path));
     if (!matchingRoot) return [];
 
     // Split the path into parts
@@ -179,48 +195,50 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
   const breadcrumbs = getBreadcrumbs();
 
   return (
-    <div className="bg-surface-elevated rounded-lg overflow-hidden">
+    <div className="overflow-hidden">
       {/* Header with navigation */}
-      <div className="bg-surface border-b border-border p-4">
+      <div className="bg-surface px-3 py-1.5 space-y-1">
         {/* Root selector */}
-        <div className="flex gap-2 flex-wrap mb-3">
-          {scanRoots.map(root => (
+        <div className="flex items-center gap-3 flex-wrap">
+          {effectiveRoots.map(root => (
             <button
               key={root.id}
               onClick={() => loadDirectory(root.path)}
               disabled={!root.is_available}
-              title={!root.is_available ? 'Directory not available - go to Monitored Directories to relink' : undefined}
-              className={`px-3 py-1.5 rounded text-sm transition relative ${
-                currentPath === root.path
-                  ? 'bg-accent text-white'
+              title={!root.is_available ? 'Directory not available - go to Monitored Directories to relink' : root.path}
+              className={`flex items-center gap-1.5 px-2 py-1 text-sm transition border-b-2 ${
+                currentPath.startsWith(root.path)
+                  ? 'border-accent text-accent'
                   : root.is_available
-                    ? 'bg-surface-hover text-content-secondary hover:brightness-110'
-                    : 'bg-surface-elevated text-content-muted cursor-not-allowed opacity-50'
+                    ? 'border-transparent text-content-muted hover:text-content'
+                    : 'border-transparent text-content-muted cursor-not-allowed opacity-50'
               }`}
             >
-              {!root.is_available && (
-                <AlertTriangle size={12} className="inline mr-1 text-warning" />
+              {root.is_available ? (
+                <Folder size={14} className={currentPath.startsWith(root.path) ? 'text-accent' : 'text-content-muted'} />
+              ) : (
+                <AlertTriangle size={14} className="text-warning" />
               )}
               {getBasename(root.path) || root.path}
             </button>
           ))}
         </div>
 
-        <div className="flex items-center gap-3">
+        {/* Breadcrumb bar */}
+        <div className="flex items-center gap-2">
           <button
             onClick={goUp}
             disabled={isAtRoot || loading}
-            className="flex items-center gap-2 px-3 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1 px-2 py-1 bg-surface-hover rounded transition text-sm disabled:opacity-40 disabled:cursor-not-allowed hover:brightness-110"
           >
-            <ArrowLeft size={16} />
-            Back
+            <ArrowLeft size={14} />
+            <span>Back</span>
           </button>
-          <div className="flex-1 flex items-center gap-2 min-w-0">
-            <Folder size={20} className="text-accent flex-shrink-0" />
+          <div className="flex-1 flex items-center gap-1.5 min-w-0">
             {breadcrumbs.length > 0 ? (
-              <div className="flex items-center gap-1 font-mono text-sm min-w-0 flex-wrap">
+              <div className="flex items-center gap-0.5 font-mono text-sm min-w-0 flex-wrap">
                 {breadcrumbs.map((crumb, index) => (
-                  <div key={crumb.path} className="flex items-center gap-1">
+                  <div key={crumb.path} className="flex items-center gap-0.5">
                     {crumb.isClickable ? (
                       <button
                         onClick={() => loadDirectory(crumb.path)}
@@ -241,30 +259,24 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
                 ))}
               </div>
             ) : (
-              <span className="font-mono text-sm text-content-secondary">Select a directory</span>
+              <span className="font-mono text-sm text-content-muted">Select a directory</span>
             )}
             {currentPath && (
               <button
                 onClick={copyPathToClipboard}
-                className="flex items-center gap-1 px-2 py-1 bg-surface-hover hover:bg-surface-hover rounded text-xs transition flex-shrink-0"
+                className="flex items-center gap-1 px-1.5 py-0.5 bg-surface-hover hover:brightness-110 rounded text-xs transition flex-shrink-0"
                 title="Copy path to clipboard"
               >
                 {copied ? (
-                  <>
-                    <Check size={14} className="text-success" />
-                    <span className="text-success">Copied!</span>
-                  </>
+                  <Check size={12} className="text-success" />
                 ) : (
-                  <>
-                    <Copy size={14} />
-                    <span>Copy</span>
-                  </>
+                  <Copy size={12} className="text-content-muted" />
                 )}
               </button>
             )}
           </div>
           {contents && (
-            <span className="text-sm text-content-muted flex-shrink-0">
+            <span className="text-xs text-content-muted flex-shrink-0">
               {contents.subdirectories.length} folders, {contents.files.length} files
             </span>
           )}
@@ -272,7 +284,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger }:
       </div>
 
       {/* Content area */}
-      <div className="p-4">
+      <div className="p-4 bg-surface-elevated border border-border rounded-lg">
         {loading && (
           <div className="text-center py-12 text-content-muted">
             Loading directory...

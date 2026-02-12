@@ -233,6 +233,77 @@ pub async fn get_log_path() -> Result<String, String> {
         .ok_or_else(|| "Log file not initialized".to_string())
 }
 
+/// Get all distinct directory paths containing files for a given camera
+#[tauri::command]
+pub async fn get_camera_directories(
+    instrume: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_camera_directories(&conn, &instrume).map_err(|e| e.to_string())
+}
+
+/// Get directory contents filtered to only files from a specific camera
+#[tauri::command]
+pub async fn get_camera_directory_contents(
+    directory_path: String,
+    instrume: String,
+    camera_directories: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<DirectoryContents, String> {
+    use std::fs;
+
+    let path = Path::new(&directory_path);
+
+    if !path.exists() {
+        return Err("Directory does not exist".to_string());
+    }
+
+    // Only include subdirectories that are ancestors of (or equal to) a camera directory
+    let mut subdirectories = Vec::new();
+    let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let entry_path = entry.path();
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+
+        if metadata.is_dir() {
+            let subdir_str = entry_path.to_string_lossy().to_string();
+            // Include this subdir if any camera directory starts with it or equals it
+            let is_relevant = camera_directories.iter().any(|cam_dir| {
+                cam_dir.starts_with(&subdir_str)
+            });
+            if is_relevant {
+                subdirectories.push(subdir_str);
+            }
+        }
+    }
+
+    // Get files from database filtered by camera
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let db_files = db::get_files_by_directory_for_camera(&conn, &directory_path, &instrume, None)
+        .map_err(|e| e.to_string())?;
+
+    let files_in_dir: Vec<FileWithFrame> = db_files
+        .into_iter()
+        .map(|(file, frame)| FileWithFrame { file, frame })
+        .collect();
+
+    subdirectories.sort();
+
+    Ok(DirectoryContents {
+        subdirectories,
+        files: files_in_dir,
+    })
+}
+
 // DTOs for files commands
 #[derive(serde::Serialize)]
 pub struct DirectoryContents {

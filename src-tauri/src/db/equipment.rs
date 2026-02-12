@@ -354,6 +354,24 @@ pub fn has_master_flat_library(conn: &Connection, instrume: &str) -> Result<bool
     Ok(count > 0)
 }
 
+/// Get all distinct parent directory paths containing files for a given camera
+pub fn get_camera_directories(conn: &Connection, instrume: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT
+            SUBSTR(f.path, 1, LENGTH(f.path) - LENGTH(f.filename) - 1) as dir_path
+        FROM files f
+        JOIN frames fr ON f.id = fr.file_id
+        WHERE fr.instrume = ?1
+        ORDER BY dir_path"
+    )?;
+
+    let dirs = stmt
+        .query_map([instrume], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(dirs)
+}
+
 /// Get frames for a specific calibration set
 pub fn get_frames_for_calibration_set(
     conn: &Connection,

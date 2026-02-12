@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Plus, RefreshCw, Pencil } from "lucide-react";
+import { ArrowLeft, Search, RefreshCw, Pencil } from "lucide-react";
 import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
@@ -178,6 +178,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
                 <button
                   onClick={handleRegenerateLibrary}
                   disabled={creating}
+                  title="Delete and recreate the master dark library from scanned FITS/XISF files. Custom metadata edits will be reset to original header values."
                   className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
@@ -213,16 +214,16 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
       {!loading && sets.length === 0 && (
         <div className="bg-surface-elevated rounded-lg p-12 text-center">
           <p className="text-content-muted mb-6">
-            No master dark library created yet. This library organizes your master calibration frames
-            (MasterDark, MasterBias, MasterDarkFlat) by date, temperature, gain, offset, and binning.
+            No master dark library created yet. Scan your monitored folders for existing master calibration files
+            (MasterDark, MasterBias, MasterDarkFlat) and organize them by date, temperature, gain, offset, and binning.
           </p>
           <button
             onClick={handleCreateLibrary}
             disabled={creating}
             className="inline-flex items-center gap-2 px-6 py-3 bg-accent hover:bg-accent-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg font-medium"
           >
-            <Plus size={20} />
-            {creating ? "Creating..." : "Create Master Dark Library"}
+            <Search size={20} />
+            {creating ? "Creating..." : "Find and Create"}
           </button>
         </div>
       )}
@@ -249,6 +250,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
                 <button
                   onClick={handleRegenerateLibrary}
                   disabled={creating}
+                  title="Delete and recreate the master dark library from scanned FITS/XISF files. Custom metadata edits will be reset to original header values."
                   className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:brightness-110 text-white rounded text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <RefreshCw size={14} className={creating ? "animate-spin" : ""} />

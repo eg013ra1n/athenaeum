@@ -1,10 +1,12 @@
-import { useState, useMemo } from "react";
-import { ArrowLeft, RefreshCw, Package, Calendar } from "lucide-react";
+import { useState, useEffect, useMemo } from "react";
+import { ArrowLeft, RefreshCw, Package, Calendar, FolderOpen } from "lucide-react";
 import DarkLibrary, { LibraryStats } from "./DarkLibrary";
 import MasterDarkLibrary from "./MasterDarkLibrary";
 import MasterFlatLibrary from "./MasterFlatLibrary";
+import DirectoryTree from "./DirectoryTree";
 import { invoke } from "@tauri-apps/api/core";
 import { ImageType } from "../types/models";
+import { useScanRootsWithAvailability } from "../hooks/useTauri";
 import { format } from "date-fns";
 
 interface CalibrationScanResult {
@@ -25,14 +27,30 @@ interface CameraDetailProps {
   onClose: () => void;
 }
 
-type TabType = "darks" | "flats" | "master-darks" | "master-flats";
+type TabType = "files" | "darks" | "flats" | "master-darks" | "master-flats";
 
 export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
-  const [activeTab, setActiveTab] = useState<TabType>("darks");
+  const [activeTab, setActiveTab] = useState<TabType>("files");
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [currentStats, setCurrentStats] = useState<LibraryStats | null>(null);
+  const [cameraDirectories, setCameraDirectories] = useState<string[]>([]);
+
+  const { scanRoots } = useScanRootsWithAvailability();
+
+  // Load camera directories on mount
+  useEffect(() => {
+    const loadDirs = async () => {
+      try {
+        const dirs = await invoke<string[]>('get_camera_directories', { instrume });
+        setCameraDirectories(dirs);
+      } catch (err) {
+        console.error('Failed to load camera directories:', err);
+      }
+    };
+    loadDirs();
+  }, [instrume]);
 
   // Memoize imageTypeFilter arrays to prevent infinite re-render loops
   const darksFilter = useMemo(() => [ImageType.Dark, ImageType.Bias, ImageType.DarkFlat], []);
@@ -74,7 +92,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
   return (
     <div className="p-6">
       {/* Header */}
-      <div className="mb-6">
+      <div className="mb-px">
         <button
           onClick={onClose}
           className="flex items-center gap-2 text-content-muted hover:text-content mb-4 transition-colors"
@@ -83,41 +101,34 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
           Back to Equipment
         </button>
 
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-3xl font-bold mb-2">Calibration Library</h2>
-            <div className="flex items-center gap-4">
-              <span className="text-content-muted">{instrume}</span>
-              {currentStats && currentStats.totalSets > 0 && (
-                <>
-                  <div className="flex items-center gap-1.5 text-sm">
-                    <Package className="text-accent" size={14} />
-                    <span className="text-content-muted">Sets:</span>
-                    <span className="text-content font-medium">{currentStats.totalSets}</span>
-                  </div>
-                  {currentStats.dateFrom && currentStats.dateTo && (
-                    <div className="flex items-center gap-1.5 text-sm">
-                      <Calendar className="text-orange" size={14} />
-                      <span className="text-content-muted">Coverage:</span>
-                      <span className="text-content font-medium">
-                        {format(new Date(currentStats.dateFrom), "MMM yyyy")} - {format(new Date(currentStats.dateTo), "MMM yyyy")}
-                      </span>
-                    </div>
-                  )}
-                </>
-              )}
+        <h2 className="text-3xl font-bold mb-2">{instrume}</h2>
+        {(activeTab === "darks" || activeTab === "flats") && currentStats && currentStats.totalSets > 0 && (
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-1.5 text-sm">
+              <Package className="text-accent" size={14} />
+              <span className="text-content-muted">Sets:</span>
+              <span className="text-content font-medium">{currentStats.totalSets}</span>
             </div>
+            {currentStats.dateFrom && currentStats.dateTo && (
+              <div className="flex items-center gap-1.5 text-sm">
+                <Calendar className="text-orange" size={14} />
+                <span className="text-content-muted">Coverage:</span>
+                <span className="text-content font-medium">
+                  {format(new Date(currentStats.dateFrom), "MMM yyyy")} - {format(new Date(currentStats.dateTo), "MMM yyyy")}
+                </span>
+              </div>
+            )}
+            <button
+              onClick={handleRefreshLibrary}
+              disabled={refreshing}
+              title="Re-scan monitored directories for calibration frames and rebuild calibration sets for this camera"
+              className="flex items-center gap-2 px-3 py-1 bg-accent hover:bg-accent-hover text-white rounded-md text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} />
+              {refreshing ? "Refreshing..." : "Refresh Calibration Sets"}
+            </button>
           </div>
-
-          <button
-            onClick={handleRefreshLibrary}
-            disabled={refreshing}
-            className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <RefreshCw size={16} className={refreshing ? "animate-spin" : ""} />
-            {refreshing ? "Refreshing..." : "Refresh"}
-          </button>
-        </div>
+        )}
       </div>
 
       {/* Messages */}
@@ -134,8 +145,18 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
       )}
 
       {/* Tabs */}
-      <div className="border-b border-border mb-6">
+      <div className="border-b border-border mb-3">
         <div className="flex gap-4">
+          <button
+            onClick={() => setActiveTab("files")}
+            className={`px-4 py-2 border-b-2 transition-colors ${
+              activeTab === "files"
+                ? "border-accent text-accent"
+                : "border-transparent text-content-muted hover:text-content"
+            }`}
+          >
+            Files
+          </button>
           <button
             onClick={() => setActiveTab("darks")}
             className={`px-4 py-2 border-b-2 transition-colors ${
@@ -185,6 +206,15 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
 
       {/* Tab Content */}
       <div>
+        {activeTab === "files" && (
+          <DirectoryTree
+            scanRoots={scanRoots}
+            duplicates={[]}
+            refreshTrigger={0}
+            instrume={instrume}
+            cameraDirectories={cameraDirectories}
+          />
+        )}
         {activeTab === "darks" && (
           <DarkLibrary
             instrume={instrume}

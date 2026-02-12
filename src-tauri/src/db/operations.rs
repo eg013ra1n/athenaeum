@@ -677,6 +677,106 @@ pub fn get_files_by_directory(
     results.collect()
 }
 
+/// Get files in a specific directory filtered by camera (instrume)
+pub fn get_files_by_directory_for_camera(
+    conn: &Connection,
+    directory_path: &str,
+    instrume: &str,
+    limit: Option<usize>
+) -> Result<Vec<(File, Option<Frame>)>> {
+    let limit_clause = match limit {
+        Some(n) => format!("LIMIT {}", n),
+        None => String::new(),
+    };
+
+    let sep = std::path::MAIN_SEPARATOR.to_string();
+    let like_pattern = format!("{}{}%", directory_path, sep);
+    let expected_depth = directory_path.matches(sep.as_str()).count() as i64 + 1;
+
+    let query = format!(
+        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
+                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
+                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
+         FROM files f
+         JOIN frames fr ON f.id = fr.file_id
+         WHERE f.path LIKE ?1
+           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?2, ''))) = ?3
+           AND fr.instrume = ?4
+         ORDER BY f.filename
+         {}",
+        limit_clause
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let results = stmt.query_map(params![like_pattern, sep, expected_depth, instrume], |row| {
+        let file = File {
+            id: Some(row.get(0)?),
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            size: row.get(3)?,
+            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            format: if row.get::<_, String>(5)? == "FITS" {
+                FileFormat::FITS
+            } else {
+                FileFormat::XISF
+            },
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+                .unwrap()
+                .with_timezone(&Utc),
+            metadata_hash: row.get(7)?,
+            content_hash: row.get(8)?,
+        };
+
+        let frame = Some(Frame {
+            id: Some(row.get(9)?),
+            file_id: file.id.unwrap(),
+            object: row.get(10).ok(),
+            date_obs: row.get::<_, Option<String>>(11).ok().flatten().and_then(|s| {
+                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            }),
+            telescop: row.get(12).ok(),
+            instrume: row.get(13).ok(),
+            exptime: row.get(14).ok(),
+            filter: row.get(15).ok(),
+            imagetyp: row.get::<_, Option<String>>(16).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+            is_master: row.get::<_, i32>(17).ok().map(|v| v == 1).unwrap_or(false),
+            gain: row.get(18).ok(),
+            offset: row.get(19).ok(),
+            binning: row.get(20).ok(),
+            xbinning: row.get(21).ok(),
+            ybinning: row.get(22).ok(),
+            ccd_temp: row.get(23).ok(),
+            set_temp: row.get(24).ok(),
+            focallen: row.get(25).ok(),
+            xpixsz: row.get(26).ok(),
+            ypixsz: row.get(27).ok(),
+            naxis1: row.get(28).ok(),
+            naxis2: row.get(29).ok(),
+            ra: row.get(30).ok(),
+            dec: row.get(31).ok(),
+            sitelat: row.get(32).ok(),
+            lat_obs: row.get(33).ok(),
+            sitelong: row.get(34).ok(),
+            long_obs: row.get(35).ok(),
+            objctra: row.get(36).ok(),
+            objctdec: row.get(37).ok(),
+            override_: row.get::<_, i32>(38).ok().map(|v| v == 1).unwrap_or(false),
+            swcreate: row.get(39).ok(),
+            bayerpat: row.get(40).ok(),
+            rotation: row.get(41).ok(),
+        });
+
+        Ok((file, frame))
+    })?;
+
+    results.collect()
+}
+
 /// Get Light frames with missing metadata
 /// category: "all", "coordinates", "object", "datetime", "instrument"
 pub fn get_frames_with_missing_metadata(

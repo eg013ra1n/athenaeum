@@ -129,19 +129,8 @@ export function CalibrationHierarchyView({
     }
   }, [data]);
 
-  // Selection mode state (controls checkbox visibility)
-  const [selectionMode, setSelectionMode] = useState(false);
-
   // Checkbox selection state for filter groups (format: "dateKey:cameraKey:filterKey")
   const [checkedFilters, setCheckedFilters] = useState<Set<string>>(new Set());
-
-  // Toggle selection mode and clear selection when exiting
-  const toggleSelectionMode = useCallback(() => {
-    if (selectionMode) {
-      setCheckedFilters(new Set());
-    }
-    setSelectionMode(prev => !prev);
-  }, [selectionMode]);
 
   // Manual calibration modal state
   const [manualModalOpen, setManualModalOpen] = useState(false);
@@ -313,8 +302,6 @@ export function CalibrationHierarchyView({
             className="w-80 flex-shrink-0"
             checkedFilters={checkedFilters}
             onCheckedChange={setCheckedFilters}
-            selectionMode={selectionMode}
-            onToggleSelectionMode={toggleSelectionMode}
           />
 
           {/* Detail Panel - Right Panel */}
@@ -335,7 +322,7 @@ export function CalibrationHierarchyView({
       )}
 
       {/* Bottom Action Bar - visible when in selection mode with items selected */}
-      {selectionMode && checkedFilters.size > 0 && (onBlinkSelected || onSplit || onCreateCustomSet) && (
+      {checkedFilters.size > 0 && (onBlinkSelected || onSplit || onCreateCustomSet) && (
         <div className="mt-3 bg-surface-elevated/80 rounded-lg p-3 border border-border/50">
           <div className="flex items-center justify-between">
             {/* Left side: Action buttons */}
@@ -407,7 +394,7 @@ export function CalibrationHierarchyView({
                 </span>
               </div>
               <button
-                onClick={toggleSelectionMode}
+                onClick={() => setCheckedFilters(new Set())}
                 className="
                   px-3 py-1.5
                   text-content-muted hover:text-content
@@ -417,7 +404,7 @@ export function CalibrationHierarchyView({
                   focus:outline-none focus-visible:ring-1 focus-visible:ring-border
                 "
               >
-                Cancel
+                Clear
               </button>
             </div>
           </div>

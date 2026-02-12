@@ -99,6 +99,8 @@ pub fn run() {
             commands::get_frames_with_missing_metadata,
             commands::get_duplicates,
             commands::get_directory_contents,
+            commands::get_camera_directories,
+            commands::get_camera_directory_contents,
             commands::get_setting,
             commands::set_setting,
             commands::get_all_settings,

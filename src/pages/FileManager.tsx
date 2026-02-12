@@ -271,7 +271,7 @@ export default function FileManager() {
       </div>
 
       {/* Tab Navigation */}
-      <div className="flex gap-2 mb-6 border-b border-border">
+      <div className="flex gap-2 mb-3 border-b border-border">
         <button
           onClick={() => setActiveTab('directories')}
           className={`px-4 py-2 transition relative ${

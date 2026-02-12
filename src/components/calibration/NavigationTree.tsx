@@ -28,10 +28,6 @@ interface NavigationTreeProps {
   checkedFilters?: Set<string>;
   /** Callback when filter selection changes */
   onCheckedChange?: (checkedFilters: Set<string>) => void;
-  /** Whether selection mode is active (shows checkboxes) */
-  selectionMode?: boolean;
-  /** Callback to toggle selection mode */
-  onToggleSelectionMode?: () => void;
 }
 
 /**
@@ -94,8 +90,6 @@ export function NavigationTree({
   warningCounts,
   checkedFilters = new Set(),
   onCheckedChange,
-  selectionMode = false,
-  onToggleSelectionMode,
 }: NavigationTreeProps) {
   // Track expanded state for date and camera levels - expanded by default
   const [expandedDates, setExpandedDates] = useState<Set<string>>(() => {
@@ -318,18 +312,6 @@ export function NavigationTree({
           >
             <ChevronsDownUp size={14} className={isAllExpanded ? "rotate-180" : ""} />
           </button>
-          {onToggleSelectionMode && (
-            <button
-              onClick={onToggleSelectionMode}
-              className={`text-xs px-2 py-0.5 rounded transition-colors ${
-                selectionMode
-                  ? 'bg-accent/20 text-accent'
-                  : 'text-content-muted hover:text-content-secondary hover:bg-surface-hover/50'
-              }`}
-            >
-              {selectionMode ? 'Done' : 'Select'}
-            </button>
-          )}
         </div>
       </div>
 
@@ -354,7 +336,7 @@ export function NavigationTree({
                   ${isSelected('date', dateKey) ? 'bg-accent/15' : ''}
                 `}
               >
-                {selectionMode && onCheckedChange && (
+                {onCheckedChange && (
                   <StyledCheckbox
                     checked={dateFullyChecked}
                     indeterminate={datePartiallyChecked}
@@ -405,7 +387,7 @@ export function NavigationTree({
                             ${isSelected('camera', dateKey, cameraGroup.instrume) ? 'bg-accent/15' : ''}
                           `}
                         >
-                          {selectionMode && onCheckedChange && (
+                          {onCheckedChange && (
                             <StyledCheckbox
                               checked={cameraFullyChecked}
                               indeterminate={cameraPartiallyChecked}
@@ -457,7 +439,7 @@ export function NavigationTree({
                                   role="treeitem"
                                   aria-selected={isFilterSelected}
                                 >
-                                  {selectionMode && onCheckedChange && (
+                                  {onCheckedChange && (
                                     <StyledCheckbox
                                       checked={isFilterChecked}
                                       onChange={() => toggleFilterChecked(fullKey)}
