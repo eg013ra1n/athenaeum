@@ -3,7 +3,6 @@ import {
   Loader2,
   CheckSquare,
   Square,
-  XSquare,
   Trash2,
 } from "lucide-react";
 import type { FrameListProps } from "./types";
@@ -31,17 +30,17 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
           <div className="flex items-center gap-1">
             <button
               onClick={onSelectAll}
-              className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
+              className="px-1.5 py-0.5 text-xs text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
               title="Select all (Ctrl+A)"
             >
-              <CheckSquare size={16} />
+              Select all
             </button>
             <button
               onClick={onClearSelection}
-              className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
+              className="px-1.5 py-0.5 text-xs text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
               title="Clear selection"
             >
-              <XSquare size={16} />
+              Unselect
             </button>
           </div>
         </div>
@@ -110,16 +109,8 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                 <div className={`flex-1 min-w-0 ${isBlackholed ? 'line-through opacity-60' : ''}`}>
                   <div className="font-medium truncate">
                     {frame.file.filename}
-                  </div>
-                  <div className="text-xs opacity-75 mt-0.5">
-                    {frame.frame?.filter && (
-                      <span>{frame.frame.filter}</span>
-                    )}
-                    {frame.frame?.exptime && (
-                      <span className="ml-2">{frame.frame.exptime}s</span>
-                    )}
                     {isBlackholed && (
-                      <span className="ml-2 text-error">(blackholed)</span>
+                      <span className="ml-2 text-xs text-error">(blackholed)</span>
                     )}
                   </div>
                 </div>

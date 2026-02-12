@@ -1,6 +1,5 @@
 import React, { memo } from "react";
 import {
-  X,
   Play,
   Pause,
   ChevronLeft,
@@ -29,6 +28,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   isBlackholing,
   isCaching,
   cacheProgress,
+  cacheStats,
   onClose,
 }) {
   return (
@@ -67,9 +67,9 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           <label className="text-sm text-content-muted">Speed:</label>
           <input
             type="range"
-            min="0.5"
-            max="25"
-            step="0.5"
+            min="1"
+            max="20"
+            step="1"
             value={blinkSpeed}
             onChange={(e) => onSpeedChange(parseFloat(e.target.value))}
             className="w-24"
@@ -91,12 +91,16 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           </div>
         )}
 
-        {isCaching && (
+        {isCaching ? (
           <div className="flex items-center gap-2 text-sm text-content-muted">
             <Loader2 className="animate-spin" size={14} />
             <span>Caching {cacheProgress.current}/{cacheProgress.total}</span>
           </div>
-        )}
+        ) : cacheStats ? (
+          <div className="text-sm text-content-muted">
+            Cached {cacheStats.frameCount} frames in {(cacheStats.elapsedMs / 1000).toFixed(1)}s ({(cacheStats.frameCount / (cacheStats.elapsedMs / 1000)).toFixed(1)} fps)
+          </div>
+        ) : null}
       </div>
 
       {/* Right: Selection actions + Close button */}
@@ -135,9 +139,9 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
         </div>
         <button
           onClick={onClose}
-          className="p-2 hover:bg-surface-elevated rounded transition-colors"
+          className="px-2 py-1 text-sm text-content-muted hover:text-content hover:bg-surface-elevated rounded transition-colors"
         >
-          <X className="text-content" size={20} />
+          [Close]
         </button>
       </div>
     </div>

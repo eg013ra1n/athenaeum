@@ -35,6 +35,7 @@ export interface ToolBarProps {
   // Caching
   isCaching: boolean;
   cacheProgress: { current: number; total: number };
+  cacheStats: { elapsedMs: number; frameCount: number } | null;
 
   // Close
   onClose: () => void;

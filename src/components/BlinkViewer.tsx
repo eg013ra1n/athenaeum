@@ -34,6 +34,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [isCaching, setIsCaching] = useState(false);
   const [cacheProgress, setCacheProgress] = useState({ current: 0, total: 0 });
+  const [cacheStats, setCacheStats] = useState<{ elapsedMs: number; frameCount: number } | null>(null);
 
   // Gate: wait for backend settings to be ready before loading images
   const [cacheModeReady, setCacheModeReady] = useState(false);
@@ -399,11 +400,11 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           break;
         case "ArrowLeft":
           e.preventDefault();
-          setBlinkSpeed((p) => Math.max(0.5, p - 0.5));
+          setBlinkSpeed((p) => Math.max(1, p - 1));
           break;
         case "ArrowRight":
           e.preventDefault();
-          setBlinkSpeed((p) => Math.min(25, p + 0.5));
+          setBlinkSpeed((p) => Math.min(20, p + 1));
           break;
         case "Escape":
           e.preventDefault();
@@ -447,9 +448,11 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       if (uncached.length === 0) return;
 
       setIsCaching(true);
+      setCacheStats(null);
       let done = 0;
       setCacheProgress({ current: 0, total: uncached.length });
 
+      const cacheStartTime = Date.now();
       const MAX_CONCURRENT = 8;
       await new Promise<void>((resolveAll) => {
         let nextJob = 0;
@@ -477,6 +480,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
         startNext();
       });
+      setCacheStats({ elapsedMs: Date.now() - cacheStartTime, frameCount: uncached.length });
       setIsCaching(false);
     };
     startCaching();
@@ -724,6 +728,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         isBlackholing={isBlackholing}
         isCaching={isCaching}
         cacheProgress={cacheProgress}
+        cacheStats={cacheStats}
         onClose={onClose}
       />
 
