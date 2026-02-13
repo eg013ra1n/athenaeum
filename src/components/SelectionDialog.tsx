@@ -3,7 +3,7 @@
  * Shows selected frames and provides options to create frame sets
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { X, Check, AlertCircle } from 'lucide-react';
 import { SelectionResult } from '../types/selection';
@@ -32,6 +32,16 @@ export function SelectionDialog({
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+
+  // Reset dialog state when opened with new selection data
+  useEffect(() => {
+    if (isOpen && result) {
+      setFrameSetName('');
+      setError(null);
+      setSuccess(false);
+      setIsCreating(false);
+    }
+  }, [isOpen, result]);
 
   const handleCreateFrameSet = async () => {
     if (!frameSetName.trim() || !result) {

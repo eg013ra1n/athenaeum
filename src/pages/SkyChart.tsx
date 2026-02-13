@@ -21,44 +21,23 @@ declare global {
   const d3: any;
 }
 
-// DSO type to color mapping
-const DSO_COLORS: Record<string, string> = {
-  // Galaxies
-  'gc': '#f59e0b',   // Galaxy clusters - amber
-  'g': '#f59e0b',    // Generic galaxy
-  'gg': '#f59e0b',   // Galaxy group
-  's': '#f59e0b',    // Spiral galaxy
-  's0': '#f59e0b',   // Lenticular galaxy
-  'sd': '#f59e0b',   // Dwarf galaxy
-  'e': '#f59e0b',    // Elliptical galaxy
-  'i': '#f59e0b',    // Irregular galaxy
-  // Nebulae
-  'en': '#ef4444',   // Emission nebula - red
-  'rn': '#f87171',   // Reflection nebula - light red
-  'sfr': '#ef4444',  // Star-forming region
-  'snr': '#ef4444',  // Supernova remnant
-  'dn': '#7f1d1d',   // Dark nebula - dark red
-  'pn': '#22c55e',   // Planetary nebula - green
-  // Clusters
-  'oc': '#38bdf8',   // Open cluster - blue
-  'gx': '#f59e0b',   // Galaxy (alt)
-  'bn': '#ef4444',   // Bright nebula
-  'nb': '#ef4444',   // Nebula (alt)
-};
-
-function getDsoColor(type: string): string {
-  return DSO_COLORS[type] || '#9ca3af'; // gray fallback
-}
-
-interface DsoFeature {
-  geometry: { type: string; coordinates: number[] };
-  properties: {
-    desig: string;
-    type: string;
-    mag: string;
-    dim: string;
-    name?: string;
-  };
+/** Inverse gnomonic: tangent-plane (xi, eta) in radians → [RA, Dec] in degrees */
+function inverseGnomonic(
+  xiRad: number, etaRad: number,
+  ra0Deg: number, dec0Deg: number
+): [number, number] {
+  const ra0Rad = (ra0Deg * Math.PI) / 180;
+  const dec0Rad = (dec0Deg * Math.PI) / 180;
+  const sinDec0 = Math.sin(dec0Rad);
+  const cosDec0 = Math.cos(dec0Rad);
+  const rho = Math.sqrt(xiRad * xiRad + etaRad * etaRad);
+  if (rho < 1e-10) return [ra0Deg, dec0Deg];
+  const c = Math.atan(rho);
+  const sinC = Math.sin(c);
+  const cosC = Math.cos(c);
+  const dec = Math.asin(cosC * sinDec0 + etaRad * sinC * cosDec0 / rho) * (180 / Math.PI);
+  const ra = (ra0Rad + Math.atan2(xiRad * sinC, rho * cosDec0 * cosC - etaRad * sinDec0 * sinC)) * (180 / Math.PI);
+  return [ra, dec];
 }
 
 export default function SkyChart() {
@@ -66,16 +45,12 @@ export default function SkyChart() {
   const mapInitialized = useRef(false);
   const resizeTimeoutRef = useRef<number | undefined>(undefined);
   const autoSaveTimeoutRef = useRef<number | undefined>(undefined);
-  const restorationDone = useRef(false);
   const saveViewStateRef = useRef<((state: any, replace?: boolean) => void) | null>(null);
   const autoSaveRegistered = useRef(false);
-  const dsoDataRef = useRef<DsoFeature[] | null>(null);
-
   const [locations, setLocations] = useState<ImagingLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [mapReady, setMapReady] = useState(false);
-  const [showDsoOutlines, setShowDsoOutlines] = useState(true);
   const [selectedTarget, setSelectedTarget] = useState<string>('');
 
   // Selection state
@@ -126,26 +101,6 @@ export default function SkyChart() {
       }
     }
     loadLocations();
-  }, []);
-
-  // Load DSO data — pre-filter to only keep DSOs with valid dimensions and mag <= 14
-  useEffect(() => {
-    fetch('/data/dsos.14.json')
-      .then(res => res.json())
-      .then(data => {
-        // Pre-parse and filter at load time so redraw is fast
-        dsoDataRef.current = (data.features as DsoFeature[]).filter(d => {
-          if (!d.properties.dim || !d.properties.dim.includes('x')) return false;
-          const parts = d.properties.dim.split('x');
-          if (parts.length < 2) return false;
-          const major = parseFloat(parts[0]);
-          return !isNaN(major) && major > 0;
-        });
-        console.log(`DSO outlines: ${dsoDataRef.current.length} objects with dimensions loaded`);
-      })
-      .catch(err => {
-        console.error('Failed to load DSO data:', err);
-      });
   }, []);
 
   // Keep saveViewState ref up to date
@@ -221,6 +176,7 @@ export default function SkyChart() {
       }
 
       const savedState = getViewState();
+      const restoringState = savedState.ra !== null || savedState.zoom !== null;
 
       // Stereographic is 1:1 — fit within container's smaller dimension
       // to minimize CSS stretch distortion (same logic as resize handler)
@@ -239,6 +195,10 @@ export default function SkyChart() {
           center: (savedState.ra !== null && savedState.dec !== null)
             ? [savedState.ra, savedState.dec, savedState.rotation ?? 0]
             : null,
+          // Suppress all d3 transition animations during initialization so
+          // any internal rotate()/zoomBy() calls inside display() use instant
+          // code paths. Re-enabled in the restoration rAF below.
+          disableAnimations: restoringState,
           orientationfixed: false,
           follow: "center",
           zoomlevel: null,
@@ -314,18 +274,25 @@ export default function SkyChart() {
         window.Celestial.display(config);
         mapInitialized.current = true;
 
-        // Restore zoom after display
-        if (savedState.zoom !== null) {
-          const targetZoom = savedState.zoom;
+        // Restore zoom and re-enable animations in a single rAF.
+        // disableAnimations was set true in the config above, so zoomBy()
+        // takes the instant path that syncs both projection.scale AND the
+        // internal d3.geo.zoom behavior state (K.scale).
+        if (restoringState) {
           requestAnimationFrame(() => {
-            const projection = window.Celestial.mapProjection;
-            if (projection && projection.scale) {
-              const currentZoom = projection.scale();
-              const zoomFactor = targetZoom / currentZoom;
-              if (window.Celestial.zoomBy) {
-                window.Celestial.zoomBy(zoomFactor);
+            if (savedState.zoom !== null) {
+              const projection = window.Celestial.mapProjection;
+              if (projection && projection.scale && window.Celestial.zoomBy) {
+                const currentZoom = projection.scale();
+                const zoomFactor = savedState.zoom / currentZoom;
+                if (Math.abs(zoomFactor - 1) > 0.001) {
+                  window.Celestial.zoomBy(zoomFactor);
+                }
               }
             }
+            // Re-enable animations now that restoration is complete
+            const settings = window.Celestial.settings();
+            settings.disableAnimations = false;
           });
         }
 
@@ -340,36 +307,6 @@ export default function SkyChart() {
       cancelAnimationFrame(rafId);
     };
   }, [loading]);
-
-  // Restore view state from URL after map initialization
-  useEffect(() => {
-    if (!mapReady || typeof window.Celestial === 'undefined') return;
-    if (restorationDone.current) return;
-
-    const viewState = getViewState();
-    const { zoom, ra, dec, rotation } = viewState;
-
-    if (zoom !== null || (ra !== null && dec !== null)) {
-      requestAnimationFrame(() => {
-        if (ra !== null && dec !== null && window.Celestial.rotate) {
-          window.Celestial.rotate({ center: [ra, dec, rotation ?? 0] });
-        }
-
-        if (zoom !== null) {
-          const projection = window.Celestial.mapProjection;
-          if (projection && projection.scale) {
-            const currentZoom = projection.scale();
-            const zoomFactor = zoom / currentZoom;
-            if (window.Celestial.zoomBy) {
-              window.Celestial.zoomBy(zoomFactor);
-            }
-          }
-        }
-      });
-
-      restorationDone.current = true;
-    }
-  }, [mapReady]);
 
   // Handle window resize
   useEffect(() => {
@@ -433,111 +370,6 @@ export default function SkyChart() {
       .attr('d', sphereD)
       .attr('transform', `scale(${scaling.scaleX},${scaling.scaleY})`);
   }, []);
-
-  // DSO outline drawing — builds SVG ellipses for visible DSOs
-  const drawDsoOutlines = useCallback(() => {
-    if (!dsoDataRef.current || typeof window.Celestial === 'undefined') return;
-
-    const mapDiv = document.getElementById('celestial-map');
-    if (!mapDiv) return;
-
-    // Find or create SVG overlay for DSOs
-    let svg = d3.select('#celestial-map').select('svg.dso-outlines-overlay');
-    if (svg.empty()) {
-      svg = d3.select('#celestial-map')
-        .append('svg')
-        .attr('class', 'dso-outlines-overlay')
-        .style('position', 'absolute')
-        .style('top', '0')
-        .style('left', '0')
-        .style('width', '100%')
-        .style('height', '100%')
-        .style('pointer-events', 'none');
-    }
-
-    let dsoGroup = svg.select('g.dso-outlines-layer');
-    if (dsoGroup.empty()) {
-      dsoGroup = svg.append('g')
-        .attr('class', 'dso-outlines-layer');
-    }
-
-    dsoGroup.selectAll('*').remove();
-
-    const scaling = getCanvasScaling();
-
-    // Update globe clip path and apply to group
-    updateGlobeClip(svg, 'dso-globe-clip', scaling);
-    dsoGroup.attr('clip-path', 'url(#dso-globe-clip)');
-
-    if (!showDsoOutlines) return;
-
-    const projection = window.Celestial.map.projection();
-    if (!projection) return;
-
-    // Build all ellipses as a single innerHTML string for speed
-    const parts: string[] = [];
-
-    for (const dso of dsoDataRef.current) {
-      const coords = dso.geometry.coordinates;
-      if (!coords || coords.length < 2) continue;
-
-      // Visibility check first (cheapest filter)
-      if (!window.Celestial.clip(coords)) continue;
-
-      const ctr = projection(coords);
-      if (!ctr || !isFinite(ctr[0]) || !isFinite(ctr[1])) continue;
-
-      // Dims already validated at load time
-      const dimParts = dso.properties.dim.split('x');
-      const majorArcmin = parseFloat(dimParts[0]);
-      const minorArcmin = parseFloat(dimParts[1]);
-      if (isNaN(minorArcmin)) continue;
-
-      const majorDeg = majorArcmin / 60;
-      const minorDeg = minorArcmin / 60;
-
-      const ra = coords[0];
-      const dec = coords[1];
-
-      const cosDec = Math.cos((dec * Math.PI) / 180);
-      const raOffsetDeg = cosDec > 0.01 ? (majorDeg / 2) / cosDec : majorDeg / 2;
-      const edgeRA = projection([ra + raOffsetDeg, dec]);
-      const edgeDec = projection([ra, dec + majorDeg / 2]);
-
-      if (!edgeRA || !edgeDec || !isFinite(edgeRA[0]) || !isFinite(edgeDec[1])) continue;
-
-      const rxPixels = Math.abs(edgeRA[0] - ctr[0]) * scaling.scaleX;
-      const ryPixels = Math.abs(edgeDec[1] - ctr[1]) * scaling.scaleY;
-
-      const ellipseRx = rxPixels;
-      const ellipseRy = (minorDeg / majorDeg) * ryPixels;
-
-      if (ellipseRx < 1 || ellipseRy < 1 || ellipseRx > 2000 || ellipseRy > 2000) continue;
-
-      const color = getDsoColor(dso.properties.type);
-
-      parts.push(
-        `<ellipse cx="${ctr[0] * scaling.scaleX}" cy="${ctr[1] * scaling.scaleY}" rx="${ellipseRx}" ry="${ellipseRy}" fill="none" stroke="${color}" stroke-width="1" stroke-opacity="0.5"/>`
-      );
-    }
-
-    // Single DOM write
-    const node = dsoGroup.node() as Element;
-    if (node) node.innerHTML = parts.join('');
-  }, [showDsoOutlines, getCanvasScaling, updateGlobeClip]);
-
-  // Register DSO outlines with Celestial redraw (every frame, no debounce)
-  useEffect(() => {
-    if (!mapReady || typeof window.Celestial === 'undefined') return;
-
-    drawDsoOutlines();
-
-    window.Celestial.add({
-      type: 'raw',
-      callback: () => {},
-      redraw: drawDsoOutlines
-    });
-  }, [mapReady, drawDsoOutlines]);
 
   // Add imaging location markers with FOV visualization
   const addImagingMarkers = useCallback((locs: ImagingLocation[]) => {
@@ -655,8 +487,10 @@ export default function SkyChart() {
             const pa = d.properties.rotation ?? 0;
             const paRad = (pa * Math.PI) / 180;
 
-            const halfW = fovW / 2;
-            const halfH = fovH / 2;
+            // Convert half-FOV angle to gnomonic tangent-plane coordinate.
+            // tan(angle) is the correct offset on the tangent plane; for small angles tan(x) ≈ x.
+            const halfW = Math.tan((fovW / 2) * Math.PI / 180) * (180 / Math.PI);
+            const halfH = Math.tan((fovH / 2) * Math.PI / 180) * (180 / Math.PI);
             const offsets: [number, number][] = [
               [-halfW, -halfH],
               [+halfW, -halfH],
@@ -666,25 +500,12 @@ export default function SkyChart() {
 
             // Inverse gnomonic projection: tangent-plane offsets → sphere
             // Handles poles correctly (flat-sky dRA=xi/cosDec breaks at Dec>89°)
-            const ra0Rad = (originalRa * Math.PI) / 180;
-            const dec0Rad = (dec * Math.PI) / 180;
-            const sinDec0 = Math.sin(dec0Rad);
-            const cosDec0 = Math.cos(dec0Rad);
-
             const corners = offsets.map(([dxi, deta]) => {
               const xi  =  dxi * Math.cos(paRad) + deta * Math.sin(paRad);
               const eta = -dxi * Math.sin(paRad) + deta * Math.cos(paRad);
               const xiRad = (xi * Math.PI) / 180;
               const etaRad = (eta * Math.PI) / 180;
-              const rho = Math.sqrt(xiRad * xiRad + etaRad * etaRad);
-              if (rho < 1e-10) {
-                return [raToGeoJsonLongitude(originalRa), dec] as [number, number];
-              }
-              const c = Math.atan(rho);
-              const sinC = Math.sin(c);
-              const cosC = Math.cos(c);
-              const cornerDec = Math.asin(cosC * sinDec0 + etaRad * sinC * cosDec0 / rho) * (180 / Math.PI);
-              const cornerRA = (ra0Rad + Math.atan2(xiRad * sinC, rho * cosDec0 * cosC - etaRad * sinDec0 * sinC)) * (180 / Math.PI);
+              const [cornerRA, cornerDec] = inverseGnomonic(xiRad, etaRad, originalRa, dec);
               return [raToGeoJsonLongitude(cornerRA), cornerDec] as [number, number];
             });
 
@@ -723,8 +544,10 @@ export default function SkyChart() {
             }
 
             const absPARad = Math.abs(paRad);
-            const expectedBBWidth = fovW * Math.abs(Math.cos(absPARad)) + fovH * Math.abs(Math.sin(absPARad));
-            const expectedBBHeight = fovW * Math.abs(Math.sin(absPARad)) + fovH * Math.abs(Math.cos(absPARad));
+            const tanW = Math.tan((fovW / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
+            const tanH = Math.tan((fovH / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
+            const expectedBBWidth = tanW * Math.abs(Math.cos(absPARad)) + tanH * Math.abs(Math.sin(absPARad));
+            const expectedBBHeight = tanW * Math.abs(Math.sin(absPARad)) + tanH * Math.abs(Math.cos(absPARad));
             const originalAspectRatio = expectedBBWidth / Math.max(expectedBBHeight, 0.001);
             const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
             const distortionRatio = projectedAspectRatio / originalAspectRatio;
@@ -875,8 +698,10 @@ export default function SkyChart() {
             if (storedFovW && storedFovH) {
               const storedRotation = (this as any).__rotation ?? 0;
               const absPARad = Math.abs(storedRotation * Math.PI / 180);
-              const expectedBBWidth = storedFovW * Math.abs(Math.cos(absPARad)) + storedFovH * Math.abs(Math.sin(absPARad));
-              const expectedBBHeight = storedFovW * Math.abs(Math.sin(absPARad)) + storedFovH * Math.abs(Math.cos(absPARad));
+              const tanW = Math.tan((storedFovW / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
+              const tanH = Math.tan((storedFovH / 2) * Math.PI / 180) * 2 * (180 / Math.PI);
+              const expectedBBWidth = tanW * Math.abs(Math.cos(absPARad)) + tanH * Math.abs(Math.sin(absPARad));
+              const expectedBBHeight = tanW * Math.abs(Math.sin(absPARad)) + tanH * Math.abs(Math.cos(absPARad));
               const originalAspectRatio = expectedBBWidth / Math.max(expectedBBHeight, 0.001);
               const projectedAspectRatio = xSpan / Math.max(ySpan, 0.001);
               const distortionRatio = projectedAspectRatio / originalAspectRatio;
@@ -1090,20 +915,6 @@ export default function SkyChart() {
               ))
             }
           </select>
-
-          {/* DSO outlines toggle */}
-          <button
-            onClick={() => setShowDsoOutlines(!showDsoOutlines)}
-            disabled={!mapReady}
-            title="Toggle DSO outlines"
-            className={`px-3 py-1.5 rounded text-sm font-medium transition ${
-              showDsoOutlines
-                ? 'bg-accent text-white shadow-lg'
-                : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
-            } ${!mapReady ? 'opacity-50 cursor-not-allowed' : ''}`}
-          >
-            DSOs
-          </button>
 
           <div className="w-px h-6 bg-border" />
 
