@@ -178,26 +178,27 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
     Ok(result)
 }
 
-/// Query frames within a rectangular region of the sky
+/// Query candidate frames within a rectangular region of the sky
 ///
-/// Handles RA wrap-around at 0°/360° boundary automatically
+/// Returns frame coordinates so the frontend can do precise pixel-space verification.
+/// This is important because RA/Dec bounding boxes break near the poles where a small
+/// visual rectangle can span nearly 360° of RA.
 ///
 /// # Arguments
 /// * `bounds` - SelectionBounds with ra_min, ra_max, dec_min, dec_max, crosses_meridian
 ///
 /// # Returns
-/// SelectionResult with frame IDs, count, and total exposure time
+/// SelectionCandidates with frame IDs, coordinates, and exposure times
 #[tauri::command(rename_all = "snake_case")]
 pub async fn query_frames_in_bounds(
     state: State<'_, AppState>,
     bounds: SelectionBounds,
-) -> Result<SelectionResult, String> {
+) -> Result<SelectionCandidates, String> {
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Handle RA wrap-around at 0°/360° boundary
-    // Use explicit crosses_meridian flag if provided, otherwise detect from ra_min > ra_max
     let ra_wrap_around = bounds.crosses_meridian.unwrap_or_else(|| bounds.ra_min > bounds.ra_max);
 
     println!(
@@ -206,64 +207,42 @@ pub async fn query_frames_in_bounds(
     );
 
     let query = if ra_wrap_around {
-        // Wrap-around case: select frames where ra >= ra_min OR ra <= ra_max
-        "SELECT id FROM frames
-         WHERE ra IS NOT NULL
-         AND dec IS NOT NULL
-         AND imagetyp = 'Light'
-         AND (ra >= ?1 OR ra <= ?2)
-         AND dec BETWEEN ?3 AND ?4".to_string()
+        "SELECT id, ra, dec, COALESCE(exptime, 0) FROM frames
+         WHERE ra IS NOT NULL AND dec IS NOT NULL AND imagetyp = 'Light'
+         AND (ra >= ?1 OR ra <= ?2) AND dec BETWEEN ?3 AND ?4"
     } else {
-        // Normal case: select frames where ra is between ra_min and ra_max
-        "SELECT id FROM frames
-         WHERE ra IS NOT NULL
-         AND dec IS NOT NULL
-         AND imagetyp = 'Light'
-         AND ra BETWEEN ?1 AND ?2
-         AND dec BETWEEN ?3 AND ?4".to_string()
+        "SELECT id, ra, dec, COALESCE(exptime, 0) FROM frames
+         WHERE ra IS NOT NULL AND dec IS NOT NULL AND imagetyp = 'Light'
+         AND ra BETWEEN ?1 AND ?2 AND dec BETWEEN ?3 AND ?4"
     };
 
     let mut stmt = conn
-        .prepare(&query)
+        .prepare(query)
         .map_err(|e| e.to_string())?;
 
-    let frame_ids: Vec<i64> = stmt
+    let candidates: Vec<SelectionCandidate> = stmt
         .query_map(
             rusqlite::params![bounds.ra_min, bounds.ra_max, bounds.dec_min, bounds.dec_max],
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok(SelectionCandidate {
+                    id: row.get(0)?,
+                    ra: row.get(1)?,
+                    dec: row.get(2)?,
+                    exposure: row.get(3)?,
+                })
+            },
         )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
 
-    println!(
-        "Found {} frames (ra_wrap_around={})",
-        frame_ids.len(),
-        ra_wrap_around
-    );
+    let total_exposure: f64 = candidates.iter().map(|c| c.exposure).sum();
+    let count = candidates.len();
 
-    // Calculate total exposure
-    let total_exposure: f64 = if !frame_ids.is_empty() {
-        let mut total: f64 = 0.0;
-        let mut stmt = conn
-            .prepare("SELECT COALESCE(exptime, 0) FROM frames WHERE id = ?1")
-            .map_err(|e| e.to_string())?;
+    println!("Found {} candidate frames (ra_wrap_around={})", count, ra_wrap_around);
 
-        for frame_id in &frame_ids {
-            let exp: f64 = stmt
-                .query_row(rusqlite::params![frame_id], |row| row.get::<_, f64>(0))
-                .unwrap_or(0.0);
-            total += exp;
-        }
-        total
-    } else {
-        0.0
-    };
-
-    let count = frame_ids.len();
-
-    Ok(SelectionResult {
-        frame_ids,
+    Ok(SelectionCandidates {
+        candidates,
         count,
         total_exposure_seconds: total_exposure,
     })

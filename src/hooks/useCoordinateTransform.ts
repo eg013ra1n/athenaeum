@@ -44,10 +44,12 @@ export interface CoordinateTransformAPI {
 }
 
 /**
- * Get projection scaling factors to account for aspect ratio changes
- * d3-celestial uses Aitoff projection with fixed 2:1 aspect ratio
- * The projection coordinate system is based on the configured width
- * We need to scale between projection space and display space
+ * Get projection scaling factors to account for CSS stretching of the canvas.
+ * d3-celestial sets canvas.width and canvas.height (buffer dimensions) to
+ * projectionWidth * dpr and projectionHeight * dpr respectively.
+ * Dividing by dpr gives the logical projection dimensions, which we compare
+ * against the CSS display dimensions to get the scaling factors.
+ * This works for any projection type without needing to know the aspect ratio.
  */
 function getCanvasScaling(): { scaleX: number; scaleY: number } {
   const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
@@ -58,10 +60,10 @@ function getCanvasScaling(): { scaleX: number; scaleY: number } {
   const displayRect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
 
-  // Get the projection dimensions from Celestial config
-  const celestialConfig = (window as any).Celestial?.settings;
-  const projectionWidth = celestialConfig?.width || canvas.width / dpr;
-  const projectionHeight = projectionWidth / 2; // Aitoff is always 2:1
+  // Read projection dimensions directly from the canvas buffer
+  // d3-celestial sets canvas.width = projWidth * dpr, canvas.height = projHeight * dpr
+  const projectionWidth = canvas.width / dpr;
+  const projectionHeight = canvas.height / dpr;
 
   return {
     scaleX: displayRect.width / projectionWidth,
@@ -118,17 +120,6 @@ export function useCoordinateTransform(): CoordinateTransformAPI {
 
       // Convert display coordinates to projection space, accounting for aspect ratio
       const [canvasX, canvasY] = scaleDisplayToCanvas(x, y);
-
-      // Debug logging
-      const scaling = getCanvasScaling();
-      if (Math.abs(scaling.scaleX - 1.0) > 0.01 || Math.abs(scaling.scaleY - 1.0) > 0.01) {
-        console.log('📏 Projection scaling applied:', {
-          display: [x, y],
-          projection: [canvasX, canvasY],
-          scaleX: scaling.scaleX.toFixed(3),
-          scaleY: scaling.scaleY.toFixed(3)
-        });
-      }
 
       // Convert pixel coordinates to sky coordinates
       const result = projection.invert([canvasX, canvasY]);

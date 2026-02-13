@@ -5,7 +5,7 @@
 
 import { useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { SelectionResult } from '../types/selection';
+import { SelectionResult, SelectionCandidates } from '../types/selection';
 import { SVGOverlayAPI } from './useSvgOverlay';
 import { CoordinateTransformAPI } from './useCoordinateTransform';
 import { D3MouseEventAPI } from './useD3MouseEvents';
@@ -217,9 +217,9 @@ export function useRectangleSelection(
 
         console.log('✅ Sky bounds:', skyBounds);
 
-        // Query backend for frames in rectangle
+        // Query backend for candidate frames in the sky bounding box
         try {
-          const result = await invoke<SelectionResult>('query_frames_in_bounds', {
+          const candidates = await invoke<SelectionCandidates>('query_frames_in_bounds', {
             bounds: {
               ra_min: skyBounds.ra_min,
               ra_max: skyBounds.ra_max,
@@ -229,9 +229,29 @@ export function useRectangleSelection(
             }
           });
 
-          console.log(`🎯 Found ${result.count} frames in selection`);
+          console.log(`📦 Got ${candidates.count} candidate frames from bounding box`);
 
-          // Call completion callback with results
+          // Pixel-space verification: project each candidate's RA/Dec to screen
+          // and check if it falls inside the drawn rectangle.
+          const verified: { id: number; exposure: number }[] = [];
+          for (const c of candidates.candidates) {
+            const pixel = coordinateTransform.skyToPixel(c.ra, c.dec);
+            if (!pixel) continue;
+            const [px, py] = pixel;
+            if (px >= pixelRect.x1 && px <= pixelRect.x2 &&
+                py >= pixelRect.y1 && py <= pixelRect.y2) {
+              verified.push({ id: c.id, exposure: c.exposure });
+            }
+          }
+          console.log(`🎯 Verified ${verified.length} frames in pixel rectangle (from ${candidates.count} candidates)`);
+
+          const totalExposure = verified.reduce((sum, f) => sum + f.exposure, 0);
+          const result: SelectionResult = {
+            frameIds: verified.map(f => f.id),
+            count: verified.length,
+            totalExposureSeconds: totalExposure,
+          };
+
           if (callbackRef.current) {
             callbackRef.current(result);
           }

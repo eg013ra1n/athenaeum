@@ -59,20 +59,23 @@ export function calculateSkyBounds(
   const ras = skyPoints.map(p => p[0]);
   const decs = skyPoints.map(p => p[1]);
 
-  // Check for pole containment
+  // Check for pole containment or proximity
   const maxDec = Math.max(...decs);
   const minDec = Math.min(...decs);
   const containsPole = maxDec >= 89.5 ? 'north' :
                        minDec <= -89.5 ? 'south' : null;
+  // Near the pole (Dec > 80°), RA becomes unreliable — a small visual area
+  // spans nearly 360° of RA. Use full RA range to avoid missing frames.
+  const nearPole = maxDec > 80 || minDec < -80;
 
   // Handle RA wraparound detection
   const raSpan = Math.max(...ras) - Math.min(...ras);
-  const crossesMeridian = raSpan > 180;
+  const crossesMeridian = !nearPole && raSpan > 180;
 
   let ra_min: number, ra_max: number;
 
-  if (containsPole) {
-    // If contains pole, RA is unbounded (all RA values)
+  if (containsPole || nearPole) {
+    // Near or at a pole — RA is unreliable, use full range
     ra_min = 0;
     ra_max = 360;
   } else if (crossesMeridian) {
@@ -105,11 +108,24 @@ export function calculateSkyBounds(
     ra_max = Math.max(...ras);
   }
 
+  // Near the pole, sampling can't capture the true Dec extremes — the pole
+  // itself (Dec=90°) is a single pixel point, so sample points even a few
+  // pixels away may only reach Dec ~89°. Extend Dec to the pole to ensure
+  // the backend query returns all high-Dec frames.
+  let dec_min_final = Math.min(...decs);
+  let dec_max_final = Math.max(...decs);
+  if (nearPole && maxDec > 80) {
+    dec_max_final = 90;
+  }
+  if (nearPole && minDec < -80) {
+    dec_min_final = -90;
+  }
+
   return {
     ra_min,
     ra_max,
-    dec_min: Math.min(...decs),
-    dec_max: Math.max(...decs),
+    dec_min: dec_min_final,
+    dec_max: dec_max_final,
     crosses_meridian: crossesMeridian,
     contains_pole: containsPole
   };

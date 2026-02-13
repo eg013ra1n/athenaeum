@@ -86,9 +86,9 @@ export default function ShootCalendar() {
   );
 
   // Navigation handlers for panel
-  const handleNavigateToSkyAtlas = useCallback(
+  const handleNavigateToSkyChart = useCallback(
     (ra: number, dec: number) => {
-      navigate(`/skyatlas?ra=${ra}&dec=${dec}&zoom=800`);
+      navigate(`/skychart?ra=${ra}&dec=${dec}&zoom=800`);
     },
     [navigate]
   );
@@ -210,7 +210,7 @@ export default function ShootCalendar() {
             <CalendarEventPanel
               selectedDate={selectedDate}
               events={selectedEvents}
-              onNavigateToSkyAtlas={handleNavigateToSkyAtlas}
+              onNavigateToSkyChart={handleNavigateToSkyChart}
               onNavigateToFrameSet={handleNavigateToFrameSet}
             />
           </div>

@@ -333,14 +333,26 @@ pub struct SelectionBounds {
     pub crosses_meridian: Option<bool>,
 }
 
-/// Result of a spatial selection query
+/// A candidate frame from a spatial query with its coordinates
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SelectionResult {
-    pub frame_ids: Vec<i64>,
+pub struct SelectionCandidate {
+    pub id: i64,
+    pub ra: f64,
+    pub dec: f64,
+    pub exposure: f64,
+}
+
+/// Result of a spatial selection query (raw candidates with coordinates)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionCandidates {
+    pub candidates: Vec<SelectionCandidate>,
     pub count: usize,
     pub total_exposure_seconds: f64,
 }
+
+
 
 /// Selection criteria for splitting frame sets
 #[derive(Debug, Clone, Serialize, Deserialize)]

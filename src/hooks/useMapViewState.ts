@@ -8,8 +8,6 @@ export interface MapViewState {
   rotation: number | null;
 }
 
-const STORAGE_KEY = 'skyatlas_view_state';
-
 /**
  * Custom hook to manage celestial map view state via URL parameters with sessionStorage fallback.
  * This enables preserving zoom and position when navigating away and back.
@@ -17,8 +15,10 @@ const STORAGE_KEY = 'skyatlas_view_state';
  * Persistence strategy:
  * 1. Primary: URL parameters (for sharing, history, refreshes)
  * 2. Fallback: sessionStorage (for sidebar navigation within session)
+ *
+ * @param storageKey - sessionStorage key for this map instance (default: 'skyatlas_view_state')
  */
-export function useMapViewState() {
+export function useMapViewState(storageKey: string = 'skyatlas_view_state') {
   const [searchParams, setSearchParams] = useSearchParams();
 
   /**
@@ -26,7 +26,7 @@ export function useMapViewState() {
    */
   const loadFromStorage = useCallback((): MapViewState | null => {
     try {
-      const stored = sessionStorage.getItem(STORAGE_KEY);
+      const stored = sessionStorage.getItem(storageKey);
       if (stored) {
         return JSON.parse(stored) as MapViewState;
       }
@@ -41,7 +41,7 @@ export function useMapViewState() {
    */
   const saveToStorage = useCallback((state: MapViewState) => {
     try {
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      sessionStorage.setItem(storageKey, JSON.stringify(state));
     } catch (e) {
       console.warn('Failed to save view state to sessionStorage:', e);
     }

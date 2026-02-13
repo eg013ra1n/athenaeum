@@ -7,7 +7,7 @@ import type { CalendarDayEvent, CalendarFrameSetSummary, CalendarUnorganizedGrou
 interface CalendarEventPanelProps {
   selectedDate: string | null;
   events: CalendarDayEvent | null;
-  onNavigateToSkyAtlas: (ra: number, dec: number) => void;
+  onNavigateToSkyChart: (ra: number, dec: number) => void;
   onNavigateToFrameSet: (frameSetId: number) => void;
 }
 
@@ -25,11 +25,11 @@ function formatExposure(seconds: number): string {
 
 function FrameSetCard({
   frameSet,
-  onSkyAtlas,
+  onSkyChart,
   onDetails,
 }: {
   frameSet: CalendarFrameSetSummary;
-  onSkyAtlas: () => void;
+  onSkyChart: () => void;
   onDetails: () => void;
 }) {
   const hasCoordinates = frameSet.ra !== null && frameSet.dec !== null;
@@ -64,7 +64,7 @@ function FrameSetCard({
           Details
         </button>
         <button
-          onClick={onSkyAtlas}
+          onClick={onSkyChart}
           disabled={!hasCoordinates}
           className={`
             flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-xs font-medium transition-colors
@@ -72,10 +72,10 @@ function FrameSetCard({
               ? 'bg-surface-hover hover:brightness-110 text-content'
               : 'bg-surface-hover text-content-muted cursor-not-allowed'}
           `}
-          title={hasCoordinates ? 'Show in SkyAtlas' : 'No coordinates available'}
+          title={hasCoordinates ? 'Show in Sky Chart' : 'No coordinates available'}
         >
           <Map size={12} />
-          SkyAtlas
+          Sky Chart
         </button>
       </div>
     </div>
@@ -84,11 +84,11 @@ function FrameSetCard({
 
 function UnorganizedCard({
   group,
-  onSkyAtlas,
+  onSkyChart,
   onCreateFrameset,
 }: {
   group: CalendarUnorganizedGroup;
-  onSkyAtlas: () => void;
+  onSkyChart: () => void;
   onCreateFrameset: () => void;
 }) {
   const hasCoordinates = group.ra !== null && group.dec !== null;
@@ -120,11 +120,11 @@ function UnorganizedCard({
         </button>
         {hasCoordinates && (
           <button
-            onClick={onSkyAtlas}
+            onClick={onSkyChart}
             className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-surface-hover hover:brightness-110 text-content rounded text-xs font-medium transition-colors"
           >
             <Map size={12} />
-            Show in SkyAtlas
+            Show in Sky Chart
           </button>
         )}
       </div>
@@ -135,7 +135,7 @@ function UnorganizedCard({
 export function CalendarEventPanel({
   selectedDate,
   events,
-  onNavigateToSkyAtlas,
+  onNavigateToSkyChart,
   onNavigateToFrameSet,
 }: CalendarEventPanelProps) {
   // State for frame set creation
@@ -205,9 +205,9 @@ export function CalendarEventPanel({
                 <FrameSetCard
                   key={frameSet.id}
                   frameSet={frameSet}
-                  onSkyAtlas={() => {
+                  onSkyChart={() => {
                     if (frameSet.ra !== null && frameSet.dec !== null) {
-                      onNavigateToSkyAtlas(frameSet.ra, frameSet.dec);
+                      onNavigateToSkyChart(frameSet.ra, frameSet.dec);
                     }
                   }}
                   onDetails={() => onNavigateToFrameSet(frameSet.id)}
@@ -228,9 +228,9 @@ export function CalendarEventPanel({
                 <UnorganizedCard
                   key={group.id}
                   group={group}
-                  onSkyAtlas={() => {
+                  onSkyChart={() => {
                     if (group.ra !== null && group.dec !== null) {
-                      onNavigateToSkyAtlas(group.ra, group.dec);
+                      onNavigateToSkyChart(group.ra, group.dec);
                     }
                   }}
                   onCreateFrameset={() => {
