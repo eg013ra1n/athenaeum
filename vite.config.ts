@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { execSync } from "child_process";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -7,6 +8,13 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
+
+  define: {
+    __APP_VERSION__: JSON.stringify(process.env.npm_package_version || '0.1.0'),
+    __GIT_COMMIT__: JSON.stringify(
+      execSync('git rev-parse --short HEAD').toString().trim()
+    ),
+  },
 
   // Tauri loads JS from local filesystem, so large bundles are fine
   build: {

@@ -12,6 +12,7 @@ import Export from './pages/Export';
 import BlackHole from './pages/BlackHole';
 import SkyChart from './pages/SkyChart';
 import Settings from './pages/Settings';
+import About from './pages/About';
 
 function App() {
   const [dbInitialized, setDbInitialized] = useState(false);
@@ -66,6 +67,7 @@ function App() {
           <Route path="export" element={<Export />} />
           <Route path="blackhole" element={<BlackHole />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="about" element={<About />} />
         </Route>
       </Routes>
     </BrowserRouter>
