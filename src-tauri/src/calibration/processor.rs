@@ -32,6 +32,8 @@ pub struct ProcessingStats {
     pub missing_flats: i64,
     pub missing_darks: i64,
     pub missing_bias: i64,
+    pub frames_with_flats_only: i64,
+    pub frames_with_darks_only: i64,
 }
 
 impl ProcessingStats {
@@ -49,6 +51,8 @@ impl ProcessingStats {
             missing_flats: 0,
             missing_darks: 0,
             missing_bias: 0,
+            frames_with_flats_only: 0,
+            frames_with_darks_only: 0,
         }
     }
 
@@ -68,6 +72,12 @@ impl ProcessingStats {
             self.frames_with_full_calibration += 1;
         } else if has_flat || has_dark {
             self.frames_with_partial_calibration += 1;
+            if has_flat && !has_dark {
+                self.frames_with_flats_only += 1;
+            }
+            if !has_flat && has_dark {
+                self.frames_with_darks_only += 1;
+            }
         } else {
             self.frames_with_no_calibration += 1;
         }
@@ -484,6 +494,8 @@ mod tests {
 
         assert_eq!(stats.total_frames, 1);
         assert_eq!(stats.frames_with_full_calibration, 1);
+        assert_eq!(stats.frames_with_flats_only, 0);
+        assert_eq!(stats.frames_with_darks_only, 0);
         assert_eq!(stats.total_flat_sets_linked, 1);
         assert_eq!(stats.total_dark_sets_linked, 1);
     }

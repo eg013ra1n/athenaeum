@@ -1253,13 +1253,19 @@ fn calculate_match_score(details: &MatchDetails, calibration_type: &str) -> f64 
         }
     }
 
-    // Date penalty (prefer recent calibrations)
-    if details.date_diff_days > 365 {
-        score -= 0.15;
-    } else if details.date_diff_days > 90 {
-        score -= 0.1;
-    } else if details.date_diff_days > 30 {
-        score -= 0.05;
+    // Date penalty: flats use smooth decay (sensitive to optical changes),
+    // darks/bias use original step thresholds (stable over time)
+    if cal_type_lower == "flat" {
+        let date_score = 1.0 / (1.0 + (details.date_diff_days as f64 / 30.0));
+        score -= 0.15 * (1.0 - date_score);
+    } else {
+        if details.date_diff_days > 365 {
+            score -= 0.15;
+        } else if details.date_diff_days > 90 {
+            score -= 0.1;
+        } else if details.date_diff_days > 30 {
+            score -= 0.05;
+        }
     }
 
     // Clamp to 0.0-1.0

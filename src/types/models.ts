@@ -571,6 +571,8 @@ export interface ProcessingStats {
   missing_flats: number;
   missing_darks: number;
   missing_bias: number;
+  frames_with_flats_only: number;
+  frames_with_darks_only: number;
 }
 
 // Flat Calibration System
@@ -580,11 +582,6 @@ export enum FlatTiming {
   During = "During",
 }
 
-export enum FlatPattern {
-  Automatic = "automatic",
-  LongTerm = "long_term",
-  Manual = "manual",
-}
 
 export interface FlatGroup {
   frame_ids: number[];

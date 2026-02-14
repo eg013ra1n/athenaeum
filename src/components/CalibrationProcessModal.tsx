@@ -84,7 +84,7 @@ export function CalibrationProcessModal({
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <CheckCircle size={16} className="text-success" />
-                      <span className="text-sm text-content-secondary">Full calibration</span>
+                      <span className="text-sm text-content-secondary">Full calibration (Flats + Darks)</span>
                     </div>
                     <span className="text-sm font-medium text-content">
                       {stats.frames_with_full_calibration}
@@ -99,10 +99,26 @@ export function CalibrationProcessModal({
                       {stats.frames_with_partial_calibration}
                     </span>
                   </div>
+                  {stats.frames_with_partial_calibration > 0 && (
+                    <div className="ml-7 space-y-1">
+                      {stats.frames_with_flats_only > 0 && (
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-content-muted">Flats only (no Darks)</span>
+                          <span className="text-content-muted">{stats.frames_with_flats_only}</span>
+                        </div>
+                      )}
+                      {stats.frames_with_darks_only > 0 && (
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-content-muted">Darks only (no Flats)</span>
+                          <span className="text-content-muted">{stats.frames_with_darks_only}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <XCircle size={16} className="text-error" />
-                      <span className="text-sm text-content-secondary">No calibration</span>
+                      <span className="text-sm text-content-secondary">No calibration found</span>
                     </div>
                     <span className="text-sm font-medium text-content">
                       {stats.frames_with_no_calibration}
@@ -164,26 +180,25 @@ export function CalibrationProcessModal({
                   <div className="space-y-2 text-sm">
                     {stats.missing_flats > 0 && (
                       <div className="flex items-center justify-between">
-                        <span className="text-error">Frames missing Flats:</span>
+                        <span className="text-error">Light frames missing Flats:</span>
                         <span className="font-medium text-error">{stats.missing_flats}</span>
                       </div>
                     )}
                     {stats.missing_darks > 0 && (
                       <div className="flex items-center justify-between">
-                        <span className="text-error">Frames missing Darks:</span>
+                        <span className="text-error">Light frames missing Darks:</span>
                         <span className="font-medium text-error">{stats.missing_darks}</span>
                       </div>
                     )}
                     {stats.missing_bias > 0 && (
                       <div className="flex items-center justify-between">
-                        <span className="text-error">Frames missing Bias:</span>
+                        <span className="text-error">Flats missing Dark/Bias:</span>
                         <span className="font-medium text-error">{stats.missing_bias}</span>
                       </div>
                     )}
                   </div>
                   <p className="text-xs text-error/70 mt-3">
-                    Consider capturing calibration frames with matching camera settings, or check the Equipment tab
-                    to see available calibration sets.
+                    Light frames need both Flat and Dark calibration. Flats additionally need their own Dark or Bias frames.
                   </p>
                 </div>
               )}
