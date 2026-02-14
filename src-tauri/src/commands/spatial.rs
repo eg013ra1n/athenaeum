@@ -43,7 +43,8 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
             GROUP_CONCAT(DISTINCT CAST(fr.focallen AS TEXT)) as focal_lengths,
             fs.is_custom as is_custom,
-            AVG(fr.rotation) as avg_rotation
+            AVG(SIN(fr.rotation * 3.14159265358979 / 180.0)) as avg_sin_rot,
+            AVG(COS(fr.rotation * 3.14159265358979 / 180.0)) as avg_cos_rot
         FROM frames_set fs
         JOIN imaging_nights ino ON ino.frames_set_id = fs.id
         JOIN sessions s ON s.imaging_night_id = ino.id
@@ -79,7 +80,8 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
             GROUP_CONCAT(DISTINCT fr.instrume) as cameras,
             GROUP_CONCAT(DISTINCT CAST(fr.focallen AS TEXT)) as focal_lengths,
             0 as is_custom,
-            AVG(fr.rotation) as avg_rotation
+            AVG(SIN(fr.rotation * 3.14159265358979 / 180.0)) as avg_sin_rot,
+            AVG(COS(fr.rotation * 3.14159265358979 / 180.0)) as avg_cos_rot
         FROM frames fr
         WHERE fr.ra IS NOT NULL
           AND fr.dec IS NOT NULL
@@ -112,7 +114,14 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         let cameras_str: Option<String> = row.get(17)?;
         let focal_lengths_str: Option<String> = row.get(18)?;
         let is_custom: i64 = row.get(19)?;
-        let avg_rotation: Option<f64> = row.get(20)?;
+        let avg_sin_rot: Option<f64> = row.get(20)?;
+        let avg_cos_rot: Option<f64> = row.get(21)?;
+
+        // Compute circular mean of rotation angles via atan2(mean_sin, mean_cos)
+        let avg_rotation: Option<f64> = match (avg_sin_rot, avg_cos_rot) {
+            (Some(s), Some(c)) => Some(s.atan2(c).to_degrees()),
+            _ => None,
+        };
 
         // Parse filters from comma-separated string
         let filters: Vec<String> = filters_str

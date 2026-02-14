@@ -12,6 +12,7 @@ pub use operations::*;
 pub use operations_blackhole::*;
 pub use equipment::*;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, Result};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -39,6 +40,18 @@ impl Database {
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 268435456;",
         )?;
+
+        // Register math functions needed by spatial queries (circular mean rotation).
+        // Return NULL for NULL input (standard SQL behaviour); AVG() skips NULLs.
+        conn.create_scalar_function("SIN", 1, FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+            let val: Option<f64> = ctx.get(0)?;
+            Ok(val.map(f64::sin))
+        })?;
+
+        conn.create_scalar_function("COS", 1, FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+            let val: Option<f64> = ctx.get(0)?;
+            Ok(val.map(f64::cos))
+        })?;
 
         init_db(&conn)?;
         Ok(Self {

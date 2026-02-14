@@ -284,16 +284,28 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
         }
     });
 
-    // Image rotation / position angle
-    // Priority 1: CROTA2 keyword (direct rotation in degrees, N through E)
-    // Priority 2: Compute from CD matrix: atan2(-CD1_2, CD2_2)
+    // Image rotation / position angle — fallback priority chain:
+    // 1. CROTA2    — FITS WCS standard (direct rotation in degrees, N through E)
+    // 2. CD matrix — atan2(-CD1_2, CD2_2)
+    // 3. CROTA1    — FITS WCS alt axis rotation
+    // 4. POSANGLE  — Mount control / plate-solve software
+    // 5. ROTATANG  — Sequence Generator Pro (SGP) / PixInsight
+    // 6. PA        — Generic position angle abbreviation
+    // 7. OBJCTROT  — Object rotation (some capture software)
+    // 8. APTS_ROT  — Astro Photography Tool (APT)
     let rotation = header.get_f64("CROTA2")
         .or_else(|| {
             match (header.get_f64("CD1_2"), header.get_f64("CD2_2")) {
                 (Some(cd1_2), Some(cd2_2)) => Some((-cd1_2).atan2(cd2_2).to_degrees()),
                 _ => None,
             }
-        });
+        })
+        .or_else(|| header.get_f64("CROTA1"))
+        .or_else(|| header.get_f64("POSANGLE"))
+        .or_else(|| header.get_f64("ROTATANG"))
+        .or_else(|| header.get_f64("PA"))
+        .or_else(|| header.get_f64("OBJCTROT"))
+        .or_else(|| header.get_f64("APTS_ROT"));
 
     // Observatory location
     let sitelat = header.get_f64("SITELAT");
@@ -597,9 +609,15 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         }
     });
 
-    // Image rotation / position angle
-    // Priority 1: CROTA2 keyword (direct rotation in degrees, N through E)
-    // Priority 2: Compute from CD matrix: atan2(-CD1_2, CD2_2)
+    // Image rotation / position angle — fallback priority chain:
+    // 1. CROTA2    — FITS WCS standard (direct rotation in degrees, N through E)
+    // 2. CD matrix — atan2(-CD1_2, CD2_2)
+    // 3. CROTA1    — FITS WCS alt axis rotation
+    // 4. POSANGLE  — Mount control / plate-solve software
+    // 5. ROTATANG  — Sequence Generator Pro (SGP) / PixInsight
+    // 6. PA        — Generic position angle abbreviation
+    // 7. OBJCTROT  — Object rotation (some capture software)
+    // 8. APTS_ROT  — Astro Photography Tool (APT)
     let rotation = fits_keywords.get("CROTA2")
         .and_then(|s| s.parse::<f64>().ok())
         .or_else(|| {
@@ -610,7 +628,13 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
                 (Some(cd1_2), Some(cd2_2)) => Some((-cd1_2).atan2(cd2_2).to_degrees()),
                 _ => None,
             }
-        });
+        })
+        .or_else(|| fits_keywords.get("CROTA1").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| fits_keywords.get("POSANGLE").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| fits_keywords.get("ROTATANG").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| fits_keywords.get("PA").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| fits_keywords.get("OBJCTROT").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| fits_keywords.get("APTS_ROT").and_then(|s| s.parse::<f64>().ok()));
 
     // Observatory location
     let sitelat = fits_keywords.get("SITELAT")
