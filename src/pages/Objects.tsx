@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2 } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2, RotateCw } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import {
@@ -990,6 +990,18 @@ export default function Objects() {
                       <MapPin size={14} />
                       <span className="font-mono text-xs">
                         RA {frames_set.objctra} / Dec {frames_set.objctdec}
+                      </span>
+                    </div>
+                  )}
+                  {frames_set.avg_rotation != null && (
+                    <div className="flex items-center gap-1 text-sm text-content-muted mt-1">
+                      <RotateCw size={14} />
+                      <span className="font-mono text-xs">
+                        {frames_set.min_rotation != null && frames_set.max_rotation != null &&
+                         Math.abs(frames_set.max_rotation - frames_set.min_rotation) >= 1
+                          ? `${frames_set.min_rotation.toFixed(1)}° – ${frames_set.max_rotation.toFixed(1)}°`
+                          : `${frames_set.avg_rotation.toFixed(1)}°`
+                        }
                       </span>
                     </div>
                   )}

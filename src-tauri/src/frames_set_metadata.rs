@@ -13,6 +13,9 @@ pub struct FrameSetMetadata {
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
     pub total_exp_time: Option<f64>,
+    pub avg_rotation: Option<f64>,
+    pub min_rotation: Option<f64>,
+    pub max_rotation: Option<f64>,
 }
 
 /// Calculate frame set metadata from a list of frame IDs
@@ -27,6 +30,9 @@ pub fn calculate_metadata_from_frame_ids(
             objctra: None,
             objctdec: None,
             total_exp_time: None,
+            avg_rotation: None,
+            min_rotation: None,
+            max_rotation: None,
         });
     }
 
@@ -37,7 +43,7 @@ pub fn calculate_metadata_from_frame_ids(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.rotation
          FROM frames fr
          WHERE fr.id IN ({})",
         placeholders
@@ -92,7 +98,7 @@ pub fn calculate_metadata_from_frame_ids(
                 override_: row.get::<_, i32>(30)? == 1,
                 swcreate: None,
                 bayerpat: None,
-                rotation: None,
+                rotation: row.get(31)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -109,6 +115,9 @@ pub fn calculate_metadata_from_frames(frames: &[Frame]) -> Result<FrameSetMetada
             objctra: None,
             objctdec: None,
             total_exp_time: None,
+            avg_rotation: None,
+            min_rotation: None,
+            max_rotation: None,
         });
     }
 
@@ -176,12 +185,37 @@ pub fn calculate_metadata_from_frames(frames: &[Frame]) -> Result<FrameSetMetada
         (None, None)
     };
 
+    // Calculate rotation stats (circular mean for avg, simple min/max for range)
+    let rotations: Vec<f64> = frames
+        .iter()
+        .filter_map(|f| f.rotation)
+        .collect();
+
+    let (avg_rotation, min_rotation, max_rotation) = if !rotations.is_empty() {
+        let min_rot = rotations.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_rot = rotations.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        // Circular mean via atan2(mean_sin, mean_cos)
+        let sum_sin: f64 = rotations.iter().map(|r| r.to_radians().sin()).sum();
+        let sum_cos: f64 = rotations.iter().map(|r| r.to_radians().cos()).sum();
+        let avg_rot = sum_sin.atan2(sum_cos).to_degrees();
+        // Normalize to 0..360
+        let avg_rot = if avg_rot < 0.0 { avg_rot + 360.0 } else { avg_rot };
+
+        (Some(avg_rot), Some(min_rot), Some(max_rot))
+    } else {
+        (None, None, None)
+    };
+
     Ok(FrameSetMetadata {
         date_obs_start,
         date_obs_end,
         objctra,
         objctdec,
         total_exp_time,
+        avg_rotation,
+        min_rotation,
+        max_rotation,
     })
 }
 

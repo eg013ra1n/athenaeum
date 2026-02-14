@@ -598,6 +598,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add rotation stats to frames_set table (migration for existing databases)
+    let has_avg_rotation: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='avg_rotation'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_avg_rotation {
+        conn.execute("ALTER TABLE frames_set ADD COLUMN avg_rotation REAL", [])?;
+        conn.execute("ALTER TABLE frames_set ADD COLUMN min_rotation REAL", [])?;
+        conn.execute("ALTER TABLE frames_set ADD COLUMN max_rotation REAL", [])?;
+    }
+
     // Calibration set originals table - stores original metadata values before custom edits
     // Used to backup original FITS header values when user edits calibration set metadata
     conn.execute(

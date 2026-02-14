@@ -1166,12 +1166,15 @@ pub fn create_frames_set(
     objctra: Option<&str>,
     objctdec: Option<&str>,
     total_exp_time: Option<f64>,
+    avg_rotation: Option<f64>,
+    min_rotation: Option<f64>,
+    max_rotation: Option<f64>,
 ) -> Result<i64> {
     let is_custom_int = if is_custom { 1 } else { 0 };
     conn.execute(
-        "INSERT INTO frames_set (name, is_custom, date_obs_start, date_obs_end, objctra, objctdec, total_exp_time)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![name, is_custom_int, date_obs_start, date_obs_end, objctra, objctdec, total_exp_time],
+        "INSERT INTO frames_set (name, is_custom, date_obs_start, date_obs_end, objctra, objctdec, total_exp_time, avg_rotation, min_rotation, max_rotation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![name, is_custom_int, date_obs_start, date_obs_end, objctra, objctdec, total_exp_time, avg_rotation, min_rotation, max_rotation],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1183,7 +1186,7 @@ pub fn get_frames_sets_by_project(
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(
         "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
-                COUNT(DISTINCT sm.frame_id) as member_count
+                COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
@@ -1203,6 +1206,9 @@ pub fn get_frames_sets_by_project(
             objctdec: row.get(6)?,
             total_exp_time: row.get(7)?,
             flat_pattern: row.get(8)?,
+            avg_rotation: row.get(10)?,
+            min_rotation: row.get(11)?,
+            max_rotation: row.get(12)?,
         };
         let member_count: i32 = row.get(9)?;
         Ok((set, member_count as usize))
@@ -1257,14 +1263,17 @@ pub fn update_frames_set_metadata(
     objctdec: Option<&str>,
     total_exp_time: Option<f64>,
     is_custom: bool,
+    avg_rotation: Option<f64>,
+    min_rotation: Option<f64>,
+    max_rotation: Option<f64>,
 ) -> Result<()> {
     let is_custom_int = if is_custom { 1 } else { 0 };
     conn.execute(
         "UPDATE frames_set
          SET date_obs_start = ?1, date_obs_end = ?2, objctra = ?3, objctdec = ?4,
-             total_exp_time = ?5, is_custom = ?6
-         WHERE id = ?7",
-        params![date_obs_start, date_obs_end, objctra, objctdec, total_exp_time, is_custom_int, id],
+             total_exp_time = ?5, is_custom = ?6, avg_rotation = ?7, min_rotation = ?8, max_rotation = ?9
+         WHERE id = ?10",
+        params![date_obs_start, date_obs_end, objctra, objctdec, total_exp_time, is_custom_int, avg_rotation, min_rotation, max_rotation, id],
     )?;
     Ok(())
 }

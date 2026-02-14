@@ -1,8 +1,8 @@
 import { useState, useMemo } from 'react';
-import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock } from 'lucide-react';
+import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw } from 'lucide-react';
 import type { FramesSetWithCount } from '../types/models';
 
-type SortField = 'name' | 'coordinates' | 'frames' | 'exposure' | 'date' | 'custom';
+type SortField = 'name' | 'coordinates' | 'frames' | 'exposure' | 'rotation' | 'date' | 'custom';
 type SortDirection = 'asc' | 'desc';
 
 interface ObjectsTableViewProps {
@@ -65,6 +65,8 @@ export function ObjectsTableView({
           return dir * (a.member_count - b.member_count);
         case 'exposure':
           return dir * ((a.frames_set.total_exp_time || 0) - (b.frames_set.total_exp_time || 0));
+        case 'rotation':
+          return dir * ((a.frames_set.avg_rotation ?? -999) - (b.frames_set.avg_rotation ?? -999));
         case 'date':
           return dir * (a.frames_set.date_obs_start || '').localeCompare(b.frames_set.date_obs_start || '');
         case 'custom':
@@ -79,6 +81,14 @@ export function ObjectsTableView({
     if (!seconds) return '-';
     const hours = (seconds / 3600).toFixed(1);
     return `${hours}h`;
+  };
+
+  const formatRotation = (avg: number | null, min: number | null, max: number | null) => {
+    if (avg == null) return '-';
+    if (min != null && max != null && Math.abs(max - min) >= 1) {
+      return `${min.toFixed(0)}° – ${max.toFixed(0)}°`;
+    }
+    return `${avg.toFixed(0)}°`;
   };
 
   const formatDateRange = (start: string | null, end: string | null) => {
@@ -116,6 +126,10 @@ export function ObjectsTableView({
             <th className={`${headerClass} hidden lg:table-cell`} onClick={() => handleSort('exposure')}>
               <Clock size={12} className="inline mr-1" />
               Exposure <SortIcon field="exposure" />
+            </th>
+            <th className={`${headerClass} hidden lg:table-cell`} onClick={() => handleSort('rotation')}>
+              <RotateCw size={12} className="inline mr-1" />
+              Rotation <SortIcon field="rotation" />
             </th>
             <th className={`${headerClass} hidden md:table-cell`} onClick={() => handleSort('date')}>
               Date Range <SortIcon field="date" />
@@ -205,6 +219,11 @@ export function ObjectsTableView({
                 {/* Exposure */}
                 <td className="px-4 py-3 hidden lg:table-cell text-content-secondary">
                   {formatExposureTime(frames_set.total_exp_time)}
+                </td>
+
+                {/* Rotation */}
+                <td className="px-4 py-3 hidden lg:table-cell text-content-muted font-mono text-sm">
+                  {formatRotation(frames_set.avg_rotation, frames_set.min_rotation, frames_set.max_rotation)}
                 </td>
 
                 {/* Date Range */}

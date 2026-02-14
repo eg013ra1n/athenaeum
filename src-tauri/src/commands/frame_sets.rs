@@ -89,6 +89,9 @@ pub async fn auto_generate_frame_sets(
             metadata.objctra.as_deref(),
             metadata.objctdec.as_deref(),
             metadata.total_exp_time,
+            metadata.avg_rotation,
+            metadata.min_rotation,
+            metadata.max_rotation,
         ).map_err(|e| e.to_string())?;
 
         // Get frames for session detection
@@ -220,6 +223,9 @@ pub async fn mark_frame_set_custom(
         metadata.objctdec.as_deref(),
         metadata.total_exp_time,
         true, // Mark as custom
+        metadata.avg_rotation,
+        metadata.min_rotation,
+        metadata.max_rotation,
     ).map_err(|e| format!("Failed to update frame set: {}", e))?;
 
     // Return the updated frame set
@@ -261,6 +267,9 @@ pub async fn recalculate_frame_set_metadata(
         metadata.objctdec.as_deref(),
         metadata.total_exp_time,
         true, // Mark as custom after manual recalculation
+        metadata.avg_rotation,
+        metadata.min_rotation,
+        metadata.max_rotation,
     ).map_err(|e| format!("Failed to update metadata: {}", e))?;
 
     // Return the updated frame set
@@ -412,6 +421,9 @@ pub async fn merge_frame_sets(
             metadata.objctdec.as_deref(),
             metadata.total_exp_time,
             true, // Mark as custom after merge
+            metadata.avg_rotation,
+            metadata.min_rotation,
+            metadata.max_rotation,
         ).map_err(|e| format!("Failed to update metadata: {}", e))?;
 
         // Delete source frame set (cascade will handle cleanup)
@@ -604,6 +616,9 @@ pub async fn split_frame_set(
             metadata.objctra.as_deref(),
             metadata.objctdec.as_deref(),
             metadata.total_exp_time,
+            metadata.avg_rotation,
+            metadata.min_rotation,
+            metadata.max_rotation,
         ).map_err(|e| format!("Failed to create frame set: {}", e))?;
 
         println!("Created new frame set with id {}", new_set_id);
@@ -694,6 +709,9 @@ pub async fn split_frame_set(
             source_metadata.objctdec.as_deref(),
             source_metadata.total_exp_time,
             true, // Mark as custom after split
+            source_metadata.avg_rotation,
+            source_metadata.min_rotation,
+            source_metadata.max_rotation,
         ).map_err(|e| format!("Failed to update source metadata: {}", e))?;
 
         println!("✅ Split completed successfully");
@@ -845,6 +863,9 @@ pub async fn create_custom_frames_set(
         metadata.objctra.as_deref(),
         metadata.objctdec.as_deref(),
         metadata.total_exp_time,
+        metadata.avg_rotation,
+        metadata.min_rotation,
+        metadata.max_rotation,
     ).map_err(|e| {
         let err_msg = format!("Failed to create frames_set: {}", e);
         println!("{}", err_msg);
@@ -952,6 +973,9 @@ pub async fn create_frame_set_from_selection(
         metadata.objctra.as_deref(),
         metadata.objctdec.as_deref(),
         metadata.total_exp_time,
+        metadata.avg_rotation,
+        metadata.min_rotation,
+        metadata.max_rotation,
     ).map_err(|e| format!("Failed to create frames_set: {}", e))?;
 
     println!("Created frames_set with id {}", set_id);

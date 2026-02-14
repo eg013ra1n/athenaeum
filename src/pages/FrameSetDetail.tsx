@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { ArrowLeft, Clock, MapPin, AlertCircle, Scissors, Play } from 'lucide-react';
+import { ArrowLeft, Clock, MapPin, RotateCw, AlertCircle, Scissors, Play } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -376,6 +376,18 @@ export default function FrameSetDetail() {
                 <MapPin size={16} />
                 <span className="font-mono text-sm">
                   {detail.frames_set.objctra} / {detail.frames_set.objctdec}
+                </span>
+              </div>
+            )}
+            {detail.frames_set?.avg_rotation != null && (
+              <div className="flex items-center gap-2 text-content-muted">
+                <RotateCw size={16} />
+                <span className="font-mono text-sm">
+                  {detail.frames_set.min_rotation != null && detail.frames_set.max_rotation != null &&
+                   Math.abs(detail.frames_set.max_rotation - detail.frames_set.min_rotation) >= 1
+                    ? `${detail.frames_set.min_rotation.toFixed(1)}° – ${detail.frames_set.max_rotation.toFixed(1)}°`
+                    : `${detail.frames_set.avg_rotation.toFixed(1)}°`
+                  }
                 </span>
               </div>
             )}

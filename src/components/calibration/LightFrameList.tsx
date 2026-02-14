@@ -324,6 +324,12 @@ export function LightFrameList({ frames, defaultExpanded = false, blackholedFile
                               <span className="text-content-muted">Software:</span>
                               <span className="text-content">{frame.swcreate ?? '-'}</span>
                             </div>
+                            {frame.rotation !== null && frame.rotation !== undefined && (
+                              <div className="flex items-center gap-2">
+                                <span className="text-content-muted">Rotation:</span>
+                                <span className="text-content">{frame.rotation.toFixed(1)}°</span>
+                              </div>
+                            )}
                             <div className="border-l border-border pl-6 flex items-center gap-4">
                               <span className="text-content-muted text-xs uppercase tracking-wide">Linked:</span>
                               <div className="flex items-center gap-2">

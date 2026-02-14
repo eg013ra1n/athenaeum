@@ -71,6 +71,7 @@ export interface Frame {
   long_obs: number | null;
   objctra: string | null;
   objctdec: string | null;
+  rotation: number | null;
   override_: boolean;
 }
 
@@ -239,6 +240,9 @@ export interface FramesSet {
   objctdec: string | null;
   total_exp_time: number | null;
   flat_pattern: string | null;  // e.g., "before_session", "after_session", "manual"
+  avg_rotation: number | null;
+  min_rotation: number | null;
+  max_rotation: number | null;
 }
 
 export interface FramesSetMember {
@@ -738,6 +742,7 @@ export interface LightFrameWithCalibration {
   swcreate: string | null;
   gain: number | null;
   offset: number | null;
+  rotation: number | null;
   calibration_status: FrameCalibrationStatus;
 }
 

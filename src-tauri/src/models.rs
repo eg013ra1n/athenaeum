@@ -173,6 +173,9 @@ pub struct FramesSet {
     pub objctdec: Option<String>,
     pub total_exp_time: Option<f64>,
     pub flat_pattern: Option<String>,
+    pub avg_rotation: Option<f64>,
+    pub min_rotation: Option<f64>,
+    pub max_rotation: Option<f64>,
 }
 
 /// Application settings
@@ -616,6 +619,7 @@ pub struct LightFrameWithCalibration {
     pub swcreate: Option<String>,
     pub gain: Option<f64>,
     pub offset: Option<f64>,
+    pub rotation: Option<f64>,
     pub calibration_status: FrameCalibrationStatus,
 }
 

@@ -506,6 +506,12 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger, i
                                 <span className="text-content">{hoveredFile.frame.dec.toFixed(4)}°</span>
                               </div>
                             )}
+                            {hoveredFile.frame.rotation !== null && hoveredFile.frame.rotation !== undefined && (
+                              <div className="flex justify-between">
+                                <span className="text-content-muted">Rotation:</span>
+                                <span className="text-content">{hoveredFile.frame.rotation.toFixed(1)}°</span>
+                              </div>
+                            )}
                           </div>
                         </div>
                       )}
