@@ -58,6 +58,10 @@ export default function SkyChart() {
   const [selectionResult, setSelectionResult] = useState<SelectionResult | null>(null);
   const [showDialog, setShowDialog] = useState(false);
 
+  // Star density setting
+  const [starLimit, setStarLimit] = useState(6);
+  const [starLimitLoaded, setStarLimitLoaded] = useState(false);
+
   // Date filter state
   const [dateFrom, setDateFrom] = useState<DateParts | null>(null);
   const [dateTo, setDateTo] = useState<DateParts | null>(null);
@@ -70,6 +74,20 @@ export default function SkyChart() {
   const { getViewState, saveViewState } = useMapViewState('skychart_view_state');
 
   const navigate = useNavigate();
+
+  const starDataFile = (limit: number) => limit > 8 ? 'stars.14.json' : 'stars.8.json';
+
+  // Load persisted star density setting before map init
+  useEffect(() => {
+    invoke<string>('get_setting', {
+      key: 'skychart.star_limit',
+      defaultValue: '6'
+    }).then(val => {
+      const parsed = parseFloat(val);
+      if ([4, 6, 8, 14].includes(parsed)) setStarLimit(parsed);
+    }).catch(console.error)
+      .finally(() => setStarLimitLoaded(true));
+  }, []);
 
   // Filter locations by date range
   const filteredLocations = useMemo(() => {
@@ -157,7 +175,7 @@ export default function SkyChart() {
 
   // Initialize d3-celestial with stereographic projection
   useLayoutEffect(() => {
-    if (loading || !containerRef.current || mapInitialized.current) return;
+    if (!starLimitLoaded || !containerRef.current || mapInitialized.current) return;
 
     if (typeof window.Celestial === 'undefined') {
       setError('Sky map library not loaded. Please refresh the page.');
@@ -210,7 +228,7 @@ export default function SkyChart() {
           datapath: '/data/',
           stars: {
             show: true,
-            limit: 8,
+            limit: starLimit,
             colors: true,
             style: { fill: '#ffffff', opacity: 0.8 },
             designation: true,
@@ -219,7 +237,7 @@ export default function SkyChart() {
             propernameLimit: 1.5,
             size: 7,
             exponent: -0.28,
-            data: 'stars.8.json'
+            data: starDataFile(starLimit)
           },
           dsos: {
             show: true,
@@ -306,7 +324,7 @@ export default function SkyChart() {
     return () => {
       cancelAnimationFrame(rafId);
     };
-  }, [loading]);
+  }, [starLimitLoaded]);
 
   // Handle window resize
   useEffect(() => {
@@ -346,6 +364,25 @@ export default function SkyChart() {
       }
     };
   }, [mapReady]);
+
+  // Apply star density changes at runtime.
+  // Celestial.settings() returns the defaults template (wt), NOT the active
+  // rendering config ($). Mutating wt and calling redraw() has no effect.
+  // The only way to update $ is Celestial.reload(config) which does
+  // Object.assign($, wt.set(config)). This also re-triggers Celestial.add()
+  // callbacks so imaging markers are automatically re-created.
+  const starLimitInitialized = useRef(false);
+  useEffect(() => {
+    if (!mapReady || typeof window.Celestial === 'undefined') return;
+    // Skip the first run — the initial config already has the correct values
+    if (!starLimitInitialized.current) {
+      starLimitInitialized.current = true;
+      return;
+    }
+    window.Celestial.reload({
+      stars: { limit: starLimit, data: starDataFile(starLimit) }
+    });
+  }, [starLimit, mapReady]);
 
   // Update the globe clip path on an SVG overlay so content outside the
   // projected sphere is hidden. Uses d3.geo.path({type:"Sphere"}) for the
@@ -823,50 +860,6 @@ export default function SkyChart() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [drawingMode]);
 
-  if (loading) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-surface">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent mx-auto mb-4"></div>
-          <p className="text-content-muted">Loading sky chart...</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-surface">
-        <div className="text-center max-w-md p-6">
-          <p className="text-error mb-2 font-semibold">Error loading sky chart</p>
-          <p className="text-content-muted text-sm mb-4">{error}</p>
-          <button
-            onClick={() => window.location.reload()}
-            className="px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
-          >
-            Retry
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (locations.length === 0) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-surface">
-        <div className="text-center max-w-md p-6">
-          <h3 className="text-xl font-bold text-content mb-2">No Imaging Locations Found</h3>
-          <p className="text-content-muted text-sm mb-4">
-            You don't have any LIGHT frames with RA/Dec coordinates yet.
-          </p>
-          <p className="text-content-muted text-sm">
-            Once you import FITS/XISF files with coordinate data, they will appear here.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="h-screen w-full flex flex-col bg-surface overflow-hidden">
       {/* Header */}
@@ -875,8 +868,12 @@ export default function SkyChart() {
         <div>
           <h2 className="text-2xl font-bold text-content">Sky Chart</h2>
           <p className="text-sm text-content-muted">
-            Stereographic projection • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
-            {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
+            {loading ? 'Loading...' : (
+              <>
+                Stereographic projection • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
+                {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
+              </>
+            )}
           </p>
         </div>
 
@@ -901,19 +898,41 @@ export default function SkyChart() {
           <select
             value={selectedTarget}
             onChange={(e) => handleTargetCenter(e.target.value)}
-            disabled={!mapReady}
+            disabled={!mapReady || loading}
             className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:border-accent"
           >
             <option value="">Center on target...</option>
             {locations
               .filter(loc => loc.objectName)
               .sort((a, b) => (a.objectName || '').localeCompare(b.objectName || ''))
+              .filter((loc, i, arr) => arr.findIndex(l => l.objectName === loc.objectName) === i)
               .map(loc => (
                 <option key={loc.id} value={String(loc.id)}>
                   {loc.objectName}
                 </option>
               ))
             }
+          </select>
+
+          <div className="w-px h-6 bg-border" />
+
+          <select
+            value={starLimit}
+            onChange={(e) => {
+              const val = parseFloat(e.target.value);
+              setStarLimit(val);
+              invoke('set_setting', {
+                key: 'skychart.star_limit',
+                value: String(val)
+              }).catch(console.error);
+            }}
+            disabled={!mapReady}
+            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:border-accent"
+          >
+            <option value="4">Stars: Few</option>
+            <option value="6">Stars: Normal</option>
+            <option value="8">Stars: Many</option>
+            <option value="14">Stars: Dense</option>
           </select>
 
           <div className="w-px h-6 bg-border" />
@@ -927,13 +946,41 @@ export default function SkyChart() {
         </div>
       </div>
 
-      {/* Sky Map */}
+      {/* Sky Map — always rendered so it can initialize immediately */}
       <div
         id="celestial-map"
         ref={containerRef}
         className="flex-1 w-full overflow-hidden relative"
         style={{ minHeight: 0 }}
       >
+        {/* Overlays for loading / error / empty states */}
+        {error && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-surface bg-opacity-90">
+            <div className="text-center max-w-md p-6">
+              <p className="text-error mb-2 font-semibold">Error loading sky chart</p>
+              <p className="text-content-muted text-sm mb-4">{error}</p>
+              <button
+                onClick={() => window.location.reload()}
+                className="px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
+              >
+                Retry
+              </button>
+            </div>
+          </div>
+        )}
+        {!loading && !error && locations.length === 0 && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-surface bg-opacity-90">
+            <div className="text-center max-w-md p-6">
+              <h3 className="text-xl font-bold text-content mb-2">No Imaging Locations Found</h3>
+              <p className="text-content-muted text-sm mb-4">
+                You don't have any LIGHT frames with RA/Dec coordinates yet.
+              </p>
+              <p className="text-content-muted text-sm">
+                Once you import FITS/XISF files with coordinate data, they will appear here.
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Selection Results Dialog */}
