@@ -16,12 +16,10 @@
   width: 100% !important;         /* Fill flex parent width */
 }
 
-/* Force canvas to fill the entire container */
+/* Canvas natively matches container dimensions via projectionRatio,
+   so no CSS stretching is needed. Just ensure it displays as block. */
 #celestial-map canvas {
-  width: 100% !important;         /* Fill container width */
-  height: 100% !important;        /* Fill container height */
   display: block !important;      /* Remove inline spacing */
-  object-fit: fill !important;    /* Stretch to fill completely */
 }
 
 /* Hide the form element completely */

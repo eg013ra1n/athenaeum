@@ -196,18 +196,17 @@ export default function SkyChart() {
       const savedState = getViewState();
       const restoringState = savedState.ra !== null || savedState.zoom !== null;
 
-      // Stereographic is 1:1 — fit within container's smaller dimension
-      // to minimize CSS stretch distortion (same logic as resize handler)
-      const projectionRatio = 1.0;
-      const containerRatio = rect.width / rect.height;
-      const initialWidth = containerRatio > projectionRatio
-        ? Math.floor(rect.height * projectionRatio)  // fit to height
-        : Math.floor(rect.width);                     // fit to width
+      // Native widescreen: tell the library to create a canvas matching
+      // the container dimensions (projectionRatio = width/height).
+      const containerAspect = rect.width / rect.height;
+      const projectionRatio = containerAspect;
+      const initialWidth = Math.floor(rect.width);
 
       try {
         const config = {
           container: 'celestial-map',
           width: initialWidth,
+          projectionRatio: projectionRatio,
           projection: 'stereographic',
           transform: 'equatorial',
           center: (savedState.ra !== null && savedState.dec !== null)
@@ -292,10 +291,11 @@ export default function SkyChart() {
         window.Celestial.display(config);
         mapInitialized.current = true;
 
-        // Restore zoom and re-enable animations in a single rAF.
-        // disableAnimations was set true in the config above, so zoomBy()
-        // takes the instant path that syncs both projection.scale AND the
-        // internal d3.geo.zoom behavior state (K.scale).
+        // Fill-zoom: the projection circle fits the height by default.
+        // Zoom in by the container aspect ratio so it fills the width,
+        // giving a horizontal band through the projection (no distortion).
+        // For returning users, the saved absolute zoom already includes the
+        // fill-zoom from their previous session, so we restore that directly.
         if (restoringState) {
           requestAnimationFrame(() => {
             if (savedState.zoom !== null) {
@@ -312,6 +312,12 @@ export default function SkyChart() {
             const settings = window.Celestial.settings();
             settings.disableAnimations = false;
           });
+        } else {
+          // First-time user (no saved state): apply fill-zoom so the
+          // projection circle fills the width of the widescreen canvas
+          if (containerAspect > 1 && window.Celestial.zoomBy) {
+            window.Celestial.zoomBy(containerAspect);
+          }
         }
 
         setMapReady(true);
@@ -326,42 +332,63 @@ export default function SkyChart() {
     };
   }, [starLimitLoaded]);
 
-  // Handle window resize
+  // Handle container resize via ResizeObserver (catches window resize,
+  // sidebar toggle, layout changes — anything that changes the container).
   useEffect(() => {
     if (!mapReady || !containerRef.current) return;
+    const container = containerRef.current;
 
-    const handleResize = () => {
-      if (resizeTimeoutRef.current) {
-        clearTimeout(resizeTimeoutRef.current);
-      }
+    // Track previous dimensions so we can scale zoom proportionally
+    let prevRect = container.getBoundingClientRect();
+
+    const observer = new ResizeObserver(() => {
+      if (resizeTimeoutRef.current) clearTimeout(resizeTimeoutRef.current);
 
       resizeTimeoutRef.current = window.setTimeout(() => {
-        if (!containerRef.current || typeof window.Celestial === 'undefined') return;
+        if (typeof window.Celestial === 'undefined') return;
 
-        const rect = containerRef.current.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          // Stereographic projection has 1:1 aspect ratio
-          const projectionRatio = 1.0;
-          const containerRatio = rect.width / rect.height;
+        const rect = container.getBoundingClientRect();
+        const newWidth = Math.floor(rect.width);
+        const newHeight = Math.floor(rect.height);
 
-          let targetWidth: number;
-          if (containerRatio > projectionRatio) {
-            targetWidth = Math.floor(rect.height * projectionRatio);
-          } else {
-            targetWidth = Math.floor(rect.width);
+        if (newWidth <= 0 || newHeight <= 0) return;
+
+        // Skip if dimensions haven't meaningfully changed
+        if (Math.abs(newWidth - Math.floor(prevRect.width)) < 2 &&
+            Math.abs(newHeight - Math.floor(prevRect.height)) < 2) return;
+
+        const oldWidth = prevRect.width;
+        const newRatio = rect.width / rect.height;
+
+        // Save current zoom level before resize resets it
+        const projection = window.Celestial.mapProjection;
+        const currentScale = projection?.scale?.() ?? null;
+
+        prevRect = rect;
+
+        // resize() with patched projectionRatio support: updates the
+        // canvas dimensions and projection ratio in a single call.
+        // The library's f() re-reads Gt from $.projectionRatio, so the
+        // canvas height = width / ratio is computed correctly.
+        window.Celestial.resize({ width: newWidth, projectionRatio: newRatio });
+
+        // Restore zoom: scale proportionally to the width change so the
+        // same field of view is shown in the new container size.
+        if (currentScale !== null && oldWidth > 0 && window.Celestial.zoomBy) {
+          const freshScale = window.Celestial.mapProjection?.scale?.() ?? 1;
+          const targetScale = currentScale * (newWidth / oldWidth);
+          const factor = targetScale / freshScale;
+          if (Math.abs(factor - 1) > 0.001) {
+            window.Celestial.zoomBy(factor);
           }
-
-          window.Celestial.resize({ width: targetWidth });
         }
       }, 250);
-    };
+    });
 
-    window.addEventListener('resize', handleResize);
+    observer.observe(container);
     return () => {
-      window.removeEventListener('resize', handleResize);
-      if (resizeTimeoutRef.current) {
-        clearTimeout(resizeTimeoutRef.current);
-      }
+      observer.disconnect();
+      if (resizeTimeoutRef.current) clearTimeout(resizeTimeoutRef.current);
     };
   }, [mapReady]);
 
@@ -379,8 +406,14 @@ export default function SkyChart() {
       starLimitInitialized.current = true;
       return;
     }
+    const rect = containerRef.current?.getBoundingClientRect();
+    const reloadRatio = rect && rect.height > 0 ? rect.width / rect.height : 1;
+    // reload() updates star data and re-triggers Celestial.add() callbacks.
+    // It preserves the current zoom level (r() doesn't reset the projection),
+    // so no zoomBy() is needed afterward.
     window.Celestial.reload({
-      stars: { limit: starLimit, data: starDataFile(starLimit) }
+      stars: { limit: starLimit, data: starDataFile(starLimit) },
+      projectionRatio: reloadRatio
     });
   }, [starLimit, mapReady]);
 
