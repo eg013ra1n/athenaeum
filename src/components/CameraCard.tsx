@@ -71,7 +71,7 @@ export default function CameraCard({ camera, onOpenCamera }: CameraCardProps) {
         className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-md transition-colors text-sm font-medium"
       >
         <Database size={16} />
-        View Calibration Library
+        View  Library
       </button>
     </div>
   );

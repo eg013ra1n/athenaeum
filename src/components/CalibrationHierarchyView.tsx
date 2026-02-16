@@ -309,6 +309,7 @@ export function CalibrationHierarchyView({
             selectedItem={selectedItem}
             onManualCalibration={openManualCalibrationModal}
             onBlink={onBlink ? handleBlink : undefined}
+            onRefresh={onRefresh}
             className="flex-1"
           />
         </div>

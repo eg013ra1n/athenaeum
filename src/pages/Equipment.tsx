@@ -50,7 +50,7 @@ export default function Equipment() {
       <div className="mb-6">
         <h2 className="text-3xl font-bold mb-2">Equipment Library</h2>
         <p className="text-content-muted">
-          Browse instruments with captured frames and dark library management
+          Browse instruments with captured frames and calibration library management
         </p>
       </div>
 

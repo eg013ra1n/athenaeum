@@ -12,6 +12,8 @@ export { DetailPanel } from './DetailPanel';
 
 export { CalibrationSetCard, EmptyCalibrationCard } from './CalibrationSetCard';
 
+export { CalibrationSetRow, EmptyCalibrationRow } from './CalibrationSetRow';
+
 export { LightFrameList } from './LightFrameList';
 
 export { StatusIndicator, StatusBadge } from './StatusIndicator';

@@ -1,17 +1,18 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings, Eye } from 'lucide-react';
-import type { CalibrationFilterGroup, LightFrameWithCalibration } from '../../types/models';
+import { Settings, Eye, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
+import type { CalibrationFilterGroup, LightFrameWithCalibration, FileWithFrame } from '../../types/models';
 import type { SelectedItem } from './NavigationTree';
-import { CalibrationSetCard, EmptyCalibrationCard } from './CalibrationSetCard';
+import { CalibrationSetRow, EmptyCalibrationRow } from './CalibrationSetRow';
 import { LightFrameList } from './LightFrameList';
-import { WarningPanel, AggregatedWarning } from './WarningPanel';
+import type { AggregatedWarning } from './WarningPanel';
 import { SubCalibrationModal } from '../SubCalibrationModal';
+import BlinkViewer from '../BlinkViewer';
 
 interface DetailPanelProps {
   selectedItem: SelectedItem | null;
   onManualCalibration: (filterGroup: CalibrationFilterGroup) => void;
-  /** Callback to open blink viewer with frames */
+  /** Callback to open blink viewer with light frames */
   onBlink?: (frames: LightFrameWithCalibration[]) => void;
   /** Callback when sub-calibration is changed (to refresh hierarchy) */
   onRefresh?: () => void;
@@ -24,7 +25,6 @@ interface DetailPanelProps {
 function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup): AggregatedWarning[] {
   const warnings: AggregatedWarning[] = [];
 
-  // Check for missing calibration (only Flat and Dark matter for lights)
   const hasCalibration =
     filterGroup.flat_sets.length > 0 ||
     filterGroup.dark_sets.length > 0;
@@ -37,7 +37,6 @@ function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup): Aggreg
     });
   }
 
-  // Collect warnings from calibration sets
   const addSetWarnings = (
     sets: typeof filterGroup.flat_sets,
     setType: string
@@ -61,12 +60,9 @@ function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup): Aggreg
 
 /**
  * Detail panel showing calibration information for selected filter group.
- * Features:
- * - Spacious layout with larger text
- * - Clear section hierarchy
- * - Prominent warning display
- * - Blink button for LIGHT frames
- * - Manual calibration button
+ *
+ * Compact layout: calibration sets as collapsible rows, light frames expanded by default.
+ * Supports blinking both light frames and calibration set frames.
  */
 export function DetailPanel({
   selectedItem,
@@ -81,15 +77,33 @@ export function DetailPanel({
   const [subCalModalSetId, setSubCalModalSetId] = useState<number | null>(null);
   const [subCalModalType, setSubCalModalType] = useState<'flat' | 'dark'>('flat');
 
+  // Calibration set blink state
+  const [calBlinkFrames, setCalBlinkFrames] = useState<FileWithFrame[] | null>(null);
+  const [calBlinkLoading, setCalBlinkLoading] = useState<number | null>(null);
+
+  // Calibration section collapse
+  const [calSectionExpanded, setCalSectionExpanded] = useState(true);
+
   const handleEditSubCalibration = (setId: number, setType: 'flat' | 'dark' | 'bias') => {
-    if (setType === 'bias') return; // Bias sets don't have sub-calibration
+    if (setType === 'bias') return;
     setSubCalModalSetId(setId);
     setSubCalModalType(setType);
   };
 
   const handleSubCalApply = () => {
-    // Refresh the hierarchy to show updated sub-calibration
     onRefresh?.();
+  };
+
+  const handleViewCalSetFrames = async (setId: number) => {
+    try {
+      setCalBlinkLoading(setId);
+      const frames = await invoke<FileWithFrame[]>('get_calibration_set_frames', { setId });
+      setCalBlinkFrames(frames);
+    } catch (err) {
+      console.error('Failed to load calibration set frames:', err);
+    } finally {
+      setCalBlinkLoading(null);
+    }
   };
 
   // Fetch blackholed file IDs when filter group changes
@@ -132,9 +146,12 @@ export function DetailPanel({
 
   const filterGroup = selectedItem.data as CalibrationFilterGroup;
   const warnings = collectFilterGroupWarnings(filterGroup);
-  const hasCalibration =
-    filterGroup.flat_sets.length > 0 ||
-    filterGroup.dark_sets.length > 0;
+
+  // Count total calibration sets
+  const totalCalSets =
+    filterGroup.flat_sets.length +
+    filterGroup.dark_sets.length +
+    filterGroup.bias_sets.length;
 
   // Check if we have frames to view/blink (1+ LIGHT frames)
   const canBlink = filterGroup.light_frames.length >= 1;
@@ -143,14 +160,14 @@ export function DetailPanel({
     <div
       className={`bg-surface-elevated rounded-xl border border-border overflow-y-auto ${className}`}
     >
-      <div className="p-6">
+      <div className="p-5">
         {/* Header */}
-        <header className="flex items-start justify-between gap-4 mb-6">
+        <header className="flex items-start justify-between gap-4 mb-4">
           <div>
             <h2 className="text-xl font-bold text-content">
               {filterGroup.filter_display}
             </h2>
-            <p className="text-base text-content-secondary mt-1">
+            <p className="text-sm text-content-secondary mt-0.5">
               {filterGroup.frame_count} light frame{filterGroup.frame_count !== 1 ? 's' : ''}
               {filterGroup.exptime !== null && ` at ${filterGroup.exptime}s`}
             </p>
@@ -194,59 +211,98 @@ export function DetailPanel({
           </div>
         </header>
 
-        {/* Warnings Section */}
+        {/* Compact inline warnings */}
         {warnings.length > 0 && (
-          <div className="mb-6">
-            <WarningPanel aggregatedWarnings={warnings} />
+          <div className="flex items-center gap-2 px-3 py-2 mb-4 bg-warning-muted rounded-lg border border-warning/50">
+            <AlertTriangle size={16} className="text-warning flex-shrink-0" />
+            <span className="text-sm text-warning/90">
+              {warnings.length} warning{warnings.length !== 1 ? 's' : ''}
+              {warnings.length <= 2 && (
+                <span className="text-warning/70">
+                  {' \u2014 '}
+                  {warnings.map(w => w.message).join('; ')}
+                </span>
+              )}
+            </span>
           </div>
         )}
 
-        {/* Calibration Sets Section */}
-        <section>
-          <h3 className="text-lg font-semibold text-content mb-4">
-            Calibration Sets
-          </h3>
+        {/* Calibration Sets Section — collapsible rows */}
+        <section className="mb-4">
+          <button
+            onClick={() => setCalSectionExpanded(!calSectionExpanded)}
+            className="flex items-center gap-2 mb-2 hover:bg-surface-hover/30 rounded px-1 py-1 transition-colors"
+          >
+            {calSectionExpanded ? (
+              <ChevronDown size={16} className="text-content-muted" />
+            ) : (
+              <ChevronRight size={16} className="text-content-muted" />
+            )}
+            <h3 className="text-sm font-semibold text-content">
+              Calibration
+            </h3>
+            <span className="text-xs text-content-muted">
+              {totalCalSets > 0
+                ? `${totalCalSets} set${totalCalSets !== 1 ? 's' : ''}`
+                : 'none linked'}
+            </span>
+          </button>
 
-          {hasCalibration ? (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {calSectionExpanded && (
+            <div className="space-y-1.5">
               {/* Flat sets */}
               {filterGroup.flat_sets.length > 0 ? (
                 filterGroup.flat_sets.map((flatSet, idx) => (
-                  <CalibrationSetCard
+                  <CalibrationSetRow
                     key={`flat-${flatSet.set.id ?? idx}`}
                     type="flat"
                     data={flatSet}
+                    onViewFrames={handleViewCalSetFrames}
                     onEditSubCalibration={handleEditSubCalibration}
+                    isLoadingFrames={calBlinkLoading === flatSet.set.id}
                   />
                 ))
               ) : (
-                <EmptyCalibrationCard type="flat" />
+                <EmptyCalibrationRow type="flat" />
               )}
 
               {/* Dark sets */}
               {filterGroup.dark_sets.length > 0 ? (
                 filterGroup.dark_sets.map((darkSet, idx) => (
-                  <CalibrationSetCard
+                  <CalibrationSetRow
                     key={`dark-${darkSet.set.id ?? idx}`}
                     type="dark"
                     data={darkSet}
+                    onViewFrames={handleViewCalSetFrames}
                     onEditSubCalibration={handleEditSubCalibration}
+                    isLoadingFrames={calBlinkLoading === darkSet.set.id}
                   />
                 ))
               ) : (
-                <EmptyCalibrationCard type="dark" />
+                <EmptyCalibrationRow type="dark" />
               )}
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <EmptyCalibrationCard type="flat" />
-              <EmptyCalibrationCard type="dark" />
+
+              {/* Bias sets (only shown if present) */}
+              {filterGroup.bias_sets.length > 0 &&
+                filterGroup.bias_sets.map((biasSet, idx) => (
+                  <CalibrationSetRow
+                    key={`bias-${biasSet.set.id ?? idx}`}
+                    type="bias"
+                    data={biasSet}
+                    onViewFrames={handleViewCalSetFrames}
+                    isLoadingFrames={calBlinkLoading === biasSet.set.id}
+                  />
+                ))}
             </div>
           )}
         </section>
 
-        {/* Light Frames Section */}
-        <LightFrameList frames={filterGroup.light_frames} blackholedFileIds={blackholedFileIds} />
+        {/* Light Frames Section — expanded by default */}
+        <LightFrameList
+          frames={filterGroup.light_frames}
+          defaultExpanded={true}
+          blackholedFileIds={blackholedFileIds}
+        />
       </div>
 
       {/* Sub-Calibration Modal */}
@@ -257,6 +313,16 @@ export function DetailPanel({
           sourceType={subCalModalType}
           onApply={handleSubCalApply}
           onClose={() => setSubCalModalSetId(null)}
+        />
+      )}
+
+      {/* Calibration Set Blink Viewer */}
+      {calBlinkFrames !== null && (
+        <BlinkViewer
+          frames={calBlinkFrames}
+          initialIndex={0}
+          onClose={() => setCalBlinkFrames(null)}
+          sourceType="calibration"
         />
       )}
     </div>

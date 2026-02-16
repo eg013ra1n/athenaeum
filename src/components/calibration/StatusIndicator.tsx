@@ -12,6 +12,7 @@ interface StatusItem {
   has: boolean;
   warning: boolean;
   label: string;
+  setId?: number | null;
 }
 
 /**
@@ -22,8 +23,8 @@ interface StatusItem {
 export function StatusIndicator({ status, compact = false }: StatusIndicatorProps) {
   // Only show Flat and Dark - Bias is not directly linked to light frames
   const items: StatusItem[] = [
-    { key: 'flat', has: status.has_flats, warning: status.flats_warning, label: 'Flat' },
-    { key: 'dark', has: status.has_darks, warning: status.darks_warning, label: 'Dark' },
+    { key: 'flat', has: status.has_flats, warning: status.flats_warning, label: 'Flat', setId: status.flat_set_id },
+    { key: 'dark', has: status.has_darks, warning: status.darks_warning, label: 'Dark', setId: status.dark_set_id },
   ];
 
   const getStatusStyles = (has: boolean, warning: boolean): string => {
@@ -59,18 +60,22 @@ export function StatusIndicator({ status, compact = false }: StatusIndicatorProp
   if (compact) {
     return (
       <div className="flex items-center justify-center gap-1" role="group" aria-label="Calibration status">
-        {items.map(({ key, has, warning, label }) => (
+        {items.map(({ key, has, warning, label, setId }) => (
           <span
             key={key}
             className={`
-              inline-flex items-center justify-center
-              w-6 h-6 rounded text-xs font-bold
+              inline-flex items-center justify-center gap-0.5
+              h-6 rounded text-xs font-bold
+              ${has && setId != null ? 'px-1.5' : 'w-6'}
               ${getStatusStyles(has, warning)}
             `}
-            title={getStatusLabel(has, warning, label)}
+            title={getStatusLabel(has, warning, label) + (has && setId != null ? ` #${setId}` : '')}
             aria-label={getStatusLabel(has, warning, label)}
           >
             {label[0]}
+            {has && setId != null && (
+              <span className="font-normal opacity-75">{setId}</span>
+            )}
           </span>
         ))}
       </div>
