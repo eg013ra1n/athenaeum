@@ -139,6 +139,8 @@ pub fn run() {
             commands::get_calibration_set_frames,
             commands::get_cache_stats,
             commands::clear_image_cache,
+            commands::repair_cache_database,
+            commands::check_cache_integrity,
             commands::set_scan_root_duplicates_flag,
             commands::set_scan_root_unique_camera_flag,
             commands::move_to_black_hole,

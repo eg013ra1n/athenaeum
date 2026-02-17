@@ -8,6 +8,14 @@ use super::models::{CacheEntry, CacheStats, StretchMode};
 pub fn init_cache_db(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
 
+    // Resilience PRAGMAs: WAL mode is more resistant to corruption from
+    // unexpected disconnects (e.g., external drive ejected mid-operation)
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 1500;
+         PRAGMA synchronous = NORMAL;"
+    )?;
+
     // Create cache entries table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS cache_entries (

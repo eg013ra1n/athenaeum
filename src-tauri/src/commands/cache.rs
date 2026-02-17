@@ -1,7 +1,8 @@
 // Cache management commands
 
-use crate::cache::CacheStats;
-use tauri::State;
+use crate::cache::{remove_file_logged, CacheManager, CacheStats};
+use std::sync::Arc;
+use tauri::{Manager, State};
 
 use super::AppState;
 
@@ -89,4 +90,69 @@ pub async fn clear_image_cache(state: State<'_, AppState>) -> Result<String, Str
             Err(error_msg)
         }
     }
+}
+
+/// Repair a corrupted cache database by deleting and recreating it
+#[tauri::command]
+pub async fn repair_cache_database(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    println!("🔧 Repairing cache database...");
+
+    // Get app data directory
+    let app_dir = app_handle.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data directory: {}", e))?;
+
+    let cache_db_path = app_dir.join("cache").join("cache.db");
+    let cache_dir = app_dir.join("cache").join("previews");
+
+    // Hold the lock for the entire operation to prevent race conditions
+    let mut cache_lock = state.cache.lock().unwrap();
+
+    // Drop the old cache manager (closes the DB connection)
+    *cache_lock = None;
+
+    // Delete corrupted database files
+    remove_file_logged(&cache_db_path);
+    remove_file_logged(&cache_db_path.with_extension("db-wal"));
+    remove_file_logged(&cache_db_path.with_extension("db-shm"));
+
+    // Delete all preview JPEGs
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension() == Some(std::ffi::OsStr::new("jpg")) {
+                remove_file_logged(&entry.path());
+            }
+        }
+    }
+
+    // Recreate cache manager
+    match CacheManager::new(&app_dir, state.settings.clone(), state.image_pool.clone()) {
+        Ok(cache_mgr) => {
+            *cache_lock = Some(Arc::new(cache_mgr));
+            let msg = "Cache database repaired successfully".to_string();
+            println!("✅ {}", msg);
+            Ok(msg)
+        }
+        Err(e) => {
+            let error_msg = format!("Failed to recreate cache database: {}", e);
+            eprintln!("❌ ERROR: {}", error_msg);
+            Err(error_msg)
+        }
+    }
+}
+
+/// Check cache database integrity
+#[tauri::command]
+pub async fn check_cache_integrity(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let cache_mgr = state.cache.lock().unwrap().clone();
+
+    let Some(cache_mgr) = cache_mgr else {
+        return Err("Cache manager not available".to_string());
+    };
+
+    cache_mgr.check_integrity().map_err(|e| e.to_string())
 }

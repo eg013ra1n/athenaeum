@@ -251,6 +251,9 @@ pub async fn read_fits_image_rustafits(
 
             match create_result {
                 Ok(cached_data) => {
+                    // Run cleanup asynchronously without blocking the response
+                    let cache_mgr_clone = cache_mgr.clone();
+                    tokio::spawn(async move { cache_mgr_clone.try_cleanup().await });
                     println!("✅ File cache: {} bytes in {:?}", cached_data.len(), t_start.elapsed());
                     return Ok(cached_data);
                 }

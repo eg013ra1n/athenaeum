@@ -301,54 +301,6 @@ pub fn get_frame_calibration_status(conn: &Connection, frame_id: i64) -> Result<
     Ok(status)
 }
 
-/// Delete all calibration links for frames in a specific frame set
-#[allow(dead_code)]
-pub fn delete_links_for_frame_set(conn: &Connection, frame_set_id: i64) -> Result<usize> {
-    // First get all frame IDs in the frame set
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT f.id
-         FROM frames f
-         JOIN session_members sm ON f.id = sm.frame_id
-         JOIN sessions s ON sm.session_id = s.id
-         JOIN imaging_nights n ON s.imaging_night_id = n.id
-         WHERE n.frames_set_id = ?1"
-    )?;
-
-    let frame_ids: Vec<i64> = stmt.query_map([frame_set_id], |row| row.get(0))?
-        .collect::<Result<Vec<i64>>>()?;
-
-    if frame_ids.is_empty() {
-        return Ok(0);
-    }
-
-    // Build placeholders for IN clause
-    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
-    let placeholders_str = placeholders.join(",");
-
-    let delete_query = format!(
-        "DELETE FROM calibration_set_to_frames
-         WHERE source_id IN ({}) AND source_type = 'frame'",
-        placeholders_str
-    );
-
-    let params: Vec<&dyn rusqlite::ToSql> = frame_ids.iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-
-    let deleted = conn.execute(&delete_query, params.as_slice())?;
-    Ok(deleted)
-}
-
-/// Delete a specific calibration link
-#[allow(dead_code)]
-pub fn delete_calibration_link(conn: &Connection, link_id: i64) -> Result<()> {
-    conn.execute(
-        "DELETE FROM calibration_set_to_frames WHERE id = ?1",
-        [link_id],
-    )?;
-    Ok(())
-}
-
 /// Get calibration statistics for a frame set
 pub fn get_calibration_statistics(conn: &Connection, frame_set_id: i64) -> Result<CalibrationStats> {
     // Get all frame IDs in the frame set
@@ -408,20 +360,6 @@ pub fn get_calibration_statistics(conn: &Connection, frame_set_id: i64) -> Resul
         frames_none,
         total_warnings,
     })
-}
-
-/// Get all frames that use a specific calibration set
-#[allow(dead_code)]
-pub fn get_frames_using_calibration_set(conn: &Connection, set_id: i64) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT source_id
-         FROM calibration_set_to_frames
-         WHERE calibration_set_id = ?1 AND source_type = 'frame'
-         ORDER BY source_id"
-    )?;
-
-    let frame_ids = stmt.query_map([set_id], |row| row.get(0))?;
-    frame_ids.collect()
 }
 
 /// Check if a calibration link exists

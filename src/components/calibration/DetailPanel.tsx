@@ -25,16 +25,31 @@ interface DetailPanelProps {
 function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup): AggregatedWarning[] {
   const warnings: AggregatedWarning[] = [];
 
-  const hasCalibration =
-    filterGroup.flat_sets.length > 0 ||
-    filterGroup.dark_sets.length > 0;
+  const hasFlats = filterGroup.flat_sets.length > 0;
+  const hasDarks = filterGroup.dark_sets.length > 0;
+  const pluralSuffix = filterGroup.frame_count !== 1 ? 's' : '';
 
-  if (!hasCalibration) {
+  if (!hasFlats && !hasDarks) {
     warnings.push({
-      message: `No calibration linked (${filterGroup.frame_count} frame${filterGroup.frame_count !== 1 ? 's' : ''})`,
+      message: `No calibration linked (${filterGroup.frame_count} frame${pluralSuffix})`,
       type: 'missing_calibration',
       filter: filterGroup.filter ?? undefined,
     });
+  } else {
+    if (!hasFlats) {
+      warnings.push({
+        message: `Missing Flat calibration (${filterGroup.frame_count} frame${pluralSuffix})`,
+        type: 'missing_calibration',
+        filter: filterGroup.filter ?? undefined,
+      });
+    }
+    if (!hasDarks) {
+      warnings.push({
+        message: `Missing Dark calibration (${filterGroup.frame_count} frame${pluralSuffix})`,
+        type: 'missing_calibration',
+        filter: filterGroup.filter ?? undefined,
+      });
+    }
   }
 
   const addSetWarnings = (

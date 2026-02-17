@@ -18,6 +18,16 @@ use crate::models::File;
 use crate::rustafits_processor::{self, Resolution};
 use crate::settings::SettingsManager;
 
+/// Remove a file, logging errors instead of silently swallowing them.
+/// NotFound errors are ignored (file already gone).
+pub fn remove_file_logged(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("⚠️  Failed to delete {}: {}", path.display(), e);
+        }
+    }
+}
+
 pub use models::{
     CacheEntry, CacheStats, StretchMode,
     StretchParams,
@@ -48,7 +58,26 @@ impl CacheManager {
 
         let cache_db_path = app_dir.join("cache").join("cache.db");
         println!("🗄️  Cache database: {:?}", cache_db_path);
-        let cache_db = init_cache_db(&cache_db_path)?;
+        let cache_db = match init_cache_db(&cache_db_path) {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("⚠️  Cache database corrupted: {}. Attempting recovery...", e);
+                // Delete corrupted database files
+                remove_file_logged(&cache_db_path);
+                remove_file_logged(&cache_db_path.with_extension("db-wal"));
+                remove_file_logged(&cache_db_path.with_extension("db-shm"));
+                // Clear preview JPEGs (they reference entries in the now-deleted DB)
+                if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                    for entry in entries.flatten() {
+                        if entry.path().extension() == Some(std::ffi::OsStr::new("jpg")) {
+                            remove_file_logged(&entry.path());
+                        }
+                    }
+                }
+                println!("🔄 Recreating cache database...");
+                init_cache_db(&cache_db_path)?
+            }
+        };
 
         println!("✅ Cache manager created successfully");
         Ok(Self {
@@ -310,10 +339,39 @@ impl CacheManager {
         Ok(deleted_count)
     }
 
+    /// Run cleanup if cache exceeds its max size limit, then checkpoint WAL.
+    /// Errors are logged but not propagated (cleanup is best-effort).
+    pub async fn try_cleanup(&self) {
+        let (total_size, max_size) = {
+            let conn = self.cache_db.lock().unwrap();
+            get_cache_stats(&conn)
+                .map(|s| (s.total_size_bytes, s.max_size_bytes))
+                .unwrap_or((0, 10_737_418_240))
+        };
+        if total_size > max_size {
+            match self.cleanup(max_size).await {
+                Ok(deleted) => println!("🧹 Cache cleanup: evicted {} entries", deleted),
+                Err(e) => eprintln!("⚠️  Cache cleanup failed: {}", e),
+            }
+        }
+        // Checkpoint WAL to prevent unbounded growth
+        let conn = self.cache_db.lock().unwrap();
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+            eprintln!("⚠️  WAL checkpoint failed: {}", e);
+        }
+    }
+
     /// Get cache statistics
     pub async fn get_stats(&self) -> Result<CacheStats> {
         let conn = self.cache_db.lock().unwrap();
         get_cache_stats(&conn)
+    }
+
+    /// Run PRAGMA integrity_check on the cache database
+    pub fn check_integrity(&self) -> Result<String> {
+        let conn = self.cache_db.lock().unwrap();
+        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result)
     }
 
     /// Update max cache size setting

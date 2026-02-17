@@ -1427,16 +1427,6 @@ pub fn sessions_exist_for_frame_set(conn: &Connection, frames_set_id: i64) -> Re
     Ok(count > 0)
 }
 
-/// Delete all sessions for a frame set
-#[allow(dead_code)]
-pub fn delete_sessions_for_frame_set(conn: &Connection, frames_set_id: i64) -> Result<()> {
-    conn.execute(
-        "DELETE FROM imaging_nights WHERE frames_set_id = ?1",
-        params![frames_set_id],
-    )?;
-    Ok(())
-}
-
 /// Reassign an imaging night to a different frame set
 pub fn reassign_imaging_night_to_frame_set(
     conn: &Connection,
@@ -1595,108 +1585,6 @@ pub fn get_sessions_for_night(
     })?;
 
     sessions.collect()
-}
-
-/// Get frames for a specific frames_set with file info (for session detection)
-#[allow(dead_code)]
-pub fn get_frames_with_files_for_set(
-    conn: &Connection,
-    frames_set_id: i64,
-) -> Result<Vec<(i64, crate::models::File, crate::models::Frame)>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
-                fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
-                fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
-                fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
-         FROM session_members sm
-         JOIN sessions s ON sm.session_id = s.id
-         JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
-         JOIN frames fr ON sm.frame_id = fr.id
-         JOIN files f ON fr.file_id = f.id
-         WHERE in_tbl.frames_set_id = ?1
-         ORDER BY fr.date_obs ASC",
-    )?;
-
-    let results = stmt.query_map(params![frames_set_id], |row| {
-        let file = crate::models::File {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            size: row.get(3)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                .unwrap()
-                .with_timezone(&Utc),
-            format: if row.get::<_, String>(5)? == "FITS" {
-                crate::models::FileFormat::FITS
-            } else {
-                crate::models::FileFormat::XISF
-            },
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                .unwrap()
-                .with_timezone(&Utc),
-            metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
-        };
-
-        let frame = crate::models::Frame {
-            id: row.get(9)?,
-            file_id: row.get(10)?,
-            object: row.get(11)?,
-            date_obs: row.get::<_, Option<String>>(12)?.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-            }),
-            telescop: row.get(13)?,
-            instrume: row.get(14)?,
-            exptime: row.get(15)?,
-            filter: row.get(16)?,
-            imagetyp: row.get::<_, Option<String>>(17)?.and_then(|s| crate::models::ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(18)? == 1,
-            gain: row.get(19)?,
-            offset: row.get(20)?,
-            binning: row.get(21)?,
-            xbinning: row.get(22)?,
-            ybinning: row.get(23)?,
-            ccd_temp: row.get(24)?,
-            set_temp: row.get(25)?,
-            focallen: row.get(26)?,
-            xpixsz: row.get(27)?,
-            ypixsz: row.get(28)?,
-            naxis1: row.get(29)?,
-            naxis2: row.get(30)?,
-            ra: row.get(31)?,
-            dec: row.get(32)?,
-            sitelat: row.get(33)?,
-            lat_obs: row.get(34)?,
-            sitelong: row.get(35)?,
-            long_obs: row.get(36)?,
-            objctra: row.get(37)?,
-            objctdec: row.get(38)?,
-            override_: row.get::<_, i32>(39)? == 1,
-            swcreate: None,
-            bayerpat: None,
-            rotation: None,
-        };
-
-        // Debug: Check date_obs in database
-        let date_obs_raw: Option<String> = row.get(12)?;
-        if date_obs_raw.is_none() {
-            let frame_id: i64 = row.get(9)?;
-            let filename: String = row.get(2)?;
-            println!("Frame {} ({}) has NULL date_obs in database", frame_id, filename);
-        } else {
-            println!("Frame has date_obs: {:?}", date_obs_raw);
-        }
-
-        // NOTE: The correct frame construction with proper row indexes is at lines 782-816
-        // This duplicate block with wrong indexes has been deleted to fix data corruption bug
-
-        let file_id: i64 = row.get(0)?;
-        Ok((file_id, file, frame))
-    })?;
-
-    results.collect()
 }
 
 /// Get frames with their files by frame IDs (for session generation during auto-clustering)
