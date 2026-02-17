@@ -408,6 +408,10 @@ fn create_flat_group(
 /// * `flat_group` - The flat group to convert to a calibration set
 /// * `allow_modify` - If true, add frames to existing sets (scanning context).
 ///                    If false, just return existing set ID without modification (find calibration context).
+/// * `focallen_tolerance` - How to match focal length when checking for existing sets:
+///   - `Some(0.0)` → exact match (Exact mode)
+///   - `Some(tol)` → range match within tolerance (Warning mode)
+///   - `None` → ignore focallen when matching (Ignore mode)
 ///
 /// # Returns
 /// The ID of the created (or existing) calibration set
@@ -415,9 +419,10 @@ pub fn create_flat_calibration_set(
     conn: &Connection,
     flat_group: &FlatGroup,
     allow_modify: bool,
+    focallen_tolerance: Option<f64>,
 ) -> Result<i64> {
     // Check if set already exists with same parameters
-    let existing_set_id = check_for_existing_flat_set(conn, flat_group)?;
+    let existing_set_id = check_for_existing_flat_set(conn, flat_group, focallen_tolerance)?;
     println!("    🔍 Existing set check: {:?}", existing_set_id);
 
     if let Some(set_id) = existing_set_id {
@@ -505,9 +510,15 @@ pub fn create_flat_calibration_set(
 /// Checks if a calibration set already exists for this flat group
 /// Uses date range overlap instead of exact date match to preserve set identity
 /// when frames are added/removed
+///
+/// `focallen_tolerance` controls focal length matching:
+/// - `Some(0.0)` → exact match
+/// - `Some(tol)` → range: ABS(cs.focallen - value) <= tol
+/// - `None` → ignore focallen entirely
 fn check_for_existing_flat_set(
     conn: &Connection,
     flat_group: &FlatGroup,
+    focallen_tolerance: Option<f64>,
 ) -> Result<Option<i64>> {
     let cluster_start = flat_group.start_time.to_rfc3339();
     let cluster_end = flat_group.end_time.to_rfc3339();
@@ -566,9 +577,31 @@ fn check_for_existing_flat_set(
         query.push_str(&format!(" AND cs.exptime = ?{}", param_count));
     }
 
-    if flat_group.focal_length.is_some() {
-        param_count += 1;
-        query.push_str(&format!(" AND cs.focallen = ?{}", param_count));
+    // Focallen matching depends on tolerance mode
+    match focallen_tolerance {
+        None => {
+            // Ignore mode: don't filter by focallen at all
+        }
+        Some(tol) if tol < 0.01 => {
+            // Exact mode
+            if flat_group.focal_length.is_some() {
+                param_count += 1;
+                query.push_str(&format!(" AND cs.focallen = ?{}", param_count));
+            }
+        }
+        Some(_tol) => {
+            // Warning/range mode
+            if flat_group.focal_length.is_some() {
+                param_count += 1;
+                let focal_param = param_count;
+                param_count += 1;
+                let tol_param = param_count;
+                query.push_str(&format!(
+                    " AND cs.focallen IS NOT NULL AND ABS(cs.focallen - ?{}) <= ?{}",
+                    focal_param, tol_param
+                ));
+            }
+        }
     }
 
     query.push_str(" LIMIT 1");
@@ -612,8 +645,25 @@ fn check_for_existing_flat_set(
         param_idx += 1;
     }
 
-    if let Some(focal_length) = flat_group.focal_length {
-        stmt.raw_bind_parameter(param_idx, focal_length)?;
+    // Bind focallen parameters based on tolerance mode
+    match focallen_tolerance {
+        None => {
+            // Ignore mode: no focallen parameter to bind
+        }
+        Some(tol) if tol < 0.01 => {
+            // Exact mode
+            if let Some(focal_length) = flat_group.focal_length {
+                stmt.raw_bind_parameter(param_idx, focal_length)?;
+            }
+        }
+        Some(tol) => {
+            // Warning/range mode
+            if let Some(focal_length) = flat_group.focal_length {
+                stmt.raw_bind_parameter(param_idx, focal_length)?;
+                param_idx += 1;
+                stmt.raw_bind_parameter(param_idx, tol)?;
+            }
+        }
     }
 
     let mut rows = stmt.raw_query();

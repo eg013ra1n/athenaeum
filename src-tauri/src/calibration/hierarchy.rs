@@ -117,7 +117,7 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.temp_min, cs.temp_max, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end, cs.date, cs.frame_count, cs.is_master_library,
-                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format, cs.focallen
          FROM calibration_set cs
          LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
          LEFT JOIN frames f ON f.id = csf.frame_id
@@ -152,6 +152,7 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
             swcreate: row.get(19)?,
             xpixsz: row.get(20)?,
             format: row.get(21)?,
+            focallen: row.get(22)?,
         })
     })?;
 
@@ -315,6 +316,15 @@ pub fn build_complete_hierarchy(
     // Load configurable matching config for threshold checks
     let config = load_config(conn);
 
+    // Derive focallen tolerance from lights→flat config
+    let focallen_tolerance: Option<f64> = config.lights.flat.as_ref()
+        .map(|flat_cfg| match flat_cfg.focallen.mode {
+            MatchMode::Exact => Some(0.0),
+            MatchMode::Warning => Some(flat_cfg.focallen.warning_threshold.unwrap_or(5.0)),
+            MatchMode::Ignore => None,
+        })
+        .unwrap_or(None);
+
     // Find Flat sets for the light frame using new pattern-based system
     let flat_set_id = if let Some(set_id) = manual_flat_set_id {
         // Manual selection - use the provided set ID directly
@@ -360,7 +370,7 @@ pub fn build_complete_hierarchy(
                     flat_match.age_days, flat_match.timing, flat_match.group.frame_count);
 
                 // Find/reuse calibration set from the flat group (don't modify existing sets)
-                let set_id = create_flat_calibration_set(conn, &flat_match.group, false)?;
+                let set_id = create_flat_calibration_set(conn, &flat_match.group, false, focallen_tolerance)?;
 
                 // Add age warning if needed (only if threshold is reasonable)
                 // Use config directly for consistency with UI

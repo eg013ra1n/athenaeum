@@ -360,6 +360,7 @@ export interface CalibrationSetDetail {
   swcreate: string | null;    // Software that created the file
   xpixsz: number | null;      // Pixel size in microns
   format: string | null;      // File format (FITS, XISF)
+  focallen: number | null;    // Focal length in mm
 }
 
 export interface DarkLibraryResult {

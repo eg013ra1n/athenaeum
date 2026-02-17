@@ -271,6 +271,7 @@ pub struct CalibrationSetDetail {
     pub swcreate: Option<String>, // Software that created the file
     pub xpixsz: Option<f64>,     // Pixel size in microns
     pub format: Option<String>,  // File format (FITS, XISF)
+    pub focallen: Option<f64>,   // Focal length in mm
 }
 
 /// Result of dark library creation

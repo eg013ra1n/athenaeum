@@ -567,7 +567,7 @@ fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<Calibrat
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.temp_min, cs.temp_max, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end, cs.date, cs.frame_count, cs.is_master_library,
-                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format, cs.focallen
          FROM calibration_set cs
          LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
          LEFT JOIN frames f ON f.id = csf.frame_id
@@ -613,6 +613,7 @@ fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<Calibrat
             swcreate: row.get(19)?,
             xpixsz: row.get(20)?,
             format: row.get(21)?,
+            focallen: row.get(22)?,
         })
     })
 }

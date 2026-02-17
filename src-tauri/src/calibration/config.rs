@@ -371,6 +371,9 @@ impl Default for CalibrationMatchingConfig {
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::exact(true),
             // Warning-capable (with dual thresholds: warn at 5mm, reject at 10mm)
+            // Note: focallen warning_threshold is also used as the tolerance for flat set
+            // clustering during scan. Exact → no tolerance, Warning → threshold tolerance,
+            // Ignore → focallen not used for grouping.
             exptime: ParameterConfig::ignore_with_warning_support(),
             focallen: ParameterConfig::warning(5.0, 10.0),
             ccd_temp: ParameterConfig::ignore_with_warning_support(),

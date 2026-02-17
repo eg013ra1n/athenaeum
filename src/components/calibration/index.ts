@@ -14,6 +14,8 @@ export { CalibrationSetCard, EmptyCalibrationCard } from './CalibrationSetCard';
 
 export { CalibrationSetRow, EmptyCalibrationRow } from './CalibrationSetRow';
 
+export { CalibrationSetsTable } from './CalibrationSetsTable';
+
 export { LightFrameList } from './LightFrameList';
 
 export { StatusIndicator, StatusBadge } from './StatusIndicator';

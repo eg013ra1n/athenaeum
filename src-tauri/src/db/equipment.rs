@@ -63,7 +63,8 @@ pub fn get_camera_dark_library(
             f.bayerpat,
             f.swcreate,
             f.xpixsz,
-            fi.format
+            fi.format,
+            cs.focallen
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -115,6 +116,7 @@ pub fn get_camera_dark_library(
                 swcreate: row.get(18)?,
                 xpixsz: row.get(19)?,
                 format: row.get(20)?,
+                focallen: row.get(21)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -187,7 +189,8 @@ pub fn get_camera_master_dark_library(
             f.bayerpat,
             f.swcreate,
             f.xpixsz,
-            fi.format
+            fi.format,
+            cs.focallen
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -239,6 +242,7 @@ pub fn get_camera_master_dark_library(
                 swcreate: row.get(18)?,
                 xpixsz: row.get(19)?,
                 format: row.get(20)?,
+                focallen: row.get(21)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -284,7 +288,8 @@ pub fn get_camera_master_flat_library(
             f.bayerpat,
             f.swcreate,
             f.xpixsz,
-            fi.format
+            fi.format,
+            cs.focallen
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -336,6 +341,7 @@ pub fn get_camera_master_flat_library(
                 swcreate: row.get(18)?,
                 xpixsz: row.get(19)?,
                 format: row.get(20)?,
+                focallen: row.get(21)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

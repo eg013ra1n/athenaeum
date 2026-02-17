@@ -841,6 +841,7 @@ pub async fn get_calibration_sets_for_manual_selection(
             swcreate: row.get(19)?,
             xpixsz: row.get(20)?,
             format: row.get(21)?,
+            focallen: row.get(14)?,
         })
     }).map_err(|e| e.to_string())?;
 
@@ -1722,6 +1723,7 @@ pub async fn get_subcalibration_sets_for_manual_selection(
             swcreate: row.get(19)?,
             xpixsz: row.get(20)?,
             format: row.get(21)?,
+            focallen: row.get(14)?,
         })
     }).map_err(|e| e.to_string())?;
 

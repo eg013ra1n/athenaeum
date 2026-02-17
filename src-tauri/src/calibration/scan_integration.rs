@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use super::flat_groups::{create_flat_calibration_set, FlatGroup};
 use super::dark_bias_groups::{create_bias_calibration_set, DarkGroup, BiasGroup};
 use super::configurable_matcher::load_config;
+use super::config::MatchMode;
 
 /// Result of calibration set creation during scan
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,9 +162,20 @@ pub fn create_calibration_sets_from_scan_with_masters(
         .map(|c| c.temp_threshold_celsius)
         .unwrap_or(DEFAULT_TEMP_THRESHOLD);
 
+    // Derive focallen tolerance from lights→flat config
+    // Exact → Some(0.0), Warning → Some(warning_threshold), Ignore → None
+    let focallen_tolerance: Option<f64> = config.lights.flat.as_ref()
+        .map(|flat_cfg| match flat_cfg.focallen.mode {
+            MatchMode::Exact => Some(0.0),
+            MatchMode::Warning => Some(flat_cfg.focallen.warning_threshold.unwrap_or(5.0)),
+            MatchMode::Ignore => None,
+        })
+        .unwrap_or(None);
+
     println!("   Clustering thresholds: flat={}min/{}°C, dark={}min/{}°C, bias={}min/{}°C, darkflat={}min/{}°C",
         flat_cluster_mins, flat_temp_threshold, dark_cluster_mins, dark_temp_threshold,
         bias_cluster_mins, bias_temp_threshold, darkflat_cluster_mins, darkflat_temp_threshold);
+    println!("   Focallen tolerance: {:?}", focallen_tolerance);
 
     let mut result = CalibrationScanResult {
         sets_created: 0,
@@ -179,7 +191,7 @@ pub fn create_calibration_sets_from_scan_with_masters(
 
     // Process each calibration type with its specific clustering threshold
     if !flat_frame_ids.is_empty() {
-        result.flat_sets_created = create_flat_sets_from_frames(conn, &flat_frame_ids, flat_cluster_mins, flat_temp_threshold)?;
+        result.flat_sets_created = create_flat_sets_from_frames(conn, &flat_frame_ids, flat_cluster_mins, flat_temp_threshold, focallen_tolerance)?;
         result.sets_created += result.flat_sets_created;
     }
 
@@ -264,13 +276,18 @@ fn query_frame_data(conn: &Connection, frame_ids: &[i64]) -> Result<Vec<Calibrat
 }
 
 /// Create flat calibration sets from frame IDs
-fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_cluster_minutes: i64, temp_threshold: f64) -> Result<i64> {
+///
+/// `focallen_tolerance` controls how focal length is used for grouping:
+/// - `Some(0.0)` → exact match (Exact mode)
+/// - `Some(tol)` → bucket by tolerance (Warning mode, e.g. 5.0mm)
+/// - `None` → ignore focallen in grouping (Ignore mode)
+fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_cluster_minutes: i64, temp_threshold: f64, focallen_tolerance: Option<f64>) -> Result<i64> {
     let frames = query_frame_data(conn, frame_ids)?;
     if frames.is_empty() {
         return Ok(0);
     }
 
-    println!("   📸 Processing {} flat frames", frames.len());
+    println!("   📸 Processing {} flat frames (focallen_tolerance={:?})", frames.len(), focallen_tolerance);
 
     // Group by exact match parameters
     let mut groups: HashMap<FlatGroupKey, Vec<CalibrationFrameData>> = HashMap::new();
@@ -282,7 +299,14 @@ fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
             binning: frame.binning.clone().unwrap_or_default(),
             gain: frame.gain.map(|g| format!("{:.2}", g)).unwrap_or_default(),
             offset: frame.offset.map(|o| format!("{:.2}", o)).unwrap_or_default(),
-            focallen: frame.focallen.map(|f| format!("{:.1}", f)).unwrap_or_default(),
+            focallen: match focallen_tolerance {
+                None => String::new(), // Ignore: all frames group together regardless of focallen
+                Some(tol) if tol < 0.01 => frame.focallen.map(|f| format!("{:.1}", f)).unwrap_or_default(), // Exact
+                Some(tol) => frame.focallen.map(|f| {
+                    let bucket = (f / tol).round() * tol;
+                    format!("{:.1}", bucket)
+                }).unwrap_or_default(), // Warning: bucket by tolerance
+            },
             exptime: frame.exptime.map(|e| format!("{:.2}", e)).unwrap_or_default(),
         };
 
@@ -301,7 +325,7 @@ fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
 
         for cluster in clusters {
             let flat_group = create_flat_group_from_cluster(&key, &cluster);
-            match create_flat_calibration_set(conn, &flat_group, true) {
+            match create_flat_calibration_set(conn, &flat_group, true, focallen_tolerance) {
                 Ok(_set_id) => {
                     sets_created += 1;
                 }

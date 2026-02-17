@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Settings, Eye, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import type { CalibrationFilterGroup, LightFrameWithCalibration, FileWithFrame } from '../../types/models';
 import type { SelectedItem } from './NavigationTree';
-import { CalibrationSetRow, EmptyCalibrationRow } from './CalibrationSetRow';
+import { CalibrationSetsTable } from './CalibrationSetsTable';
 import { LightFrameList } from './LightFrameList';
 import type { AggregatedWarning } from './WarningPanel';
 import { SubCalibrationModal } from '../SubCalibrationModal';
@@ -227,7 +227,7 @@ export function DetailPanel({
           </div>
         )}
 
-        {/* Calibration Sets Section — collapsible rows */}
+        {/* Calibration Sets Section — collapsible table */}
         <section className="mb-4">
           <button
             onClick={() => setCalSectionExpanded(!calSectionExpanded)}
@@ -249,51 +249,12 @@ export function DetailPanel({
           </button>
 
           {calSectionExpanded && (
-            <div className="space-y-1.5">
-              {/* Flat sets */}
-              {filterGroup.flat_sets.length > 0 ? (
-                filterGroup.flat_sets.map((flatSet, idx) => (
-                  <CalibrationSetRow
-                    key={`flat-${flatSet.set.id ?? idx}`}
-                    type="flat"
-                    data={flatSet}
-                    onViewFrames={handleViewCalSetFrames}
-                    onEditSubCalibration={handleEditSubCalibration}
-                    isLoadingFrames={calBlinkLoading === flatSet.set.id}
-                  />
-                ))
-              ) : (
-                <EmptyCalibrationRow type="flat" />
-              )}
-
-              {/* Dark sets */}
-              {filterGroup.dark_sets.length > 0 ? (
-                filterGroup.dark_sets.map((darkSet, idx) => (
-                  <CalibrationSetRow
-                    key={`dark-${darkSet.set.id ?? idx}`}
-                    type="dark"
-                    data={darkSet}
-                    onViewFrames={handleViewCalSetFrames}
-                    onEditSubCalibration={handleEditSubCalibration}
-                    isLoadingFrames={calBlinkLoading === darkSet.set.id}
-                  />
-                ))
-              ) : (
-                <EmptyCalibrationRow type="dark" />
-              )}
-
-              {/* Bias sets (only shown if present) */}
-              {filterGroup.bias_sets.length > 0 &&
-                filterGroup.bias_sets.map((biasSet, idx) => (
-                  <CalibrationSetRow
-                    key={`bias-${biasSet.set.id ?? idx}`}
-                    type="bias"
-                    data={biasSet}
-                    onViewFrames={handleViewCalSetFrames}
-                    isLoadingFrames={calBlinkLoading === biasSet.set.id}
-                  />
-                ))}
-            </div>
+            <CalibrationSetsTable
+              filterGroup={filterGroup}
+              onViewFrames={handleViewCalSetFrames}
+              onEditSubCalibration={handleEditSubCalibration}
+              loadingSetId={calBlinkLoading}
+            />
           )}
         </section>
 
