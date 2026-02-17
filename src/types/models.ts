@@ -797,6 +797,21 @@ export interface CalendarYearData {
 
 // ========== Calibration Set Metadata Editing ==========
 
+// Excluded frames from auto-generation
+export interface ExcludedFrameEntry {
+  file_id: number;
+  path: string;
+  filename: string;
+  reason: string;
+  excluded_at: string;
+}
+
+/** Result of reclassifying excluded frames */
+export interface ReclassifyResult {
+  frames_updated: number;
+  cameras_refreshed: string[];
+}
+
 /** Edits to apply to calibration set metadata (selective fields) */
 export interface CalibrationMetadataEdits {
   ccd_temp?: number | null;

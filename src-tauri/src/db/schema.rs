@@ -610,6 +610,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE frames_set ADD COLUMN max_rotation REAL", [])?;
     }
 
+    // Excluded frames table - stores frames excluded during auto-generation
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS excluded_frames (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            excluded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Calibration set originals table - stores original metadata values before custom edits
     // Used to backup original FITS header values when user edits calibration set metadata
     conn.execute(

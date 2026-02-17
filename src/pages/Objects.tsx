@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2, RotateCw } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2, RotateCw, FileX } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import {
@@ -56,6 +56,7 @@ export default function Objects() {
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [filters, setFilters] = useState<ObjectsFilterState>(emptyFilterState);
   const [viewMode, setViewMode] = useState<'cards' | 'table'>('cards');
+  const [excludedCount, setExcludedCount] = useState<number>(0);
 
   // For now, using project_id = 1 as default
   const PROJECT_ID = 1;
@@ -64,7 +65,17 @@ export default function Objects() {
     loadFrameSets();
     loadDefaultThreshold();
     loadViewMode();
+    loadExcludedCount();
   }, []);
+
+  const loadExcludedCount = async () => {
+    try {
+      const count = await invoke<number>('get_excluded_frames_count');
+      setExcludedCount(count);
+    } catch (err) {
+      console.error('Failed to load excluded frames count:', err);
+    }
+  };
 
   const loadViewMode = async () => {
     try {
@@ -221,6 +232,9 @@ export default function Objects() {
       });
 
       setGenerateResult(result);
+
+      // Refresh excluded count (always, even if no sets created)
+      loadExcludedCount();
 
       if (result.sets_created > 0) {
         // Reload frame sets
@@ -590,6 +604,15 @@ export default function Objects() {
             <p className="text-content-muted">
               Frame sets grouped by sky coordinates
             </p>
+            {excludedCount > 0 && (
+              <button
+                onClick={() => navigate('/excluded')}
+                className="mt-1 flex items-center gap-1.5 text-sm text-warning hover:text-warning/80 transition-colors"
+              >
+                <FileX size={14} />
+                {excludedCount} excluded frame{excludedCount !== 1 ? 's' : ''}
+              </button>
+            )}
           </div>
           <div className="flex items-center gap-3">
             <button
@@ -796,22 +819,15 @@ export default function Objects() {
               <p>Frames excluded: {generateResult.frames_excluded}</p>
             )}
           </div>
-          {generateResult.exclusion_reasons.length > 0 && (
-            <details className="mt-3">
-              <summary className="text-sm text-success cursor-pointer">
-                View exclusion reasons ({generateResult.exclusion_reasons.length})
-              </summary>
-              <div className="mt-2 text-xs text-content-muted max-h-32 overflow-y-auto">
-                {generateResult.exclusion_reasons.slice(0, 10).map((reason, i) => (
-                  <p key={i} className="truncate">{reason}</p>
-                ))}
-                {generateResult.exclusion_reasons.length > 10 && (
-                  <p className="text-content-muted italic">
-                    ... and {generateResult.exclusion_reasons.length - 10} more
-                  </p>
-                )}
-              </div>
-            </details>
+          {generateResult.frames_excluded > 0 && (
+            <div className="mt-3">
+              <button
+                onClick={() => navigate('/excluded')}
+                className="text-sm text-success hover:text-success/80 underline cursor-pointer"
+              >
+                View {generateResult.frames_excluded} excluded frames
+              </button>
+            </div>
           )}
         </div>
       )}

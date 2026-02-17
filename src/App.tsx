@@ -13,6 +13,7 @@ import BlackHole from './pages/BlackHole';
 import SkyChart from './pages/SkyChart';
 import Settings from './pages/Settings';
 import About from './pages/About';
+import ExcludedFrames from './pages/ExcludedFrames';
 
 function App() {
   const [dbInitialized, setDbInitialized] = useState(false);
@@ -62,6 +63,7 @@ function App() {
           <Route path="calendar" element={<ShootCalendar />} />
           <Route path="objects" element={<Objects />} />
           <Route path="objects/:id" element={<FrameSetDetail />} />
+          <Route path="excluded" element={<ExcludedFrames />} />
           <Route path="skychart" element={<SkyChart />} />
           <Route path="equipment" element={<Equipment />} />
           <Route path="export" element={<Export />} />

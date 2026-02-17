@@ -689,6 +689,16 @@ pub struct CalibrationMetadataEdits {
     pub exptime: Option<f64>,
 }
 
+/// Excluded frame entry (frame excluded during auto-generation)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExcludedFrameEntry {
+    pub file_id: i64,
+    pub path: String,
+    pub filename: String,
+    pub reason: String,
+    pub excluded_at: String,
+}
+
 /// Original calibration set metadata values (backed up before editing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationSetOriginals {

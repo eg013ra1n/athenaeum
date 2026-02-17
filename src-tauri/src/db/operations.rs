@@ -2012,3 +2012,137 @@ pub fn clone_session(
     Ok(new_session_id)
 }
 
+// ============================================================================
+// Excluded Frames Operations
+// ============================================================================
+
+/// Clear all excluded frames
+pub fn clear_excluded_frames(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM excluded_frames", [])?;
+    Ok(())
+}
+
+/// Insert excluded frames in batch
+pub fn insert_excluded_frames(conn: &Connection, entries: &[(i64, String)]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO excluded_frames (file_id, reason) VALUES (?1, ?2)",
+    )?;
+    for (file_id, reason) in entries {
+        stmt.execute(params![file_id, reason])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Get count of excluded frames
+pub fn get_excluded_frames_count(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM excluded_frames", [], |row| row.get(0))
+}
+
+/// Reclassify excluded frames: update imagetyp, remove from excluded_frames,
+/// return distinct instrume values for calibration refresh.
+pub fn reclassify_excluded_frames(
+    conn: &Connection,
+    file_ids: &[i64],
+    new_imagetyp: &str,
+) -> Result<(usize, Vec<String>)> {
+    if file_ids.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+
+    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let values: Vec<rusqlite::types::Value> = file_ids
+        .iter()
+        .map(|id| rusqlite::types::Value::Integer(*id))
+        .collect();
+
+    // Update imagetyp for frames matching these file_ids
+    let sql = format!(
+        "UPDATE frames SET imagetyp = ?1 WHERE file_id IN ({})",
+        placeholders
+    );
+    let mut update_params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(new_imagetyp.to_string())];
+    update_params.extend(values.iter().cloned());
+    let frames_updated = conn.execute(&sql, rusqlite::params_from_iter(update_params.iter()))?;
+
+    // Remove from excluded_frames
+    let sql = format!(
+        "DELETE FROM excluded_frames WHERE file_id IN ({})",
+        placeholders
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
+
+    // Get distinct instrume values for affected frames
+    let sql = format!(
+        "SELECT DISTINCT instrume FROM frames WHERE file_id IN ({}) AND instrume IS NOT NULL",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let cameras: Vec<String> = stmt
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok((frames_updated, cameras))
+}
+
+/// Get frame IDs (frames.id) for a list of file IDs (files.id)
+pub fn get_frame_ids_for_file_ids(conn: &Connection, file_ids: &[i64]) -> Result<Vec<i64>> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let values: Vec<rusqlite::types::Value> = file_ids
+        .iter()
+        .map(|id| rusqlite::types::Value::Integer(*id))
+        .collect();
+    let sql = format!("SELECT id FROM frames WHERE file_id IN ({})", placeholders);
+    let mut stmt = conn.prepare(&sql)?;
+    let ids: Vec<i64> = stmt
+        .query_map(rusqlite::params_from_iter(values.iter()), |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(ids)
+}
+
+/// Delete excluded frames by file IDs
+pub fn delete_excluded_frames_by_file_ids(conn: &Connection, file_ids: &[i64]) -> Result<usize> {
+    if file_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let values: Vec<rusqlite::types::Value> = file_ids
+        .iter()
+        .map(|id| rusqlite::types::Value::Integer(*id))
+        .collect();
+    let sql = format!(
+        "DELETE FROM excluded_frames WHERE file_id IN ({})",
+        placeholders
+    );
+    let deleted = conn.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
+    Ok(deleted)
+}
+
+/// Get all excluded frames joined with file paths
+pub fn get_excluded_frames(conn: &Connection) -> Result<Vec<crate::models::ExcludedFrameEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT ef.file_id, f.path, f.filename, ef.reason, ef.excluded_at
+         FROM excluded_frames ef
+         JOIN files f ON ef.file_id = f.id
+         ORDER BY f.path ASC"
+    )?;
+
+    let entries = stmt.query_map([], |row| {
+        Ok(crate::models::ExcludedFrameEntry {
+            file_id: row.get(0)?,
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            reason: row.get(3)?,
+            excluded_at: row.get(4)?,
+        })
+    })?;
+
+    entries.collect()
+}
+

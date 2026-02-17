@@ -1304,6 +1304,99 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
 
 // ========== Refresh Calibration Library Command ==========
 
+/// Inner logic for refreshing calibration library for a specific camera.
+/// Extracted so it can be called from both the Tauri command and other commands
+/// (e.g., reclassify_excluded_frames) without going through IPC.
+pub(crate) fn refresh_calibration_library_inner(
+    conn: &rusqlite::Connection,
+    instrume: &str,
+) -> Result<CalibrationScanResult, String> {
+    println!("🔄 Refreshing calibration library for camera: {}", instrume);
+
+    // Step 1: Clear frame memberships for this camera's sets (but keep the sets)
+    conn.execute(
+        "DELETE FROM calibration_set_frames
+         WHERE set_id IN (
+             SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0
+         )",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to clear frame memberships: {}", e))?;
+
+    // Reset frame counts to 0 for these sets
+    conn.execute(
+        "UPDATE calibration_set SET frame_count = 0
+         WHERE instrume = ?1 AND is_master_library = 0",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to reset frame counts: {}", e))?;
+
+    println!("   Cleared existing frame memberships (sets preserved for ID stability)");
+
+    // Step 2: Query all calibration frame IDs for this camera
+    let flat_frame_ids = query_frame_ids_by_type(conn, instrume, "FLAT")
+        .map_err(|e| format!("Failed to query flat frames: {}", e))?;
+
+    let dark_frame_ids = query_frame_ids_by_type(conn, instrume, "DARK")
+        .map_err(|e| format!("Failed to query dark frames: {}", e))?;
+
+    let bias_frame_ids = query_frame_ids_by_type(conn, instrume, "BIAS")
+        .map_err(|e| format!("Failed to query bias frames: {}", e))?;
+
+    let darkflat_frame_ids = query_frame_ids_by_type(conn, instrume, "DARKFLAT")
+        .map_err(|e| format!("Failed to query darkflat frames: {}", e))?;
+
+    // Query master frame IDs
+    let master_dark_ids = query_frame_ids_by_type(conn, instrume, "MASTERDARK")
+        .map_err(|e| format!("Failed to query master dark frames: {}", e))?;
+    let master_flat_ids = query_frame_ids_by_type(conn, instrume, "MASTERFLAT")
+        .map_err(|e| format!("Failed to query master flat frames: {}", e))?;
+    let master_bias_ids = query_frame_ids_by_type(conn, instrume, "MASTERBIAS")
+        .map_err(|e| format!("Failed to query master bias frames: {}", e))?;
+    let master_darkflat_ids = query_frame_ids_by_type(conn, instrume, "MASTERDARKFLAT")
+        .map_err(|e| format!("Failed to query master darkflat frames: {}", e))?;
+
+    let master_frame_ids = MasterFrameIds {
+        master_dark_ids,
+        master_flat_ids,
+        master_bias_ids,
+        master_darkflat_ids,
+    };
+
+    println!("   Found frames - Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
+        flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
+    if !master_frame_ids.is_empty() {
+        println!("   Found master frames - Dark: {}, Flat: {}, Bias: {}, DarkFlat: {}",
+            master_frame_ids.master_dark_ids.len(),
+            master_frame_ids.master_flat_ids.len(),
+            master_frame_ids.master_bias_ids.len(),
+            master_frame_ids.master_darkflat_ids.len());
+    }
+
+    // Step 3: Recreate calibration sets using the same algorithm as folder scanning
+    let result = create_calibration_sets_from_scan_with_masters(
+        conn,
+        flat_frame_ids,
+        dark_frame_ids,
+        bias_frame_ids,
+        darkflat_frame_ids,
+        master_frame_ids,
+    ).map_err(|e| format!("Failed to create calibration sets: {}", e))?;
+
+    // Step 4: Delete orphaned sets (sets with no frames after reclustering)
+    let deleted_orphans = conn.execute(
+        "DELETE FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0",
+        rusqlite::params![instrume],
+    ).map_err(|e| format!("Failed to delete orphaned sets: {}", e))?;
+
+    if deleted_orphans > 0 {
+        println!("   Deleted {} orphaned sets", deleted_orphans);
+    }
+
+    println!("Refresh complete - {} calibration sets active (IDs preserved)", result.sets_created);
+
+    Ok(result)
+}
+
 /// Refresh calibration library for a specific camera
 ///
 /// This command preserves calibration set IDs by:
@@ -1320,92 +1413,7 @@ pub async fn refresh_calibration_library_for_camera(
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    println!("🔄 Refreshing calibration library for camera: {}", instrume);
-
-    // Step 1: Clear frame memberships for this camera's sets (but keep the sets)
-    // This allows reclustering to rebuild the memberships while preserving set IDs
-    conn.execute(
-        "DELETE FROM calibration_set_frames
-         WHERE set_id IN (
-             SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0
-         )",
-        rusqlite::params![instrume],
-    ).map_err(|e| format!("Failed to clear frame memberships: {}", e))?;
-
-    // Reset frame counts to 0 for these sets
-    conn.execute(
-        "UPDATE calibration_set SET frame_count = 0
-         WHERE instrume = ?1 AND is_master_library = 0",
-        rusqlite::params![instrume],
-    ).map_err(|e| format!("Failed to reset frame counts: {}", e))?;
-
-    println!("   ✅ Cleared existing frame memberships (sets preserved for ID stability)");
-
-    // Step 2: Query all calibration frame IDs for this camera
-    let flat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "FLAT")
-        .map_err(|e| format!("Failed to query flat frames: {}", e))?;
-
-    let dark_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARK")
-        .map_err(|e| format!("Failed to query dark frames: {}", e))?;
-
-    let bias_frame_ids = query_frame_ids_by_type(&conn, &instrume, "BIAS")
-        .map_err(|e| format!("Failed to query bias frames: {}", e))?;
-
-    let darkflat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARKFLAT")
-        .map_err(|e| format!("Failed to query darkflat frames: {}", e))?;
-
-    // Query master frame IDs
-    let master_dark_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARK")
-        .map_err(|e| format!("Failed to query master dark frames: {}", e))?;
-    let master_flat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERFLAT")
-        .map_err(|e| format!("Failed to query master flat frames: {}", e))?;
-    let master_bias_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERBIAS")
-        .map_err(|e| format!("Failed to query master bias frames: {}", e))?;
-    let master_darkflat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARKFLAT")
-        .map_err(|e| format!("Failed to query master darkflat frames: {}", e))?;
-
-    let master_frame_ids = MasterFrameIds {
-        master_dark_ids,
-        master_flat_ids,
-        master_bias_ids,
-        master_darkflat_ids,
-    };
-
-    println!("   📊 Found frames - Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
-        flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
-    if !master_frame_ids.is_empty() {
-        println!("   ⭐ Found master frames - Dark: {}, Flat: {}, Bias: {}, DarkFlat: {}",
-            master_frame_ids.master_dark_ids.len(),
-            master_frame_ids.master_flat_ids.len(),
-            master_frame_ids.master_bias_ids.len(),
-            master_frame_ids.master_darkflat_ids.len());
-    }
-
-    // Step 3: Recreate calibration sets using the same algorithm as folder scanning
-    // Sets will be matched by params + date range overlap, preserving IDs
-    let result = create_calibration_sets_from_scan_with_masters(
-        &conn,
-        flat_frame_ids,
-        dark_frame_ids,
-        bias_frame_ids,
-        darkflat_frame_ids,
-        master_frame_ids,
-    ).map_err(|e| format!("Failed to create calibration sets: {}", e))?;
-
-    // Step 4: Delete orphaned sets (sets with no frames after reclustering)
-    let deleted_orphans = conn.execute(
-        "DELETE FROM calibration_set
-         WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0",
-        rusqlite::params![instrume],
-    ).map_err(|e| format!("Failed to delete orphaned sets: {}", e))?;
-
-    if deleted_orphans > 0 {
-        println!("   🗑️  Deleted {} orphaned sets", deleted_orphans);
-    }
-
-    println!("🎉 Refresh complete - {} calibration sets active (IDs preserved)", result.sets_created);
-
-    Ok(result)
+    refresh_calibration_library_inner(&conn, &instrume)
 }
 
 /// Query frame IDs for a specific camera and image type

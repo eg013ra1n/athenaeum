@@ -63,6 +63,12 @@ pub async fn auto_generate_frame_sets(
     let (clusters, excluded) = crate::clustering::auto_generate_frame_sets(frames, threshold_deg)
         .map_err(|e| e.to_string())?;
 
+    // Persist excluded frames to DB (clear old, insert new)
+    db::clear_excluded_frames(&conn).map_err(|e| e.to_string())?;
+    if !excluded.is_empty() {
+        db::insert_excluded_frames(&conn, &excluded).map_err(|e| e.to_string())?;
+    }
+
     // Create frame sets in a transaction
     let mut sets_created = 0;
     let mut frames_clustered = 0;
@@ -932,6 +938,104 @@ pub async fn create_custom_frames_set(
     Ok(set_id)
 }
 
+/// Shared logic for creating a custom frame set from frame IDs.
+/// Returns the new frame set ID.
+fn create_frame_set_inner(
+    conn: &rusqlite::Connection,
+    name: &str,
+    frame_ids: &[i64],
+    settings: &std::sync::Arc<crate::settings::SettingsManager>,
+) -> Result<i64, String> {
+    if frame_ids.is_empty() {
+        return Err("Cannot create frame set with no frames".to_string());
+    }
+
+    // Calculate metadata from frame IDs
+    let metadata = crate::frames_set_metadata::calculate_metadata_from_frame_ids(
+        frame_ids,
+        conn,
+    ).map_err(|e| format!("Failed to calculate metadata: {}", e))?;
+
+    println!("Calculated metadata: date_obs_start={:?}, date_obs_end={:?}, coordinates={:?}/{:?}, total_exp_time={:?}",
+             metadata.date_obs_start, metadata.date_obs_end, metadata.objctra, metadata.objctdec, metadata.total_exp_time);
+
+    // Create the custom frames_set
+    let set_id = db::create_frames_set(
+        conn,
+        Some(name),
+        true, // is_custom = true
+        metadata.date_obs_start.as_deref(),
+        metadata.date_obs_end.as_deref(),
+        metadata.objctra.as_deref(),
+        metadata.objctdec.as_deref(),
+        metadata.total_exp_time,
+        metadata.avg_rotation,
+        metadata.min_rotation,
+        metadata.max_rotation,
+    ).map_err(|e| format!("Failed to create frames_set: {}", e))?;
+
+    println!("Created frames_set with id {}", set_id);
+
+    // Get frames with file info for session detection
+    let frames = db::get_frames_with_files_by_ids(conn, frame_ids)
+        .map_err(|e| format!("Failed to get frames: {}", e))?;
+
+    // Detect nights from selected frames using gap threshold
+    let gap_threshold_hours: f64 = settings
+        .get_session_gap_threshold_hours(conn)
+        .unwrap_or(6.0);
+
+    println!("Detecting nights from {} frames with gap threshold {} hours", frames.len(), gap_threshold_hours);
+
+    let detected_nights = crate::sessions::detect_sessions(frames, gap_threshold_hours)
+        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
+
+    println!("Detected {} nights", detected_nights.len());
+
+    if detected_nights.is_empty() {
+        println!("No nights detected, creating single night with all frames");
+
+        let now = chrono::Utc::now();
+        let night_start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let night_end = (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let night_id = db::create_imaging_night(conn, set_id, &night_start, &night_end)
+            .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
+
+        let session_id = db::create_session(conn, night_id, "Unknown", frame_ids.len() as i32, metadata.total_exp_time)
+            .map_err(|e| format!("Failed to create session: {}", e))?;
+
+        db::insert_session_members(conn, session_id, frame_ids)
+            .map_err(|e| format!("Failed to add frames to session: {}", e))?;
+
+        println!("Created custom frame set '{}' (id {}) with {} frames", name, set_id, frame_ids.len());
+    } else {
+        for (night_idx, night) in detected_nights.iter().enumerate() {
+            println!("Processing night {}/{}: {} to {}", night_idx + 1, detected_nights.len(), night.start_time, night.end_time);
+
+            let night_id = db::create_imaging_night(conn, set_id, &night.start_time, &night.end_time)
+                .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
+
+            for session in &night.sessions {
+                let session_id = db::create_session(
+                    conn,
+                    night_id,
+                    &session.instrume,
+                    session.frame_ids.len() as i32,
+                    session.total_exp_time,
+                ).map_err(|e| format!("Failed to create session: {}", e))?;
+
+                db::insert_session_members(conn, session_id, &session.frame_ids)
+                    .map_err(|e| format!("Failed to add frames to session: {}", e))?;
+            }
+        }
+
+        println!("Created custom frame set '{}' (id {}) with {} nights and {} frames", name, set_id, detected_nights.len(), frame_ids.len());
+    }
+
+    Ok(set_id)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn create_frame_set_from_selection(
     state: State<'_, AppState>,
@@ -949,100 +1053,114 @@ pub async fn create_frame_set_from_selection(
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    // Verify frames exist
+    create_frame_set_inner(&conn, &name, &frame_ids, &state.settings)
+}
+
+/// Create a custom frame set from excluded frames (identified by file_id),
+/// then remove them from the excluded_frames table.
+#[tauri::command]
+pub async fn create_frame_set_from_excluded(
+    file_ids: Vec<i64>,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    println!(
+        "Creating frame set from {} excluded files: name='{}'",
+        file_ids.len(),
+        name
+    );
+
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Map file_ids → frame_ids
+    let frame_ids = db::get_frame_ids_for_file_ids(&conn, &file_ids)
+        .map_err(|e| format!("Failed to get frame IDs: {}", e))?;
+
     if frame_ids.is_empty() {
-        return Err("Cannot create frame set with no frames".to_string());
+        return Err("No frames found for the selected files".to_string());
     }
 
-    // Calculate metadata from frame IDs
-    let metadata = crate::frames_set_metadata::calculate_metadata_from_frame_ids(
-        &frame_ids,
-        &conn,
-    ).map_err(|e| format!("Failed to calculate metadata: {}", e))?;
+    println!("Mapped {} file_ids to {} frame_ids", file_ids.len(), frame_ids.len());
 
-    println!("Calculated metadata: date_obs_start={:?}, date_obs_end={:?}, coordinates={:?}/{:?}, total_exp_time={:?}",
-             metadata.date_obs_start, metadata.date_obs_end, metadata.objctra, metadata.objctdec, metadata.total_exp_time);
+    // Create the frame set
+    let set_id = create_frame_set_inner(&conn, &name, &frame_ids, &state.settings)?;
 
-    // Create the custom frames_set
-    let set_id = db::create_frames_set(
-        &conn,
-        Some(&name),
-        true, // is_custom = true
-        metadata.date_obs_start.as_deref(),
-        metadata.date_obs_end.as_deref(),
-        metadata.objctra.as_deref(),
-        metadata.objctdec.as_deref(),
-        metadata.total_exp_time,
-        metadata.avg_rotation,
-        metadata.min_rotation,
-        metadata.max_rotation,
-    ).map_err(|e| format!("Failed to create frames_set: {}", e))?;
+    // Remove from excluded_frames
+    let deleted = db::delete_excluded_frames_by_file_ids(&conn, &file_ids)
+        .map_err(|e| format!("Failed to remove from excluded frames: {}", e))?;
 
-    println!("Created frames_set with id {}", set_id);
-
-    // Get frames with file info for session detection
-    let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids)
-        .map_err(|e| format!("Failed to get frames: {}", e))?;
-
-    // Detect nights from selected frames using gap threshold
-    let gap_threshold_hours: f64 = state.settings
-        .get_session_gap_threshold_hours(&conn)
-        .unwrap_or(6.0);
-
-    println!("Detecting nights from {} frames with gap threshold {} hours", frames.len(), gap_threshold_hours);
-
-    let detected_nights = crate::sessions::detect_sessions(frames, gap_threshold_hours)
-        .map_err(|e| format!("Failed to detect sessions: {}", e))?;
-
-    println!("Detected {} nights", detected_nights.len());
-
-    if detected_nights.is_empty() {
-        // If no nights detected, create a single night/session with all frames
-        println!("No nights detected, creating single night with all frames");
-
-        let now = chrono::Utc::now();
-        let night_start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let night_end = (now + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        let night_id = db::create_imaging_night(&conn, set_id, &night_start, &night_end)
-            .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
-
-        let session_id = db::create_session(&conn, night_id, "Unknown", frame_ids.len() as i32, metadata.total_exp_time)
-            .map_err(|e| format!("Failed to create session: {}", e))?;
-
-        db::insert_session_members(&conn, session_id, &frame_ids)
-            .map_err(|e| format!("Failed to add frames to session: {}", e))?;
-
-        println!("✅ Created custom frame set '{}' (id {}) with {} frames", name, set_id, frame_ids.len());
-    } else {
-        // Create imaging nights and sessions for detected nights
-        for (night_idx, night) in detected_nights.iter().enumerate() {
-            println!("Processing night {}/{}: {} to {}", night_idx + 1, detected_nights.len(), night.start_time, night.end_time);
-
-            let night_id = db::create_imaging_night(&conn, set_id, &night.start_time, &night.end_time)
-                .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
-
-            println!("Created imaging_night with id {}", night_id);
-
-            // Process sessions within this night
-            for session in &night.sessions {
-                let session_id = db::create_session(
-                    &conn,
-                    night_id,
-                    &session.instrume,
-                    session.frame_ids.len() as i32,
-                    session.total_exp_time,
-                ).map_err(|e| format!("Failed to create session: {}", e))?;
-
-                db::insert_session_members(&conn, session_id, &session.frame_ids)
-                    .map_err(|e| format!("Failed to add frames to session: {}", e))?;
-            }
-        }
-
-        println!("✅ Created custom frame set '{}' (id {}) with {} nights and {} frames", name, set_id, detected_nights.len(), frame_ids.len());
-    }
+    println!("Removed {} entries from excluded_frames, created frame set {}", deleted, set_id);
 
     Ok(set_id)
+}
+
+/// Reclassify excluded frames to a new image type (e.g., Flat or Dark),
+/// remove them from the excluded list, and refresh calibration libraries.
+#[tauri::command]
+pub async fn reclassify_excluded_frames(
+    file_ids: Vec<i64>,
+    new_imagetyp: String,
+    state: State<'_, AppState>,
+) -> Result<ReclassifyResult, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    println!(
+        "Reclassifying {} frames to {}",
+        file_ids.len(),
+        new_imagetyp
+    );
+
+    let (frames_updated, cameras) =
+        db::reclassify_excluded_frames(&conn, &file_ids, &new_imagetyp)
+            .map_err(|e| format!("Failed to reclassify frames: {}", e))?;
+
+    println!(
+        "Updated {} frames, affected cameras: {:?}",
+        frames_updated, cameras
+    );
+
+    // Refresh calibration library for each affected camera
+    for camera in &cameras {
+        if let Err(e) = super::calibration::refresh_calibration_library_inner(&conn, camera) {
+            eprintln!(
+                "Warning: failed to refresh calibration library for {}: {}",
+                camera, e
+            );
+        }
+    }
+
+    Ok(ReclassifyResult {
+        frames_updated,
+        cameras_refreshed: cameras,
+    })
+}
+
+/// Get count of excluded frames (lightweight check)
+#[tauri::command]
+pub async fn get_excluded_frames_count(
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_excluded_frames_count(&conn).map_err(|e| e.to_string())
+}
+
+/// Get all excluded frames with file paths
+#[tauri::command]
+pub async fn get_excluded_frames(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::ExcludedFrameEntry>, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_excluded_frames(&conn).map_err(|e| e.to_string())
 }
 
 // DTOs for frame sets
@@ -1059,4 +1177,10 @@ pub struct AutoGenerateResult {
 pub struct FramesSetWithCount {
     pub frames_set: FramesSet,
     pub member_count: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct ReclassifyResult {
+    pub frames_updated: usize,
+    pub cameras_refreshed: Vec<String>,
 }
