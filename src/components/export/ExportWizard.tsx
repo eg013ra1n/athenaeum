@@ -1,10 +1,10 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Folder, Loader2, Check, AlertCircle, Play, Layers } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
 import { ExportSummary } from './ExportSummary';
-import { useExportableFrameSets } from '../../hooks/useExportData';
+import { useExportableFrameSets, useWbppConfig } from '../../hooks/useExportData';
 import type { ExportResult } from '../../types/export';
 
 interface ExportWizardProps {
@@ -23,6 +23,62 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
 
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
+  const { config: wbppConfig } = useWbppConfig();
+
+  // Build dynamic WBPP keyword instructions from config
+  const keywordDescriptions: Record<string, string> = useMemo(() => ({
+    CAMERA: 'Groups files by camera/instrument',
+    BIAS: 'Bias calibration level (outermost calibration)',
+    DARKS: 'Dark + darkflat calibration level',
+    FLAT: 'Flat calibration level (calibrates lights)',
+  }), []);
+
+  const wbppKeywords = useMemo(() => {
+    if (!wbppConfig) return [];
+    return wbppConfig.keywordOrder.map((kw) => ({
+      keyword: kw,
+      description: keywordDescriptions[kw] || kw,
+    }));
+  }, [wbppConfig, keywordDescriptions]);
+
+  const exampleStructure = useMemo(() => {
+    if (!wbppConfig) return '';
+    // Build example structure based on keyword order
+    const order = wbppConfig.keywordOrder;
+    const lines: string[] = ['output/'];
+    let indent = '└── ';
+    let prefix = '';
+    for (const kw of order) {
+      switch (kw) {
+        case 'CAMERA':
+          lines.push(`${prefix}${indent}camera_{instrume}/`);
+          prefix = '    ';
+          indent = '└── ';
+          break;
+        case 'BIAS':
+          lines.push(`${prefix}${indent}BIAS_{id}/`);
+          lines.push(`${prefix}    bias frames...`);
+          prefix += '    ';
+          indent = '└── ';
+          break;
+        case 'DARKS':
+          lines.push(`${prefix}${indent}DARKS_{id}/`);
+          lines.push(`${prefix}    dark + darkflat frames...`);
+          prefix += '    ';
+          indent = '└── ';
+          break;
+        case 'FLAT':
+          lines.push(`${prefix}${indent}FLAT_{id}/`);
+          lines.push(`${prefix}    flat frames...`);
+          prefix += '    ';
+          indent = '└── ';
+          break;
+      }
+    }
+    lines.push(`${prefix}${indent}lights/`);
+    lines.push(`${prefix}    light frames...`);
+    return lines.join('\n');
+  }, [wbppConfig]);
 
   // Handle folder selection
   const handleSelectFolder = useCallback(async () => {
@@ -152,32 +208,28 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
                     WBPP Setup Guide
                   </summary>
                   <div className="mt-3 space-y-3">
-                    <p>To enable automatic grouping in WBPP, add these <strong>Grouping Keywords</strong>:</p>
+                    <p>To enable automatic grouping in WBPP, add these <strong>Grouping Keywords</strong> (in order):</p>
                     <ol className="list-decimal list-inside space-y-1 text-xs">
                       <li>Open WBPP in PixInsight</li>
                       <li>Check <strong>Grouping Keywords</strong></li>
-                      <li>Add <code className="px-1 bg-surface-hover rounded">CAMERA</code> with <strong>Pre</strong> checked</li>
-                      <li>Add <code className="px-1 bg-surface-hover rounded">DARKS</code> with <strong>Pre</strong> checked</li>
-                      <li>Add <code className="px-1 bg-surface-hover rounded">FLATS</code> with <strong>Pre</strong> checked</li>
+                      {wbppKeywords.map((kw) => (
+                        <li key={kw.keyword}>
+                          Add <code className="px-1 bg-surface-hover rounded">{kw.keyword}</code> with <strong>Pre</strong> checked
+                          <span className="text-content-muted ml-1">({kw.description})</span>
+                        </li>
+                      ))}
                     </ol>
                     <img
                       src="/wbpp-grouping-keywords.png"
                       alt="WBPP Grouping Keywords settings"
                       className="rounded border border-border max-w-sm"
                     />
-                    <div>
-                      <p className="font-medium mb-1">Expected folder structure:</p>
-                      <pre className="text-xs font-mono">
-{`output/
-└── {camera}/
-    ├── darks/
-    │   └── (bias, dark, darkflat files)
-    └── flats_{filter}/
-        ├── (flat files)
-        └── lights/
-            └── (light frames)`}
-                      </pre>
-                    </div>
+                    {exampleStructure && (
+                      <div>
+                        <p className="font-medium mb-1">Expected folder structure:</p>
+                        <pre className="text-xs font-mono">{exampleStructure}</pre>
+                      </div>
+                    )}
                   </div>
                 </details>
               </div>

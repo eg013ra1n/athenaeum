@@ -5,7 +5,6 @@ import {
   CalibrationTypeConfig,
   CONFIGURABLE_PARAMETERS,
   getParameterLabel,
-  isLockedParameter,
   supportsWarningMode,
   validateThresholds,
 } from "../../types/calibration-config";
@@ -56,7 +55,7 @@ export default function MatchingMatrixTable({
     parameter: string,
     paramConfig: ParameterConfig
   ) => {
-    const isLocked = paramConfig.locked || isLockedParameter(parameter);
+    const isLocked = paramConfig.locked;
     const canWarn = paramConfig.supports_warning || supportsWarningMode(parameter);
     const validationError = validateThresholds(paramConfig);
 
@@ -203,9 +202,6 @@ export default function MatchingMatrixTable({
                 >
                   <span className="flex items-center justify-center gap-1">
                     {getParameterLabel(param)}
-                    {isLockedParameter(param) && (
-                      <Lock size={10} className="text-content-muted" />
-                    )}
                   </span>
                 </th>
               ))}
@@ -262,18 +258,14 @@ export default function MatchingMatrixTable({
             <span className="w-6 h-6 flex items-center justify-center bg-surface-hover/30 text-content-muted border border-border/50 rounded font-bold">-</span>
             <span>Ignored</span>
           </div>
-          <div className="flex items-center gap-2">
-            <Lock size={14} className="text-content-muted" />
-            <span>Locked</span>
-          </div>
         </div>
 
         {/* Detailed explanation */}
         <div className="text-xs text-content-muted space-y-1 pt-2 border-t border-border">
           <p>
             <span className="text-success font-medium">=</span> <strong>Exact</strong>:
-            Parameters must match exactly. Locked parameters (Camera, Binning, Gain, Offset)
-            cannot be changed — calibration frames must come from the same equipment configuration.
+            Parameters must match exactly. Equipment parameters (Camera, Binning, Gain, Offset)
+            default to Exact match. Set to Ignore only if you intentionally mix equipment configurations.
           </p>
           <p>
             <span className="text-warning font-medium">≈</span> <strong>Threshold</strong>:

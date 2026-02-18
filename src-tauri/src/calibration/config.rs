@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 /// Current configuration schema version
 /// v2: Added telescop field, dual thresholds (warning + matching), locked/supports_warning flags
-pub const CONFIG_VERSION: i32 = 2;
+/// v3: Unlocked instrume/binning/gain/offset (can now be set to Ignore)
+pub const CONFIG_VERSION: i32 = 3;
 
 /// Match mode for parameter comparison
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -65,18 +66,6 @@ impl Default for ParameterConfig {
 }
 
 impl ParameterConfig {
-    /// Create an exact match parameter (cannot be changed by user)
-    pub fn exact_locked() -> Self {
-        Self {
-            mode: MatchMode::Exact,
-            required: true,
-            warning_threshold: None,
-            matching_threshold: None,
-            locked: true,
-            supports_warning: false,
-        }
-    }
-
     /// Create an exact match parameter (can be changed to Ignore)
     pub fn exact(required: bool) -> Self {
         Self {
@@ -140,13 +129,13 @@ impl ParameterConfig {
 /// Contains rules for all 9 matchable parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationTypeConfig {
-    /// Camera/instrument name - always exact, locked
+    /// Camera/instrument name - exact by default, can be set to ignore
     pub instrume: ParameterConfig,
-    /// Binning mode (e.g., "1x1", "2x2") - always exact, locked
+    /// Binning mode (e.g., "1x1", "2x2") - exact by default, can be set to ignore
     pub binning: ParameterConfig,
-    /// Sensor gain value - always exact, locked
+    /// Sensor gain value - exact by default, can be set to ignore
     pub gain: ParameterConfig,
-    /// Sensor offset value - always exact, locked
+    /// Sensor offset value - exact by default, can be set to ignore
     pub offset: ParameterConfig,
     /// Telescope name - exact or disabled (no warning mode)
     pub telescop: ParameterConfig,
@@ -163,11 +152,11 @@ pub struct CalibrationTypeConfig {
 impl Default for CalibrationTypeConfig {
     fn default() -> Self {
         Self {
-            // Always exact, locked parameters
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            // Equipment parameters - exact by default, can be set to ignore
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             // Exact or disabled (no warning support)
             telescop: ParameterConfig::ignore(), // Can be set to exact or ignore
             filter: ParameterConfig::ignore(),   // Can be set to exact or ignore
@@ -363,10 +352,10 @@ impl Default for CalibrationMatchingConfig {
         // Configure Lights → Flat (with filter matching, focal length with threshold)
         config.lights.flat = Some(CalibrationTypeConfig {
             // Locked exact parameters
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             // Exact or disabled (no warning)
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::exact(true),
@@ -381,10 +370,10 @@ impl Default for CalibrationMatchingConfig {
 
         // Configure Lights → Dark (exposure must match, temp with thresholds)
         config.lights.dark = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
             // Exposure: warn at 1s diff, reject at 5s diff
@@ -396,10 +385,10 @@ impl Default for CalibrationMatchingConfig {
 
         // Configure Lights → Bias (no filter, no exptime, temp with thresholds)
         config.lights.bias = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
             exptime: ParameterConfig::ignore_with_warning_support(),
@@ -409,10 +398,10 @@ impl Default for CalibrationMatchingConfig {
 
         // Configure Flats → DarkFlat (exposure match, temp with thresholds)
         config.flats.darkflat = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
             exptime: ParameterConfig::warning(1.0, 5.0),
@@ -422,10 +411,10 @@ impl Default for CalibrationMatchingConfig {
 
         // Configure Flats → Dark (same as DarkFlat)
         config.flats.dark = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
             exptime: ParameterConfig::warning(1.0, 5.0),
@@ -435,10 +424,10 @@ impl Default for CalibrationMatchingConfig {
 
         // Configure Flats → Bias (temp with thresholds)
         config.flats.bias = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
             exptime: ParameterConfig::ignore_with_warning_support(),
@@ -448,10 +437,10 @@ impl Default for CalibrationMatchingConfig {
 
         // Configure Darks → Bias (temp with thresholds)
         config.darks.bias = Some(CalibrationTypeConfig {
-            instrume: ParameterConfig::exact_locked(),
-            binning: ParameterConfig::exact_locked(),
-            gain: ParameterConfig::exact_locked(),
-            offset: ParameterConfig::exact_locked(),
+            instrume: ParameterConfig::exact(true),
+            binning: ParameterConfig::exact(true),
+            gain: ParameterConfig::exact(true),
+            offset: ParameterConfig::exact(true),
             telescop: ParameterConfig::ignore(),
             filter: ParameterConfig::ignore(),
             exptime: ParameterConfig::ignore_with_warning_support(),
@@ -505,6 +494,35 @@ impl Default for CalibrationMatchingConfig {
 }
 
 impl CalibrationMatchingConfig {
+    /// Migrate config from older versions to current version.
+    /// v2→v3: Unlock instrume/binning/gain/offset (set locked=false).
+    pub fn migrate(mut self) -> Self {
+        if self.version < 3 {
+            Self::unlock_core_params(&mut self.lights);
+            Self::unlock_core_params(&mut self.flats);
+            Self::unlock_core_params(&mut self.darks);
+            self.version = CONFIG_VERSION;
+        }
+        self
+    }
+
+    fn unlock_core_params(source: &mut SourceTypeConfig) {
+        for type_config in [
+            source.flat.as_mut(),
+            source.darkflat.as_mut(),
+            source.dark.as_mut(),
+            source.bias.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            type_config.instrume.locked = false;
+            type_config.binning.locked = false;
+            type_config.gain.locked = false;
+            type_config.offset.locked = false;
+        }
+    }
+
     /// Get the matching config for a source→calibration pair
     pub fn get_type_config(&self, source: &str, calibration: &str) -> Option<&CalibrationTypeConfig> {
         let source_config = match source {
@@ -598,13 +616,18 @@ mod tests {
         let config = CalibrationMatchingConfig::default();
         assert_eq!(config.version, CONFIG_VERSION);
 
-        // Check Lights→Flat has filter matching and locked params
+        // Check Lights→Flat has filter matching and unlocked equipment params
         let flat_config = config.get_type_config("lights", "flat").unwrap();
         assert_eq!(flat_config.filter.mode, MatchMode::Exact);
-        assert!(flat_config.instrume.locked, "instrume should be locked");
-        assert!(flat_config.gain.locked, "gain should be locked");
-        assert!(flat_config.binning.locked, "binning should be locked");
-        assert!(flat_config.offset.locked, "offset should be locked");
+        assert!(!flat_config.instrume.locked, "instrume should be unlocked");
+        assert!(!flat_config.gain.locked, "gain should be unlocked");
+        assert!(!flat_config.binning.locked, "binning should be unlocked");
+        assert!(!flat_config.offset.locked, "offset should be unlocked");
+        // Defaults are still Exact mode
+        assert_eq!(flat_config.instrume.mode, MatchMode::Exact);
+        assert_eq!(flat_config.gain.mode, MatchMode::Exact);
+        assert_eq!(flat_config.binning.mode, MatchMode::Exact);
+        assert_eq!(flat_config.offset.mode, MatchMode::Exact);
 
         // Check Lights→Dark has temp warning with dual thresholds
         let dark_config = config.get_type_config("lights", "dark").unwrap();

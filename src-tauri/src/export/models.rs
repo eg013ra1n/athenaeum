@@ -625,3 +625,57 @@ pub enum WarningSeverity {
     /// Error (likely to cause issues)
     Error,
 }
+
+// ============================================================================
+// WBPP Export Configuration
+// ============================================================================
+
+/// Configuration for WBPP export folder hierarchy
+///
+/// Controls the keyword nesting order used to build the folder structure.
+/// WBPP's "Grouping Keywords with Pre" reads folder nesting to determine
+/// calibration chains — parent calibrates child.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WbppExportConfig {
+    /// Keyword nesting order (outermost first).
+    /// Default: ["CAMERA", "BIAS", "DARKS", "FLAT"]
+    pub keyword_order: Vec<String>,
+}
+
+impl Default for WbppExportConfig {
+    fn default() -> Self {
+        Self {
+            keyword_order: vec![
+                "CAMERA".to_string(),
+                "BIAS".to_string(),
+                "DARKS".to_string(),
+                "FLAT".to_string(),
+            ],
+        }
+    }
+}
+
+/// Setup instructions for configuring WBPP grouping keywords
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct WbppSetupInstructions {
+    /// Ordered list of keywords to configure in WBPP
+    pub keywords: Vec<WbppKeywordInstruction>,
+    /// Example folder structure matching the current config
+    pub example_structure: String,
+}
+
+/// A single WBPP keyword instruction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct WbppKeywordInstruction {
+    /// The WBPP grouping keyword name
+    pub keyword: String,
+    /// Whether "Pre" should be checked for this keyword
+    pub pre_checked: bool,
+    /// Description of what this keyword controls
+    pub description: String,
+}

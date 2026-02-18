@@ -29,13 +29,13 @@ export interface ParameterConfig {
 
 /** Configuration for matching a specific calibration type */
 export interface CalibrationTypeConfig {
-  /** Camera/instrument name - always exact, locked */
+  /** Camera/instrument name - exact by default, can be set to ignore */
   instrume: ParameterConfig;
-  /** Binning mode (e.g., "1x1", "2x2") - always exact, locked */
+  /** Binning mode (e.g., "1x1", "2x2") - exact by default, can be set to ignore */
   binning: ParameterConfig;
-  /** Sensor gain value - always exact, locked */
+  /** Sensor gain value - exact by default, can be set to ignore */
   gain: ParameterConfig;
-  /** Sensor offset value - always exact, locked */
+  /** Sensor offset value - exact by default, can be set to ignore */
   offset: ParameterConfig;
   /** Telescope name - exact or disabled (no warning mode) */
   telescop: ParameterConfig;
@@ -153,16 +153,6 @@ export function createParameterConfig(
   };
 }
 
-/** Helper to create exact match config (locked, always exact) */
-export function exactLocked(): ParameterConfig {
-  return {
-    mode: MatchMode.Exact,
-    required: true,
-    locked: true,
-    supports_warning: false,
-  };
-}
-
 /** Helper to create exact match config (can be changed to ignore) */
 export function exactMatch(required: boolean = true): ParameterConfig {
   return {
@@ -236,16 +226,15 @@ export function getParameterLabel(param: string): string {
   return labels[param] || param;
 }
 
-/** Parameters that are always exact and locked (cannot be changed) */
-export const LOCKED_PARAMETERS = [
+/** Parameters that can be exact or disabled (no warning mode) */
+export const EXACT_OR_DISABLED_PARAMETERS = [
   "instrume",
   "binning",
   "gain",
   "offset",
+  "telescop",
+  "filter",
 ] as const;
-
-/** Parameters that can be exact or disabled (no warning mode) */
-export const EXACT_OR_DISABLED_PARAMETERS = ["telescop", "filter"] as const;
 
 /** Parameters that support warning mode with dual thresholds */
 export const WARNING_CAPABLE_PARAMETERS = [
@@ -268,16 +257,10 @@ export const CONFIGURABLE_PARAMETERS = [
 ] as const;
 
 export type ConfigurableParameter = (typeof CONFIGURABLE_PARAMETERS)[number];
-export type LockedParameter = (typeof LOCKED_PARAMETERS)[number];
 export type ExactOrDisabledParameter =
   (typeof EXACT_OR_DISABLED_PARAMETERS)[number];
 export type WarningCapableParameter =
   (typeof WARNING_CAPABLE_PARAMETERS)[number];
-
-/** Check if a parameter is locked (always exact) */
-export function isLockedParameter(param: string): param is LockedParameter {
-  return (LOCKED_PARAMETERS as readonly string[]).includes(param);
-}
 
 /** Check if a parameter supports warning mode */
 export function supportsWarningMode(

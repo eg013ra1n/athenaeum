@@ -8,6 +8,7 @@ use crate::export::models::{
     DetailedWarning, ExportCalibrationSet, ExportData, ExportFrame, ExportGroup, ExportSummary,
     ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode, FolderNodeType,
     FolderPreview, FrameDetail, MasterCreationPlan, MasterInfo, WarningSeverity, WarningType,
+    WbppExportConfig,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -1140,7 +1141,7 @@ fn get_calibration_applications(
 // ============================================================================
 
 /// Collect enhanced export summary for the new UI
-pub fn collect_export_summary(conn: &Connection, frame_set_id: i64) -> Result<ExportSummary> {
+pub fn collect_export_summary(conn: &Connection, frame_set_id: i64, config: &WbppExportConfig) -> Result<ExportSummary> {
     println!("📊 Building export summary for frame set {}", frame_set_id);
 
     // Get basic export data first
@@ -1159,7 +1160,7 @@ pub fn collect_export_summary(conn: &Connection, frame_set_id: i64) -> Result<Ex
     println!("  Built {} filter groups", filter_groups.len());
 
     // Build folder preview
-    let folder_preview = build_folder_preview(&export_data)?;
+    let folder_preview = build_folder_preview(&export_data, config)?;
 
     // Build detailed warnings
     let warnings = build_detailed_warnings(&export_data, &filter_groups)?;
@@ -1495,8 +1496,11 @@ fn build_calibration_chain_string(subgroup: Option<&CalibrationSubgroup>) -> Str
     }
 }
 
-/// Build folder preview structure
-fn build_folder_preview(export_data: &ExportData) -> Result<FolderPreview> {
+/// Build folder preview structure matching the new WBPP hierarchy
+///
+/// The preview mirrors the actual export: BIAS → DARKS → FLAT → lights nesting,
+/// with missing calibration levels collapsed.
+fn build_folder_preview(export_data: &ExportData, _config: &WbppExportConfig) -> Result<FolderPreview> {
     use crate::export::models::sanitize_folder_name;
 
     let root_name = export_data
@@ -1509,268 +1513,224 @@ fn build_folder_preview(export_data: &ExportData) -> Result<FolderPreview> {
     let mut total_files = 0;
 
     // Group by camera
-    let mut cameras_map: HashMap<String, Vec<&ExportGroup>> = HashMap::new();
+    let mut cameras_map: HashMap<String, Vec<(&ExportGroup, &CalibrationSubgroup)>> = HashMap::new();
     for group in &export_data.groups {
-        // Get camera name from first frame
-        let camera_name = group
-            .subgroups
-            .first()
-            .and_then(|sg| sg.frames.first())
-            .and_then(|f| f.instrume.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        cameras_map.entry(camera_name).or_default().push(group);
+        for subgroup in &group.subgroups {
+            let camera_name = subgroup
+                .frames
+                .first()
+                .and_then(|f| f.instrume.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            cameras_map.entry(camera_name).or_default().push((group, subgroup));
+        }
     }
 
-    for (camera, groups) in &cameras_map {
+    for (camera, group_subgroups) in &cameras_map {
         let camera_folder_name = format!("camera_{}", sanitize_folder_name(camera));
+
+        // Track organized set IDs to avoid counting duplicates across subgroups
+        let mut counted_sets: HashSet<i64> = HashSet::new();
+
+        // Build the camera's children by processing each subgroup
+        // Each subgroup creates its own nested hierarchy path
         let mut camera_children: Vec<FolderNode> = Vec::new();
 
-        // Track calibration files for darks folder (use HashSet to avoid counting duplicates)
-        let mut counted_bias_sets: HashSet<i64> = HashSet::new();
-        let mut counted_dark_sets: HashSet<i64> = HashSet::new();
-        let mut counted_darkflat_sets: HashSet<i64> = HashSet::new();
+        for (_group, subgroup) in group_subgroups {
+            // Resolve calibration sets (same logic as file_organizer)
+            let bias: Option<&CalibrationSetInfo> = subgroup
+                .bias
+                .as_ref()
+                .or_else(|| subgroup.dark.as_ref().and_then(|d| d.bias.as_deref()));
+            let dark: Option<&CalibrationSetInfo> = subgroup.dark.as_ref();
+            let flat: Option<&CalibrationSetInfo> = subgroup.flat.as_ref();
+            let dark_flat: Option<&CalibrationSetInfo> =
+                flat.and_then(|f| f.dark_flat.as_deref());
+            let flat_dark: Option<&CalibrationSetInfo> =
+                flat.and_then(|f| f.dark.as_deref());
+            let flat_bias: Option<&CalibrationSetInfo> =
+                flat.and_then(|f| f.bias.as_deref());
 
-        let mut darks_count = 0;
-        let mut bias_count = 0;
-        let mut darkflat_count = 0;
+            // Build nested tree from outermost to innermost
+            // We construct the tree bottom-up, then attach it to camera_children
 
-        // Track example filenames for calibrations
-        let mut first_bias_filename: Option<String> = None;
-        let mut first_dark_filename: Option<String> = None;
-        let mut first_darkflat_filename: Option<String> = None;
-
-        for group in groups {
-            let filter_name = group.filter.clone().unwrap_or_else(|| "luminance".to_string());
-            let filter_folder_name = format!("flats_{}", sanitize_folder_name(&filter_name));
-            let mut filter_children: Vec<FolderNode> = Vec::new();
-
-            // Count and collect flats (track by set_id to avoid duplicates)
-            let mut counted_flat_sets: HashSet<i64> = HashSet::new();
-            let mut flat_count = 0;
-            let mut first_flat_filename: Option<String> = None;
-
-            for subgroup in &group.subgroups {
-                if let Some(ref flat) = subgroup.flat {
-                    // Only count if we haven't seen this flat set yet
-                    if counted_flat_sets.insert(flat.set_id) {
-                        flat_count += flat.frame_count;
-
-                        // Get first flat filename
-                        if first_flat_filename.is_none() {
-                            first_flat_filename = flat.frames.first().map(|f| f.filename.clone());
-                        }
-                    }
-
-                    // Count and collect sub-calibrations (only if not already counted)
-                    if let Some(ref dark_flat) = flat.dark_flat {
-                        if counted_darkflat_sets.insert(dark_flat.set_id) {
-                            darkflat_count += dark_flat.frame_count;
-                            if first_darkflat_filename.is_none() {
-                                first_darkflat_filename = dark_flat.frames.first().map(|f| f.filename.clone());
-                            }
-                        }
-                    }
-                    if let Some(ref dark) = flat.dark {
-                        if counted_dark_sets.insert(dark.set_id) {
-                            darks_count += dark.frame_count;
-                            if first_dark_filename.is_none() {
-                                first_dark_filename = dark.frames.first().map(|f| f.filename.clone());
-                            }
-                        }
-                        if let Some(ref bias) = dark.bias {
-                            if counted_bias_sets.insert(bias.set_id) {
-                                bias_count += bias.frame_count;
-                                if first_bias_filename.is_none() {
-                                    first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
-                                }
-                            }
-                        }
-                    }
-                    if let Some(ref bias) = flat.bias {
-                        if counted_bias_sets.insert(bias.set_id) {
-                            bias_count += bias.frame_count;
-                            if first_bias_filename.is_none() {
-                                first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
-                            }
-                        }
-                    }
-                }
-
-                // Count darks and bias for lights (only if not already counted)
-                if let Some(ref dark) = subgroup.dark {
-                    if counted_dark_sets.insert(dark.set_id) {
-                        darks_count += dark.frame_count;
-                        if first_dark_filename.is_none() {
-                            first_dark_filename = dark.frames.first().map(|f| f.filename.clone());
-                        }
-                    }
-                    if let Some(ref bias) = dark.bias {
-                        if counted_bias_sets.insert(bias.set_id) {
-                            bias_count += bias.frame_count;
-                            if first_bias_filename.is_none() {
-                                first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
-                            }
-                        }
-                    }
-                }
-                if let Some(ref bias) = subgroup.bias {
-                    if counted_bias_sets.insert(bias.set_id) {
-                        bias_count += bias.frame_count;
-                        if first_bias_filename.is_none() {
-                            first_bias_filename = bias.frames.first().map(|f| f.filename.clone());
-                        }
-                    }
-                }
-            }
-
-            // Add flat file examples using actual filename
-            if flat_count > 0 {
-                let flat_example = first_flat_filename.unwrap_or_else(|| "flat_001.fits".to_string());
-                filter_children.push(FolderNode {
-                    name: flat_example,
-                    node_type: FolderNodeType::File,
-                    file_count: None,
-                    description: None,
-                    children: vec![],
-                });
-                if flat_count > 1 {
-                    filter_children.push(FolderNode {
-                        name: format!("... {} more flat frames", flat_count - 1),
-                        node_type: FolderNodeType::Ellipsis,
-                        file_count: Some(flat_count),
-                        description: None,
-                        children: vec![],
-                    });
-                }
-            }
-
-            // Lights subfolder
-            let lights_count = group.total_frames;
-            let mut lights_children: Vec<FolderNode> = Vec::new();
-
-            // Add light file examples
-            let example_filename = group
-                .subgroups
+            // Lights node (innermost)
+            let lights_count = subgroup.frames.len() as i32;
+            let example_light = subgroup
+                .frames
                 .first()
-                .and_then(|sg| sg.frames.first())
                 .map(|f| f.filename.clone())
                 .unwrap_or_else(|| "light_001.fits".to_string());
-
-            lights_children.push(FolderNode {
-                name: example_filename,
-                node_type: FolderNodeType::File,
-                file_count: None,
-                description: None,
-                children: vec![],
-            });
+            let mut lights_children = vec![make_file_node(&example_light)];
             if lights_count > 1 {
-                lights_children.push(FolderNode {
-                    name: format!("... {} more light frames", lights_count - 1),
-                    node_type: FolderNodeType::Ellipsis,
-                    file_count: Some(lights_count),
-                    description: None,
-                    children: vec![],
-                });
+                lights_children.push(make_ellipsis_node("light", lights_count));
             }
+            total_files += lights_count;
 
-            filter_children.push(FolderNode {
+            let lights_node = FolderNode {
                 name: "lights".to_string(),
                 node_type: FolderNodeType::Folder,
                 file_count: Some(lights_count),
                 description: Some(format!("← {} lights", lights_count)),
                 children: lights_children,
-            });
+            };
 
-            total_files += lights_count + flat_count;
+            // Current innermost content starts with lights
+            let mut innermost_content = vec![lights_node];
 
-            camera_children.push(FolderNode {
-                name: filter_folder_name,
-                node_type: FolderNodeType::Folder,
-                file_count: Some(flat_count + lights_count),
-                description: Some(format!("← {} flats + lights", flat_count)),
-                children: filter_children,
-            });
-        }
+            // FLAT level
+            if let Some(flat_info) = flat {
+                let flat_folder = format!("FLAT_{}", flat_info.set_id);
+                let mut flat_children: Vec<FolderNode> = Vec::new();
 
-        // Add darks folder if we have calibration files
-        let total_calibrations = darks_count + bias_count + darkflat_count;
-        if total_calibrations > 0 {
-            let mut darks_children: Vec<FolderNode> = Vec::new();
-
-            if bias_count > 0 {
-                let bias_example = first_bias_filename.unwrap_or_else(|| "bias_001.fits".to_string());
-                darks_children.push(FolderNode {
-                    name: bias_example,
-                    node_type: FolderNodeType::File,
-                    file_count: None,
-                    description: None,
-                    children: vec![],
-                });
-                if bias_count > 1 {
-                    darks_children.push(FolderNode {
-                        name: format!("... {} more bias frames", bias_count - 1),
-                        node_type: FolderNodeType::Ellipsis,
-                        file_count: Some(bias_count),
-                        description: None,
-                        children: vec![],
-                    });
+                if counted_sets.insert(flat_info.set_id) {
+                    let fc = flat_info.frame_count;
+                    if fc > 0 {
+                        let example = flat_info.frames.first().map(|f| f.filename.clone())
+                            .unwrap_or_else(|| "flat_001.fits".to_string());
+                        flat_children.push(make_file_node(&example));
+                        if fc > 1 {
+                            flat_children.push(make_ellipsis_node("flat", fc));
+                        }
+                        total_files += fc;
+                    }
                 }
-            }
-            if darks_count > 0 {
-                let dark_example = first_dark_filename.unwrap_or_else(|| "dark_001.fits".to_string());
-                darks_children.push(FolderNode {
-                    name: dark_example,
-                    node_type: FolderNodeType::File,
-                    file_count: None,
-                    description: None,
-                    children: vec![],
-                });
-                if darks_count > 1 {
-                    darks_children.push(FolderNode {
-                        name: format!("... {} more dark frames", darks_count - 1),
-                        node_type: FolderNodeType::Ellipsis,
-                        file_count: Some(darks_count),
-                        description: None,
-                        children: vec![],
-                    });
-                }
-            }
-            if darkflat_count > 0 {
-                let darkflat_example = first_darkflat_filename.unwrap_or_else(|| "darkflat_001.fits".to_string());
-                darks_children.push(FolderNode {
-                    name: darkflat_example,
-                    node_type: FolderNodeType::File,
-                    file_count: None,
-                    description: None,
-                    children: vec![],
-                });
-                if darkflat_count > 1 {
-                    darks_children.push(FolderNode {
-                        name: format!("... {} more darkflat frames", darkflat_count - 1),
-                        node_type: FolderNodeType::Ellipsis,
-                        file_count: Some(darkflat_count),
-                        description: None,
-                        children: vec![],
-                    });
-                }
-            }
 
-            camera_children.insert(
-                0,
-                FolderNode {
-                    name: "darks".to_string(),
+                flat_children.extend(innermost_content);
+
+                innermost_content = vec![FolderNode {
+                    name: flat_folder,
                     node_type: FolderNodeType::Folder,
-                    file_count: Some(total_calibrations),
-                    description: Some(format!(
-                        "← {} darks, {} bias",
-                        darks_count + darkflat_count,
-                        bias_count
-                    )),
-                    children: darks_children,
-                },
-            );
+                    file_count: None,
+                    description: Some(format!("← {} flats", flat_info.frame_count)),
+                    children: flat_children,
+                }];
+            }
 
-            total_files += total_calibrations;
+            // DARKS level
+            let has_darks = dark.is_some() || dark_flat.is_some() || flat_dark.is_some();
+            if has_darks {
+                let darks_set_id = dark
+                    .map(|d| d.set_id)
+                    .or_else(|| flat_dark.map(|d| d.set_id))
+                    .or_else(|| dark_flat.map(|df| df.set_id))
+                    .unwrap_or(0);
+                let darks_folder = format!("DARKS_{}", darks_set_id);
+                let mut darks_children: Vec<FolderNode> = Vec::new();
+
+                // Dark frames
+                if let Some(dark_info) = dark {
+                    if counted_sets.insert(dark_info.set_id) {
+                        let dc = dark_info.frame_count;
+                        if dc > 0 {
+                            let example = dark_info.frames.first().map(|f| f.filename.clone())
+                                .unwrap_or_else(|| "dark_001.fits".to_string());
+                            darks_children.push(make_file_node(&example));
+                            if dc > 1 {
+                                darks_children.push(make_ellipsis_node("dark", dc));
+                            }
+                            total_files += dc;
+                        }
+                    }
+                }
+
+                // Flat's own dark
+                if let Some(fd) = flat_dark {
+                    if counted_sets.insert(fd.set_id) {
+                        let fdc = fd.frame_count;
+                        if fdc > 0 {
+                            let example = fd.frames.first().map(|f| f.filename.clone())
+                                .unwrap_or_else(|| "dark_001.fits".to_string());
+                            darks_children.push(make_file_node(&example));
+                            if fdc > 1 {
+                                darks_children.push(make_ellipsis_node("dark", fdc));
+                            }
+                            total_files += fdc;
+                        }
+                    }
+                }
+
+                // Darkflat frames
+                if let Some(df_info) = dark_flat {
+                    if counted_sets.insert(df_info.set_id) {
+                        let dfc = df_info.frame_count;
+                        if dfc > 0 {
+                            let example = df_info.frames.first().map(|f| f.filename.clone())
+                                .unwrap_or_else(|| "darkflat_001.fits".to_string());
+                            darks_children.push(make_file_node(&example));
+                            if dfc > 1 {
+                                darks_children.push(make_ellipsis_node("darkflat", dfc));
+                            }
+                            total_files += dfc;
+                        }
+                    }
+                }
+
+                darks_children.extend(innermost_content);
+
+                let mut darks_desc_parts = Vec::new();
+                if let Some(d) = dark { darks_desc_parts.push(format!("{} darks", d.frame_count)); }
+                if let Some(df) = dark_flat { darks_desc_parts.push(format!("{} darkflats", df.frame_count)); }
+
+                innermost_content = vec![FolderNode {
+                    name: darks_folder,
+                    node_type: FolderNodeType::Folder,
+                    file_count: None,
+                    description: Some(format!("← {}", darks_desc_parts.join(", "))),
+                    children: darks_children,
+                }];
+            }
+
+            // BIAS level
+            let effective_bias = bias.or(flat_bias);
+            if let Some(bias_info) = effective_bias {
+                let bias_folder = format!("BIAS_{}", bias_info.set_id);
+                let mut bias_children: Vec<FolderNode> = Vec::new();
+
+                if counted_sets.insert(bias_info.set_id) {
+                    let bc = bias_info.frame_count;
+                    if bc > 0 {
+                        let example = bias_info.frames.first().map(|f| f.filename.clone())
+                            .unwrap_or_else(|| "bias_001.fits".to_string());
+                        bias_children.push(make_file_node(&example));
+                        if bc > 1 {
+                            bias_children.push(make_ellipsis_node("bias", bc));
+                        }
+                        total_files += bc;
+                    }
+                }
+
+                // Also count flat's own bias if different
+                if let (Some(fb), Some(b)) = (flat_bias, bias) {
+                    if fb.set_id != b.set_id && counted_sets.insert(fb.set_id) {
+                        let fbc = fb.frame_count;
+                        if fbc > 0 {
+                            total_files += fbc;
+                        }
+                    }
+                }
+
+                bias_children.extend(innermost_content);
+
+                innermost_content = vec![FolderNode {
+                    name: bias_folder,
+                    node_type: FolderNodeType::Folder,
+                    file_count: None,
+                    description: Some(format!("← {} bias", bias_info.frame_count)),
+                    children: bias_children,
+                }];
+            }
+
+            // Add the built hierarchy to camera children
+            // Check if we already have a node with the same name to merge subgroups
+            // that share the same calibration path into one tree
+            for node in innermost_content {
+                if let Some(existing) = camera_children.iter_mut().find(|n| n.name == node.name) {
+                    // Merge children into existing node
+                    merge_folder_children(existing, node);
+                } else {
+                    camera_children.push(node);
+                }
+            }
         }
 
         root_children.push(FolderNode {
@@ -1788,6 +1748,43 @@ fn build_folder_preview(export_data: &ExportData) -> Result<FolderPreview> {
         total_files,
         estimated_size: format_bytes_human(0), // Will be calculated separately
     })
+}
+
+/// Create a file node for folder preview
+fn make_file_node(filename: &str) -> FolderNode {
+    FolderNode {
+        name: filename.to_string(),
+        node_type: FolderNodeType::File,
+        file_count: None,
+        description: None,
+        children: vec![],
+    }
+}
+
+/// Create an ellipsis node showing "... N more X frames"
+fn make_ellipsis_node(frame_type: &str, total_count: i32) -> FolderNode {
+    FolderNode {
+        name: format!("... {} more {} frames", total_count - 1, frame_type),
+        node_type: FolderNodeType::Ellipsis,
+        file_count: Some(total_count),
+        description: None,
+        children: vec![],
+    }
+}
+
+/// Merge children from source node into target node (for combining subgroups)
+fn merge_folder_children(target: &mut FolderNode, source: FolderNode) {
+    for child in source.children {
+        if child.node_type == FolderNodeType::Folder {
+            // Try to merge with existing folder of same name
+            if let Some(existing) = target.children.iter_mut().find(|n| n.name == child.name && n.node_type == FolderNodeType::Folder) {
+                merge_folder_children(existing, child);
+            } else {
+                target.children.push(child);
+            }
+        }
+        // Skip file/ellipsis nodes during merge to avoid duplicates
+    }
 }
 
 /// Build detailed warnings from export data

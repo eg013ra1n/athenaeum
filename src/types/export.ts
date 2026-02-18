@@ -420,3 +420,37 @@ export type WarningType =
  * Warning severity levels
  */
 export type WarningSeverity = 'info' | 'warning' | 'error';
+
+// ============================================================================
+// WBPP Export Configuration
+// ============================================================================
+
+/**
+ * Configuration for WBPP export folder hierarchy
+ */
+export interface WbppExportConfig {
+  /** Keyword nesting order (outermost first). Default: ["CAMERA", "BIAS", "DARKS", "FLAT"] */
+  keywordOrder: string[];
+}
+
+/**
+ * Setup instructions for configuring WBPP grouping keywords
+ */
+export interface WbppSetupInstructions {
+  /** Ordered list of keywords to configure in WBPP */
+  keywords: WbppKeywordInstruction[];
+  /** Example folder structure matching the current config */
+  exampleStructure: string;
+}
+
+/**
+ * A single WBPP keyword instruction
+ */
+export interface WbppKeywordInstruction {
+  /** The WBPP grouping keyword name */
+  keyword: string;
+  /** Whether "Pre" should be checked for this keyword */
+  preChecked: boolean;
+  /** Description of what this keyword controls */
+  description: string;
+}

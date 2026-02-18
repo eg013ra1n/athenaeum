@@ -7,11 +7,90 @@ use crate::export::{
     collect_export_data, collect_export_summary, organize_files_wbpp,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
-        ExportData, ExportResult, ExportSummary,
+        ExportData, ExportResult, ExportSummary, WbppExportConfig,
     },
 };
 use std::path::PathBuf;
 use tauri::State;
+
+const WBPP_CONFIG_KEY: &str = "export.wbpp_config";
+
+// ============================================================================
+// WBPP Export Config Commands
+// ============================================================================
+
+/// Get WBPP export configuration (returns default if not set)
+#[tauri::command]
+pub async fn get_wbpp_export_config(
+    state: State<'_, AppState>,
+) -> Result<WbppExportConfig, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    load_wbpp_config(&conn)
+}
+
+/// Save WBPP export configuration to database
+#[tauri::command]
+pub async fn set_wbpp_export_config(
+    state: State<'_, AppState>,
+    config: WbppExportConfig,
+) -> Result<WbppExportConfig, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        rusqlite::params![WBPP_CONFIG_KEY, json],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(config)
+}
+
+/// Reset WBPP export configuration to defaults
+#[tauri::command]
+pub async fn reset_wbpp_export_config(
+    state: State<'_, AppState>,
+) -> Result<WbppExportConfig, String> {
+    let state_lock = state.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        rusqlite::params![WBPP_CONFIG_KEY],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(WbppExportConfig::default())
+}
+
+/// Load WBPP config from DB or return default
+fn load_wbpp_config(conn: &rusqlite::Connection) -> Result<WbppExportConfig, String> {
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![WBPP_CONFIG_KEY],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match result {
+        Some(json) => serde_json::from_str(&json).map_err(|e| {
+            eprintln!("Failed to parse WBPP config, using default: {}", e);
+            e.to_string()
+        }),
+        None => Ok(WbppExportConfig::default()),
+    }
+}
+
+// ============================================================================
+// Export Preview & Data Commands
+// ============================================================================
 
 /// Get export preview data for a frame set
 ///
@@ -347,18 +426,20 @@ pub async fn export_to_wbpp(
     output_dir: String,
     use_symlinks: bool,
 ) -> Result<ExportResult, String> {
-    // Collect export data
-    let export_data = {
+    // Collect export data and config
+    let (export_data, config) = {
         let state_lock = state.db.lock().unwrap();
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
-        collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?
+        let data = collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?;
+        let cfg = load_wbpp_config(&conn).unwrap_or_default();
+        (data, cfg)
     };
 
     let output_path = PathBuf::from(&output_dir);
 
     // Organize files into WBPP structure
-    match organize_files_wbpp(&output_path, &export_data, use_symlinks) {
+    match organize_files_wbpp(&output_path, &export_data, use_symlinks, &config) {
         Ok(org_result) => Ok(ExportResult {
             success: true,
             output_dir,
@@ -394,6 +475,7 @@ pub async fn get_export_summary(
     let state_lock = state.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
+    let config = load_wbpp_config(&conn).unwrap_or_default();
 
-    collect_export_summary(&conn, frame_set_id).map_err(|e| e.to_string())
+    collect_export_summary(&conn, frame_set_id, &config).map_err(|e| e.to_string())
 }

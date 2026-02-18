@@ -604,6 +604,7 @@ pub async fn get_calibration_matching_config(
     match config_json {
         Some(json) => {
             crate::calibration::CalibrationMatchingConfig::from_json(&json)
+                .map(|c| c.migrate())
                 .map_err(|e| format!("Failed to parse calibration config: {}", e))
         }
         None => {

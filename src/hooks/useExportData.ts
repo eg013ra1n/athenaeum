@@ -5,6 +5,7 @@ import type {
   ExportableFrameSet,
   CalibrationRoute,
   ExportSummary,
+  WbppExportConfig,
 } from '../types/export';
 
 interface UseExportDataResult {
@@ -172,4 +173,61 @@ export function useExportSummary(frameSetId: number | null): UseExportSummaryRes
   }, [loadData]);
 
   return { summary, loading, error, refresh: loadData };
+}
+
+interface UseWbppConfigResult {
+  config: WbppExportConfig | null;
+  loading: boolean;
+  error: string | null;
+  save: (config: WbppExportConfig) => Promise<void>;
+  reset: () => Promise<void>;
+  refresh: () => void;
+}
+
+/**
+ * Hook to manage WBPP export configuration
+ */
+export function useWbppConfig(): UseWbppConfigResult {
+  const [config, setConfig] = useState<WbppExportConfig | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadData = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      const result = await invoke<WbppExportConfig>('get_wbpp_export_config');
+      setConfig(result);
+    } catch (err) {
+      setError(err as string);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  const save = useCallback(async (newConfig: WbppExportConfig) => {
+    try {
+      setError(null);
+      const result = await invoke<WbppExportConfig>('set_wbpp_export_config', { config: newConfig });
+      setConfig(result);
+    } catch (err) {
+      setError(err as string);
+    }
+  }, []);
+
+  const reset = useCallback(async () => {
+    try {
+      setError(null);
+      const result = await invoke<WbppExportConfig>('reset_wbpp_export_config');
+      setConfig(result);
+    } catch (err) {
+      setError(err as string);
+    }
+  }, []);
+
+  return { config, loading, error, save, reset, refresh: loadData };
 }

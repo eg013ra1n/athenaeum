@@ -119,7 +119,7 @@ export default function BlackHole() {
 
   // Get folder path from full file path
   function getFolderPath(fullPath: string): string {
-    const lastSlash = fullPath.lastIndexOf('/');
+    const lastSlash = Math.max(fullPath.lastIndexOf('/'), fullPath.lastIndexOf('\\'));
     return lastSlash > 0 ? fullPath.substring(0, lastSlash) : fullPath;
   }
 
@@ -306,64 +306,66 @@ export default function BlackHole() {
             <h2 className="text-3xl font-bold">Black Hole</h2>
             <p className="text-content-muted mt-1">
               {entries.length} file{entries.length !== 1 ? 's' : ''} • {formatSize(totalSize)} total
+              {selectionCount > 0 && (
+                <span className="text-warning ml-2">• {selectionCount} selected</span>
+              )}
             </p>
           </div>
 
-          {/* Filter */}
-          <div className="flex items-center gap-3">
-            <Filter size={20} className="text-content-muted" />
-            <select
-              value={filter || ''}
-              onChange={(e) => setFilter(e.target.value || null)}
-              className="bg-surface-elevated border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            >
-              <option value="">All sources</option>
-              {sources.map(source => (
-                <option key={source} value={source}>
-                  {source}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-      </div>
-
-      {/* Selection Toolbar - appears when items selected */}
-      {selectionCount > 0 && (
-        <div className="mb-4 flex-shrink-0 bg-surface-elevated border border-border rounded-lg p-3 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <span className="text-warning font-medium">
-              {selectionCount} selected
-            </span>
-          </div>
           <div className="flex items-center gap-2">
+            {/* Action Buttons */}
             <button
-              onClick={handleRestoreSelected}
-              disabled={progress !== null}
-              className="flex items-center gap-2 px-3 py-1.5 bg-success hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+              onClick={handleSelectAll}
+              disabled={entries.length === 0 || progress !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
-              <RotateCcw size={16} />
-              Restore Selected
-            </button>
-            <button
-              onClick={handleVoidSelected}
-              disabled={progress !== null}
-              className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-            >
-              <Trash2 size={16} />
-              Send to Void
+              <CheckSquare size={16} />
+              Select All
             </button>
             <button
               onClick={handleClearSelection}
-              disabled={progress !== null}
-              className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+              disabled={selectionCount === 0 || progress !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <XSquare size={16} />
               Clear
             </button>
+            <button
+              onClick={handleRestoreSelected}
+              disabled={selectionCount === 0 || progress !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-success hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+            >
+              <RotateCcw size={16} />
+              Restore
+            </button>
+            <button
+              onClick={handleVoidSelected}
+              disabled={selectionCount === 0 || progress !== null}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-error hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+            >
+              <Trash2 size={16} />
+              Send to Void
+            </button>
+
+            {/* Filter */}
+            <div className="flex items-center gap-2 ml-2 pl-2 border-l border-border">
+              <Filter size={20} className="text-content-muted" />
+              <select
+                value={filter || ''}
+                onChange={(e) => setFilter(e.target.value || null)}
+                className="bg-surface-elevated border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+              >
+                <option value="">All sources</option>
+                {sources.map(source => (
+                  <option key={source} value={source}>
+                    {source}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         </div>
-      )}
+      </div>
 
       {/* Progress indicator */}
       {progress && (

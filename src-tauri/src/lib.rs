@@ -201,6 +201,9 @@ pub fn run() {
             commands::get_custom_metadata_set_ids,
             commands::get_calibration_set_originals,
             // Export commands
+            commands::get_wbpp_export_config,
+            commands::set_wbpp_export_config,
+            commands::reset_wbpp_export_config,
             commands::get_export_preview,
             commands::get_exportable_frame_sets,
             commands::get_calibration_route,

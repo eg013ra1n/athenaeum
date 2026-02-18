@@ -184,25 +184,25 @@ pub fn check_calibration_match(
     let mut warnings = Vec::new();
     let mut all_match = true;
 
-    // Check instrume (always exact, locked)
+    // Check instrume
     let result = check_string_param(&frame.instrume, set_instrume, &config.instrume, "instrume");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check binning (always exact, locked)
+    // Check binning
     let result = check_string_param(&frame.binning, set_binning, &config.binning, "binning");
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check gain (always exact, locked, tolerance: 0.01)
+    // Check gain (tolerance: 0.01)
     let result = check_float_param(frame.gain, set_gain, &config.gain, "gain", 0.01);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
     if let Some(msg) = result.warning_message { warnings.push(msg); }
 
-    // Check offset (always exact, locked, tolerance: 0.01)
+    // Check offset (tolerance: 0.01)
     let result = check_float_param(frame.offset, set_offset, &config.offset, "offset", 0.01);
     if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
     if !result.matches { all_match = false; }
@@ -588,7 +588,7 @@ pub fn load_config(conn: &Connection) -> CalibrationMatchingConfig {
     match result {
         Ok(json) => {
             match CalibrationMatchingConfig::from_json(&json) {
-                Ok(config) => config,
+                Ok(config) => config.migrate(),
                 Err(e) => {
                     eprintln!("Failed to parse calibration config, using defaults: {}", e);
                     CalibrationMatchingConfig::default()
