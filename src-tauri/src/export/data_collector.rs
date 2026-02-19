@@ -1501,13 +1501,9 @@ fn build_calibration_chain_string(subgroup: Option<&CalibrationSubgroup>) -> Str
 /// The preview mirrors the actual export: BIAS → DARKS → FLAT → lights nesting,
 /// with missing calibration levels collapsed.
 fn build_folder_preview(export_data: &ExportData, _config: &WbppExportConfig) -> Result<FolderPreview> {
-    use crate::export::models::sanitize_folder_name;
+    use crate::export::models::{sanitize_display_folder_name, sanitize_folder_name};
 
-    let root_name = export_data
-        .object_name
-        .clone()
-        .unwrap_or_else(|| export_data.frame_set_name.clone());
-    let root_name = format!("{}_Export", sanitize_folder_name(&root_name));
+    let root_name = sanitize_display_folder_name(&export_data.frame_set_name);
 
     let mut root_children: Vec<FolderNode> = Vec::new();
     let mut total_files = 0;

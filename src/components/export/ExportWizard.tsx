@@ -21,8 +21,8 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
   const { config: wbppConfig } = useWbppConfig();
-  const { startExport, isExporting } = useExportProgressContext();
-  const exporting = selectedFrameSetId !== null && isExporting(selectedFrameSetId);
+  const { startExport, hasActiveExports } = useExportProgressContext();
+  const exporting = hasActiveExports;
 
   // Build dynamic WBPP keyword instructions from config
   const keywordDescriptions: Record<string, string> = useMemo(() => ({

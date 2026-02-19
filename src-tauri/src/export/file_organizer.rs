@@ -22,8 +22,8 @@
 //! Missing calibration levels are simply omitted (collapsed).
 
 use crate::export::models::{
-    sanitize_folder_name, CalibrationSetInfo, CalibrationSubgroup, ExportData,
-    ExportProgressEvent, WbppExportConfig,
+    sanitize_display_folder_name, sanitize_folder_name, CalibrationSetInfo, CalibrationSubgroup,
+    ExportData, ExportProgressEvent, WbppExportConfig,
 };
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -121,6 +121,10 @@ pub fn organize_files_wbpp(
     let mut files_organized = 0;
     let mut warnings = Vec::new();
     let mut organized_set_ids: HashSet<i64> = HashSet::new();
+
+    // Create parent directory named after the frame set
+    let object_dir = output_dir.join(sanitize_display_folder_name(&data.frame_set_name));
+    let output_dir = object_dir.as_path();
 
     let total_files = count_total_files(data);
     let mut last_emit = Instant::now();

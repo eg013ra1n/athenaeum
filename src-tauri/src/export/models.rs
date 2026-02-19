@@ -223,8 +223,8 @@ pub struct MasterInfo {
     pub source_exptime: Option<f64>,
 }
 
-/// Sanitize a name for use in folder paths
-/// Strips spaces and special characters, keeping only alphanumerics
+/// Sanitize a technical name (e.g. instrument) for use in folder paths.
+/// Strips spaces and special characters, keeping only lowercase alphanumerics.
 /// e.g. "ZWO 2600MM Pro" → "zwo2600mmpro"
 pub fn sanitize_folder_name(name: &str) -> String {
     name.trim()
@@ -232,6 +232,39 @@ pub fn sanitize_folder_name(name: &str) -> String {
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect()
+}
+
+/// Sanitize a human-readable name for use as a folder name.
+/// Preserves spaces, letters, digits, hyphens, underscores, dots, and parentheses.
+/// Replaces filesystem-unsafe characters (: / \ * ? " < > |) with underscores,
+/// then collapses consecutive underscores.
+/// e.g. "Unknown @ RA=21:48:10.0, Dec=+47:17:35.5" → "Unknown @ RA=21_48_10.0, Dec=+47_17_35.5"
+pub fn sanitize_display_folder_name(name: &str) -> String {
+    let sanitized: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            match c {
+                ':' | '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                _ => c,
+            }
+        })
+        .collect();
+    // Collapse consecutive underscores
+    let mut result = String::with_capacity(sanitized.len());
+    let mut prev_underscore = false;
+    for c in sanitized.chars() {
+        if c == '_' {
+            if !prev_underscore {
+                result.push(c);
+            }
+            prev_underscore = true;
+        } else {
+            result.push(c);
+            prev_underscore = false;
+        }
+    }
+    result
 }
 
 // ============================================================================
