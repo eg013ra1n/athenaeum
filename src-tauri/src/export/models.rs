@@ -224,17 +224,14 @@ pub struct MasterInfo {
 }
 
 /// Sanitize a name for use in folder paths
-/// Replaces spaces and special characters with underscores
+/// Strips spaces and special characters, keeping only alphanumerics
+/// e.g. "ZWO 2600MM Pro" → "zwo2600mmpro"
 pub fn sanitize_folder_name(name: &str) -> String {
     name.trim()
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
-        .collect::<String>()
-        .split('_')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
 // ============================================================================
@@ -309,6 +306,37 @@ pub struct CalibrationRouteSummary {
     pub bias_complete: bool,
     /// Overall warnings
     pub warnings: Vec<String>,
+}
+
+// ============================================================================
+// Export Progress Events (Tauri event payloads)
+// ============================================================================
+
+/// Progress event emitted during export file organization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgressEvent {
+    pub frame_set_id: i64,
+    /// Files copied so far
+    pub current: usize,
+    /// Total files to copy
+    pub total: usize,
+    pub percent: f64,
+    pub current_file: Option<String>,
+    /// "collecting" | "copying" | "complete"
+    pub phase: String,
+}
+
+/// Event emitted when export finishes (success or failure)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportCompleteEvent {
+    pub frame_set_id: i64,
+    pub success: bool,
+    pub files_organized: i32,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+    pub output_dir: String,
 }
 
 // ============================================================================

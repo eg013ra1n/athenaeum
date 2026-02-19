@@ -53,6 +53,7 @@ pub fn run() {
                 cache: Arc::new(Mutex::new(None)),
                 memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
                 active_scans: Arc::new(Mutex::new(HashMap::new())),
+                active_exports: Arc::new(Mutex::new(HashMap::new())),
                 image_pool: Arc::new(
                     rayon::ThreadPoolBuilder::new()
                         .num_threads(max_threads)
@@ -208,6 +209,7 @@ pub fn run() {
             commands::get_exportable_frame_sets,
             commands::get_calibration_route,
             commands::export_to_wbpp,
+            commands::cancel_export,
             commands::get_export_summary,
             commands::get_log_path,
             commands::get_database_path,

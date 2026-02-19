@@ -17,6 +17,11 @@ pub struct ScanHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
+/// Handle to track an active export operation
+pub struct ExportHandle {
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
 /// App state containing database connection, settings manager, cache manager, and active scans
 pub struct AppState {
     pub db: Mutex<Option<Database>>,
@@ -24,6 +29,7 @@ pub struct AppState {
     pub cache: Arc<Mutex<Option<Arc<CacheManager>>>>,
     pub memory_cache: Arc<Mutex<MemoryImageCache>>,
     pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
+    pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
     /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
     /// can be swapped at runtime when the user changes blink.threads.

@@ -2,16 +2,19 @@
 //!
 //! Commands for exporting frame sets to PixInsight WBPP folder structure.
 
-use crate::commands::AppState;
+use crate::commands::{AppState, ExportHandle};
 use crate::export::{
     collect_export_data, collect_export_summary, organize_files_wbpp,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
-        ExportData, ExportResult, ExportSummary, WbppExportConfig,
+        ExportCompleteEvent, ExportData, ExportProgressEvent, ExportResult, ExportSummary,
+        WbppExportConfig,
     },
 };
 use std::path::PathBuf;
-use tauri::State;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tauri::{Emitter, State};
 
 const WBPP_CONFIG_KEY: &str = "export.wbpp_config";
 
@@ -422,10 +425,33 @@ pub async fn get_calibration_route(
 #[tauri::command]
 pub async fn export_to_wbpp(
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
     frame_set_id: i64,
     output_dir: String,
     use_symlinks: bool,
 ) -> Result<ExportResult, String> {
+    // Create cancel flag and register export
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut exports = state.active_exports.lock().unwrap();
+        exports.insert(frame_set_id, ExportHandle {
+            cancel_flag: cancel_flag.clone(),
+        });
+    }
+
+    // Emit collecting phase
+    let _ = app_handle.emit(
+        "export-progress",
+        ExportProgressEvent {
+            frame_set_id,
+            current: 0,
+            total: 0,
+            percent: 0.0,
+            current_file: None,
+            phase: "collecting".to_string(),
+        },
+    );
+
     // Collect export data and config
     let (export_data, config) = {
         let state_lock = state.db.lock().unwrap();
@@ -438,24 +464,94 @@ pub async fn export_to_wbpp(
 
     let output_path = PathBuf::from(&output_dir);
 
-    // Organize files into WBPP structure
-    match organize_files_wbpp(&output_path, &export_data, use_symlinks, &config) {
-        Ok(org_result) => Ok(ExportResult {
-            success: true,
-            output_dir,
-            files_organized: org_result.files_organized,
-            scripts_generated: Vec::new(),
-            warnings: org_result.warnings,
-            error: None,
-        }),
-        Err(e) => Ok(ExportResult {
+    // Organize files into WBPP structure (with progress events + cancel support)
+    let cancelled = cancel_flag.load(Ordering::Relaxed);
+    let result = if cancelled {
+        ExportResult {
             success: false,
-            output_dir,
+            output_dir: output_dir.clone(),
             files_organized: 0,
             scripts_generated: Vec::new(),
             warnings: Vec::new(),
-            error: Some(format!("Failed to organize files: {}", e)),
-        }),
+            error: Some("Export cancelled".to_string()),
+        }
+    } else {
+        match organize_files_wbpp(
+            &output_path,
+            &export_data,
+            use_symlinks,
+            &config,
+            Some(&app_handle),
+            frame_set_id,
+            &cancel_flag,
+        ) {
+            Ok(org_result) => {
+                let was_cancelled = cancel_flag.load(Ordering::Relaxed);
+                if was_cancelled {
+                    ExportResult {
+                        success: false,
+                        output_dir: output_dir.clone(),
+                        files_organized: org_result.files_organized,
+                        scripts_generated: Vec::new(),
+                        warnings: org_result.warnings,
+                        error: Some("Export cancelled".to_string()),
+                    }
+                } else {
+                    ExportResult {
+                        success: true,
+                        output_dir: output_dir.clone(),
+                        files_organized: org_result.files_organized,
+                        scripts_generated: Vec::new(),
+                        warnings: org_result.warnings,
+                        error: None,
+                    }
+                }
+            },
+            Err(e) => ExportResult {
+                success: false,
+                output_dir: output_dir.clone(),
+                files_organized: 0,
+                scripts_generated: Vec::new(),
+                warnings: Vec::new(),
+                error: Some(format!("Failed to organize files: {}", e)),
+            },
+        }
+    };
+
+    // Unregister export
+    {
+        let mut exports = state.active_exports.lock().unwrap();
+        exports.remove(&frame_set_id);
+    }
+
+    // Emit completion event
+    let _ = app_handle.emit(
+        "export-complete",
+        ExportCompleteEvent {
+            frame_set_id,
+            success: result.success,
+            files_organized: result.files_organized,
+            warnings: result.warnings.clone(),
+            error: result.error.clone(),
+            output_dir: result.output_dir.clone(),
+        },
+    );
+
+    Ok(result)
+}
+
+/// Cancel an active export
+#[tauri::command]
+pub async fn cancel_export(
+    frame_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let exports = state.active_exports.lock().unwrap();
+    if let Some(handle) = exports.get(&frame_set_id) {
+        handle.cancel_flag.store(true, Ordering::SeqCst);
+        Ok(())
+    } else {
+        Err("No active export for this frame set".to_string())
     }
 }
 

@@ -1,11 +1,10 @@
 import { useState, useCallback, useMemo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { Folder, Loader2, Check, AlertCircle, Play, Layers } from 'lucide-react';
+import { Folder, Loader2, Play, Layers } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
 import { ExportSummary } from './ExportSummary';
 import { useExportableFrameSets, useWbppConfig } from '../../hooks/useExportData';
-import type { ExportResult } from '../../types/export';
+import { useExportProgressContext } from '../../contexts/ExportProgressContext';
 
 interface ExportWizardProps {
   initialFrameSetId?: number;
@@ -18,12 +17,12 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   );
   const [outputDir, setOutputDir] = useState<string>('');
   const [useSymlinks, setUseSymlinks] = useState(false);
-  const [exporting, setExporting] = useState(false);
-  const [result, setResult] = useState<ExportResult | null>(null);
 
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
   const { config: wbppConfig } = useWbppConfig();
+  const { startExport, isExporting } = useExportProgressContext();
+  const exporting = selectedFrameSetId !== null && isExporting(selectedFrameSetId);
 
   // Build dynamic WBPP keyword instructions from config
   const keywordDescriptions: Record<string, string> = useMemo(() => ({
@@ -93,33 +92,11 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
     }
   }, []);
 
-  // Handle export
+  // Handle export — delegates to global context (progress modal survives navigation)
   const handleExport = useCallback(async () => {
     if (!selectedFrameSetId || !outputDir) return;
-
-    setResult(null);
-    setExporting(true);
-
-    try {
-      const exportResult = await invoke<ExportResult>('export_to_wbpp', {
-        frameSetId: selectedFrameSetId,
-        outputDir,
-        useSymlinks,
-      });
-      setResult(exportResult);
-    } catch (error) {
-      setResult({
-        success: false,
-        outputDir,
-        filesOrganized: 0,
-        scriptsGenerated: [],
-        warnings: [],
-        error: String(error),
-      });
-    } finally {
-      setExporting(false);
-    }
-  }, [selectedFrameSetId, outputDir, useSymlinks]);
+    startExport(selectedFrameSetId, outputDir, useSymlinks);
+  }, [selectedFrameSetId, outputDir, useSymlinks, startExport]);
 
   // Check if ready to export
   const canExport =
@@ -208,7 +185,7 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
                     WBPP Setup Guide
                   </summary>
                   <div className="mt-3 space-y-3">
-                    <p>To enable automatic grouping in WBPP, add these <strong>Grouping Keywords</strong> (in order):</p>
+                    <p>To enable automatic grouping in WBPP, add these <strong>Grouping Keywords</strong> in <strong>exactly this order</strong>:</p>
                     <ol className="list-decimal list-inside space-y-1 text-xs">
                       <li>Open WBPP in PixInsight</li>
                       <li>Check <strong>Grouping Keywords</strong></li>
@@ -219,11 +196,6 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
                         </li>
                       ))}
                     </ol>
-                    <img
-                      src="/wbpp-grouping-keywords.png"
-                      alt="WBPP Grouping Keywords settings"
-                      className="rounded border border-border max-w-sm"
-                    />
                     {exampleStructure && (
                       <div>
                         <p className="font-medium mb-1">Expected folder structure:</p>
@@ -234,46 +206,6 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
                 </details>
               </div>
             </section>
-
-            {/* Result */}
-            {result && (
-              <div
-                className={`p-4 rounded-lg border ${
-                  result.success
-                    ? 'bg-success-muted border-success/30'
-                    : 'bg-error-muted border-error/30'
-                }`}
-              >
-                <div className="flex items-center gap-2 mb-2">
-                  {result.success ? (
-                    <Check className="text-success" size={20} />
-                  ) : (
-                    <AlertCircle className="text-error" size={20} />
-                  )}
-                  <span className="font-medium">
-                    {result.success ? 'Export Complete' : 'Export Failed'}
-                  </span>
-                </div>
-                {result.success ? (
-                  <div className="text-sm text-content-muted">
-                    <div>Files organized: {result.filesOrganized}</div>
-                    <div className="mt-2 text-content-muted truncate">
-                      Output: {result.outputDir}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-sm text-error">{result.error}</div>
-                )}
-                {result.warnings.length > 0 && (
-                  <div className="mt-3 text-sm text-warning">
-                    <div className="font-medium mb-1">Warnings:</div>
-                    {result.warnings.map((warning, i) => (
-                      <div key={i}>• {warning}</div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
 
             {/* Export button */}
             <button

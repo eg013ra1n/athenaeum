@@ -422,6 +422,37 @@ export type WarningType =
 export type WarningSeverity = 'info' | 'warning' | 'error';
 
 // ============================================================================
+// Export Progress Events
+// ============================================================================
+
+/**
+ * Progress event emitted during export file organization
+ */
+export interface ExportProgressEvent {
+  frameSetId: number;
+  /** Files copied so far */
+  current: number;
+  /** Total files to copy */
+  total: number;
+  percent: number;
+  currentFile: string | null;
+  /** "collecting" | "copying" | "complete" */
+  phase: string;
+}
+
+/**
+ * Event emitted when export finishes (success or failure)
+ */
+export interface ExportCompleteEvent {
+  frameSetId: number;
+  success: boolean;
+  filesOrganized: number;
+  warnings: string[];
+  error: string | null;
+  outputDir: string;
+}
+
+// ============================================================================
 // WBPP Export Configuration
 // ============================================================================
 
