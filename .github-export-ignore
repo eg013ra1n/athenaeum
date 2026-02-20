@@ -27,5 +27,8 @@ src-tauri/REFACTORING.md
 # Build artifacts
 builds/
 
+# Sync infrastructure
+scripts/sync-github.sh
+
 # This file itself
 .github-export-ignore

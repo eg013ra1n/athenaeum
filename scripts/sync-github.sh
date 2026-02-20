@@ -58,10 +58,12 @@ else
     echo "Warning: $IGNORE_FILE not found, only default excludes will be used." >&2
 fi
 
-# --- Determine source commit SHA ------------------------------------------------
+# --- Determine source commit info -----------------------------------------------
 SOURCE_SHA="unknown"
+SOURCE_MSG="Mirror from GitLab"
 if command -v git &>/dev/null && git -C "$REPO_ROOT" rev-parse HEAD &>/dev/null; then
     SOURCE_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+    SOURCE_MSG="$(git -C "$REPO_ROOT" log -1 --format=%B)"
 fi
 
 # --- Clone existing GitHub repo or init fresh -----------------------------------
@@ -98,7 +100,7 @@ if git diff --cached --quiet; then
     exit 0
 fi
 
-git commit -m "Mirror from GitLab @ ${SOURCE_SHA}"
+git commit -m "${SOURCE_MSG}"
 
 echo "Pushing to ${REMOTE}..."
 if [ "$FORCE" = true ]; then
