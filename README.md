@@ -62,13 +62,12 @@ athenaeum/
 │       ├── calibration/  # Calibration management
 │       ├── export/       # Export with templating
 │       ├── models.rs     # Data models
-│       └── commands.rs   # Tauri commands (frontend API)
-└── TS.md                  # Technical specification
+│       └── commands/     # Tauri commands (frontend API)
 ```
 
 ## Architecture
 
-See [CLAUDE.md](./CLAUDE.md) for detailed architecture notes and development guidelines.
+Athenaeum uses a **Tauri 2.0** stack: a Rust backend handles file scanning, FITS/XISF parsing, SQLite storage, and calibration matching, while a React/TypeScript frontend provides the UI. Commands are organized into focused modules by domain (scanning, calibration, export, etc.) and called from the frontend via Tauri's `invoke()` IPC.
 
 ## Recommended IDE Setup
 
@@ -76,4 +75,4 @@ See [CLAUDE.md](./CLAUDE.md) for detailed architecture notes and development gui
 
 ## License
 
-TBD
+[Apache-2.0](./LICENSE)
