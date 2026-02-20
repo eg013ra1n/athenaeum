@@ -16,6 +16,9 @@ const frontendDeps: Dependency[] = [
   { name: 'clsx', url: 'https://github.com/lukeed/clsx', license: 'MIT', copyright: 'Luke Edwards' },
   { name: 'date-fns', url: 'https://github.com/date-fns/date-fns', license: 'MIT', copyright: 'Sasha Koss' },
   { name: 'Lucide React', url: 'https://github.com/lucide-icons/lucide', license: 'ISC', copyright: 'Lucide Contributors' },
+  { name: 'D3.js', url: 'https://github.com/d3/d3', license: 'BSD-3-Clause', copyright: 'Mike Bostock' },
+  { name: 'd3-geo-projection', url: 'https://github.com/d3/d3-geo-projection', license: 'BSD-3-Clause', copyright: 'Mike Bostock' },
+  { name: 'd3-celestial', url: 'https://github.com/ofrohn/d3-celestial', license: 'BSD-3-Clause', copyright: 'Olaf Frohn' },
 ];
 
 const backendDeps: Dependency[] = [
