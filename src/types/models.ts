@@ -121,6 +121,7 @@ export interface ScanRoot {
   find_duplicates: boolean;
   unique_camera: boolean;
   last_scan: string | null; // ISO 8601 datetime
+  last_scan_errors: string[] | null;
 }
 
 export interface ScanRootWithAvailability extends ScanRoot {

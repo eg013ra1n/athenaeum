@@ -610,6 +610,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE frames_set ADD COLUMN max_rotation REAL", [])?;
     }
 
+    // Add last_scan_errors to scan_roots table (migration for existing databases)
+    let has_last_scan_errors: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_roots') WHERE name='last_scan_errors'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_last_scan_errors {
+        conn.execute(
+            "ALTER TABLE scan_roots ADD COLUMN last_scan_errors TEXT",
+            [],
+        )?;
+    }
+
     // Excluded frames table - stores frames excluded during auto-generation
     conn.execute(
         "CREATE TABLE IF NOT EXISTS excluded_frames (

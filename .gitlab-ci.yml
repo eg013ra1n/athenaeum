@@ -223,6 +223,29 @@ release:
     - job: build:macos
       artifacts: true
 
+publish_version:
+  stage: release
+  tags:
+    - linux
+  only:
+    - tags
+  variables:
+    DEPLOY_PORT: "40022"
+    SSH_CMD: "ssh -p ${DEPLOY_PORT}"
+    SCP_CMD: "scp -P ${DEPLOY_PORT}"
+  before_script:
+    - eval $(ssh-agent -s)
+    - chmod 400 "$DEPLOY_SSH_KEY"
+    - ssh-add "$DEPLOY_SSH_KEY"
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    - VERSION=${CI_COMMIT_TAG#v}
+    - printf '{"version":"%s","download_url":"https://artfrom.space/releases/download"}' "$VERSION" > version.json
+    - ${SCP_CMD} version.json ${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/artfrom.space/version.json
+  after_script:
+    - ssh-agent -k 2>/dev/null || true
+
 # --- Mirror to GitHub (main only) ---
 mirror:github:
   stage: mirror

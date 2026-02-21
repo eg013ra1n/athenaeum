@@ -97,7 +97,7 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 /// Get all scan roots
 pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, enabled, find_duplicates, unique_camera, last_scan FROM scan_roots ORDER BY path"
+        "SELECT id, path, enabled, find_duplicates, unique_camera, last_scan, last_scan_errors FROM scan_roots ORDER BY path"
     )?;
 
     let roots = stmt.query_map([], |row| {
@@ -106,6 +106,10 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
+        let last_scan_errors_str: Option<String> = row.get(6)?;
+        let last_scan_errors = last_scan_errors_str
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+
         Ok(ScanRoot {
             id: Some(row.get(0)?),
             path: row.get(1)?,
@@ -113,11 +117,11 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
             find_duplicates: row.get::<_, i32>(3)? == 1,
             unique_camera: row.get::<_, i32>(4)? == 1,
             last_scan,
+            last_scan_errors,
         })
     })?;
 
-    roots.collect()
-}
+    roots.collect()}
 
 /// Insert or update a scan root
 pub fn upsert_scan_root(conn: &Connection, path: &str) -> Result<i64> {
@@ -333,6 +337,20 @@ pub fn update_scan_root_timestamp(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(
         "UPDATE scan_roots SET last_scan = ?1 WHERE id = ?2",
         params![now, id],
+    )?;
+    Ok(())
+}
+
+/// Persist scan errors for a scan root (stored as JSON, cleared if empty)
+pub fn update_scan_root_errors(conn: &Connection, id: i64, errors: &[String]) -> anyhow::Result<()> {
+    let json_val: Option<String> = if errors.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(errors).map_err(|e| anyhow::anyhow!(e))?)
+    };
+    conn.execute(
+        "UPDATE scan_roots SET last_scan_errors = ?1 WHERE id = ?2",
+        params![json_val, id],
     )?;
     Ok(())
 }

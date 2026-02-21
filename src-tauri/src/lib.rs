@@ -90,6 +90,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::initialize_database,
+            commands::get_app_version,
+            commands::check_for_updates,
             commands::add_scan_root,
             commands::get_scan_roots,
             commands::delete_scan_root,

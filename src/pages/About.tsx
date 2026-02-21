@@ -1,5 +1,14 @@
+import { useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { ExternalLink } from 'lucide-react';
+import { RefreshCw, Download, CheckCircle2, AlertCircle, Info, ExternalLink } from 'lucide-react';
+
+interface UpdateInfo {
+  current_version: string;
+  latest_version: string;
+  is_update_available: boolean;
+  download_url: string;
+}
 
 interface Dependency {
   name: string;
@@ -35,6 +44,76 @@ const backendDeps: Dependency[] = [
   { name: 'anyhow', url: 'https://github.com/dtolnay/anyhow', license: 'MIT OR Apache-2.0', copyright: 'David Tolnay' },
   { name: 'base64', url: 'https://github.com/marshallpierce/rust-base64', license: 'MIT OR Apache-2.0', copyright: 'Marshall Pierce' },
 ];
+
+function UpdateSection() {
+  const [checking, setChecking] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [checkError, setCheckError] = useState<string | null>(null);
+
+  const handleCheck = async () => {
+    setChecking(true);
+    setCheckError(null);
+    setUpdateInfo(null);
+    try {
+      const info = await invoke<UpdateInfo>('check_for_updates');
+      setUpdateInfo(info);
+    } catch (err) {
+      const msg = typeof err === 'string' ? err : 'Failed to check for updates';
+      console.error('check_for_updates:', err);
+      setCheckError(msg);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-4">
+      <h2 className="text-sm font-semibold uppercase tracking-wider text-accent">Updates</h2>
+      <button
+        onClick={handleCheck}
+        disabled={checking}
+        className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+      >
+        <RefreshCw size={15} className={checking ? 'animate-spin' : ''} />
+        {checking ? 'Checking…' : 'Check for Updates'}
+      </button>
+
+      {checkError && (
+        <div className="flex items-start gap-2 p-3 bg-error/10 border border-error/40 rounded-lg text-sm text-error">
+          <AlertCircle size={15} className="flex-shrink-0 mt-0.5" />
+          {checkError}
+        </div>
+      )}
+
+      {updateInfo && !updateInfo.is_update_available && (
+        <div className="flex items-center gap-2 p-3 bg-success/10 border border-success/40 rounded-lg text-sm text-success">
+          <CheckCircle2 size={15} />
+          You're up to date! (v{updateInfo.current_version})
+        </div>
+      )}
+
+      {updateInfo && updateInfo.is_update_available && (
+        <div className="p-3 bg-accent/10 border border-accent/40 rounded-lg space-y-2">
+          <div className="flex items-center gap-2 text-sm font-semibold text-accent">
+            <Info size={15} />
+            Version {updateInfo.latest_version} is available
+          </div>
+          <p className="text-sm text-content-muted">
+            You are running v{updateInfo.current_version}.
+          </p>
+          <button
+            onClick={() => openUrl(updateInfo.download_url)}
+            className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition text-sm"
+          >
+            <Download size={15} />
+            Download v{updateInfo.latest_version}
+            <ExternalLink size={13} />
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
 
 function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
   return (
@@ -92,6 +171,8 @@ export default function About() {
           imaging library.
         </p>
       </section>
+
+      <UpdateSection />
 
       <div className="grid grid-cols-2 gap-6">
         <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">
