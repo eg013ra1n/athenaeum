@@ -1,3 +1,9 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_COMMIT_BRANCH == "main"
+    - when: never
+
 stages:
   - build
   - deploy
@@ -14,7 +20,6 @@ build:windows:
   tags:
     - windows
   only:
-    - main
     - tags
   needs:
     - job: build:linux
@@ -44,7 +49,6 @@ build:linux:
   tags:
     - linux
   only:
-    - main
     - tags
   before_script:
     - source "$HOME/.cargo/env"
@@ -74,7 +78,6 @@ build:macos:
   tags:
     - macos
   only:
-    - main
     - tags
   cache:
     key: "main-macos"
@@ -159,13 +162,12 @@ update-cache:macos:
     - npm run tauri build -- --target aarch64-apple-darwin
     - npm run tauri build -- --target x86_64-apple-darwin
 
-# --- Deploy to Web Server (main and tags) ---
+# --- Deploy to Web Server (tags only) ---
 deploy:
   stage: deploy
   tags:
     - linux
   only:
-    - main
     - tags
   variables:
     DEPLOY_PORT: "40022"
@@ -186,32 +188,23 @@ deploy:
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
     - ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
   script:
-    # Determine build key: tag name for releases, short SHA for main
-    - BUILD_KEY="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
-    # For tagged releases, rename artifacts to include the tag in the filename
-    # so that release asset URLs can reference them with ${CI_COMMIT_TAG} alone
-    - |
-      if [ -n "${CI_COMMIT_TAG}" ]; then
-        mv src-tauri/target/release/bundle/appimage/*.AppImage "src-tauri/target/release/bundle/appimage/athenaeum_${CI_COMMIT_TAG}_amd64.AppImage"
-        mv src-tauri/target/release/bundle/deb/*.deb "src-tauri/target/release/bundle/deb/athenaeum_${CI_COMMIT_TAG}_amd64.deb"
-        mv src-tauri/target/release/bundle/msi/*.msi "src-tauri/target/release/bundle/msi/Athenaeum_${CI_COMMIT_TAG}_x64_en-US.msi"
-        mv src-tauri/target/release/bundle/nsis/*.exe "src-tauri/target/release/bundle/nsis/Athenaeum_${CI_COMMIT_TAG}_x64-setup.exe"
-        mv src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg"
-        mv src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg "src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_x64.dmg"
-      fi
+    # Rename artifacts to include tag in filename
+    - mv src-tauri/target/release/bundle/appimage/*.AppImage "src-tauri/target/release/bundle/appimage/athenaeum_${CI_COMMIT_TAG}_amd64.AppImage"
+    - mv src-tauri/target/release/bundle/deb/*.deb "src-tauri/target/release/bundle/deb/athenaeum_${CI_COMMIT_TAG}_amd64.deb"
+    - mv src-tauri/target/release/bundle/msi/*.msi "src-tauri/target/release/bundle/msi/Athenaeum_${CI_COMMIT_TAG}_x64_en-US.msi"
+    - mv src-tauri/target/release/bundle/nsis/*.exe "src-tauri/target/release/bundle/nsis/Athenaeum_${CI_COMMIT_TAG}_x64-setup.exe"
+    - mv src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg"
+    - mv src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg "src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_x64.dmg"
     # Create directories on remote
-    - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${BUILDS_PATH}/${BUILD_KEY}/linux ${BUILDS_PATH}/${BUILD_KEY}/windows ${BUILDS_PATH}/${BUILD_KEY}/macos"
+    - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos"
     # Upload Linux artifacts
-    - ${SCP_CMD} src-tauri/target/release/bundle/appimage/*.AppImage src-tauri/target/release/bundle/deb/*.deb ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${BUILD_KEY}/linux/
+    - ${SCP_CMD} src-tauri/target/release/bundle/appimage/*.AppImage src-tauri/target/release/bundle/deb/*.deb ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/linux/
     # Upload Windows artifacts
-    - ${SCP_CMD} src-tauri/target/release/bundle/msi/*.msi src-tauri/target/release/bundle/nsis/*.exe ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${BUILD_KEY}/windows/
+    - ${SCP_CMD} src-tauri/target/release/bundle/msi/*.msi src-tauri/target/release/bundle/nsis/*.exe ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/windows/
     # Upload macOS artifacts
-    - ${SCP_CMD} src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${BUILD_KEY}/macos/
-    # Update latest/ symlink for main branch builds only
-    - |
-      if [ -z "${CI_COMMIT_TAG}" ]; then
-        ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_SHORT_SHA} ${BUILDS_PATH}/latest"
-      fi
+    - ${SCP_CMD} src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/macos/
+    # Update latest/ symlink to point to this release
+    - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/latest"
   after_script:
     - ssh-agent -k 2>/dev/null || true
 
