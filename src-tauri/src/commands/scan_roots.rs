@@ -82,6 +82,7 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
         find_duplicates: true,
         unique_camera: false,
         last_scan: None,
+        last_scan_errors: None,
     })
 }
 
@@ -139,6 +140,11 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
 
     // Update last_scan timestamp
     db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
+
+    // Persist scan errors so they survive app restarts
+    if let Err(e) = db::update_scan_root_errors(&conn, root_id, &result.errors) {
+        eprintln!("Failed to persist scan errors: {}", e);
+    }
 
     Ok(ScanResultDto {
         files_found: result.files_found,
@@ -595,6 +601,11 @@ pub async fn start_scan_with_progress(
 
         // Update last_scan timestamp
         db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
+
+        // Persist scan errors so they survive app restarts
+        if let Err(e) = db::update_scan_root_errors(&conn, root_id, &result.errors) {
+            eprintln!("Failed to persist scan errors: {}", e);
+        }
 
         println!("🔵 Scan complete for root_id={}, releasing lock", root_id);
         (result, reconcile)

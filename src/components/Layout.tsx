@@ -9,10 +9,10 @@ import Logo from '../assets/athenaeum.png';
 export default function Layout() {
   const navItems = [
     { to: '/files', icon: Files, label: 'File Manager' },
-    { to: '/calendar', icon: Calendar, label: 'Shoot Calendar' },
     { to: '/objects', icon: Target, label: 'Objects' },
-    { to: '/skychart', icon: Focus, label: 'Sky Chart' },
     { to: '/equipment', icon: Camera, label: 'Equipment' },
+    { to: '/skychart', icon: Focus, label: 'Sky Chart' },
+    { to: '/calendar', icon: Calendar, label: 'Shoot Calendar' },
     { to: '/export', icon: Layers, label: 'Export' },
     { to: '/blackhole', icon: Trash2, label: 'Black Hole' },
     { to: '/settings', icon: Settings, label: 'Settings' },

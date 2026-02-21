@@ -123,6 +123,7 @@ pub struct ScanRoot {
     pub find_duplicates: bool,
     pub unique_camera: bool,
     pub last_scan: Option<DateTime<Utc>>,
+    pub last_scan_errors: Option<Vec<String>>,
 }
 
 /// Duplicate detection result

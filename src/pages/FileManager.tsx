@@ -71,6 +71,9 @@ export default function FileManager() {
     variant: 'info',
   });
 
+  // Scan error log expand state (per scan root)
+  const [expandedErrors, setExpandedErrors] = useState<Record<number, boolean>>({});
+
   // Missing files tracking state
   const [missingFilesCountMap, setMissingFilesCountMap] = useState<Record<number, number>>({});
   const [missingFilesMap, setMissingFilesMap] = useState<Record<number, MissingFileRecord[]>>({});
@@ -509,7 +512,7 @@ export default function FileManager() {
                           ) : (
                             <Play size={16} />
                           )}
-                          {rootIsScanning ? 'Scanning...' : 'Rescan'}
+                          {rootIsScanning ? 'Scanning...' : root.last_scan ? 'Rescan' : 'Scan'}
                         </button>
                         <button
                           onClick={() => root.id && handleRemoveScanRoot(root.id)}
@@ -594,6 +597,41 @@ export default function FileManager() {
                         )}
                       </div>
                     )}
+
+                    {/* Persistent scan error log */}
+                    {(() => {
+                      const scanResult = root.id ? scanResultMap[root.id] : undefined;
+                      const displayErrors = scanResult?.errors ?? root.last_scan_errors ?? [];
+                      const isExpanded = root.id ? (expandedErrors[root.id] ?? false) : false;
+                      if (displayErrors.length === 0) return null;
+                      return (
+                        <div className="mt-2 border border-error/30 rounded overflow-hidden">
+                          <button
+                            onClick={() => root.id && setExpandedErrors(prev => ({
+                              ...prev,
+                              [root.id!]: !prev[root.id!]
+                            }))}
+                            className="w-full flex items-center justify-between px-3 py-2 bg-error-muted hover:bg-surface-hover transition text-sm"
+                          >
+                            <span className="flex items-center gap-2 text-error font-medium">
+                              <AlertCircle size={14} />
+                              {displayErrors.length} file{displayErrors.length !== 1 ? 's' : ''} failed in last scan
+                            </span>
+                            <ChevronDown
+                              size={14}
+                              className={`text-error transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+                            />
+                          </button>
+                          {isExpanded && (
+                            <div className="px-3 py-2 max-h-40 overflow-y-auto space-y-1 bg-surface">
+                              {displayErrors.map((err, i) => (
+                                <p key={i} className="text-xs text-error/80 font-mono break-all">{err}</p>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })}

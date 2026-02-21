@@ -48,8 +48,8 @@ xxHash XXH3_64-based file hashing for fast duplicate identification across large
 - **Desktop Framework**: Tauri 2.0
 - **Backend**: Rust
 - **Database**: SQLite (rusqlite)
-- **FITS/XISF Rendering**: [rustafits](https://github.com/eg013ra1n/rustafits) -- a pure Rust FITS/XISF image rendering library by the same author. Handles Bayer demosaicing, debayering, auto-stretch, and multi-resolution JPEG output with zero C dependencies for image processing.
-- **FITS Metadata**: fitsio (cfitsio bindings for header extraction)
+- **FITS/XISF Rendering**: [rustafits](https://github.com/eg013ra1n/rustafits) -- a pure Rust FITS/XISF image rendering library. Handles Bayer demosaicing, debayering, auto-stretch, and multi-resolution JPEG output with zero C dependencies for image processing.
+- **FITS/XISF Metadata**: Custom pure-Rust parser — FITS headers are read block-by-block per the FITS standard; XISF headers are parsed from embedded XML using quick-xml
 - **File Scanning**: walkdir + rayon (multi-threaded directory traversal)
 - **Hashing**: xxhash-rust (XXH3_64)
 

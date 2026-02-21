@@ -1,6 +1,6 @@
 [package]
 name = "athenaeum"
-version = "0.1.0"
+version = "0.1.1"
 description = "Astrophotography File Manager - FITS/XISF catalog and management tool"
 authors = ["you"]
 edition = "2021"
@@ -35,6 +35,8 @@ anyhow = "1"
 quick-xml = "0.36"
 rustafits = "0.4.2"
 base64 = "0.22"
+reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
 
 [profile.dev.package."*"]
 opt-level = 2        # Optimize all dependencies in dev builds (image processing, rayon, etc.)
