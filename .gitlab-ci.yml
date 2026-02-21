@@ -15,6 +15,7 @@ build:windows:
     - windows
   only:
     - main
+    - tags
   cache:
     key: "${CI_COMMIT_REF_SLUG}-windows"
     policy: pull
@@ -40,6 +41,7 @@ build:linux:
     - linux
   only:
     - main
+    - tags
   before_script:
     - source "$HOME/.cargo/env"
   cache:
@@ -69,6 +71,7 @@ build:macos:
     - macos
   only:
     - main
+    - tags
   cache:
     key: "${CI_COMMIT_REF_SLUG}-macos"
     policy: pull
