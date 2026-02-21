@@ -52,6 +52,7 @@ build:linux:
       - .npm/
   script:
     - export RUSTAFITS_PORTABLE=1
+    - rm -rf src-tauri/target/release/bundle/
     - npm ci
     - npm run tauri build
   artifacts:
