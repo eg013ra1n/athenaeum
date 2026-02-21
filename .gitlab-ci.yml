@@ -16,6 +16,9 @@ build:windows:
   only:
     - main
     - tags
+  needs:
+    - job: build:linux
+      artifacts: false
   cache:
     key: "main-windows"
     policy: pull
@@ -25,8 +28,8 @@ build:windows:
       - src-tauri/target/
       - .npm/
   script:
-    - if exist src-tauri\target\release\bundle rmdir /s /q src-tauri\target\release\bundle
-    - npm ci
+    - if (Test-Path "src-tauri\target\release\bundle") { Remove-Item -Recurse -Force "src-tauri\target\release\bundle" }
+    - npm install
     - npm run tauri build
   artifacts:
     name: "athenaeum-windows-${CI_COMMIT_SHORT_SHA}"
@@ -56,7 +59,7 @@ build:linux:
   script:
     - export RUSTAFITS_PORTABLE=1
     - rm -rf src-tauri/target/release/bundle/
-    - npm ci
+    - npm install
     - npm run tauri build
   artifacts:
     name: "athenaeum-linux-${CI_COMMIT_SHORT_SHA}"
@@ -84,7 +87,7 @@ build:macos:
   script:
     - rm -rf src-tauri/target/aarch64-apple-darwin/release/bundle/
     - rm -rf src-tauri/target/x86_64-apple-darwin/release/bundle/
-    - npm ci
+    - npm install
     - npm run tauri build -- --target aarch64-apple-darwin
     - npm run tauri build -- --target x86_64-apple-darwin
   artifacts:
@@ -111,7 +114,7 @@ update-cache:windows:
       - src-tauri/target/
       - .npm/
   script:
-    - npm ci
+    - npm install
     - npm run tauri build
 
 update-cache:linux:
@@ -133,7 +136,7 @@ update-cache:linux:
       - .npm/
   script:
     - export RUSTAFITS_PORTABLE=1
-    - npm ci
+    - npm install
     - npm run tauri build
 
 update-cache:macos:
@@ -152,7 +155,7 @@ update-cache:macos:
       - src-tauri/target/
       - .npm/
   script:
-    - npm ci
+    - npm install
     - npm run tauri build -- --target aarch64-apple-darwin
     - npm run tauri build -- --target x86_64-apple-darwin
 
