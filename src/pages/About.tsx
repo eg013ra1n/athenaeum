@@ -174,7 +174,7 @@ export default function About() {
 
       <UpdateSection />
 
-      <div className="grid grid-cols-2 gap-6">
+      <div className="grid grid-cols-3 gap-6">
         <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">
           <h2 className="text-sm font-semibold uppercase tracking-wider text-accent">Creator</h2>
           <p className="text-content-secondary">
@@ -194,6 +194,23 @@ export default function About() {
               Apache License 2.0
             </ExtLink>
           </p>
+        </section>
+
+        <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-accent">Support</h2>
+          <p className="text-content-secondary leading-relaxed">
+            If you find Athenaeum useful, consider supporting its development.
+          </p>
+          <button
+            onClick={() => openUrl('https://ko-fi.com/N4N81UR2EE')}
+            className="hover:opacity-80 transition-opacity"
+          >
+            <img
+              src="https://ko-fi.com/img/githubbutton_sm.svg"
+              alt="Support on Ko-fi"
+              height="30"
+            />
+          </button>
         </section>
       </div>
 

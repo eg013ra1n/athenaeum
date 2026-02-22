@@ -4,6 +4,8 @@ A desktop application for astrophotographers to manage, organize, and export FIT
 
 Website and documentation: [artfrom.space](https://artfrom.space)
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/N4N81UR2EE)
+
 ## Features
 
 ### File Manager
