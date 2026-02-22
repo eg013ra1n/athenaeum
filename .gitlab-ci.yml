@@ -212,7 +212,7 @@ deploy:
 release:
   stage: release
   tags:
-    - windows
+    - linux
   only:
     - tags
   needs:
