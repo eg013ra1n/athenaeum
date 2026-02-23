@@ -15,7 +15,7 @@ import { MissingFilesPanel } from '../components/MissingFilesPanel';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
-type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrument';
+type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrument' | 'frametype';
 
 export default function FileManager() {
   const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, relinkScanRoot } = useScanRootsWithAvailability();
@@ -1042,7 +1042,7 @@ export default function FileManager() {
       {activeTab === 'missing-metadata' && (
         <div className="bg-surface-elevated rounded-lg p-4">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold">Light Frames with Missing Metadata</h3>
+            <h3 className="text-lg font-semibold">Frames with Missing Metadata</h3>
             <div className="flex items-center gap-3">
               <select
                 value={missingCategory}
@@ -1054,6 +1054,7 @@ export default function FileManager() {
                 <option value="object">Missing Object Name</option>
                 <option value="datetime">Missing Date/Time</option>
                 <option value="instrument">Missing Instrument</option>
+                <option value="frametype">Missing Frame Type</option>
               </select>
               <button
                 onClick={() => loadMissingMetadata(missingCategory)}

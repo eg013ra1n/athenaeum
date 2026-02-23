@@ -1084,6 +1084,22 @@ pub async fn create_frame_set_from_excluded(
 
     println!("Mapped {} file_ids to {} frame_ids", file_ids.len(), frame_ids.len());
 
+    // Set imagetyp to 'Light' for frames with missing frame type
+    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "UPDATE frames SET imagetyp = 'Light' WHERE file_id IN ({}) AND (imagetyp IS NULL OR imagetyp = '')",
+        placeholders
+    );
+    let params: Vec<rusqlite::types::Value> = file_ids
+        .iter()
+        .map(|id| rusqlite::types::Value::Integer(*id))
+        .collect();
+    let reclassified = conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+        .map_err(|e| format!("Failed to set imagetyp for unclassified frames: {}", e))?;
+    if reclassified > 0 {
+        println!("Set imagetyp to 'Light' for {} unclassified frames", reclassified);
+    }
+
     // Create the frame set
     let set_id = create_frame_set_inner(&conn, &name, &frame_ids, &state.settings)?;
 

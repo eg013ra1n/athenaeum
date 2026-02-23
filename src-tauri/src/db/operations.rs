@@ -795,18 +795,22 @@ pub fn get_files_by_directory_for_camera(
     results.collect()
 }
 
-/// Get Light frames with missing metadata
-/// category: "all", "coordinates", "object", "datetime", "instrument"
+/// Get frames with missing metadata
+/// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
 pub fn get_frames_with_missing_metadata(
     conn: &Connection,
     category: &str,
 ) -> Result<Vec<(File, Frame)>> {
-    let missing_clause = match category {
-        "coordinates" => "(fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)",
-        "object" => "fr.object IS NULL OR fr.object = ''",
-        "datetime" => "fr.date_obs IS NULL",
-        "instrument" => "fr.instrume IS NULL OR fr.instrume = ''",
-        _ => "((fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)) OR (fr.object IS NULL OR fr.object = '') OR fr.date_obs IS NULL OR (fr.instrume IS NULL OR fr.instrume = '')",
+    let (missing_clause, imagetyp_filter) = match category {
+        "coordinates" => ("(fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
+        "object" => ("fr.object IS NULL OR fr.object = ''", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
+        "datetime" => ("fr.date_obs IS NULL", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
+        "instrument" => ("fr.instrume IS NULL OR fr.instrume = ''", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
+        "frametype" => ("(fr.imagetyp IS NULL OR fr.imagetyp = '')", ""),
+        _ => (
+            "(UPPER(fr.imagetyp) = 'LIGHT' AND (((fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)) OR (fr.object IS NULL OR fr.object = '') OR fr.date_obs IS NULL OR (fr.instrume IS NULL OR fr.instrume = ''))) OR (fr.imagetyp IS NULL OR fr.imagetyp = '')",
+            ""
+        ),
     };
 
     let query = format!(
@@ -817,9 +821,9 @@ pub fn get_frames_with_missing_metadata(
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
-         WHERE UPPER(fr.imagetyp) = 'LIGHT' AND ({})
+         WHERE {} ({})
          ORDER BY f.modified_at DESC",
-        missing_clause
+        imagetyp_filter, missing_clause
     );
 
     let mut stmt = conn.prepare(&query)?;
@@ -1323,7 +1327,7 @@ pub fn get_light_frames_for_project(
                 fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
-         WHERE fr.imagetyp = 'Light'
+         WHERE fr.imagetyp = 'Light' OR fr.imagetyp IS NULL
          ORDER BY f.id"
     )?;
 
@@ -1492,12 +1496,17 @@ pub fn update_imaging_night_time_range(
 }
 
 /// Deduplicate session members within a frame set
-/// Removes duplicate frame references from all sessions in a frame set
+/// Three phases:
+/// 1. Per-session: remove identical frame_id duplicates within a single session
+/// 2. Cross-session: remove different frame_ids that reference the same physical file (same files.path)
+/// 3. Session consolidation: merge sessions with the same instrume within the same imaging night
 pub fn deduplicate_session_members_in_set(
     conn: &Connection,
     frames_set_id: i64,
 ) -> Result<usize> {
-    // Find all sessions in this frame set
+    let mut total_removed = 0;
+
+    // --- Phase 1: Per-session frame_id dedup (original logic) ---
     let session_ids: Vec<i64> = conn
         .prepare(
             "SELECT s.id
@@ -1508,10 +1517,7 @@ pub fn deduplicate_session_members_in_set(
         .query_map(params![frames_set_id], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut total_removed = 0;
-
-    for session_id in session_ids {
-        // Find duplicate frame_ids in this session
+    for session_id in &session_ids {
         let duplicates: Vec<(i64, i32)> = conn
             .prepare(
                 "SELECT frame_id, COUNT(*) as count
@@ -1523,22 +1529,124 @@ pub fn deduplicate_session_members_in_set(
             .query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        // For each duplicate, keep only one and remove the rest
         for (frame_id, count) in duplicates {
-            // Delete all instances
             conn.execute(
                 "DELETE FROM session_members WHERE session_id = ?1 AND frame_id = ?2",
                 params![session_id, frame_id],
             )?;
-
-            // Re-insert exactly one
             conn.execute(
                 "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
                 params![session_id, frame_id],
             )?;
-
             total_removed += (count - 1) as usize;
         }
+    }
+
+    // --- Phase 2: Cross-session dedup by file path ---
+    // Different frame_ids can reference the same physical file (same files.path)
+    // after a scan root is removed and re-added. Keep the lowest frame_id, remove others.
+    let path_members: Vec<(i64, i64, String)> = conn
+        .prepare(
+            "SELECT sm.frame_id, sm.session_id, f.path
+             FROM session_members sm
+             JOIN sessions s ON sm.session_id = s.id
+             JOIN imaging_nights n ON s.imaging_night_id = n.id
+             JOIN frames fr ON sm.frame_id = fr.id
+             JOIN files f ON fr.file_id = f.id
+             WHERE n.frames_set_id = ?1
+             ORDER BY f.path, sm.frame_id"
+        )?
+        .query_map(params![frames_set_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut seen_paths: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for (frame_id, session_id, path) in &path_members {
+        if let Some(&kept_id) = seen_paths.get(path) {
+            if *frame_id != kept_id {
+                conn.execute(
+                    "DELETE FROM session_members WHERE session_id = ?1 AND frame_id = ?2",
+                    params![session_id, frame_id],
+                )?;
+                total_removed += 1;
+            }
+        } else {
+            seen_paths.insert(path.clone(), *frame_id);
+        }
+    }
+
+    // --- Phase 3: Session consolidation ---
+    // Merge sessions with the same instrume within the same imaging night.
+    let night_ids: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM imaging_nights WHERE frames_set_id = ?1"
+        )?
+        .query_map(params![frames_set_id], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for night_id in &night_ids {
+        // Get sessions ordered by instrume then by member count descending (keep largest)
+        let sessions: Vec<(i64, String, i64)> = conn
+            .prepare(
+                "SELECT s.id, COALESCE(s.instrume, ''), COUNT(sm.frame_id) as cnt
+                 FROM sessions s
+                 LEFT JOIN session_members sm ON s.id = sm.session_id
+                 WHERE s.imaging_night_id = ?1
+                 GROUP BY s.id, s.instrume
+                 ORDER BY COALESCE(s.instrume, ''), cnt DESC"
+            )?
+            .query_map(params![night_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut instrume_primary: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for (session_id, instrume, _count) in &sessions {
+            if let Some(&primary_id) = instrume_primary.get(instrume) {
+                // Move members from duplicate session to primary (ignore conflicts from PK)
+                conn.execute(
+                    "UPDATE OR IGNORE session_members SET session_id = ?1 WHERE session_id = ?2",
+                    params![primary_id, session_id],
+                )?;
+                // Delete any that couldn't be moved (already exist in primary)
+                conn.execute(
+                    "DELETE FROM session_members WHERE session_id = ?1",
+                    params![session_id],
+                )?;
+                // Delete the now-empty session
+                conn.execute(
+                    "DELETE FROM sessions WHERE id = ?1",
+                    params![session_id],
+                )?;
+            } else {
+                instrume_primary.insert(instrume.clone(), *session_id);
+            }
+        }
+    }
+
+    // --- Update frame_count and total_exp_time on surviving sessions ---
+    let surviving_sessions: Vec<i64> = conn
+        .prepare(
+            "SELECT s.id
+             FROM sessions s
+             JOIN imaging_nights n ON s.imaging_night_id = n.id
+             WHERE n.frames_set_id = ?1"
+        )?
+        .query_map(params![frames_set_id], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for session_id in &surviving_sessions {
+        conn.execute(
+            "UPDATE sessions SET
+                frame_count = (SELECT COUNT(*) FROM session_members WHERE session_id = ?1),
+                total_exp_time = COALESCE(
+                    (SELECT SUM(fr.exptime) FROM session_members sm
+                     JOIN frames fr ON sm.frame_id = fr.id
+                     WHERE sm.session_id = ?1), 0.0)
+             WHERE id = ?1",
+            params![session_id],
+        )?;
     }
 
     Ok(total_removed)

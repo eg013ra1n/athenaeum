@@ -6,7 +6,38 @@ use crate::models::{Frame, ImageType};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use fits_header_reader::FitsHeader;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+
+/// Read the XISF XML header bytes from a file.
+/// Parses the 16-byte binary header (8-byte signature + 4-byte header length + 4 reserved)
+/// to determine exactly how many bytes to read.
+fn read_xisf_header(path: &Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
+    let mut buf_reader = BufReader::new(file);
+
+    let mut sig = [0u8; 8];
+    buf_reader.read_exact(&mut sig)?;
+    if &sig != b"XISF0100" {
+        anyhow::bail!("Not a valid XISF file: bad signature");
+    }
+
+    let mut len_bytes = [0u8; 4];
+    buf_reader.read_exact(&mut len_bytes)?;
+    let header_length = u32::from_le_bytes(len_bytes) as usize;
+
+    // Safety cap at 64MB
+    if header_length > 64 * 1024 * 1024 {
+        anyhow::bail!("XISF header too large: {} bytes", header_length);
+    }
+
+    // Skip 4 reserved bytes, then read header_length bytes
+    buf_reader.seek(SeekFrom::Current(4))?;
+    let mut content = vec![0u8; header_length];
+    buf_reader.read_exact(&mut content)?;
+    Ok(content)
+}
 
 /// Detects if RA is in hours (0-24) or degrees (0-360) and normalizes to degrees
 ///
@@ -116,19 +147,9 @@ pub fn parse_fits_with_header(path: &Path, file_id: i64) -> Result<(Frame, Strin
 pub fn extract_xisf_header(path: &Path) -> Result<String> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
-    use std::fs::File;
-    use std::io::{BufReader, Read};
 
     crate::logging::log("DEBUG", &format!("Opening XISF for header: {}", path.display()));
-    // Read the first 1MB which should contain the XML header
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
-    let mut buf_reader = BufReader::new(file);
-
-    let max_header_size = 1024 * 1024; // 1MB
-    let mut content = vec![0u8; max_header_size];
-    let bytes_read = buf_reader.read(&mut content)?;
-    content.truncate(bytes_read);
+    let content = read_xisf_header(path)?;
 
     // Find the XML section
     let xml_start = content.windows(5)
@@ -403,23 +424,10 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
     use std::collections::HashMap;
-    use std::fs::File;
-    use std::io::{BufReader, Read};
 
     crate::logging::log("DEBUG", &format!("Opening XISF for parsing: {}", path.display()));
 
-    // Read the file
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open XISF file: {}", path.display()))?;
-    let mut buf_reader = BufReader::new(file);
-
-    // XISF format: binary header + XML header + image data
-    // Read only the first 1MB which should contain the XML header
-    // (XML headers are typically much smaller, but 1MB gives us safety margin)
-    let max_header_size = 1024 * 1024; // 1MB
-    let mut content = vec![0u8; max_header_size];
-    let bytes_read = buf_reader.read(&mut content)?;
-    content.truncate(bytes_read);
+    let content = read_xisf_header(path)?;
 
     // Find the XML section - it starts after "<?xml"
     let xml_start = content.windows(5)
@@ -430,7 +438,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let xml_end = content.windows(7)
         .skip(xml_start)
         .position(|w| w == b"</xisf>")
-        .ok_or_else(|| anyhow::anyhow!("No closing </xisf> tag found in first {}KB", max_header_size / 1024))?;
+        .ok_or_else(|| anyhow::anyhow!("No closing </xisf> tag found"))?;
     let xml_end = xml_start + xml_end + 7; // +7 for the length of "</xisf>"
 
     // Extract XML content

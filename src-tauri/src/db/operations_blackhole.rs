@@ -189,8 +189,8 @@ pub fn find_duplicate_folders(
             }
 
             if shared_count > 0 {
-                let min_files = files_a.len().min(files_b.len()) as f64;
-                let similarity_percent = (shared_count as f64 / min_files) * 100.0;
+                let total_unique = (files_a.len() + files_b.len() - shared_count) as f64;
+                let similarity_percent = (shared_count as f64 / total_unique) * 100.0;
 
                 if similarity_percent >= similarity_threshold {
                     similarities.push(FolderSimilarity {
