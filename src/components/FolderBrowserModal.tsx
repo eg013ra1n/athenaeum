@@ -17,12 +17,15 @@ interface FolderBrowserModalProps {
   isOpen: boolean;
   onSelect: (path: string) => void;
   onClose: () => void;
+  /** `"scan"` (default) browses scan roots; `"export"` browses the export directory. */
+  scope?: 'scan' | 'export';
 }
 
 export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
   isOpen,
   onSelect,
   onClose,
+  scope,
 }) => {
   const [currentPath, setCurrentPath] = useState('');
   const [inputPath, setInputPath] = useState('');
@@ -37,6 +40,7 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
     try {
       const result = await api.invoke<BrowseDirectoriesResponse>('browse_directories', {
         path: path || undefined,
+        scope: scope || undefined,
       });
       setCurrentPath(result.current);
       setInputPath(result.current);
@@ -47,7 +51,7 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [scope]);
 
   // Load root listing when modal opens
   useEffect(() => {

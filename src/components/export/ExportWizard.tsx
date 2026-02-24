@@ -1,8 +1,11 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { pickDirectory } from '../../api/desktop';
+import { api } from '../../api';
+import { isTauri } from '../../utils/platform';
 import { Folder, Loader2, Play, Layers } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
 import { ExportSummary } from './ExportSummary';
+import { FolderBrowserModal } from '../FolderBrowserModal';
 import { useExportableFrameSets, useWbppConfig } from '../../hooks/useExportData';
 import { useExportProgressContext } from '../../contexts/ExportProgressContext';
 
@@ -17,12 +20,23 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
   );
   const [outputDir, setOutputDir] = useState<string>('');
   const [useSymlinks, setUseSymlinks] = useState(false);
+  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
 
   // Hooks
   const { frameSets, loading: loadingFrameSets } = useExportableFrameSets();
   const { config: wbppConfig } = useWbppConfig();
   const { startExport, hasActiveExports } = useExportProgressContext();
   const exporting = hasActiveExports;
+
+  // In web mode, auto-fill export dir from server config
+  useEffect(() => {
+    if (isTauri) return;
+    api.invoke<string | null>('get_export_dir', {}).then((dir) => {
+      if (dir) setOutputDir(dir);
+    }).catch((err) => {
+      console.error('Failed to get export dir:', err);
+    });
+  }, []);
 
   // Build dynamic WBPP keyword instructions from config
   const keywordDescriptions: Record<string, string> = useMemo(() => ({
@@ -81,8 +95,12 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
 
   // Handle folder selection
   const handleSelectFolder = useCallback(async () => {
+    if (!isTauri) {
+      // Web mode: open folder browser modal scoped to export dir
+      setShowFolderBrowser(true);
+      return;
+    }
     const selected = await pickDirectory();
-
     if (selected && typeof selected === 'string') {
       setOutputDir(selected);
     }
@@ -149,8 +167,8 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
                   </div>
                 </div>
 
-                {/* Use symlinks */}
-                {(() => {
+                {/* Use symlinks — hidden in web mode (Docker always copies) */}
+                {isTauri && (() => {
                   const isWindows = navigator.userAgent.includes('Windows');
                   return (
                     <div>
@@ -233,6 +251,17 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
           </div>
         )}
       </div>
+
+      {/* Web mode: folder browser for export directory */}
+      <FolderBrowserModal
+        isOpen={showFolderBrowser}
+        scope="export"
+        onSelect={(path) => {
+          setOutputDir(path);
+          setShowFolderBrowser(false);
+        }}
+        onClose={() => setShowFolderBrowser(false)}
+      />
     </div>
   );
 }

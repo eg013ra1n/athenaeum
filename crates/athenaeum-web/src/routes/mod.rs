@@ -153,6 +153,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/export_to_wbpp", post(export::export_to_wbpp))
         .route("/api/cancel_export", post(export::cancel_export))
         .route("/api/get_export_summary", post(export::get_export_summary))
+        .route("/api/get_export_dir", post(export::get_export_dir))
         // Spatial
         .route("/api/get_imaging_locations", post(spatial::get_imaging_locations))
         .route("/api/query_frames_in_bounds", post(spatial::query_frames_in_bounds))

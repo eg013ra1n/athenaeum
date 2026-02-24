@@ -28,7 +28,7 @@ pub struct ScanResultDto {
     pub darkflats_count: usize,
     pub calibration_sets_created: usize,
     pub cancelled: bool,
-    // Reconciliation fields — always zero in web mode (no unique_camera reconcile)
+    // Reconciliation fields from unique_camera instrume suffix reconciliation
     pub frames_renamed: usize,
     pub calibration_sets_deleted: usize,
     pub sessions_updated: usize,
@@ -226,7 +226,7 @@ pub async fn start_scan_with_progress(
     }
 
     // Gather everything needed before entering the blocking task
-    let scan_result = {
+    let (scan_result, reconcile) = {
         let lock = state.ctx.db.lock().unwrap();
         let db = lock.as_ref().ok_or_else(|| {
             // Clean up active scan registration on early error
@@ -235,6 +235,14 @@ pub async fn start_scan_with_progress(
             (StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string())
         })?;
         let conn = db.conn();
+
+        // Reconcile unique_camera instrume suffix state before scanning
+        let reconcile = db::reconcile_unique_camera_instrume(&conn, root_id)
+            .map_err(|e| {
+                let mut scans = state.ctx.active_scans.lock().unwrap();
+                scans.remove(&root_id);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Reconciliation failed: {}", e))
+            })?;
 
         let roots = db::get_scan_roots(&conn).map_err(|e| {
             let mut scans = state.ctx.active_scans.lock().unwrap();
@@ -260,7 +268,7 @@ pub async fn start_scan_with_progress(
         // scan_directory_parallel holds the Connection reference for its full
         // duration, so it must run while the DB lock is held. The lock is
         // released when `lock` drops at the end of this block.
-        let result = scan_directory_parallel(
+        let mut result = scan_directory_parallel(
             Path::new(&root.path),
             root_id,
             &conn,
@@ -270,6 +278,17 @@ pub async fn start_scan_with_progress(
             root.unique_camera,
         );
 
+        // If reconciliation changed frames, wipe and rebuild calibration sets
+        if reconcile.frames_renamed > 0 {
+            if let Err(e) = db::delete_calibration_sets_for_root(&conn, root_id) {
+                eprintln!("Failed to delete cal sets for root {}: {}", root_id, e);
+            }
+            match recreate_calibration_sets_for_root(&conn, root_id) {
+                Ok(count) => result.calibration_sets_created = count,
+                Err(e) => eprintln!("Failed to recreate cal sets for root {}: {}", root_id, e),
+            }
+        }
+
         // Persist last-scan timestamp and any errors
         if let Err(e) = db::update_scan_root_timestamp(&conn, root_id) {
             eprintln!("Failed to update scan root timestamp for root {}: {}", root_id, e);
@@ -278,7 +297,7 @@ pub async fn start_scan_with_progress(
             eprintln!("Failed to persist scan errors for root {}: {}", root_id, e);
         }
 
-        result
+        (result, reconcile)
     };
 
     // Deregister the active scan
@@ -299,9 +318,9 @@ pub async fn start_scan_with_progress(
         darkflats_count: scan_result.darkflats_count,
         calibration_sets_created: scan_result.calibration_sets_created,
         cancelled: scan_result.cancelled,
-        frames_renamed: 0,
-        calibration_sets_deleted: 0,
-        sessions_updated: 0,
+        frames_renamed: reconcile.frames_renamed,
+        calibration_sets_deleted: reconcile.calibration_sets_deleted,
+        sessions_updated: reconcile.sessions_updated,
     }))
 }
 
@@ -490,4 +509,76 @@ pub async fn get_active_scans(
 ) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
     let scans = state.ctx.active_scans.lock().unwrap();
     Ok(Json(scans.keys().cloned().collect()))
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Query calibration frame IDs under a scan root and recreate calibration sets.
+/// Mirrors `recreate_calibration_sets_for_root` in athenaeum-tauri.
+fn recreate_calibration_sets_for_root(
+    conn: &rusqlite::Connection,
+    root_id: i64,
+) -> Result<usize, String> {
+    use athenaeum_core::calibration::scan_integration::{
+        create_calibration_sets_from_scan_with_masters, MasterFrameIds,
+    };
+
+    let root_path: String = conn.query_row(
+        "SELECT path FROM scan_roots WHERE id = ?1",
+        rusqlite::params![root_id],
+        |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+
+    let like_pattern = format!("{}%", root_path);
+
+    let mut stmt = conn.prepare(
+        "SELECT fr.id, fr.imagetyp FROM frames fr
+         JOIN files f ON fr.file_id = f.id
+         WHERE f.path LIKE ?1
+           AND fr.imagetyp IN ('Flat','Dark','Bias','DarkFlat','MasterFlat','MasterDark','MasterBias','MasterDarkFlat')"
+    ).map_err(|e| e.to_string())?;
+
+    let mut flat_ids = Vec::new();
+    let mut dark_ids = Vec::new();
+    let mut bias_ids = Vec::new();
+    let mut darkflat_ids = Vec::new();
+    let mut master_ids = MasterFrameIds::default();
+
+    let rows = stmt.query_map(rusqlite::params![like_pattern], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    }).map_err(|e| e.to_string())?;
+
+    for row in rows {
+        let (frame_id, imagetyp) = row.map_err(|e| e.to_string())?;
+        match imagetyp.as_str() {
+            "Flat" => flat_ids.push(frame_id),
+            "Dark" => dark_ids.push(frame_id),
+            "Bias" => bias_ids.push(frame_id),
+            "DarkFlat" => darkflat_ids.push(frame_id),
+            "MasterFlat" => master_ids.master_flat_ids.push(frame_id),
+            "MasterDark" => master_ids.master_dark_ids.push(frame_id),
+            "MasterBias" => master_ids.master_bias_ids.push(frame_id),
+            "MasterDarkFlat" => master_ids.master_darkflat_ids.push(frame_id),
+            _ => {}
+        }
+    }
+
+    let total_cal_frames = flat_ids.len() + dark_ids.len() + bias_ids.len()
+        + darkflat_ids.len() + master_ids.total_count();
+
+    if total_cal_frames == 0 {
+        return Ok(0);
+    }
+
+    eprintln!(
+        "Recreating calibration sets for root {}: {} flats, {} darks, {} bias, {} darkflats, {} masters",
+        root_id, flat_ids.len(), dark_ids.len(), bias_ids.len(),
+        darkflat_ids.len(), master_ids.total_count()
+    );
+
+    let scan_result = create_calibration_sets_from_scan_with_masters(
+        conn, flat_ids, dark_ids, bias_ids, darkflat_ids, master_ids,
+    ).map_err(|e| e.to_string())?;
+
+    Ok(scan_result.sets_created as usize)
 }

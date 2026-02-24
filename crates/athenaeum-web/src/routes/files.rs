@@ -309,6 +309,9 @@ pub async fn get_files_with_frames_by_ids(
 #[derive(serde::Deserialize)]
 pub struct BrowseDirectoriesArgs {
     pub path: Option<String>,
+    /// `"scan"` (default) validates against `allowed_paths`;
+    /// `"export"` validates against the configured export directory.
+    pub scope: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -327,18 +330,31 @@ pub struct BrowseDirectoriesResponse {
 /// POST /api/browse_directories
 ///
 /// Returns subdirectories of the given path. If path is empty or omitted,
-/// returns the allowed paths as top-level entries. All paths are validated
-/// against `state.allowed_paths`.
+/// returns the root entries for the requested scope.
+///
+/// `scope = "scan"` (default): validates against `state.allowed_paths`.
+/// `scope = "export"`: validates against the configured export directory.
 pub async fn browse_directories(
     State(state): State<WebAppState>,
     Json(args): Json<BrowseDirectoriesArgs>,
 ) -> Result<Json<BrowseDirectoriesResponse>, (StatusCode, String)> {
     let path_str = args.path.unwrap_or_default();
+    let scope = args.scope.as_deref().unwrap_or("scan");
 
-    // If no path provided, return allowed paths as top-level entries
+    // Resolve the set of root paths for this scope
+    let root_paths: Vec<PathBuf> = match scope {
+        "export" => {
+            match state.export_dir {
+                Some(ref dir) => vec![dir.clone()],
+                None => return Err((StatusCode::BAD_REQUEST, "No export directory configured".to_string())),
+            }
+        }
+        _ => state.allowed_paths.clone(),
+    };
+
+    // If no path provided, return root paths as top-level entries
     if path_str.is_empty() || path_str == "/" {
-        let directories: Vec<BrowseDirectoryEntry> = state
-            .allowed_paths
+        let directories: Vec<BrowseDirectoryEntry> = root_paths
             .iter()
             .filter(|p| p.is_dir())
             .map(|p| {
@@ -362,8 +378,8 @@ pub async fn browse_directories(
         .canonicalize()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
 
-    // Security: validate path is within allowed_paths
-    let is_allowed = state.allowed_paths.iter().any(|allowed| {
+    // Security: validate path is within scope roots
+    let is_allowed = root_paths.iter().any(|allowed| {
         allowed.canonicalize().map(|a| canonical.starts_with(&a)).unwrap_or(false)
     });
 
@@ -394,14 +410,14 @@ pub async fn browse_directories(
 
     let parent = canonical.parent().and_then(|p| {
         let parent_str = p.to_string_lossy().to_string();
-        // Only return parent if it's still within an allowed path
-        let parent_within = state.allowed_paths.iter().any(|allowed| {
+        // Only return parent if it's still within a scope root
+        let parent_within = root_paths.iter().any(|allowed| {
             allowed.canonicalize().map(|a| p.starts_with(&a)).unwrap_or(false)
         });
         if parent_within {
             Some(parent_str)
         } else {
-            // Parent is at or above an allowed root — go back to root listing
+            // Parent is at or above a root — go back to root listing
             None
         }
     });

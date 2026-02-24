@@ -645,6 +645,14 @@ pub async fn export_to_wbpp(
     Ok(Json(result))
 }
 
+/// Returns the configured export directory path, or null if not set.
+pub async fn get_export_dir(
+    State(state): State<WebAppState>,
+    Json(_args): Json<serde_json::Value>,
+) -> Json<Option<String>> {
+    Json(state.export_dir.as_ref().map(|p| p.to_string_lossy().to_string()))
+}
+
 /// Cancel an active export operation.
 pub async fn cancel_export(
     State(state): State<WebAppState>,
