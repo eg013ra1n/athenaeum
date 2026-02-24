@@ -547,6 +547,23 @@ pub async fn export_to_wbpp(
 
     let output_path = PathBuf::from(&args.output_dir);
 
+    // Validate output path is within the configured export directory
+    if let Some(ref export_dir) = state.export_dir {
+        if !output_path.starts_with(export_dir) {
+            return Ok(Json(ExportResult {
+                success: false,
+                output_dir: args.output_dir.clone(),
+                files_organized: 0,
+                scripts_generated: Vec::new(),
+                warnings: Vec::new(),
+                error: Some(format!(
+                    "Export path must be within {}",
+                    export_dir.display()
+                )),
+            }));
+        }
+    }
+
     // Run the file organizer (no DB lock held during file operations)
     let was_cancelled = cancel_flag.load(Ordering::Relaxed);
     let result = if was_cancelled {

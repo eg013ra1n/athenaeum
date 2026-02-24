@@ -16,6 +16,7 @@ struct Config {
     port: u16,
     static_dir: Option<PathBuf>,
     allowed_paths: Vec<PathBuf>,
+    export_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -35,6 +36,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from)
                 .collect(),
+            export_dir: std::env::var("ATHENAEUM_EXPORT_DIR").ok().map(PathBuf::from),
         }
     }
 }
@@ -45,6 +47,7 @@ pub struct WebAppState {
     pub ctx: Arc<ServiceContext>,
     pub event_tx: tokio::sync::broadcast::Sender<events::SseEvent>,
     pub allowed_paths: Vec<PathBuf>,
+    pub export_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -61,6 +64,9 @@ async fn main() {
     }
     if !config.allowed_paths.is_empty() {
         println!("  Allowed:  {:?}", config.allowed_paths);
+    }
+    if let Some(ref dir) = config.export_dir {
+        println!("  Export:   {}", dir.display());
     }
 
     // Ensure DB parent directory exists
@@ -93,25 +99,6 @@ async fn main() {
         image_pool: Arc::new(image_pool),
     });
 
-    // Auto-register allowed paths as scan roots
-    {
-        let db_lock = ctx.db.lock().unwrap();
-        if let Some(ref db) = *db_lock {
-            let conn = db.conn();
-            for path in &config.allowed_paths {
-                if path.is_dir() {
-                    let path_str = path.to_string_lossy();
-                    match athenaeum_core::db::upsert_scan_root(&conn, &path_str) {
-                        Ok(id) => println!("  Scan root registered: {} (id={})", path_str, id),
-                        Err(e) => eprintln!("  Warning: failed to register {}: {}", path_str, e),
-                    }
-                } else {
-                    eprintln!("  Warning: allowed path not found: {}", path.display());
-                }
-            }
-        }
-    }
-
     // SSE broadcast channel
     let (event_tx, _) = tokio::sync::broadcast::channel::<events::SseEvent>(256);
 
@@ -119,6 +106,7 @@ async fn main() {
         ctx,
         event_tx,
         allowed_paths: config.allowed_paths,
+        export_dir: config.export_dir,
     };
 
     // Build router

@@ -68,6 +68,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_camera_directory_contents", post(files::get_camera_directory_contents))
         .route("/api/get_frames_with_missing_metadata", post(files::get_frames_with_missing_metadata))
         .route("/api/get_files_with_frames_by_ids", post(files::get_files_with_frames_by_ids))
+        .route("/api/browse_directories", post(files::browse_directories))
         // Settings
         .route("/api/get_setting", post(settings::get_setting))
         .route("/api/set_setting", post(settings::set_setting))

@@ -228,10 +228,13 @@ export function useScanRootsWithAvailability() {
     fetchScanRootsWithAvailability();
   }, [fetchScanRootsWithAvailability]);
 
+  const clearError = useCallback(() => setError(null), []);
+
   return {
     scanRoots,
     loading,
     error,
+    clearError,
     addScanRoot,
     deleteScanRoot,
     toggleDuplicatesFlag,

@@ -12,13 +12,14 @@ import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { ScanSummaryModal } from '../components/ScanSummaryModal';
 import { MissingFilesPanel } from '../components/MissingFilesPanel';
+import { FolderBrowserModal } from '../components/FolderBrowserModal';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
 type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrument' | 'frametype';
 
 export default function FileManager() {
-  const { scanRoots, loading: rootsLoading, error: rootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, relinkScanRoot } = useScanRootsWithAvailability();
+  const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, relinkScanRoot } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning } = useScanProgressContext();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
@@ -79,6 +80,9 @@ export default function FileManager() {
   const [missingFilesMap, setMissingFilesMap] = useState<Record<number, MissingFileRecord[]>>({});
   const [expandedMissingPanels, setExpandedMissingPanels] = useState<Set<number>>(new Set());
   const [loadingMissingFiles, setLoadingMissingFiles] = useState<number | null>(null);
+
+  // Folder browser modal (web mode)
+  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
 
   // Data file locations state
   const [showDataPaths, setShowDataPaths] = useState(false);
@@ -190,14 +194,30 @@ export default function FileManager() {
 
   // Handle adding a new directory
   const handleAddDirectory = async () => {
-    try {
-      const selected = await pickDirectory();
-
-      if (selected && typeof selected === 'string') {
-        await addScanRoot(selected);
+    if (isTauri) {
+      try {
+        const selected = await pickDirectory();
+        if (selected && typeof selected === 'string') {
+          await addScanRoot(selected);
+        }
+      } catch (error) {
+        console.error('Failed to add directory:', error);
+        clearRootsError();
+        showAlert('Add Directory Failed', typeof error === 'string' ? error : 'Failed to add directory', 'error');
       }
+    } else {
+      setShowFolderBrowser(true);
+    }
+  };
+
+  // Handle folder browser selection (web mode)
+  const handleFolderBrowserSelect = async (path: string) => {
+    setShowFolderBrowser(false);
+    try {
+      await addScanRoot(path);
     } catch (error) {
       console.error('Failed to add directory:', error);
+      clearRootsError();
       showAlert('Add Directory Failed', typeof error === 'string' ? error : 'Failed to add directory', 'error');
     }
   };
@@ -393,16 +413,14 @@ export default function FileManager() {
         <div>
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-xl font-semibold">Monitored Directories</h3>
-            {isTauri && (
-              <button
-                onClick={handleAddDirectory}
-                disabled={rootsLoading}
-                className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <FolderPlus size={20} />
-                Add Directory
-              </button>
-            )}
+            <button
+              onClick={handleAddDirectory}
+              disabled={rootsLoading}
+              className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <FolderPlus size={20} />
+              Add Directory
+            </button>
           </div>
 
           {rootsLoading ? (
@@ -510,14 +528,12 @@ export default function FileManager() {
                           )}
                           {rootIsScanning ? 'Scanning...' : root.last_scan ? 'Rescan' : 'Scan'}
                         </button>
-                        {isTauri && (
-                          <button
-                            onClick={() => root.id && handleRemoveScanRoot(root.id)}
-                            className="text-error hover:text-error/90 p-2 rounded hover:bg-error-muted transition"
-                          >
-                            <Trash2 size={18} />
-                          </button>
-                        )}
+                        <button
+                          onClick={() => root.id && handleRemoveScanRoot(root.id)}
+                          className="text-error hover:text-error/90 p-2 rounded hover:bg-error-muted transition"
+                        >
+                          <Trash2 size={18} />
+                        </button>
                       </div>
                     </div>
 
@@ -1184,6 +1200,13 @@ export default function FileManager() {
           missingFilesCount={scanSummaryModal.missingFilesCount}
         />
       )}
+
+      {/* Folder Browser Modal (web mode) */}
+      <FolderBrowserModal
+        isOpen={showFolderBrowser}
+        onSelect={handleFolderBrowserSelect}
+        onClose={() => setShowFolderBrowser(false)}
+      />
     </div>
   );
 }

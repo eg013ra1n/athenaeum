@@ -4,7 +4,7 @@ use athenaeum_core::db;
 use athenaeum_core::models::FileWithFrame;
 use axum::{extract::State, http::StatusCode, Json};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::WebAppState;
 
@@ -302,4 +302,113 @@ pub async fn get_files_with_frames_by_ids(
             })
             .collect(),
     ))
+}
+
+// ── Browse directories (web-only) ──────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct BrowseDirectoriesArgs {
+    pub path: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct BrowseDirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct BrowseDirectoriesResponse {
+    pub current: String,
+    pub parent: Option<String>,
+    pub directories: Vec<BrowseDirectoryEntry>,
+}
+
+/// POST /api/browse_directories
+///
+/// Returns subdirectories of the given path. If path is empty or omitted,
+/// returns the allowed paths as top-level entries. All paths are validated
+/// against `state.allowed_paths`.
+pub async fn browse_directories(
+    State(state): State<WebAppState>,
+    Json(args): Json<BrowseDirectoriesArgs>,
+) -> Result<Json<BrowseDirectoriesResponse>, (StatusCode, String)> {
+    let path_str = args.path.unwrap_or_default();
+
+    // If no path provided, return allowed paths as top-level entries
+    if path_str.is_empty() || path_str == "/" {
+        let directories: Vec<BrowseDirectoryEntry> = state
+            .allowed_paths
+            .iter()
+            .filter(|p| p.is_dir())
+            .map(|p| {
+                let s = p.to_string_lossy().to_string();
+                BrowseDirectoryEntry {
+                    name: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| s.clone()),
+                    path: s,
+                }
+            })
+            .collect();
+
+        return Ok(Json(BrowseDirectoriesResponse {
+            current: "/".to_string(),
+            parent: None,
+            directories,
+        }));
+    }
+
+    let target = PathBuf::from(&path_str);
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
+
+    // Security: validate path is within allowed_paths
+    let is_allowed = state.allowed_paths.iter().any(|allowed| {
+        allowed.canonicalize().map(|a| canonical.starts_with(&a)).unwrap_or(false)
+    });
+
+    if !is_allowed {
+        return Err((StatusCode::FORBIDDEN, "Path is outside allowed directories".to_string()));
+    }
+
+    if !canonical.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "Path is not a directory".to_string()));
+    }
+
+    let mut directories = Vec::new();
+    let entries = fs::read_dir(&canonical)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read directory: {}", e)))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let metadata = entry.metadata().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if metadata.is_dir() {
+            let entry_path = entry.path();
+            directories.push(BrowseDirectoryEntry {
+                name: entry.file_name().to_string_lossy().to_string(),
+                path: entry_path.to_string_lossy().to_string(),
+            });
+        }
+    }
+    directories.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let parent = canonical.parent().and_then(|p| {
+        let parent_str = p.to_string_lossy().to_string();
+        // Only return parent if it's still within an allowed path
+        let parent_within = state.allowed_paths.iter().any(|allowed| {
+            allowed.canonicalize().map(|a| p.starts_with(&a)).unwrap_or(false)
+        });
+        if parent_within {
+            Some(parent_str)
+        } else {
+            // Parent is at or above an allowed root — go back to root listing
+            None
+        }
+    });
+
+    Ok(Json(BrowseDirectoriesResponse {
+        current: canonical.to_string_lossy().to_string(),
+        parent,
+        directories,
+    }))
 }

@@ -91,6 +91,16 @@ pub async fn add_scan_root(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve path: {}", e)))?;
     let path_str = canonical.to_string_lossy().to_string();
 
+    // Security: validate path is within allowed_paths (web mode sandboxing)
+    if !state.allowed_paths.is_empty() {
+        let is_allowed = state.allowed_paths.iter().any(|allowed| {
+            allowed.canonicalize().map(|a| canonical.starts_with(&a)).unwrap_or(false)
+        });
+        if !is_allowed {
+            return Err((StatusCode::FORBIDDEN, "Path is outside allowed directories".to_string()));
+        }
+    }
+
     let lock = state.ctx.db.lock().unwrap();
     let db = lock
         .as_ref()
