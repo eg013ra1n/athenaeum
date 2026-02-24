@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/core';
+import { api, type UnlistenFn } from '../api';
 import type { ExportProgressEvent, ExportCompleteEvent, ExportResult } from '../types/export';
 
 export interface ActiveExport {
@@ -21,23 +20,23 @@ export function useExportProgress() {
     let completeUnlisten: UnlistenFn;
 
     const setupListeners = async () => {
-      progressUnlisten = await listen<ExportProgressEvent>('export-progress', (event) => {
-        const { frameSetId } = event.payload;
+      progressUnlisten = await api.listen<ExportProgressEvent>('export-progress', (payload) => {
+        const { frameSetId } = payload;
         setActiveExports((prev) => {
           const updated = new Map(prev);
           const existing = updated.get(frameSetId);
           if (existing) {
             updated.set(frameSetId, {
               ...existing,
-              progress: event.payload,
+              progress: payload,
             });
           }
           return updated;
         });
       });
 
-      completeUnlisten = await listen<ExportCompleteEvent>('export-complete', (event) => {
-        const { frameSetId } = event.payload;
+      completeUnlisten = await api.listen<ExportCompleteEvent>('export-complete', (payload) => {
+        const { frameSetId } = payload;
         setActiveExports((prev) => {
           const updated = new Map(prev);
           const existing = updated.get(frameSetId);
@@ -47,12 +46,12 @@ export function useExportProgress() {
               isComplete: true,
               isCancelling: false,
               result: {
-                success: event.payload.success,
-                outputDir: event.payload.outputDir,
-                filesOrganized: event.payload.filesOrganized,
+                success: payload.success,
+                outputDir: payload.outputDir,
+                filesOrganized: payload.filesOrganized,
                 scriptsGenerated: [],
-                warnings: event.payload.warnings,
-                error: event.payload.error,
+                warnings: payload.warnings,
+                error: payload.error,
               },
               progress: null,
             });
@@ -72,7 +71,7 @@ export function useExportProgress() {
 
   const startExport = useCallback(
     async (frameSetId: number, outputDir: string, useSymlinks: boolean): Promise<ExportResult> => {
-      // Register export in state immediately (shows toast before invoke)
+      // Register export in state immediately (shows toast before api.invoke)
       flushSync(() => {
         setActiveExports((prev) => {
           const updated = new Map(prev);
@@ -92,7 +91,7 @@ export function useExportProgress() {
       await new Promise(resolve => setTimeout(resolve, 50));
 
       try {
-        const result = await invoke<ExportResult>('export_to_wbpp', {
+        const result = await api.invoke<ExportResult>('export_to_wbpp', {
           frameSetId,
           outputDir,
           useSymlinks,
@@ -142,7 +141,7 @@ export function useExportProgress() {
       return updated;
     });
     // Send cancel request to backend
-    await invoke('cancel_export', { frameSetId });
+    await api.invoke('cancel_export', { frameSetId });
   }, []);
 
   const dismissCompletedExport = useCallback((frameSetId: number) => {

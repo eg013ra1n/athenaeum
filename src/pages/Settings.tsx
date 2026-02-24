@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
 
@@ -51,7 +51,7 @@ export default function Settings() {
   useEffect(() => {
     loadSettings();
     loadCacheStats();
-    invoke<number>('get_blink_threads_max').then(setBlinkThreadsMax).catch(console.error);
+    api.invoke<number>('get_blink_threads_max').then(setBlinkThreadsMax).catch(console.error);
   }, []);
 
   const loadSettings = async () => {
@@ -62,47 +62,47 @@ export default function Settings() {
       const [
         value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, blinkThreadsVal, contentHash, contentHashRescanned
       ] = await Promise.all([
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
           defaultValue: '3.0',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'grouping.threshold.unit',
           defaultValue: 'deg',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'session_gap_threshold_hours',
           defaultValue: '6.0',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'rustafits.quality.thumbnail',
           defaultValue: '70',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'rustafits.quality.preview',
           defaultValue: '85',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'rustafits.quality.full',
           defaultValue: '95',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'blink.resolution',
           defaultValue: 'preview',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'blink.cache_mode',
           defaultValue: 'file',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'blink.threads',
           defaultValue: '4',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'duplicates.use_content_hash',
           defaultValue: 'false',
         }),
-        invoke<string>('get_setting', {
+        api.invoke<string>('get_setting', {
           key: 'duplicates.content_hash_rescanned',
           defaultValue: 'false',
         }),
@@ -172,47 +172,47 @@ export default function Settings() {
         setError(`Concurrent threads must be between 1 and ${blinkThreadsMax}`);
         return;
       }
-      await invoke('set_blink_threads', { threads: blinkThreadsNum });
+      await api.invoke('set_blink_threads', { threads: blinkThreadsNum });
 
       await Promise.all([
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'grouping.threshold.value',
           value: thresholdValue,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'grouping.threshold.unit',
           value: thresholdUnit,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'session_gap_threshold_hours',
           value: sessionGapHours,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'rustafits.quality.thumbnail',
           value: qualityThumbnail,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'rustafits.quality.preview',
           value: qualityPreview,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'rustafits.quality.full',
           value: qualityFull,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'blink.resolution',
           value: blinkResolution,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'blink.cache_mode',
           value: blinkCacheMode,
         }),
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'duplicates.use_content_hash',
           value: useContentHash ? 'true' : 'false',
         }),
         // Reset rescan flag when toggling content hash
-        invoke('set_setting', {
+        api.invoke('set_setting', {
           key: 'duplicates.content_hash_rescanned',
           value: useContentHash ? 'false' : 'false',
         }),
@@ -230,7 +230,7 @@ export default function Settings() {
 
   const loadCacheStats = async () => {
     try {
-      const stats = await invoke<CacheStats>('get_cache_stats');
+      const stats = await api.invoke<CacheStats>('get_cache_stats');
       setCacheStats(stats);
     } catch (err) {
       console.error('Failed to load cache stats:', err);
@@ -261,7 +261,7 @@ export default function Settings() {
       setError(null);
       setCacheSuccess(false);
 
-      await invoke('clear_image_cache');
+      await api.invoke('clear_image_cache');
 
       setCacheSuccess(true);
       setTimeout(() => setCacheSuccess(false), 3000);
@@ -298,7 +298,7 @@ export default function Settings() {
       setError(null);
       setBackfillSuccess(null);
 
-      const count = await invoke<number>('backfill_header_fingerprints');
+      const count = await api.invoke<number>('backfill_header_fingerprints');
       setBackfillSuccess(count);
       setTimeout(() => setBackfillSuccess(null), 5000);
     } catch (err) {
@@ -315,7 +315,7 @@ export default function Settings() {
       setError(null);
       setRescanSuccess(null);
 
-      const result = await invoke<{files_total: number, files_updated: number, files_skipped: number, files_missing: number, errors: string[]}>('rescan_all_for_content_hash');
+      const result = await api.invoke<{files_total: number, files_updated: number, files_skipped: number, files_missing: number, errors: string[]}>('rescan_all_for_content_hash');
 
       if (result.errors.length > 0) {
         setError(`Rescan completed with ${result.errors.length} errors. Check console for details.`);

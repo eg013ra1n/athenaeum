@@ -26,7 +26,7 @@ fn format_bytes(bytes: u64) -> String {
 /// Get cache statistics (for display in UI)
 #[tauri::command]
 pub async fn get_cache_stats(state: State<'_, AppState>) -> Result<CacheStats, String> {
-    let cache_mgr = state.cache.lock().unwrap().clone();
+    let cache_mgr = state.ctx.cache.lock().unwrap().clone();
 
     if let Some(cache_mgr) = cache_mgr {
         use tokio::runtime::Handle;
@@ -47,7 +47,7 @@ pub async fn get_cache_stats(state: State<'_, AppState>) -> Result<CacheStats, S
 pub async fn clear_image_cache(state: State<'_, AppState>) -> Result<String, String> {
     println!("🗑️  Clearing image cache...");
 
-    let cache_mgr = state.cache.lock().unwrap().clone();
+    let cache_mgr = state.ctx.cache.lock().unwrap().clone();
 
     let Some(cache_mgr) = cache_mgr else {
         return Err("Cache manager not available".to_string());
@@ -108,7 +108,7 @@ pub async fn repair_cache_database(
     let cache_dir = app_dir.join("cache").join("previews");
 
     // Hold the lock for the entire operation to prevent race conditions
-    let mut cache_lock = state.cache.lock().unwrap();
+    let mut cache_lock = state.ctx.cache.lock().unwrap();
 
     // Drop the old cache manager (closes the DB connection)
     *cache_lock = None;
@@ -128,7 +128,7 @@ pub async fn repair_cache_database(
     }
 
     // Recreate cache manager
-    match CacheManager::new(&app_dir, state.settings.clone(), state.image_pool.clone()) {
+    match CacheManager::new(&app_dir, state.ctx.settings.clone(), state.ctx.image_pool.clone()) {
         Ok(cache_mgr) => {
             *cache_lock = Some(Arc::new(cache_mgr));
             let msg = "Cache database repaired successfully".to_string();
@@ -148,7 +148,7 @@ pub async fn repair_cache_database(
 pub async fn check_cache_integrity(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let cache_mgr = state.cache.lock().unwrap().clone();
+    let cache_mgr = state.ctx.cache.lock().unwrap().clone();
 
     let Some(cache_mgr) = cache_mgr else {
         return Err("Cache manager not available".to_string());

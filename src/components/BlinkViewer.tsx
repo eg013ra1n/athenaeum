@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../api';
 import {
   X,
   Loader2,
@@ -123,7 +123,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setError(null);
 
     try {
-      const imageData = await invoke<Uint8Array>("read_fits_image_rustafits", {
+      const imageData = await api.invoke<Uint8Array>("read_fits_image_rustafits", {
         path: frame.file.path,
       });
 
@@ -493,7 +493,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       const ids = frames.map((f) => f.file.id).filter((id): id is number => id != null);
       if (ids.length === 0) return;
       try {
-        const blackholed = await invoke<number[]>('get_blackholed_file_ids', { fileIds: ids });
+        const blackholed = await api.invoke<number[]>('get_blackholed_file_ids', { fileIds: ids });
         setBlackholedFileIds(new Set(blackholed));
       } catch (err) {
         console.error('Failed to check blackhole status:', err);
@@ -651,7 +651,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       const frame = fitsFrames[index];
       if (!frame?.file?.id) continue;
       try {
-        await invoke('move_to_black_hole', { fileId: frame.file.id, fromWhere: sourceType });
+        await api.invoke('move_to_black_hole', { fileId: frame.file.id, fromWhere: sourceType });
         blackholedIds.push(frame.file.id);
       } catch (err) {
         errors.push(`${frame.file.filename}: ${err}`);
@@ -685,7 +685,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
     for (const id of toRestore) {
       try {
-        await invoke('restore_from_black_hole', { fileId: id });
+        await api.invoke('restore_from_black_hole', { fileId: id });
         restored.push(id);
       } catch (err) {
         errors.push(`${id}: ${err}`);

@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { api } from '../api';
+import { openUrl } from '../api/desktop';
 import { RefreshCw, Download, CheckCircle2, AlertCircle, Info, ExternalLink } from 'lucide-react';
 
 interface UpdateInfo {
@@ -55,7 +55,7 @@ function UpdateSection() {
     setCheckError(null);
     setUpdateInfo(null);
     try {
-      const info = await invoke<UpdateInfo>('check_for_updates');
+      const info = await api.invoke<UpdateInfo>('check_for_updates');
       setUpdateInfo(info);
     } catch (err) {
       const msg = typeof err === 'string' ? err : 'Failed to check for updates';

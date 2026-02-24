@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../../api';
 import {
   Save,
   RefreshCw,
@@ -46,7 +46,7 @@ export default function CalibrationMatchingConfig() {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<ConfigType>("get_calibration_matching_config");
+      const result = await api.invoke<ConfigType>("get_calibration_matching_config");
       setConfig(result);
     } catch (err) {
       setError(String(err));
@@ -64,7 +64,7 @@ export default function CalibrationMatchingConfig() {
       setError(null);
       setSuccess(false);
 
-      await invoke("set_calibration_matching_config", { config });
+      await api.invoke("set_calibration_matching_config", { config });
 
       setSuccess(true);
       setTimeout(() => setSuccess(false), 3000);
@@ -80,7 +80,7 @@ export default function CalibrationMatchingConfig() {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<ConfigType>("reset_calibration_matching_config");
+      const result = await api.invoke<ConfigType>("reset_calibration_matching_config");
       setConfig(result);
     } catch (err) {
       setError(String(err));

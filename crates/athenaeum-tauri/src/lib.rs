@@ -1,22 +1,28 @@
-// Core modules
-mod models;
-mod db;
-mod fits_parser;
-mod scanner;
-mod duplicates;
-mod calibration;
-mod settings;
-mod coordinates;
-mod clustering;
-mod sessions;
-mod cache;
-mod rustafits_processor;
-mod fingerprint;
-mod relinking;
-mod frames_set_metadata;
-mod frames_set_merge;
-mod export;
-pub mod logging;
+// Re-export modules from athenaeum-core
+pub use athenaeum_core::models;
+pub use athenaeum_core::coordinates;
+pub use athenaeum_core::fingerprint;
+pub use athenaeum_core::db;
+pub use athenaeum_core::fits_parser;
+pub use athenaeum_core::clustering;
+pub use athenaeum_core::settings;
+pub use athenaeum_core::sessions;
+pub use athenaeum_core::duplicates;
+pub use athenaeum_core::relinking;
+pub use athenaeum_core::frames_set_metadata;
+pub use athenaeum_core::frames_set_merge;
+pub use athenaeum_core::logging;
+pub use athenaeum_core::calibration;
+
+pub use athenaeum_core::scanner;
+pub use athenaeum_core::events;
+pub use athenaeum_core::export;
+pub use athenaeum_core::rustafits_processor;
+pub use athenaeum_core::cache;
+
+// Tauri-specific modules
+pub mod tauri_events;
+
 
 // Commands (Tauri API endpoints)
 mod commands;
@@ -24,6 +30,7 @@ mod commands_rustafits;
 
 use cache::{CacheManager, MemoryImageCache};
 use commands::AppState;
+use athenaeum_core::services::ServiceContext;
 use settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,18 +55,20 @@ pub fn run() {
             let default_permits = 4usize;
             println!("🧵 CPU cores cap: {}, default blink semaphore permits: {}", max_threads, default_permits);
             AppState {
-                db: Mutex::new(None),
-                settings: Arc::new(SettingsManager::new()),
-                cache: Arc::new(Mutex::new(None)),
-                memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
-                active_scans: Arc::new(Mutex::new(HashMap::new())),
-                active_exports: Arc::new(Mutex::new(HashMap::new())),
-                image_pool: Arc::new(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(max_threads)
-                        .build()
-                        .expect("Failed to create image processing thread pool"),
-                ),
+                ctx: ServiceContext {
+                    db: Mutex::new(None),
+                    settings: Arc::new(SettingsManager::new()),
+                    cache: Arc::new(Mutex::new(None)),
+                    memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
+                    active_scans: Arc::new(Mutex::new(HashMap::new())),
+                    active_exports: Arc::new(Mutex::new(HashMap::new())),
+                    image_pool: Arc::new(
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(max_threads)
+                            .build()
+                            .expect("Failed to create image processing thread pool"),
+                    ),
+                },
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),
                 )),
@@ -73,9 +82,9 @@ pub fn run() {
 
             // Get app data directory for cache
             if let Ok(app_dir) = app_handle.path().app_data_dir() {
-                match CacheManager::new(&app_dir, state.settings.clone(), state.image_pool.clone()) {
+                match CacheManager::new(&app_dir, state.ctx.settings.clone(), state.ctx.image_pool.clone()) {
                     Ok(cache_mgr) => {
-                        *state.cache.lock().unwrap() = Some(Arc::new(cache_mgr));
+                        *state.ctx.cache.lock().unwrap() = Some(Arc::new(cache_mgr));
                         println!("✅ Cache manager initialized");
                     }
                     Err(e) => {

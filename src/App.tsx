@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from './api';
 import Layout from './components/Layout';
 import WelcomeScreen from './components/WelcomeScreen';
 import FileManager from './pages/FileManager';
@@ -22,7 +22,7 @@ function App() {
   useEffect(() => {
     const initializeDb = async () => {
       try {
-        await invoke('initialize_database');
+        await api.invoke('initialize_database');
         setDbInitialized(true);
       } catch (error) {
         console.error('Failed to initialize database:', error);

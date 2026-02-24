@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import type {
   ExportData,
   ExportableFrameSet,
@@ -32,7 +32,7 @@ export function useExportData(frameSetId: number | null): UseExportDataResult {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<ExportData>('get_export_preview', {
+      const result = await api.invoke<ExportData>('get_export_preview', {
         frameSetId,
       });
       setData(result);
@@ -70,7 +70,7 @@ export function useExportableFrameSets(): UseExportableFrameSetsResult {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<ExportableFrameSet[]>('get_exportable_frame_sets');
+      const result = await api.invoke<ExportableFrameSet[]>('get_exportable_frame_sets');
       setFrameSets(result);
     } catch (err) {
       setError(err as string);
@@ -112,7 +112,7 @@ export function useCalibrationRoute(frameSetId: number | null): UseCalibrationRo
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<CalibrationRoute>('get_calibration_route', {
+      const result = await api.invoke<CalibrationRoute>('get_calibration_route', {
         frameSetId,
       });
       setRoute(result);
@@ -156,7 +156,7 @@ export function useExportSummary(frameSetId: number | null): UseExportSummaryRes
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<ExportSummary>('get_export_summary', {
+      const result = await api.invoke<ExportSummary>('get_export_summary', {
         frameSetId,
       });
       setSummary(result);
@@ -196,7 +196,7 @@ export function useWbppConfig(): UseWbppConfigResult {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<WbppExportConfig>('get_wbpp_export_config');
+      const result = await api.invoke<WbppExportConfig>('get_wbpp_export_config');
       setConfig(result);
     } catch (err) {
       setError(err as string);
@@ -212,7 +212,7 @@ export function useWbppConfig(): UseWbppConfigResult {
   const save = useCallback(async (newConfig: WbppExportConfig) => {
     try {
       setError(null);
-      const result = await invoke<WbppExportConfig>('set_wbpp_export_config', { config: newConfig });
+      const result = await api.invoke<WbppExportConfig>('set_wbpp_export_config', { config: newConfig });
       setConfig(result);
     } catch (err) {
       setError(err as string);
@@ -222,7 +222,7 @@ export function useWbppConfig(): UseWbppConfigResult {
   const reset = useCallback(async () => {
     try {
       setError(null);
-      const result = await invoke<WbppExportConfig>('reset_wbpp_export_config');
+      const result = await api.invoke<WbppExportConfig>('reset_wbpp_export_config');
       setConfig(result);
     } catch (err) {
       setError(err as string);

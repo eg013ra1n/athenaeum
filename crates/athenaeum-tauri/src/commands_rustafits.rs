@@ -27,7 +27,7 @@ pub async fn read_fits_image_rustafits(
 
     // ── Step 1: Read settings from DB (separate mutex, held <100μs) ──
     let (resolution_str, cache_mode, quality, file_info) = {
-        let state_lock = state.db.lock().unwrap();
+        let state_lock = state.ctx.db.lock().unwrap();
         if let Some(db) = state_lock.as_ref() {
             let conn = db.conn();
             let res_str = if let Some(res_param) = resolution.as_deref() {
@@ -116,7 +116,7 @@ pub async fn read_fits_image_rustafits(
 
         // Fast path: cache hit returns instantly, no semaphore needed
         {
-            let mut mem_cache = state.memory_cache.lock().unwrap();
+            let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
             if let Some(cached) = mem_cache.get(&cache_key) {
                 println!("⚡ Memory cache hit (fast path, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
                 return Ok(cached.data.clone());
@@ -136,7 +136,7 @@ pub async fn read_fits_image_rustafits(
 
         // Double-check cache — another request may have filled it while we waited
         {
-            let mut mem_cache = state.memory_cache.lock().unwrap();
+            let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
             if let Some(cached) = mem_cache.get(&cache_key) {
                 println!("⚡ Memory cache hit (after semaphore, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
                 return Ok(cached.data.clone());
@@ -145,7 +145,7 @@ pub async fn read_fits_image_rustafits(
 
         // Cache miss — process FITS to JPEG (same pipeline as file mode)
         println!("⏳ Memory cache miss, processing...");
-        let result = rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.image_pool)
+        let result = rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.ctx.image_pool)
             .map_err(|e| {
                 let error_msg = format!("Failed to process FITS image: {}", e);
                 eprintln!("ERROR: {}", error_msg);
@@ -156,7 +156,7 @@ pub async fn read_fits_image_rustafits(
 
         // Insert JPEG bytes into memory cache
         {
-            let mut mem_cache = state.memory_cache.lock().unwrap();
+            let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
             mem_cache.insert(cache_key, CachedImage { data: jpeg_data.clone() });
         }
 
@@ -166,7 +166,7 @@ pub async fn read_fits_image_rustafits(
 
     // ── Step 3: File mode — disk-based JPEG cache ──
     // Fast path: check disk cache BEFORE acquiring semaphore
-    let cache_mgr = state.cache.lock().unwrap().clone();
+    let cache_mgr = state.ctx.cache.lock().unwrap().clone();
 
     if let Some(ref cache_mgr) = cache_mgr {
         if let Some(ref file) = file_info {
@@ -267,7 +267,7 @@ pub async fn read_fits_image_rustafits(
     // Fallback: Direct processing without cache
     println!("⚠️  Processing without cache...");
 
-    let result = rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.image_pool)
+    let result = rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.ctx.image_pool)
         .map_err(|e| {
             let error_msg = format!("Failed to process FITS image: {}", e);
             eprintln!("ERROR: {}", error_msg);

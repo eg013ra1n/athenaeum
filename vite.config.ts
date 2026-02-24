@@ -12,7 +12,7 @@ export default defineConfig(async () => ({
   define: {
     __APP_VERSION__: JSON.stringify(process.env.npm_package_version || '0.1.0'),
     __GIT_COMMIT__: JSON.stringify(
-      execSync('git rev-parse --short HEAD').toString().trim()
+      (() => { try { return execSync('git rev-parse --short HEAD').toString().trim(); } catch { return 'unknown'; } })()
     ),
   },
 
@@ -38,8 +38,8 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching Rust crates
+      ignored: ["**/crates/**", "**/target/**"],
     },
   },
 }));

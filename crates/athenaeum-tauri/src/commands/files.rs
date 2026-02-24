@@ -13,7 +13,7 @@ pub async fn get_files(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -32,7 +32,7 @@ pub async fn get_files_by_directory(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -51,7 +51,7 @@ pub async fn get_frames_with_missing_metadata(
     category: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -66,12 +66,12 @@ pub async fn get_frames_with_missing_metadata(
 /// Get duplicate file groups (from cache)
 #[tauri::command]
 pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateGroup>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Check setting to determine which hash type to use
-    let use_content_hash = state.settings
+    let use_content_hash = state.ctx.settings
         .get_duplicates_use_content_hash(&conn)
         .unwrap_or(false);
 
@@ -113,7 +113,7 @@ pub async fn get_directory_contents(
 
     // Get files from database for this directory
     println!("📂 get_directory_contents acquiring lock for {}", directory_path);
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     println!("📂 get_directory_contents lock acquired for {}", directory_path);
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -141,7 +141,7 @@ pub async fn get_orphaned_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::OrphanedFile>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -155,7 +155,7 @@ pub async fn delete_orphaned_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -174,7 +174,7 @@ pub async fn get_frame_preview(
 
     // Get file path for this frame
     let file_path: String = {
-        let state_lock = state.db.lock().unwrap();
+        let state_lock = state.ctx.db.lock().unwrap();
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
 
@@ -209,7 +209,7 @@ pub async fn get_files_with_frames_by_ids(
     frame_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -251,7 +251,7 @@ pub async fn get_camera_directories(
     instrume: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -296,7 +296,7 @@ pub async fn get_camera_directory_contents(
     }
 
     // Get files from database filtered by camera
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 

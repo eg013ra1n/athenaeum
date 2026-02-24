@@ -4,7 +4,7 @@ import DarkLibrary, { LibraryStats } from "./DarkLibrary";
 import MasterDarkLibrary from "./MasterDarkLibrary";
 import MasterFlatLibrary from "./MasterFlatLibrary";
 import DirectoryTree from "./DirectoryTree";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../api';
 import { ImageType } from "../types/models";
 import { useScanRootsWithAvailability } from "../hooks/useTauri";
 import { format } from "date-fns";
@@ -43,7 +43,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
   useEffect(() => {
     const loadDirs = async () => {
       try {
-        const dirs = await invoke<string[]>('get_camera_directories', { instrume });
+        const dirs = await api.invoke<string[]>('get_camera_directories', { instrume });
         setCameraDirectories(dirs);
       } catch (err) {
         console.error('Failed to load camera directories:', err);
@@ -62,7 +62,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
       setError(null);
       setSuccessMessage(null);
 
-      const result = await invoke<CalibrationScanResult>("refresh_calibration_library_for_camera", { instrume });
+      const result = await api.invoke<CalibrationScanResult>("refresh_calibration_library_for_camera", { instrume });
 
       // Build success message
       const masterTotal = result.master_dark_sets_created + result.master_flat_sets_created +

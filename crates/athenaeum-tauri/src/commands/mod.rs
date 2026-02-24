@@ -3,34 +3,17 @@
 // This module structure replaces the monolithic commands.rs file (2,878 lines)
 // with focused, domain-specific modules for better maintainability.
 
-use crate::cache::{CacheManager, MemoryImageCache};
-use crate::db::Database;
-use crate::settings::SettingsManager;
-use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
-/// Handle to track an active scan operation
-pub struct ScanHandle {
-    #[allow(dead_code)] // Kept for debugging - HashMap key already provides root_id
-    pub root_id: i64,
-    pub cancel_flag: Arc<AtomicBool>,
-}
+// Re-export core service types so commands can use them directly
+pub use athenaeum_core::services::{ServiceContext, ScanHandle, ExportHandle};
 
-/// Handle to track an active export operation
-pub struct ExportHandle {
-    pub cancel_flag: Arc<AtomicBool>,
-}
-
-/// App state containing database connection, settings manager, cache manager, and active scans
+/// Tauri-specific app state wrapping the shared ServiceContext.
+///
+/// The `ctx` field holds all backend-agnostic state. Tauri-only fields
+/// (semaphore, max_blink_threads) live here alongside it.
 pub struct AppState {
-    pub db: Mutex<Option<Database>>,
-    pub settings: Arc<SettingsManager>,
-    pub cache: Arc<Mutex<Option<Arc<CacheManager>>>>,
-    pub memory_cache: Arc<Mutex<MemoryImageCache>>,
-    pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
-    pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,
-    pub image_pool: Arc<rayon::ThreadPool>,
+    pub ctx: ServiceContext,
     /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
     /// can be swapped at runtime when the user changes blink.threads.
     pub image_semaphore: RwLock<Arc<tokio::sync::Semaphore>>,

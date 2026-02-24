@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
+import { api } from '../api';
+import { pickFile } from '../api/desktop';
 import {
   AlertTriangle,
   RefreshCw,
@@ -49,7 +49,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
   const handleRecheckAll = async () => {
     setIsRechecking(true);
     try {
-      await invoke('recheck_missing_files', { rootId });
+      await api.invoke('recheck_missing_files', { rootId });
       onRefresh();
     } catch (error) {
       console.error('Failed to recheck missing files:', error);
@@ -61,7 +61,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
   const handleIgnore = async (fileId: number) => {
     setActionInProgress(fileId);
     try {
-      await invoke('ignore_missing_file', { fileId });
+      await api.invoke('ignore_missing_file', { fileId });
       onRefresh();
     } catch (error) {
       console.error('Failed to ignore file:', error);
@@ -73,7 +73,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
   const handleUnignore = async (fileId: number) => {
     setActionInProgress(fileId);
     try {
-      await invoke('unignore_missing_file', { fileId });
+      await api.invoke('unignore_missing_file', { fileId });
       onRefresh();
     } catch (error) {
       console.error('Failed to unignore file:', error);
@@ -85,7 +85,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
   const handleDelete = async (fileId: number) => {
     setActionInProgress(fileId);
     try {
-      await invoke('delete_missing_files', { fileIds: [fileId] });
+      await api.invoke('delete_missing_files', { fileIds: [fileId] });
       onRefresh();
     } catch (error) {
       console.error('Failed to delete file:', error);
@@ -98,7 +98,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
     if (selectedIds.size === 0) return;
     setIsDeleting(true);
     try {
-      await invoke('delete_missing_files', { fileIds: Array.from(selectedIds) });
+      await api.invoke('delete_missing_files', { fileIds: Array.from(selectedIds) });
       setSelectedIds(new Set());
       onRefresh();
     } catch (error) {
@@ -112,7 +112,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
     if (selectedIds.size === 0) return;
     try {
       for (const fileId of selectedIds) {
-        await invoke('ignore_missing_file', { fileId });
+        await api.invoke('ignore_missing_file', { fileId });
       }
       setSelectedIds(new Set());
       onRefresh();
@@ -123,7 +123,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
 
   const handleLocate = async (file: MissingFileRecord) => {
     try {
-      const selected = await open({
+      const selected = await pickFile({
         title: `Locate ${file.filename}`,
         filters: [
           { name: 'FITS/XISF Files', extensions: ['fits', 'fit', 'xisf'] },
@@ -133,7 +133,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
 
       if (selected && typeof selected === 'string') {
         setActionInProgress(file.file_id);
-        await invoke('relocate_missing_file', {
+        await api.invoke('relocate_missing_file', {
           fileId: file.file_id,
           newPath: selected,
         });

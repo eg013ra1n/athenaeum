@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2, RotateCw, FileX } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -70,7 +70,7 @@ export default function Objects() {
 
   const loadExcludedCount = async () => {
     try {
-      const count = await invoke<number>('get_excluded_frames_count');
+      const count = await api.invoke<number>('get_excluded_frames_count');
       setExcludedCount(count);
     } catch (err) {
       console.error('Failed to load excluded frames count:', err);
@@ -79,7 +79,7 @@ export default function Objects() {
 
   const loadViewMode = async () => {
     try {
-      const savedMode = await invoke<string>('get_setting', {
+      const savedMode = await api.invoke<string>('get_setting', {
         key: 'objects.view_mode',
         defaultValue: 'cards'
       });
@@ -94,7 +94,7 @@ export default function Objects() {
   const handleViewModeChange = async (mode: 'cards' | 'table') => {
     setViewMode(mode);
     try {
-      await invoke('set_setting', {
+      await api.invoke('set_setting', {
         key: 'objects.view_mode',
         value: mode
       });
@@ -105,11 +105,11 @@ export default function Objects() {
 
   const loadDefaultThreshold = async () => {
     try {
-      const valueStr = await invoke<string>('get_setting', {
+      const valueStr = await api.invoke<string>('get_setting', {
         key: 'grouping.threshold.value',
         defaultValue: '3.0'
       });
-      const unit = await invoke<string>('get_setting', {
+      const unit = await api.invoke<string>('get_setting', {
         key: 'grouping.threshold.unit',
         defaultValue: 'deg'
       });
@@ -147,7 +147,7 @@ export default function Objects() {
     try {
       setLoading(true);
       setError(null);
-      const sets = await invoke<FramesSetWithCount[]>('get_frames_sets', {
+      const sets = await api.invoke<FramesSetWithCount[]>('get_frames_sets', {
         projectId: PROJECT_ID,
       });
       setFrameSets(sets);
@@ -226,7 +226,7 @@ export default function Objects() {
         thresholdDeg = parsed;
       }
 
-      const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
+      const result = await api.invoke<AutoGenerateResult>('auto_generate_frame_sets', {
         projectId: PROJECT_ID,
         thresholdDeg,
       });
@@ -238,7 +238,7 @@ export default function Objects() {
 
       if (result.sets_created > 0) {
         // Reload frame sets
-        const updatedSets = await invoke<FramesSetWithCount[]>('get_frames_sets', {
+        const updatedSets = await api.invoke<FramesSetWithCount[]>('get_frames_sets', {
           projectId: PROJECT_ID,
         });
         setFrameSets(updatedSets);
@@ -266,7 +266,7 @@ export default function Objects() {
     setShowDeleteConfirm(false);
 
     try {
-      await invoke('delete_frames_set', { framesSetId: deleteTarget.id });
+      await api.invoke('delete_frames_set', { framesSetId: deleteTarget.id });
       await loadFrameSets();
     } catch (err) {
       setError(err as string);
@@ -293,7 +293,7 @@ export default function Objects() {
     }
 
     try {
-      await invoke('rename_frames_set', {
+      await api.invoke('rename_frames_set', {
         framesSetId: setId,
         newName: editingName.trim()
       });
@@ -308,7 +308,7 @@ export default function Objects() {
 
   const handleMarkAsCustom = async (setId: number) => {
     try {
-      await invoke('mark_frame_set_custom', {
+      await api.invoke('mark_frame_set_custom', {
         framesSetId: setId
       });
       await loadFrameSets();
@@ -329,7 +329,7 @@ export default function Objects() {
       setDeletingAutoSets(true);
       setError(null);
 
-      const deletedCount = await invoke<number>('delete_auto_generated_frame_sets');
+      const deletedCount = await api.invoke<number>('delete_auto_generated_frame_sets');
 
       // Reload frame sets to reflect deletions
       await loadFrameSets();
@@ -455,7 +455,7 @@ export default function Objects() {
     try {
       setMerging(true);
       setError(null);
-      await invoke('merge_frame_sets', {
+      await api.invoke('merge_frame_sets', {
         sourceId: pendingMerge.sourceId,
         targetId: pendingMerge.targetId
       });
@@ -481,7 +481,7 @@ export default function Objects() {
     try {
       setMerging(true);
       setError(null);
-      await invoke('merge_frame_sets', { sourceId, targetId });
+      await api.invoke('merge_frame_sets', { sourceId, targetId });
       await loadFrameSets();
       // Remove this suggestion from the list
       setSuggestedMerges(prev => prev.filter(s => s.sourceId !== sourceId));

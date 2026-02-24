@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback } from 'react';
 import { ChevronDown, ChevronRight, FolderOpen } from 'lucide-react';
-import { revealItemInDir } from '@tauri-apps/plugin-opener';
+import { revealItemInDir } from '../../api/desktop';
 import type { LightFrameWithCalibration } from '../../types/models';
 import { StatusIndicator } from './StatusIndicator';
 

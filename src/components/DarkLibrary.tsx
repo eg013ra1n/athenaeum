@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../api';
 import { ArrowLeft } from "lucide-react";
 import { CalibrationSetDetail, ImageType } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
@@ -60,10 +60,10 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
     try {
       setLoading(true);
       setError(null);
-      const hasLibrary = await invoke<boolean>("has_dark_library", { instrume });
+      const hasLibrary = await api.invoke<boolean>("has_dark_library", { instrume });
 
       if (hasLibrary) {
-        const result = await invoke<CalibrationSetDetail[]>("get_dark_library", { instrume });
+        const result = await api.invoke<CalibrationSetDetail[]>("get_dark_library", { instrume });
         setSets(result);
       } else {
         setSets([]);

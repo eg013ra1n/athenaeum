@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../../api';
 import { Settings, Eye, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import type { CalibrationFilterGroup, LightFrameWithCalibration, FileWithFrame } from '../../types/models';
 import type { SelectedItem } from './NavigationTree';
@@ -112,7 +112,7 @@ export function DetailPanel({
   const handleViewCalSetFrames = async (setId: number) => {
     try {
       setCalBlinkLoading(setId);
-      const frames = await invoke<FileWithFrame[]>('get_calibration_set_frames', { setId });
+      const frames = await api.invoke<FileWithFrame[]>('get_calibration_set_frames', { setId });
       setCalBlinkFrames(frames);
     } catch (err) {
       console.error('Failed to load calibration set frames:', err);
@@ -136,7 +136,7 @@ export function DetailPanel({
       return;
     }
 
-    invoke<number[]>('get_blackholed_file_ids', { fileIds })
+    api.invoke<number[]>('get_blackholed_file_ids', { fileIds })
       .then(blackholed => setBlackholedFileIds(new Set(blackholed)))
       .catch(err => {
         console.error('Failed to fetch blackholed file IDs:', err);

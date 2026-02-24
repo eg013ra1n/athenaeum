@@ -10,9 +10,9 @@ if [[ "$FILE_PATH" != *.rs ]]; then
   exit 0
 fi
 
-# Run cargo check from the src-tauri directory
-cd "$CLAUDE_PROJECT_DIR/src-tauri" || exit 0
-OUTPUT=$(cargo check --message-format=short 2>&1)
+# Run cargo check from the workspace root
+cd "$CLAUDE_PROJECT_DIR" || exit 0
+OUTPUT=$(cargo check --workspace --message-format=short 2>&1)
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../api';
 import { X, Check, RotateCcw, Pencil } from "lucide-react";
 import { CalibrationSetDetail, CalibrationMetadataEdits } from "../types/models";
 
@@ -131,7 +131,7 @@ export default function BulkEditMetadataModal({
 
       console.log("Updating calibration metadata:", { setIds, edits });
 
-      await invoke("bulk_update_calibration_metadata", {
+      await api.invoke("bulk_update_calibration_metadata", {
         setIds,
         edits,
       });
@@ -158,7 +158,7 @@ export default function BulkEditMetadataModal({
       setRestoring(true);
       setError(null);
 
-      await invoke("bulk_restore_calibration_metadata", {
+      await api.invoke("bulk_restore_calibration_metadata", {
         setIds: selectedSetsWithCustomMetadata,
       });
 

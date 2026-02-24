@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../api';
 import { ArrowLeft, Search, RefreshCw, Pencil } from "lucide-react";
 import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
@@ -44,14 +44,14 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
     try {
       setLoading(true);
       setError(null);
-      const hasLibrary = await invoke<boolean>("has_master_dark_library", { instrume });
+      const hasLibrary = await api.invoke<boolean>("has_master_dark_library", { instrume });
 
       if (hasLibrary) {
-        const result = await invoke<CalibrationSetDetail[]>("get_master_dark_library", { instrume });
+        const result = await api.invoke<CalibrationSetDetail[]>("get_master_dark_library", { instrume });
         setSets(result);
 
         // Load custom metadata set IDs
-        const customIds = await invoke<number[]>("get_custom_metadata_set_ids", { instrume });
+        const customIds = await api.invoke<number[]>("get_custom_metadata_set_ids", { instrume });
         setCustomMetadataSetIds(customIds);
       } else {
         setSets([]);
@@ -70,7 +70,7 @@ export default function MasterDarkLibrary({ instrume, onClose, isTabView = false
       setError(null);
       setSuccessMessage(null);
 
-      const result = await invoke<DarkLibraryResult>("create_master_dark_library", { instrume });
+      const result = await api.invoke<DarkLibraryResult>("create_master_dark_library", { instrume });
 
       setSuccessMessage(
         `Created ${result.sets_created} master calibration sets with ${result.frames_grouped} frames`

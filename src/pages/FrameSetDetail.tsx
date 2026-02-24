@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { ArrowLeft, Clock, MapPin, RotateCw, AlertCircle, Scissors, Play } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
@@ -68,10 +68,10 @@ export default function FrameSetDetail() {
 
       // Load both in parallel
       const [detailResult, hierarchyResult] = await Promise.all([
-        invoke<FrameSetDetail>('get_frame_set_detail', {
+        api.invoke<FrameSetDetail>('get_frame_set_detail', {
           framesSetId: parseInt(id),
         }),
-        invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
+        api.invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
           frameSetId: parseInt(id),
         }),
       ]);
@@ -90,7 +90,7 @@ export default function FrameSetDetail() {
   const refreshCalibrationHierarchy = useCallback(async () => {
     if (!id) return;
     try {
-      const result = await invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
+      const result = await api.invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
         frameSetId: parseInt(id),
       });
       setCalibrationHierarchy(result);
@@ -161,7 +161,7 @@ export default function FrameSetDetail() {
 
     try {
       // Load full frame data for the given frame IDs
-      const frames = await invoke<FileWithFrame[]>('get_files_with_frames_by_ids', {
+      const frames = await api.invoke<FileWithFrame[]>('get_files_with_frames_by_ids', {
         frameIds,
       });
 
@@ -222,7 +222,7 @@ export default function FrameSetDetail() {
     try {
       setCreating(true);
       // Use existing command that creates frame set from frame IDs
-      await invoke('create_frame_set_from_selection', {
+      await api.invoke('create_frame_set_from_selection', {
         name: customSetName.trim(),
         frame_ids: frameIds,
         description: null,
@@ -260,7 +260,7 @@ export default function FrameSetDetail() {
     try {
       setSplitting(true);
       // Use existing split_frame_set with Frames selection type
-      await invoke('split_frame_set', {
+      await api.invoke('split_frame_set', {
         sourceSetId: parseInt(id),
         selection: { type: 'frames', ids: frameIds },
         newName: splitName.trim(),
@@ -291,7 +291,7 @@ export default function FrameSetDetail() {
     if (!id) return;
 
     try {
-      await invoke('delete_frames_set', { framesSetId: parseInt(id) });
+      await api.invoke('delete_frames_set', { framesSetId: parseInt(id) });
       navigate('/objects');
     } catch (err) {
       showAlert('Delete Failed', 'Failed to delete: ' + String(err), 'error');

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { Zap } from 'lucide-react';
 import type { ProcessingStats } from '../types/models';
 import { CalibrationProcessModal } from './CalibrationProcessModal';
@@ -24,7 +24,7 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
     setStats(null);
 
     try {
-      const result = await invoke<ProcessingStats>('find_calibration_for_frame_set', {
+      const result = await api.invoke<ProcessingStats>('find_calibration_for_frame_set', {
         frameSetId,
         flatPattern: "automatic",
         manualFlatSelections: null

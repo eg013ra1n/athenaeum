@@ -1,5 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { useNavigate } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
 import { DrawingMode, SelectionResult } from '../types/selection';
@@ -79,7 +79,7 @@ export default function SkyChart() {
 
   // Load persisted star density setting before map init
   useEffect(() => {
-    invoke<string>('get_setting', {
+    api.invoke<string>('get_setting', {
       key: 'skychart.star_limit',
       defaultValue: '6'
     }).then(val => {
@@ -109,7 +109,7 @@ export default function SkyChart() {
   useEffect(() => {
     async function loadLocations() {
       try {
-        const data = await invoke<ImagingLocation[]>('get_imaging_locations');
+        const data = await api.invoke<ImagingLocation[]>('get_imaging_locations');
         setLocations(data);
         setLoading(false);
       } catch (err) {
@@ -954,7 +954,7 @@ export default function SkyChart() {
             onChange={(e) => {
               const val = parseFloat(e.target.value);
               setStarLimit(val);
-              invoke('set_setting', {
+              api.invoke('set_setting', {
                 key: 'skychart.star_limit',
                 value: String(val)
               }).catch(console.error);

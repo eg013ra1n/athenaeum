@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../../api';
 import { Map, Eye, Clock, Camera, Plus, Calendar } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import type { CalendarDayEvent, CalendarFrameSetSummary, CalendarUnorganizedGroup } from '../../types/models';
@@ -153,7 +153,7 @@ export function CalendarEventPanel({
     setCreateError(null);
 
     try {
-      await invoke<number>('create_frame_set_from_selection', {
+      await api.invoke<number>('create_frame_set_from_selection', {
         name: frameSetName.trim(),
         frame_ids: creatingFromGroup.frameIds,
         description: ''

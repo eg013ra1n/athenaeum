@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../api';
 import { CameraStats } from "../types/models";
 import CameraCard from "../components/CameraCard";
 import CameraDetail from "../components/CameraDetail";
@@ -18,7 +18,7 @@ export default function Equipment() {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<CameraStats[]>("get_equipment_cameras");
+      const result = await api.invoke<CameraStats[]>("get_equipment_cameras");
       setCameras(result);
     } catch (err) {
       setError(err as string);

@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::Emitter;
+use crate::events::{ProgressEmitter, emit_event};
 use walkdir::WalkDir;
 
 /// Result from processing a single file (for collecting before batch insert)
@@ -435,8 +435,8 @@ pub struct ScanProgress {
 }
 
 /// Emit progress event to frontend (throttled)
-pub fn emit_progress(
-    app_handle: &tauri::AppHandle,
+pub fn emit_progress<E: ProgressEmitter>(
+    emitter: &E,
     root_id: i64,
     current: usize,
     total: usize,
@@ -458,11 +458,11 @@ pub fn emit_progress(
         phase: phase.to_string(),
     };
 
-    let _ = app_handle.emit("scan-progress", &event);
+    emit_event(emitter, "scan-progress", &event);
 }
 
 /// Emit scan complete event to frontend
-fn emit_scan_complete(app_handle: &tauri::AppHandle, root_id: i64, result: &ScanResult) {
+fn emit_scan_complete<E: ProgressEmitter>(emitter: &E, root_id: i64, result: &ScanResult) {
     let event = ScanCompleteEvent {
         root_id,
         files_found: result.files_found,
@@ -478,7 +478,7 @@ fn emit_scan_complete(app_handle: &tauri::AppHandle, root_id: i64, result: &Scan
         cancelled: result.cancelled,
     };
 
-    let _ = app_handle.emit("scan-complete", &event);
+    emit_event(emitter, "scan-complete", &event);
 }
 
 /// Process a single file without database access (safe for parallel execution)
@@ -567,11 +567,11 @@ fn process_file_parallel(
 /// This function uses a two-phase approach:
 /// - Phase 1: Parallel file discovery and metadata extraction (CPU-bound)
 /// - Phase 2: Sequential database inserts in a single transaction (I/O-bound)
-pub fn scan_directory_parallel(
+pub fn scan_directory_parallel<E: ProgressEmitter>(
     root_path: &Path,
     root_id: i64,
     conn: &Connection,
-    app_handle: &tauri::AppHandle,
+    emitter: &E,
     use_content_hash: bool,
     cancel_flag: Arc<AtomicBool>,
     unique_camera: bool,
@@ -592,7 +592,7 @@ pub fn scan_directory_parallel(
 
     // Phase 1a: Discovery - collect all file paths with progress updates
     crate::logging::log("INFO", &format!("Phase 1a: Starting file discovery in '{}'", root_path.display()));
-    emit_progress(app_handle, root_id, 0, 0, None, "discovery");
+    emit_progress(emitter, root_id, 0, 0, None, "discovery");
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut discovery_count = 0usize;
@@ -612,7 +612,7 @@ pub fn scan_directory_parallel(
                 // Emit progress every 100 files discovered
                 if discovery_count % 100 == 0 {
                     emit_progress(
-                        app_handle,
+                        emitter,
                         root_id,
                         discovery_count,
                         0, // Total unknown during discovery
@@ -627,7 +627,7 @@ pub fn scan_directory_parallel(
         if discovery_count % 500 == 0 && cancel_flag.load(Ordering::SeqCst) {
             result.cancelled = true;
             result.files_found = files.len();
-            emit_scan_complete(app_handle, root_id, &result);
+            emit_scan_complete(emitter, root_id, &result);
             return result;
         }
     }
@@ -638,15 +638,15 @@ pub fn scan_directory_parallel(
     // Check for cancellation before proceeding
     if cancel_flag.load(Ordering::SeqCst) {
         result.cancelled = true;
-        emit_scan_complete(app_handle, root_id, &result);
+        emit_scan_complete(emitter, root_id, &result);
         return result;
     }
 
     if files.is_empty() {
         // Emit progress showing discovery complete with 0 files
-        emit_progress(app_handle, root_id, 0, 0, None, "processing");
+        emit_progress(emitter, root_id, 0, 0, None, "processing");
         std::thread::sleep(std::time::Duration::from_millis(100));
-        emit_scan_complete(app_handle, root_id, &result);
+        emit_scan_complete(emitter, root_id, &result);
         return result;
     }
 
@@ -686,7 +686,7 @@ pub fn scan_directory_parallel(
     // Check for cancellation before processing
     if cancel_flag.load(Ordering::SeqCst) {
         result.cancelled = true;
-        emit_scan_complete(app_handle, root_id, &result);
+        emit_scan_complete(emitter, root_id, &result);
         return result;
     }
 
@@ -694,7 +694,7 @@ pub fn scan_directory_parallel(
         // Emit progress showing all files were checked (even if all skipped)
         // This ensures frontend always sees at least one progress event
         emit_progress(
-            app_handle,
+            emitter,
             root_id,
             result.files_found,
             result.files_found,
@@ -703,7 +703,7 @@ pub fn scan_directory_parallel(
         );
         // Small delay to ensure frontend has time to render progress modal
         std::thread::sleep(std::time::Duration::from_millis(100));
-        emit_scan_complete(app_handle, root_id, &result);
+        emit_scan_complete(emitter, root_id, &result);
         return result;
     }
 
@@ -712,7 +712,6 @@ pub fn scan_directory_parallel(
     let progress_counter = Arc::new(AtomicUsize::new(0));
     let total_new = new_files.len();
     let errors = Arc::new(Mutex::new(Vec::new()));
-    let app_handle_clone = app_handle.clone();
     let cancel_flag_clone = cancel_flag.clone();
 
     let mut processed_results: Vec<FileProcessResult> = new_files
@@ -728,7 +727,7 @@ pub fn scan_directory_parallel(
             // Emit progress every 10 files or on last file
             if current % 10 == 0 || current == total_new {
                 emit_progress(
-                    &app_handle_clone,
+                    emitter,
                     root_id,
                     current,
                     total_new,
@@ -759,12 +758,12 @@ pub fn scan_directory_parallel(
             Ok(mutex) => mutex.into_inner().unwrap_or_default(),
             Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         };
-        emit_scan_complete(app_handle, root_id, &result);
+        emit_scan_complete(emitter, root_id, &result);
         return result;
     }
 
     // Phase 2: Sequential database inserts in a transaction
-    emit_progress(app_handle, root_id, 0, processed_results.len(), None, "inserting");
+    emit_progress(emitter, root_id, 0, processed_results.len(), None, "inserting");
 
     // Track calibration frame IDs
     let mut flat_frame_ids: Vec<i64> = Vec::new();
@@ -793,7 +792,7 @@ pub fn scan_directory_parallel(
         // Emit progress every 50 files during insert phase
         if idx % 50 == 0 || idx == total_results - 1 {
             emit_progress(
-                app_handle,
+                emitter,
                 root_id,
                 idx + 1,
                 total_results,
@@ -931,7 +930,7 @@ pub fn scan_directory_parallel(
             || !master_darkflat_ids.is_empty();
 
         if has_calibration_frames || has_master_frames {
-            emit_progress(app_handle, root_id, 0, 0, None, "calibrating");
+            emit_progress(emitter, root_id, 0, 0, None, "calibrating");
 
             use crate::calibration::scan_integration::{create_calibration_sets_from_scan_with_masters, MasterFrameIds};
 
@@ -962,7 +961,7 @@ pub fn scan_directory_parallel(
         // Phase 4: Rebuild duplicate caches
         // This runs once after all scanning to pre-compute duplicate data
         emit_progress(
-            app_handle,
+            emitter,
             root_id,
             result.files_processed,
             result.files_processed,
@@ -982,7 +981,7 @@ pub fn scan_directory_parallel(
     }
 
     // Emit completion
-    emit_scan_complete(app_handle, root_id, &result);
+    emit_scan_complete(emitter, root_id, &result);
 
     result
 }

@@ -15,12 +15,12 @@ pub async fn get_setting(
     default_value: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let default = default_value.unwrap_or_default();
-    state.settings
+    state.ctx.settings
         .get_with_precedence(&conn, &key, &default)
         .map_err(|e| e.to_string())
 }
@@ -32,11 +32,11 @@ pub async fn set_setting(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    state.settings
+    state.ctx.settings
         .persist_setting(&conn, &key, &value)
         .map_err(|e| e.to_string())
 }
@@ -44,7 +44,7 @@ pub async fn set_setting(
 /// Get all settings from database
 #[tauri::command]
 pub async fn get_all_settings(state: State<'_, AppState>) -> Result<Vec<Setting>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -54,7 +54,7 @@ pub async fn get_all_settings(state: State<'_, AppState>) -> Result<Vec<Setting>
 /// Delete a setting by key
 #[tauri::command]
 pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(), String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -64,11 +64,11 @@ pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(
 /// Get the grouping threshold in degrees (with unit conversion)
 #[tauri::command]
 pub async fn get_grouping_threshold_deg(state: State<'_, AppState>) -> Result<f64, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    state.settings
+    state.ctx.settings
         .get_grouping_threshold_deg(&conn)
         .map_err(|e| e.to_string())
 }
@@ -87,10 +87,10 @@ pub async fn set_blink_threads(
 
     // Persist to DB
     {
-        let state_lock = state.db.lock().unwrap();
+        let state_lock = state.ctx.db.lock().unwrap();
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
-        state.settings
+        state.ctx.settings
             .persist_setting(&conn, settings::keys::BLINK_THREADS, &threads.to_string())
             .map_err(|e| e.to_string())?;
     }

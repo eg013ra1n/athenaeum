@@ -4,7 +4,7 @@
  */
 
 import { useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { SelectionResult, SelectionCandidates } from '../types/selection';
 import { SVGOverlayAPI } from './useSvgOverlay';
 import { CoordinateTransformAPI } from './useCoordinateTransform';
@@ -219,7 +219,7 @@ export function useRectangleSelection(
 
         // Query backend for candidate frames in the sky bounding box
         try {
-          const candidates = await invoke<SelectionCandidates>('query_frames_in_bounds', {
+          const candidates = await api.invoke<SelectionCandidates>('query_frames_in_bounds', {
             bounds: {
               ra_min: skyBounds.ra_min,
               ra_max: skyBounds.ra_max,

@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tauri::Emitter;
+use crate::events::{ProgressEmitter, emit_event};
 
 /// Result of organizing files for export
 #[derive(Debug, Clone)]
@@ -114,7 +114,7 @@ pub fn organize_files_wbpp(
     data: &ExportData,
     use_symlinks: bool,
     _config: &WbppExportConfig,
-    app_handle: Option<&tauri::AppHandle>,
+    emitter: Option<&dyn ProgressEmitter>,
     frame_set_id: i64,
     cancel_flag: &std::sync::atomic::AtomicBool,
 ) -> Result<OrganizeResult> {
@@ -133,15 +133,16 @@ pub fn organize_files_wbpp(
     let mut emit_progress = |current: usize, filename: Option<&str>| {
         let now = Instant::now();
         if now.duration_since(last_emit).as_millis() >= 100 || current == total_files {
-            if let Some(handle) = app_handle {
+            if let Some(e) = emitter {
                 let percent = if total_files > 0 {
                     (current as f64 / total_files as f64) * 100.0
                 } else {
                     0.0
                 };
-                let _ = handle.emit(
+                emit_event(
+                    e,
                     "export-progress",
-                    ExportProgressEvent {
+                    &ExportProgressEvent {
                         frame_set_id,
                         current,
                         total: total_files,

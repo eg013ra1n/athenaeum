@@ -2,7 +2,7 @@ import { useState } from "react";
 import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star, Pencil } from "lucide-react";
 import { CalibrationSetDetail, FileWithFrame, ImageType, isMasterType } from "../types/models";
 import { format } from "date-fns";
-import { invoke } from "@tauri-apps/api/core";
+import { api } from '../api';
 import BlinkViewer from "./BlinkViewer";
 
 interface CalibrationSetTableProps {
@@ -49,7 +49,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
     event.stopPropagation(); // Prevent row expansion
     try {
       setLoadingFrames(setId);
-      const frames = await invoke<FileWithFrame[]>('get_calibration_set_frames', { setId });
+      const frames = await api.invoke<FileWithFrame[]>('get_calibration_set_frames', { setId });
       setBlinkFrames(frames);
     } catch (err) {
       console.error('Failed to load calibration frames:', err);

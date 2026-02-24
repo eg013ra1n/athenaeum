@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Trash2, RotateCcw, Loader2, Filter, ChevronDown, ChevronRight, Square, CheckSquare, XSquare, Folder } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { format } from 'date-fns';
 import type { BlackHoleEntry } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -70,7 +70,7 @@ export default function BlackHole() {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<BlackHoleEntry[]>('get_black_hole_files', { filter });
+      const result = await api.invoke<BlackHoleEntry[]>('get_black_hole_files', { filter });
       setEntries(result);
       // Clear selection when reloading
       setSelectedIds(new Set());
@@ -224,7 +224,7 @@ export default function BlackHole() {
 
         for (let i = 0; i < idsArray.length; i++) {
           try {
-            await invoke('restore_from_black_hole', { fileId: idsArray[i] });
+            await api.invoke('restore_from_black_hole', { fileId: idsArray[i] });
             successCount++;
           } catch (err) {
             errors.push(String(err));
@@ -256,7 +256,7 @@ export default function BlackHole() {
 
         for (let i = 0; i < idsArray.length; i++) {
           try {
-            await invoke('send_to_void', { fileId: idsArray[i] });
+            await api.invoke('send_to_void', { fileId: idsArray[i] });
             successCount++;
           } catch (err) {
             errors.push(String(err));

@@ -27,7 +27,7 @@ const WBPP_CONFIG_KEY: &str = "export.wbpp_config";
 pub async fn get_wbpp_export_config(
     state: State<'_, AppState>,
 ) -> Result<WbppExportConfig, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -40,7 +40,7 @@ pub async fn set_wbpp_export_config(
     state: State<'_, AppState>,
     config: WbppExportConfig,
 ) -> Result<WbppExportConfig, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -59,7 +59,7 @@ pub async fn set_wbpp_export_config(
 pub async fn reset_wbpp_export_config(
     state: State<'_, AppState>,
 ) -> Result<WbppExportConfig, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -103,7 +103,7 @@ pub async fn get_export_preview(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<ExportData, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -115,7 +115,7 @@ pub async fn get_export_preview(
 pub async fn get_exportable_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<Vec<ExportableFrameSet>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -187,7 +187,7 @@ pub async fn get_calibration_route(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<CalibrationRoute, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -433,7 +433,7 @@ pub async fn export_to_wbpp(
     // Create cancel flag and register export
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
-        let mut exports = state.active_exports.lock().unwrap();
+        let mut exports = state.ctx.active_exports.lock().unwrap();
         exports.insert(frame_set_id, ExportHandle {
             cancel_flag: cancel_flag.clone(),
         });
@@ -454,7 +454,7 @@ pub async fn export_to_wbpp(
 
     // Collect export data and config
     let (export_data, config) = {
-        let state_lock = state.db.lock().unwrap();
+        let state_lock = state.ctx.db.lock().unwrap();
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
         let data = collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?;
@@ -476,12 +476,13 @@ pub async fn export_to_wbpp(
             error: Some("Export cancelled".to_string()),
         }
     } else {
+        let export_emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
         match organize_files_wbpp(
             &output_path,
             &export_data,
             use_symlinks,
             &config,
-            Some(&app_handle),
+            Some(&export_emitter as &dyn athenaeum_core::events::ProgressEmitter),
             frame_set_id,
             &cancel_flag,
         ) {
@@ -520,7 +521,7 @@ pub async fn export_to_wbpp(
 
     // Unregister export
     {
-        let mut exports = state.active_exports.lock().unwrap();
+        let mut exports = state.ctx.active_exports.lock().unwrap();
         exports.remove(&frame_set_id);
     }
 
@@ -546,7 +547,7 @@ pub async fn cancel_export(
     frame_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let exports = state.active_exports.lock().unwrap();
+    let exports = state.ctx.active_exports.lock().unwrap();
     if let Some(handle) = exports.get(&frame_set_id) {
         handle.cancel_flag.store(true, Ordering::SeqCst);
         Ok(())
@@ -568,7 +569,7 @@ pub async fn get_export_summary(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<ExportSummary, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
     let config = load_wbpp_config(&conn).unwrap_or_default();

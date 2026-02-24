@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import {
   X,
   Camera,
@@ -85,25 +85,25 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
 
     try {
       // Load light frame parameters
-      const params = await invoke<LightFrameParameters>('get_light_frame_parameters', {
+      const params = await api.invoke<LightFrameParameters>('get_light_frame_parameters', {
         frameIds,
       });
       setLightParams(params);
 
       // Load calibration sets for each type
       const [flats, darks, biases] = await Promise.all([
-        invoke<CalibrationSetWithScore[]>('get_calibration_sets_for_manual_selection', {
+        api.invoke<CalibrationSetWithScore[]>('get_calibration_sets_for_manual_selection', {
           frameIds,
           calibrationType: 'flat',
           showAll,
         }),
-        invoke<CalibrationSetWithScore[]>('get_calibration_sets_for_manual_selection', {
+        api.invoke<CalibrationSetWithScore[]>('get_calibration_sets_for_manual_selection', {
           frameIds,
           calibrationType: 'dark',
           showAll,
         }),
         useBiasForDarkOptimization
-          ? invoke<CalibrationSetWithScore[]>('get_calibration_sets_for_manual_selection', {
+          ? api.invoke<CalibrationSetWithScore[]>('get_calibration_sets_for_manual_selection', {
               frameIds,
               calibrationType: 'bias',
               showAll,

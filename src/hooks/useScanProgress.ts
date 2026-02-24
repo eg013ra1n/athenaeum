@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
-import { invoke } from '@tauri-apps/api/core';
+import { api, type UnlistenFn } from '../api';
 import type { ScanProgressEvent, ScanCompleteEvent, ScanResult, OrphanedFile } from '../types/models';
 
 // Extended result that includes missing files info
@@ -28,23 +27,23 @@ export function useScanProgress() {
     let completeUnlisten: UnlistenFn;
 
     const setupListeners = async () => {
-      progressUnlisten = await listen<ScanProgressEvent>('scan-progress', (event) => {
-        const { root_id } = event.payload;
+      progressUnlisten = await api.listen<ScanProgressEvent>('scan-progress', (payload) => {
+        const { root_id } = payload;
         setActiveScans((prev) => {
           const updated = new Map(prev);
           const existing = updated.get(root_id);
           if (existing) {
             updated.set(root_id, {
               ...existing,
-              progress: event.payload,
+              progress: payload,
             });
           }
           return updated;
         });
       });
 
-      completeUnlisten = await listen<ScanCompleteEvent>('scan-complete', (event) => {
-        const { root_id } = event.payload;
+      completeUnlisten = await api.listen<ScanCompleteEvent>('scan-complete', (payload) => {
+        const { root_id } = payload;
         setActiveScans((prev) => {
           const updated = new Map(prev);
           const existing = updated.get(root_id);
@@ -53,20 +52,20 @@ export function useScanProgress() {
               ...existing,
               isComplete: true,
               result: {
-                files_found: event.payload.files_found,
-                files_processed: event.payload.files_processed,
-                files_skipped: event.payload.files_skipped,
-                errors: event.payload.errors,
-                lights_count: event.payload.lights_count,
-                darks_count: event.payload.darks_count,
-                flats_count: event.payload.flats_count,
-                bias_count: event.payload.bias_count,
-                darkflats_count: event.payload.darkflats_count,
-                calibration_sets_created: event.payload.calibration_sets_created,
-                frames_renamed: event.payload.frames_renamed ?? 0,
-                calibration_sets_deleted: event.payload.calibration_sets_deleted ?? 0,
-                sessions_updated: event.payload.sessions_updated ?? 0,
-                cancelled: event.payload.cancelled,
+                files_found: payload.files_found,
+                files_processed: payload.files_processed,
+                files_skipped: payload.files_skipped,
+                errors: payload.errors,
+                lights_count: payload.lights_count,
+                darks_count: payload.darks_count,
+                flats_count: payload.flats_count,
+                bias_count: payload.bias_count,
+                darkflats_count: payload.darkflats_count,
+                calibration_sets_created: payload.calibration_sets_created,
+                frames_renamed: payload.frames_renamed ?? 0,
+                calibration_sets_deleted: payload.calibration_sets_deleted ?? 0,
+                sessions_updated: payload.sessions_updated ?? 0,
+                cancelled: payload.cancelled,
               },
               progress: null,
             });
@@ -110,7 +109,7 @@ export function useScanProgress() {
 
       try {
         // Start scan with progress - this will emit events and return result
-        const result = await invoke<ScanResult>('start_scan_with_progress', { rootId });
+        const result = await api.invoke<ScanResult>('start_scan_with_progress', { rootId });
 
         // Update state with final result
         setActiveScans((prev) => {
@@ -165,24 +164,24 @@ export function useScanProgress() {
 
       try {
         // Step 1: Check missing files (backend emits "verifying" phase)
-        const missingFiles = await invoke<OrphanedFile[]>('check_missing_files_in_scan_root', { rootId });
+        const missingFiles = await api.invoke<OrphanedFile[]>('check_missing_files_in_scan_root', { rootId });
 
         // Step 2: Persist missing files to database for persistent tracking
         if (missingFiles.length > 0) {
-          await invoke('sync_missing_files', {
+          await api.invoke('sync_missing_files', {
             rootId,
             fileIds: missingFiles.map(f => f.id),
           });
         } else {
           // Clear any previously tracked missing files that are now found
-          await invoke('sync_missing_files', {
+          await api.invoke('sync_missing_files', {
             rootId,
             fileIds: [],
           });
         }
 
         // Step 3: Run scan (backend emits discovery/processing/etc phases)
-        const scanResult = await invoke<ScanResult>('start_scan_with_progress', { rootId });
+        const scanResult = await api.invoke<ScanResult>('start_scan_with_progress', { rootId });
 
         // Combine results
         const result: RescanResult = {
@@ -234,7 +233,7 @@ export function useScanProgress() {
       return updated;
     });
     // Send cancel request to backend - scan will complete with cancelled flag
-    await invoke('cancel_scan', { rootId });
+    await api.invoke('cancel_scan', { rootId });
   }, []);
 
   const dismissCompletedScan = useCallback((rootId: number) => {

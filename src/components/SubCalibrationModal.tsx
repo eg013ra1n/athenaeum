@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import {
   X,
   Camera,
@@ -75,7 +75,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
 
     try {
       // Load calibration set parameters
-      const params = await invoke<CalibrationSetParameters>('get_calibration_set_parameters', {
+      const params = await api.invoke<CalibrationSetParameters>('get_calibration_set_parameters', {
         setId: sourceSetId,
       });
       setSetParams(params);
@@ -83,17 +83,17 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
       if (sourceType === 'flat') {
         // Load DarkFlat, Dark, and Bias sets for flat sub-calibration
         const [darkflats, darks, biases] = await Promise.all([
-          invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
+          api.invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
             setId: sourceSetId,
             calibrationType: 'darkflat',
             showAll,
           }),
-          invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
+          api.invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
             setId: sourceSetId,
             calibrationType: 'dark',
             showAll,
           }),
-          invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
+          api.invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
             setId: sourceSetId,
             calibrationType: 'bias',
             showAll,
@@ -105,7 +105,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
         setBiasSets(biases);
       } else {
         // Dark source - only load Bias sets
-        const biases = await invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
+        const biases = await api.invoke<CalibrationSetWithScore[]>('get_subcalibration_sets_for_manual_selection', {
           setId: sourceSetId,
           calibrationType: 'bias',
           showAll,
@@ -125,7 +125,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
 
     try {
       // Clear existing sub-calibration links first
-      await invoke('clear_subcalibration_override', {
+      await api.invoke('clear_subcalibration_override', {
         sourceSetId,
         calibrationType: null,  // Clear all
       });
@@ -134,19 +134,19 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
       if (sourceType === 'flat') {
         // For flats, only one of DarkFlat/Dark/Bias should be selected (priority)
         if (selectedDarkFlatId) {
-          await invoke('manual_assign_subcalibration', {
+          await api.invoke('manual_assign_subcalibration', {
             sourceSetId,
             calibrationSetId: selectedDarkFlatId,
             calibrationType: 'DarkFlat',
           });
         } else if (selectedDarkId) {
-          await invoke('manual_assign_subcalibration', {
+          await api.invoke('manual_assign_subcalibration', {
             sourceSetId,
             calibrationSetId: selectedDarkId,
             calibrationType: 'Dark',
           });
         } else if (selectedBiasId) {
-          await invoke('manual_assign_subcalibration', {
+          await api.invoke('manual_assign_subcalibration', {
             sourceSetId,
             calibrationSetId: selectedBiasId,
             calibrationType: 'Bias',
@@ -155,7 +155,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
       } else {
         // For darks, only Bias
         if (selectedBiasId) {
-          await invoke('manual_assign_subcalibration', {
+          await api.invoke('manual_assign_subcalibration', {
             sourceSetId,
             calibrationSetId: selectedBiasId,
             calibrationType: 'Bias',

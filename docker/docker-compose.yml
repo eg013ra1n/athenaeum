@@ -1,0 +1,21 @@
+services:
+  athenaeum:
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - athenaeum-data:/data
+      - /Volumes/BigMac/Users/astrobureau/Pictures/Unsorted:/astro-files:rw
+      - /Volumes/BigMac/Users/astrobureau/Pictures/docker_export:/exports:rw
+    environment:
+      - ATHENAEUM_DB_PATH=/data/athenaeum.db
+      - ATHENAEUM_PORT=3000
+      - ATHENAEUM_STATIC_DIR=/app/static
+      - ATHENAEUM_ALLOWED_PATHS=/astro-files,/exports
+    restart: unless-stopped
+
+volumes:
+  athenaeum-data:

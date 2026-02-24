@@ -4,7 +4,7 @@
  */
 
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { X, Check, AlertCircle } from 'lucide-react';
 import { SelectionResult } from '../types/selection';
 
@@ -60,7 +60,7 @@ export function SelectionDialog({
         description: selectionDescription || ''
       });
 
-      const frameSetId = await invoke<number>('create_frame_set_from_selection', {
+      const frameSetId = await api.invoke<number>('create_frame_set_from_selection', {
         frame_ids: result.frameIds,
         name: frameSetName,
         description: selectionDescription || ''

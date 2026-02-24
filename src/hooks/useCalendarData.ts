@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import type { CalendarMonthData } from '../types/models';
 
 interface UseCalendarDataResult {
@@ -23,7 +23,7 @@ export function useCalendarData(year: number, month: number): UseCalendarDataRes
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<CalendarMonthData>('get_calendar_month_data', {
+      const result = await api.invoke<CalendarMonthData>('get_calendar_month_data', {
         year,
         month,
       });

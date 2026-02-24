@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Folder, File as FileIcon, ArrowLeft, AlertCircle, FolderOpen, AlertTriangle, Play } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
-import { revealItemInDir } from '@tauri-apps/plugin-opener';
+import { api } from '../api';
+import { revealItemInDir } from '../api/desktop';
 import type { ScanRootWithAvailability, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
 import BlinkViewer from './BlinkViewer';
 
@@ -80,7 +80,7 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger, i
       if (fileIds.length === 0) return;
 
       try {
-        const blackholed = await invoke<number[]>('get_blackholed_file_ids', { fileIds });
+        const blackholed = await api.invoke<number[]>('get_blackholed_file_ids', { fileIds });
         setBlackholedFileIds(new Set(blackholed));
       } catch (err) {
         console.error('Failed to fetch blackholed file IDs:', err);
@@ -98,12 +98,12 @@ export default function DirectoryTree({ scanRoots, duplicates, refreshTrigger, i
 
     try {
       const result = instrume && cameraDirectories
-        ? await invoke<DirectoryContents>('get_camera_directory_contents', {
+        ? await api.invoke<DirectoryContents>('get_camera_directory_contents', {
             directoryPath: path,
             instrume,
             cameraDirectories,
           })
-        : await invoke<DirectoryContents>('get_directory_contents', {
+        : await api.invoke<DirectoryContents>('get_directory_contents', {
             directoryPath: path,
           });
       setContents(result);

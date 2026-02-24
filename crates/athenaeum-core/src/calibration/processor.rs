@@ -1,12 +1,10 @@
 // Frame set processor - processes all light frames in a frame set
 use crate::models::{Frame, CalibrationTolerance, CalibrationHierarchy, ImageType};
 use crate::calibration::hierarchy::{build_complete_hierarchy, store_calibration_hierarchy};
-use crate::commands::AppState;
 use rusqlite::Connection;
 use anyhow::{Result, Context};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
-use tauri::State;
 
 /// Progress report for frame set processing
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,7 +199,6 @@ pub fn get_light_frames_from_frame_set(
 /// * `max_age_days` - Maximum age of flats to consider
 /// * `time_cluster_minutes` - Time threshold for grouping flats
 /// * `temp_weight` - Weight for temperature matching
-/// * `state` - AppState for accessing settings and on-demand calibration creation
 pub fn process_frame_set(
     conn: &Connection,
     frame_set_id: i64,
@@ -211,7 +208,6 @@ pub fn process_frame_set(
     max_age_days: i64,
     time_cluster_minutes: i64,
     temp_weight: f64,
-    state: &State<'_, AppState>,
 ) -> Result<ProcessingStats> {
     // Get all light frames from the frame set
     let frames = get_light_frames_from_frame_set(conn, frame_set_id)
@@ -239,7 +235,6 @@ pub fn process_frame_set(
             max_age_days,
             time_cluster_minutes,
             temp_weight,
-            state,
         ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
 
         // Store hierarchy in database
@@ -280,7 +275,6 @@ pub fn process_frame_set_with_progress<F>(
     max_age_days: i64,
     time_cluster_minutes: i64,
     temp_weight: f64,
-    state: &State<'_, AppState>,
     mut progress_callback: F,
 ) -> Result<ProcessingStats>
 where
@@ -312,7 +306,6 @@ where
             max_age_days,
             time_cluster_minutes,
             temp_weight,
-            state,
         ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
 
         // Store hierarchy in database

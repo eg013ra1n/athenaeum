@@ -1,6 +1,7 @@
 // Scan root commands - directory scanning and monitoring
 
 use crate::db::{self};
+use crate::tauri_events::TauriProgressEmitter;
 use crate::models::*;
 use crate::scanner::{scan_directory, scan_directory_parallel, emit_progress};
 use rayon::prelude::*;
@@ -14,7 +15,7 @@ use super::utils::normalize_path;
 
 #[tauri::command]
 pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<ScanRoot, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -88,7 +89,7 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
 
 #[tauri::command]
 pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -97,7 +98,7 @@ pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>,
 
 #[tauri::command]
 pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -106,7 +107,7 @@ pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(),
 
 #[tauri::command]
 pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<ScanResultDto, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -122,7 +123,7 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
         .ok_or("Scan root not found")?;
 
     // Check if content hash should be computed
-    let use_content_hash = state.settings
+    let use_content_hash = state.ctx.settings
         .get_duplicates_use_content_hash(&conn)
         .unwrap_or(false);
 
@@ -166,7 +167,7 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
 
 #[tauri::command]
 pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<RescanResultDto, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -230,7 +231,7 @@ pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<R
     // Mark content hash rescan as completed
     if updated > 0 || skipped > 0 {
         // Only set flag if we actually processed files successfully
-        state.settings
+        state.ctx.settings
             .persist_setting(&conn, "duplicates.content_hash_rescanned", "true")
             .map_err(|e| format!("Failed to set rescan flag: {}", e))?;
         println!("Content hash rescan flag set to true");
@@ -252,7 +253,7 @@ pub async fn relink_scan_root(
     new_path: String,
     state: State<'_, AppState>,
 ) -> Result<crate::models::RelinkResult, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -290,7 +291,7 @@ pub async fn check_scan_root_availability(
     root_id: i64,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -312,7 +313,7 @@ pub async fn check_scan_root_availability(
 pub async fn check_all_scan_roots_availability(
     state: State<'_, AppState>,
 ) -> Result<Vec<(i64, bool)>, String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -337,11 +338,12 @@ pub async fn check_missing_files_in_scan_root(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::OrphanedFile>, String> {
     // Emit initial "verifying" phase progress
-    emit_progress(&app_handle, root_id, 0, 0, None, "verifying");
+    let emitter = TauriProgressEmitter(app_handle.clone());
+    emit_progress(&emitter, root_id, 0, 0, None, "verifying");
 
     // Collect files from database with lock held briefly
     let files = {
-        let state_lock = state.db.lock().unwrap();
+        let state_lock = state.ctx.db.lock().unwrap();
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
 
@@ -400,7 +402,7 @@ pub async fn check_missing_files_in_scan_root(
         .collect();
 
     // Emit final progress
-    emit_progress(&app_handle, root_id, total_files, total_files, None, "verifying");
+    emit_progress(&emitter, root_id, total_files, total_files, None, "verifying");
 
     Ok(missing_files)
 }
@@ -444,7 +446,7 @@ pub async fn set_scan_root_unique_camera_flag(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.db.lock().unwrap();
+    let state_lock = state.ctx.db.lock().unwrap();
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -540,7 +542,7 @@ pub async fn start_scan_with_progress(
 
     // Check if already scanning this root
     {
-        let scans = state.active_scans.lock().unwrap();
+        let scans = state.ctx.active_scans.lock().unwrap();
         if scans.contains_key(&root_id) {
             println!("🔴 Scan already in progress for root_id={}", root_id);
             return Err("Scan already in progress for this root".to_string());
@@ -550,7 +552,7 @@ pub async fn start_scan_with_progress(
     // Create cancel flag and register scan
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
-        let mut scans = state.active_scans.lock().unwrap();
+        let mut scans = state.ctx.active_scans.lock().unwrap();
         scans.insert(root_id, ScanHandle {
             root_id,
             cancel_flag: cancel_flag.clone(),
@@ -560,7 +562,7 @@ pub async fn start_scan_with_progress(
     // Get scan root info and perform scan
     println!("🔵 Acquiring database lock for root_id={}", root_id);
     let (result, reconcile) = {
-        let state_lock = state.db.lock().unwrap();
+        let state_lock = state.ctx.db.lock().unwrap();
         println!("🔵 Database lock acquired for root_id={}", root_id);
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
@@ -575,16 +577,17 @@ pub async fn start_scan_with_progress(
             .find(|r| r.id == Some(root_id))
             .ok_or("Scan root not found")?;
 
-        let use_content_hash = state.settings
+        let use_content_hash = state.ctx.settings
             .get_duplicates_use_content_hash(&conn)
             .unwrap_or(false);
 
         // Perform the parallel scan with progress events
+        let scan_emitter = TauriProgressEmitter(app_handle.clone());
         let mut result = scan_directory_parallel(
             Path::new(&root.path),
             root_id,
             &conn,
-            &app_handle,
+            &scan_emitter,
             use_content_hash,
             cancel_flag.clone(),
             root.unique_camera,
@@ -615,7 +618,7 @@ pub async fn start_scan_with_progress(
 
     // Remove from active scans
     {
-        let mut scans = state.active_scans.lock().unwrap();
+        let mut scans = state.ctx.active_scans.lock().unwrap();
         scans.remove(&root_id);
     }
 
@@ -648,7 +651,7 @@ pub async fn cancel_scan(
     root_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let scans = state.active_scans.lock().unwrap();
+    let scans = state.ctx.active_scans.lock().unwrap();
     if let Some(handle) = scans.get(&root_id) {
         handle.cancel_flag.store(true, Ordering::SeqCst);
         Ok(())
@@ -662,6 +665,6 @@ pub async fn cancel_scan(
 pub async fn get_active_scans(
     state: State<'_, AppState>,
 ) -> Result<Vec<i64>, String> {
-    let scans = state.active_scans.lock().unwrap();
+    let scans = state.ctx.active_scans.lock().unwrap();
     Ok(scans.keys().cloned().collect())
 }

@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo } from 'react';
-import { open } from '@tauri-apps/plugin-dialog';
+import { pickDirectory } from '../../api/desktop';
 import { Folder, Loader2, Play, Layers } from 'lucide-react';
 import { FrameSetSelector } from './FrameSetSelector';
 import { ExportSummary } from './ExportSummary';
@@ -81,11 +81,7 @@ export function ExportWizard({ initialFrameSetId }: ExportWizardProps) {
 
   // Handle folder selection
   const handleSelectFolder = useCallback(async () => {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: 'Select Export Directory',
-    });
+    const selected = await pickDirectory();
 
     if (selected && typeof selected === 'string') {
       setOutputDir(selected);

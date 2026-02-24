@@ -57,7 +57,7 @@ pub async fn initialize_database(
 
     // Hold the lock for the entire initialization to prevent concurrent
     // Database::new calls (React StrictMode fires effects twice in dev)
-    let mut db_lock = state.db.lock().unwrap();
+    let mut db_lock = state.ctx.db.lock().unwrap();
     if db_lock.is_some() {
         return Ok(db_path.to_string_lossy().to_string());
     }
@@ -72,7 +72,7 @@ pub async fn initialize_database(
     // Apply persisted blink.threads setting to the semaphore
     if let Some(ref db) = *db_lock {
         let conn = db.conn();
-        let saved = state.settings
+        let saved = state.ctx.settings
             .get_with_precedence(&conn, settings::keys::BLINK_THREADS, settings::defaults::BLINK_THREADS)
             .unwrap_or_else(|_| settings::defaults::BLINK_THREADS.to_string());
         if let Ok(threads) = saved.parse::<usize>() {
@@ -101,7 +101,7 @@ pub async fn check_for_updates(state: State<'_, super::AppState>) -> Result<Upda
 
     // Get or generate a persistent installation ID (stored in settings table)
     let installation_id = {
-        let state_lock = state.db.lock().unwrap();
+        let state_lock = state.ctx.db.lock().unwrap();
         let db = state_lock.as_ref().ok_or("Database not initialized")?;
         let conn = db.conn();
 

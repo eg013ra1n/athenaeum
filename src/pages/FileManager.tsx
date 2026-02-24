@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react';
 import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
-import { open } from '@tauri-apps/plugin-dialog';
-import { revealItemInDir } from '@tauri-apps/plugin-opener';
-import { invoke } from '@tauri-apps/api/core';
+import { pickDirectory, revealItemInDir } from '../api/desktop';
+import { api } from '../api';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
 import { format } from 'date-fns';
@@ -95,8 +94,8 @@ export default function FileManager() {
 
   // Fetch data file locations on mount
   useEffect(() => {
-    invoke<string>('get_database_path').then(setDbPath).catch(console.error);
-    invoke<string>('get_log_path').then(setLogPath).catch(console.error);
+    api.invoke<string>('get_database_path').then(setDbPath).catch(console.error);
+    api.invoke<string>('get_log_path').then(setLogPath).catch(console.error);
   }, []);
 
   // Lazy load duplicates when Duplicates tab is clicked
@@ -117,7 +116,7 @@ export default function FileManager() {
   useEffect(() => {
     const loadMissingCounts = async () => {
       try {
-        const counts = await invoke<Record<number, number>>('get_missing_files_counts');
+        const counts = await api.invoke<Record<number, number>>('get_missing_files_counts');
         setMissingFilesCountMap(counts);
       } catch (error) {
         console.error('Failed to load missing files counts:', error);
@@ -131,7 +130,7 @@ export default function FileManager() {
     if (missingFilesMap[rootId]) return; // Already loaded
     setLoadingMissingFiles(rootId);
     try {
-      const files = await invoke<MissingFileRecord[]>('get_missing_files', { rootId });
+      const files = await api.invoke<MissingFileRecord[]>('get_missing_files', { rootId });
       setMissingFilesMap(prev => ({ ...prev, [rootId]: files }));
     } catch (error) {
       console.error('Failed to load missing files:', error);
@@ -156,8 +155,8 @@ export default function FileManager() {
   const handleRefreshMissingFiles = async (rootId: number) => {
     try {
       const [files, counts] = await Promise.all([
-        invoke<MissingFileRecord[]>('get_missing_files', { rootId }),
-        invoke<Record<number, number>>('get_missing_files_counts'),
+        api.invoke<MissingFileRecord[]>('get_missing_files', { rootId }),
+        api.invoke<Record<number, number>>('get_missing_files_counts'),
       ]);
       setMissingFilesMap(prev => ({ ...prev, [rootId]: files }));
       setMissingFilesCountMap(counts);
@@ -171,7 +170,7 @@ export default function FileManager() {
     try {
       setLoadingMissing(true);
       setMissingError(null);
-      const frames = await invoke<FileWithFrame[]>('get_frames_with_missing_metadata', { category });
+      const frames = await api.invoke<FileWithFrame[]>('get_frames_with_missing_metadata', { category });
       setMissingFrames(frames);
     } catch (error) {
       console.error('Failed to load missing metadata:', error);
@@ -191,11 +190,7 @@ export default function FileManager() {
   // Handle adding a new directory
   const handleAddDirectory = async () => {
     try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: 'Select directory to monitor',
-      });
+      const selected = await pickDirectory();
 
       if (selected && typeof selected === 'string') {
         await addScanRoot(selected);
@@ -255,11 +250,7 @@ export default function FileManager() {
       setRelinkingRootId(rootId);
       setRelinkResult(null);
 
-      const selectedPath = await open({
-        directory: true,
-        multiple: false,
-        title: 'Select new location for scan root',
-      });
+      const selectedPath = await pickDirectory();
 
       if (!selectedPath || typeof selectedPath !== 'string') {
         setRelinkingRootId(null);

@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import { Scissors, Plus, Play } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -267,7 +267,7 @@ export function CalibrationHierarchyView({
     async (flatSetId: number | null, darkSetId: number | null, biasSetId: number | null) => {
       try {
         if (flatSetId !== null && flatSetId !== manualModalCurrentFlat) {
-          await invoke('manual_assign_calibration', {
+          await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
             calibrationSetId: flatSetId,
             calibrationType: 'Flat',
@@ -275,7 +275,7 @@ export function CalibrationHierarchyView({
           setManualModalCurrentFlat(flatSetId);
         }
         if (darkSetId !== null && darkSetId !== manualModalCurrentDark) {
-          await invoke('manual_assign_calibration', {
+          await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
             calibrationSetId: darkSetId,
             calibrationType: 'Dark',
@@ -283,7 +283,7 @@ export function CalibrationHierarchyView({
           setManualModalCurrentDark(darkSetId);
         }
         if (biasSetId !== null && biasSetId !== manualModalCurrentBias) {
-          await invoke('manual_assign_calibration', {
+          await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
             calibrationSetId: biasSetId,
             calibrationType: 'Bias',

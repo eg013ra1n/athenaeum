@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { api } from '../api';
 import type { CalendarMonthData, CalendarYearData } from '../types/models';
 
 interface UseCalendarYearDataResult {
@@ -29,7 +29,7 @@ export function useCalendarYearData(year: number, enabled: boolean = true): UseC
 
       // Fetch all 12 months in parallel
       const monthPromises = Array.from({ length: 12 }, (_, i) =>
-        invoke<CalendarMonthData>('get_calendar_month_data', {
+        api.invoke<CalendarMonthData>('get_calendar_month_data', {
           year,
           month: i + 1,
         })

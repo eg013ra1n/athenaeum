@@ -1,5 +1,5 @@
-// Custom hooks for Tauri command invocation
-import { invoke } from '@tauri-apps/api/core';
+// Custom hooks for backend command invocation
+import { api } from '../api';
 import { useState, useEffect, useCallback } from 'react';
 import type {
   ScanRoot,
@@ -22,7 +22,7 @@ export function useScanRoots() {
   const fetchScanRoots = useCallback(async () => {
     try {
       setLoading(true);
-      const roots = await invoke<ScanRoot[]>('get_scan_roots');
+      const roots = await api.invoke<ScanRoot[]>('get_scan_roots');
       setScanRoots(roots);
       setError(null);
     } catch (e) {
@@ -35,7 +35,7 @@ export function useScanRoots() {
   const addScanRoot = useCallback(async (path: string) => {
     try {
       setLoading(true);
-      const newRoot = await invoke<ScanRoot>('add_scan_root', { path });
+      const newRoot = await api.invoke<ScanRoot>('add_scan_root', { path });
       setScanRoots((prev) => [...prev, newRoot]);
       setError(null);
       return newRoot;
@@ -50,7 +50,7 @@ export function useScanRoots() {
   const deleteScanRoot = useCallback(async (id: number) => {
     try {
       setLoading(true);
-      await invoke('delete_scan_root', { id });
+      await api.invoke('delete_scan_root', { id });
       setScanRoots((prev) => prev.filter((root) => root.id !== id));
       setError(null);
     } catch (e) {
@@ -63,7 +63,7 @@ export function useScanRoots() {
 
   const toggleDuplicatesFlag = useCallback(async (id: number, enabled: boolean) => {
     try {
-      await invoke('set_scan_root_duplicates_flag', { id, enabled });
+      await api.invoke('set_scan_root_duplicates_flag', { id, enabled });
       setScanRoots((prev) =>
         prev.map((root) =>
           root.id === id ? { ...root, find_duplicates: enabled } : root
@@ -78,7 +78,7 @@ export function useScanRoots() {
 
   const toggleUniqueCameraFlag = useCallback(async (id: number, enabled: boolean): Promise<void> => {
     try {
-      await invoke('set_scan_root_unique_camera_flag', { id, enabled });
+      await api.invoke('set_scan_root_unique_camera_flag', { id, enabled });
       setScanRoots((prev) =>
         prev.map((root) =>
           root.id === id ? { ...root, unique_camera: enabled } : root
@@ -118,8 +118,8 @@ export function useScanRootsWithAvailability() {
   const fetchScanRootsWithAvailability = useCallback(async () => {
     try {
       setLoading(true);
-      const roots = await invoke<ScanRoot[]>('get_scan_roots');
-      const availability = await invoke<[number, boolean][]>('check_all_scan_roots_availability');
+      const roots = await api.invoke<ScanRoot[]>('get_scan_roots');
+      const availability = await api.invoke<[number, boolean][]>('check_all_scan_roots_availability');
 
       const availabilityMap = new Map(availability);
       const rootsWithAvailability: ScanRootWithAvailability[] = roots.map(root => ({
@@ -139,7 +139,7 @@ export function useScanRootsWithAvailability() {
   const addScanRoot = useCallback(async (path: string) => {
     try {
       setLoading(true);
-      const newRoot = await invoke<ScanRoot>('add_scan_root', { path });
+      const newRoot = await api.invoke<ScanRoot>('add_scan_root', { path });
       const rootWithAvailability: ScanRootWithAvailability = {
         ...newRoot,
         is_available: true, // Newly added roots should be available
@@ -158,7 +158,7 @@ export function useScanRootsWithAvailability() {
   const deleteScanRoot = useCallback(async (id: number) => {
     try {
       setLoading(true);
-      await invoke('delete_scan_root', { id });
+      await api.invoke('delete_scan_root', { id });
       setScanRoots((prev) => prev.filter((root) => root.id !== id));
       setError(null);
     } catch (e) {
@@ -171,7 +171,7 @@ export function useScanRootsWithAvailability() {
 
   const toggleDuplicatesFlag = useCallback(async (id: number, enabled: boolean) => {
     try {
-      await invoke('set_scan_root_duplicates_flag', { id, enabled });
+      await api.invoke('set_scan_root_duplicates_flag', { id, enabled });
       setScanRoots((prev) =>
         prev.map((root) =>
           root.id === id ? { ...root, find_duplicates: enabled } : root
@@ -186,7 +186,7 @@ export function useScanRootsWithAvailability() {
 
   const toggleUniqueCameraFlag = useCallback(async (id: number, enabled: boolean): Promise<void> => {
     try {
-      await invoke('set_scan_root_unique_camera_flag', { id, enabled });
+      await api.invoke('set_scan_root_unique_camera_flag', { id, enabled });
       setScanRoots((prev) =>
         prev.map((root) =>
           root.id === id ? { ...root, unique_camera: enabled } : root
@@ -202,12 +202,12 @@ export function useScanRootsWithAvailability() {
   const relinkScanRoot = useCallback(async (rootId: number, newPath: string) => {
     try {
       setLoading(true);
-      const result = await invoke<RelinkResult>('relink_scan_root', { rootId, newPath });
+      const result = await api.invoke<RelinkResult>('relink_scan_root', { rootId, newPath });
 
       // Refresh scan roots directly instead of calling fetchScanRootsWithAvailability
       // This avoids dependency issues that could cause duplicate executions
-      const roots = await invoke<ScanRoot[]>('get_scan_roots');
-      const availability = await invoke<[number, boolean][]>('check_all_scan_roots_availability');
+      const roots = await api.invoke<ScanRoot[]>('get_scan_roots');
+      const availability = await api.invoke<[number, boolean][]>('check_all_scan_roots_availability');
       const availabilityMap = new Map(availability);
       const rootsWithAvailability: ScanRootWithAvailability[] = roots.map(root => ({
         ...root,
@@ -253,7 +253,7 @@ export function useScan() {
     try {
       setScanning(true);
       setError(null);
-      const result = await invoke<ScanResult>('start_scan', { rootId });
+      const result = await api.invoke<ScanResult>('start_scan', { rootId });
       setScanResult(result);
       return result;
     } catch (e) {
@@ -283,7 +283,7 @@ export function useFiles(limit?: number) {
   const fetchFiles = useCallback(async () => {
     try {
       setLoading(true);
-      const result = await invoke<FileWithFrame[]>('get_files', { limit: limit || null });
+      const result = await api.invoke<FileWithFrame[]>('get_files', { limit: limit || null });
       setFiles(result);
       setError(null);
     } catch (e) {
@@ -316,7 +316,7 @@ export function useFilesByDirectory(directoryPath: string, limit?: number) {
   const fetchFiles = useCallback(async () => {
     try {
       setLoading(true);
-      const result = await invoke<FileWithFrame[]>('get_files_by_directory', {
+      const result = await api.invoke<FileWithFrame[]>('get_files_by_directory', {
         directory_path: directoryPath,
         limit: limit || null
       });
@@ -355,7 +355,7 @@ export function useDuplicates() {
   const fetchDuplicates = useCallback(async () => {
     try {
       setLoading(true);
-      const result = await invoke<DuplicateGroup[]>('get_duplicates');
+      const result = await api.invoke<DuplicateGroup[]>('get_duplicates');
       setDuplicates(result);
       setError(null);
       setLoaded(true);
@@ -395,7 +395,7 @@ export function useDuplicateFolders(threshold: number = 70.0) {
   const fetchFolders = useCallback(async () => {
     try {
       setLoading(true);
-      const result = await invoke<FolderSimilarity[]>('get_duplicate_folders', { threshold });
+      const result = await api.invoke<FolderSimilarity[]>('get_duplicate_folders', { threshold });
       setFolders(result);
       setError(null);
       setLoaded(true);
@@ -427,5 +427,5 @@ export function useDuplicateFolders(threshold: number = 70.0) {
  * Move a file to black hole
  */
 export async function moveToBlackHole(fileId: number, fromWhere: string): Promise<number> {
-  return await invoke<number>('move_to_black_hole', { fileId, fromWhere });
+  return await api.invoke<number>('move_to_black_hole', { fileId, fromWhere });
 }

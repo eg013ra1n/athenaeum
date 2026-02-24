@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { invoke } from '@tauri-apps/api/core';
-import { revealItemInDir } from '@tauri-apps/plugin-opener';
+import { api } from '../api';
+import { revealItemInDir } from '../api/desktop';
 import { ArrowLeft, FolderOpen, ChevronDown, ChevronRight, AlertCircle, FileX, Play, Plus } from 'lucide-react';
 import type { ExcludedFrameEntry, FileWithFrame, ReclassifyResult } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
@@ -35,7 +35,7 @@ export default function ExcludedFrames() {
     try {
       setLoading(true);
       setError(null);
-      const result = await invoke<ExcludedFrameEntry[]>('get_excluded_frames');
+      const result = await api.invoke<ExcludedFrameEntry[]>('get_excluded_frames');
       setEntries(result);
       setSelectedFileIds(new Set());
     } catch (err) {
@@ -88,7 +88,7 @@ export default function ExcludedFrames() {
   const handleBlink = async (folder: string, excludedFileIds: Set<number>) => {
     try {
       setBlinkLoading(folder);
-      const dirContents = await invoke<{ files: FileWithFrame[] }>('get_directory_contents', {
+      const dirContents = await api.invoke<{ files: FileWithFrame[] }>('get_directory_contents', {
         directoryPath: folder,
       });
       const excluded = dirContents.files.filter(
@@ -135,7 +135,7 @@ export default function ExcludedFrames() {
     try {
       setReclassifying(true);
       setError(null);
-      const result = await invoke<ReclassifyResult>('reclassify_excluded_frames', {
+      const result = await api.invoke<ReclassifyResult>('reclassify_excluded_frames', {
         fileIds: Array.from(selectedFileIds),
         newImagetyp,
       });
@@ -155,7 +155,7 @@ export default function ExcludedFrames() {
     try {
       setCreating(true);
       setError(null);
-      await invoke<number>('create_frame_set_from_excluded', {
+      await api.invoke<number>('create_frame_set_from_excluded', {
         fileIds: Array.from(selectedFileIds),
         name: frameSetName.trim(),
       });
