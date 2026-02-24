@@ -33,6 +33,7 @@ pub struct GetFilesByDirectoryArgs {
 
 #[derive(serde::Deserialize)]
 pub struct GetDirectoryContentsArgs {
+    #[serde(rename = "directoryPath")]
     pub path: String,
 }
 

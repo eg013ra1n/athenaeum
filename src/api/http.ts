@@ -14,6 +14,11 @@ export const httpApi: ApiBackend = {
       const text = await res.text();
       throw text || `HTTP ${res.status}`;
     }
+    const ct = res.headers.get('content-type') ?? '';
+    if (ct.startsWith('image/') || ct === 'application/octet-stream') {
+      const buf = await res.arrayBuffer();
+      return new Uint8Array(buf) as unknown as T;
+    }
     return res.json() as Promise<T>;
   },
 

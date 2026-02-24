@@ -23,7 +23,8 @@ use crate::WebAppState;
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetFramePreviewArgs {
-    pub file_id: i64,
+    #[serde(alias = "fileId")]
+    pub frame_id: i64,
     pub resolution: Option<String>,
 }
 
@@ -60,10 +61,10 @@ pub async fn get_frame_preview(
         let path: String = conn
             .query_row(
                 "SELECT path FROM files WHERE id = ?1",
-                rusqlite::params![args.file_id],
+                rusqlite::params![args.frame_id],
                 |row| row.get(0),
             )
-            .map_err(|e| db_err(format!("File id {} not found: {}", args.file_id, e)))?;
+            .map_err(|e| db_err(format!("File id {} not found: {}", args.frame_id, e)))?;
 
         // Determine resolution string: prefer explicit arg, fall back to DB setting.
         let resolution_str = match args.resolution.as_deref() {

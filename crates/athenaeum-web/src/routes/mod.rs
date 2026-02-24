@@ -3,7 +3,7 @@ use axum::{
     extract::State,
     response::{
         sse::{Event, Sse},
-        IntoResponse, Json, Response,
+        Json,
     },
     routing::{get, post},
     http::StatusCode,
@@ -24,6 +24,7 @@ mod duplicates;
 mod export;
 mod spatial;
 mod images;
+mod missing_files;
 
 /// Helper to extract DB connection from state, returning a JSON error on failure.
 fn db_err() -> (StatusCode, Json<serde_json::Value>) {
@@ -42,9 +43,23 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/add_scan_root", post(scan_roots::add_scan_root))
         .route("/api/get_scan_roots", post(scan_roots::get_scan_roots))
         .route("/api/delete_scan_root", post(scan_roots::delete_scan_root))
+        .route("/api/start_scan", post(scan_roots::start_scan))
         .route("/api/start_scan_with_progress", post(scan_roots::start_scan_with_progress))
         .route("/api/cancel_scan", post(scan_roots::cancel_scan))
         .route("/api/get_active_scans", post(scan_roots::get_active_scans))
+        .route("/api/check_all_scan_roots_availability", post(scan_roots::check_all_scan_roots_availability))
+        .route("/api/get_missing_files_counts", post(scan_roots::get_missing_files_counts))
+        .route("/api/rescan_all_for_content_hash", post(scan_roots::rescan_all_for_content_hash))
+        .route("/api/relink_scan_root", post(scan_roots::relink_scan_root))
+        // Missing files
+        .route("/api/check_missing_files_in_scan_root", post(missing_files::check_missing_files_in_scan_root))
+        .route("/api/sync_missing_files", post(missing_files::sync_missing_files))
+        .route("/api/get_missing_files", post(missing_files::get_missing_files))
+        .route("/api/recheck_missing_files", post(missing_files::recheck_missing_files))
+        .route("/api/ignore_missing_file", post(missing_files::ignore_missing_file))
+        .route("/api/unignore_missing_file", post(missing_files::unignore_missing_file))
+        .route("/api/delete_missing_files", post(missing_files::delete_missing_files))
+        .route("/api/relocate_missing_file", post(relocate_missing_file_stub))
         // Files
         .route("/api/get_files", post(files::get_files))
         .route("/api/get_files_by_directory", post(files::get_files_by_directory))
@@ -59,6 +74,11 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_all_settings", post(settings::get_all_settings))
         .route("/api/delete_setting", post(settings::delete_setting))
         .route("/api/get_grouping_threshold_deg", post(settings::get_grouping_threshold_deg))
+        // Cache & blink (Category C — modified behavior in web mode)
+        .route("/api/get_cache_stats", post(settings::get_cache_stats))
+        .route("/api/clear_image_cache", post(settings::clear_image_cache))
+        .route("/api/get_blink_threads_max", post(settings::get_blink_threads_max))
+        .route("/api/set_blink_threads", post(settings::set_blink_threads))
         // Frame sets
         .route("/api/auto_generate_frame_sets", post(frame_sets::auto_generate_frame_sets))
         .route("/api/get_frames_sets", post(frame_sets::get_frames_sets))
@@ -75,6 +95,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/create_frame_set_from_selection", post(frame_sets::create_frame_set_from_selection))
         .route("/api/create_frame_set_from_excluded", post(frame_sets::create_frame_set_from_excluded))
         .route("/api/update_frame_set_flat_pattern", post(frame_sets::update_frame_set_flat_pattern))
+        // Excluded frames
+        .route("/api/get_excluded_frames", post(frame_sets::get_excluded_frames))
+        .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
+        .route("/api/reclassify_excluded_frames", post(frame_sets::reclassify_excluded_frames))
         // Calibration
         .route("/api/get_equipment_cameras", post(calibration::get_equipment_cameras))
         .route("/api/create_dark_library", post(calibration::create_dark_library))
@@ -94,6 +118,18 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_calibration_matching_config", post(calibration::get_calibration_matching_config))
         .route("/api/set_calibration_matching_config", post(calibration::set_calibration_matching_config))
         .route("/api/reset_calibration_matching_config", post(calibration::reset_calibration_matching_config))
+        // Calibration — Phase 4 routes (hierarchy, manual selection, sub-calibration, metadata)
+        .route("/api/get_calibration_hierarchy_for_frame_set", post(calibration::get_calibration_hierarchy_for_frame_set))
+        .route("/api/get_calibration_set_parameters", post(calibration::get_calibration_set_parameters))
+        .route("/api/get_calibration_sets_for_manual_selection", post(calibration::get_calibration_sets_for_manual_selection))
+        .route("/api/get_subcalibration_sets_for_manual_selection", post(calibration::get_subcalibration_sets_for_manual_selection))
+        .route("/api/get_light_frame_parameters", post(calibration::get_light_frame_parameters))
+        .route("/api/manual_assign_calibration", post(calibration::manual_assign_calibration))
+        .route("/api/manual_assign_subcalibration", post(calibration::manual_assign_subcalibration))
+        .route("/api/clear_subcalibration_override", post(calibration::clear_subcalibration_override))
+        .route("/api/bulk_update_calibration_metadata", post(calibration::bulk_update_calibration_metadata))
+        .route("/api/bulk_restore_calibration_metadata", post(calibration::bulk_restore_calibration_metadata))
+        .route("/api/get_custom_metadata_set_ids", post(calibration::get_custom_metadata_set_ids))
         // Duplicates / black hole
         .route("/api/get_duplicates", post(duplicates::get_duplicates))
         .route("/api/move_to_black_hole", post(duplicates::move_to_black_hole))
@@ -103,6 +139,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/send_to_void", post(duplicates::send_to_void))
         .route("/api/send_all_to_void", post(duplicates::send_all_to_void))
         .route("/api/get_duplicate_folders", post(duplicates::get_duplicate_folders))
+        .route("/api/set_scan_root_duplicates_flag", post(duplicates::set_scan_root_duplicates_flag))
+        .route("/api/set_scan_root_unique_camera_flag", post(duplicates::set_scan_root_unique_camera_flag))
+        .route("/api/backfill_header_fingerprints", post(duplicates::backfill_header_fingerprints))
         // Export
         .route("/api/get_wbpp_export_config", post(export::get_wbpp_export_config))
         .route("/api/set_wbpp_export_config", post(export::set_wbpp_export_config))
@@ -124,6 +163,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_app_version", post(get_app_version))
         .route("/api/get_log_path", post(get_log_path))
         .route("/api/get_database_path", post(get_database_path))
+        // Category A — Desktop-only stubs
+        .route("/api/check_for_updates", post(check_for_updates))
+        .route("/api/read_fits_image_rustafits", post(read_fits_image_rustafits_stub))
         .with_state(state);
 
     // Optionally serve static frontend files
@@ -183,4 +225,32 @@ async fn get_database_path(
     let lock = state.ctx.db.lock().unwrap();
     let path = lock.as_ref().map(|db| db.path().to_string_lossy().to_string());
     Json(path)
+}
+
+// ── Category A — Desktop-only stubs ──────────────────────────────────────────
+
+/// POST /api/check_for_updates — returns static no-update response
+async fn check_for_updates(
+    Json(_): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    Json(serde_json::json!({
+        "current_version": version,
+        "latest_version": version,
+        "is_update_available": false,
+    }))
+}
+
+/// POST /api/relocate_missing_file — 501 in web mode (needs native file picker)
+async fn relocate_missing_file_stub(
+    Json(_): Json<serde_json::Value>,
+) -> (StatusCode, String) {
+    (StatusCode::NOT_IMPLEMENTED, "relocate_missing_file is not available in web mode".to_string())
+}
+
+/// POST /api/read_fits_image_rustafits — 501 in web mode (web uses get_frame_preview)
+async fn read_fits_image_rustafits_stub(
+    Json(_): Json<serde_json::Value>,
+) -> (StatusCode, String) {
+    (StatusCode::NOT_IMPLEMENTED, "read_fits_image_rustafits is not available in web mode".to_string())
 }

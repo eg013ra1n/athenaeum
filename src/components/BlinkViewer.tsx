@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { api } from '../api';
+import { isTauri } from '../utils/platform';
 import {
   X,
   Loader2,
@@ -123,9 +124,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setError(null);
 
     try {
-      const imageData = await api.invoke<Uint8Array>("read_fits_image_rustafits", {
-        path: frame.file.path,
-      });
+      const imageData = isTauri
+        ? await api.invoke<Uint8Array>("read_fits_image_rustafits", {
+            path: frame.file.path,
+          })
+        : await api.invoke<Uint8Array>("get_frame_preview", {
+            frameId: frame.file.id,
+          });
 
       const binaryData = imageData instanceof Uint8Array
         ? imageData

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { pickDirectory, revealItemInDir } from '../api/desktop';
+import { isTauri } from '../utils/platform';
 import { api } from '../api';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
@@ -291,7 +292,7 @@ export default function FileManager() {
             <div className="flex items-center gap-2">
               <span className="text-content-muted min-w-[80px]">Database:</span>
               <span className="text-content truncate">{dbPath || '—'}</span>
-              {dbPath && (
+              {isTauri && dbPath && (
                 <button
                   onClick={() => revealItemInDir(dbPath)}
                   className="text-content-muted hover:text-content transition flex-shrink-0"
@@ -304,7 +305,7 @@ export default function FileManager() {
             <div className="flex items-center gap-2">
               <span className="text-content-muted min-w-[80px]">Log file:</span>
               <span className="text-content truncate">{logPath || '—'}</span>
-              {logPath && (
+              {isTauri && logPath && (
                 <button
                   onClick={() => revealItemInDir(logPath)}
                   className="text-content-muted hover:text-content transition flex-shrink-0"
@@ -392,14 +393,16 @@ export default function FileManager() {
         <div>
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-xl font-semibold">Monitored Directories</h3>
-            <button
-              onClick={handleAddDirectory}
-              disabled={rootsLoading}
-              className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <FolderPlus size={20} />
-              Add Directory
-            </button>
+            {isTauri && (
+              <button
+                onClick={handleAddDirectory}
+                disabled={rootsLoading}
+                className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <FolderPlus size={20} />
+                Add Directory
+              </button>
+            )}
           </div>
 
           {rootsLoading ? (
@@ -438,14 +441,16 @@ export default function FileManager() {
                           <p className="text-sm text-warning/80 mb-2">
                             This directory is not accessible. It may have been moved, renamed, or is on an unmounted drive.
                           </p>
-                          <button
-                            onClick={() => root.id && handleRelinkScanRoot(root.id)}
-                            disabled={relinkingRootId === root.id}
-                            className="flex items-center gap-2 px-3 py-1.5 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded text-sm transition"
-                          >
-                            <RefreshCw size={16} className={relinkingRootId === root.id ? 'animate-spin' : ''} />
-                            {relinkingRootId === root.id ? 'Relinking...' : 'Relink Directory'}
-                          </button>
+                          {isTauri && (
+                            <button
+                              onClick={() => root.id && handleRelinkScanRoot(root.id)}
+                              disabled={relinkingRootId === root.id}
+                              className="flex items-center gap-2 px-3 py-1.5 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded text-sm transition"
+                            >
+                              <RefreshCw size={16} className={relinkingRootId === root.id ? 'animate-spin' : ''} />
+                              {relinkingRootId === root.id ? 'Relinking...' : 'Relink Directory'}
+                            </button>
+                          )}
                         </div>
                       </div>
                     )}
@@ -505,12 +510,14 @@ export default function FileManager() {
                           )}
                           {rootIsScanning ? 'Scanning...' : root.last_scan ? 'Rescan' : 'Scan'}
                         </button>
-                        <button
-                          onClick={() => root.id && handleRemoveScanRoot(root.id)}
-                          className="text-error hover:text-error/90 p-2 rounded hover:bg-error-muted transition"
-                        >
-                          <Trash2 size={18} />
-                        </button>
+                        {isTauri && (
+                          <button
+                            onClick={() => root.id && handleRemoveScanRoot(root.id)}
+                            className="text-error hover:text-error/90 p-2 rounded hover:bg-error-muted transition"
+                          >
+                            <Trash2 size={18} />
+                          </button>
+                        )}
                       </div>
                     </div>
 

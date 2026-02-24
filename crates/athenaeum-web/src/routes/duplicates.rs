@@ -209,6 +209,86 @@ pub async fn send_all_to_void(
     Ok(Json(n))
 }
 
+// ── Scan root flags ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetScanRootDuplicatesFlagArgs {
+    pub id: i64,
+    pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetScanRootUniqueCameraFlagArgs {
+    pub id: i64,
+    pub enabled: bool,
+}
+
+/// Update the allow_duplicates flag for a scan root.
+pub async fn set_scan_root_duplicates_flag(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetScanRootDuplicatesFlagArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    athenaeum_core::db::update_scan_root_duplicates_flag(&conn, args.id, args.enabled)
+        .map_err(db_err)?;
+    Ok(Json(()))
+}
+
+/// Toggle unique_camera flag for a scan root.
+pub async fn set_scan_root_unique_camera_flag(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetScanRootUniqueCameraFlagArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    athenaeum_core::db::set_unique_camera_flag(&conn, args.id, args.enabled)
+        .map_err(db_err)?;
+
+    eprintln!("unique_camera flag set for root {}: enabled={}", args.id, args.enabled);
+    Ok(Json(()))
+}
+
+/// Backfill fingerprints for existing FITS headers that are missing them.
+pub async fn backfill_header_fingerprints(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    let mut stmt = conn
+        .prepare("SELECT id, header FROM fits_header WHERE header_fingerprint IS NULL")
+        .map_err(db_err)?;
+
+    let headers: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let total = headers.len();
+    eprintln!("Backfilling fingerprints for {} headers", total);
+
+    for (id, header) in headers {
+        let fingerprint = athenaeum_core::fingerprint::compute_header_fingerprint(&header);
+        conn.execute(
+            "UPDATE fits_header SET header_fingerprint = ?1 WHERE id = ?2",
+            rusqlite::params![fingerprint, id],
+        )
+        .map_err(db_err)?;
+    }
+
+    Ok(Json(total))
+}
+
 /// Find directory pairs with a high proportion of duplicate files.
 ///
 /// `threshold` is a similarity percentage (0–100); defaults to 70.0 if omitted.

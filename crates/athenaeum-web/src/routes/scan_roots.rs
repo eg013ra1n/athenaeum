@@ -58,6 +58,15 @@ pub struct CancelScanArgs {
     pub root_id: i64,
 }
 
+#[derive(serde::Serialize)]
+pub struct RescanResultDto {
+    pub files_total: usize,
+    pub files_updated: usize,
+    pub files_skipped: usize,
+    pub files_missing: usize,
+    pub errors: Vec<String>,
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 /// POST /api/add_scan_root
@@ -301,6 +310,165 @@ pub async fn cancel_scan(
     } else {
         Err((StatusCode::NOT_FOUND, "No active scan for this root".to_string()))
     }
+}
+
+/// POST /api/check_all_scan_roots_availability
+///
+/// Returns a list of (root_id, exists) pairs indicating whether each scan root
+/// directory is currently accessible on the filesystem.
+pub async fn check_all_scan_roots_availability(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<Vec<(i64, bool)>>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db = lock
+        .as_ref()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    let roots = db::get_scan_roots(&conn)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let availability: Vec<(i64, bool)> = roots
+        .into_iter()
+        .map(|root| {
+            let exists = Path::new(&root.path).exists();
+            (root.id.unwrap_or(0), exists)
+        })
+        .collect();
+
+    Ok(Json(availability))
+}
+
+/// POST /api/get_missing_files_counts
+///
+/// Returns a map of scan_root_id -> count of files with 'missing' status.
+pub async fn get_missing_files_counts(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<std::collections::HashMap<i64, i64>>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db = lock
+        .as_ref()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT scan_root_id, COUNT(*)
+             FROM missing_files
+             WHERE status = 'missing'
+             GROUP BY scan_root_id",
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut counts = std::collections::HashMap::new();
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    for row in rows {
+        let (root_id, count) = row.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        counts.insert(root_id, count);
+    }
+
+    Ok(Json(counts))
+}
+
+/// POST /api/start_scan
+///
+/// Non-progress scan variant. In web mode, delegates to start_scan_with_progress.
+pub async fn start_scan(
+    State(state): State<WebAppState>,
+    Json(args): Json<StartScanArgs>,
+) -> Result<Json<ScanResultDto>, (StatusCode, String)> {
+    start_scan_with_progress(State(state), Json(args)).await
+}
+
+/// POST /api/rescan_all_for_content_hash
+///
+/// Iterate all files and compute xxHash for those missing a content_hash.
+pub async fn rescan_all_for_content_hash(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<RescanResultDto>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db = lock
+        .as_ref()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    eprintln!("Starting content hash rescan for all files...");
+
+    let all_files = athenaeum_core::db::get_files(&conn, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total = all_files.len();
+
+    let mut updated = 0;
+    let mut skipped = 0;
+    let mut missing = 0;
+    let mut errors = Vec::new();
+
+    for (file, _frame) in all_files {
+        let path_buf = std::path::PathBuf::from(&file.path);
+
+        if !path_buf.exists() {
+            missing += 1;
+            continue;
+        }
+
+        if file.content_hash.is_some() {
+            skipped += 1;
+            continue;
+        }
+
+        match athenaeum_core::duplicates::compute_xxhash(&path_buf) {
+            Ok(hash) => {
+                match conn.execute(
+                    "UPDATE files SET content_hash = ?1 WHERE id = ?2",
+                    rusqlite::params![hash, file.id],
+                ) {
+                    Ok(_) => {
+                        updated += 1;
+                        if updated % 100 == 0 {
+                            eprintln!("Progress: {}/{} files processed", updated + skipped + missing, total);
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: Failed to update database: {}", file.path, e));
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: Failed to compute hash: {}", file.path, e));
+            }
+        }
+    }
+
+    eprintln!(
+        "Content hash rescan complete! Total: {}, Updated: {}, Skipped: {}, Missing: {}, Errors: {}",
+        total, updated, skipped, missing, errors.len()
+    );
+
+    if updated > 0 || skipped > 0 {
+        let _ = state.ctx.settings
+            .persist_setting(&conn, "duplicates.content_hash_rescanned", "true");
+    }
+
+    Ok(Json(RescanResultDto {
+        files_total: total,
+        files_updated: updated,
+        files_skipped: skipped,
+        files_missing: missing,
+        errors,
+    }))
+}
+
+/// POST /api/relink_scan_root — 501 in web mode (needs native dir picker)
+pub async fn relink_scan_root(
+    Json(_): Json<serde_json::Value>,
+) -> (StatusCode, String) {
+    (StatusCode::NOT_IMPLEMENTED, "relink_scan_root is not available in web mode".to_string())
 }
 
 /// POST /api/get_active_scans

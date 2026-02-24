@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api } from '../api';
 import { pickFile } from '../api/desktop';
+import { isTauri } from '../utils/platform';
 import {
   AlertTriangle,
   RefreshCw,
@@ -247,14 +248,16 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
                   </td>
                   <td className="p-2">
                     <div className="flex items-center gap-1 justify-end">
-                      <button
-                        onClick={() => handleLocate(file)}
-                        disabled={actionInProgress === file.file_id}
-                        className="p-1.5 hover:bg-accent/30 rounded text-accent transition"
-                        title="Locate file"
-                      >
-                        <FolderSearch size={14} />
-                      </button>
+                      {isTauri && (
+                        <button
+                          onClick={() => handleLocate(file)}
+                          disabled={actionInProgress === file.file_id}
+                          className="p-1.5 hover:bg-accent/30 rounded text-accent transition"
+                          title="Locate file"
+                        >
+                          <FolderSearch size={14} />
+                        </button>
+                      )}
                       <button
                         onClick={() => handleIgnore(file.file_id)}
                         disabled={actionInProgress === file.file_id}

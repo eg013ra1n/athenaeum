@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api } from '../api';
 import { openUrl } from '../api/desktop';
+import { isTauri } from '../utils/platform';
 import { RefreshCw, Download, CheckCircle2, AlertCircle, Info, ExternalLink } from 'lucide-react';
 
 interface UpdateInfo {
@@ -116,9 +117,17 @@ function UpdateSection() {
 }
 
 function ExtLink({ href, children }: { href: string; children: React.ReactNode }) {
+  const handleClick = () => {
+    if (isTauri) {
+      openUrl(href);
+    } else {
+      window.open(href, '_blank', 'noopener');
+    }
+  };
+
   return (
     <button
-      onClick={() => openUrl(href)}
+      onClick={handleClick}
       className="inline-flex items-center gap-1 text-accent hover:text-accent-hover transition-colors"
     >
       {children}
@@ -172,7 +181,7 @@ export default function About() {
         </p>
       </section>
 
-      <UpdateSection />
+      {isTauri && <UpdateSection />}
 
       <div className="grid grid-cols-3 gap-6">
         <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">
@@ -202,7 +211,7 @@ export default function About() {
             If you find Athenaeum useful, consider supporting its development.
           </p>
           <button
-            onClick={() => openUrl('https://ko-fi.com/N4N81UR2EE')}
+            onClick={() => isTauri ? openUrl('https://ko-fi.com/N4N81UR2EE') : window.open('https://ko-fi.com/N4N81UR2EE', '_blank', 'noopener')}
             className="hover:opacity-80 transition-opacity"
           >
             <img

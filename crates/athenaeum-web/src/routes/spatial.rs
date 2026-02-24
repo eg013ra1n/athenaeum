@@ -12,6 +12,33 @@ use serde::Deserialize;
 
 use crate::WebAppState;
 
+/// camelCase wrapper for the core `SelectionBounds` type.
+/// Frontend sends `raMin`, `raMax`, etc. but the core struct uses snake_case.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionBoundsArgs {
+    pub ra_min: f64,
+    pub ra_max: f64,
+    pub dec_min: f64,
+    pub dec_max: f64,
+    #[serde(default)]
+    pub crosses_meridian: Option<bool>,
+    #[serde(default)]
+    pub selected_object_ids: Option<Vec<i64>>,
+}
+
+impl From<SelectionBoundsArgs> for SelectionBounds {
+    fn from(a: SelectionBoundsArgs) -> Self {
+        SelectionBounds {
+            ra_min: a.ra_min,
+            ra_max: a.ra_max,
+            dec_min: a.dec_min,
+            dec_max: a.dec_max,
+            crosses_meridian: a.crosses_meridian,
+        }
+    }
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Calculate field of view in degrees given camera and telescope parameters.
@@ -235,8 +262,9 @@ pub async fn get_imaging_locations(
 /// bounding box.  Handles the RA wrap-around at 0°/360°.
 pub async fn query_frames_in_bounds(
     State(state): State<WebAppState>,
-    Json(bounds): Json<SelectionBounds>,
+    Json(args): Json<SelectionBoundsArgs>,
 ) -> Result<Json<SelectionCandidates>, (StatusCode, String)> {
+    let bounds: SelectionBounds = args.into();
     let lock = state.ctx.db.lock().unwrap();
     let db = lock
         .as_ref()

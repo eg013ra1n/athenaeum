@@ -16,26 +16,26 @@ pub struct GetFramesSetsArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameSetIdArgs {
-    pub frame_set_id: i64,
+    pub frames_set_id: i64,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteFramesSetArgs {
-    pub id: i64,
+    pub frames_set_id: i64,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenameFramesSetArgs {
-    pub id: i64,
-    pub name: String,
+    pub frames_set_id: i64,
+    pub new_name: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarkFrameSetCustomArgs {
-    pub id: i64,
+    pub frames_set_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -68,7 +68,6 @@ pub struct CreateCustomFramesSetArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreateFrameSetFromSelectionArgs {
     pub name: String,
     pub frame_ids: Vec<i64>,
@@ -85,7 +84,7 @@ pub struct CreateFrameSetFromExcludedArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateFrameSetFlatPatternArgs {
-    pub frame_set_id: i64,
+    pub frames_set_id: i64,
     pub flat_pattern: Option<String>,
 }
 
@@ -418,7 +417,7 @@ pub async fn get_frame_set_detail(
     let db = lock.as_ref().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    let detail = load_frame_set_detail(&conn, args.frame_set_id).map_err(db_err)?;
+    let detail = load_frame_set_detail(&conn, args.frames_set_id).map_err(db_err)?;
     Ok(Json(detail))
 }
 
@@ -431,7 +430,7 @@ pub async fn delete_frames_set(
     let db = lock.as_ref().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    athenaeum_core::db::delete_frames_set(&conn, args.id).map_err(db_err)?;
+    athenaeum_core::db::delete_frames_set(&conn, args.frames_set_id).map_err(db_err)?;
     Ok(Json(()))
 }
 
@@ -457,7 +456,7 @@ pub async fn rename_frames_set(
     let db = lock.as_ref().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    athenaeum_core::db::update_frames_set_name(&conn, args.id, &args.name).map_err(db_err)?;
+    athenaeum_core::db::update_frames_set_name(&conn, args.frames_set_id, &args.new_name).map_err(db_err)?;
     Ok(Json(()))
 }
 
@@ -473,12 +472,12 @@ pub async fn mark_frame_set_custom(
     let conn = db_ref.conn();
 
     let metadata =
-        athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(args.id, &conn)
+        athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(args.frames_set_id, &conn)
             .map_err(|e| db_err(format!("Failed to calculate metadata: {}", e)))?;
 
     db::update_frames_set_metadata(
         &conn,
-        args.id,
+        args.frames_set_id,
         metadata.date_obs_start.as_deref(),
         metadata.date_obs_end.as_deref(),
         metadata.objctra.as_deref(),
@@ -494,7 +493,7 @@ pub async fn mark_frame_set_custom(
     let sets = db::get_frames_sets_by_project(&conn, 1).map_err(db_err)?;
     let frames_set = sets
         .into_iter()
-        .find(|(set, _)| set.id == Some(args.id))
+        .find(|(set, _)| set.id == Some(args.frames_set_id))
         .ok_or_else(|| db_err("Frame set not found"))?
         .0;
 
@@ -513,14 +512,14 @@ pub async fn recalculate_frame_set_metadata(
     let conn = db_ref.conn();
 
     let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
-        args.frame_set_id,
+        args.frames_set_id,
         &conn,
     )
     .map_err(|e| db_err(format!("Failed to calculate metadata: {}", e)))?;
 
     db::update_frames_set_metadata(
         &conn,
-        args.frame_set_id,
+        args.frames_set_id,
         metadata.date_obs_start.as_deref(),
         metadata.date_obs_end.as_deref(),
         metadata.objctra.as_deref(),
@@ -536,7 +535,7 @@ pub async fn recalculate_frame_set_metadata(
     let sets = db::get_frames_sets_by_project(&conn, 1).map_err(db_err)?;
     let frames_set = sets
         .into_iter()
-        .find(|(set, _)| set.id == Some(args.frame_set_id))
+        .find(|(set, _)| set.id == Some(args.frames_set_id))
         .ok_or_else(|| db_err("Frame set not found"))?
         .0;
 
@@ -1060,6 +1059,147 @@ pub async fn create_frame_set_from_excluded(
     Ok(Json(set_id))
 }
 
+// ── Excluded frames ───────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct ReclassifyResult {
+    pub frames_updated: usize,
+    pub cameras_refreshed: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReclassifyExcludedFramesArgs {
+    pub file_ids: Vec<i64>,
+    pub new_imagetyp: String,
+}
+
+/// Get all excluded frames with file paths.
+pub async fn get_excluded_frames(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<Vec<athenaeum_core::models::ExcludedFrameEntry>>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+
+    let entries = athenaeum_core::db::get_excluded_frames(&conn).map_err(db_err)?;
+    Ok(Json(entries))
+}
+
+/// Get count of excluded frames (lightweight check).
+pub async fn get_excluded_frames_count(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+
+    let count = athenaeum_core::db::get_excluded_frames_count(&conn).map_err(db_err)?;
+    Ok(Json(count))
+}
+
+/// Reclassify excluded frames to a new image type, remove from excluded list,
+/// and refresh calibration libraries.
+pub async fn reclassify_excluded_frames(
+    State(state): State<WebAppState>,
+    Json(args): Json<ReclassifyExcludedFramesArgs>,
+) -> Result<Json<ReclassifyResult>, (StatusCode, String)> {
+    use athenaeum_core::db;
+
+    let lock = state.ctx.db.lock().unwrap();
+    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+
+    let (frames_updated, cameras) =
+        db::reclassify_excluded_frames(&conn, &args.file_ids, &args.new_imagetyp)
+            .map_err(|e| db_err(format!("Failed to reclassify frames: {}", e)))?;
+
+    eprintln!(
+        "Reclassified {} frames, affected cameras: {:?}",
+        frames_updated, cameras
+    );
+
+    // Refresh calibration library for each affected camera using the same
+    // inline logic from calibration.rs (clear memberships, re-cluster, prune)
+    for camera in &cameras {
+        if let Err(e) = refresh_calibration_for_camera(&conn, camera) {
+            eprintln!(
+                "Warning: failed to refresh calibration library for {}: {}",
+                camera, e
+            );
+        }
+    }
+
+    Ok(Json(ReclassifyResult {
+        frames_updated,
+        cameras_refreshed: cameras,
+    }))
+}
+
+/// Refresh calibration library for a single camera (same logic as calibration.rs handler).
+fn refresh_calibration_for_camera(
+    conn: &rusqlite::Connection,
+    instrume: &str,
+) -> Result<(), String> {
+    use athenaeum_core::calibration::scan_integration::{
+        create_calibration_sets_from_scan_with_masters, MasterFrameIds,
+    };
+
+    conn.execute(
+        "DELETE FROM calibration_set_frames
+         WHERE set_id IN (
+             SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0
+         )",
+        rusqlite::params![instrume],
+    )
+    .map_err(|e| format!("Failed to clear frame memberships: {}", e))?;
+
+    conn.execute(
+        "UPDATE calibration_set SET frame_count = 0
+         WHERE instrume = ?1 AND is_master_library = 0",
+        rusqlite::params![instrume],
+    )
+    .map_err(|e| format!("Failed to reset frame counts: {}", e))?;
+
+    let query_ids = |imagetyp: &str| -> Result<Vec<i64>, String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM frames WHERE instrume = ?1 AND UPPER(imagetyp) = UPPER(?2)")
+            .map_err(|e| e.to_string())?;
+        let ids = stmt.query_map([instrume, imagetyp], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(ids)
+    };
+
+    let flat_ids = query_ids("FLAT")?;
+    let dark_ids = query_ids("DARK")?;
+    let bias_ids = query_ids("BIAS")?;
+    let darkflat_ids = query_ids("DARKFLAT")?;
+    let master_frame_ids = MasterFrameIds {
+        master_dark_ids: query_ids("MASTERDARK")?,
+        master_flat_ids: query_ids("MASTERFLAT")?,
+        master_bias_ids: query_ids("MASTERBIAS")?,
+        master_darkflat_ids: query_ids("MASTERDARKFLAT")?,
+    };
+
+    create_calibration_sets_from_scan_with_masters(
+        conn, flat_ids, dark_ids, bias_ids, darkflat_ids, master_frame_ids,
+    )
+    .map_err(|e| format!("Failed to create calibration sets: {}", e))?;
+
+    conn.execute(
+        "DELETE FROM calibration_set
+         WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0",
+        rusqlite::params![instrume],
+    )
+    .map_err(|e| format!("Failed to delete orphaned sets: {}", e))?;
+
+    Ok(())
+}
+
 /// Store the flat_pattern preference for a frame set.
 pub async fn update_frame_set_flat_pattern(
     State(state): State<WebAppState>,
@@ -1071,7 +1211,7 @@ pub async fn update_frame_set_flat_pattern(
 
     athenaeum_core::db::update_frames_set_flat_pattern(
         &conn,
-        args.frame_set_id,
+        args.frames_set_id,
         args.flat_pattern.as_deref(),
     )
     .map_err(db_err)?;

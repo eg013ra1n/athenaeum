@@ -115,6 +115,86 @@ pub async fn delete_setting(
     Ok(Json(()))
 }
 
+// ── Cache & blink routes (Category C — modified behavior) ────────────────────
+
+/// Cache stats DTO for web mode.
+#[derive(serde::Serialize)]
+pub struct WebCacheStats {
+    pub total_entries: usize,
+    pub total_size_bytes: u64,
+    pub total_size_human: String,
+}
+
+/// POST /api/get_cache_stats
+///
+/// In web mode, returns memory cache stats (entry count).
+pub async fn get_cache_stats(
+    State(_state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<WebCacheStats>, (StatusCode, String)> {
+    // MemoryImageCache doesn't expose len(); return 0 entries since we can't
+    // cheaply inspect the internal HashMap without modifying the cache crate.
+    // The web mode doesn't use the disk cache, so this is a best-effort stat.
+    Ok(Json(WebCacheStats {
+        total_entries: 0,
+        total_size_bytes: 0,
+        total_size_human: "In-memory cache (stats not tracked)".to_string(),
+    }))
+}
+
+/// POST /api/clear_image_cache
+///
+/// In web mode, clears the in-memory image cache.
+pub async fn clear_image_cache(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
+    mem_cache.clear();
+    let msg = "Memory image cache cleared".to_string();
+    eprintln!("{}", msg);
+    Ok(Json(msg))
+}
+
+/// POST /api/get_blink_threads_max
+///
+/// In web mode, returns available_parallelism capped at 16.
+pub async fn get_blink_threads_max(
+    Json(_): Json<serde_json::Value>,
+) -> Json<usize> {
+    let max = std::thread::available_parallelism()
+        .map(|n| n.get().min(16))
+        .unwrap_or(4);
+    Json(max)
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetBlinkThreadsArgs {
+    pub threads: usize,
+}
+
+/// POST /api/set_blink_threads
+///
+/// In web mode, persists the setting but doesn't rebuild a semaphore.
+pub async fn set_blink_threads(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetBlinkThreadsArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db = lock
+        .as_ref()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    state
+        .ctx
+        .settings
+        .persist_setting(&conn, "blink.max_threads", &args.threads.to_string())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(()))
+}
+
 /// POST /api/get_grouping_threshold_deg
 ///
 /// Returns the frame-set clustering threshold in decimal degrees. Reads the
