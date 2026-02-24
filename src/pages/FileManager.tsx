@@ -97,8 +97,9 @@ export default function FileManager() {
     setAlertDialog({ isOpen: true, title, message, variant });
   };
 
-  // Fetch data file locations on mount
+  // Fetch data file locations on mount (desktop only)
   useEffect(() => {
+    if (!isTauri) return;
     api.invoke<string>('get_database_path').then(setDbPath).catch(console.error);
     api.invoke<string>('get_log_path').then(setLogPath).catch(console.error);
   }, []);
@@ -297,7 +298,8 @@ export default function FileManager() {
         </p>
       </div>
 
-      {/* Data file locations */}
+      {/* Data file locations (desktop only) */}
+      {isTauri && (
       <div className="mb-4">
         <button
           onClick={() => setShowDataPaths(!showDataPaths)}
@@ -312,7 +314,7 @@ export default function FileManager() {
             <div className="flex items-center gap-2">
               <span className="text-content-muted min-w-[80px]">Database:</span>
               <span className="text-content truncate">{dbPath || '—'}</span>
-              {isTauri && dbPath && (
+              {dbPath && (
                 <button
                   onClick={() => revealItemInDir(dbPath)}
                   className="text-content-muted hover:text-content transition flex-shrink-0"
@@ -325,7 +327,7 @@ export default function FileManager() {
             <div className="flex items-center gap-2">
               <span className="text-content-muted min-w-[80px]">Log file:</span>
               <span className="text-content truncate">{logPath || '—'}</span>
-              {isTauri && logPath && (
+              {logPath && (
                 <button
                   onClick={() => revealItemInDir(logPath)}
                   className="text-content-muted hover:text-content transition flex-shrink-0"
@@ -338,6 +340,7 @@ export default function FileManager() {
           </div>
         )}
       </div>
+      )}
 
       {/* Tab Navigation */}
       <div className="flex gap-2 mb-3 border-b border-border">

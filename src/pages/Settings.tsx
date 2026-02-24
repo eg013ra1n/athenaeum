@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { api } from '../api';
 import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
+import { isTauri } from '../utils/platform';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
@@ -50,7 +51,7 @@ export default function Settings() {
 
   useEffect(() => {
     loadSettings();
-    loadCacheStats();
+    if (isTauri) loadCacheStats();
     api.invoke<number>('get_blink_threads_max').then(setBlinkThreadsMax).catch(console.error);
   }, []);
 
@@ -203,10 +204,10 @@ export default function Settings() {
           key: 'blink.resolution',
           value: blinkResolution,
         }),
-        api.invoke('set_setting', {
+        ...(isTauri ? [api.invoke('set_setting', {
           key: 'blink.cache_mode',
           value: blinkCacheMode,
-        }),
+        })] : []),
         api.invoke('set_setting', {
           key: 'duplicates.use_content_hash',
           value: useContentHash ? 'true' : 'false',
@@ -503,44 +504,8 @@ export default function Settings() {
               </p>
             </div>
 
-            {/* Cache Mode */}
-            <div>
-              <label className="block text-sm font-medium text-content-secondary mb-2">
-                Cache Mode
-              </label>
-              <select
-                value={blinkCacheMode}
-                onChange={(e) => setBlinkCacheMode(e.target.value)}
-                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
-              >
-                <option value="file">File (disk JPEG)</option>
-                <option value="memory">Memory (in-memory JPEG)</option>
-              </select>
-              <p className="text-xs text-content-muted mt-2">
-                File mode caches JPEGs on disk (persistent). Memory mode keeps up to 200 images in RAM for instant switching (~60MB).
-              </p>
-            </div>
-
-            {/* Concurrent Threads */}
-            <div>
-              <label className="block text-sm font-medium text-content-secondary mb-2">
-                Concurrent Processing Threads ({blinkThreads})
-              </label>
-              <input
-                type="number"
-                value={blinkThreads}
-                onChange={(e) => setBlinkThreads(e.target.value)}
-                min="1"
-                max={blinkThreadsMax}
-                step="1"
-                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
-              />
-              <p className="text-xs text-content-muted mt-2">
-                Number of concurrent image processing threads (1–{blinkThreadsMax}). Lower values use less memory, higher values process faster.
-              </p>
-            </div>
-
-            {/* Thumbnail JPEG Quality */}
+            {/* JPEG Quality - shows only the slider matching the selected resolution */}
+            {blinkResolution === 'thumbnail' && (
             <div>
               <label className="block text-sm font-medium text-content-secondary mb-2">
                 Thumbnail JPEG Quality ({qualityThumbnail})
@@ -562,8 +527,9 @@ export default function Settings() {
                 JPEG quality for thumbnail images. Default: 70. Lower values = smaller files, faster loading.
               </p>
             </div>
+            )}
 
-            {/* Preview JPEG Quality */}
+            {blinkResolution === 'preview' && (
             <div>
               <label className="block text-sm font-medium text-content-secondary mb-2">
                 Preview JPEG Quality ({qualityPreview})
@@ -585,8 +551,9 @@ export default function Settings() {
                 JPEG quality for preview/blink viewer images. Default: 85. Good balance of quality and file size.
               </p>
             </div>
+            )}
 
-            {/* Full JPEG Quality */}
+            {blinkResolution === 'full' && (
             <div>
               <label className="block text-sm font-medium text-content-secondary mb-2">
                 Full Resolution JPEG Quality ({qualityFull})
@@ -606,6 +573,46 @@ export default function Settings() {
               </div>
               <p className="text-xs text-content-muted mt-2">
                 JPEG quality for full resolution images. Default: 95. Highest quality for detailed viewing.
+              </p>
+            </div>
+            )}
+
+            {/* Cache Mode - desktop only */}
+            {isTauri && (
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Cache Mode
+              </label>
+              <select
+                value={blinkCacheMode}
+                onChange={(e) => setBlinkCacheMode(e.target.value)}
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              >
+                <option value="file">File (disk JPEG)</option>
+                <option value="memory">Memory (in-memory JPEG)</option>
+              </select>
+              <p className="text-xs text-content-muted mt-2">
+                File mode caches JPEGs on disk (persistent). Memory mode keeps up to 200 images in RAM for instant switching (~60MB).
+              </p>
+            </div>
+            )}
+
+            {/* Concurrent Threads */}
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Concurrent Processing Threads ({blinkThreads})
+              </label>
+              <input
+                type="number"
+                value={blinkThreads}
+                onChange={(e) => setBlinkThreads(e.target.value)}
+                min="1"
+                max={blinkThreadsMax}
+                step="1"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-2">
+                Number of concurrent image processing threads (1–{blinkThreadsMax}). Lower values use less memory, higher values process faster.
               </p>
             </div>
 
@@ -674,6 +681,7 @@ export default function Settings() {
               {saving ? 'Saving...' : 'Save Settings'}
             </button>
 
+            {isTauri && (
             <button
               onClick={handleClearCache}
               disabled={clearingCache}
@@ -685,8 +693,9 @@ export default function Settings() {
                 : `Clear Image Cache${cacheStats ? ` (${formatBytes(cacheStats.total_size_bytes)})` : ''}`
               }
             </button>
+            )}
 
-            {cacheSuccess && (
+            {isTauri && cacheSuccess && (
               <div className="flex items-center gap-2 text-success">
                 <CheckCircle size={18} />
                 <span>Cache cleared!</span>
