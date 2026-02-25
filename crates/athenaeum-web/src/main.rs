@@ -1,11 +1,12 @@
 use athenaeum_core::cache::MemoryImageCache;
-use athenaeum_core::db::Database;
+use athenaeum_core::db::{self, Database};
 use athenaeum_core::logging;
 use athenaeum_core::services::ServiceContext;
-use athenaeum_core::settings::SettingsManager;
+use athenaeum_core::settings::{self, SettingsManager};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 mod events;
 mod routes;
@@ -87,13 +88,26 @@ async fn main() {
         .build()
         .expect("Failed to create image processing thread pool");
 
+    // Read memory cache settings from DB
+    let cache_size: usize = db::get_setting(&db.conn(), settings::keys::BLINK_MEMORY_CACHE_SIZE)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let retention_minutes: u64 = db::get_setting(&db.conn(), settings::keys::BLINK_MEMORY_RETENTION_MINUTES)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    println!("  Memory cache: {} entries, {} min retention", cache_size, retention_minutes);
+
     // Build ServiceContext
-    let settings = Arc::new(SettingsManager::new());
+    let settings_mgr = Arc::new(SettingsManager::new());
     let ctx = Arc::new(ServiceContext {
         db: Mutex::new(Some(db)),
-        settings,
+        settings: settings_mgr,
         cache: Arc::new(Mutex::new(None)),
-        memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
+        memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(cache_size, retention_minutes))),
         active_scans: Arc::new(Mutex::new(HashMap::new())),
         active_exports: Arc::new(Mutex::new(HashMap::new())),
         image_pool: Arc::new(image_pool),
@@ -108,6 +122,18 @@ async fn main() {
         allowed_paths: config.allowed_paths,
         export_dir: config.export_dir,
     };
+
+    // Spawn background sweeper for stale memory-cache entries (every 60s)
+    {
+        let memory_cache = Arc::clone(&state.ctx.memory_cache);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let mut cache = memory_cache.lock().unwrap();
+                cache.evict_stale();
+            }
+        });
+    }
 
     // Build router
     let app = routes::build_router(state, config.static_dir);

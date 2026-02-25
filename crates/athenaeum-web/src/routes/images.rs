@@ -121,7 +121,7 @@ pub async fn get_frame_preview(
 
     {
         let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
-        mem_cache.insert(cache_key, CachedImage { data: jpeg_data.clone() });
+        mem_cache.insert(cache_key, CachedImage { data: jpeg_data.clone(), last_accessed: std::time::Instant::now() });
     }
 
     // ── 5. Return JPEG bytes ──────────────────────────────────────────────────

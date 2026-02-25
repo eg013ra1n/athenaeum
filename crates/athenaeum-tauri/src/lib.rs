@@ -34,6 +34,7 @@ use athenaeum_core::services::ServiceContext;
 use settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Manager, State};
 
 /// Initialize file-based logging before Tauri starts.
@@ -59,7 +60,7 @@ pub fn run() {
                     db: Mutex::new(None),
                     settings: Arc::new(SettingsManager::new()),
                     cache: Arc::new(Mutex::new(None)),
-                    memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200))),
+                    memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200, 30))),
                     active_scans: Arc::new(Mutex::new(HashMap::new())),
                     active_exports: Arc::new(Mutex::new(HashMap::new())),
                     image_pool: Arc::new(
@@ -92,6 +93,38 @@ pub fn run() {
                     }
                 }
             }
+
+            // Read memory cache settings from DB and apply
+            {
+                let db_lock = state.ctx.db.lock().unwrap();
+                if let Some(db) = db_lock.as_ref() {
+                    let conn = db.conn();
+                    let cache_size: usize = db::get_setting(&conn, settings::keys::BLINK_MEMORY_CACHE_SIZE)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(200);
+                    let retention_minutes: u64 = db::get_setting(&conn, settings::keys::BLINK_MEMORY_RETENTION_MINUTES)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30);
+                    let mut cache = state.ctx.memory_cache.lock().unwrap();
+                    cache.set_max_entries(cache_size);
+                    cache.set_retention(retention_minutes);
+                    println!("Memory cache: {} entries, {} min retention", cache_size, retention_minutes);
+                }
+            }
+
+            // Spawn background sweeper for stale memory-cache entries (every 60s)
+            let memory_cache = Arc::clone(&state.ctx.memory_cache);
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let mut cache = memory_cache.lock().unwrap();
+                    cache.evict_stale();
+                }
+            });
 
             logging::log("INFO", "Athenaeum started, Tauri setup complete");
             Ok(())

@@ -29,6 +29,8 @@ pub mod defaults {
 
     // Blink viewer
     pub const BLINK_THREADS: &str = "4";
+    pub const BLINK_MEMORY_CACHE_SIZE: &str = "200";
+    pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "30";
 }
 
 /// Setting keys used throughout the application
@@ -51,6 +53,8 @@ pub mod keys {
 
     // Blink viewer
     pub const BLINK_THREADS: &str = "blink.threads";
+    pub const BLINK_MEMORY_CACHE_SIZE: &str = "blink.memory_cache_size";
+    pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "blink.memory_retention_minutes";
 }
 
 /// Runtime overrides for settings (session-specific)

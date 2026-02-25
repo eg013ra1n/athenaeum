@@ -27,6 +27,8 @@ export default function Settings() {
   const [blinkCacheMode, setBlinkCacheMode] = useState('file');
   const [blinkThreads, setBlinkThreads] = useState('4');
   const [blinkThreadsMax, setBlinkThreadsMax] = useState(4);
+  const [blinkCacheSize, setBlinkCacheSize] = useState('200');
+  const [blinkRetentionMinutes, setBlinkRetentionMinutes] = useState('30');
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
 
@@ -61,7 +63,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, blinkThreadsVal, contentHash, contentHashRescanned
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned
       ] = await Promise.all([
         api.invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -100,6 +102,14 @@ export default function Settings() {
           defaultValue: '4',
         }),
         api.invoke<string>('get_setting', {
+          key: 'blink.memory_cache_size',
+          defaultValue: '200',
+        }),
+        api.invoke<string>('get_setting', {
+          key: 'blink.memory_retention_minutes',
+          defaultValue: '30',
+        }),
+        api.invoke<string>('get_setting', {
           key: 'duplicates.use_content_hash',
           defaultValue: 'false',
         }),
@@ -118,6 +128,8 @@ export default function Settings() {
       setBlinkResolution(resolution);
       setBlinkCacheMode(cacheMode);
       setBlinkThreads(blinkThreadsVal);
+      setBlinkCacheSize(cacheSizeVal);
+      setBlinkRetentionMinutes(retentionMin);
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
     } catch (err) {
@@ -175,6 +187,20 @@ export default function Settings() {
       }
       await api.invoke('set_blink_threads', { threads: blinkThreadsNum });
 
+      // Validate memory cache size
+      const cacheSizeNum = parseInt(blinkCacheSize);
+      if (isNaN(cacheSizeNum) || cacheSizeNum < 10 || cacheSizeNum > 5000) {
+        setError('Memory cache size must be between 10 and 5000');
+        return;
+      }
+
+      // Validate memory cache retention
+      const retentionNum = parseInt(blinkRetentionMinutes);
+      if (isNaN(retentionNum) || retentionNum < 1 || retentionNum > 1440) {
+        setError('Memory cache retention must be between 1 and 1440 minutes');
+        return;
+      }
+
       await Promise.all([
         api.invoke('set_setting', {
           key: 'grouping.threshold.value',
@@ -208,6 +234,14 @@ export default function Settings() {
           key: 'blink.cache_mode',
           value: blinkCacheMode,
         })] : []),
+        api.invoke('set_setting', {
+          key: 'blink.memory_cache_size',
+          value: blinkCacheSize,
+        }),
+        api.invoke('set_setting', {
+          key: 'blink.memory_retention_minutes',
+          value: blinkRetentionMinutes,
+        }),
         api.invoke('set_setting', {
           key: 'duplicates.use_content_hash',
           value: useContentHash ? 'true' : 'false',
@@ -613,6 +647,44 @@ export default function Settings() {
               />
               <p className="text-xs text-content-muted mt-2">
                 Number of concurrent image processing threads (1–{blinkThreadsMax}). Lower values use less memory, higher values process faster.
+              </p>
+            </div>
+
+            {/* Memory Cache Size */}
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Memory Cache Size (images)
+              </label>
+              <input
+                type="number"
+                value={blinkCacheSize}
+                onChange={(e) => setBlinkCacheSize(e.target.value)}
+                min="10"
+                max="5000"
+                step="10"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-2">
+                Maximum number of images kept in the memory cache. Default: 200. For large frame sets, increase this to avoid cache thrashing. Each image uses ~1-2 MB of RAM.
+              </p>
+            </div>
+
+            {/* Memory Cache Retention */}
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Memory Cache Retention (minutes)
+              </label>
+              <input
+                type="number"
+                value={blinkRetentionMinutes}
+                onChange={(e) => setBlinkRetentionMinutes(e.target.value)}
+                min="1"
+                max="1440"
+                step="1"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-2">
+                Cached images are automatically evicted after this many minutes of inactivity. Default: 30. Max: 1440 (24 hours). Accessing an image resets its timer.
               </p>
             </div>
 

@@ -38,7 +38,18 @@ pub async fn set_setting(
 
     state.ctx.settings
         .persist_setting(&conn, &key, &value)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Update in-memory cache settings when they change
+    if key == settings::keys::BLINK_MEMORY_CACHE_SIZE {
+        let size: usize = value.parse().unwrap_or(200);
+        state.ctx.memory_cache.lock().unwrap().set_max_entries(size);
+    } else if key == settings::keys::BLINK_MEMORY_RETENTION_MINUTES {
+        let minutes: u64 = value.parse().unwrap_or(30);
+        state.ctx.memory_cache.lock().unwrap().set_retention(minutes);
+    }
+
+    Ok(())
 }
 
 /// Get all settings from database

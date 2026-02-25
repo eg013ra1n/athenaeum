@@ -2,6 +2,7 @@
 
 use athenaeum_core::db;
 use athenaeum_core::models::Setting;
+use athenaeum_core::settings;
 use axum::{extract::State, http::StatusCode, Json};
 
 use crate::WebAppState;
@@ -72,6 +73,15 @@ pub async fn set_setting(
         .settings
         .persist_setting(&conn, &args.key, &args.value)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Update in-memory cache settings when they change
+    if args.key == settings::keys::BLINK_MEMORY_CACHE_SIZE {
+        let size: usize = args.value.parse().unwrap_or(200);
+        state.ctx.memory_cache.lock().unwrap().set_max_entries(size);
+    } else if args.key == settings::keys::BLINK_MEMORY_RETENTION_MINUTES {
+        let minutes: u64 = args.value.parse().unwrap_or(30);
+        state.ctx.memory_cache.lock().unwrap().set_retention(minutes);
+    }
 
     Ok(Json(()))
 }
