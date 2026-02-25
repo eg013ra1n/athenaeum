@@ -104,12 +104,20 @@ pub async fn get_frame_preview(
     //
     // process_fits_to_jpeg is CPU-intensive synchronous work; we move it off
     // the async executor using spawn_blocking to avoid blocking tokio threads.
+    // Acquire a semaphore permit first to limit concurrent image processing.
+
+    let sem = state.image_semaphore.read().unwrap().clone();
+    let _permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|e| db_err(format!("Semaphore closed: {}", e)))?;
 
     let path_buf = PathBuf::from(&file_path);
     let res = Resolution::from_string(&resolution_str);
     let pool: Arc<rayon::ThreadPool> = Arc::clone(&state.ctx.image_pool);
 
     let jpeg_data = tokio::task::spawn_blocking(move || {
+        let _permit = _permit; // hold permit until processing completes
         rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &pool)
     })
     .await

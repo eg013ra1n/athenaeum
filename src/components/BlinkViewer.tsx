@@ -244,19 +244,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     img.src = imageValue;
   }, [drawImageToCanvas]);
 
-  // Load current and preload next images sequentially (wait for cache mode to be determined)
+  // Ensure current frame loads immediately on navigation (idempotent — skips if already loaded/loading)
   useEffect(() => {
     if (!cacheModeReady) return;
-    let cancelled = false;
-    const preload = async () => {
-      await loadImage(currentIndex);
-      if (cancelled) return;
-      await loadImage(currentIndex + 1);
-      if (cancelled) return;
-      await loadImage(currentIndex + 2);
-    };
-    preload();
-    return () => { cancelled = true; };
+    loadImage(currentIndex);
   }, [currentIndex, loadImage, cacheModeReady]);
 
   // Cleanup blob URLs on unmount
@@ -443,52 +434,64 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     return () => window.removeEventListener("keydown", handleKeyPress);
   }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames, zoomIn, zoomOut, resetZoom]);
 
-  // Auto-cache after cache mode is ready
+  // Unified queue: cache all frames in priority order (current first, then forward, then wrap)
   useEffect(() => {
     if (!cacheModeReady) return;
+    const total = fitsFrames.length;
+    if (total === 0) return;
+
+    let cancelled = false;
+
     const startCaching = async () => {
-      await new Promise((r) => setTimeout(r, 100));
-      const preloadSet = new Set([currentIndex, currentIndex + 1, currentIndex + 2]);
-      const uncached = fitsFrames.map((_, i) => i).filter((i) => !loadedImages.has(i) && !preloadSet.has(i));
-      if (uncached.length === 0) return;
+      // Build priority-ordered queue: currentIndex, +1, +2, ... wrap around to 0, 1, ...
+      const queue: number[] = [];
+      for (let i = 0; i < total; i++) {
+        queue.push((currentIndex + i) % total);
+      }
 
       setIsCaching(true);
       setCacheStats(null);
       let done = 0;
-      setCacheProgress({ current: 0, total: uncached.length });
+      setCacheProgress({ current: 0, total });
 
       const cacheStartTime = Date.now();
       const MAX_CONCURRENT = 8;
+
       await new Promise<void>((resolveAll) => {
         let nextJob = 0;
         let running = 0;
 
         const startNext = () => {
-          while (running < MAX_CONCURRENT && nextJob < uncached.length) {
+          while (!cancelled && running < MAX_CONCURRENT && nextJob < queue.length) {
             running++;
-            const idx = uncached[nextJob++];
+            const idx = queue[nextJob++];
             loadImage(idx).finally(() => {
               running--;
               done++;
-              setCacheProgress({ current: done, total: uncached.length });
-              if (nextJob < uncached.length) {
+              setCacheProgress({ current: done, total });
+              if (!cancelled && nextJob < queue.length) {
                 startNext();
               } else if (running === 0) {
                 resolveAll();
               }
             });
           }
-          if (running === 0 && nextJob >= uncached.length) {
+          if (running === 0 && nextJob >= queue.length) {
             resolveAll();
           }
         };
 
         startNext();
       });
-      setCacheStats({ elapsedMs: Date.now() - cacheStartTime, frameCount: uncached.length });
-      setIsCaching(false);
+
+      if (!cancelled) {
+        setCacheStats({ elapsedMs: Date.now() - cacheStartTime, frameCount: total });
+        setIsCaching(false);
+      }
     };
+
     startCaching();
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheModeReady]);
 

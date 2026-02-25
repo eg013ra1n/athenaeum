@@ -5,7 +5,7 @@ use athenaeum_core::services::ServiceContext;
 use athenaeum_core::settings::{self, SettingsManager};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 mod events;
@@ -49,6 +49,11 @@ pub struct WebAppState {
     pub event_tx: tokio::sync::broadcast::Sender<events::SseEvent>,
     pub allowed_paths: Vec<PathBuf>,
     pub export_dir: Option<PathBuf>,
+    /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
+    /// can be swapped at runtime when the user changes blink.threads.
+    pub image_semaphore: Arc<RwLock<Arc<tokio::sync::Semaphore>>>,
+    /// CPU-based upper bound for blink threads (min(vCPUs, 16)).
+    pub max_blink_threads: usize,
 }
 
 #[tokio::main]
@@ -88,6 +93,17 @@ async fn main() {
         .build()
         .expect("Failed to create image processing thread pool");
 
+    // Read blink threads setting from DB
+    let blink_threads: usize = db::get_setting(&db.conn(), settings::keys::BLINK_THREADS)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(settings::defaults::BLINK_THREADS.parse::<usize>().unwrap_or(4));
+    let image_semaphore = Arc::new(RwLock::new(Arc::new(
+        tokio::sync::Semaphore::new(blink_threads),
+    )));
+    println!("  Blink threads: {} (semaphore permits)", blink_threads);
+
     // Read memory cache settings from DB
     let cache_size: usize = db::get_setting(&db.conn(), settings::keys::BLINK_MEMORY_CACHE_SIZE)
         .ok()
@@ -121,6 +137,8 @@ async fn main() {
         event_tx,
         allowed_paths: config.allowed_paths,
         export_dir: config.export_dir,
+        image_semaphore,
+        max_blink_threads: max_threads,
     };
 
     // Spawn background sweeper for stale memory-cache entries (every 60s)

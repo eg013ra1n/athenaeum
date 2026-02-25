@@ -40,7 +40,7 @@ pub async fn read_fits_image_rustafits(
             };
             let mode = match crate::db::get_setting(&conn, "blink.cache_mode") {
                 Ok(Some(value)) => value,
-                _ => "file".to_string(),
+                _ => "memory".to_string(),
             };
 
             // Read quality setting and file info (needed for both modes now)

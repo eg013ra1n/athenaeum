@@ -168,14 +168,12 @@ pub async fn clear_image_cache(
 
 /// POST /api/get_blink_threads_max
 ///
-/// In web mode, returns available_parallelism capped at 16.
+/// Returns the CPU-based max so the frontend can set the slider/input max dynamically.
 pub async fn get_blink_threads_max(
+    State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Json<usize> {
-    let max = std::thread::available_parallelism()
-        .map(|n| n.get().min(16))
-        .unwrap_or(4);
-    Json(max)
+    Json(state.max_blink_threads)
 }
 
 #[derive(serde::Deserialize)]
@@ -185,11 +183,14 @@ pub struct SetBlinkThreadsArgs {
 
 /// POST /api/set_blink_threads
 ///
-/// In web mode, persists the setting but doesn't rebuild a semaphore.
+/// Persists the thread count to DB and rebuilds the image processing semaphore.
+/// In-flight permits on the old semaphore complete naturally.
 pub async fn set_blink_threads(
     State(state): State<WebAppState>,
     Json(args): Json<SetBlinkThreadsArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
+    let threads = args.threads.clamp(1, state.max_blink_threads);
+
     let lock = state.ctx.db.lock().unwrap();
     let db = lock
         .as_ref()
@@ -199,9 +200,14 @@ pub async fn set_blink_threads(
     state
         .ctx
         .settings
-        .persist_setting(&conn, "blink.max_threads", &args.threads.to_string())
+        .persist_setting(&conn, settings::keys::BLINK_THREADS, &threads.to_string())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Rebuild semaphore — in-flight permits on the old Arc complete naturally
+    *state.image_semaphore.write().unwrap() =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(threads));
+
+    eprintln!("Blink semaphore rebuilt with {} permits", threads);
     Ok(Json(()))
 }
 

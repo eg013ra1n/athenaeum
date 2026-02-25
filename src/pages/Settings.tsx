@@ -95,7 +95,7 @@ export default function Settings() {
         }),
         api.invoke<string>('get_setting', {
           key: 'blink.cache_mode',
-          defaultValue: 'file',
+          defaultValue: 'memory',
         }),
         api.invoke<string>('get_setting', {
           key: 'blink.threads',
