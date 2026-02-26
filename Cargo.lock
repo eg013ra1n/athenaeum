@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "athenaeum-core"
-version = "0.1.4"
+version = "0.2.0-beta.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "athenaeum-tauri"
-version = "0.1.4"
+version = "0.2.0-beta.1"
 dependencies = [
  "anyhow",
  "athenaeum-core",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "athenaeum-web"
-version = "0.1.4"
+version = "0.2.0-beta.1"
 dependencies = [
  "athenaeum-core",
  "axum",

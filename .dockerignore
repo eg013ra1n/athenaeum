@@ -1,0 +1,24 @@
+.git/
+.github/
+.claude/
+.continue/
+.vscode/
+node_modules/
+dist/
+builds/
+docs/
+doc/
+
+# Desktop-only crate (excluded from Docker workspace)
+crates/athenaeum-tauri/
+
+# Rust build cache
+target/
+
+# Editor / AI config
+CLAUDE.md
+*.md
+!README.md
+
+# CI
+.gitlab-ci.yml

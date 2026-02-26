@@ -109,4 +109,11 @@ else
     git push origin main
 fi
 
+# Push tag to GitHub if CI_COMMIT_TAG is set (GitLab CI passes this on tag pipelines)
+if [ -n "${CI_COMMIT_TAG:-}" ]; then
+    echo "Tagging GitHub mirror with ${CI_COMMIT_TAG}..."
+    git tag -f "${CI_COMMIT_TAG}"
+    git push origin "${CI_COMMIT_TAG}" --force
+fi
+
 echo "Done. GitHub mirror updated (source: ${SOURCE_SHA})."

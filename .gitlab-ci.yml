@@ -203,8 +203,13 @@ deploy:
     - ${SCP_CMD} src-tauri/target/release/bundle/msi/*.msi src-tauri/target/release/bundle/nsis/*.exe ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/windows/
     # Upload macOS artifacts
     - ${SCP_CMD} src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/macos/
-    # Update latest/ symlink to point to this release
-    - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/latest"
+    # Update symlink: beta tags → builds/beta, stable tags → builds/latest
+    - |
+      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then
+        ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/beta"
+      else
+        ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "ln -sfn ${BUILDS_PATH}/${CI_COMMIT_TAG} ${BUILDS_PATH}/latest"
+      fi
   after_script:
     - ssh-agent -k 2>/dev/null || true
 
@@ -227,7 +232,7 @@ release:
         --data "{
           \"tag_name\": \"${CI_COMMIT_TAG}\",
           \"name\": \"Athenaeum ${CI_COMMIT_TAG}\",
-          \"description\": \"Release ${CI_COMMIT_TAG}\",
+          \"description\": $(cat RELEASE_NOTES.md 2>/dev/null | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '\"Release '${CI_COMMIT_TAG}'\"'),
           \"assets\": {
             \"links\": [
               {\"name\": \"Windows Installer (MSI)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/windows/Athenaeum_${CI_COMMIT_TAG}_x64_en-US.msi\"},
@@ -248,7 +253,7 @@ publish_version:
   only:
     - tags
   needs:
-    - job: release
+    - job: deploy
       artifacts: false
   variables:
     DEPLOY_PORT: "40022"
@@ -262,8 +267,14 @@ publish_version:
     - ssh-keyscan -p ${DEPLOY_PORT} -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
   script:
     - VERSION=${CI_COMMIT_TAG#v}
-    - printf '{"version":"%s","download_url":"https://artfrom.space/releases/download"}' "$VERSION" > version.json
-    - ${SCP_CMD} version.json ${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/artfrom.space/version.json
+    - |
+      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then
+        TARGET="version-beta.json"
+      else
+        TARGET="version.json"
+      fi
+    - printf '{"version":"%s","download_url":"https://artfrom.space/releases/download"}' "$VERSION" > "$TARGET"
+    - ${SCP_CMD} "$TARGET" ${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/artfrom.space/"$TARGET"
   after_script:
     - ssh-agent -k 2>/dev/null || true
 

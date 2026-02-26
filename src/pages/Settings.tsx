@@ -31,6 +31,7 @@ export default function Settings() {
   const [blinkRetentionMinutes, setBlinkRetentionMinutes] = useState('30');
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
+  const [checkBeta, setCheckBeta] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -63,7 +64,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned, checkBetaVal
       ] = await Promise.all([
         api.invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -117,6 +118,10 @@ export default function Settings() {
           key: 'duplicates.content_hash_rescanned',
           defaultValue: 'false',
         }),
+        api.invoke<string>('get_setting', {
+          key: 'updates.check_beta',
+          defaultValue: 'false',
+        }),
       ]);
 
       setThresholdValue(value);
@@ -132,6 +137,7 @@ export default function Settings() {
       setBlinkRetentionMinutes(retentionMin);
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
+      setCheckBeta(checkBetaVal.toLowerCase() === 'true');
     } catch (err) {
       setError(err as string);
       console.error('Failed to load settings:', err);
@@ -250,6 +256,10 @@ export default function Settings() {
         api.invoke('set_setting', {
           key: 'duplicates.content_hash_rescanned',
           value: useContentHash ? 'false' : 'false',
+        }),
+        api.invoke('set_setting', {
+          key: 'updates.check_beta',
+          value: checkBeta ? 'true' : 'false',
         }),
       ]);
 
@@ -452,6 +462,32 @@ export default function Settings() {
           )}
 
           <div className="bg-surface-elevated rounded-lg p-6 space-y-6">
+
+        {/* Updates section - desktop only */}
+        {isTauri && (
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Updates</h3>
+          <div className="space-y-4">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={checkBeta}
+                onChange={(e) => setCheckBeta(e.target.checked)}
+                className="w-5 h-5 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0"
+              />
+              <div>
+                <span className="block text-sm font-medium text-content-secondary">
+                  Check for beta updates
+                </span>
+                <span className="block text-xs text-content-muted mt-1">
+                  When enabled, the update checker will also look for pre-release (beta) versions. Beta builds may contain new features that are still being tested.
+                </span>
+              </div>
+            </label>
+          </div>
+        </div>
+        )}
+
         <div>
           <h3 className="text-lg font-semibold mb-4">Clustering Parameters</h3>
 

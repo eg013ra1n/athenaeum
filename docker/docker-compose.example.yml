@@ -1,0 +1,39 @@
+# Athenaeum — self-hosted astrophotography image manager
+#
+# Quick start:
+#   1. Copy this file:  cp docker-compose.example.yml docker-compose.yml
+#   2. Edit the volume paths below to match your system
+#   3. Run:  docker compose up -d
+#   4. Open http://localhost:3000
+#
+# Updating:
+#   docker compose pull && docker compose up -d
+
+services:
+  athenaeum:
+    image: ghcr.io/eg013ra1n/athenaeum:latest
+    # For beta builds, use:
+    # image: ghcr.io/eg013ra1n/athenaeum:beta
+    ports:
+      - "3000:3000"
+    volumes:
+      # Database storage (persistent)
+      - athenaeum-data:/data
+      # Mount your astrophotography directories here.
+      # Add as many as you need — each one becomes browsable in the app.
+      # Format:  /host/path:/container/path:ro   (ro = read-only recommended)
+      - /path/to/your/astro-images:/astro-files:ro
+      # Export directory (read-write, for file exports)
+      - /path/to/exports:/exports:rw
+    environment:
+      - ATHENAEUM_DB_PATH=/data/athenaeum.db
+      - ATHENAEUM_PORT=3000
+      - ATHENAEUM_STATIC_DIR=/app/static
+      # Comma-separated list of container paths the app is allowed to browse.
+      # Must match the container-side paths in your volume mounts above.
+      - ATHENAEUM_ALLOWED_PATHS=/astro-files
+      - ATHENAEUM_EXPORT_DIR=/exports
+    restart: unless-stopped
+
+volumes:
+  athenaeum-data:
