@@ -2,7 +2,6 @@
 //
 // Renders a FITS/XISF file to JPEG using the rustafits processing pipeline.
 // The memory image cache (MemoryImageCache) is used for fast repeated requests.
-// No disk-based CacheManager is used in web mode (it is always None).
 
 use athenaeum_core::cache::CachedImage;
 use athenaeum_core::db;

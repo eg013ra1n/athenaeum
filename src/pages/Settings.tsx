@@ -1,19 +1,10 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, Trash2, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { isTauri } from '../utils/platform';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
-
-interface CacheStats {
-  total_entries: number;
-  total_size_bytes: number;
-  cache_hits: number;
-  cache_misses: number;
-  hit_rate: number;
-  max_size_bytes: number;
-}
 
 export default function Settings() {
   // Defaults should match backend: settings/mod.rs defaults
@@ -24,7 +15,6 @@ export default function Settings() {
   const [qualityPreview, setQualityPreview] = useState('85');
   const [qualityFull, setQualityFull] = useState('95');
   const [blinkResolution, setBlinkResolution] = useState('preview');
-  const [blinkCacheMode, setBlinkCacheMode] = useState('file');
   const [blinkThreads, setBlinkThreads] = useState('4');
   const [blinkThreadsMax, setBlinkThreadsMax] = useState(4);
   const [blinkCacheSize, setBlinkCacheSize] = useState('200');
@@ -35,11 +25,8 @@ export default function Settings() {
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [clearingCache, setClearingCache] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
-  const [cacheSuccess, setCacheSuccess] = useState(false);
-  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
 
   // Backfill fingerprints state
   const [backfillingFingerprints, setBackfillingFingerprints] = useState(false);
@@ -54,7 +41,6 @@ export default function Settings() {
 
   useEffect(() => {
     loadSettings();
-    if (isTauri) loadCacheStats();
     api.invoke<number>('get_blink_threads_max').then(setBlinkThreadsMax).catch(console.error);
   }, []);
 
@@ -64,7 +50,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, cacheMode, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned, checkBetaVal
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned, checkBetaVal
       ] = await Promise.all([
         api.invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -93,10 +79,6 @@ export default function Settings() {
         api.invoke<string>('get_setting', {
           key: 'blink.resolution',
           defaultValue: 'preview',
-        }),
-        api.invoke<string>('get_setting', {
-          key: 'blink.cache_mode',
-          defaultValue: 'memory',
         }),
         api.invoke<string>('get_setting', {
           key: 'blink.threads',
@@ -131,7 +113,6 @@ export default function Settings() {
       setQualityPreview(qPreview);
       setQualityFull(qFull);
       setBlinkResolution(resolution);
-      setBlinkCacheMode(cacheMode);
       setBlinkThreads(blinkThreadsVal);
       setBlinkCacheSize(cacheSizeVal);
       setBlinkRetentionMinutes(retentionMin);
@@ -236,10 +217,6 @@ export default function Settings() {
           key: 'blink.resolution',
           value: blinkResolution,
         }),
-        ...(isTauri ? [api.invoke('set_setting', {
-          key: 'blink.cache_mode',
-          value: blinkCacheMode,
-        })] : []),
         api.invoke('set_setting', {
           key: 'blink.memory_cache_size',
           value: blinkCacheSize,
@@ -270,54 +247,6 @@ export default function Settings() {
       console.error('Failed to save settings:', err);
     } finally {
       setSaving(false);
-    }
-  };
-
-  const loadCacheStats = async () => {
-    try {
-      const stats = await api.invoke<CacheStats>('get_cache_stats');
-      setCacheStats(stats);
-    } catch (err) {
-      console.error('Failed to load cache stats:', err);
-      // Don't show error to user, just fail silently
-      setCacheStats(null);
-    }
-  };
-
-  const formatBytes = (bytes: number): string => {
-    const KB = 1024;
-    const MB = KB * 1024;
-    const GB = MB * 1024;
-
-    if (bytes >= GB) {
-      return `${(bytes / GB).toFixed(2)} GB`;
-    } else if (bytes >= MB) {
-      return `${(bytes / MB).toFixed(2)} MB`;
-    } else if (bytes >= KB) {
-      return `${(bytes / KB).toFixed(2)} KB`;
-    } else {
-      return `${bytes} bytes`;
-    }
-  };
-
-  const handleClearCache = async () => {
-    try {
-      setClearingCache(true);
-      setError(null);
-      setCacheSuccess(false);
-
-      await api.invoke('clear_image_cache');
-
-      setCacheSuccess(true);
-      setTimeout(() => setCacheSuccess(false), 3000);
-
-      // Reload cache stats after clearing
-      await loadCacheStats();
-    } catch (err) {
-      setError(err as string);
-      console.error('Failed to clear cache:', err);
-    } finally {
-      setClearingCache(false);
     }
   };
 
@@ -647,26 +576,6 @@ export default function Settings() {
             </div>
             )}
 
-            {/* Cache Mode - desktop only */}
-            {isTauri && (
-            <div>
-              <label className="block text-sm font-medium text-content-secondary mb-2">
-                Cache Mode
-              </label>
-              <select
-                value={blinkCacheMode}
-                onChange={(e) => setBlinkCacheMode(e.target.value)}
-                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
-              >
-                <option value="file">File (disk JPEG)</option>
-                <option value="memory">Memory (in-memory JPEG)</option>
-              </select>
-              <p className="text-xs text-content-muted mt-2">
-                File mode caches JPEGs on disk (persistent). Memory mode keeps up to 200 images in RAM for instant switching (~60MB).
-              </p>
-            </div>
-            )}
-
             {/* Concurrent Threads */}
             <div>
               <label className="block text-sm font-medium text-content-secondary mb-2">
@@ -789,26 +698,6 @@ export default function Settings() {
               {saving ? 'Saving...' : 'Save Settings'}
             </button>
 
-            {isTauri && (
-            <button
-              onClick={handleClearCache}
-              disabled={clearingCache}
-              className="flex items-center gap-2 px-6 py-2 bg-error hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-            >
-              <Trash2 size={18} />
-              {clearingCache
-                ? 'Clearing...'
-                : `Clear Image Cache${cacheStats ? ` (${formatBytes(cacheStats.total_size_bytes)})` : ''}`
-              }
-            </button>
-            )}
-
-            {isTauri && cacheSuccess && (
-              <div className="flex items-center gap-2 text-success">
-                <CheckCircle size={18} />
-                <span>Cache cleared!</span>
-              </div>
-            )}
           </div>
         </div>
       </div>

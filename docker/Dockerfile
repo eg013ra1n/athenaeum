@@ -7,10 +7,12 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/athenaeum-core/Cargo.toml crates/athenaeum-core/Cargo.toml
 COPY crates/athenaeum-web/Cargo.toml crates/athenaeum-web/Cargo.toml
+COPY crates/jpeg-encode/Cargo.toml crates/jpeg-encode/Cargo.toml
 
 # Create dummy lib/main to cache dependency compilation
 RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/athenaeum-core/src/lib.rs \
-    && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs
+    && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs \
+    && mkdir -p crates/jpeg-encode/src && echo "pub fn _dummy() {}" > crates/jpeg-encode/src/lib.rs
 
 # Exclude athenaeum-tauri from workspace during Docker build
 RUN sed -i '/"crates\/athenaeum-tauri",/d' Cargo.toml
@@ -32,9 +34,10 @@ RUN cargo build --release --package athenaeum-web 2>/dev/null || true
 # Copy real source and build
 COPY crates/athenaeum-core/ crates/athenaeum-core/
 COPY crates/athenaeum-web/ crates/athenaeum-web/
+COPY crates/jpeg-encode/ crates/jpeg-encode/
 
 # Touch source files to invalidate the dummy build cache
-RUN touch crates/athenaeum-core/src/lib.rs crates/athenaeum-web/src/main.rs
+RUN touch crates/athenaeum-core/src/lib.rs crates/athenaeum-web/src/main.rs crates/jpeg-encode/src/lib.rs
 
 RUN cargo build --release --package athenaeum-web
 

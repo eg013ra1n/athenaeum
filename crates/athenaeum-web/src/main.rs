@@ -122,7 +122,6 @@ async fn main() {
     let ctx = Arc::new(ServiceContext {
         db: Mutex::new(Some(db)),
         settings: settings_mgr,
-        cache: Arc::new(Mutex::new(None)),
         memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(cache_size, retention_minutes))),
         active_scans: Arc::new(Mutex::new(HashMap::new())),
         active_exports: Arc::new(Mutex::new(HashMap::new())),

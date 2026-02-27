@@ -3,7 +3,7 @@
 //! The `ServiceContext` holds all shared state. Each backend creates one at
 //! startup and passes it (or references to it) into service functions.
 
-use crate::cache::{CacheManager, MemoryImageCache};
+use crate::cache::MemoryImageCache;
 use crate::db::Database;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
@@ -26,7 +26,6 @@ pub struct ExportHandle {
 pub struct ServiceContext {
     pub db: Mutex<Option<Database>>,
     pub settings: Arc<SettingsManager>,
-    pub cache: Arc<Mutex<Option<Arc<CacheManager>>>>,
     pub memory_cache: Arc<Mutex<MemoryImageCache>>,
     pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
     pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,

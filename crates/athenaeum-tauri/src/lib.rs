@@ -28,7 +28,7 @@ pub mod tauri_events;
 mod commands;
 mod commands_rustafits;
 
-use cache::{CacheManager, MemoryImageCache};
+use cache::MemoryImageCache;
 use commands::AppState;
 use athenaeum_core::services::ServiceContext;
 use settings::SettingsManager;
@@ -59,7 +59,6 @@ pub fn run() {
                 ctx: ServiceContext {
                     db: Mutex::new(None),
                     settings: Arc::new(SettingsManager::new()),
-                    cache: Arc::new(Mutex::new(None)),
                     memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200, 30))),
                     active_scans: Arc::new(Mutex::new(HashMap::new())),
                     active_exports: Arc::new(Mutex::new(HashMap::new())),
@@ -77,19 +76,16 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            // Initialize cache manager after app is ready
             let app_handle = app.handle();
             let state: State<AppState> = app.state();
 
-            // Get app data directory for cache
+            // Clean up old file-based cache directory if it exists (one-time migration)
             if let Ok(app_dir) = app_handle.path().app_data_dir() {
-                match CacheManager::new(&app_dir, state.ctx.settings.clone(), state.ctx.image_pool.clone()) {
-                    Ok(cache_mgr) => {
-                        *state.ctx.cache.lock().unwrap() = Some(Arc::new(cache_mgr));
-                        println!("✅ Cache manager initialized");
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  Failed to initialize cache manager: {}", e);
+                let old_cache_dir = app_dir.join("cache");
+                if old_cache_dir.exists() {
+                    match std::fs::remove_dir_all(&old_cache_dir) {
+                        Ok(()) => println!("🧹 Removed old file cache directory: {:?}", old_cache_dir),
+                        Err(e) => eprintln!("⚠️  Failed to remove old cache directory {:?}: {}", old_cache_dir, e),
                     }
                 }
             }
@@ -182,10 +178,7 @@ pub fn run() {
             commands::has_master_flat_library,
             commands::refresh_calibration_library_for_camera,
             commands::get_calibration_set_frames,
-            commands::get_cache_stats,
             commands::clear_image_cache,
-            commands::repair_cache_database,
-            commands::check_cache_integrity,
             commands::set_scan_root_duplicates_flag,
             commands::set_scan_root_unique_camera_flag,
             commands::move_to_black_hole,
