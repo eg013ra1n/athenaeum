@@ -1,12 +1,15 @@
 import { useState, useMemo } from 'react';
-import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw } from 'lucide-react';
+import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw, Archive, ArchiveRestore } from 'lucide-react';
 import type { FramesSetWithCount } from '../types/models';
+
+export type ObjectsTab = 'stage' | 'wip' | 'archive';
 
 type SortField = 'name' | 'coordinates' | 'frames' | 'exposure' | 'rotation' | 'date' | 'custom';
 type SortDirection = 'asc' | 'desc';
 
 interface ObjectsTableViewProps {
   frameSets: FramesSetWithCount[];
+  activeTab: ObjectsTab;
   isMergeMode: boolean;
   isDragging: boolean;
   draggedSetId: number | null;
@@ -21,10 +24,13 @@ interface ObjectsTableViewProps {
   onCancelEditing: () => void;
   onEditingNameChange: (name: string) => void;
   onMarkAsCustom: (setId: number) => void;
+  onArchive: (setId: number) => void;
+  onUnarchive: (setId: number) => void;
 }
 
 export function ObjectsTableView({
   frameSets,
+  activeTab,
   isMergeMode,
   isDragging,
   draggedSetId,
@@ -39,6 +45,8 @@ export function ObjectsTableView({
   onCancelEditing,
   onEditingNameChange,
   onMarkAsCustom,
+  onArchive,
+  onUnarchive,
 }: ObjectsTableViewProps) {
   const [sortField, setSortField] = useState<SortField>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
@@ -256,6 +264,23 @@ export function ObjectsTableView({
                     >
                       <Pencil size={14} />
                     </button>
+                    {activeTab === 'archive' ? (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onUnarchive(frames_set.id!); }}
+                        className="p-1.5 text-content-muted hover:text-accent hover:bg-surface-hover rounded transition-colors"
+                        title="Unarchive"
+                      >
+                        <ArchiveRestore size={14} />
+                      </button>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onArchive(frames_set.id!); }}
+                        className="p-1.5 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
+                        title="Archive"
+                      >
+                        <Archive size={14} />
+                      </button>
+                    )}
                     <button
                       onClick={(e) => { e.stopPropagation(); onDelete(frames_set.id!, frames_set.name); }}
                       className="p-1.5 text-content-muted hover:text-error hover:bg-surface-hover rounded transition-colors"

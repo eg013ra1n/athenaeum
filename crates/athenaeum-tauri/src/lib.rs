@@ -165,6 +165,8 @@ pub fn run() {
             commands::split_frame_set,
             commands::get_frame_set_detail,
             commands::create_custom_frames_set,
+            commands::archive_frame_set,
+            commands::unarchive_frame_set,
             commands::get_equipment_cameras,
             commands::create_dark_library,
             commands::get_dark_library,

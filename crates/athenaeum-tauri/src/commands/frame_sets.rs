@@ -1195,6 +1195,34 @@ pub struct FramesSetWithCount {
     pub member_count: usize,
 }
 
+/// Archive a frame set (move to Archive tab)
+#[tauri::command]
+pub async fn archive_frame_set(
+    frames_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let state_lock = state.ctx.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::set_frame_set_archived(&conn, frames_set_id, true)
+        .map_err(|e| format!("Failed to archive frame set: {}", e))
+}
+
+/// Unarchive a frame set (move back to Stage or WIP based on is_custom)
+#[tauri::command]
+pub async fn unarchive_frame_set(
+    frames_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let state_lock = state.ctx.db.lock().unwrap();
+    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::set_frame_set_archived(&conn, frames_set_id, false)
+        .map_err(|e| format!("Failed to unarchive frame set: {}", e))
+}
+
 #[derive(serde::Serialize)]
 pub struct ReclassifyResult {
     pub frames_updated: usize,

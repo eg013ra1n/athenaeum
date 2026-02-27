@@ -623,6 +623,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add is_archived to frames_set table (migration for existing databases)
+    let has_is_archived: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='is_archived'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_is_archived {
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
     // Excluded frames table - stores frames excluded during auto-generation
     conn.execute(
         "CREATE TABLE IF NOT EXISTS excluded_frames (

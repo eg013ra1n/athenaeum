@@ -235,6 +235,7 @@ export interface FramesSet {
   id: number | null;
   name: string | null;
   is_custom: boolean;
+  is_archived: boolean;
   date_obs_start: string | null;
   date_obs_end: string | null;
   objctra: string | null;

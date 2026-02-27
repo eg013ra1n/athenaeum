@@ -168,6 +168,7 @@ pub struct FramesSet {
     pub id: Option<i64>,
     pub name: Option<String>,
     pub is_custom: bool,
+    pub is_archived: bool,
     pub date_obs_start: Option<String>,
     pub date_obs_end: Option<String>,
     pub objctra: Option<String>,

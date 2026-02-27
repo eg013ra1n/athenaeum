@@ -88,6 +88,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/create_frame_set_from_selection", post(frame_sets::create_frame_set_from_selection))
         .route("/api/create_frame_set_from_excluded", post(frame_sets::create_frame_set_from_excluded))
         .route("/api/update_frame_set_flat_pattern", post(frame_sets::update_frame_set_flat_pattern))
+        .route("/api/archive_frame_set", post(frame_sets::archive_frame_set))
+        .route("/api/unarchive_frame_set", post(frame_sets::unarchive_frame_set))
         // Excluded frames
         .route("/api/get_excluded_frames", post(frame_sets::get_excluded_frames))
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))

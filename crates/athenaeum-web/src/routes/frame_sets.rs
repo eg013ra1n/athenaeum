@@ -1217,3 +1217,29 @@ pub async fn update_frame_set_flat_pattern(
 
     Ok(Json(()))
 }
+
+/// Archive a frame set.
+pub async fn archive_frame_set(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+
+    athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, true).map_err(db_err)?;
+    Ok(Json(()))
+}
+
+/// Unarchive a frame set.
+pub async fn unarchive_frame_set(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let lock = state.ctx.db.lock().unwrap();
+    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+
+    athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, false).map_err(db_err)?;
+    Ok(Json(()))
+}

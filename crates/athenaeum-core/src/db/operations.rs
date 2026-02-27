@@ -1208,7 +1208,7 @@ pub fn get_frames_sets_by_project(
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(
         "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
-                COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation
+                COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation, fs.is_archived
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
@@ -1231,6 +1231,7 @@ pub fn get_frames_sets_by_project(
             avg_rotation: row.get(10)?,
             min_rotation: row.get(11)?,
             max_rotation: row.get(12)?,
+            is_archived: row.get::<_, i32>(13).unwrap_or(0) == 1,
         };
         let member_count: i32 = row.get(9)?;
         Ok((set, member_count as usize))
@@ -1308,6 +1309,16 @@ pub fn update_frames_set_flat_pattern(
     conn.execute(
         "UPDATE frames_set SET flat_pattern = ?1 WHERE id = ?2",
         params![flat_pattern, id],
+    )?;
+    Ok(())
+}
+
+/// Set the archived status of a frames_set
+pub fn set_frame_set_archived(conn: &Connection, id: i64, archived: bool) -> Result<()> {
+    let archived_int = if archived { 1 } else { 0 };
+    conn.execute(
+        "UPDATE frames_set SET is_archived = ?1 WHERE id = ?2",
+        params![archived_int, id],
     )?;
     Ok(())
 }
