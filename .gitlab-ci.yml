@@ -79,8 +79,6 @@ build:macos:
     - macos
   only:
     - tags
-  before_script:
-    - source "$HOME/.cargo/env"
   cache:
     key: "main-macos"
     policy: pull
@@ -90,6 +88,8 @@ build:macos:
       - target/
       - .npm/
   script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - which cargo && rustc --print sysroot
     - rustup target add x86_64-apple-darwin
     - rm -rf target/aarch64-apple-darwin/release/bundle/
     - rm -rf target/x86_64-apple-darwin/release/bundle/
@@ -152,8 +152,6 @@ update-cache:macos:
   only:
     - main
   when: manual
-  before_script:
-    - source "$HOME/.cargo/env"
   cache:
     key: "main-macos"
     policy: push
@@ -163,6 +161,7 @@ update-cache:macos:
       - target/
       - .npm/
   script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
     - rustup target add x86_64-apple-darwin
     - npm install
     - npm run tauri build -- --target aarch64-apple-darwin
