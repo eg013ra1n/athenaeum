@@ -26,14 +26,6 @@ mod spatial;
 mod images;
 mod missing_files;
 
-/// Helper to extract DB connection from state, returning a JSON error on failure.
-fn db_err() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": "Database not initialized" })),
-    )
-}
-
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
     let api = Router::new()

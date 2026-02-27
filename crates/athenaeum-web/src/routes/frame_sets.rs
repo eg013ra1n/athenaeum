@@ -71,7 +71,6 @@ pub struct CreateCustomFramesSetArgs {
 pub struct CreateFrameSetFromSelectionArgs {
     pub name: String,
     pub frame_ids: Vec<i64>,
-    pub description: Option<String>,
 }
 
 #[derive(Deserialize)]
