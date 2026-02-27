@@ -5,8 +5,16 @@ members = [
     "crates/athenaeum-tauri",
     "crates/athenaeum-web",
 ]
+# jpeg-encode must NOT be a workspace member so it gets compiled as an
+# external dep with [profile.dev.package."*"] opt-level=2 and without
+# incremental compilation — otherwise the JPEG encoder is ~4x slower.
+exclude = ["crates/jpeg-encode"]
 
 [profile.dev.package."*"]
+opt-level = 2
+
+# Workspace members aren't covered by package."*" above.
+[profile.dev.package.athenaeum-core]
 opt-level = 2
 
 [profile.release]

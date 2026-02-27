@@ -15,6 +15,18 @@ RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/ath
 # Exclude athenaeum-tauri from workspace during Docker build
 RUN sed -i '/"crates\/athenaeum-tauri",/d' Cargo.toml
 
+# Fetch deps, then patch zune-jpeg NEON build for aarch64.
+# zune-jpeg 0.5.12 has safe fns calling unsafe NEON intrinsics without unsafe
+# blocks — fails on any stable Rust for aarch64. Changing to unsafe fn is
+# correct since all call sites already use unsafe blocks.
+# TODO: Remove once zune-jpeg publishes a fix.
+RUN cargo fetch \
+    && sed -i \
+       -e 's/^pub fn upsample_horizontal_neon/pub unsafe fn upsample_horizontal_neon/' \
+       -e 's/^pub fn upsample_vertical_neon/pub unsafe fn upsample_vertical_neon/' \
+       -e 's/^pub fn upsample_hv_neon/pub unsafe fn upsample_hv_neon/' \
+       /usr/local/cargo/registry/src/*/zune-jpeg-*/src/upsampler/neon.rs
+
 RUN cargo build --release --package athenaeum-web 2>/dev/null || true
 
 # Copy real source and build

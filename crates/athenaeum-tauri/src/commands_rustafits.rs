@@ -144,8 +144,11 @@ pub async fn read_fits_image_rustafits(
         }
 
         // Cache miss — process FITS to JPEG (same pipeline as file mode)
-        println!("⏳ Memory cache miss, processing...");
-        let result = rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.ctx.image_pool)
+        // Use block_in_place so tokio knows this thread is blocked and can
+        // spawn replacement threads for other async tasks (semaphore waiters, IPC, etc.)
+        let result = tokio::task::block_in_place(|| {
+            rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.ctx.image_pool)
+        })
             .map_err(|e| {
                 let error_msg = format!("Failed to process FITS image: {}", e);
                 eprintln!("ERROR: {}", error_msg);
@@ -160,7 +163,7 @@ pub async fn read_fits_image_rustafits(
             mem_cache.insert(cache_key, CachedImage { data: jpeg_data.clone(), last_accessed: Instant::now() });
         }
 
-        println!("✅ Processed and cached ({} bytes) in {:?}", jpeg_data.len(), t_start.elapsed());
+        println!("✅ Memory cache: {} bytes in {:?}", jpeg_data.len(), t_start.elapsed());
         return Ok(jpeg_data);
     }
 
@@ -267,7 +270,9 @@ pub async fn read_fits_image_rustafits(
     // Fallback: Direct processing without cache
     println!("⚠️  Processing without cache...");
 
-    let result = rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.ctx.image_pool)
+    let result = tokio::task::block_in_place(|| {
+        rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.ctx.image_pool)
+    })
         .map_err(|e| {
             let error_msg = format!("Failed to process FITS image: {}", e);
             eprintln!("ERROR: {}", error_msg);

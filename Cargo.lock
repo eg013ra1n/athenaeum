@@ -218,6 +218,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "jpeg-encode",
  "quick-xml 0.36.2",
  "rayon",
  "rusqlite",
@@ -2099,6 +2100,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eaf4bc02d17cbdd7ff4c7438cafcdf7fb9a4613313ad11b4f8fefe7d3fa0130"
 
 [[package]]
+name = "jpeg-encode"
+version = "0.1.0"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3574,9 +3582,9 @@ dependencies = [
 
 [[package]]
 name = "rustafits"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2175a6898354d302fac4e1372c32ed30f288c7534443fa3013fbd389a798d14"
+checksum = "42d7f400ef5c1ac385a14ed4633e63fbe5eded913f15c912cd90442d29a0b9de"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

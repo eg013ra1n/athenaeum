@@ -17,5 +17,6 @@ anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.36"
 uuid = { version = "1", features = ["v4"] }
-rustafits = "0.4.2"
+rustafits = "0.4.5"
 base64 = "0.22"
+jpeg-encode = { path = "../jpeg-encode" }

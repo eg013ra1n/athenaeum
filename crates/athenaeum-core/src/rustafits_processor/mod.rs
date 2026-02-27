@@ -87,14 +87,10 @@ pub struct ProcessedImage {
 }
 
 
-/// Process a FITS/XISF file to JPEG using rustafits
+/// Process a FITS/XISF file to JPEG entirely in memory (no temp files).
 ///
-/// This function:
-/// 1. Creates a temporary output path for the JPEG
-/// 2. Calls rustafits with appropriate settings for the resolution
-/// 3. Reads the JPEG bytes from disk
-/// 4. Cleans up the temporary file
-/// 5. Returns the JPEG data
+/// Uses `converter.process()` to get raw RGB pixels, then encodes JPEG
+/// in-process via `image::codecs::jpeg::JpegEncoder` writing to a `Vec<u8>`.
 ///
 /// Note: rustafits 0.2+ handles Bayer/color detection internally for both FITS and XISF
 pub fn process_fits_to_jpeg<P: AsRef<Path>>(
@@ -110,25 +106,9 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         anyhow::bail!("Input file does not exist: {}", input_path.display());
     }
 
-    // Create temporary output path
-    let temp_dir = std::env::temp_dir();
-    let temp_filename = format!(
-        "athenaeum_{}_{:?}.jpg",
-        input_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown"),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    );
-    let output_path = temp_dir.join(temp_filename);
-
     // Build rustafits converter with resolution-specific settings
     let mut converter = ImageConverter::new()
-        .with_thread_pool(pool.clone())
-        .with_quality(resolution.jpeg_quality(quality));
+        .with_thread_pool(pool.clone());
 
     // Apply downscale if needed (for thumbnails)
     if resolution.downscale_factor() > 1 {
@@ -136,40 +116,44 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     }
 
     // Apply preview mode for faster processing
-    // rustafits 0.2+ handles color/Bayer detection internally
     if resolution.use_preview_mode() {
         converter = converter.with_preview_mode();
     }
 
-    // Convert FITS/XISF to JPEG
-    converter
-        .convert(&input_path, &output_path)
-        .with_context(|| {
-            format!(
-                "Failed to convert image: {} -> {}",
-                input_path.display(),
-                output_path.display()
-            )
-        })?;
+    // Process FITS/XISF to raw RGB pixels in memory
+    let processed = converter
+        .process(input_path)
+        .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
 
-    // Read JPEG bytes from disk
-    let image_data = std::fs::read(&output_path).with_context(|| {
-        format!("Failed to read generated JPEG: {}", output_path.display())
-    })?;
+    let width = processed.width as u32;
+    let height = processed.height as u32;
+    let is_color = processed.is_color;
 
-    // Dimensions set to 0 - frontend determines from JPEG
-    let width = 0;
-    let height = 0;
+    // Strip alpha channel if RGBA (4 channels → 3)
+    let rgb_data = if processed.channels == 4 {
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for chunk in processed.data.chunks_exact(4) {
+            rgb.push(chunk[0]);
+            rgb.push(chunk[1]);
+            rgb.push(chunk[2]);
+        }
+        rgb
+    } else {
+        processed.data
+    };
 
-    // Clean up temporary file
-    let _ = std::fs::remove_file(&output_path);
+    // Encode JPEG in memory via jpeg-encode crate (compiled outside workspace
+    // so the encoder gets full optimisation without incremental compilation penalty)
+    let jpeg_quality = resolution.jpeg_quality(quality);
+    let image_data = jpeg_encode::encode_rgb_to_jpeg(&rgb_data, width, height, jpeg_quality)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     Ok(ProcessedImage {
         image_data,
         width,
         height,
         format: "jpeg".to_string(),
-        is_color: false, // Not used - rustafits handles color internally
+        is_color,
     })
 }
 
