@@ -79,6 +79,8 @@ build:macos:
     - macos
   only:
     - tags
+  before_script:
+    - source "$HOME/.cargo/env"
   cache:
     key: "main-macos"
     policy: pull
@@ -150,6 +152,8 @@ update-cache:macos:
   only:
     - main
   when: manual
+  before_script:
+    - source "$HOME/.cargo/env"
   cache:
     key: "main-macos"
     policy: push
