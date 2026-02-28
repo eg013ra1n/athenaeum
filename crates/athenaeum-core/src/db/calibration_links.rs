@@ -970,7 +970,9 @@ pub fn get_calibration_hierarchy_for_frame_set(
             f.swcreate,
             f.gain,
             f.offset,
-            f.rotation
+            f.rotation,
+            f.objctra,
+            f.objctdec
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
          JOIN session_members sm ON f.id = sm.frame_id
@@ -999,6 +1001,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
         gain: Option<f64>,
         offset: Option<f64>,
         rotation: Option<f64>,
+        objctra: Option<String>,
+        objctdec: Option<String>,
     }
 
     let frames: Vec<RawFrame> = stmt
@@ -1021,6 +1025,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                 gain: row.get(14)?,
                 offset: row.get(15)?,
                 rotation: row.get(16)?,
+                objctra: row.get(17)?,
+                objctdec: row.get(18)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -1189,6 +1195,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                             gain: raw_frame.gain,
                             offset: raw_frame.offset,
                             rotation: raw_frame.rotation,
+                            objctra: raw_frame.objctra.clone(),
+                            objctdec: raw_frame.objctdec.clone(),
                             calibration_status: status,
                         });
                     }

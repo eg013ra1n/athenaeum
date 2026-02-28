@@ -743,6 +743,8 @@ export interface LightFrameWithCalibration {
   gain: number | null;
   offset: number | null;
   rotation: number | null;
+  objctra: string | null;
+  objctdec: string | null;
   calibration_status: FrameCalibrationStatus;
 }
 

@@ -623,6 +623,8 @@ pub struct LightFrameWithCalibration {
     pub gain: Option<f64>,
     pub offset: Option<f64>,
     pub rotation: Option<f64>,
+    pub objctra: Option<String>,
+    pub objctdec: Option<String>,
     pub calibration_status: FrameCalibrationStatus,
 }
 

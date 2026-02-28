@@ -1,13 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, Clock, MapPin, RotateCw, AlertCircle, Scissors, Play } from 'lucide-react';
+import { ArrowLeft, Clock, MapPin, RotateCw, AlertCircle, Scissors, Play, BarChart3, Shield } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
+import { LightsAnalysisView } from '../components/LightsAnalysisView';
+
+type FrameSetTab = 'calibration' | 'analysis';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -49,6 +52,9 @@ export default function FrameSetDetail() {
   // Calibration hierarchy data (loaded on mount)
   const [calibrationHierarchy, setCalibrationHierarchy] = useState<CalibrationHierarchyView | null>(null);
   const [loadingCalibration, setLoadingCalibration] = useState(false);
+
+  // Tab state
+  const [activeTab, setActiveTab] = useState<FrameSetTab>('calibration');
 
   // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
   const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
@@ -367,10 +373,10 @@ export default function FrameSetDetail() {
       </div>
 
       {/* Frame Set Header - Combined with Stats */}
-      <div className="bg-surface-elevated rounded-lg p-5 mb-4 border border-border flex-shrink-0">
-        <div className="flex items-start justify-between mb-4">
-          <div className="flex items-center gap-4">
-            <h1 className="text-2xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
+      <div className="bg-surface-elevated rounded-lg p-3 mb-3 border border-border flex-shrink-0">
+        <div className="flex items-start justify-between mb-2">
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
             {detail.frames_set?.objctra && detail.frames_set?.objctdec && (
               <div className="flex items-center gap-2 text-content-muted">
                 <MapPin size={16} />
@@ -411,36 +417,36 @@ export default function FrameSetDetail() {
         </div>
 
         {/* Stats Row */}
-        <div className="grid grid-cols-5 gap-4 text-center">
-          <div className="bg-surface/50 rounded p-3">
-            <div className="text-2xl font-bold text-content">
+        <div className="grid grid-cols-5 gap-2 text-center">
+          <div className="bg-surface/50 rounded px-2 py-1.5">
+            <div className="text-lg font-bold text-content">
               {calibrationHierarchy?.total_frames ?? '-'}
             </div>
-            <div className="text-xs text-content-muted mt-1">Total Frames</div>
+            <div className="text-xs text-content-muted">Total Frames</div>
           </div>
-          <div className="bg-surface/50 rounded p-3">
-            <div className="text-2xl font-bold text-success">
+          <div className="bg-surface/50 rounded px-2 py-1.5">
+            <div className="text-lg font-bold text-success">
               {calibrationHierarchy?.calibrated_frames ?? '-'}
             </div>
-            <div className="text-xs text-content-muted mt-1">Calibrated</div>
+            <div className="text-xs text-content-muted">Calibrated</div>
           </div>
-          <div className="bg-surface/50 rounded p-3">
-            <div className="text-2xl font-bold text-warning">
+          <div className="bg-surface/50 rounded px-2 py-1.5">
+            <div className="text-lg font-bold text-warning">
               {calibrationHierarchy?.uncalibrated_frames ?? '-'}
             </div>
-            <div className="text-xs text-content-muted mt-1">Uncalibrated</div>
+            <div className="text-xs text-content-muted">Uncalibrated</div>
           </div>
-          <div className="bg-surface/50 rounded p-3">
-            <div className="text-2xl font-bold text-accent">
+          <div className="bg-surface/50 rounded px-2 py-1.5">
+            <div className="text-lg font-bold text-accent">
               {calibrationHierarchy?.date_groups.length ?? '-'}
             </div>
-            <div className="text-xs text-content-muted mt-1">Sessions</div>
+            <div className="text-xs text-content-muted">Sessions</div>
           </div>
-          <div className="bg-surface/50 rounded p-3">
-            <div className="text-2xl font-bold text-content">
+          <div className="bg-surface/50 rounded px-2 py-1.5">
+            <div className="text-lg font-bold text-content">
               {formatExposureTime(detail.frames_set?.total_exp_time)}
             </div>
-            <div className="text-xs text-content-muted mt-1 flex items-center justify-center gap-1">
+            <div className="text-xs text-content-muted flex items-center justify-center gap-1">
               <Clock size={12} />
               Exposure
             </div>
@@ -448,7 +454,28 @@ export default function FrameSetDetail() {
         </div>
       </div>
 
-      {/* Main Content - CalibrationHierarchyView */}
+      {/* Tab Bar */}
+      <div className="flex items-center gap-1 border-b border-border mb-3 flex-shrink-0">
+        {([
+          { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Shield },
+          { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
+        ]).map(({ key, label, icon: Icon }) => (
+          <button
+            key={key}
+            onClick={() => setActiveTab(key)}
+            className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
+              activeTab === key
+                ? 'border-accent text-accent'
+                : 'border-transparent text-content-muted hover:text-content hover:border-border'
+            }`}
+          >
+            <Icon size={16} />
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* Main Content */}
       <div className="flex-1 min-h-0">
         {loadingCalibration ? (
           <div className="text-center py-12">
@@ -456,14 +483,22 @@ export default function FrameSetDetail() {
             <p className="text-content-muted">Loading calibration data...</p>
           </div>
         ) : calibrationHierarchy ? (
-          <CalibrationHierarchyViewComponent
-            data={calibrationHierarchy}
-            onRefresh={refreshCalibrationHierarchy}
-            onBlink={handleBlink}
-            onBlinkSelected={handleBlink}
-            onSplit={handleOpenSplitDialog}
-            onCreateCustomSet={handleOpenCreateDialog}
-          />
+          activeTab === 'calibration' ? (
+            <CalibrationHierarchyViewComponent
+              data={calibrationHierarchy}
+              onRefresh={refreshCalibrationHierarchy}
+              onBlink={handleBlink}
+              onBlinkSelected={handleBlink}
+              onSplit={handleOpenSplitDialog}
+              onCreateCustomSet={handleOpenCreateDialog}
+            />
+          ) : (
+            <LightsAnalysisView
+              hierarchy={calibrationHierarchy}
+              onRefresh={refreshCalibrationHierarchy}
+              onBlink={handleBlink}
+            />
+          )
         ) : (
           <div className="text-center py-12 text-content-muted">
             <p>Failed to load calibration data.</p>
