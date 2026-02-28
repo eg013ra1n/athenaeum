@@ -1,8 +1,9 @@
 export interface RejectionThresholds {
   fwhm: string;
   eccentricity: string;
-  snr: string;
-  alt: string;
+  snr_weight: string;
+  stars: string;
+  score: string;
 }
 
 interface RejectionThresholdBarProps {
@@ -22,11 +23,12 @@ export function RejectionThresholdBar({ thresholds, onChange }: RejectionThresho
       </span>
       <div className="flex items-center gap-3 flex-1">
         {([
-          { key: 'fwhm' as const, label: 'FWHM' },
-          { key: 'eccentricity' as const, label: 'Eccentricity' },
-          { key: 'snr' as const, label: 'SNR' },
-          { key: 'alt' as const, label: 'ALT' },
-        ]).map(({ key, label }) => (
+          { key: 'fwhm' as const, label: 'FWHM >', placeholder: 'px' },
+          { key: 'eccentricity' as const, label: 'Ecc >', placeholder: '0-1' },
+          { key: 'snr_weight' as const, label: 'SNR <', placeholder: 'wt' },
+          { key: 'stars' as const, label: 'Stars <', placeholder: '#' },
+          { key: 'score' as const, label: 'Score <', placeholder: '%' },
+        ]).map(({ key, label, placeholder }) => (
           <div key={key} className="flex items-center gap-1.5">
             <label className="text-xs text-content-secondary whitespace-nowrap">{label}</label>
             <input
@@ -35,7 +37,7 @@ export function RejectionThresholdBar({ thresholds, onChange }: RejectionThresho
               value={thresholds[key]}
               onChange={e => handleChange(key, e.target.value)}
               className="w-16 px-2 py-1 text-xs bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent"
-              placeholder="-"
+              placeholder={placeholder}
             />
           </div>
         ))}

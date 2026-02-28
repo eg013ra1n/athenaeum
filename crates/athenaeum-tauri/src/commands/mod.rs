@@ -33,6 +33,7 @@ pub mod cache;
 pub mod spatial;
 pub mod calendar;
 pub mod export;
+pub mod analysis;
 pub mod utils;
 
 // Re-export all commands for convenient access
@@ -48,3 +49,4 @@ pub use cache::*;
 pub use spatial::*;
 pub use calendar::*;
 pub use export::*;
+pub use analysis::*;

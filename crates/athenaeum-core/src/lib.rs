@@ -20,4 +20,5 @@ pub mod scanner;
 pub mod export;
 pub mod rustafits_processor;
 pub mod cache;
+pub mod analysis;
 pub mod services;

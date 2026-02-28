@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3 } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
+import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { isTauri } from '../utils/platform';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
@@ -37,7 +38,7 @@ export default function Settings() {
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
   // Tab state
-  const [activeTab, setActiveTab] = useState<'general' | 'calibration'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'calibration' | 'analysis'>('general');
 
   useEffect(() => {
     loadSettings();
@@ -354,6 +355,17 @@ export default function Settings() {
           <Crosshair size={18} />
           Calibration Matching
         </button>
+        <button
+          onClick={() => setActiveTab('analysis')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'analysis'
+              ? 'bg-surface-elevated text-white border-b-2 border-accent'
+              : 'text-content-muted hover:text-content hover:bg-surface-elevated/50'
+          }`}
+        >
+          <BarChart3 size={18} />
+          Analysis
+        </button>
       </div>
 
       {/* Calibration Matching Tab */}
@@ -365,6 +377,18 @@ export default function Settings() {
             Define which parameters must match exactly, warn on threshold, or be ignored.
           </p>
           <CalibrationMatchingConfig />
+        </div>
+      )}
+
+      {/* Analysis Tab */}
+      {activeTab === 'analysis' && (
+        <div className="bg-surface-elevated rounded-lg p-6">
+          <h3 className="text-xl font-semibold mb-4">Star Analysis Configuration</h3>
+          <p className="text-content-muted mb-6">
+            Configure star detection parameters and quality scoring weights for the Lights Analysis tab.
+            Changes here affect new analyses — existing results keep their original settings until re-analyzed.
+          </p>
+          <AnalysisSettingsPanel />
         </div>
       )}
 

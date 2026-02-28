@@ -252,6 +252,14 @@ pub fn run() {
             commands::get_export_summary,
             commands::get_log_path,
             commands::get_database_path,
+            // Analysis commands
+            commands::get_analysis_config,
+            commands::set_analysis_config,
+            commands::reset_analysis_config,
+            commands::analyze_frame_set,
+            commands::analyze_single_frame,
+            commands::get_analysis_for_frame_set,
+            commands::delete_analysis_for_frame_set,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())

@@ -745,6 +745,8 @@ export interface LightFrameWithCalibration {
   rotation: number | null;
   objctra: string | null;
   objctdec: string | null;
+  ra: number | null;
+  dec: number | null;
   calibration_status: FrameCalibrationStatus;
 }
 
@@ -814,6 +816,48 @@ export interface ExcludedFrameEntry {
 export interface ReclassifyResult {
   frames_updated: number;
   cameras_refreshed: string[];
+}
+
+// ========== Frame Analysis ==========
+
+/** Star detection and image quality analysis results for a single frame */
+export interface FrameAnalysis {
+  id: number | null;
+  frame_id: number;
+  file_id: number;
+  stars_detected: number;
+  median_fwhm: number;
+  median_eccentricity: number;
+  median_snr: number;
+  median_hfr: number;
+  snr_db: number;
+  snr_weight: number;
+  psf_signal: number;
+  background: number;
+  noise: number;
+  detection_threshold: number;
+  width: number;
+  height: number;
+  source_channels: number;
+  quality_score: number | null;
+  config_hash: string | null;
+  analyzed_at: string;
+}
+
+/** Result of batch frame set analysis */
+export interface AnalyzeFrameSetResult {
+  analyzed: number;
+  skipped: number;
+  failed: number;
+  errors: string[];
+}
+
+/** Analysis progress event emitted during batch analysis */
+export interface AnalysisProgressEvent {
+  current: number;
+  total: number;
+  current_file: string;
+  percent: number;
 }
 
 /** Edits to apply to calibration set metadata (selective fields) */

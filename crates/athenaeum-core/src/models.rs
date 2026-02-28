@@ -625,6 +625,8 @@ pub struct LightFrameWithCalibration {
     pub rotation: Option<f64>,
     pub objctra: Option<String>,
     pub objctdec: Option<String>,
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
     pub calibration_status: FrameCalibrationStatus,
 }
 
@@ -701,6 +703,31 @@ pub struct ExcludedFrameEntry {
     pub filename: String,
     pub reason: String,
     pub excluded_at: String,
+}
+
+/// Frame analysis results from star detection and image quality metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameAnalysis {
+    pub id: Option<i64>,
+    pub frame_id: i64,
+    pub file_id: i64,
+    pub stars_detected: i64,
+    pub median_fwhm: f64,
+    pub median_eccentricity: f64,
+    pub median_snr: f64,
+    pub median_hfr: f64,
+    pub snr_db: f64,
+    pub snr_weight: f64,
+    pub psf_signal: f64,
+    pub background: f64,
+    pub noise: f64,
+    pub detection_threshold: f64,
+    pub width: i64,
+    pub height: i64,
+    pub source_channels: i64,
+    pub quality_score: Option<f64>,
+    pub config_hash: Option<String>,
+    pub analyzed_at: String,
 }
 
 /// Original calibration set metadata values (backed up before editing)

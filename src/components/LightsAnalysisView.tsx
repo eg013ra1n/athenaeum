@@ -1,8 +1,11 @@
-import { useState, useMemo, useCallback } from 'react';
-import { Play, Trash2 } from 'lucide-react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import { Play, Trash2, BarChart3 } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
+  FrameAnalysis,
+  AnalyzeFrameSetResult,
+  AnalysisProgressEvent,
 } from '../types/models';
 import { CameraFilterTree, CameraFilterNode } from './calibration/CameraFilterTree';
 import { LightsAnalysisTable, EnrichedLightFrame } from './calibration/LightsAnalysisTable';
@@ -10,6 +13,7 @@ import { RejectionThresholdBar, RejectionThresholds } from './calibration/Reject
 
 interface LightsAnalysisViewProps {
   hierarchy: CalibrationHierarchyViewData;
+  frameSetId: number;
   onRefresh?: () => void;
   onBlink?: (frameIds: number[]) => void;
 }
@@ -84,7 +88,7 @@ function buildCameraFilterTree(hierarchy: CalibrationHierarchyViewData): CameraF
   return { nodes, framesByKey, allFrames };
 }
 
-export function LightsAnalysisView({ hierarchy, onRefresh, onBlink }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }: LightsAnalysisViewProps) {
   // Tree checkbox state — which filter groups are checked (for filtering the table)
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
   // Table row selection — which individual frames are selected (for mass actions)
@@ -94,14 +98,71 @@ export function LightsAnalysisView({ hierarchy, onRefresh, onBlink }: LightsAnal
   const [thresholds, setThresholds] = useState<RejectionThresholds>({
     fwhm: '',
     eccentricity: '',
-    snr: '',
-    alt: '',
+    snr_weight: '',
+    stars: '',
+    score: '',
   });
+
+  // Analysis state
+  const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysisProgress, setAnalysisProgress] = useState<AnalysisProgressEvent | null>(null);
 
   const { nodes, framesByKey, allFrames } = useMemo(
     () => buildCameraFilterTree(hierarchy),
     [hierarchy]
   );
+
+  // Load existing analysis data on mount
+  useEffect(() => {
+    loadAnalysisData();
+  }, [frameSetId]);
+
+  const loadAnalysisData = useCallback(async () => {
+    try {
+      const results = await api.invoke<FrameAnalysis[]>('get_analysis_for_frame_set', {
+        frameSetId,
+      });
+      const map = new Map<number, FrameAnalysis>();
+      for (const a of results) {
+        map.set(a.frame_id, a);
+      }
+      setAnalysisData(map);
+    } catch (err) {
+      console.error('Failed to load analysis data:', err);
+    }
+  }, [frameSetId]);
+
+  // Run analysis on all frames
+  const handleAnalyzeAll = useCallback(async (force?: boolean) => {
+    setAnalyzing(true);
+    setAnalysisProgress(null);
+
+    // Listen for progress events
+    const unlisten = await api.listen<AnalysisProgressEvent>('analysis-progress', (payload) => {
+      setAnalysisProgress(payload);
+    });
+
+    try {
+      const result = await api.invoke<AnalyzeFrameSetResult>('analyze_frame_set', {
+        frameSetId,
+        force: force ?? false,
+      });
+
+      if (result.errors.length > 0) {
+        console.error('Analysis errors:', result.errors);
+      }
+
+      // Reload analysis data
+      await loadAnalysisData();
+    } catch (err) {
+      console.error('Failed to analyze frame set:', err);
+    } finally {
+      unlisten();
+      setAnalyzing(false);
+      setAnalysisProgress(null);
+    }
+  }, [frameSetId, loadAnalysisData]);
 
   // Frames shown in the table: filtered by checked tree items, or all if nothing checked
   const displayedFrames = useMemo(() => {
@@ -124,6 +185,49 @@ export function LightsAnalysisView({ hierarchy, onRefresh, onBlink }: LightsAnal
     }
     return count;
   }, [checkedKeys, framesByKey]);
+
+  // Compute rejected frame IDs from thresholds
+  const rejectedFrameIds = useMemo(() => {
+    const rejected = new Set<number>();
+    const fwhmThreshold = parseFloat(thresholds.fwhm);
+    const eccThreshold = parseFloat(thresholds.eccentricity);
+    const snrThreshold = parseFloat(thresholds.snr_weight);
+    const starsThreshold = parseFloat(thresholds.stars);
+    const scoreThreshold = parseFloat(thresholds.score);
+
+    for (const frame of displayedFrames) {
+      const a = analysisData.get(frame.frame_id);
+      if (!a) continue;
+
+      // FWHM > threshold = rejected (worse)
+      if (!isNaN(fwhmThreshold) && a.median_fwhm > fwhmThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+      // Eccentricity > threshold = rejected (worse)
+      if (!isNaN(eccThreshold) && a.median_eccentricity > eccThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+      // SNR Weight < threshold = rejected (worse)
+      if (!isNaN(snrThreshold) && a.snr_weight < snrThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+      // Stars < threshold = rejected (worse)
+      if (!isNaN(starsThreshold) && a.stars_detected < starsThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+      // Score < threshold (as percentage) = rejected (worse)
+      if (!isNaN(scoreThreshold) && a.quality_score != null && a.quality_score * 100 < scoreThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+    }
+
+    return rejected;
+  }, [thresholds, displayedFrames, analysisData]);
 
   // Clear table selection when tree filter changes
   const handleCheckedChange = useCallback((keys: Set<string>) => {
@@ -174,8 +278,59 @@ export function LightsAnalysisView({ hierarchy, onRefresh, onBlink }: LightsAnal
     }
   }, [selectedFrameIds, allFrames, blackholedFileIds, onRefresh]);
 
+  const analyzedCount = analysisData.size;
+  const totalLightFrames = allFrames.length;
+
   return (
     <div className="flex flex-col h-full">
+      {/* Analysis Action Bar */}
+      <div className="flex items-center gap-3 mb-3 flex-shrink-0">
+        <button
+          onClick={() => handleAnalyzeAll(false)}
+          disabled={analyzing}
+          className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
+        >
+          <BarChart3 size={16} />
+          {analyzing ? 'Analyzing...' : 'Analyze All'}
+        </button>
+        {analyzedCount > 0 && (
+          <button
+            onClick={() => handleAnalyzeAll(true)}
+            disabled={analyzing}
+            className="inline-flex items-center gap-1.5 px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content-secondary text-sm rounded-lg transition-colors disabled:opacity-50"
+          >
+            Re-analyze
+          </button>
+        )}
+        <div className="text-xs text-content-muted">
+          {analyzedCount > 0
+            ? `${analyzedCount} / ${totalLightFrames} frames analyzed`
+            : 'No analysis data yet'
+          }
+          {rejectedFrameIds.size > 0 && (
+            <span className="ml-2 text-error">
+              {rejectedFrameIds.size} rejected
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Progress Bar */}
+      {analyzing && analysisProgress && (
+        <div className="mb-3 flex-shrink-0">
+          <div className="flex items-center justify-between text-xs text-content-muted mb-1">
+            <span>{analysisProgress.current_file}</span>
+            <span>{analysisProgress.current} / {analysisProgress.total} ({analysisProgress.percent.toFixed(0)}%)</span>
+          </div>
+          <div className="w-full bg-surface-hover rounded-full h-2">
+            <div
+              className="bg-accent h-2 rounded-full transition-all duration-300"
+              style={{ width: `${analysisProgress.percent}%` }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Main Content — two-panel layout */}
       <div className="flex flex-1 min-h-0 gap-4">
         {/* Left panel — Navigation tree */}
@@ -200,6 +355,8 @@ export function LightsAnalysisView({ hierarchy, onRefresh, onBlink }: LightsAnal
               selectedFrameIds={selectedFrameIds}
               onSelectionChange={setSelectedFrameIds}
               onBlackhole={handleBlackhole}
+              analysisData={analysisData}
+              rejectedFrameIds={rejectedFrameIds}
             />
           </div>
         </div>

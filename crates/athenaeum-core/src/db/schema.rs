@@ -648,6 +648,45 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Frame analysis table - star detection and image quality metrics
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS frame_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            stars_detected INTEGER NOT NULL,
+            median_fwhm REAL NOT NULL,
+            median_eccentricity REAL NOT NULL,
+            median_snr REAL NOT NULL,
+            median_hfr REAL NOT NULL,
+            snr_db REAL NOT NULL,
+            snr_weight REAL NOT NULL,
+            psf_signal REAL NOT NULL,
+            background REAL NOT NULL,
+            noise REAL NOT NULL,
+            detection_threshold REAL NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            source_channels INTEGER NOT NULL,
+            quality_score REAL,
+            config_hash TEXT,
+            analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+            UNIQUE(frame_id)
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frame_analysis_frame_id ON frame_analysis(frame_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frame_analysis_file_id ON frame_analysis(file_id)",
+        [],
+    )?;
+
     // Calibration set originals table - stores original metadata values before custom edits
     // Used to backup original FITS header values when user edits calibration set metadata
     conn.execute(

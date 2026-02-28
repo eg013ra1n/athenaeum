@@ -225,6 +225,7 @@ dependencies = [
  "rustafits",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
  "walkdir",
  "xxhash-rust",
@@ -238,6 +239,7 @@ dependencies = [
  "athenaeum-core",
  "base64 0.22.1",
  "chrono",
+ "futures",
  "quick-xml 0.36.2",
  "rayon",
  "reqwest",
@@ -1217,12 +1219,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65bc07b1a8bc7c85c5f2e110c476c7389b4554ba72af57d8445ea63a576b0876"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dff15bf788c671c1934e366d07e30c1814a8ef514e1af724a602e8a2fbe1b10"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -1290,6 +1308,7 @@ version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fa08315bb612088cc391249efdc3bc77536f16c91f6cf495e6fbe85b20a4a81"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -3583,8 +3602,7 @@ dependencies = [
 [[package]]
 name = "rustafits"
 version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42d7f400ef5c1ac385a14ed4633e63fbe5eded913f15c912cd90442d29a0b9de"
+source = "git+https://github.com/eg013ra1n/rustafits.git#c37b526b06bde209f1c6ee163a03c9960dc11ca8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -2,9 +2,9 @@ import { useState, useMemo, useCallback } from 'react';
 import { FolderOpen, Trash2 } from 'lucide-react';
 import { revealItemInDir } from '../../api/desktop';
 import { api } from '../../api';
-import type { LightFrameWithCalibration } from '../../types/models';
+import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
-type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'ra' | 'rotation' | 'stars' | 'fwhm' | 'eccentricity' | 'snr_psf' | 'snr_db';
+type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'ra' | 'rotation' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'snr_db' | 'psf_signal' | 'snr_weight' | 'score';
 type SortDirection = 'asc' | 'desc';
 
 /** Frame enriched with camera/filter context from the hierarchy */
@@ -21,6 +21,10 @@ interface LightsAnalysisTableProps {
   selectedFrameIds: Set<number>;
   onSelectionChange: (selectedIds: Set<number>) => void;
   onBlackhole?: (fileId: number) => void;
+  /** Analysis data keyed by frame_id */
+  analysisData?: Map<number, FrameAnalysis>;
+  /** Frame IDs that are below rejection thresholds */
+  rejectedFrameIds?: Set<number>;
 }
 
 function formatDateTime(dateStr: string | null): string {
@@ -37,6 +41,27 @@ function formatDateTime(dateStr: string | null): string {
   } catch {
     return '-';
   }
+}
+
+/** Convert decimal degrees to HMS string (e.g. "18h 27m 33.4s") */
+function raToHms(deg: number): string {
+  const h = deg / 15;
+  const hours = Math.floor(h);
+  const m = (h - hours) * 60;
+  const minutes = Math.floor(m);
+  const seconds = (m - minutes) * 60;
+  return `${hours}h ${String(minutes).padStart(2, '0')}m ${seconds.toFixed(1)}s`;
+}
+
+/** Convert decimal degrees to DMS string (e.g. "-13° 35' 45.4\"") */
+function decToDms(deg: number): string {
+  const sign = deg < 0 ? '-' : '+';
+  const abs = Math.abs(deg);
+  const d = Math.floor(abs);
+  const m = (abs - d) * 60;
+  const minutes = Math.floor(m);
+  const seconds = (m - minutes) * 60;
+  return `${sign}${d}° ${String(minutes).padStart(2, '0')}' ${seconds.toFixed(1)}"`;
 }
 
 function SortableHeader({
@@ -75,6 +100,8 @@ export function LightsAnalysisTable({
   selectedFrameIds,
   onSelectionChange,
   onBlackhole,
+  analysisData,
+  rejectedFrameIds,
 }: LightsAnalysisTableProps) {
   const [sortField, setSortField] = useState<SortField | null>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
@@ -128,11 +155,18 @@ export function LightsAnalysisTable({
   const allSelected = frames.length > 0 && selectedFrameIds.size === frames.length;
   const someSelected = selectedFrameIds.size > 0 && selectedFrameIds.size < frames.length;
 
+  // Helper to get analysis data for a frame
+  const getAnalysis = useCallback((frameId: number): FrameAnalysis | undefined => {
+    return analysisData?.get(frameId);
+  }, [analysisData]);
+
   const sortedFrames = useMemo(() => {
     if (!sortField) return frames;
 
     return [...frames].sort((a, b) => {
       let comparison = 0;
+      const aAnalysis = getAnalysis(a.frame_id);
+      const bAnalysis = getAnalysis(b.frame_id);
 
       switch (sortField) {
         case 'date': {
@@ -151,19 +185,40 @@ export function LightsAnalysisTable({
           comparison = (a.exptime ?? 0) - (b.exptime ?? 0);
           break;
         case 'ra':
-          comparison = (a.objctra ?? '').localeCompare(b.objctra ?? '');
+          comparison = (a.ra ?? 0) - (b.ra ?? 0);
           break;
         case 'rotation':
           comparison = (a.rotation ?? 0) - (b.rotation ?? 0);
           break;
-        default:
-          // Placeholder columns — no real data to sort
+        case 'stars':
+          comparison = (aAnalysis?.stars_detected ?? -1) - (bAnalysis?.stars_detected ?? -1);
+          break;
+        case 'fwhm':
+          comparison = (aAnalysis?.median_fwhm ?? -1) - (bAnalysis?.median_fwhm ?? -1);
+          break;
+        case 'eccentricity':
+          comparison = (aAnalysis?.median_eccentricity ?? -1) - (bAnalysis?.median_eccentricity ?? -1);
+          break;
+        case 'median_snr':
+          comparison = (aAnalysis?.median_snr ?? -1) - (bAnalysis?.median_snr ?? -1);
+          break;
+        case 'snr_db':
+          comparison = (aAnalysis?.snr_db ?? -1) - (bAnalysis?.snr_db ?? -1);
+          break;
+        case 'psf_signal':
+          comparison = (aAnalysis?.psf_signal ?? -1) - (bAnalysis?.psf_signal ?? -1);
+          break;
+        case 'snr_weight':
+          comparison = (aAnalysis?.snr_weight ?? -1) - (bAnalysis?.snr_weight ?? -1);
+          break;
+        case 'score':
+          comparison = (aAnalysis?.quality_score ?? -1) - (bAnalysis?.quality_score ?? -1);
           break;
       }
 
       return sortDirection === 'asc' ? comparison : -comparison;
     });
-  }, [frames, sortField, sortDirection]);
+  }, [frames, sortField, sortDirection, getAnalysis]);
 
   return (
     <div className="border border-border rounded-xl overflow-hidden">
@@ -180,103 +235,46 @@ export function LightsAnalysisTable({
               />
             </th>
             <th scope="col" className="px-3 py-2.5 text-left">
-              <SortableHeader
-                field="date"
-                label="Date/Time"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="date" label="Date/Time" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-left">
-              <SortableHeader
-                field="camera"
-                label="Camera"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="camera" label="Camera" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-left">
-              <SortableHeader
-                field="filter"
-                label="Filter"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="filter" label="Filter" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="ra"
-                label="RA / Dec"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="ra" label="RA / Dec" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="rotation"
-                label="Rotation"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="rotation" label="Rotation" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="exptime"
-                label="Exposure"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="exptime" label="Exposure" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="stars"
-                label="Stars"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="stars" label="Stars" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="fwhm"
-                label="FWHM"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="eccentricity"
-                label="Eccentricity"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="eccentricity" label="Eccentricity" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="snr_psf"
-                label="SNR PSF"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader
-                field="snr_db"
-                label="SNR dB"
-                currentSort={sortField}
-                currentDirection={sortDirection}
-                onSort={handleSort}
-              />
+              <SortableHeader field="snr_db" label="SNR (dB)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+            </th>
+            <th scope="col" className="px-3 py-2.5 text-center">
+              <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+            </th>
+            <th scope="col" className="px-3 py-2.5 text-center">
+              <SortableHeader field="snr_weight" label="SNR Weight" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+            </th>
+            <th scope="col" className="px-3 py-2.5 text-center">
+              <SortableHeader field="score" label="Score" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="w-20 px-2 py-2.5 text-center text-xs font-semibold text-content-secondary">
               Actions
@@ -287,12 +285,14 @@ export function LightsAnalysisTable({
           {sortedFrames.map((frame, idx) => {
             const isBlackholed = blackholedFileIds.has(frame.file_id);
             const isSelected = selectedFrameIds.has(frame.frame_id);
+            const isRejected = rejectedFrameIds?.has(frame.frame_id) ?? false;
+            const analysis = getAnalysis(frame.frame_id);
 
             return (
               <tr
                 key={frame.frame_id}
                 className={`
-                  ${idx % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface'}
+                  ${isRejected ? 'bg-error/10' : idx % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface'}
                   hover:bg-surface-hover transition-colors
                   ${isBlackholed ? 'opacity-50' : ''}
                 `}
@@ -317,7 +317,9 @@ export function LightsAnalysisTable({
                 <td className={`px-3 py-2 text-xs font-mono text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.objctra && frame.objctdec
                     ? <>{frame.objctra}<br />{frame.objctdec}</>
-                    : '-'}
+                    : frame.ra != null && frame.dec != null
+                      ? <>{raToHms(frame.ra)}<br />{decToDms(frame.dec)}</>
+                      : '-'}
                 </td>
                 <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.rotation !== null ? `${frame.rotation.toFixed(1)}°` : '-'}
@@ -325,11 +327,31 @@ export function LightsAnalysisTable({
                 <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.exptime !== null ? `${frame.exptime}s` : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-muted text-center">-</td>
-                <td className="px-3 py-2 text-sm text-content-muted text-center">-</td>
-                <td className="px-3 py-2 text-sm text-content-muted text-center">-</td>
-                <td className="px-3 py-2 text-sm text-content-muted text-center">-</td>
-                <td className="px-3 py-2 text-sm text-content-muted text-center">-</td>
+                {/* Analysis columns */}
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis ? analysis.stars_detected : '-'}
+                </td>
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis ? analysis.median_fwhm.toFixed(2) : '-'}
+                </td>
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis ? analysis.median_eccentricity.toFixed(3) : '-'}
+                </td>
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis ? analysis.median_snr.toFixed(1) : '-'}
+                </td>
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis ? analysis.snr_db.toFixed(1) : '-'}
+                </td>
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis ? analysis.psf_signal.toFixed(1) : '-'}
+                </td>
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis ? analysis.snr_weight.toFixed(1) : '-'}
+                </td>
+                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                  {analysis?.quality_score != null ? `${(analysis.quality_score * 100).toFixed(0)}%` : '-'}
+                </td>
                 <td className="w-20 px-2 py-2 text-center">
                   <div className="flex items-center justify-center gap-1">
                     <button

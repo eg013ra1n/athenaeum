@@ -495,6 +495,7 @@ export default function FrameSetDetail() {
           ) : (
             <LightsAnalysisView
               hierarchy={calibrationHierarchy}
+              frameSetId={parseInt(id!)}
               onRefresh={refreshCalibrationHierarchy}
               onBlink={handleBlink}
             />
