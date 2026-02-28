@@ -1,7 +1,11 @@
 export interface RejectionThresholds {
   fwhm: string;
   eccentricity: string;
+  median_snr: string;
+  snr_db: string;
+  psf_signal: string;
   snr_weight: string;
+  trail: string;
   stars: string;
   score: string;
 }
@@ -23,10 +27,14 @@ export function RejectionThresholdBar({ thresholds, onChange }: RejectionThresho
       </span>
       <div className="flex items-center gap-3 flex-1">
         {([
+          { key: 'stars' as const, label: 'Stars <', placeholder: '#' },
           { key: 'fwhm' as const, label: 'FWHM >', placeholder: 'px' },
           { key: 'eccentricity' as const, label: 'Ecc >', placeholder: '0-1' },
-          { key: 'snr_weight' as const, label: 'SNR <', placeholder: 'wt' },
-          { key: 'stars' as const, label: 'Stars <', placeholder: '#' },
+          { key: 'median_snr' as const, label: 'SNR <', placeholder: 'ratio' },
+          { key: 'snr_db' as const, label: 'SNR dB <', placeholder: 'dB' },
+          { key: 'psf_signal' as const, label: 'PSF <', placeholder: 'sig' },
+          { key: 'snr_weight' as const, label: 'SNR Wt <', placeholder: 'wt' },
+          { key: 'trail' as const, label: 'Trail >', placeholder: 'R²' },
           { key: 'score' as const, label: 'Score <', placeholder: '%' },
         ]).map(({ key, label, placeholder }) => (
           <div key={key} className="flex items-center gap-1.5">

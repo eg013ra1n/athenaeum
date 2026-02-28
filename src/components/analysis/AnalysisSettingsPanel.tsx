@@ -149,6 +149,28 @@ export function AnalysisSettingsPanel() {
             />
             <p className="text-xs text-content-muted mt-1">Reject saturated stars (0.5-1.0)</p>
           </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Max Eccentricity</label>
+            <input
+              type="number"
+              value={config.max_eccentricity}
+              onChange={e => updateField('max_eccentricity', parseFloat(e.target.value) || 0.9)}
+              min="0" max="1" step="0.05"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">Stars above this eccentricity are excluded and their metrics zeroed (0.0-1.0)</p>
+          </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Trail Threshold (R²)</label>
+            <input
+              type="number"
+              value={config.trail_threshold}
+              onChange={e => updateField('trail_threshold', parseFloat(e.target.value) || 0.6)}
+              min="0" max="1" step="0.05"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">R² threshold for trail detection. Higher = less sensitive. (0.0-1.0)</p>
+          </div>
         </div>
       </div>
 
@@ -165,7 +187,7 @@ export function AnalysisSettingsPanel() {
             />
             <div>
               <span className="text-sm text-content-secondary">Use Gaussian Fit</span>
-              <p className="text-xs text-content-muted">More accurate FWHM/eccentricity but slower. Disable for fast approximation.</p>
+              <p className="text-xs text-content-muted">Uses full 2D Gaussian fitting for FWHM/eccentricity measurement. When disabled, uses fast windowed moments approximation.</p>
             </div>
           </label>
           <div>

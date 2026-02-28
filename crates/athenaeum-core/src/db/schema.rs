@@ -668,6 +668,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             width INTEGER NOT NULL,
             height INTEGER NOT NULL,
             source_channels INTEGER NOT NULL,
+            trail_r_squared REAL NOT NULL DEFAULT 0.0,
+            possibly_trailed INTEGER NOT NULL DEFAULT 0,
             quality_score REAL,
             config_hash TEXT,
             analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -686,6 +688,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_frame_analysis_file_id ON frame_analysis(file_id)",
         [],
     )?;
+
+    // Add trail_r_squared and possibly_trailed to frame_analysis (migration for existing databases)
+    let has_trail: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name='trail_r_squared'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_trail {
+        conn.execute(
+            "ALTER TABLE frame_analysis ADD COLUMN trail_r_squared REAL NOT NULL DEFAULT 0.0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE frame_analysis ADD COLUMN possibly_trailed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
 
     // Calibration set originals table - stores original metadata values before custom edits
     // Used to backup original FITS header values when user edits calibration set metadata

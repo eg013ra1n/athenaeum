@@ -839,6 +839,8 @@ export interface FrameAnalysis {
   width: number;
   height: number;
   source_channels: number;
+  trail_r_squared: number;
+  possibly_trailed: boolean;
   quality_score: number | null;
   config_hash: string | null;
   analyzed_at: string;

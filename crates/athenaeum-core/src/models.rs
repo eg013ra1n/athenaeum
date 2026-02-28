@@ -725,6 +725,8 @@ pub struct FrameAnalysis {
     pub width: i64,
     pub height: i64,
     pub source_channels: i64,
+    pub trail_r_squared: f64,
+    pub possibly_trailed: bool,
     pub quality_score: Option<f64>,
     pub config_hash: Option<String>,
     pub analyzed_at: String,

@@ -17,7 +17,9 @@ pub fn analyze_frame(
         .with_min_star_area(config.min_star_area as usize)
         .with_max_star_area(config.max_star_area as usize)
         .with_saturation_fraction(config.saturation_fraction as f32)
-        .with_max_stars(config.max_stars as usize);
+        .with_max_stars(config.max_stars as usize)
+        .with_max_eccentricity(config.max_eccentricity as f32)
+        .with_trail_threshold(config.trail_threshold as f32);
 
     if !config.use_gaussian_fit {
         analyzer = analyzer.without_gaussian_fit();
@@ -37,7 +39,7 @@ pub fn analyze_frame(
         id: None,
         frame_id: 0,
         file_id: 0,
-        stars_detected: result.stars_detected as i64,
+        stars_detected: result.stars.len() as i64,
         median_fwhm: result.median_fwhm as f64,
         median_eccentricity: result.median_eccentricity as f64,
         median_snr: result.median_snr as f64,
@@ -51,6 +53,8 @@ pub fn analyze_frame(
         width: result.width as i64,
         height: result.height as i64,
         source_channels: result.source_channels as i64,
+        trail_r_squared: result.trail_r_squared as f64,
+        possibly_trailed: result.possibly_trailed,
         quality_score: None,
         config_hash: Some(config.config_hash()),
         analyzed_at: chrono::Utc::now().to_rfc3339(),

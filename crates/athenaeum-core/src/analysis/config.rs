@@ -15,6 +15,11 @@ pub struct AnalysisConfig {
     pub saturation_fraction: f64,
     /// Keep only the brightest N stars. Default: 200
     pub max_stars: u32,
+    /// Reject stars with eccentricity above this threshold. Stars exceeding this will be
+    /// excluded and their metrics zeroed. Default: 0.9 (range 0.0-1.0)
+    pub max_eccentricity: f64,
+    /// R² threshold for trail detection. Default: 0.6 (range 0.0-1.0)
+    pub trail_threshold: f64,
     /// Use 2D Gaussian fit (accurate, slower) vs windowed moments (fast). Default: true
     pub use_gaussian_fit: bool,
     /// Mesh-grid background estimation cell size. None = global. Default: None
@@ -45,6 +50,8 @@ impl Default for AnalysisConfig {
             max_star_area: 2000,
             saturation_fraction: 0.95,
             max_stars: 200,
+            max_eccentricity: 0.9,
+            trail_threshold: 0.6,
             use_gaussian_fit: true,
             background_mesh_size: None,
             scoring_weights: ScoringWeights::default(),
@@ -114,6 +121,12 @@ impl AnalysisConfig {
         }
         if self.max_stars < 10 || self.max_stars > 2000 {
             return Err("max_stars must be between 10 and 2000".into());
+        }
+        if self.max_eccentricity < 0.0 || self.max_eccentricity > 1.0 {
+            return Err("max_eccentricity must be between 0.0 and 1.0".into());
+        }
+        if self.trail_threshold < 0.0 || self.trail_threshold > 1.0 {
+            return Err("trail_threshold must be between 0.0 and 1.0".into());
         }
         if let Some(mesh) = self.background_mesh_size {
             if mesh < 16 {

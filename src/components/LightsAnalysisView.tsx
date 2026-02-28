@@ -98,7 +98,11 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
   const [thresholds, setThresholds] = useState<RejectionThresholds>({
     fwhm: '',
     eccentricity: '',
+    median_snr: '',
+    snr_db: '',
+    psf_signal: '',
     snr_weight: '',
+    trail: '',
     stars: '',
     score: '',
   });
@@ -191,7 +195,11 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
     const rejected = new Set<number>();
     const fwhmThreshold = parseFloat(thresholds.fwhm);
     const eccThreshold = parseFloat(thresholds.eccentricity);
-    const snrThreshold = parseFloat(thresholds.snr_weight);
+    const medianSnrThreshold = parseFloat(thresholds.median_snr);
+    const snrDbThreshold = parseFloat(thresholds.snr_db);
+    const psfThreshold = parseFloat(thresholds.psf_signal);
+    const snrWtThreshold = parseFloat(thresholds.snr_weight);
+    const trailThreshold = parseFloat(thresholds.trail);
     const starsThreshold = parseFloat(thresholds.stars);
     const scoreThreshold = parseFloat(thresholds.score);
 
@@ -209,8 +217,28 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
         rejected.add(frame.frame_id);
         continue;
       }
+      // SNR < threshold = rejected (worse)
+      if (!isNaN(medianSnrThreshold) && a.median_snr < medianSnrThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+      // SNR dB < threshold = rejected (worse)
+      if (!isNaN(snrDbThreshold) && a.snr_db < snrDbThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+      // PSF Signal < threshold = rejected (worse)
+      if (!isNaN(psfThreshold) && a.psf_signal < psfThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
       // SNR Weight < threshold = rejected (worse)
-      if (!isNaN(snrThreshold) && a.snr_weight < snrThreshold) {
+      if (!isNaN(snrWtThreshold) && a.snr_weight < snrWtThreshold) {
+        rejected.add(frame.frame_id);
+        continue;
+      }
+      // Trail R² > threshold = rejected (trailed)
+      if (!isNaN(trailThreshold) && a.trail_r_squared > trailThreshold) {
         rejected.add(frame.frame_id);
         continue;
       }
@@ -228,6 +256,11 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
 
     return rejected;
   }, [thresholds, displayedFrames, analysisData]);
+
+  // Auto-select rejected frames when thresholds change
+  useEffect(() => {
+    setSelectedFrameIds(rejectedFrameIds);
+  }, [rejectedFrameIds]);
 
   // Clear table selection when tree filter changes
   const handleCheckedChange = useCallback((keys: Set<string>) => {
@@ -348,7 +381,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
             onChange={setThresholds}
           />
 
-          <div className="flex-1 min-h-0 overflow-y-auto">
+          <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
             <LightsAnalysisTable
               frames={displayedFrames}
               blackholedFileIds={blackholedFileIds}

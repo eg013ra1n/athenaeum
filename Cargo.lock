@@ -3602,7 +3602,7 @@ dependencies = [
 [[package]]
 name = "rustafits"
 version = "0.4.5"
-source = "git+https://github.com/eg013ra1n/rustafits.git#c37b526b06bde209f1c6ee163a03c9960dc11ca8"
+source = "git+https://github.com/eg013ra1n/rustafits.git#031809b54c93a4cee4a9bdc36fcd99693c87d4ed"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

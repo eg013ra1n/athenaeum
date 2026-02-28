@@ -5,6 +5,8 @@ export interface AnalysisConfig {
   max_star_area: number;
   saturation_fraction: number;
   max_stars: number;
+  max_eccentricity: number;
+  trail_threshold: number;
   use_gaussian_fit: boolean;
   background_mesh_size: number | null;
   scoring_weights: ScoringWeights;
@@ -25,6 +27,8 @@ export const DEFAULT_ANALYSIS_CONFIG: AnalysisConfig = {
   max_star_area: 2000,
   saturation_fraction: 0.95,
   max_stars: 200,
+  max_eccentricity: 0.9,
+  trail_threshold: 0.6,
   use_gaussian_fit: true,
   background_mesh_size: null,
   scoring_weights: {
