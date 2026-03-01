@@ -5,6 +5,7 @@
 
 use crate::cache::MemoryImageCache;
 use crate::db::Database;
+use crate::rustafits_processor::AnnotationMetrics;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -30,4 +31,6 @@ pub struct ServiceContext {
     pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
     pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
+    /// Cached analysis metrics from annotated image processing (keyed by cache key)
+    pub annotation_metrics: Arc<Mutex<HashMap<String, AnnotationMetrics>>>,
 }

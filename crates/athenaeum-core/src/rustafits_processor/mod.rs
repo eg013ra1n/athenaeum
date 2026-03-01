@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use astroimage::ImageConverter;
+use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -145,6 +145,120 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
         height,
         format: "jpeg".to_string(),
         is_color,
+    })
+}
+
+/// Analysis summary returned alongside annotated images
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationMetrics {
+    pub stars_detected: usize,
+    pub median_fwhm: f32,
+    pub median_eccentricity: f32,
+    pub median_snr: f32,
+    pub median_hfr: f32,
+    pub snr_db: f32,
+    pub snr_weight: f32,
+    pub psf_signal: f32,
+    pub trail_r_squared: f32,
+    pub possibly_trailed: bool,
+}
+
+/// Result of annotated image processing — JPEG bytes + analysis metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotatedImageResult {
+    pub image_data: Vec<u8>,
+    pub metrics: Option<AnnotationMetrics>,
+}
+
+/// Process a FITS/XISF file to JPEG with star annotations burned in.
+///
+/// Runs image analysis to detect stars, draws color-coded ellipses onto the
+/// processed image, and returns both the annotated JPEG and analysis metrics.
+pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
+    input_path: P,
+    resolution: Resolution,
+    quality: Option<u8>,
+    pool: &Arc<rayon::ThreadPool>,
+) -> Result<AnnotatedImageResult> {
+    let input_path = input_path.as_ref();
+
+    if !input_path.exists() {
+        anyhow::bail!("Input file does not exist: {}", input_path.display());
+    }
+
+    // Build converter with resolution-specific settings
+    let mut converter = ImageConverter::new().with_thread_pool(pool.clone());
+
+    if resolution.downscale_factor() > 1 {
+        converter = converter.with_downscale(resolution.downscale_factor());
+    }
+    if resolution.use_preview_mode() {
+        converter = converter.with_preview_mode();
+    }
+
+    // Process FITS/XISF to raw RGB pixels
+    let mut processed = converter
+        .process(input_path)
+        .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
+
+    let width = processed.width as u32;
+    let height = processed.height as u32;
+
+    // Run star analysis
+    let metrics = match ImageAnalyzer::new()
+        .with_max_stars(200)
+        .without_gaussian_fit()
+        .with_thread_pool(pool.clone())
+        .analyze(input_path.to_str().unwrap_or_default())
+    {
+        Ok(result) => {
+            // Burn annotations into the image
+            annotate_image(&mut processed, &result, &AnnotationConfig::default());
+
+            Some(AnnotationMetrics {
+                stars_detected: result.stars.len(),
+                median_fwhm: result.median_fwhm,
+                median_eccentricity: result.median_eccentricity,
+                median_snr: result.median_snr,
+                median_hfr: result.median_hfr,
+                snr_db: result.snr_db,
+                snr_weight: result.snr_weight,
+                psf_signal: result.psf_signal,
+                trail_r_squared: result.trail_r_squared,
+                possibly_trailed: result.possibly_trailed,
+            })
+        }
+        Err(e) => {
+            eprintln!(
+                "WARNING: Star analysis failed for {}: {}. Returning unannotated image.",
+                input_path.display(),
+                e
+            );
+            None
+        }
+    };
+
+    // Strip alpha channel if RGBA
+    let rgb_data = if processed.channels == 4 {
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for chunk in processed.data.chunks_exact(4) {
+            rgb.push(chunk[0]);
+            rgb.push(chunk[1]);
+            rgb.push(chunk[2]);
+        }
+        rgb
+    } else {
+        processed.data
+    };
+
+    // Encode JPEG
+    let jpeg_quality = resolution.jpeg_quality(quality);
+    let image_data = jpeg_encode::encode_rgb_to_jpeg(&rgb_data, width, height, jpeg_quality)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    Ok(AnnotatedImageResult {
+        image_data,
+        metrics,
     })
 }
 

@@ -59,7 +59,7 @@ pub fn run() {
                 ctx: ServiceContext {
                     db: Mutex::new(None),
                     settings: Arc::new(SettingsManager::new()),
-                    memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(200, 30))),
+                    memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(400, 30))),
                     active_scans: Arc::new(Mutex::new(HashMap::new())),
                     active_exports: Arc::new(Mutex::new(HashMap::new())),
                     image_pool: Arc::new(
@@ -68,6 +68,7 @@ pub fn run() {
                             .build()
                             .expect("Failed to create image processing thread pool"),
                     ),
+                    annotation_metrics: Arc::new(Mutex::new(HashMap::new())),
                 },
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),
@@ -261,6 +262,7 @@ pub fn run() {
             commands::get_analysis_for_frame_set,
             commands::delete_analysis_for_frame_set,
             commands_rustafits::read_fits_image_rustafits,
+            commands_rustafits::read_fits_image_annotated,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

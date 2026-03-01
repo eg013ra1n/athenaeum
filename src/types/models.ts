@@ -871,6 +871,26 @@ export interface CalibrationMetadataEdits {
   exptime?: number | null;
 }
 
+/** Analysis metrics from star annotation processing */
+export interface AnnotationMetrics {
+  stars_detected: number;
+  median_fwhm: number;
+  median_eccentricity: number;
+  median_snr: number;
+  median_hfr: number;
+  snr_db: number;
+  snr_weight: number;
+  psf_signal: number;
+  trail_r_squared: number;
+  possibly_trailed: boolean;
+}
+
+/** Response from read_fits_image_annotated command */
+export interface AnnotatedImageResponse {
+  image_data: number[];
+  metrics: AnnotationMetrics | null;
+}
+
 /** Original calibration set metadata values (backed up before editing) */
 export interface CalibrationSetOriginals {
   set_id: number;

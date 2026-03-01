@@ -1,4 +1,4 @@
-import type { FileWithFrame } from "../../types/models";
+import type { FileWithFrame, AnnotationMetrics } from "../../types/models";
 
 /** Props for the main BlinkViewer component */
 export interface BlinkViewerProps {
@@ -32,6 +32,10 @@ export interface ToolBarProps {
   onRestore: () => void;
   isBlackholing: boolean;
 
+  // Annotations
+  showAnnotations: boolean;
+  onToggleAnnotations: () => void;
+
   // Caching
   isCaching: boolean;
   cacheProgress: { current: number; total: number };
@@ -54,9 +58,10 @@ export interface FrameListProps {
   onClearSelection: () => void;
 }
 
-/** Props for the DetailsBar component */
-export interface DetailsBarProps {
+/** Props for the FrameInfoPanel component */
+export interface FrameInfoPanelProps {
   currentFrame: FileWithFrame | undefined;
+  metrics: AnnotationMetrics | null;
 }
 
 /** Cache progress state */

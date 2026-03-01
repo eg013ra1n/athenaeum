@@ -7,6 +7,7 @@ import {
   Loader2,
   Trash2,
   RotateCcw,
+  Star,
 } from "lucide-react";
 import type { ToolBarProps } from "./types";
 
@@ -26,6 +27,8 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   onBlackhole,
   onRestore,
   isBlackholing,
+  showAnnotations,
+  onToggleAnnotations,
   isCaching,
   cacheProgress,
   cacheStats,
@@ -76,6 +79,19 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           />
           <span className="text-sm text-content w-14">{blinkSpeed} FPS</span>
         </div>
+
+        {/* Star annotation toggle */}
+        <button
+          onClick={onToggleAnnotations}
+          className={`p-2 rounded transition-colors ${
+            showAnnotations
+              ? "bg-accent text-surface"
+              : "bg-surface-elevated text-content hover:bg-surface-hover"
+          }`}
+          title={showAnnotations ? "Hide star annotations (A)" : "Show star annotations (A)"}
+        >
+          <Star size={20} />
+        </button>
       </div>
 
       {/* Center: Frame counter + selection count + caching progress */}
@@ -135,7 +151,7 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
         )}
 
         <div className="text-xs text-content-muted mr-2">
-          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed | +/-: Zoom | 0: Reset
+          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed | A: Stars | +/-: Zoom | 0: Reset
         </div>
         <button
           onClick={onClose}

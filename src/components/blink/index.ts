@@ -1,10 +1,10 @@
 export { ToolBar } from "./ToolBar";
 export { FrameList } from "./FrameList";
-export { DetailsBar } from "./DetailsBar";
+export { FrameInfoPanel } from "./FrameInfoPanel";
 export type {
   BlinkViewerProps,
   ToolBarProps,
   FrameListProps,
-  DetailsBarProps,
+  FrameInfoPanelProps,
   CacheProgress,
 } from "./types";

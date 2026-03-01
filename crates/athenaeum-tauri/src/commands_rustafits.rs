@@ -2,9 +2,17 @@
 
 use crate::cache::CachedImage;
 use crate::commands::AppState;
-use crate::rustafits_processor::{self, Resolution};
+use crate::rustafits_processor::{self, AnnotationMetrics, Resolution};
+use serde::Serialize;
 use std::path::PathBuf;
 use tauri::State;
+
+/// Response for annotated image requests — JPEG bytes + analysis metrics
+#[derive(Serialize)]
+pub struct AnnotatedImageResponse {
+    pub image_data: Vec<u8>,
+    pub metrics: Option<AnnotationMetrics>,
+}
 
 /// Read FITS image and return JPEG bytes via in-memory cache.
 ///
@@ -115,4 +123,131 @@ pub async fn read_fits_image_rustafits(
 
     println!("✅ Memory cache: {} bytes in {:?}", jpeg_data.len(), t_start.elapsed());
     Ok(jpeg_data)
+}
+
+/// Read FITS image with star annotations burned in + analysis metrics.
+///
+/// JPEG bytes are cached in memory_cache (key suffix ":annotated").
+/// Metrics are cached in annotation_metrics map.
+#[tauri::command]
+pub async fn read_fits_image_annotated(
+    path: String,
+    resolution: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AnnotatedImageResponse, String> {
+    use std::time::Instant;
+
+    let t_start = Instant::now();
+    let path_buf = PathBuf::from(&path);
+
+    // ── Step 1: Read settings from DB ──
+    let (resolution_str, quality) = {
+        let state_lock = state.ctx.db.lock().unwrap();
+        if let Some(db) = state_lock.as_ref() {
+            let conn = db.conn();
+            let res_str = if let Some(res_param) = resolution.as_deref() {
+                res_param.to_string()
+            } else {
+                match crate::db::get_setting(&conn, "blink.resolution") {
+                    Ok(Some(value)) => value,
+                    _ => "preview".to_string(),
+                }
+            };
+
+            let res = match res_str.as_str() {
+                "thumbnail" => Resolution::Thumbnail,
+                "preview" => Resolution::Preview,
+                "full" => Resolution::Full,
+                _ => Resolution::Preview,
+            };
+            let quality_key = res.quality_setting_key();
+            let q = match crate::db::get_setting(&conn, quality_key) {
+                Ok(Some(value)) => value.parse().ok(),
+                _ => None,
+            };
+
+            (res_str, q)
+        } else {
+            (
+                resolution.as_deref().unwrap_or("preview").to_string(),
+                None,
+            )
+        }
+    };
+
+    let res = match resolution_str.as_str() {
+        "thumbnail" => Resolution::Thumbnail,
+        "preview" => Resolution::Preview,
+        "full" => Resolution::Full,
+        _ => Resolution::Preview,
+    };
+
+    // ── Step 2: Memory cache lookup (fast path) ──
+    let cache_key = format!("{}:{}:annotated", path, resolution_str);
+
+    {
+        let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
+        if let Some(cached) = mem_cache.get(&cache_key) {
+            // Look up cached metrics
+            let metrics = state.ctx.annotation_metrics.lock().unwrap().get(&cache_key).cloned();
+            println!("⚡ Annotated cache hit ({} bytes) in {:?}", cached.data.len(), t_start.elapsed());
+            return Ok(AnnotatedImageResponse {
+                image_data: cached.data.clone(),
+                metrics,
+            });
+        }
+    }
+
+    if !path_buf.exists() {
+        let error_msg = format!("File not found: {}", path_buf.display());
+        eprintln!("ERROR: {}", error_msg);
+        return Err(error_msg);
+    }
+
+    // Slow path: acquire semaphore
+    let sem = state.image_semaphore.read().unwrap().clone();
+    let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+
+    // Double-check cache
+    {
+        let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
+        if let Some(cached) = mem_cache.get(&cache_key) {
+            let metrics = state.ctx.annotation_metrics.lock().unwrap().get(&cache_key).cloned();
+            println!("⚡ Annotated cache hit (after semaphore, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
+            return Ok(AnnotatedImageResponse {
+                image_data: cached.data.clone(),
+                metrics,
+            });
+        }
+    }
+
+    // Cache miss — process with annotations
+    let result = tokio::task::block_in_place(|| {
+        rustafits_processor::process_fits_to_jpeg_annotated(&path_buf, res, quality, &state.ctx.image_pool)
+    })
+    .map_err(|e| {
+        let error_msg = format!("Failed to process annotated FITS image: {}", e);
+        eprintln!("ERROR: {}", error_msg);
+        error_msg
+    })?;
+
+    let jpeg_data = result.image_data;
+    let metrics = result.metrics.clone();
+
+    // Cache JPEG bytes
+    {
+        let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
+        mem_cache.insert(cache_key.clone(), CachedImage { data: jpeg_data.clone(), last_accessed: Instant::now() });
+    }
+
+    // Cache metrics separately
+    if let Some(ref m) = metrics {
+        state.ctx.annotation_metrics.lock().unwrap().insert(cache_key, m.clone());
+    }
+
+    println!("✅ Annotated cache: {} bytes in {:?}", jpeg_data.len(), t_start.elapsed());
+    Ok(AnnotatedImageResponse {
+        image_data: jpeg_data,
+        metrics,
+    })
 }

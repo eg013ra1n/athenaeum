@@ -20,7 +20,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
   onClearSelection,
 }) {
   return (
-    <div className="w-1/4 bg-surface border-l border-border flex flex-col">
+    <div className="bg-surface flex flex-col h-full">
       {/* List header with selection controls */}
       <div className="p-2 border-b border-border">
         <div className="flex items-center justify-between">

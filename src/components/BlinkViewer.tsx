@@ -7,8 +7,9 @@ import {
   Trash2,
   AlertTriangle,
 } from "lucide-react";
-import type { FileWithFrame } from "../types/models";
-import { ToolBar, FrameList, DetailsBar } from "./blink";
+import type { FileWithFrame, AnnotationMetrics, AnnotatedImageResponse } from "../types/models";
+import { ToolBar, FrameList, FrameInfoPanel } from "./blink";
+import { useBlinkCache } from "../hooks/useBlinkCache";
 
 interface BlinkViewerProps {
   frames: FileWithFrame[];
@@ -33,10 +34,6 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [loadedImages, setLoadedImages] = useState<Map<number, string>>(new Map());
   const [loadingIndices, setLoadingIndices] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
-  const [isCaching, setIsCaching] = useState(false);
-  const [cacheProgress, setCacheProgress] = useState({ current: 0, total: 0 });
-  const [cacheStats, setCacheStats] = useState<{ elapsedMs: number; frameCount: number } | null>(null);
-
   // Gate: wait for backend settings to be ready before loading images
   const [cacheModeReady, setCacheModeReady] = useState(false);
 
@@ -49,6 +46,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [isBlackholing, setIsBlackholing] = useState(false);
   const [blackholeError, setBlackholeError] = useState<string | null>(null);
   const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
+
+  // Annotation state
+  const [showAnnotations, setShowAnnotations] = useState(false);
+  const [annotatedImages, setAnnotatedImages] = useState<Map<number, string>>(new Map());
+  const [frameMetrics, setFrameMetrics] = useState<Map<number, AnnotationMetrics>>(new Map());
+  const annotatedImagesRef = useRef(annotatedImages);
+  annotatedImagesRef.current = annotatedImages;
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const blinkIntervalRef = useRef<number | null>(null);
@@ -151,6 +155,47 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       });
     }
   }, [fitsFrames]);
+
+  // Load annotated image from backend
+  const loadAnnotatedImage = useCallback(async (index: number) => {
+    if (index < 0 || index >= fitsFrames.length) return;
+    if (annotatedImagesRef.current.has(index)) return;
+
+    const frame = fitsFrames[index];
+    if (!frame) return;
+
+    try {
+      const response = await api.invoke<AnnotatedImageResponse>("read_fits_image_annotated", {
+        path: frame.file.path,
+      });
+
+      const binaryData = response.image_data instanceof Uint8Array
+        ? response.image_data
+        : new Uint8Array(response.image_data as number[]);
+
+      const blob = new Blob([binaryData], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      setAnnotatedImages((prev) => new Map(prev).set(index, url));
+
+      if (response.metrics) {
+        setFrameMetrics((prev) => new Map(prev).set(index, response.metrics!));
+      }
+    } catch (err) {
+      console.error(`Failed to load annotated image ${index}:`, err);
+    }
+  }, [fitsFrames]);
+
+  // Unified priority-queue caching for both plain and annotated images
+  const { isCaching, cacheProgress, cacheStats } = useBlinkCache({
+    frames: fitsFrames,
+    currentIndex,
+    showAnnotations,
+    cacheModeReady,
+    loadedImages,
+    annotatedImages,
+    loadImage,
+    loadAnnotatedImage,
+  });
 
   // Helper to update zoom display with debouncing
   const updateZoomDisplay = useCallback((zoom: number) => {
@@ -258,14 +303,24 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           URL.revokeObjectURL(value);
         }
       });
+      annotatedImagesRef.current.forEach((value) => {
+        if (value.startsWith("blob:")) {
+          URL.revokeObjectURL(value);
+        }
+      });
     };
   }, []);
 
-  // Render current image
+  // Render current image — prefer annotated variant when annotations are on
   useEffect(() => {
-    const imageValue = loadedImages.get(currentIndex);
+    let imageValue: string | undefined;
+    if (showAnnotations) {
+      imageValue = annotatedImages.get(currentIndex) ?? loadedImages.get(currentIndex);
+    } else {
+      imageValue = loadedImages.get(currentIndex);
+    }
     if (imageValue) renderImage(imageValue);
-  }, [currentIndex, loadedImages, renderImage]);
+  }, [currentIndex, loadedImages, annotatedImages, showAnnotations, renderImage]);
 
   // Handle window resize
   useEffect(() => {
@@ -274,12 +329,17 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       if (!canvas) return;
 
       const newWidth = window.innerWidth * 0.75;
-      const newHeight = window.innerHeight - 140;
+      const newHeight = window.innerHeight - 48;
 
       if (canvas.width !== newWidth || canvas.height !== newHeight) {
         canvas.width = newWidth;
         canvas.height = newHeight;
-        const imageValue = loadedImagesRef.current.get(currentIndexRef.current);
+        let imageValue: string | undefined;
+        if (showAnnotations) {
+          imageValue = annotatedImagesRef.current.get(currentIndexRef.current) ?? loadedImagesRef.current.get(currentIndexRef.current);
+        } else {
+          imageValue = loadedImagesRef.current.get(currentIndexRef.current);
+        }
         if (imageValue) renderImage(imageValue);
       }
     };
@@ -287,7 +347,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     updateCanvasSize();
     window.addEventListener("resize", updateCanvasSize);
     return () => window.removeEventListener("resize", updateCanvasSize);
-  }, [renderImage]);
+  }, [renderImage, showAnnotations]);
 
   // Blink playback
   useEffect(() => {
@@ -314,6 +374,11 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     });
     setLastSelectedIndex(currentIndex);
   }, [currentIndex]);
+
+  // Toggle annotations
+  const handleToggleAnnotations = useCallback(() => {
+    setShowAnnotations((prev) => !prev);
+  }, []);
 
   // Constrain pan to keep at least 10% of image visible
   const constrainPan = useCallback((newPan: { x: number; y: number }) => {
@@ -410,6 +475,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           if (e.ctrlKey || e.metaKey) {
             e.preventDefault();
             setSelectedFrames(new Set(fitsFrames.map((_, i) => i)));
+          } else {
+            // Bare 'a' toggles annotations
+            e.preventDefault();
+            handleToggleAnnotations();
           }
           break;
         // Zoom controls
@@ -432,68 +501,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
     window.addEventListener("keydown", handleKeyPress);
     return () => window.removeEventListener("keydown", handleKeyPress);
-  }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames, zoomIn, zoomOut, resetZoom]);
-
-  // Unified queue: cache all frames in priority order (current first, then forward, then wrap)
-  useEffect(() => {
-    if (!cacheModeReady) return;
-    const total = fitsFrames.length;
-    if (total === 0) return;
-
-    let cancelled = false;
-
-    const startCaching = async () => {
-      // Build priority-ordered queue: currentIndex, +1, +2, ... wrap around to 0, 1, ...
-      const queue: number[] = [];
-      for (let i = 0; i < total; i++) {
-        queue.push((currentIndex + i) % total);
-      }
-
-      setIsCaching(true);
-      setCacheStats(null);
-      let done = 0;
-      setCacheProgress({ current: 0, total });
-
-      const cacheStartTime = Date.now();
-      const MAX_CONCURRENT = 8;
-
-      await new Promise<void>((resolveAll) => {
-        let nextJob = 0;
-        let running = 0;
-
-        const startNext = () => {
-          while (!cancelled && running < MAX_CONCURRENT && nextJob < queue.length) {
-            running++;
-            const idx = queue[nextJob++];
-            loadImage(idx).finally(() => {
-              running--;
-              done++;
-              setCacheProgress({ current: done, total });
-              if (!cancelled && nextJob < queue.length) {
-                startNext();
-              } else if (running === 0) {
-                resolveAll();
-              }
-            });
-          }
-          if (running === 0 && nextJob >= queue.length) {
-            resolveAll();
-          }
-        };
-
-        startNext();
-      });
-
-      if (!cancelled) {
-        setCacheStats({ elapsedMs: Date.now() - cacheStartTime, frameCount: total });
-        setIsCaching(false);
-      }
-    };
-
-    startCaching();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cacheModeReady]);
+  }, [fitsFrames.length, onClose, toggleCurrentFrameSelection, fitsFrames, zoomIn, zoomOut, resetZoom, handleToggleAnnotations]);
 
   // Check blackhole status on mount
   useEffect(() => {
@@ -734,6 +742,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         onBlackhole={() => setShowBlackholeConfirm(true)}
         onRestore={handleRestoreSelected}
         isBlackholing={isBlackholing}
+        showAnnotations={showAnnotations}
+        onToggleAnnotations={handleToggleAnnotations}
         isCaching={isCaching}
         cacheProgress={cacheProgress}
         cacheStats={cacheStats}
@@ -777,26 +787,33 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           )}
         </div>
 
-        {/* Frame list */}
-        <FrameList
-          frames={fitsFrames}
-          currentIndex={currentIndex}
-          selectedFrames={selectedFrames}
-          blackholedFileIds={blackholedFileIds}
-          loadingIndices={loadingIndices}
-          onFrameClick={handleFrameClick}
-          onCheckboxClick={handleCheckboxClick}
-          onSelectAll={handleSelectAll}
-          onClearSelection={handleClearSelection}
-        />
+        {/* Right sidebar: Frame list + Info panel */}
+        <div className="w-1/4 bg-surface border-l border-border flex flex-col">
+          {/* Frame list — takes available space */}
+          <div className="flex-1 min-h-0">
+            <FrameList
+              frames={fitsFrames}
+              currentIndex={currentIndex}
+              selectedFrames={selectedFrames}
+              blackholedFileIds={blackholedFileIds}
+              loadingIndices={loadingIndices}
+              onFrameClick={handleFrameClick}
+              onCheckboxClick={handleCheckboxClick}
+              onSelectAll={handleSelectAll}
+              onClearSelection={handleClearSelection}
+            />
+          </div>
+          {/* Info panel — fixed at bottom */}
+          <FrameInfoPanel
+            currentFrame={currentFrame}
+            metrics={showAnnotations ? frameMetrics.get(currentIndex) ?? null : null}
+          />
+        </div>
       </div>
-
-      {/* BOTTOM DETAILS BAR */}
-      <DetailsBar currentFrame={currentFrame} />
 
       {/* Blackhole error notification */}
       {blackholeError && (
-        <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-error text-white px-4 py-2 rounded shadow-lg z-60 flex items-center gap-2">
+        <div className="fixed bottom-12 left-1/2 transform -translate-x-1/2 bg-error text-white px-4 py-2 rounded shadow-lg z-60 flex items-center gap-2">
           <AlertTriangle size={18} />
           {blackholeError}
           <button onClick={() => setBlackholeError(null)} className="ml-2 p-1 hover:brightness-90 rounded">

@@ -126,6 +126,7 @@ async fn main() {
         active_scans: Arc::new(Mutex::new(HashMap::new())),
         active_exports: Arc::new(Mutex::new(HashMap::new())),
         image_pool: Arc::new(image_pool),
+        annotation_metrics: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // SSE broadcast channel
