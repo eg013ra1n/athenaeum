@@ -209,7 +209,7 @@ pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
         .with_max_stars(200)
         .without_gaussian_fit()
         .with_thread_pool(pool.clone())
-        .analyze(input_path.to_str().unwrap_or_default())
+        .analyze(input_path)
     {
         Ok(result) => {
             // Burn annotations into the image
