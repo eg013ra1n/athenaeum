@@ -1,21 +1,21 @@
 ## What's New
 
-- Docker / self-hosted web deployment — full Axum HTTP backend with Docker Compose
-- Configurable memory cache for blink viewer — size (10-5000 images) and retention (1-1440 min)
-- Configurable concurrent processing threads for image rendering
-- Web folder browser modal for directory selection in web/Docker mode
-- Beta update channel — opt-in checkbox in Settings to check for beta releases
+- **Frame analysis pipeline** — star detection, FWHM, eccentricity, SNR, HFR, PSF signal, and quality scoring for light frames with parallel processing across all available CPU cores
+- **Star annotations & metrics** — toggle annotated FITS image rendering in the blink viewer showing detected stars, annotation metrics, and a dedicated frame info panel
+- **Trail detection** — automatic satellite/airplane trail detection with configurable R-squared threshold and visual warnings in the analysis table
+- **Lights analysis table** — sortable table with real analysis data, rejection thresholds (FWHM, eccentricity, SNR weight, stars, score), and auto-selection of rejected frames
+- **Stage / WIP / Archive tabs** — workflow pipeline on the Objects page to organize frame sets by lifecycle stage with count badges and tab-aware actions
+- **Analysis settings** — configurable detection sigma, star area bounds, saturation fraction, max stars, and quality score weights in Settings
 
 ## Changes
 
-- Default blink cache mode switched from disk to memory (faster frame navigation, ~60 MB RAM for 200 cached images)
-- Blink viewer uses a unified priority queue — all frames queued from current position forward, replacing the old two-phase sequential+concurrent preload
-- Desktop-only UI elements (cache mode toggle, file manager reveal, scan root buttons) hidden in web mode
-- Web concurrency control — image processing semaphore limits parallel FITS rendering in Docker deployments
+- Calibration hierarchy queries now include object coordinates (OBJCTRA/OBJCTDEC) for light frames
+- RA/Dec display falls back to converting numeric decimal degrees to HMS/DMS when FITS keywords are absent
+- RA column sorting uses numeric comparison instead of string
+- rustafits dependency switched from git fork to crates.io v0.5.5
+- Default max eccentricity threshold updated to 0.9
+- Stars detected count now uses post-filter count instead of raw detections
 
 ## Bug Fixes
 
-- Fixed camelCase/snake_case serialization mismatches causing HTTP 422 errors in 34 web API routes
-- Fixed binary image delivery in web backend (returns raw JPEG instead of JSON-wrapped)
-- Fixed export folder path selection and validation for Docker volume mounts
-- Fixed blink thread setting key mismatch in web backend (blink.max_threads → blink.threads)
+- Fixed stars_detected to use filtered star count (stars.len()) instead of raw detection count
