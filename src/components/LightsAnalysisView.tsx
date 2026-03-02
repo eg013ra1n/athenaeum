@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Play, Trash2, BarChart3 } from 'lucide-react';
+import { Play, Trash2, BarChart3, Download } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -311,6 +311,38 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
     }
   }, [selectedFrameIds, allFrames, blackholedFileIds, onRefresh]);
 
+  const handleExportCsv = useCallback(() => {
+    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM', 'Eccentricity', 'SNR', 'SNR (dB)', 'PSF Signal', 'SNR Weight', 'Trail R²', 'Score'];
+    const rows = displayedFrames.map(frame => {
+      const a = analysisData.get(frame.frame_id);
+      return [
+        frame.filename,
+        frame.date_obs ?? '',
+        frame.camera ?? '',
+        frame.filter ?? '',
+        frame.exptime != null ? String(frame.exptime) : '',
+        a ? String(a.stars_detected) : '',
+        a ? a.median_fwhm.toFixed(2) : '',
+        a ? a.median_eccentricity.toFixed(3) : '',
+        a ? a.median_snr.toFixed(1) : '',
+        a ? a.snr_db.toFixed(1) : '',
+        a ? a.psf_signal.toFixed(1) : '',
+        a ? a.snr_weight.toFixed(1) : '',
+        a ? a.trail_r_squared.toFixed(4) : '',
+        a?.quality_score != null ? (a.quality_score * 100).toFixed(1) : '',
+      ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
+    });
+
+    const csv = [headers.join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'analysis-export.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [displayedFrames, analysisData]);
+
   const analyzedCount = analysisData.size;
   const totalLightFrames = allFrames.length;
 
@@ -346,6 +378,14 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
             </span>
           )}
         </div>
+        <button
+          onClick={handleExportCsv}
+          disabled={analysisData.size === 0}
+          className="ml-auto inline-flex items-center gap-1.5 px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content-secondary text-sm rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <Download size={16} />
+          Export CSV{checkedKeys.size > 0 ? ' (filtered)' : ''}
+        </button>
       </div>
 
       {/* Progress Bar */}

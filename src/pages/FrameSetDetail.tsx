@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, Clock, MapPin, RotateCw, AlertCircle, Scissors, Play, BarChart3, Shield } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, Play, BarChart3, Crosshair } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -361,21 +361,16 @@ export default function FrameSetDetail() {
 
   return (
     <div className="p-6 h-full flex flex-col">
-      {/* Back Button */}
-      <div className="mb-6 flex items-center justify-between flex-shrink-0">
-        <button
-          onClick={() => navigate('/objects')}
-          className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:bg-surface-hover rounded-lg transition"
-        >
-          <ArrowLeft size={18} />
-          Back to Objects
-        </button>
-      </div>
-
-      {/* Frame Set Header - Combined with Stats */}
+      {/* Frame Set Header */}
       <div className="bg-surface-elevated rounded-lg p-3 mb-3 border border-border flex-shrink-0">
-        <div className="flex items-start justify-between mb-2">
+        <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => navigate('/objects')}
+              className="flex items-center text-content-muted hover:text-content transition pr-3 mr-1 border-r border-border"
+            >
+              <ArrowLeft size={18} />
+            </button>
             <h1 className="text-xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
             {detail.frames_set?.objctra && detail.frames_set?.objctdec && (
               <div className="flex items-center gap-2 text-content-muted">
@@ -398,58 +393,16 @@ export default function FrameSetDetail() {
               </div>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => handleBlink(getAllLightFrameIds())}
-              disabled={!calibrationHierarchy || getAllLightFrameIds().length === 0}
-              className="flex items-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition text-sm"
-              title="Blink through all LIGHT frames in this frame set"
-            >
-              <Play size={16} />
-              Blink All
-            </button>
-            <CalibrationFinderButton
-              frameSetId={parseInt(id!)}
-              frameSetName={detail.frames_set?.name || 'Untitled'}
-              onComplete={loadData}
-            />
-          </div>
-        </div>
-
-        {/* Stats Row */}
-        <div className="grid grid-cols-5 gap-2 text-center">
-          <div className="bg-surface/50 rounded px-2 py-1.5">
-            <div className="text-lg font-bold text-content">
-              {calibrationHierarchy?.total_frames ?? '-'}
-            </div>
-            <div className="text-xs text-content-muted">Total Frames</div>
-          </div>
-          <div className="bg-surface/50 rounded px-2 py-1.5">
-            <div className="text-lg font-bold text-success">
-              {calibrationHierarchy?.calibrated_frames ?? '-'}
-            </div>
-            <div className="text-xs text-content-muted">Calibrated</div>
-          </div>
-          <div className="bg-surface/50 rounded px-2 py-1.5">
-            <div className="text-lg font-bold text-warning">
-              {calibrationHierarchy?.uncalibrated_frames ?? '-'}
-            </div>
-            <div className="text-xs text-content-muted">Uncalibrated</div>
-          </div>
-          <div className="bg-surface/50 rounded px-2 py-1.5">
-            <div className="text-lg font-bold text-accent">
-              {calibrationHierarchy?.date_groups.length ?? '-'}
-            </div>
-            <div className="text-xs text-content-muted">Sessions</div>
-          </div>
-          <div className="bg-surface/50 rounded px-2 py-1.5">
-            <div className="text-lg font-bold text-content">
-              {formatExposureTime(detail.frames_set?.total_exp_time)}
-            </div>
-            <div className="text-xs text-content-muted flex items-center justify-center gap-1">
-              <Clock size={12} />
-              Exposure
-            </div>
+          <div className="flex items-center gap-1.5 text-sm text-content-muted">
+            <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
+            <span>·</span>
+            <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
+            <span>·</span>
+            <span><span className="font-medium text-warning">{calibrationHierarchy?.uncalibrated_frames ?? '-'}</span> uncalibrated</span>
+            <span>·</span>
+            <span><span className="font-medium text-accent">{calibrationHierarchy?.date_groups.length ?? '-'}</span> sessions</span>
+            <span>·</span>
+            <span className="font-medium text-content">{formatExposureTime(detail.frames_set?.total_exp_time)}</span>
           </div>
         </div>
       </div>
@@ -457,7 +410,7 @@ export default function FrameSetDetail() {
       {/* Tab Bar */}
       <div className="flex items-center gap-1 border-b border-border mb-3 flex-shrink-0">
         {([
-          { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Shield },
+          { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
         ]).map(({ key, label, icon: Icon }) => (
           <button
@@ -484,14 +437,34 @@ export default function FrameSetDetail() {
           </div>
         ) : calibrationHierarchy ? (
           activeTab === 'calibration' ? (
-            <CalibrationHierarchyViewComponent
-              data={calibrationHierarchy}
-              onRefresh={refreshCalibrationHierarchy}
-              onBlink={handleBlink}
-              onBlinkSelected={handleBlink}
-              onSplit={handleOpenSplitDialog}
-              onCreateCustomSet={handleOpenCreateDialog}
-            />
+            <div className="flex flex-col h-full">
+              <div className="flex items-center gap-3 mb-3 flex-shrink-0">
+                <CalibrationFinderButton
+                  frameSetId={parseInt(id!)}
+                  frameSetName={detail.frames_set?.name || 'Untitled'}
+                  onComplete={loadData}
+                />
+                <button
+                  onClick={() => handleBlink(getAllLightFrameIds())}
+                  disabled={getAllLightFrameIds().length === 0}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
+                  title="Blink through all LIGHT frames in this frame set"
+                >
+                  <Play size={16} />
+                  Blink All
+                </button>
+              </div>
+              <div className="flex-1 min-h-0">
+                <CalibrationHierarchyViewComponent
+                  data={calibrationHierarchy}
+                  onRefresh={refreshCalibrationHierarchy}
+                  onBlink={handleBlink}
+                  onBlinkSelected={handleBlink}
+                  onSplit={handleOpenSplitDialog}
+                  onCreateCustomSet={handleOpenCreateDialog}
+                />
+              </div>
+            </div>
           ) : (
             <LightsAnalysisView
               hierarchy={calibrationHierarchy}

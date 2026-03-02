@@ -43,31 +43,48 @@ function formatDateTime(dateStr: string | null): string {
   }
 }
 
+function formatTotalExposure(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(0)}s`;
+  if (seconds < 3600) return `${(seconds / 60).toFixed(1)}m`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
 function SortableHeader({
   field,
   label,
   currentSort,
   currentDirection,
   onSort,
+  avg,
+  align = 'center',
 }: {
   field: SortField;
   label: string;
   currentSort: SortField | null;
   currentDirection: SortDirection;
   onSort: (field: SortField) => void;
+  avg?: string;
+  align?: 'left' | 'center';
 }) {
   const isActive = currentSort === field;
 
   return (
     <button
       onClick={() => onSort(field)}
-      className="flex items-center gap-1 text-xs font-semibold text-content-secondary hover:text-content transition-colors"
+      className={`flex flex-col gap-0.5 w-full text-xs font-semibold text-content-secondary hover:text-content transition-colors ${align === 'left' ? 'items-start' : 'items-center'}`}
     >
-      {label}
-      {isActive && (
-        <span className="text-accent">
-          {currentDirection === 'asc' ? '↑' : '↓'}
-        </span>
+      <span className="flex items-center gap-1">
+        {label}
+        {isActive && (
+          <span className="text-accent">
+            {currentDirection === 'asc' ? '↑' : '↓'}
+          </span>
+        )}
+      </span>
+      {avg != null && (
+        <span className="text-xs font-normal text-accent">{avg}</span>
       )}
     </button>
   );
@@ -138,6 +155,38 @@ export function LightsAnalysisTable({
   const getAnalysis = useCallback((frameId: number): FrameAnalysis | undefined => {
     return analysisData?.get(frameId);
   }, [analysisData]);
+
+  const averages = useMemo(() => {
+    if (!analysisData || analysisData.size === 0) return null;
+
+    const analyzed = frames.filter(f => analysisData.has(f.frame_id));
+    if (analyzed.length === 0) return null;
+
+    const n = analyzed.length;
+    const sumA = (fn: (a: FrameAnalysis) => number) =>
+      analyzed.reduce((acc, f) => acc + fn(analysisData.get(f.frame_id)!), 0);
+
+    const framesWithExp = analyzed.filter(f => f.exptime != null);
+    const exptime = framesWithExp.reduce((acc, f) => acc + f.exptime!, 0);
+
+    const withScore = analyzed.filter(f => analysisData.get(f.frame_id)!.quality_score != null);
+
+    return {
+      count: n,
+      exptime,
+      stars: sumA(a => a.stars_detected) / n,
+      fwhm: sumA(a => a.median_fwhm) / n,
+      eccentricity: sumA(a => a.median_eccentricity) / n,
+      median_snr: sumA(a => a.median_snr) / n,
+      snr_db: sumA(a => a.snr_db) / n,
+      psf_signal: sumA(a => a.psf_signal) / n,
+      snr_weight: sumA(a => a.snr_weight) / n,
+      trail: sumA(a => a.trail_r_squared) / n,
+      score: withScore.length > 0
+        ? withScore.reduce((acc, f) => acc + (analysisData.get(f.frame_id)!.quality_score ?? 0), 0) / withScore.length
+        : null,
+    };
+  }, [frames, analysisData]);
 
   const sortedFrames = useMemo(() => {
     if (!sortField) return frames;
@@ -211,43 +260,43 @@ export function LightsAnalysisTable({
               />
             </th>
             <th scope="col" className="px-3 py-2.5 text-left">
-              <SortableHeader field="date" label="Date/Time" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="date" label="Date/Time" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} align="left" />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-left">
+            <th scope="col" className="px-3 py-2.5 text-center">
               <SortableHeader field="camera" label="Camera" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-left">
+            <th scope="col" className="px-3 py-2.5 text-center">
               <SortableHeader field="filter" label="Filter" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="exptime" label="Exposure" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="exptime" label="Exposure" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? formatTotalExposure(averages.exptime) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="stars" label="Stars" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="stars" label="Stars" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.stars.toFixed(0) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.fwhm.toFixed(2) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="eccentricity" label="Eccentricity" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="eccentricity" label="Eccentricity" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.eccentricity.toFixed(3) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.median_snr.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="snr_db" label="SNR (dB)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="snr_db" label="SNR (dB)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_db.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.psf_signal.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="snr_weight" label="SNR Weight" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="snr_weight" label="SNR Weight" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_weight.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="trail" label="Trail R²" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="trail" label="Trail R²" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.trail.toFixed(3) : undefined} />
             </th>
             <th scope="col" className="px-3 py-2.5 text-center">
-              <SortableHeader field="score" label="Score" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+              <SortableHeader field="score" label="Score" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.score != null ? `${(averages.score * 100).toFixed(0)}%` : undefined} />
             </th>
             <th scope="col" className="w-20 px-2 py-2.5 text-center text-xs font-semibold text-content-secondary">
               Actions
@@ -281,10 +330,10 @@ export function LightsAnalysisTable({
                 <td className={`px-3 py-2 text-sm font-mono text-content-secondary ${isBlackholed ? 'line-through' : ''}`}>
                   {formatDateTime(frame.date_obs)}
                 </td>
-                <td className={`px-3 py-2 text-sm text-content-secondary ${isBlackholed ? 'line-through' : ''}`}>
+                <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.camera}
                 </td>
-                <td className={`px-3 py-2 text-sm text-content-secondary ${isBlackholed ? 'line-through' : ''}`}>
+                <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.filter ?? '-'}
                 </td>
                 <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
