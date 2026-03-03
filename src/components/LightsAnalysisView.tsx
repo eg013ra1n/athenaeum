@@ -7,85 +7,16 @@ import type {
   AnalyzeFrameSetResult,
   AnalysisProgressEvent,
 } from '../types/models';
-import { CameraFilterTree, CameraFilterNode } from './calibration/CameraFilterTree';
-import { LightsAnalysisTable, EnrichedLightFrame } from './calibration/LightsAnalysisTable';
+import { CameraFilterTree } from './calibration/CameraFilterTree';
+import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/LightsAnalysisTable';
 import { RejectionThresholdBar, RejectionThresholds } from './calibration/RejectionThresholdBar';
+import { buildCameraFilterTree } from './calibration/utils';
 
 interface LightsAnalysisViewProps {
   hierarchy: CalibrationHierarchyViewData;
   frameSetId: number;
   onRefresh?: () => void;
   onBlink?: (frameIds: number[]) => void;
-}
-
-interface CameraFilterData {
-  nodes: CameraFilterNode[];
-  framesByKey: Map<string, EnrichedLightFrame[]>;
-  allFrames: EnrichedLightFrame[];
-}
-
-function buildCameraFilterTree(hierarchy: CalibrationHierarchyViewData): CameraFilterData {
-  const cameraMap = new Map<string, Map<string, { label: string; frames: EnrichedLightFrame[] }>>();
-  const allFrames: EnrichedLightFrame[] = [];
-
-  for (const dateGroup of hierarchy.date_groups) {
-    for (const cameraGroup of dateGroup.camera_groups) {
-      const camera = cameraGroup.instrume;
-
-      if (!cameraMap.has(camera)) {
-        cameraMap.set(camera, new Map());
-      }
-      const filterMap = cameraMap.get(camera)!;
-
-      for (const filterGroup of cameraGroup.filter_groups) {
-        const filterName = filterGroup.filter ?? 'No Filter';
-        const exptime = filterGroup.exptime;
-        const key = `${camera}::${filterName}::${exptime ?? 'any'}`;
-        const label = exptime != null ? `${filterName} (${exptime}s)` : filterName;
-
-        if (!filterMap.has(key)) {
-          filterMap.set(key, { label, frames: [] });
-        }
-
-        const enriched: EnrichedLightFrame[] = filterGroup.light_frames.map(f => ({
-          ...f,
-          camera,
-          filter: filterGroup.filter,
-        }));
-
-        filterMap.get(key)!.frames.push(...enriched);
-        allFrames.push(...enriched);
-      }
-    }
-  }
-
-  const nodes: CameraFilterNode[] = [];
-  const framesByKey = new Map<string, EnrichedLightFrame[]>();
-
-  for (const [camera, filterMap] of cameraMap) {
-    const filters: CameraFilterNode['filters'] = [];
-
-    for (const [key, data] of filterMap) {
-      filters.push({
-        key,
-        label: data.label,
-        frameCount: data.frames.length,
-      });
-      framesByKey.set(key, data.frames);
-    }
-
-    filters.sort((a, b) => a.label.localeCompare(b.label));
-
-    nodes.push({
-      camera,
-      totalFrameCount: filters.reduce((sum, f) => sum + f.frameCount, 0),
-      filters,
-    });
-  }
-
-  nodes.sort((a, b) => a.camera.localeCompare(b.camera));
-
-  return { nodes, framesByKey, allFrames };
 }
 
 export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }: LightsAnalysisViewProps) {

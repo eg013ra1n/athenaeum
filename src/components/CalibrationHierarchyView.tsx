@@ -1,151 +1,61 @@
-import { useState, useMemo, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import { api } from '../api';
-import { Scissors, Plus, Play } from 'lucide-react';
+import { Scissors, Plus, Play, Settings } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
-  CalibrationFilterGroup,
-  LightFrameWithCalibration,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
-import {
-  NavigationTree,
-  DetailPanel,
-  SelectedItem,
-  AggregatedWarning,
-} from './calibration';
+import { CameraFilterTree } from './calibration/CameraFilterTree';
+import { CalibrationLightsTable } from './calibration/CalibrationLightsTable';
+import { CalibrationCardView } from './calibration/CalibrationCardView';
+import { CalibrationGroupModal } from './calibration/CalibrationGroupModal';
+import type { FlatGroupData, DarkOnlyGroupData } from './calibration/CalibrationGroupCard';
+import type { EnrichedLightFrame } from './calibration/LightsAnalysisTable';
+import { buildCameraFilterTree } from './calibration/utils';
 
 interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
   useBiasForDarkOptimization?: boolean;
   onRefresh?: () => void;
-  /** Callback when Blink button is clicked with frame IDs */
   onBlink?: (frameIds: number[]) => void;
-  /** Callback when "Blink Selected" is clicked in the action bar with frame IDs from checked filter groups */
   onBlinkSelected?: (frameIds: number[]) => void;
-  /** Callback to open split dialog with selected filter keys */
   onSplit?: (selectedFilterKeys: Set<string>) => void;
-  /** Callback to open create custom set dialog with selected filter keys */
   onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
 }
 
-/**
- * Build a unique filter key that includes exptime to differentiate same filter with different exposures.
- */
-function buildFilterKey(filterGroup: CalibrationFilterGroup): string {
-  const baseFilter = filterGroup.filter ?? '__no_filter__';
-  return filterGroup.exptime !== null
-    ? `${baseFilter}:${filterGroup.exptime}`
-    : baseFilter;
+interface ModalState {
+  type: 'flat' | 'dark';
+  data: FlatGroupData | DarkOnlyGroupData;
 }
 
-/**
- * Collect warnings from a filter group.
- */
-function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup): AggregatedWarning[] {
-  const warnings: AggregatedWarning[] = [];
-
-  // Only Flat and Dark matter for lights - Bias is linked to Dark, not directly to lights
-  const hasFlats = filterGroup.flat_sets.length > 0;
-  const hasDarks = filterGroup.dark_sets.length > 0;
-  const pluralSuffix = filterGroup.frame_count !== 1 ? 's' : '';
-
-  if (!hasFlats && !hasDarks) {
-    warnings.push({
-      message: `No calibration linked (${filterGroup.frame_count} frame${pluralSuffix})`,
-      type: 'missing_calibration',
-      filter: filterGroup.filter ?? undefined,
-    });
-  } else {
-    if (!hasFlats) {
-      warnings.push({
-        message: `Missing Flat calibration (${filterGroup.frame_count} frame${pluralSuffix})`,
-        type: 'missing_calibration',
-        filter: filterGroup.filter ?? undefined,
-      });
-    }
-    if (!hasDarks) {
-      warnings.push({
-        message: `Missing Dark calibration (${filterGroup.frame_count} frame${pluralSuffix})`,
-        type: 'missing_calibration',
-        filter: filterGroup.filter ?? undefined,
-      });
-    }
-  }
-
-  const addSetWarnings = (sets: typeof filterGroup.flat_sets, setType: string) => {
-    for (const setWithCount of sets) {
-      for (const warning of setWithCount.warnings) {
-        warnings.push({
-          message: `${setType}: ${warning.message}`,
-          type: warning.warning_type as 'date' | 'temperature',
-          filter: filterGroup.filter ?? undefined,
-        });
-      }
-    }
-  };
-
-  addSetWarnings(filterGroup.flat_sets, 'Flat');
-  addSetWarnings(filterGroup.dark_sets, 'Dark');
-
-  return warnings;
-}
-
-/**
- * CalibrationHierarchyView with accessible master-detail layout.
- *
- * Features:
- * - Two-panel layout: navigation tree on left, detail panel on right
- * - Improved text contrast (minimum WCAG AA)
- * - Larger fonts (14px minimum for body text)
- * - 44px minimum touch targets
- * - Clear visual hierarchy
- */
 export function CalibrationHierarchyView({
   data,
   useBiasForDarkOptimization = false,
   onRefresh,
-  onBlink,
+  onBlink: _onBlink,
   onBlinkSelected,
   onSplit,
   onCreateCustomSet,
 }: CalibrationHierarchyViewProps) {
-  // Selection state for master-detail navigation
-  const [selectedItem, setSelectedItem] = useState<SelectedItem | null>(null);
+  // onBlink is aliased to _onBlink — in the new design, onBlinkSelected handles all blink actions.
+  // The prop is kept for interface compatibility with FrameSetDetail which passes it.
+  void _onBlink;
+  const isPreCalibration = data.calibrated_frames === 0;
 
-  // Sync selectedItem with refreshed data to get updated calibration status
-  useEffect(() => {
-    if (!selectedItem || selectedItem.type !== 'filter') return;
+  // Build camera→filter tree from hierarchy data
+  const { nodes, framesByKey, allFrames } = useMemo(
+    () => buildCameraFilterTree(data),
+    [data]
+  );
 
-    const oldFilterGroup = selectedItem.data as CalibrationFilterGroup;
-    const oldFilterKey = buildFilterKey(oldFilterGroup);
+  // CameraFilterTree checkbox state (for filtering)
+  const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
 
-    // Find the corresponding filter group in the new data
-    for (const dateGroup of data.date_groups) {
-      if (dateGroup.date !== selectedItem.dateKey) continue;
+  // Pre-cal: table row selection
+  const [selectedFrameIds, setSelectedFrameIds] = useState<Set<number>>(new Set());
 
-      for (const cameraGroup of dateGroup.camera_groups) {
-        if (cameraGroup.instrume !== selectedItem.cameraKey) continue;
-
-        for (const filterGroup of cameraGroup.filter_groups) {
-          const filterKey = buildFilterKey(filterGroup);
-          if (filterKey === oldFilterKey) {
-            // Update selectedItem with fresh data
-            setSelectedItem({
-              type: 'filter',
-              dateKey: dateGroup.date,
-              cameraKey: cameraGroup.instrume,
-              filterKey,
-              data: filterGroup,
-            });
-            return;
-          }
-        }
-      }
-    }
-  }, [data]);
-
-  // Checkbox selection state for filter groups (format: "dateKey:cameraKey:filterKey")
-  const [checkedFilters, setCheckedFilters] = useState<Set<string>>(new Set());
+  // Post-cal: group modal state
+  const [modalData, setModalData] = useState<ModalState | null>(null);
 
   // Manual calibration modal state
   const [manualModalOpen, setManualModalOpen] = useState(false);
@@ -155,112 +65,80 @@ export function CalibrationHierarchyView({
   const [manualModalCurrentDark, setManualModalCurrentDark] = useState<number | null>(null);
   const [manualModalCurrentBias, setManualModalCurrentBias] = useState<number | null>(null);
 
-  // Build warning counts map for navigation tree badges
-  const warningCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-
-    for (const dateGroup of data.date_groups) {
-      const dateKey = dateGroup.date;
-      let dateWarnings = 0;
-
-      for (const cameraGroup of dateGroup.camera_groups) {
-        const cameraKey = `${dateKey}:${cameraGroup.instrume}`;
-        let cameraWarnings = 0;
-
-        for (const filterGroup of cameraGroup.filter_groups) {
-          const filterKey = buildFilterKey(filterGroup);
-          const fullKey = `${dateKey}:${cameraGroup.instrume}:${filterKey}`;
-          const filterWarnings = collectFilterGroupWarnings(filterGroup).length;
-
-          counts.set(fullKey, filterWarnings);
-          cameraWarnings += filterWarnings;
-        }
-
-        counts.set(cameraKey, cameraWarnings);
-        dateWarnings += cameraWarnings;
-      }
-
-      counts.set(dateKey, dateWarnings);
+  // Frames shown in the table: filtered by checked tree items, or all if nothing checked
+  const displayedFrames = useMemo(() => {
+    if (checkedKeys.size === 0) return allFrames;
+    const frames: EnrichedLightFrame[] = [];
+    for (const key of checkedKeys) {
+      const keyFrames = framesByKey.get(key);
+      if (keyFrames) frames.push(...keyFrames);
     }
+    return frames;
+  }, [checkedKeys, allFrames, framesByKey]);
 
-    return counts;
-  }, [data]);
+  // Visible frame IDs for card view filtering
+  const visibleFrameIds = useMemo(() => {
+    if (checkedKeys.size === 0) return undefined;
+    return new Set(displayedFrames.map(f => f.frame_id));
+  }, [checkedKeys, displayedFrames]);
 
-  // Count total selected frames across all checked filter groups
-  const selectedFrameCount = useMemo(() => {
-    let count = 0;
-    for (const dateGroup of data.date_groups) {
-      for (const cameraGroup of dateGroup.camera_groups) {
-        for (const filterGroup of cameraGroup.filter_groups) {
-          const filterKey = buildFilterKey(filterGroup);
-          const fullKey = `${dateGroup.date}:${cameraGroup.instrume}:${filterKey}`;
-          if (checkedFilters.has(fullKey)) {
-            count += filterGroup.light_frames.length;
-          }
-        }
-      }
-    }
-    return count;
-  }, [data, checkedFilters]);
+  // Count of selected/checked frames for action bar
+  const checkedFrameCount = useMemo(() => {
+    if (checkedKeys.size === 0) return 0;
+    return displayedFrames.length;
+  }, [checkedKeys, displayedFrames]);
 
-  // Handle blink from DetailPanel - passes frame IDs to parent
-  const handleBlink = useCallback((frames: LightFrameWithCalibration[]) => {
-    if (onBlink) {
-      const frameIds = frames.map(f => f.frame_id);
-      onBlink(frameIds);
-    }
-  }, [onBlink]);
+  // Clear table selection when tree filter changes
+  const handleCheckedChange = useCallback((keys: Set<string>) => {
+    setCheckedKeys(keys);
+    setSelectedFrameIds(new Set());
+  }, []);
 
-  // Handle split button click
-  const handleSplit = useCallback(() => {
-    if (onSplit && checkedFilters.size > 0) {
-      onSplit(checkedFilters);
-    }
-  }, [onSplit, checkedFilters]);
-
-  // Handle create custom set button click
-  const handleCreateCustomSet = useCallback(() => {
-    if (onCreateCustomSet && checkedFilters.size > 0) {
-      onCreateCustomSet(checkedFilters);
-    }
-  }, [onCreateCustomSet, checkedFilters]);
-
-  // Handle blink selected button click - collect frame IDs from checked filter groups
+  // Blink selected frames (pre-cal table selection)
   const handleBlinkSelected = useCallback(() => {
-    if (!onBlinkSelected || checkedFilters.size === 0) return;
+    if (!onBlinkSelected) return;
 
-    const frameIds: number[] = [];
-    for (const dateGroup of data.date_groups) {
-      for (const cameraGroup of dateGroup.camera_groups) {
-        for (const filterGroup of cameraGroup.filter_groups) {
-          const filterKey = buildFilterKey(filterGroup);
-          const fullKey = `${dateGroup.date}:${cameraGroup.instrume}:${filterKey}`;
-          if (checkedFilters.has(fullKey)) {
-            frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
-          }
-        }
-      }
+    if (selectedFrameIds.size > 0) {
+      onBlinkSelected([...selectedFrameIds]);
+    } else if (checkedKeys.size > 0) {
+      onBlinkSelected(displayedFrames.map(f => f.frame_id));
     }
+  }, [onBlinkSelected, selectedFrameIds, checkedKeys, displayedFrames]);
 
-    if (frameIds.length > 0) {
-      onBlinkSelected(frameIds);
+  // Split with checked filter keys
+  const handleSplit = useCallback(() => {
+    if (onSplit && checkedKeys.size > 0) {
+      onSplit(checkedKeys);
     }
-  }, [onBlinkSelected, checkedFilters, data]);
+  }, [onSplit, checkedKeys]);
 
-  // Open manual calibration modal for a filter group
-  const openManualCalibrationModal = useCallback((filterGroup: CalibrationFilterGroup) => {
-    const frameIds = filterGroup.light_frames.map((f) => f.frame_id);
-    const currentFlat = filterGroup.flat_sets.length > 0 ? filterGroup.flat_sets[0].set.id ?? null : null;
-    const currentDark = filterGroup.dark_sets.length > 0 ? filterGroup.dark_sets[0].set.id ?? null : null;
-    const currentBias = filterGroup.bias_sets.length > 0 ? filterGroup.bias_sets[0].set.id ?? null : null;
+  // Create custom set with checked filter keys
+  const handleCreateCustomSet = useCallback(() => {
+    if (onCreateCustomSet && checkedKeys.size > 0) {
+      onCreateCustomSet(checkedKeys);
+    }
+  }, [onCreateCustomSet, checkedKeys]);
 
+  // Open card group detail modal
+  const handleOpenGroup = useCallback((type: 'flat' | 'dark', groupData: FlatGroupData | DarkOnlyGroupData) => {
+    setModalData({ type, data: groupData });
+  }, []);
+
+  // Open manual calibration modal for specific frame IDs
+  const openManualCalibrationForFrameIds = useCallback((frameIds: number[]) => {
     setManualModalFrameIds(frameIds);
-    setManualModalFilterDisplay(filterGroup.filter_display);
-    setManualModalCurrentFlat(currentFlat);
-    setManualModalCurrentDark(currentDark);
-    setManualModalCurrentBias(currentBias);
+    setManualModalFilterDisplay('Selected frames');
+    setManualModalCurrentFlat(null);
+    setManualModalCurrentDark(null);
+    setManualModalCurrentBias(null);
     setManualModalOpen(true);
   }, []);
+
+  // Open manual calibration modal for pre-cal selected frames
+  const handleManualCalibrationPreCal = useCallback(() => {
+    if (selectedFrameIds.size === 0) return;
+    openManualCalibrationForFrameIds([...selectedFrameIds]);
+  }, [selectedFrameIds, openManualCalibrationForFrameIds]);
 
   // Handle manual calibration apply
   const handleManualCalibrationApply = useCallback(
@@ -303,30 +181,43 @@ export function CalibrationHierarchyView({
     [manualModalFrameIds, manualModalCurrentFlat, manualModalCurrentDark, manualModalCurrentBias, onRefresh]
   );
 
+  // Determine action bar visibility and counts
+  const showPreCalActionBar = isPreCalibration && selectedFrameIds.size > 0;
+  const showFilterActionBar = !isPreCalibration && checkedKeys.size > 0 && (onBlinkSelected || onSplit || onCreateCustomSet);
+
   return (
     <div className="flex flex-col h-full">
-      {/* Main Content - Master-Detail Layout */}
+      {/* Main Content */}
       {data.date_groups.length > 0 ? (
         <div className="flex flex-1 min-h-0 gap-4">
-          {/* Navigation Tree - Left Panel */}
-          <NavigationTree
-            data={data}
-            selectedItem={selectedItem}
-            onSelect={setSelectedItem}
-            warningCounts={warningCounts}
+          {/* Left Panel — CameraFilterTree */}
+          <CameraFilterTree
+            nodes={nodes}
+            checkedKeys={checkedKeys}
+            onCheckedChange={handleCheckedChange}
             className="w-80 flex-shrink-0"
-            checkedFilters={checkedFilters}
-            onCheckedChange={setCheckedFilters}
           />
 
-          {/* Detail Panel - Right Panel */}
-          <DetailPanel
-            selectedItem={selectedItem}
-            onManualCalibration={openManualCalibrationModal}
-            onBlink={onBlink ? handleBlink : undefined}
-            onRefresh={onRefresh}
-            className="flex-1"
-          />
+          {/* Right Panel */}
+          {isPreCalibration ? (
+            /* Pre-calibration: flat sortable table */
+            <div className="flex-1 min-w-0 overflow-y-auto border border-border rounded-xl">
+              <CalibrationLightsTable
+                frames={displayedFrames}
+                selectedFrameIds={selectedFrameIds}
+                onSelectionChange={setSelectedFrameIds}
+              />
+            </div>
+          ) : (
+            /* Post-calibration: card view */
+            <CalibrationCardView
+              data={data}
+              allFrames={allFrames}
+              visibleFrameIds={visibleFrameIds}
+              onOpenGroup={handleOpenGroup}
+              onManualCalibration={openManualCalibrationForFrameIds}
+            />
+          )}
         </div>
       ) : (
         /* Empty State */
@@ -337,28 +228,60 @@ export function CalibrationHierarchyView({
         </div>
       )}
 
-      {/* Bottom Action Bar - visible when in selection mode with items selected */}
-      {checkedFilters.size > 0 && (onBlinkSelected || onSplit || onCreateCustomSet) && (
+      {/* Pre-cal action bar: when table rows are selected */}
+      {showPreCalActionBar && (
         <div className="mt-3 bg-surface-elevated/80 rounded-lg p-3 border border-border/50">
           <div className="flex items-center justify-between">
-            {/* Left side: Action buttons */}
+            <div className="flex items-center gap-2">
+              {onBlinkSelected && (
+                <>
+                  <button
+                    onClick={() => onBlinkSelected([...selectedFrameIds])}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-cyan-600 hover:bg-cyan-700 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500"
+                  >
+                    <Play size={14} aria-hidden="true" />
+                    Blink ({selectedFrameIds.size})
+                  </button>
+                  <span className="text-content-muted">|</span>
+                </>
+              )}
+              <button
+                onClick={handleManualCalibrationPreCal}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+              >
+                <Settings size={14} aria-hidden="true" />
+                Assign Calibration
+              </button>
+            </div>
+            <div className="flex items-center gap-3">
+              <div className="text-sm text-content-secondary">
+                <span className="font-medium text-content">{selectedFrameIds.size}</span>{' '}
+                frame{selectedFrameIds.size !== 1 ? 's' : ''}
+              </div>
+              <button
+                onClick={() => setSelectedFrameIds(new Set())}
+                className="px-3 py-1.5 text-content-muted hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Post-cal action bar: when CameraFilterTree groups are checked */}
+      {showFilterActionBar && (
+        <div className="mt-3 bg-surface-elevated/80 rounded-lg p-3 border border-border/50">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               {onBlinkSelected && (
                 <>
                   <button
                     onClick={handleBlinkSelected}
-                    className="
-                      inline-flex items-center gap-1.5
-                      px-3 py-1.5
-                      bg-cyan-600 hover:bg-cyan-700
-                      text-white text-sm
-                      rounded
-                      transition-colors
-                      focus:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500
-                    "
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-cyan-600 hover:bg-cyan-700 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500"
                   >
                     <Play size={14} aria-hidden="true" />
-                    Blink Selected ({selectedFrameCount})
+                    Blink Selected ({checkedFrameCount})
                   </button>
                   {(onSplit || onCreateCustomSet) && (
                     <span className="text-content-muted">|</span>
@@ -368,15 +291,7 @@ export function CalibrationHierarchyView({
               {onSplit && (
                 <button
                   onClick={handleSplit}
-                  className="
-                    inline-flex items-center gap-1.5
-                    px-3 py-1.5
-                    bg-accent hover:bg-accent-hover
-                    text-white text-sm
-                    rounded
-                    transition-colors
-                    focus:outline-none focus-visible:ring-1 focus-visible:ring-accent
-                  "
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
                 >
                   <Scissors size={14} aria-hidden="true" />
                   Split
@@ -385,46 +300,45 @@ export function CalibrationHierarchyView({
               {onCreateCustomSet && (
                 <button
                   onClick={handleCreateCustomSet}
-                  className="
-                    inline-flex items-center gap-1.5
-                    px-3 py-1.5
-                    bg-success hover:brightness-90
-                    text-white text-sm
-                    rounded
-                    transition-colors
-                    focus:outline-none focus-visible:ring-1 focus-visible:ring-success
-                  "
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-success hover:brightness-90 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-success"
                 >
                   <Plus size={14} aria-hidden="true" />
                   Create Set
                 </button>
               )}
             </div>
-            {/* Right side: Selection info and Cancel */}
             <div className="flex items-center gap-3">
               <div className="text-sm text-content-secondary">
-                <span className="font-medium text-content">{checkedFilters.size}</span>{' '}
-                group{checkedFilters.size !== 1 ? 's' : ''}
+                <span className="font-medium text-content">{checkedKeys.size}</span>{' '}
+                group{checkedKeys.size !== 1 ? 's' : ''}
                 <span className="text-content-muted ml-1">
-                  ({selectedFrameCount} frame{selectedFrameCount !== 1 ? 's' : ''})
+                  ({checkedFrameCount} frame{checkedFrameCount !== 1 ? 's' : ''})
                 </span>
               </div>
               <button
-                onClick={() => setCheckedFilters(new Set())}
-                className="
-                  px-3 py-1.5
-                  text-content-muted hover:text-content
-                  text-sm
-                  rounded
-                  transition-colors
-                  focus:outline-none focus-visible:ring-1 focus-visible:ring-border
-                "
+                onClick={() => setCheckedKeys(new Set())}
+                className="px-3 py-1.5 text-content-muted hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
               >
                 Clear
               </button>
             </div>
           </div>
         </div>
+      )}
+
+      {/* Calibration Group Modal */}
+      {modalData && (
+        <CalibrationGroupModal
+          type={modalData.type}
+          data={modalData.data}
+          allLightFrames={allFrames}
+          onClose={() => setModalData(null)}
+          onRefresh={() => {
+            setModalData(null);
+            onRefresh?.();
+          }}
+          onManualCalibration={openManualCalibrationForFrameIds}
+        />
       )}
 
       {/* Manual Calibration Modal */}
