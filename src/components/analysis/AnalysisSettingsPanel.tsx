@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Save, RotateCw } from 'lucide-react';
 import { api } from '../../api';
 import type { AnalysisConfig, ScoringWeights } from '../../types/analysis-config';
+import { THRESHOLD_FIELDS, EMPTY_THRESHOLDS, type RejectionThresholds } from '../calibration/RejectionThresholdBar';
 
 export function AnalysisSettingsPanel() {
   const [config, setConfig] = useState<AnalysisConfig | null>(null);
@@ -9,6 +10,7 @@ export function AnalysisSettingsPanel() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rejectionDefaults, setRejectionDefaults] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
 
   useEffect(() => {
     loadConfig();
@@ -19,6 +21,14 @@ export function AnalysisSettingsPanel() {
       setLoading(true);
       const result = await api.invoke<AnalysisConfig>('get_analysis_config');
       setConfig(result);
+      // Load rejection defaults
+      const json = await api.invoke<string>('get_setting', {
+        key: 'analysis.rejection_defaults',
+        defaultValue: '',
+      });
+      if (json) {
+        setRejectionDefaults({ ...EMPTY_THRESHOLDS, ...JSON.parse(json) });
+      }
     } catch (err) {
       setError(String(err));
       console.error('Failed to load analysis config:', err);
@@ -33,6 +43,21 @@ export function AnalysisSettingsPanel() {
       setSaving(true);
       setError(null);
       await api.invoke('set_analysis_config', { config });
+      // Save rejection defaults
+      const hasAny = Object.values(rejectionDefaults).some(v => v !== '');
+      if (hasAny) {
+        // Only persist non-empty values
+        const toSave: Partial<RejectionThresholds> = {};
+        for (const [k, v] of Object.entries(rejectionDefaults)) {
+          if (v !== '') toSave[k as keyof RejectionThresholds] = v;
+        }
+        await api.invoke('set_setting', {
+          key: 'analysis.rejection_defaults',
+          value: JSON.stringify(toSave),
+        });
+      } else {
+        await api.invoke('delete_setting', { key: 'analysis.rejection_defaults' });
+      }
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch (err) {
@@ -41,13 +66,15 @@ export function AnalysisSettingsPanel() {
     } finally {
       setSaving(false);
     }
-  }, [config]);
+  }, [config, rejectionDefaults]);
 
   const handleReset = useCallback(async () => {
     try {
       setError(null);
       const result = await api.invoke<AnalysisConfig>('reset_analysis_config');
       setConfig(result);
+      setRejectionDefaults(EMPTY_THRESHOLDS);
+      await api.invoke('delete_setting', { key: 'analysis.rejection_defaults' });
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch (err) {
@@ -239,6 +266,40 @@ export function AnalysisSettingsPanel() {
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Default Rejection Thresholds */}
+      <div>
+        <h4 className="text-sm font-semibold text-content mb-1">Default Rejection Thresholds</h4>
+        <p className="text-xs text-content-muted mb-3">
+          Pre-fill the threshold bar on the Analysis tab. Leave a field empty to not set a default for it.
+        </p>
+        <div className="grid grid-cols-3 gap-3">
+          {THRESHOLD_FIELDS.map(field => (
+            <div key={field.key}>
+              <label className="block text-xs text-content-secondary mb-1">{field.label}</label>
+              <input
+                type="number"
+                step={field.step}
+                min={field.min}
+                max={field.max}
+                value={rejectionDefaults[field.key]}
+                onChange={e => setRejectionDefaults(prev => ({ ...prev, [field.key]: e.target.value }))}
+                placeholder={field.placeholder}
+                className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+              />
+            </div>
+          ))}
+        </div>
+        {Object.values(rejectionDefaults).some(v => v !== '') && (
+          <button
+            type="button"
+            onClick={() => setRejectionDefaults(EMPTY_THRESHOLDS)}
+            className="mt-2 text-xs text-content-muted hover:text-content-secondary transition-colors"
+          >
+            Clear all defaults
+          </button>
+        )}
       </div>
 
       {/* Actions */}

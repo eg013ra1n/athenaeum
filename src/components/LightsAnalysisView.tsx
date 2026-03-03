@@ -9,7 +9,7 @@ import type {
 } from '../types/models';
 import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/LightsAnalysisTable';
-import { RejectionThresholdBar, RejectionThresholds } from './calibration/RejectionThresholdBar';
+import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildMergedCameraFilterTree } from './calibration/utils';
 import { AnalysisChartsModal } from './analysis/AnalysisChartsModal';
 
@@ -28,17 +28,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   const [selectedFrameIds, setSelectedFrameIds] = useState<Set<number>>(new Set());
   const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
   const [blackholing, setBlackholing] = useState(false);
-  const [thresholds, setThresholds] = useState<RejectionThresholds>({
-    fwhm: '',
-    eccentricity: '',
-    median_snr: '',
-    snr_db: '',
-    psf_signal: '',
-    snr_weight: '',
-    trail: '',
-    stars: '',
-    score: '',
-  });
+  const [thresholds, setThresholds] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
+  const [defaultThresholds, setDefaultThresholds] = useState<RejectionThresholds | null>(null);
 
   // Analysis state
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
@@ -57,6 +48,26 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   useEffect(() => {
     loadAnalysisData();
   }, [frameSetId]);
+
+  // Load saved rejection defaults on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const json = await api.invoke<string>('get_setting', {
+          key: 'analysis.rejection_defaults',
+          defaultValue: '',
+        });
+        if (json) {
+          const saved = JSON.parse(json) as RejectionThresholds;
+          const merged = { ...EMPTY_THRESHOLDS, ...saved };
+          setDefaultThresholds(merged);
+          setThresholds(merged);
+        }
+      } catch (err) {
+        console.error('Failed to load rejection defaults:', err);
+      }
+    })();
+  }, []);
 
   const loadAnalysisData = useCallback(async () => {
     try {
@@ -103,6 +114,14 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
       setAnalysisProgress(null);
     }
   }, [frameSetId, loadAnalysisData]);
+
+  const handleClearThresholds = useCallback(() => {
+    setThresholds(EMPTY_THRESHOLDS);
+  }, []);
+
+  const handleLoadDefaults = useCallback(() => {
+    if (defaultThresholds) setThresholds(defaultThresholds);
+  }, [defaultThresholds]);
 
   // Frames shown in the table: filtered by checked tree items, or all if nothing checked
   const displayedFrames = useMemo(() => {
@@ -376,6 +395,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
           <RejectionThresholdBar
             thresholds={thresholds}
             onChange={setThresholds}
+            onClear={handleClearThresholds}
+            onLoadDefaults={handleLoadDefaults}
+            hasDefaults={defaultThresholds !== null}
           />
 
           <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
