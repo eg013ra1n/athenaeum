@@ -22,6 +22,18 @@ export interface CameraFilterData {
   allFrames: EnrichedLightFrame[];
 }
 
+export interface MergedCameraFilterNode {
+  camera: string;
+  totalFrameCount: number;
+  filters: { key: string; label: string; frameCount: number }[];
+}
+
+export interface MergedCameraFilterData {
+  nodes: MergedCameraFilterNode[];
+  framesByKey: Map<string, EnrichedLightFrame[]>;
+  allFrames: EnrichedLightFrame[];
+}
+
 /**
  * Build a unique filter key that includes exptime to differentiate same filter with different exposures.
  */
@@ -142,6 +154,69 @@ export function buildCameraFilterTree(hierarchy: CalibrationHierarchyView): Came
 
   // Sort dates chronologically (newest first)
   nodes.sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+
+  return { nodes, framesByKey, allFrames };
+}
+
+/**
+ * Build a 2-level camera→filter tree merged across all dates.
+ * Used by the Analysis tab where date grouping is not needed.
+ */
+export function buildMergedCameraFilterTree(hierarchy: CalibrationHierarchyView): MergedCameraFilterData {
+  const cameraMap = new Map<string, Map<string, { label: string; frames: EnrichedLightFrame[] }>>();
+  const framesByKey = new Map<string, EnrichedLightFrame[]>();
+  const allFrames: EnrichedLightFrame[] = [];
+
+  for (const dateGroup of hierarchy.date_groups) {
+    for (const cameraGroup of dateGroup.camera_groups) {
+      const camera = cameraGroup.instrume;
+
+      if (!cameraMap.has(camera)) {
+        cameraMap.set(camera, new Map());
+      }
+      const filterMap = cameraMap.get(camera)!;
+
+      for (const filterGroup of cameraGroup.filter_groups) {
+        const filterName = filterGroup.filter ?? 'No Filter';
+        const exptime = filterGroup.exptime;
+        const key = `${camera}::${filterName}::${exptime ?? 'any'}`;
+        const label = exptime != null ? `${filterName} (${exptime}s)` : filterName;
+
+        const enriched: EnrichedLightFrame[] = filterGroup.light_frames.map(f => ({
+          ...f,
+          camera,
+          filter: filterGroup.filter,
+        }));
+
+        if (!filterMap.has(key)) {
+          filterMap.set(key, { label, frames: [] });
+        }
+        filterMap.get(key)!.frames.push(...enriched);
+        allFrames.push(...enriched);
+      }
+    }
+  }
+
+  const nodes: MergedCameraFilterNode[] = [];
+
+  for (const [camera, filterMap] of cameraMap) {
+    const filters: MergedCameraFilterNode['filters'] = [];
+
+    for (const [key, { label, frames }] of filterMap) {
+      filters.push({ key, label, frameCount: frames.length });
+      framesByKey.set(key, frames);
+    }
+
+    filters.sort((a, b) => a.label.localeCompare(b.label));
+
+    nodes.push({
+      camera,
+      totalFrameCount: filters.reduce((sum, f) => sum + f.frameCount, 0),
+      filters,
+    });
+  }
+
+  nodes.sort((a, b) => a.camera.localeCompare(b.camera));
 
   return { nodes, framesByKey, allFrames };
 }

@@ -7,10 +7,10 @@ import type {
   AnalyzeFrameSetResult,
   AnalysisProgressEvent,
 } from '../types/models';
-import { CameraFilterTree } from './calibration/CameraFilterTree';
+import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/LightsAnalysisTable';
 import { RejectionThresholdBar, RejectionThresholds } from './calibration/RejectionThresholdBar';
-import { buildCameraFilterTree } from './calibration/utils';
+import { buildMergedCameraFilterTree } from './calibration/utils';
 import { AnalysisChartsModal } from './analysis/AnalysisChartsModal';
 
 interface LightsAnalysisViewProps {
@@ -49,7 +49,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   const [chartsOpen, setChartsOpen] = useState(false);
 
   const { nodes, framesByKey, allFrames } = useMemo(
-    () => buildCameraFilterTree(hierarchy),
+    () => buildMergedCameraFilterTree(hierarchy),
     [hierarchy]
   );
 
@@ -364,7 +364,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
       {/* Main Content — two-panel layout */}
       <div className="flex flex-1 min-h-0 gap-4">
         {/* Left panel — Navigation tree */}
-        <CameraFilterTree
+        <MergedCameraFilterTree
           nodes={nodes}
           checkedKeys={checkedKeys}
           onCheckedChange={handleCheckedChange}
