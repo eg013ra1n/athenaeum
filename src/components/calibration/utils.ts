@@ -3,11 +3,21 @@ import type {
   CalibrationFilterGroup,
 } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
-import type { CameraFilterNode } from './CameraFilterTree';
 import type { AggregatedWarning } from './WarningPanel';
 
+export interface DateCameraFilterNode {
+  dateKey: string;
+  dateDisplay: string;
+  totalFrameCount: number;
+  cameras: {
+    camera: string;
+    totalFrameCount: number;
+    filters: { key: string; label: string; frameCount: number }[];
+  }[];
+}
+
 export interface CameraFilterData {
-  nodes: CameraFilterNode[];
+  nodes: DateCameraFilterNode[];
   framesByKey: Map<string, EnrichedLightFrame[]>;
   allFrames: EnrichedLightFrame[];
 }
@@ -74,31 +84,26 @@ export function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup):
 }
 
 /**
- * Build a 2-level camera→filter tree from the calibration hierarchy data.
- * Merges across date groups so each camera+filter combination appears once.
+ * Build a 3-level date→camera→filter tree from the calibration hierarchy data.
+ * Each date group becomes a top-level node containing cameras and their filters.
  */
 export function buildCameraFilterTree(hierarchy: CalibrationHierarchyView): CameraFilterData {
-  const cameraMap = new Map<string, Map<string, { label: string; frames: EnrichedLightFrame[] }>>();
+  const nodes: DateCameraFilterNode[] = [];
+  const framesByKey = new Map<string, EnrichedLightFrame[]>();
   const allFrames: EnrichedLightFrame[] = [];
 
   for (const dateGroup of hierarchy.date_groups) {
+    const cameras: DateCameraFilterNode['cameras'] = [];
+
     for (const cameraGroup of dateGroup.camera_groups) {
       const camera = cameraGroup.instrume;
-
-      if (!cameraMap.has(camera)) {
-        cameraMap.set(camera, new Map());
-      }
-      const filterMap = cameraMap.get(camera)!;
+      const filters: DateCameraFilterNode['cameras'][0]['filters'] = [];
 
       for (const filterGroup of cameraGroup.filter_groups) {
         const filterName = filterGroup.filter ?? 'No Filter';
         const exptime = filterGroup.exptime;
-        const key = `${camera}::${filterName}::${exptime ?? 'any'}`;
+        const key = `${dateGroup.date}::${camera}::${filterName}::${exptime ?? 'any'}`;
         const label = exptime != null ? `${filterName} (${exptime}s)` : filterName;
-
-        if (!filterMap.has(key)) {
-          filterMap.set(key, { label, frames: [] });
-        }
 
         const enriched: EnrichedLightFrame[] = filterGroup.light_frames.map(f => ({
           ...f,
@@ -106,37 +111,37 @@ export function buildCameraFilterTree(hierarchy: CalibrationHierarchyView): Came
           filter: filterGroup.filter,
         }));
 
-        filterMap.get(key)!.frames.push(...enriched);
+        filters.push({
+          key,
+          label,
+          frameCount: enriched.length,
+        });
+
+        framesByKey.set(key, enriched);
         allFrames.push(...enriched);
       }
-    }
-  }
 
-  const nodes: CameraFilterNode[] = [];
-  const framesByKey = new Map<string, EnrichedLightFrame[]>();
+      filters.sort((a, b) => a.label.localeCompare(b.label));
 
-  for (const [camera, filterMap] of cameraMap) {
-    const filters: CameraFilterNode['filters'] = [];
-
-    for (const [key, data] of filterMap) {
-      filters.push({
-        key,
-        label: data.label,
-        frameCount: data.frames.length,
+      cameras.push({
+        camera,
+        totalFrameCount: filters.reduce((sum, f) => sum + f.frameCount, 0),
+        filters,
       });
-      framesByKey.set(key, data.frames);
     }
 
-    filters.sort((a, b) => a.label.localeCompare(b.label));
+    cameras.sort((a, b) => a.camera.localeCompare(b.camera));
 
     nodes.push({
-      camera,
-      totalFrameCount: filters.reduce((sum, f) => sum + f.frameCount, 0),
-      filters,
+      dateKey: dateGroup.date,
+      dateDisplay: dateGroup.date_display,
+      totalFrameCount: cameras.reduce((sum, c) => sum + c.totalFrameCount, 0),
+      cameras,
     });
   }
 
-  nodes.sort((a, b) => a.camera.localeCompare(b.camera));
+  // Sort dates chronologically (newest first)
+  nodes.sort((a, b) => b.dateKey.localeCompare(a.dateKey));
 
   return { nodes, framesByKey, allFrames };
 }

@@ -1,14 +1,9 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import { Camera, Aperture, ChevronDown, ChevronRight, ChevronsDownUp } from 'lucide-react';
-
-export interface CameraFilterNode {
-  camera: string;
-  totalFrameCount: number;
-  filters: { key: string; label: string; frameCount: number }[];
-}
+import { Calendar, Camera, Aperture, ChevronDown, ChevronRight, ChevronsDownUp } from 'lucide-react';
+import type { DateCameraFilterNode } from './utils';
 
 interface CameraFilterTreeProps {
-  nodes: CameraFilterNode[];
+  nodes: DateCameraFilterNode[];
   /** Checked filter keys (multi-select) */
   checkedKeys: Set<string>;
   onCheckedChange: (keys: Set<string>) => void;
@@ -55,23 +50,33 @@ function StyledCheckbox({
 }
 
 export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '' }: CameraFilterTreeProps) {
+  const [expandedDates, setExpandedDates] = useState<Set<string>>(
+    () => new Set(nodes.map(n => n.dateKey))
+  );
   const [expandedCameras, setExpandedCameras] = useState<Set<string>>(
-    () => new Set(nodes.map(n => n.camera))
+    () => new Set(nodes.flatMap(n => n.cameras.map(c => `${n.dateKey}::${c.camera}`)))
   );
 
   // Re-expand all when nodes change
   useEffect(() => {
-    setExpandedCameras(new Set(nodes.map(n => n.camera)));
+    setExpandedDates(new Set(nodes.map(n => n.dateKey)));
+    setExpandedCameras(new Set(nodes.flatMap(n => n.cameras.map(c => `${n.dateKey}::${c.camera}`))));
   }, [nodes]);
 
-  const toggleCamera = useCallback((camera: string) => {
+  const toggleDate = useCallback((dateKey: string) => {
+    setExpandedDates(prev => {
+      const next = new Set(prev);
+      if (next.has(dateKey)) next.delete(dateKey);
+      else next.add(dateKey);
+      return next;
+    });
+  }, []);
+
+  const toggleCamera = useCallback((cameraKey: string) => {
     setExpandedCameras(prev => {
       const next = new Set(prev);
-      if (next.has(camera)) {
-        next.delete(camera);
-      } else {
-        next.add(camera);
-      }
+      if (next.has(cameraKey)) next.delete(cameraKey);
+      else next.add(cameraKey);
       return next;
     });
   }, []);
@@ -82,42 +87,76 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
   );
 
   const allFilterKeys = useMemo(
-    () => nodes.flatMap(n => n.filters.map(f => f.key)),
+    () => nodes.flatMap(n => n.cameras.flatMap(c => c.filters.map(f => f.key))),
     [nodes]
   );
 
+  // Expand/collapse all
   const isAllExpanded = useMemo(() => {
     if (nodes.length === 0) return false;
-    return nodes.every(n => expandedCameras.has(n.camera));
-  }, [nodes, expandedCameras]);
+    return nodes.every(n => expandedDates.has(n.dateKey)) &&
+      nodes.every(n => n.cameras.every(c => expandedCameras.has(`${n.dateKey}::${c.camera}`)));
+  }, [nodes, expandedDates, expandedCameras]);
 
   const toggleExpandAll = useCallback(() => {
     if (isAllExpanded) {
+      setExpandedDates(new Set());
       setExpandedCameras(new Set());
     } else {
-      setExpandedCameras(new Set(nodes.map(n => n.camera)));
+      setExpandedDates(new Set(nodes.map(n => n.dateKey)));
+      setExpandedCameras(new Set(nodes.flatMap(n => n.cameras.map(c => `${n.dateKey}::${c.camera}`))));
     }
   }, [isAllExpanded, nodes]);
 
-  // Check helpers
-  const getFilterKeysForCamera = useCallback((node: CameraFilterNode): string[] => {
-    return node.filters.map(f => f.key);
+  // --- Check helpers ---
+
+  const getFilterKeysForDate = useCallback((node: DateCameraFilterNode): string[] => {
+    return node.cameras.flatMap(c => c.filters.map(f => f.key));
   }, []);
 
-  const isCameraFullyChecked = useCallback((node: CameraFilterNode): boolean => {
-    const keys = getFilterKeysForCamera(node);
+  const getFilterKeysForCamera = useCallback((_dateKey: string, cam: DateCameraFilterNode['cameras'][0]): string[] => {
+    return cam.filters.map(f => f.key);
+  }, []);
+
+  // Date-level check state
+  const isDateFullyChecked = useCallback((node: DateCameraFilterNode): boolean => {
+    const keys = getFilterKeysForDate(node);
+    return keys.length > 0 && keys.every(k => checkedKeys.has(k));
+  }, [checkedKeys, getFilterKeysForDate]);
+
+  const isDatePartiallyChecked = useCallback((node: DateCameraFilterNode): boolean => {
+    const keys = getFilterKeysForDate(node);
+    const count = keys.filter(k => checkedKeys.has(k)).length;
+    return count > 0 && count < keys.length;
+  }, [checkedKeys, getFilterKeysForDate]);
+
+  const toggleDateChecked = useCallback((node: DateCameraFilterNode) => {
+    const keys = getFilterKeysForDate(node);
+    const allChecked = isDateFullyChecked(node);
+    const next = new Set(checkedKeys);
+    if (allChecked) {
+      keys.forEach(k => next.delete(k));
+    } else {
+      keys.forEach(k => next.add(k));
+    }
+    onCheckedChange(next);
+  }, [checkedKeys, onCheckedChange, getFilterKeysForDate, isDateFullyChecked]);
+
+  // Camera-level check state
+  const isCameraFullyChecked = useCallback((_dateKey: string, cam: DateCameraFilterNode['cameras'][0]): boolean => {
+    const keys = getFilterKeysForCamera(_dateKey, cam);
     return keys.length > 0 && keys.every(k => checkedKeys.has(k));
   }, [checkedKeys, getFilterKeysForCamera]);
 
-  const isCameraPartiallyChecked = useCallback((node: CameraFilterNode): boolean => {
-    const keys = getFilterKeysForCamera(node);
+  const isCameraPartiallyChecked = useCallback((_dateKey: string, cam: DateCameraFilterNode['cameras'][0]): boolean => {
+    const keys = getFilterKeysForCamera(_dateKey, cam);
     const count = keys.filter(k => checkedKeys.has(k)).length;
     return count > 0 && count < keys.length;
   }, [checkedKeys, getFilterKeysForCamera]);
 
-  const toggleCameraChecked = useCallback((node: CameraFilterNode) => {
-    const keys = getFilterKeysForCamera(node);
-    const allChecked = isCameraFullyChecked(node);
+  const toggleCameraChecked = useCallback((dateKey: string, cam: DateCameraFilterNode['cameras'][0]) => {
+    const keys = getFilterKeysForCamera(dateKey, cam);
+    const allChecked = isCameraFullyChecked(dateKey, cam);
     const next = new Set(checkedKeys);
     if (allChecked) {
       keys.forEach(k => next.delete(k));
@@ -127,13 +166,11 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
     onCheckedChange(next);
   }, [checkedKeys, onCheckedChange, getFilterKeysForCamera, isCameraFullyChecked]);
 
+  // Filter-level toggle
   const toggleFilterChecked = useCallback((key: string) => {
     const next = new Set(checkedKeys);
-    if (next.has(key)) {
-      next.delete(key);
-    } else {
-      next.add(key);
-    }
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
     onCheckedChange(next);
   }, [checkedKeys, onCheckedChange]);
 
@@ -153,7 +190,7 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
     <nav
       className={`bg-surface-elevated/50 rounded-lg border border-border/50 overflow-hidden flex flex-col ${className}`}
       role="tree"
-      aria-label="Camera and filter navigation"
+      aria-label="Date, camera and filter navigation"
     >
       {/* Compact Header */}
       <div className="px-2 py-1.5 border-b border-border/50 flex items-center justify-between">
@@ -165,7 +202,7 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
             title="Select all"
           />
           <span className="text-xs text-content-muted">
-            {nodes.length} camera{nodes.length !== 1 ? 's' : ''} · {totalFrames} frames
+            {nodes.length} night{nodes.length !== 1 ? 's' : ''} · {totalFrames} frames
           </span>
         </div>
         <button
@@ -179,77 +216,117 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
 
       {/* Tree content */}
       <div className="flex-1 overflow-y-auto py-1">
-        {nodes.map(node => {
-          const isExpanded = expandedCameras.has(node.camera);
-          const cameraFullyChecked = isCameraFullyChecked(node);
-          const cameraPartiallyChecked = isCameraPartiallyChecked(node);
+        {nodes.map(dateNode => {
+          const isDateExpanded = expandedDates.has(dateNode.dateKey);
+          const dateFullyChecked = isDateFullyChecked(dateNode);
+          const datePartiallyChecked = isDatePartiallyChecked(dateNode);
 
           return (
-            <div key={node.camera} role="treeitem" aria-expanded={isExpanded}>
-              {/* Camera level */}
-              <div
-                className="w-full py-1 px-2 flex items-center gap-1.5 transition-colors hover:bg-surface-hover/40"
-              >
+            <div key={dateNode.dateKey} role="treeitem" aria-expanded={isDateExpanded}>
+              {/* Date level */}
+              <div className="w-full py-1 px-2 flex items-center gap-1.5 transition-colors hover:bg-surface-hover/40">
                 <StyledCheckbox
-                  checked={cameraFullyChecked}
-                  indeterminate={cameraPartiallyChecked}
-                  onChange={() => toggleCameraChecked(node)}
-                  title="Select all in this camera"
+                  checked={dateFullyChecked}
+                  indeterminate={datePartiallyChecked}
+                  onChange={() => toggleDateChecked(dateNode)}
+                  title="Select all in this night"
                 />
                 <button
-                  onClick={() => toggleCamera(node.camera)}
+                  onClick={() => toggleDate(dateNode.dateKey)}
                   className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded min-h-[26px]"
                 >
-                  {isExpanded ? (
+                  {isDateExpanded ? (
                     <ChevronDown size={14} className="text-content-muted flex-shrink-0" />
                   ) : (
                     <ChevronRight size={14} className="text-content-muted flex-shrink-0" />
                   )}
-                  <Camera size={14} className="text-accent flex-shrink-0" />
+                  <Calendar size={14} className="text-purple-400 flex-shrink-0" />
                   <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
-                    {node.camera}
+                    {dateNode.dateDisplay}
                   </span>
                   <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
-                    {node.totalFrameCount}
+                    {dateNode.totalFrameCount}
                   </span>
                 </button>
               </div>
 
-              {/* Filter level (with indent guide) */}
-              {isExpanded && (
+              {/* Camera level (with indent guide) */}
+              {isDateExpanded && (
                 <div role="group" className="ml-3 pl-2 border-l border-border/50">
-                  {node.filters.map(filter => {
-                    const isChecked = checkedKeys.has(filter.key);
+                  {dateNode.cameras.map(cam => {
+                    const cameraKey = `${dateNode.dateKey}::${cam.camera}`;
+                    const isCamExpanded = expandedCameras.has(cameraKey);
+                    const camFullyChecked = isCameraFullyChecked(dateNode.dateKey, cam);
+                    const camPartiallyChecked = isCameraPartiallyChecked(dateNode.dateKey, cam);
 
                     return (
-                      <div
-                        key={filter.key}
-                        className={`
-                          w-full py-1 px-1
-                          flex items-center gap-1.5
-                          transition-colors
-                          hover:bg-surface-hover/40
-                          ${isChecked ? 'bg-accent/10' : ''}
-                        `}
-                        role="treeitem"
-                      >
-                        <StyledCheckbox
-                          checked={isChecked}
-                          onChange={() => toggleFilterChecked(filter.key)}
-                          title="Select this filter group"
-                        />
-                        <button
-                          onClick={() => toggleFilterChecked(filter.key)}
-                          className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded min-h-[24px]"
-                        >
-                          <Aperture size={14} className="text-accent flex-shrink-0" />
-                          <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
-                            {filter.label}
-                          </span>
-                          <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
-                            {filter.frameCount}
-                          </span>
-                        </button>
+                      <div key={cameraKey} role="treeitem" aria-expanded={isCamExpanded}>
+                        <div className="w-full py-1 px-1 flex items-center gap-1.5 transition-colors hover:bg-surface-hover/40">
+                          <StyledCheckbox
+                            checked={camFullyChecked}
+                            indeterminate={camPartiallyChecked}
+                            onChange={() => toggleCameraChecked(dateNode.dateKey, cam)}
+                            title="Select all in this camera"
+                          />
+                          <button
+                            onClick={() => toggleCamera(cameraKey)}
+                            className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded min-h-[26px]"
+                          >
+                            {isCamExpanded ? (
+                              <ChevronDown size={14} className="text-content-muted flex-shrink-0" />
+                            ) : (
+                              <ChevronRight size={14} className="text-content-muted flex-shrink-0" />
+                            )}
+                            <Camera size={14} className="text-accent flex-shrink-0" />
+                            <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
+                              {cam.camera}
+                            </span>
+                            <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
+                              {cam.totalFrameCount}
+                            </span>
+                          </button>
+                        </div>
+
+                        {/* Filter level (with nested indent guide) */}
+                        {isCamExpanded && (
+                          <div role="group" className="ml-3 pl-2 border-l border-border/50">
+                            {cam.filters.map(filter => {
+                              const isChecked = checkedKeys.has(filter.key);
+
+                              return (
+                                <div
+                                  key={filter.key}
+                                  className={`
+                                    w-full py-1 px-1
+                                    flex items-center gap-1.5
+                                    transition-colors
+                                    hover:bg-surface-hover/40
+                                    ${isChecked ? 'bg-accent/10' : ''}
+                                  `}
+                                  role="treeitem"
+                                >
+                                  <StyledCheckbox
+                                    checked={isChecked}
+                                    onChange={() => toggleFilterChecked(filter.key)}
+                                    title="Select this filter group"
+                                  />
+                                  <button
+                                    onClick={() => toggleFilterChecked(filter.key)}
+                                    className="flex-1 flex items-center gap-1.5 text-left focus:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded min-h-[24px]"
+                                  >
+                                    <Aperture size={14} className="text-accent flex-shrink-0" />
+                                    <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
+                                      {filter.label}
+                                    </span>
+                                    <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
+                                      {filter.frameCount}
+                                    </span>
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -261,7 +338,7 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
 
         {nodes.length === 0 && (
           <div className="px-2 py-6 text-center text-content-muted">
-            <p className="text-xs">No cameras found</p>
+            <p className="text-xs">No frames found</p>
           </div>
         )}
       </div>

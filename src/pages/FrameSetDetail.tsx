@@ -116,15 +116,7 @@ export default function FrameSetDetail() {
     return parseFloat(hours) >= 1 ? `${hours}h` : `${minutes}m`;
   };
 
-  // Build a unique filter key that includes exptime to differentiate same filter with different exposures
-  const buildFilterKey = useCallback((filterGroup: { filter: string | null; exptime: number | null }): string => {
-    const baseFilter = filterGroup.filter ?? '__no_filter__';
-    return filterGroup.exptime !== null
-      ? `${baseFilter}:${filterGroup.exptime}`
-      : baseFilter;
-  }, []);
-
-  // Get frame IDs from selected filter keys
+  // Get frame IDs from selected filter keys (must match key format in buildCameraFilterTree)
   const getFrameIdsFromFilterKeys = useCallback((filterKeys: Set<string>): number[] => {
     if (!calibrationHierarchy) return [];
 
@@ -132,8 +124,9 @@ export default function FrameSetDetail() {
     for (const dateGroup of calibrationHierarchy.date_groups) {
       for (const cameraGroup of dateGroup.camera_groups) {
         for (const filterGroup of cameraGroup.filter_groups) {
-          const filterKey = buildFilterKey(filterGroup);
-          const fullKey = `${dateGroup.date}:${cameraGroup.instrume}:${filterKey}`;
+          const filterName = filterGroup.filter ?? 'No Filter';
+          const exptime = filterGroup.exptime;
+          const fullKey = `${dateGroup.date}::${cameraGroup.instrume}::${filterName}::${exptime ?? 'any'}`;
           if (filterKeys.has(fullKey)) {
             frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
           }
@@ -141,7 +134,7 @@ export default function FrameSetDetail() {
       }
     }
     return frameIds;
-  }, [calibrationHierarchy, buildFilterKey]);
+  }, [calibrationHierarchy]);
 
   // Get all LIGHT frame IDs from the calibration hierarchy
   const getAllLightFrameIds = useCallback((): number[] => {
