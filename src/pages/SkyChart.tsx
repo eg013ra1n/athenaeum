@@ -897,18 +897,8 @@ export default function SkyChart() {
     <div className="h-screen w-full flex flex-col bg-surface overflow-hidden">
       {/* Header */}
       <div className="flex-shrink-0 py-[14px] px-4 border-b border-border bg-surface-elevated flex items-center justify-between">
-        {/* Left: Title + Subtitle */}
-        <div>
-          <h2 className="text-2xl font-bold text-content">Sky Chart</h2>
-          <p className="text-sm text-content-muted">
-            {loading ? 'Loading...' : (
-              <>
-                Stereographic projection • {filteredLocations.length} imaging location{filteredLocations.length !== 1 ? 's' : ''}
-                {filteredLocations.length !== locations.length && ` (${locations.length} total)`}
-              </>
-            )}
-          </p>
-        </div>
+        {/* Left: Title */}
+        <h2 className="text-2xl font-bold text-content">Sky Chart</h2>
 
         {/* Right: Controls */}
         <div className="flex items-center gap-4">

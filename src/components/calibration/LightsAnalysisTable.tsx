@@ -250,7 +250,8 @@ export function LightsAnalysisTable({
       <table className="w-full" role="table">
         <thead className="bg-surface sticky top-0 z-10">
           <tr>
-            <th scope="col" className="w-10 px-2 py-2.5 text-center">
+            {/* Identity group — no tint */}
+            <th scope="col" className="w-10 px-1.5 py-1.5 text-center">
               <input
                 type="checkbox"
                 checked={allSelected}
@@ -259,46 +260,51 @@ export function LightsAnalysisTable({
                 className="rounded border-border text-accent focus:ring-accent cursor-pointer"
               />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-left">
+            <th scope="col" className="px-1.5 py-1.5 text-left">
               <SortableHeader field="date" label="Date/Time" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} align="left" />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            <th scope="col" className="px-1.5 py-1.5 text-center">
               <SortableHeader field="camera" label="Camera" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            <th scope="col" className="px-1.5 py-1.5 text-center">
               <SortableHeader field="filter" label="Filter" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            {/* Exposure group — gold tint */}
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-warning/10">
               <SortableHeader field="exptime" label="Exposure" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? formatTotalExposure(averages.exptime) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            {/* Image Quality group — frost blue tint */}
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
               <SortableHeader field="stars" label="Stars" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.stars.toFixed(0) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
               <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.fwhm.toFixed(2) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
               <SortableHeader field="eccentricity" label="Eccentricity" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.eccentricity.toFixed(3) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            {/* Signal group — green tint */}
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.median_snr.toFixed(1) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="snr_db" label="SNR (dB)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_db.toFixed(1) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.psf_signal.toFixed(1) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="snr_weight" label="SNR Weight" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_weight.toFixed(1) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            {/* Tracking group — orange tint */}
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-orange/10">
               <SortableHeader field="trail" label="Trail R²" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.trail.toFixed(3) : undefined} />
             </th>
-            <th scope="col" className="px-3 py-2.5 text-center">
+            {/* Score group — purple tint */}
+            <th scope="col" className="px-1.5 py-1.5 text-center bg-purple/10">
               <SortableHeader field="score" label="Score" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.score != null ? `${(averages.score * 100).toFixed(0)}%` : undefined} />
             </th>
-            <th scope="col" className="w-20 px-2 py-2.5 text-center text-xs font-semibold text-content-secondary">
+            <th scope="col" className="w-20 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
               Actions
             </th>
           </tr>
@@ -319,7 +325,8 @@ export function LightsAnalysisTable({
                   ${isBlackholed ? 'opacity-50' : ''}
                 `}
               >
-                <td className="w-10 px-2 py-2 text-center">
+                {/* Identity group — no tint */}
+                <td className="w-10 px-1.5 py-1 text-center">
                   <input
                     type="checkbox"
                     checked={isSelected}
@@ -327,41 +334,44 @@ export function LightsAnalysisTable({
                     className="rounded border-border text-accent focus:ring-accent cursor-pointer"
                   />
                 </td>
-                <td className={`px-3 py-2 text-sm font-mono text-content-secondary ${isBlackholed ? 'line-through' : ''}`}>
+                <td className={`px-1.5 py-1 text-sm font-mono text-content-secondary ${isBlackholed ? 'line-through' : ''}`}>
                   {formatDateTime(frame.date_obs)}
                 </td>
-                <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
+                <td className={`px-1.5 py-1 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.camera}
                 </td>
-                <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
+                <td className={`px-1.5 py-1 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.filter ?? '-'}
                 </td>
-                <td className={`px-3 py-2 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
+                {/* Exposure group — gold tint */}
+                <td className={`px-1.5 py-1 text-sm text-content-secondary text-center bg-warning/5 ${isBlackholed ? 'line-through' : ''}`}>
                   {frame.exptime !== null ? `${frame.exptime}s` : '-'}
                 </td>
-                {/* Analysis columns */}
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                {/* Image Quality group — frost blue tint */}
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
                   {analysis ? analysis.stars_detected : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
                   {analysis ? analysis.median_fwhm.toFixed(2) : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
                   {analysis ? analysis.median_eccentricity.toFixed(3) : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                {/* Signal group — green tint */}
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">
                   {analysis ? analysis.median_snr.toFixed(1) : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">
                   {analysis ? analysis.snr_db.toFixed(1) : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">
                   {analysis ? analysis.psf_signal.toFixed(1) : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">
                   {analysis ? analysis.snr_weight.toFixed(1) : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                {/* Tracking group — orange tint */}
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-orange/5">
                   {analysis ? (
                     <span className="inline-flex items-center gap-1">
                       {analysis.trail_r_squared.toFixed(3)}
@@ -373,10 +383,11 @@ export function LightsAnalysisTable({
                     </span>
                   ) : '-'}
                 </td>
-                <td className="px-3 py-2 text-sm text-content-secondary text-center">
+                {/* Score group — purple tint */}
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-purple/5">
                   {analysis?.quality_score != null ? `${(analysis.quality_score * 100).toFixed(0)}%` : '-'}
                 </td>
-                <td className="w-20 px-2 py-2 text-center">
+                <td className="w-20 px-1.5 py-1 text-center">
                   <div className="flex items-center justify-center gap-1">
                     <button
                       onClick={e => handleReveal(e, frame.file_path)}

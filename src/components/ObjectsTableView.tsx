@@ -110,42 +110,42 @@ export function ObjectsTableView({
   const SortIcon = ({ field }: { field: SortField }) => {
     if (sortField !== field) return null;
     return sortDirection === 'asc'
-      ? <ChevronUp size={14} className="inline ml-1" />
-      : <ChevronDown size={14} className="inline ml-1" />;
+      ? <ChevronUp size={12} className="inline ml-0.5" />
+      : <ChevronDown size={12} className="inline ml-0.5" />;
   };
 
-  const headerClass = "px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider cursor-pointer hover:text-content transition-colors select-none";
+  const headerClass = "px-2 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider cursor-pointer hover:text-content transition-colors select-none whitespace-nowrap";
 
   return (
     <div className={`overflow-x-auto bg-surface-elevated rounded-lg border border-border ${isDragging || isMergeMode ? 'select-none' : ''}`}>
-      <table className="w-full">
+      <table className="w-full text-sm">
         <thead className="bg-surface">
           <tr>
             <th className={headerClass} onClick={() => handleSort('name')}>
               Name <SortIcon field="name" />
             </th>
             <th className={`${headerClass} hidden md:table-cell`} onClick={() => handleSort('coordinates')}>
-              <MapPin size={12} className="inline mr-1" />
-              Coordinates <SortIcon field="coordinates" />
+              <MapPin size={10} className="inline mr-0.5" />
+              Coords <SortIcon field="coordinates" />
             </th>
             <th className={headerClass} onClick={() => handleSort('frames')}>
-              Frames <SortIcon field="frames" />
+              # <SortIcon field="frames" />
             </th>
             <th className={`${headerClass} hidden lg:table-cell`} onClick={() => handleSort('exposure')}>
-              <Clock size={12} className="inline mr-1" />
-              Exposure <SortIcon field="exposure" />
+              <Clock size={10} className="inline mr-0.5" />
+              Exp. <SortIcon field="exposure" />
             </th>
             <th className={`${headerClass} hidden lg:table-cell`} onClick={() => handleSort('rotation')}>
-              <RotateCw size={12} className="inline mr-1" />
-              Rotation <SortIcon field="rotation" />
+              <RotateCw size={10} className="inline mr-0.5" />
+              Rot. <SortIcon field="rotation" />
             </th>
             <th className={`${headerClass} hidden md:table-cell`} onClick={() => handleSort('date')}>
-              Date Range <SortIcon field="date" />
+              Date <SortIcon field="date" />
             </th>
             <th className={headerClass} onClick={() => handleSort('custom')}>
-              <Star size={12} className="inline" /> <SortIcon field="custom" />
+              <Star size={10} className="inline" /> <SortIcon field="custom" />
             </th>
-            <th className="px-4 py-3 text-center text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-2 py-1.5 text-center text-xs font-medium text-content-muted uppercase tracking-wider whitespace-nowrap">
               Actions
             </th>
           </tr>
@@ -164,15 +164,16 @@ export function ObjectsTableView({
                   ${index % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface-elevated/50'}
                   ${isBeingDragged ? 'opacity-40 bg-info-muted' : ''}
                   ${isDropTarget ? 'bg-success-muted ring-2 ring-success' : ''}
+                  ${activeTab === 'wip' && !frames_set.is_custom && !isBeingDragged ? 'opacity-60' : ''}
                   ${!editingSetId && isMergeMode && !isDragging ? 'cursor-grab' : ''}
                   ${isDragging ? 'cursor-grabbing' : ''}
                   hover:bg-surface-hover/50 transition-colors
                 `}
               >
                 {/* Name */}
-                <td className="px-4 py-3">
+                <td className={`px-2 py-1.5 border-l-4 ${frames_set.is_custom ? 'border-l-orange' : 'border-l-accent'}`}>
                   {editingSetId === frames_set.id ? (
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1">
                       <input
                         type="text"
                         value={editingName}
@@ -181,112 +182,119 @@ export function ObjectsTableView({
                           if (e.key === 'Enter') onSaveRename(frames_set.id!);
                           else if (e.key === 'Escape') onCancelEditing();
                         }}
-                        className="flex-1 px-2 py-1 bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent text-sm"
+                        className="flex-1 px-1.5 py-0.5 bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent text-sm"
                         autoFocus
                         onClick={(e) => e.stopPropagation()}
                       />
                       <button
                         onClick={(e) => { e.stopPropagation(); onSaveRename(frames_set.id!); }}
-                        className="p-1 text-success hover:text-success/80"
+                        className="p-0.5 text-success hover:text-success/80"
                       >
-                        <Check size={16} />
+                        <Check size={13} />
                       </button>
                       <button
                         onClick={(e) => { e.stopPropagation(); onCancelEditing(); }}
-                        className="p-1 text-error hover:text-error/80"
+                        className="p-0.5 text-error hover:text-error/80"
                       >
-                        <X size={16} />
+                        <X size={13} />
                       </button>
                     </div>
                   ) : (
-                    <button
-                      onClick={(e) => { e.stopPropagation(); onView(frames_set.id!); }}
-                      className="font-medium text-content hover:text-accent transition-colors text-left"
-                    >
-                      {frames_set.name || 'Untitled'}
-                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onView(frames_set.id!); }}
+                        className="font-medium text-content hover:text-accent transition-colors text-left text-sm"
+                      >
+                        {frames_set.name || 'Untitled'}
+                      </button>
+                      {activeTab === 'wip' && !frames_set.is_custom && (
+                        <span className="px-1 py-0.5 text-[9px] font-semibold uppercase rounded bg-surface-hover text-content-muted flex-shrink-0">
+                          Stage
+                        </span>
+                      )}
+                    </div>
                   )}
                 </td>
 
                 {/* Coordinates */}
-                <td className="px-4 py-3 hidden md:table-cell">
+                <td className="px-2 py-1.5 hidden md:table-cell">
                   {frames_set.objctra && frames_set.objctdec ? (
                     <span className="font-mono text-xs text-content-muted">
                       {frames_set.objctra} / {frames_set.objctdec}
                     </span>
                   ) : (
-                    <span className="text-content-muted">-</span>
+                    <span className="text-content-muted text-xs">-</span>
                   )}
                 </td>
 
                 {/* Frames */}
-                <td className="px-4 py-3 text-content-secondary">
+                <td className="px-2 py-1.5 text-content-secondary text-sm">
                   {member_count}
                 </td>
 
                 {/* Exposure */}
-                <td className="px-4 py-3 hidden lg:table-cell text-content-secondary">
+                <td className="px-2 py-1.5 hidden lg:table-cell text-content-secondary text-sm">
                   {formatExposureTime(frames_set.total_exp_time)}
                 </td>
 
                 {/* Rotation */}
-                <td className="px-4 py-3 hidden lg:table-cell text-content-muted font-mono text-sm">
+                <td className="px-2 py-1.5 hidden lg:table-cell text-content-muted font-mono text-sm">
                   {formatRotation(frames_set.avg_rotation, frames_set.min_rotation, frames_set.max_rotation)}
                 </td>
 
                 {/* Date Range */}
-                <td className="px-4 py-3 hidden md:table-cell text-content-muted text-sm">
+                <td className="px-2 py-1.5 hidden md:table-cell text-content-muted text-sm">
                   {formatDateRange(frames_set.date_obs_start, frames_set.date_obs_end)}
                 </td>
 
                 {/* Custom Star */}
-                <td className="px-4 py-3 text-center">
+                <td className="px-2 py-1.5 text-center">
                   {frames_set.is_custom ? (
-                    <Star size={16} className="text-orange fill-orange inline" />
+                    <Star size={13} className="text-orange fill-orange inline" />
                   ) : (
                     <button
                       onClick={(e) => { e.stopPropagation(); onMarkAsCustom(frames_set.id!); }}
                       className="text-content-muted hover:text-orange/80 transition-colors"
                       title="Mark as Custom Set"
                     >
-                      <Star size={16} />
+                      <Star size={13} />
                     </button>
                   )}
                 </td>
 
                 {/* Actions */}
-                <td className="px-4 py-3">
-                  <div className="flex items-center justify-center gap-2">
+                <td className="px-2 py-1.5">
+                  <div className="flex items-center justify-center gap-1">
                     <button
                       onClick={(e) => { e.stopPropagation(); onStartEditing(frames_set.id!, frames_set.name); }}
-                      className="p-1.5 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
+                      className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
                       title="Rename"
                     >
-                      <Pencil size={14} />
+                      <Pencil size={12} />
                     </button>
                     {activeTab === 'archive' ? (
                       <button
                         onClick={(e) => { e.stopPropagation(); onUnarchive(frames_set.id!); }}
-                        className="p-1.5 text-content-muted hover:text-accent hover:bg-surface-hover rounded transition-colors"
+                        className="p-1 text-content-muted hover:text-accent hover:bg-surface-hover rounded transition-colors"
                         title="Unarchive"
                       >
-                        <ArchiveRestore size={14} />
+                        <ArchiveRestore size={12} />
                       </button>
                     ) : (
                       <button
                         onClick={(e) => { e.stopPropagation(); onArchive(frames_set.id!); }}
-                        className="p-1.5 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
+                        className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"
                         title="Archive"
                       >
-                        <Archive size={14} />
+                        <Archive size={12} />
                       </button>
                     )}
                     <button
                       onClick={(e) => { e.stopPropagation(); onDelete(frames_set.id!, frames_set.name); }}
-                      className="p-1.5 text-content-muted hover:text-error hover:bg-surface-hover rounded transition-colors"
+                      className="p-1 text-content-muted hover:text-error hover:bg-surface-hover rounded transition-colors"
                       title="Delete"
                     >
-                      <Trash2 size={14} />
+                      <Trash2 size={12} />
                     </button>
                   </div>
                 </td>

@@ -109,13 +109,13 @@ export default function ShootCalendar() {
     : (yearData.data?.totalExposureSeconds ?? 0) / 3600;
 
   return (
-    <div className="p-6 h-full flex flex-col">
+    <div className="p-4 pt-3 h-full flex flex-col">
       {/* Header */}
-      <div className="flex-shrink-0 mb-4">
-        <h2 className="text-3xl font-bold mb-2">Shoot Calendar</h2>
-        <p className="text-content-muted">
-          Browse captures by date with equipment and target information
-        </p>
+      <div className="flex-shrink-0 mb-2">
+        <h2 className="text-2xl font-bold">
+          Shoot Calendar
+          <span className="text-sm font-normal text-content-muted ml-3">Browse captures by date with equipment and target information</span>
+        </h2>
       </div>
 
       {/* Navigation - always visible */}

@@ -46,12 +46,12 @@ export default function Equipment() {
   }
 
   return (
-    <div className="p-6">
-      <div className="mb-6">
-        <h2 className="text-3xl font-bold mb-2">Equipment Library</h2>
-        <p className="text-content-muted">
-          Browse instruments with captured frames and calibration library management
-        </p>
+    <div className="p-4 pt-3">
+      <div className="mb-4">
+        <h2 className="text-2xl font-bold">
+          Equipment Library
+          <span className="text-sm font-normal text-content-muted ml-3">Browse instruments with captured frames and calibration library management</span>
+        </h2>
       </div>
 
       {loading && (

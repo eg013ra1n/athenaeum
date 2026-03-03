@@ -188,7 +188,7 @@ export default function ExcludedFrames() {
   }, [entries]);
 
   return (
-    <div className="p-6">
+    <div className="p-4 pt-3">
       {/* Header */}
       <div className="mb-6">
         <button
@@ -198,10 +198,12 @@ export default function ExcludedFrames() {
           <ArrowLeft size={18} />
           Back to Objects
         </button>
-        <h2 className="text-3xl font-bold">Excluded Frames</h2>
-        <p className="text-content-muted">
-          {entries.length} frame{entries.length !== 1 ? 's' : ''} excluded during auto-generation, grouped by folder
-        </p>
+        <h2 className="text-2xl font-bold">
+          Excluded Frames
+          <span className="text-sm font-normal text-content-muted ml-3">
+            {entries.length} frame{entries.length !== 1 ? 's' : ''} excluded during auto-generation, grouped by folder
+          </span>
+        </h2>
       </div>
 
       {error && (

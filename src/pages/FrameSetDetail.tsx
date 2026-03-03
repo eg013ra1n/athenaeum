@@ -360,9 +360,9 @@ export default function FrameSetDetail() {
   }
 
   return (
-    <div className="p-6 h-full flex flex-col">
+    <div className="p-4 pt-3 h-full flex flex-col">
       {/* Frame Set Header */}
-      <div className="bg-surface-elevated rounded-lg p-3 mb-3 border border-border flex-shrink-0">
+      <div className="bg-surface-elevated rounded-lg p-3 mb-2 border border-border flex-shrink-0">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <button

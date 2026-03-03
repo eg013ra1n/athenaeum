@@ -416,6 +416,14 @@ export default function Objects() {
       if (cardElement) {
         const hoveredSetId = parseInt(cardElement.getAttribute('data-set-id') || '');
         if (hoveredSetId && hoveredSetId !== draggedSetId) {
+          // On WIP tab, only allow custom (WIP) sets as drop targets — Stage sets are sources only
+          if (activeTab === 'wip') {
+            const hoveredSet = frameSets.find(fs => fs.frames_set.id === hoveredSetId);
+            if (hoveredSet && !hoveredSet.frames_set.is_custom) {
+              if (dropTargetId !== null) setDropTargetId(null);
+              return;
+            }
+          }
           if (dropTargetId !== hoveredSetId) {
             console.log('[MouseMove] Hovering over set:', hoveredSetId, '- green highlight should show');
             setDropTargetId(hoveredSetId);
@@ -568,6 +576,8 @@ export default function Objects() {
         case 'stage':
           return !fs.frames_set.is_custom && !fs.frames_set.is_archived;
         case 'wip':
+          // In merge mode, show Stage sets alongside WIP sets so users can drag them onto WIP targets
+          if (isMergeMode) return !fs.frames_set.is_archived;
           return fs.frames_set.is_custom && !fs.frames_set.is_archived;
         case 'archive':
           return fs.frames_set.is_archived;
@@ -625,7 +635,7 @@ export default function Objects() {
     }
 
     return result;
-  }, [frameSets, filters, activeTab]);
+  }, [frameSets, filters, activeTab, isMergeMode]);
 
   // Tab counts for badges
   const tabCounts = useMemo(() => ({
@@ -637,14 +647,14 @@ export default function Objects() {
   const activeFilterCount = countActiveFilters(filters);
 
   return (
-    <div className="p-6">
-      <div className="mb-6">
+    <div className="p-4 pt-3">
+      <div className="mb-4">
         <div className="flex items-center justify-between mb-2">
           <div>
-            <h2 className="text-3xl font-bold">Objects Library</h2>
-            <p className="text-content-muted">
-              Frame sets grouped by sky coordinates
-            </p>
+            <h2 className="text-2xl font-bold">
+              Objects Library
+              <span className="text-sm font-normal text-content-muted ml-3">Frame sets grouped by sky coordinates</span>
+            </h2>
             {excludedCount > 0 && (
               <button
                 onClick={() => navigate('/excluded')}
@@ -848,7 +858,11 @@ export default function Objects() {
             <Grip className="text-success" size={20} />
             <div>
               <p className="font-medium text-success">Merge Mode Active</p>
-              <p className="text-sm text-success/80">Drag and drop frame sets to merge them</p>
+              <p className="text-sm text-success/80">
+                {activeTab === 'wip'
+                  ? 'Drag Stage sets onto WIP sets to merge new data'
+                  : 'Drag and drop frame sets to merge them'}
+              </p>
             </div>
           </div>
           <button
@@ -1025,181 +1039,184 @@ export default function Objects() {
           onUnarchive={handleUnarchive}
         />
       ) : (
-        <div className={`grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
+        <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
           {filteredFrameSets.map(({ frames_set, member_count }) => (
             <div
               key={frames_set.id}
               data-set-id={frames_set.id}
               onMouseDown={(e) => !editingSetId && isMergeMode && handleMouseDown(e, frames_set.id!)}
-              className={`bg-surface-elevated rounded-lg p-4 border-2 transition-all duration-200 group ${
+              className={`bg-surface-elevated rounded-lg p-3 border border-l-4 transition-all duration-200 group ${
                 isDragging && draggedSetId === frames_set.id
                   ? 'opacity-40 border-accent shadow-lg shadow-accent/50 cursor-grabbing select-none'
                   : dropTargetId === frames_set.id
                   ? 'border-success bg-success-muted scale-105 shadow-lg shadow-success/50'
-                  : 'border-border hover:border-border'
+                  : activeTab === 'wip' && !frames_set.is_custom
+                  ? 'border-dashed border-border border-l-accent opacity-60'
+                  : `border-border ${frames_set.is_custom ? 'border-l-orange' : 'border-l-accent'}`
               } ${!editingSetId && isMergeMode && !isDragging ? 'cursor-grab' : ''} ${isDragging ? 'select-none' : ''}`}
             >
-              <div className="flex items-start justify-between mb-3">
-                <div className="flex-1 min-w-0">
-                  {editingSetId === frames_set.id ? (
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="text"
-                        value={editingName}
-                        onChange={(e) => setEditingName(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            saveRename(frames_set.id!);
-                          } else if (e.key === 'Escape') {
-                            cancelEditing();
-                          }
-                        }}
-                        className="flex-1 px-2 py-1 bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent"
-                        autoFocus
-                      />
-                      <button
-                        onClick={() => saveRename(frames_set.id!)}
-                        className="p-1 text-success hover:text-success/90"
-                        title="Save"
-                      >
-                        <Check size={18} />
-                      </button>
-                      <button
-                        onClick={cancelEditing}
-                        className="p-1 text-error hover:text-error/90"
-                        title="Cancel"
-                      >
-                        <X size={18} />
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-2">
-                      {frames_set.is_custom ? (
-                        <span title="Custom Set">
-                          <Star size={16} className="text-orange fill-orange flex-shrink-0" />
-                        </span>
-                      ) : (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleMarkAsCustom(frames_set.id!);
-                          }}
-                          className="p-0 text-content-muted hover:text-orange transition-colors"
-                          title="Mark as Custom Set"
-                        >
-                          <Star size={16} className="flex-shrink-0" />
-                        </button>
-                      )}
-                      <h3 className="text-lg font-semibold text-content truncate">
-                        {frames_set.name || 'Untitled'}
-                      </h3>
+              {/* Name row */}
+              <div className="flex-1 min-w-0 mb-1.5">
+                {editingSetId === frames_set.id ? (
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="text"
+                      value={editingName}
+                      onChange={(e) => setEditingName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          saveRename(frames_set.id!);
+                        } else if (e.key === 'Escape') {
+                          cancelEditing();
+                        }
+                      }}
+                      className="flex-1 px-1.5 py-0.5 bg-surface-hover text-content rounded border border-border focus:outline-none focus:border-accent text-sm"
+                      autoFocus
+                    />
+                    <button
+                      onClick={() => saveRename(frames_set.id!)}
+                      className="p-0.5 text-success hover:text-success/90"
+                      title="Save"
+                    >
+                      <Check size={14} />
+                    </button>
+                    <button
+                      onClick={cancelEditing}
+                      className="p-0.5 text-error hover:text-error/90"
+                      title="Cancel"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    {frames_set.is_custom ? (
+                      <span title="Custom Set">
+                        <Star size={13} className="text-orange fill-orange flex-shrink-0" />
+                      </span>
+                    ) : (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          startEditing(frames_set.id!, frames_set.name);
+                          handleMarkAsCustom(frames_set.id!);
                         }}
-                        className="p-1 text-content-muted hover:text-content opacity-0 group-hover:opacity-100 transition-opacity"
-                        title="Rename"
+                        className="p-0 text-content-muted hover:text-orange transition-colors"
+                        title="Mark as Custom Set"
                       >
-                        <Pencil size={14} />
+                        <Star size={13} className="flex-shrink-0" />
                       </button>
-                    </div>
-                  )}
-                  {frames_set.objctra && frames_set.objctdec && (
-                    <div className="flex items-center gap-1 text-sm text-content-muted mt-1">
-                      <MapPin size={14} />
-                      <span className="font-mono text-xs">
-                        RA {frames_set.objctra} / Dec {frames_set.objctdec}
+                    )}
+                    <h3 className="text-sm font-semibold text-content truncate">
+                      {frames_set.name || 'Untitled'}
+                    </h3>
+                    {activeTab === 'wip' && !frames_set.is_custom && (
+                      <span className="px-1 py-0.5 text-[9px] font-semibold uppercase rounded bg-surface-hover text-content-muted flex-shrink-0">
+                        Stage
                       </span>
-                    </div>
-                  )}
-                  {frames_set.avg_rotation != null && (
-                    <div className="flex items-center gap-1 text-sm text-content-muted mt-1">
-                      <RotateCw size={14} />
-                      <span className="font-mono text-xs">
-                        {frames_set.min_rotation != null && frames_set.max_rotation != null &&
-                         Math.abs(frames_set.max_rotation - frames_set.min_rotation) >= 1
-                          ? `${frames_set.min_rotation.toFixed(1)}° – ${frames_set.max_rotation.toFixed(1)}°`
-                          : `${frames_set.avg_rotation.toFixed(1)}°`
-                        }
-                      </span>
-                    </div>
-                  )}
-                </div>
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        startEditing(frames_set.id!, frames_set.name);
+                      }}
+                      className="p-0.5 text-content-muted hover:text-content opacity-0 group-hover:opacity-100 transition-opacity"
+                      title="Rename"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                  </div>
+                )}
               </div>
 
-              <div className="grid grid-cols-2 gap-3 mb-3 text-sm">
-                <div className="bg-surface/50 rounded p-2">
-                  <p className="text-content-muted text-xs">Frames</p>
-                  <p className="text-content font-medium">{member_count}</p>
-                </div>
-                <div className="bg-surface/50 rounded p-2">
-                  <p className="text-content-muted text-xs flex items-center gap-1">
-                    <Clock size={12} />
-                    Total Exp.
-                  </p>
-                  <p className="text-content font-medium">
-                    {formatExposureTime(frames_set.total_exp_time)}
-                  </p>
-                </div>
-              </div>
-
+              {/* Date range */}
               {frames_set.date_obs_start && (
-                <p className="text-xs text-content-muted mb-3">
-                  {frames_set.date_obs_end && frames_set.date_obs_start !== frames_set.date_obs_end
-                    ? `${new Date(frames_set.date_obs_start).toLocaleDateString()} - ${new Date(frames_set.date_obs_end).toLocaleDateString()}`
-                    : new Date(frames_set.date_obs_start).toLocaleDateString()
-                  }
-                </p>
+                <div className="flex items-center gap-1 text-content-secondary text-xs mb-1">
+                  <Clock size={11} className="text-content-muted flex-shrink-0" />
+                  <span>
+                    {frames_set.date_obs_end && frames_set.date_obs_start !== frames_set.date_obs_end
+                      ? `${new Date(frames_set.date_obs_start).toLocaleDateString()} – ${new Date(frames_set.date_obs_end).toLocaleDateString()}`
+                      : new Date(frames_set.date_obs_start).toLocaleDateString()
+                    }
+                  </span>
+                </div>
               )}
 
-              <div className="space-y-2">
-                <div className="flex gap-2">
+              {/* Coords + rotation on one line */}
+              <div className="flex items-center gap-2 text-content-muted text-[10px] mb-2">
+                {frames_set.objctra && frames_set.objctdec && (
+                  <span className="flex items-center gap-0.5 font-mono">
+                    <MapPin size={10} />
+                    {frames_set.objctra} / {frames_set.objctdec}
+                  </span>
+                )}
+                {frames_set.avg_rotation != null && (
+                  <span className="flex items-center gap-0.5 font-mono">
+                    <RotateCw size={10} />
+                    {frames_set.min_rotation != null && frames_set.max_rotation != null &&
+                     Math.abs(frames_set.max_rotation - frames_set.min_rotation) >= 1
+                      ? `${frames_set.min_rotation.toFixed(0)}°–${frames_set.max_rotation.toFixed(0)}°`
+                      : `${frames_set.avg_rotation.toFixed(0)}°`
+                    }
+                  </span>
+                )}
+              </div>
+
+              {/* Accented stats row */}
+              <div className="flex items-center justify-between mb-2 text-xs">
+                <span className="flex items-center gap-1 text-accent font-semibold">
+                  <Clock size={12} />
+                  {formatExposureTime(frames_set.total_exp_time)}
+                </span>
+                <span className="text-content-muted">
+                  {member_count} frame{member_count !== 1 ? 's' : ''}
+                </span>
+              </div>
+
+              <div className="flex gap-1.5">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    navigate(`/objects/${frames_set.id}`);
+                  }}
+                  className="flex-1 flex items-center justify-center gap-1 px-2 py-1 bg-surface-hover hover:bg-surface-hover text-content rounded transition-colors text-xs"
+                  title="View members"
+                >
+                  <Eye size={13} />
+                  View
+                </button>
+                {activeTab === 'archive' ? (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      navigate(`/objects/${frames_set.id}`);
+                      handleUnarchive(frames_set.id!);
                     }}
-                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content rounded transition-colors text-sm"
-                    title="View members"
+                    className="px-2 py-1 bg-surface-hover hover:bg-accent/20 text-content-muted hover:text-accent rounded transition-colors"
+                    title="Unarchive"
                   >
-                    <Eye size={16} />
-                    View
+                    <ArchiveRestore size={13} />
                   </button>
-                  {activeTab === 'archive' ? (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleUnarchive(frames_set.id!);
-                      }}
-                      className="px-3 py-2 bg-surface-hover hover:bg-accent/20 text-content-muted hover:text-accent rounded transition-colors"
-                      title="Unarchive"
-                    >
-                      <ArchiveRestore size={16} />
-                    </button>
-                  ) : (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleArchive(frames_set.id!);
-                      }}
-                      className="px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content-muted hover:text-content rounded transition-colors"
-                      title="Archive"
-                    >
-                      <Archive size={16} />
-                    </button>
-                  )}
+                ) : (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleDelete(frames_set.id!, frames_set.name);
+                      handleArchive(frames_set.id!);
                     }}
-                    className="px-3 py-2 bg-error-muted hover:bg-error/30 text-error rounded transition-colors"
-                    title="Delete set"
+                    className="px-2 py-1 bg-surface-hover hover:bg-surface-hover text-content-muted hover:text-content rounded transition-colors"
+                    title="Archive"
                   >
-                    <Trash2 size={16} />
+                    <Archive size={13} />
                   </button>
-                </div>
+                )}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDelete(frames_set.id!, frames_set.name);
+                  }}
+                  className="px-2 py-1 bg-error-muted hover:bg-error/30 text-error rounded transition-colors"
+                  title="Delete set"
+                >
+                  <Trash2 size={13} />
+                </button>
               </div>
             </div>
           ))}
