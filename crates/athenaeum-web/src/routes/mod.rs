@@ -25,6 +25,7 @@ mod export;
 mod spatial;
 mod images;
 mod missing_files;
+mod analysis;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -152,8 +153,17 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_imaging_locations", post(spatial::get_imaging_locations))
         .route("/api/query_frames_in_bounds", post(spatial::query_frames_in_bounds))
         .route("/api/get_frame_preview", post(images::get_frame_preview))
+        .route("/api/read_fits_image_annotated", post(images::read_fits_image_annotated))
         // Calendar
         .route("/api/get_calendar_month_data", post(spatial::get_calendar_month_data))
+        // Analysis
+        .route("/api/get_analysis_config", post(analysis::get_analysis_config))
+        .route("/api/set_analysis_config", post(analysis::set_analysis_config))
+        .route("/api/reset_analysis_config", post(analysis::reset_analysis_config))
+        .route("/api/get_analysis_for_frame_set", post(analysis::get_analysis_for_frame_set))
+        .route("/api/delete_analysis_for_frame_set", post(analysis::delete_analysis_for_frame_set))
+        .route("/api/analyze_single_frame", post(analysis::analyze_single_frame))
+        .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_app_version", post(get_app_version))

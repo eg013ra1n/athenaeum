@@ -22,3 +22,4 @@ rayon = "1"
 # Required for rusqlite::params! in route handlers that run inline SQL queries
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"

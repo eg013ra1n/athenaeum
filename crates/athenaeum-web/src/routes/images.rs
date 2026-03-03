@@ -5,7 +5,7 @@
 
 use athenaeum_core::cache::CachedImage;
 use athenaeum_core::db;
-use athenaeum_core::rustafits_processor::{self, Resolution};
+use athenaeum_core::rustafits_processor::{self, AnnotationMetrics, Resolution};
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::WebAppState;
 
-// ── Request struct ────────────────────────────────────────────────────────────
+// ── Request structs ───────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +25,19 @@ pub struct GetFramePreviewArgs {
     #[serde(alias = "fileId")]
     pub frame_id: i64,
     pub resolution: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AnnotatedImageArgs {
+    pub path: String,
+    pub resolution: Option<String>,
+}
+
+/// Response for annotated image requests — JPEG bytes + analysis metrics
+#[derive(serde::Serialize)]
+pub struct AnnotatedImageResponse {
+    pub image_data: Vec<u8>,
+    pub metrics: Option<AnnotationMetrics>,
 }
 
 // ── Error helper ──────────────────────────────────────────────────────────────
@@ -134,4 +147,114 @@ pub async fn get_frame_preview(
     // ── 5. Return JPEG bytes ──────────────────────────────────────────────────
 
     Ok(([(header::CONTENT_TYPE, "image/jpeg")], jpeg_data).into_response())
+}
+
+/// `POST /api/read_fits_image_annotated`
+///
+/// Renders a FITS/XISF file with star annotations burned in.
+/// Returns JSON `{ image_data: [...], metrics: {...} }`.
+pub async fn read_fits_image_annotated(
+    State(state): State<WebAppState>,
+    Json(args): Json<AnnotatedImageArgs>,
+) -> Result<Json<AnnotatedImageResponse>, (StatusCode, String)> {
+    let path = args.path;
+
+    // ── 1. Read settings from DB ─────────────────────────────────────────────
+
+    let (resolution_str, quality) = {
+        let lock = state.ctx.db.lock().unwrap();
+        let db = lock
+            .as_ref()
+            .ok_or_else(|| db_err("Database not initialized"))?;
+        let conn = db.conn();
+
+        let res_str = match args.resolution.as_deref() {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => db::get_setting(&conn, "blink.resolution")
+                .map_err(|e| db_err(e))?
+                .unwrap_or_else(|| "preview".to_string()),
+        };
+
+        let res = Resolution::from_string(&res_str);
+        let q: Option<u8> = db::get_setting(&conn, res.quality_setting_key())
+            .map_err(|e| db_err(e))?
+            .and_then(|v| v.parse::<u8>().ok());
+
+        (res_str, q)
+    };
+
+    // ── 2. Check memory cache ────────────────────────────────────────────────
+
+    let cache_key = format!("{}:{}:annotated", path, resolution_str);
+
+    {
+        let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
+        if let Some(cached) = mem_cache.get(&cache_key) {
+            let metrics = state
+                .ctx
+                .annotation_metrics
+                .lock()
+                .unwrap()
+                .get(&cache_key)
+                .cloned();
+            return Ok(Json(AnnotatedImageResponse {
+                image_data: cached.data.clone(),
+                metrics,
+            }));
+        }
+    }
+
+    // ── 3. Process with annotations on a blocking thread ─────────────────────
+
+    let path_buf = PathBuf::from(&path);
+    if !path_buf.exists() {
+        return Err(db_err(format!("File not found: {}", path)));
+    }
+
+    let sem = state.image_semaphore.read().unwrap().clone();
+    let _permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|e| db_err(format!("Semaphore closed: {}", e)))?;
+
+    let res = Resolution::from_string(&resolution_str);
+    let pool: Arc<rayon::ThreadPool> = Arc::clone(&state.ctx.image_pool);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = _permit;
+        rustafits_processor::process_fits_to_jpeg_annotated(&path_buf, res, quality, &pool)
+    })
+    .await
+    .map_err(|e| db_err(format!("Task join error: {}", e)))?
+    .map_err(|e| db_err(format!("Annotated image processing failed: {}", e)))?;
+
+    let jpeg_data = result.image_data;
+    let metrics = result.metrics.clone();
+
+    // ── 4. Cache JPEG bytes and metrics ──────────────────────────────────────
+
+    {
+        let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
+        mem_cache.insert(
+            cache_key.clone(),
+            CachedImage {
+                data: jpeg_data.clone(),
+                last_accessed: std::time::Instant::now(),
+            },
+        );
+    }
+
+    if let Some(ref m) = metrics {
+        state
+            .ctx
+            .annotation_metrics
+            .lock()
+            .unwrap()
+            .insert(cache_key, m.clone());
+    }
+
+    Ok(Json(AnnotatedImageResponse {
+        image_data: jpeg_data,
+        metrics,
+    }))
 }

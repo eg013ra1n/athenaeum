@@ -17,6 +17,7 @@ import type {
   CameraType,
   DetailedWarning,
 } from '../../types/export';
+import { getFilterColor } from '../../utils/filterColors';
 
 interface FilterGroupCardProps {
   group: FilterGroupSummary;
@@ -280,28 +281,6 @@ function CameraTypeBadge({ type }: { type: CameraType }) {
       {isOsc ? 'OSC' : 'Mono'}
     </span>
   );
-}
-
-/**
- * Get a color for the filter
- */
-function getFilterColor(filter: string | null): string {
-  if (!filter) return '#9CA3AF'; // gray for luminance
-
-  const f = filter.toLowerCase();
-
-  // Narrowband
-  if (f.includes('ha') || f === 'h-alpha') return '#DC2626'; // red
-  if (f.includes('oiii') || f === 'o3') return '#06B6D4'; // cyan
-  if (f.includes('sii') || f === 's2') return '#7C3AED'; // purple
-
-  // Broadband
-  if (f === 'r' || f === 'red') return '#EF4444';
-  if (f === 'g' || f === 'green') return '#22C55E';
-  if (f === 'b' || f === 'blue') return '#3B82F6';
-  if (f === 'l' || f === 'lum' || f === 'luminance') return '#9CA3AF';
-
-  return '#6B7280'; // default gray
 }
 
 function isNarrowband(filter: string): boolean {

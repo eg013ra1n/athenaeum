@@ -265,6 +265,7 @@ dependencies = [
  "athenaeum-core",
  "axum",
  "chrono",
+ "futures",
  "rayon",
  "rusqlite",
  "serde",

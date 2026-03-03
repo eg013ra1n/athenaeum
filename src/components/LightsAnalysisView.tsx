@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Play, Trash2, BarChart3, Download } from 'lucide-react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { Play, Trash2, BarChart3, Download, Check, LineChart } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -11,15 +11,17 @@ import { CameraFilterTree } from './calibration/CameraFilterTree';
 import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/LightsAnalysisTable';
 import { RejectionThresholdBar, RejectionThresholds } from './calibration/RejectionThresholdBar';
 import { buildCameraFilterTree } from './calibration/utils';
+import { AnalysisChartsModal } from './analysis/AnalysisChartsModal';
 
 interface LightsAnalysisViewProps {
   hierarchy: CalibrationHierarchyViewData;
   frameSetId: number;
+  frameSetName?: string;
   onRefresh?: () => void;
   onBlink?: (frameIds: number[]) => void;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefresh, onBlink }: LightsAnalysisViewProps) {
   // Tree checkbox state — which filter groups are checked (for filtering the table)
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
   // Table row selection — which individual frames are selected (for mass actions)
@@ -42,6 +44,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState<AnalysisProgressEvent | null>(null);
+  const [csvExportedMsg, setCsvExportedMsg] = useState<string | null>(null);
+  const csvTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [chartsOpen, setChartsOpen] = useState(false);
 
   const { nodes, framesByKey, allFrames } = useMemo(
     () => buildCameraFilterTree(hierarchy),
@@ -267,11 +272,18 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
     const csv = [headers.join(','), ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
+    const now = new Date();
+    const timestamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+    const safeName = (frameSetName || 'analysis').replace(/[^a-zA-Z0-9_-]/g, '_');
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'analysis-export.csv';
+    a.download = `${timestamp}_${safeName}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+
+    if (csvTimerRef.current) clearTimeout(csvTimerRef.current);
+    setCsvExportedMsg(`Exported ${rows.length} frames to CSV`);
+    csvTimerRef.current = setTimeout(() => setCsvExportedMsg(null), 3000);
   }, [displayedFrames, analysisData]);
 
   const analyzedCount = analysisData.size;
@@ -309,13 +321,27 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
             </span>
           )}
         </div>
+        {csvExportedMsg && (
+          <span className="ml-auto inline-flex items-center gap-1 text-xs text-green-400">
+            <Check size={14} />
+            {csvExportedMsg} — check your Downloads folder
+          </span>
+        )}
         <button
           onClick={handleExportCsv}
           disabled={analysisData.size === 0}
-          className="ml-auto inline-flex items-center gap-1.5 px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content-secondary text-sm rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className={`${csvExportedMsg ? '' : 'ml-auto '}inline-flex items-center gap-1.5 px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content-secondary text-sm rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
         >
           <Download size={16} />
           Export CSV{checkedKeys.size > 0 ? ' (filtered)' : ''}
+        </button>
+        <button
+          onClick={() => setChartsOpen(true)}
+          disabled={analysisData.size === 0}
+          className="inline-flex items-center gap-1.5 px-3 py-2 bg-surface-hover hover:bg-surface-hover text-content-secondary text-sm rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <LineChart size={16} />
+          Charts{checkedKeys.size > 0 ? ' (filtered)' : ''}
         </button>
       </div>
 
@@ -434,6 +460,14 @@ export function LightsAnalysisView({ hierarchy, frameSetId, onRefresh, onBlink }
           </div>
         </div>
       )}
+
+      <AnalysisChartsModal
+        isOpen={chartsOpen}
+        onClose={() => setChartsOpen(false)}
+        displayedFrames={displayedFrames}
+        analysisData={analysisData}
+        frameSetName={frameSetName}
+      />
     </div>
   );
 }
