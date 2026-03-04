@@ -27,8 +27,7 @@ const WBPP_CONFIG_KEY: &str = "export.wbpp_config";
 pub async fn get_wbpp_export_config(
     state: State<'_, AppState>,
 ) -> Result<WbppExportConfig, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     load_wbpp_config(&conn)
@@ -40,8 +39,7 @@ pub async fn set_wbpp_export_config(
     state: State<'_, AppState>,
     config: WbppExportConfig,
 ) -> Result<WbppExportConfig, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
@@ -59,8 +57,7 @@ pub async fn set_wbpp_export_config(
 pub async fn reset_wbpp_export_config(
     state: State<'_, AppState>,
 ) -> Result<WbppExportConfig, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     conn.execute(
@@ -103,8 +100,7 @@ pub async fn get_export_preview(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<ExportData, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())
@@ -115,8 +111,7 @@ pub async fn get_export_preview(
 pub async fn get_exportable_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<Vec<ExportableFrameSet>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let mut stmt = conn
@@ -187,8 +182,7 @@ pub async fn get_calibration_route(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<CalibrationRoute, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Collect export data
@@ -454,8 +448,7 @@ pub async fn export_to_wbpp(
 
     // Collect export data and config
     let (export_data, config) = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
         let data = collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?;
         let cfg = load_wbpp_config(&conn).unwrap_or_default();
@@ -569,8 +562,7 @@ pub async fn get_export_summary(
     state: State<'_, AppState>,
     frame_set_id: i64,
 ) -> Result<ExportSummary, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
     let config = load_wbpp_config(&conn).unwrap_or_default();
 

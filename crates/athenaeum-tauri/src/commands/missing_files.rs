@@ -33,8 +33,7 @@ pub async fn sync_missing_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -109,8 +108,7 @@ pub async fn get_missing_files(
     root_id: i64,
     state: State<'_, AppState>,
 ) -> Result<Vec<MissingFileRecord>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let mut stmt = conn
@@ -168,8 +166,7 @@ pub async fn get_missing_files(
 pub async fn get_missing_files_counts(
     state: State<'_, AppState>,
 ) -> Result<HashMap<i64, i64>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let mut stmt = conn
@@ -203,8 +200,7 @@ pub async fn recheck_missing_files(
 ) -> Result<Vec<MissingFileRecord>, String> {
     // First phase: update the database
     {
-        let state_lock = state.ctx.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -259,7 +255,7 @@ pub async fn recheck_missing_files(
             rusqlite::params![&now, root_id],
         )
         .map_err(|e| e.to_string())?;
-    } // state_lock is dropped here
+    }
 
     // Second phase: return the updated list
     get_missing_files(root_id, state).await
@@ -271,8 +267,7 @@ pub async fn ignore_missing_file(
     file_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     conn.execute(
@@ -290,8 +285,7 @@ pub async fn unignore_missing_file(
     file_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     conn.execute(
@@ -313,8 +307,7 @@ pub async fn delete_missing_files(
         return Ok(());
     }
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
@@ -341,8 +334,7 @@ pub async fn relocate_missing_file(
         return Err(format!("File does not exist at path: {}", new_path));
     }
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Extract new filename from path

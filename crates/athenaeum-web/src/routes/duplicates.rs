@@ -63,8 +63,7 @@ pub async fn get_duplicates(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<Vec<athenaeum_core::models::DuplicateGroup>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let use_content_hash = state
@@ -94,8 +93,7 @@ pub async fn move_to_black_hole(
     State(state): State<WebAppState>,
     Json(args): Json<MoveToBlackHoleArgs>,
 ) -> Result<Json<i64>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let original_path: String = conn
@@ -120,8 +118,7 @@ pub async fn get_black_hole_files(
     State(state): State<WebAppState>,
     Json(args): Json<GetBlackHoleFilesArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::BlackHoleEntry>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let entries = athenaeum_core::db::get_black_hole_files(&conn, args.filter).map_err(db_err)?;
@@ -137,8 +134,7 @@ pub async fn get_blackholed_file_ids(
         return Ok(Json(vec![]));
     }
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let placeholders: Vec<String> = args.file_ids.iter().map(|_| "?".to_string()).collect();
@@ -170,8 +166,7 @@ pub async fn restore_from_black_hole(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     athenaeum_core::db::remove_from_black_hole(&conn, args.file_id).map_err(db_err)?;
@@ -186,8 +181,7 @@ pub async fn send_to_void(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     athenaeum_core::db::send_to_void(&conn, args.file_id).map_err(db_err)?;
@@ -201,8 +195,7 @@ pub async fn send_all_to_void(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let n = athenaeum_core::db::send_all_to_void(&conn).map_err(db_err)?;
@@ -230,8 +223,7 @@ pub async fn set_scan_root_duplicates_flag(
     State(state): State<WebAppState>,
     Json(args): Json<SetScanRootDuplicatesFlagArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     athenaeum_core::db::update_scan_root_duplicates_flag(&conn, args.id, args.enabled)
@@ -244,8 +236,7 @@ pub async fn set_scan_root_unique_camera_flag(
     State(state): State<WebAppState>,
     Json(args): Json<SetScanRootUniqueCameraFlagArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     athenaeum_core::db::set_unique_camera_flag(&conn, args.id, args.enabled)
@@ -260,8 +251,7 @@ pub async fn backfill_header_fingerprints(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let mut stmt = conn
@@ -298,8 +288,7 @@ pub async fn get_duplicate_folders(
     State(state): State<WebAppState>,
     Json(args): Json<GetDuplicateFoldersArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::FolderSimilarity>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let threshold = args.threshold.unwrap_or(70.0);

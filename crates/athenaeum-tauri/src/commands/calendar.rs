@@ -17,8 +17,7 @@ pub async fn get_calendar_month_data(
     month: i32,
     state: State<'_, AppState>,
 ) -> Result<CalendarMonthData, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Calculate date range for the month

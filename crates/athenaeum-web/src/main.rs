@@ -5,7 +5,7 @@ use athenaeum_core::services::ServiceContext;
 use athenaeum_core::settings::{self, SettingsManager};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 mod events;
@@ -119,8 +119,10 @@ async fn main() {
 
     // Build ServiceContext
     let settings_mgr = Arc::new(SettingsManager::new());
+    let db_cell = OnceLock::new();
+    let _ = db_cell.set(db);
     let ctx = Arc::new(ServiceContext {
-        db: Mutex::new(Some(db)),
+        db: db_cell,
         settings: settings_mgr,
         memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(cache_size, retention_minutes))),
         active_scans: Arc::new(Mutex::new(HashMap::new())),
@@ -130,7 +132,7 @@ async fn main() {
     });
 
     // SSE broadcast channel
-    let (event_tx, _) = tokio::sync::broadcast::channel::<events::SseEvent>(256);
+    let (event_tx, _) = tokio::sync::broadcast::channel::<events::SseEvent>(1024);
 
     let state = WebAppState {
         ctx,

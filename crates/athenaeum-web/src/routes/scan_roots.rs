@@ -101,9 +101,7 @@ pub async fn add_scan_root(
         }
     }
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -161,9 +159,7 @@ pub async fn get_scan_roots(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<Vec<ScanRoot>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -180,9 +176,7 @@ pub async fn delete_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteScanRootArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -227,8 +221,7 @@ pub async fn start_scan_with_progress(
 
     // Gather everything needed before entering the blocking task
     let (scan_result, reconcile) = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(|| {
+        let db = state.ctx.db.get().ok_or_else(|| {
             // Clean up active scan registration on early error
             let mut scans = state.ctx.active_scans.lock().unwrap();
             scans.remove(&root_id);
@@ -349,9 +342,7 @@ pub async fn check_all_scan_roots_availability(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<Vec<(i64, bool)>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -376,9 +367,7 @@ pub async fn get_missing_files_counts(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<std::collections::HashMap<i64, i64>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -421,9 +410,7 @@ pub async fn rescan_all_for_content_hash(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<RescanResultDto>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 

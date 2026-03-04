@@ -15,8 +15,7 @@ use super::utils::normalize_path;
 
 #[tauri::command]
 pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<ScanRoot, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // 1. Check if directory exists
@@ -89,8 +88,7 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
 
 #[tauri::command]
 pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_scan_roots(&conn).map_err(|e| e.to_string())
@@ -98,8 +96,7 @@ pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>,
 
 #[tauri::command]
 pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::delete_scan_root(&conn, id).map_err(|e| e.to_string())
@@ -107,8 +104,7 @@ pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(),
 
 #[tauri::command]
 pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<ScanResultDto, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Reconcile unique_camera instrume suffix state before scanning
@@ -167,8 +163,7 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
 
 #[tauri::command]
 pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<RescanResultDto, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     println!("Starting content hash rescan for all files...");
@@ -253,8 +248,7 @@ pub async fn relink_scan_root(
     new_path: String,
     state: State<'_, AppState>,
 ) -> Result<crate::models::RelinkResult, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get old root path
@@ -291,8 +285,7 @@ pub async fn check_scan_root_availability(
     root_id: i64,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get scan root path
@@ -313,8 +306,7 @@ pub async fn check_scan_root_availability(
 pub async fn check_all_scan_roots_availability(
     state: State<'_, AppState>,
 ) -> Result<Vec<(i64, bool)>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
@@ -341,10 +333,9 @@ pub async fn check_missing_files_in_scan_root(
     let emitter = TauriProgressEmitter(app_handle.clone());
     emit_progress(&emitter, root_id, 0, 0, None, "verifying");
 
-    // Collect files from database with lock held briefly
+    // Collect files from database
     let files = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
 
         // Get scan root path
@@ -388,7 +379,6 @@ pub async fn check_missing_files_in_scan_root(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         result
-        // Lock is released here when state_lock goes out of scope
     };
 
     // Filter to only files that don't exist on disk - done in parallel
@@ -446,8 +436,7 @@ pub async fn set_scan_root_unique_camera_flag(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::set_unique_camera_flag(&conn, id, enabled)
@@ -560,11 +549,8 @@ pub async fn start_scan_with_progress(
     }
 
     // Get scan root info and perform scan
-    println!("🔵 Acquiring database lock for root_id={}", root_id);
     let (result, reconcile) = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        println!("🔵 Database lock acquired for root_id={}", root_id);
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
 
         // Reconcile unique_camera instrume suffix state before scanning
@@ -610,11 +596,8 @@ pub async fn start_scan_with_progress(
             eprintln!("Failed to persist scan errors: {}", e);
         }
 
-        println!("🔵 Scan complete for root_id={}, releasing lock", root_id);
         (result, reconcile)
     };
-
-    println!("🔵 Database lock released for root_id={}", root_id);
 
     // Remove from active scans
     {

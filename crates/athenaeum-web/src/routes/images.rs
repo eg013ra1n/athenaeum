@@ -63,9 +63,7 @@ pub async fn get_frame_preview(
     // ── 1. Read path and settings from DB, then drop the lock ────────────────
 
     let (file_path, resolution_str, quality) = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock
-            .as_ref()
+        let db = state.ctx.db.get()
             .ok_or_else(|| db_err("Database not initialized"))?;
         let conn = db.conn();
 
@@ -162,9 +160,7 @@ pub async fn read_fits_image_annotated(
     // ── 1. Read settings from DB ─────────────────────────────────────────────
 
     let (resolution_str, quality) = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock
-            .as_ref()
+        let db = state.ctx.db.get()
             .ok_or_else(|| db_err("Database not initialized"))?;
         let conn = db.conn();
 

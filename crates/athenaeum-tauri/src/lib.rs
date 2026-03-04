@@ -33,7 +33,7 @@ use commands::AppState;
 use athenaeum_core::services::ServiceContext;
 use settings::SettingsManager;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{Manager, State};
 
@@ -57,7 +57,7 @@ pub fn run() {
             println!("🧵 CPU cores cap: {}, default blink semaphore permits: {}", max_threads, default_permits);
             AppState {
                 ctx: ServiceContext {
-                    db: Mutex::new(None),
+                    db: OnceLock::new(),
                     settings: Arc::new(SettingsManager::new()),
                     memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(400, 30))),
                     active_scans: Arc::new(Mutex::new(HashMap::new())),
@@ -93,8 +93,7 @@ pub fn run() {
 
             // Read memory cache settings from DB and apply
             {
-                let db_lock = state.ctx.db.lock().unwrap();
-                if let Some(db) = db_lock.as_ref() {
+                if let Some(db) = state.ctx.db.get() {
                     let conn = db.conn();
                     let cache_size: usize = db::get_setting(&conn, settings::keys::BLINK_MEMORY_CACHE_SIZE)
                         .ok()

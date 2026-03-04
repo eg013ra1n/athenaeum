@@ -77,10 +77,8 @@ pub async fn initialize_database(
 
     let db_path = app_dir.join("athenaeum.db");
 
-    // Hold the lock for the entire initialization to prevent concurrent
-    // Database::new calls (React StrictMode fires effects twice in dev)
-    let mut db_lock = state.ctx.db.lock().unwrap();
-    if db_lock.is_some() {
+    // OnceLock ensures only one thread can initialize; subsequent calls are no-ops
+    if state.ctx.db.get().is_some() {
         return Ok(db_path.to_string_lossy().to_string());
     }
 
@@ -89,10 +87,11 @@ pub async fn initialize_database(
         e.to_string()
     })?;
 
-    *db_lock = Some(db);
+    // set() returns Err if already set (race with StrictMode) — that's fine
+    let _ = state.ctx.db.set(db);
 
     // Apply persisted blink.threads setting to the semaphore
-    if let Some(ref db) = *db_lock {
+    if let Some(db) = state.ctx.db.get() {
         let conn = db.conn();
         let saved = state.ctx.settings
             .get_with_precedence(&conn, settings::keys::BLINK_THREADS, settings::defaults::BLINK_THREADS)
@@ -146,8 +145,7 @@ pub async fn check_for_updates(state: State<'_, super::AppState>) -> Result<Upda
 
     // Get or generate a persistent installation ID and read beta preference
     let (installation_id, check_beta) = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
 
         let id = match crate::db::get_setting(&conn, "installation.id").map_err(|e| e.to_string())? {

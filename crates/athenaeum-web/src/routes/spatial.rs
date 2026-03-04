@@ -73,9 +73,7 @@ fn calculate_fov(
 pub async fn get_imaging_locations(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<ImagingLocation>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -265,9 +263,7 @@ pub async fn query_frames_in_bounds(
     Json(args): Json<SelectionBoundsArgs>,
 ) -> Result<Json<SelectionCandidates>, (StatusCode, String)> {
     let bounds: SelectionBounds = args.into();
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -353,9 +349,7 @@ pub async fn get_calendar_month_data(
     };
     use std::collections::HashMap;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 

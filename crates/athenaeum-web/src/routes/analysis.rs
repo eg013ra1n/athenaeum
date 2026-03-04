@@ -74,8 +74,7 @@ pub async fn get_analysis_config(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<AnalysisConfig>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+    let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
     let conn = db.conn();
     Ok(Json(config::load_config(&conn)))
 }
@@ -85,8 +84,7 @@ pub async fn set_analysis_config(
     State(state): State<WebAppState>,
     Json(config): Json<AnalysisConfig>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+    let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
     let conn = db.conn();
     config::save_config(&conn, &config).map_err(err)?;
     Ok(Json(()))
@@ -97,8 +95,7 @@ pub async fn reset_analysis_config(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<AnalysisConfig>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+    let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
     let conn = db.conn();
     let default_config = AnalysisConfig::default();
     config::save_config(&conn, &default_config).map_err(err)?;
@@ -112,8 +109,7 @@ pub async fn get_analysis_for_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<Vec<FrameAnalysis>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+    let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
     let conn = db.conn();
     let results = db_analysis::get_frame_analyses_for_frame_set(&conn, args.frame_set_id)
         .map_err(err)?;
@@ -125,8 +121,7 @@ pub async fn delete_analysis_for_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+    let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
     let conn = db.conn();
     let deleted = db_analysis::delete_analyses_for_frame_set(&conn, args.frame_set_id)
         .map_err(err)?;
@@ -143,8 +138,7 @@ pub async fn analyze_single_frame(
     let frame_id = args.frame_id;
 
     let (analysis_config, file_id, path) = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+        let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
         let conn = db.conn();
 
         let analysis_config = config::load_config(&conn);
@@ -192,8 +186,7 @@ pub async fn analyze_single_frame(
 
     // Persist
     {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+        let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
         let conn = db.conn();
         db_analysis::upsert_frame_analysis(&conn, &analysis).map_err(err)?;
     }
@@ -216,8 +209,7 @@ pub async fn analyze_frame_set(
 
     // Load config, concurrency setting, and frame list under lock, then release
     let (analysis_config, frames_to_analyze, concurrency) = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+        let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
         let conn = db.conn();
 
         let analysis_config = config::load_config(&conn);
@@ -385,8 +377,7 @@ pub async fn analyze_frame_set(
 
     // Persist all results
     {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(|| err("Database not initialized"))?;
+        let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
         let conn = db.conn();
 
         // If we analyzed some frames, we also need to recompute scores for

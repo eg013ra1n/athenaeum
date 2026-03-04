@@ -31,8 +31,7 @@ pub async fn read_fits_image_rustafits(
 
     // ── Step 1: Read settings from DB ──
     let (resolution_str, quality) = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        if let Some(db) = state_lock.as_ref() {
+        if let Some(db) = state.ctx.db.get() {
             let conn = db.conn();
             let res_str = if let Some(res_param) = resolution.as_deref() {
                 res_param.to_string()
@@ -142,8 +141,7 @@ pub async fn read_fits_image_annotated(
 
     // ── Step 1: Read settings from DB ──
     let (resolution_str, quality) = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        if let Some(db) = state_lock.as_ref() {
+        if let Some(db) = state.ctx.db.get() {
             let conn = db.conn();
             let res_str = if let Some(res_param) = resolution.as_deref() {
                 res_param.to_string()

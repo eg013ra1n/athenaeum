@@ -13,8 +13,7 @@ use super::AppState;
 /// - Unorganized locations: Frames not in any set, clustered by sky coordinates
 #[tauri::command]
 pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<ImagingLocation>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Query both organized frame sets AND unorganized frames
@@ -203,8 +202,7 @@ pub async fn query_frames_in_bounds(
     state: State<'_, AppState>,
     bounds: SelectionBounds,
 ) -> Result<SelectionCandidates, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Handle RA wrap-around at 0°/360° boundary

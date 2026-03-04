@@ -104,8 +104,7 @@ pub async fn get_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
 ) -> Result<Json<WbppExportConfig>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let config = load_wbpp_config(&conn).map_err(db_err)?;
@@ -117,8 +116,7 @@ pub async fn set_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(args): Json<SetWbppExportConfigArgs>,
 ) -> Result<Json<WbppExportConfig>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let json = serde_json::to_string(&args.config).map_err(db_err)?;
@@ -136,8 +134,7 @@ pub async fn reset_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
 ) -> Result<Json<WbppExportConfig>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     conn.execute(
@@ -156,8 +153,7 @@ pub async fn get_export_preview(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<ExportData>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let data = collect_export_data(&conn, args.frame_set_id).map_err(db_err)?;
@@ -169,8 +165,7 @@ pub async fn get_exportable_frame_sets(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
 ) -> Result<Json<Vec<ExportableFrameSet>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let mut stmt = conn
@@ -228,8 +223,7 @@ pub async fn get_calibration_route(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<CalibrationRoute>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     // Collect export data
@@ -484,8 +478,7 @@ pub async fn get_export_summary(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<ExportSummary>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let config = load_wbpp_config(&conn).unwrap_or_default();
@@ -536,8 +529,7 @@ pub async fn export_to_wbpp(
 
     // Collect export data and config — release the DB lock immediately after
     let (export_data, config) = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(no_db)?;
+        let db = state.ctx.db.get().ok_or_else(no_db)?;
         let conn = db.conn();
 
         let data = collect_export_data(&conn, frame_set_id).map_err(db_err)?;

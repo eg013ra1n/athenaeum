@@ -14,8 +14,7 @@ use super::AppState;
 pub async fn get_equipment_cameras(
     state: State<'_, AppState>
 ) -> Result<Vec<CameraStats>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_all_cameras(&conn).map_err(|e| e.to_string())
@@ -26,8 +25,7 @@ pub async fn create_dark_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<DarkLibraryResult, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get thresholds from settings
@@ -53,8 +51,7 @@ pub async fn get_dark_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<Vec<CalibrationSetDetail>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_camera_dark_library(&conn, &instrume).map_err(|e| e.to_string())
@@ -65,8 +62,7 @@ pub async fn delete_dark_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::delete_camera_dark_library(&conn, &instrume).map_err(|e| e.to_string())
@@ -77,8 +73,7 @@ pub async fn has_dark_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<bool, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::has_dark_library(&conn, &instrume).map_err(|e| e.to_string())
@@ -89,8 +84,7 @@ pub async fn create_master_dark_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<DarkLibraryResult, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get thresholds from settings
@@ -116,8 +110,7 @@ pub async fn get_master_dark_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<Vec<CalibrationSetDetail>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_camera_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
@@ -128,8 +121,7 @@ pub async fn has_master_dark_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<bool, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::has_master_dark_library(&conn, &instrume).map_err(|e| e.to_string())
@@ -140,8 +132,7 @@ pub async fn create_master_flat_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<DarkLibraryResult, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get thresholds from settings
@@ -167,8 +158,7 @@ pub async fn get_master_flat_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<Vec<CalibrationSetDetail>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_camera_master_flat_library(&conn, &instrume).map_err(|e| e.to_string())
@@ -179,8 +169,7 @@ pub async fn has_master_flat_library(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<bool, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::has_master_flat_library(&conn, &instrume).map_err(|e| e.to_string())
@@ -191,8 +180,7 @@ pub async fn get_calibration_set_frames(
     state: State<'_, AppState>,
     set_id: i64,
 ) -> Result<Vec<crate::models::FileWithFrame>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_frames_for_calibration_set(&conn, set_id).map_err(|e| e.to_string())
@@ -213,8 +201,7 @@ pub async fn find_calibration_for_frame_set(
     use crate::calibration::processor::process_frame_set;
     use crate::models::CalibrationTolerance;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get frame set metadata (flat_pattern, date ranges)
@@ -286,8 +273,7 @@ pub async fn get_calibration_status(
 ) -> Result<crate::models::CalibrationStats, String> {
     use crate::db::calibration_links::get_calibration_statistics;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     get_calibration_statistics(&conn, frame_set_id).map_err(|e| e.to_string())
@@ -301,8 +287,7 @@ pub async fn get_frame_set_calibration_groups(
 ) -> Result<crate::models::FrameSetCalibrationGroups, String> {
     use crate::db::calibration_links::get_calibration_groups_for_frame_set;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     get_calibration_groups_for_frame_set(&conn, frame_set_id).map_err(|e| e.to_string())
@@ -316,8 +301,7 @@ pub async fn get_calibration_hierarchy_for_frame_set(
 ) -> Result<crate::models::CalibrationHierarchyView, String> {
     use crate::db::calibration_links::get_calibration_hierarchy_for_frame_set as get_hierarchy;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     get_hierarchy(&conn, frame_set_id).map_err(|e| e.to_string())
@@ -334,8 +318,7 @@ pub async fn get_frame_calibration_hierarchy(
     use crate::calibration::hierarchy::build_complete_hierarchy;
     use crate::models::CalibrationTolerance;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get frame data
@@ -444,8 +427,7 @@ pub async fn get_flat_group_options_for_frame_set(
     use crate::calibration::flat_groups::detect_flat_groups;
     use crate::calibration::processor::get_light_frames_from_frame_set;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Load calibration config
@@ -538,8 +520,7 @@ pub async fn clear_calibration_links(
 ) -> Result<usize, String> {
     use crate::calibration::processor::clear_calibration_links_for_frame_set;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     println!("Clearing calibration links for frame set {}", frame_set_id);
@@ -560,8 +541,7 @@ pub async fn get_frame_calibration_links(
 ) -> Result<Vec<crate::models::CalibrationLink>, String> {
     use crate::db::calibration_links::get_links_for_frame;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     get_links_for_frame(&conn, frame_id).map_err(|e| e.to_string())
@@ -575,8 +555,7 @@ pub async fn get_frame_status(
 ) -> Result<crate::models::FrameCalibrationStatus, String> {
     use crate::db::calibration_links::get_frame_calibration_status;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     get_frame_calibration_status(&conn, frame_id).map_err(|e| e.to_string())
@@ -591,8 +570,7 @@ const CALIBRATION_CONFIG_KEY: &str = "calibration.matching_config";
 pub async fn get_calibration_matching_config(
     state: State<'_, AppState>,
 ) -> Result<crate::calibration::CalibrationMatchingConfig, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Try to get from settings
@@ -621,8 +599,7 @@ pub async fn set_calibration_matching_config(
     // Validate config before saving (ensures warning_threshold <= matching_threshold)
     config.validate()?;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let json = config.to_json()
@@ -637,8 +614,7 @@ pub async fn set_calibration_matching_config(
 pub async fn reset_calibration_matching_config(
     state: State<'_, AppState>,
 ) -> Result<crate::calibration::CalibrationMatchingConfig, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let default_config = crate::calibration::CalibrationMatchingConfig::default();
@@ -661,8 +637,7 @@ pub async fn get_light_frame_parameters(
 ) -> Result<LightFrameParameters, String> {
     use crate::db::calibration_links::get_links_for_frame;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     if frame_ids.is_empty() {
@@ -780,8 +755,7 @@ pub async fn get_calibration_sets_for_manual_selection(
     show_all: bool,
     state: State<'_, AppState>,
 ) -> Result<Vec<CalibrationSetWithScore>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     if frame_ids.is_empty() {
@@ -894,8 +868,7 @@ pub async fn manual_assign_calibration(
 ) -> Result<usize, String> {
     use crate::db::calibration_links::insert_calibration_link;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     if frame_ids.is_empty() {
@@ -948,8 +921,7 @@ pub async fn clear_manual_calibration_override(
     calibration_type: Option<String>,  // None = clear all types
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     if frame_ids.is_empty() {
@@ -1408,8 +1380,7 @@ pub async fn refresh_calibration_library_for_camera(
     state: State<'_, AppState>,
     instrume: String,
 ) -> Result<CalibrationScanResult, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     refresh_calibration_library_inner(&conn, &instrume)
@@ -1451,8 +1422,7 @@ pub async fn cleanup_duplicate_flat_subcalibrations(
     use crate::calibration::configurable_matcher::load_config;
     use rusqlite::params;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Load config to determine fallback priority
@@ -1549,8 +1519,7 @@ pub async fn get_calibration_set_parameters(
 ) -> Result<CalibrationSetParameters, String> {
     use crate::db::calibration_links::get_links_for_calibration_set;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get calibration set details
@@ -1620,8 +1589,7 @@ pub async fn get_subcalibration_sets_for_manual_selection(
     show_all: bool,
     state: State<'_, AppState>,
 ) -> Result<Vec<CalibrationSetWithScore>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Check if this is a master set - masters don't need sub-calibration
@@ -1881,8 +1849,7 @@ pub async fn manual_assign_subcalibration(
 ) -> Result<(), String> {
     use crate::db::calibration_links::insert_calibration_link;
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Validate calibration_type
@@ -1923,8 +1890,7 @@ pub async fn clear_subcalibration_override(
     calibration_type: Option<String>,  // None = clear all sub-calibrations
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let deleted = match &calibration_type {
@@ -1962,8 +1928,7 @@ pub async fn bulk_update_calibration_metadata(
     edits: crate::models::CalibrationMetadataEdits,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     if set_ids.is_empty() {
@@ -2060,8 +2025,7 @@ pub async fn bulk_restore_calibration_metadata(
     set_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     if set_ids.is_empty() {
@@ -2110,8 +2074,7 @@ pub async fn get_custom_metadata_set_ids(
     instrume: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<i64>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let mut stmt = conn.prepare(
@@ -2134,8 +2097,7 @@ pub async fn get_calibration_set_originals(
     set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<Option<crate::models::CalibrationSetOriginals>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let mut stmt = conn.prepare(

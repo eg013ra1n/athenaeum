@@ -9,7 +9,7 @@ use crate::rustafits_processor::AnnotationMetrics;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Handle to track an active scan operation.
 pub struct ScanHandle {
@@ -25,7 +25,7 @@ pub struct ExportHandle {
 
 /// Shared application state accessible from any backend (Tauri, Axum, CLI).
 pub struct ServiceContext {
-    pub db: Mutex<Option<Database>>,
+    pub db: OnceLock<Database>,
     pub settings: Arc<SettingsManager>,
     pub memory_cache: Arc<Mutex<MemoryImageCache>>,
     pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,

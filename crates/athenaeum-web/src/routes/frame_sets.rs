@@ -254,8 +254,7 @@ pub async fn auto_generate_frame_sets(
 ) -> Result<Json<AutoGenerateResult>, (StatusCode, String)> {
     use athenaeum_core::db;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     // Resolve threshold: use provided value or fall back to persisted setting.
@@ -389,8 +388,7 @@ pub async fn get_frames_sets(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramesSetsArgs>,
 ) -> Result<Json<Vec<FramesSetWithCount>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let project_id = args.project_id.unwrap_or(1);
@@ -412,8 +410,7 @@ pub async fn get_frame_set_detail(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<athenaeum_core::models::FrameSetDetail>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let detail = load_frame_set_detail(&conn, args.frames_set_id).map_err(db_err)?;
@@ -425,8 +422,7 @@ pub async fn delete_frames_set(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteFramesSetArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     athenaeum_core::db::delete_frames_set(&conn, args.frames_set_id).map_err(db_err)?;
@@ -438,8 +434,7 @@ pub async fn delete_auto_generated_frame_sets(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let n = athenaeum_core::db::delete_auto_generated_frame_sets(&conn).map_err(db_err)?;
@@ -451,8 +446,7 @@ pub async fn rename_frames_set(
     State(state): State<WebAppState>,
     Json(args): Json<RenameFramesSetArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     athenaeum_core::db::update_frames_set_name(&conn, args.frames_set_id, &args.new_name).map_err(db_err)?;
@@ -466,8 +460,7 @@ pub async fn mark_frame_set_custom(
 ) -> Result<Json<athenaeum_core::models::FramesSet>, (StatusCode, String)> {
     use athenaeum_core::db;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let metadata =
@@ -506,8 +499,7 @@ pub async fn recalculate_frame_set_metadata(
 ) -> Result<Json<athenaeum_core::models::FramesSet>, (StatusCode, String)> {
     use athenaeum_core::db;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
@@ -556,8 +548,7 @@ pub async fn merge_frame_sets(
     }
 
     {
-        let lock = state.ctx.db.lock().unwrap();
-        let db_ref = lock.as_ref().ok_or_else(no_db)?;
+        let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
         let conn = db_ref.conn();
 
         let source_nights =
@@ -627,11 +618,10 @@ pub async fn merge_frame_sets(
         .map_err(db_err)?;
 
         db::delete_frames_set(&conn, args.source_id).map_err(db_err)?;
-    } // lock released here
+    }
 
-    // Re-acquire to return detail
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    // Return detail
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
     let detail = load_frame_set_detail(&conn, args.target_id).map_err(db_err)?;
     Ok(Json(detail))
@@ -646,8 +636,7 @@ pub async fn can_split(
     use athenaeum_core::db;
     use athenaeum_core::models::SplitSelection;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let all_nights = db::get_imaging_nights_for_set(&conn, args.source_set_id).map_err(db_err)?;
@@ -692,8 +681,7 @@ pub async fn split_frame_set(
     use athenaeum_core::models::SplitSelection;
 
     let new_set_id = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db_ref = lock.as_ref().ok_or_else(no_db)?;
+        let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
         let conn = db_ref.conn();
 
         // Validate: split must not leave the source empty.
@@ -879,11 +867,10 @@ pub async fn split_frame_set(
         .map_err(db_err)?;
 
         new_set_id
-    }; // lock released here
+    };
 
     // Return detail of the newly created set.
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
     let detail = load_frame_set_detail(&conn, new_set_id).map_err(db_err)?;
     Ok(Json(detail))
@@ -896,8 +883,7 @@ pub async fn create_custom_frames_set(
 ) -> Result<Json<i64>, (StatusCode, String)> {
     use athenaeum_core::db;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     // Collect frames for each selected session.
@@ -1005,8 +991,7 @@ pub async fn create_frame_set_from_selection(
     State(state): State<WebAppState>,
     Json(args): Json<CreateFrameSetFromSelectionArgs>,
 ) -> Result<Json<i64>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let set_id = create_frame_set_inner(&conn, &args.name, &args.frame_ids, &state.ctx.settings)
@@ -1023,8 +1008,7 @@ pub async fn create_frame_set_from_excluded(
 ) -> Result<Json<i64>, (StatusCode, String)> {
     use athenaeum_core::db;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let frame_ids = db::get_frame_ids_for_file_ids(&conn, &args.file_ids).map_err(db_err)?;
@@ -1078,8 +1062,7 @@ pub async fn get_excluded_frames(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<Vec<athenaeum_core::models::ExcludedFrameEntry>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let entries = athenaeum_core::db::get_excluded_frames(&conn).map_err(db_err)?;
@@ -1091,8 +1074,7 @@ pub async fn get_excluded_frames_count(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<i64>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let count = athenaeum_core::db::get_excluded_frames_count(&conn).map_err(db_err)?;
@@ -1107,8 +1089,7 @@ pub async fn reclassify_excluded_frames(
 ) -> Result<Json<ReclassifyResult>, (StatusCode, String)> {
     use athenaeum_core::db;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     let (frames_updated, cameras) =
@@ -1204,8 +1185,7 @@ pub async fn update_frame_set_flat_pattern(
     State(state): State<WebAppState>,
     Json(args): Json<UpdateFrameSetFlatPatternArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     athenaeum_core::db::update_frames_set_flat_pattern(
@@ -1223,8 +1203,7 @@ pub async fn archive_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, true).map_err(db_err)?;
@@ -1236,8 +1215,7 @@ pub async fn unarchive_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db_ref = lock.as_ref().ok_or_else(no_db)?;
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db_ref.conn();
 
     athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, false).map_err(db_err)?;

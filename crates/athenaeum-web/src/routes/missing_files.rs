@@ -91,8 +91,7 @@ pub async fn check_missing_files_in_scan_root(
 
     // Collect files from database
     let files = {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(no_db)?;
+        let db = state.ctx.db.get().ok_or_else(no_db)?;
         let conn = db.conn();
 
         let path: String = conn
@@ -150,8 +149,7 @@ pub async fn sync_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<SyncMissingFilesArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -213,8 +211,7 @@ pub async fn get_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<RootIdArgs>,
 ) -> Result<Json<Vec<MissingFileRecord>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     get_missing_files_internal(&conn, args.root_id)
@@ -231,8 +228,7 @@ pub async fn recheck_missing_files(
     let root_id = args.root_id;
 
     {
-        let lock = state.ctx.db.lock().unwrap();
-        let db = lock.as_ref().ok_or_else(no_db)?;
+        let db = state.ctx.db.get().ok_or_else(no_db)?;
         let conn = db.conn();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -284,8 +280,7 @@ pub async fn recheck_missing_files(
     }
 
     // Return updated list
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
     get_missing_files_internal(&conn, root_id)
 }
@@ -295,8 +290,7 @@ pub async fn ignore_missing_file(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     conn.execute(
@@ -313,8 +307,7 @@ pub async fn unignore_missing_file(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     conn.execute(
@@ -337,8 +330,7 @@ pub async fn delete_missing_files(
         return Ok(Json(()));
     }
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let placeholders: Vec<String> = args.file_ids.iter().map(|_| "?".to_string()).collect();

@@ -72,9 +72,7 @@ pub async fn get_files(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesArgs>,
 ) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -97,9 +95,7 @@ pub async fn get_files_by_directory(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesByDirectoryArgs>,
 ) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -145,9 +141,7 @@ pub async fn get_directory_contents(
     subdirectories.sort();
 
     // Look up files from the database for this directory
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -173,9 +167,7 @@ pub async fn get_camera_directories(
     State(state): State<WebAppState>,
     Json(args): Json<GetCameraDirectoriesArgs>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -224,9 +216,7 @@ pub async fn get_camera_directory_contents(
     subdirectories.sort();
 
     // Look up files for this camera from the database
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -255,9 +245,7 @@ pub async fn get_frames_with_missing_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramesWithMissingMetadataArgs>,
 ) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -284,9 +272,7 @@ pub async fn get_files_with_frames_by_ids(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesWithFramesByIdsArgs>,
 ) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 

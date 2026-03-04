@@ -12,8 +12,7 @@ pub async fn auto_generate_frame_sets(
     threshold_deg: Option<f64>,
     state: State<'_, AppState>,
 ) -> Result<AutoGenerateResult, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Use provided threshold or get from settings
@@ -150,8 +149,7 @@ pub async fn get_frames_sets(
     project_id: i64,
     state: State<'_, AppState>,
 ) -> Result<Vec<FramesSetWithCount>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let sets = db::get_frames_sets_by_project(&conn, project_id)
@@ -172,8 +170,7 @@ pub async fn delete_frames_set(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::delete_frames_set(&conn, frames_set_id).map_err(|e| e.to_string())
@@ -184,8 +181,7 @@ pub async fn delete_frames_set(
 pub async fn delete_auto_generated_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::delete_auto_generated_frame_sets(&conn).map_err(|e| e.to_string())
@@ -198,8 +194,7 @@ pub async fn rename_frames_set(
     new_name: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::update_frames_set_name(&conn, frames_set_id, &new_name).map_err(|e| e.to_string())
@@ -211,8 +206,7 @@ pub async fn mark_frame_set_custom(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<FramesSet, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get current metadata to preserve it
@@ -253,8 +247,7 @@ pub async fn recalculate_frame_set_metadata(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<FramesSet, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Calculate metadata from all frames in the set
@@ -298,8 +291,7 @@ pub async fn update_frame_set_flat_pattern(
     flat_pattern: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::update_frames_set_flat_pattern(&conn, frame_set_id, Some(&flat_pattern))
@@ -325,8 +317,7 @@ pub async fn merge_frame_sets(
 
     // Perform all database operations in a scope so conn is dropped before we call get_frame_set_detail
     {
-        let state_lock = state.ctx.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
 
         // Get all nights from source frame set
@@ -438,7 +429,7 @@ pub async fn merge_frame_sets(
             .map_err(|e| format!("Failed to delete source frame set: {}", e))?;
 
         println!("✅ Merge completed successfully");
-    } // state_lock and conn are dropped here
+    } // conn is dropped here
 
     // Return the updated target frame set detail
     get_frame_set_detail(target_id, state).await
@@ -451,8 +442,7 @@ pub async fn can_split(
     selection: crate::models::SplitSelection,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get all nights in the source set
@@ -508,8 +498,7 @@ pub async fn split_frame_set(
 
     // Perform all database operations in a scope
     let new_set_id = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
 
         // Validate that split won't leave source empty (inline to avoid nested locks)
@@ -723,7 +712,7 @@ pub async fn split_frame_set(
         println!("✅ Split completed successfully");
 
         new_set_id
-    }; // state_lock and conn are dropped here
+    }; // conn is dropped here
 
     // Return the new frame set detail
     get_frame_set_detail(new_set_id, state).await
@@ -735,8 +724,7 @@ pub async fn get_frame_set_detail(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<FrameSetDetail, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get the frame set
@@ -780,8 +768,7 @@ pub async fn create_custom_frames_set(
 ) -> Result<i64, String> {
     println!("Creating custom frames set: name='{}', session_ids={:?}", name, session_ids);
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Get frames for all selected sessions to determine date ranges
@@ -1049,8 +1036,7 @@ pub async fn create_frame_set_from_selection(
         frame_ids.len()
     );
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     create_frame_set_inner(&conn, &name, &frame_ids, &state.ctx.settings)
@@ -1070,8 +1056,7 @@ pub async fn create_frame_set_from_excluded(
         name
     );
 
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Map file_ids → frame_ids
@@ -1120,8 +1105,7 @@ pub async fn reclassify_excluded_frames(
     new_imagetyp: String,
     state: State<'_, AppState>,
 ) -> Result<ReclassifyResult, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     println!(
@@ -1160,8 +1144,7 @@ pub async fn reclassify_excluded_frames(
 pub async fn get_excluded_frames_count(
     state: State<'_, AppState>,
 ) -> Result<i64, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_excluded_frames_count(&conn).map_err(|e| e.to_string())
@@ -1172,8 +1155,7 @@ pub async fn get_excluded_frames_count(
 pub async fn get_excluded_frames(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::ExcludedFrameEntry>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_excluded_frames(&conn).map_err(|e| e.to_string())
@@ -1201,8 +1183,7 @@ pub async fn archive_frame_set(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::set_frame_set_archived(&conn, frames_set_id, true)
@@ -1215,8 +1196,7 @@ pub async fn unarchive_frame_set(
     frames_set_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::set_frame_set_archived(&conn, frames_set_id, false)

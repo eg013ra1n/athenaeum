@@ -71,8 +71,7 @@ pub async fn get_equipment_cameras(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<Vec<athenaeum_core::models::CameraStats>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let cameras = db::get_all_cameras(&conn).map_err(db_err)?;
@@ -86,8 +85,7 @@ pub async fn create_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<athenaeum_core::models::DarkLibraryResult>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let date_threshold = state.ctx.settings
@@ -115,8 +113,7 @@ pub async fn get_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetDetail>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let sets = db::get_camera_dark_library(&conn, &args.instrume).map_err(db_err)?;
@@ -130,8 +127,7 @@ pub async fn delete_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     db::delete_camera_dark_library(&conn, &args.instrume).map_err(db_err)?;
@@ -145,8 +141,7 @@ pub async fn has_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let has = db::has_dark_library(&conn, &args.instrume).map_err(db_err)?;
@@ -162,8 +157,7 @@ pub async fn create_master_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<athenaeum_core::models::DarkLibraryResult>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let date_threshold = state.ctx.settings
@@ -191,8 +185,7 @@ pub async fn get_master_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetDetail>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let sets = db::get_camera_master_dark_library(&conn, &args.instrume).map_err(db_err)?;
@@ -206,8 +199,7 @@ pub async fn has_master_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let has = db::has_master_dark_library(&conn, &args.instrume).map_err(db_err)?;
@@ -223,8 +215,7 @@ pub async fn create_master_flat_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<athenaeum_core::models::DarkLibraryResult>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let date_threshold = state.ctx.settings
@@ -252,8 +243,7 @@ pub async fn get_master_flat_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetDetail>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let sets = db::get_camera_master_flat_library(&conn, &args.instrume).map_err(db_err)?;
@@ -267,8 +257,7 @@ pub async fn has_master_flat_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let has = db::has_master_flat_library(&conn, &args.instrume).map_err(db_err)?;
@@ -289,8 +278,7 @@ pub async fn refresh_calibration_library_for_camera(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<athenaeum_core::calibration::scan_integration::CalibrationScanResult>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let instrume = &args.instrume;
@@ -378,8 +366,7 @@ pub async fn get_calibration_set_frames(
     State(state): State<WebAppState>,
     Json(args): Json<SetIdArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::FileWithFrame>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let frames = db::get_frames_for_calibration_set(&conn, args.set_id).map_err(db_err)?;
@@ -397,8 +384,7 @@ pub async fn find_calibration_for_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FindCalibrationArgs>,
 ) -> Result<Json<processor::ProcessingStats>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let frame_set_id = args.frame_set_id;
@@ -485,8 +471,7 @@ pub async fn get_calibration_status(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<athenaeum_core::models::CalibrationStats>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let stats = calibration_links::get_calibration_statistics(&conn, args.frame_set_id)
@@ -505,8 +490,7 @@ pub async fn get_calibration_matching_config(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<CalibrationMatchingConfig>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let config_json = db::get_setting(&conn, CALIBRATION_CONFIG_KEY).map_err(db_err)?;
@@ -531,8 +515,7 @@ pub async fn set_calibration_matching_config(
     // Validate before acquiring the DB lock so we fail fast on bad input.
     config.validate().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let json = config
@@ -551,8 +534,7 @@ pub async fn reset_calibration_matching_config(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
 ) -> Result<Json<CalibrationMatchingConfig>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let default_config = CalibrationMatchingConfig::default();
@@ -577,8 +559,7 @@ pub async fn get_calibration_hierarchy_for_frame_set(
 ) -> Result<Json<athenaeum_core::models::CalibrationHierarchyView>, (StatusCode, String)> {
     use athenaeum_core::db::calibration_links::get_calibration_hierarchy_for_frame_set as get_hierarchy;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let hierarchy = get_hierarchy(&conn, args.frame_set_id).map_err(db_err)?;
@@ -654,8 +635,7 @@ pub async fn get_calibration_set_parameters(
 ) -> Result<Json<athenaeum_core::models::CalibrationSetParameters>, (StatusCode, String)> {
     use athenaeum_core::db::calibration_links::get_links_for_calibration_set;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let mut stmt = conn.prepare(
@@ -716,8 +696,7 @@ pub async fn get_light_frame_parameters(
 ) -> Result<Json<athenaeum_core::models::LightFrameParameters>, (StatusCode, String)> {
     use athenaeum_core::db::calibration_links::get_links_for_frame;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     if args.frame_ids.is_empty() {
@@ -755,8 +734,7 @@ pub async fn get_calibration_sets_for_manual_selection(
     State(state): State<WebAppState>,
     Json(args): Json<GetCalibrationSetsForManualSelectionArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetWithScore>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     if args.frame_ids.is_empty() {
@@ -778,8 +756,7 @@ pub async fn get_subcalibration_sets_for_manual_selection(
     State(state): State<WebAppState>,
     Json(args): Json<GetSubcalibrationSetsArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetWithScore>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     // Check if master set — masters don't need sub-calibration
@@ -846,8 +823,7 @@ pub async fn manual_assign_calibration(
     use athenaeum_core::db::calibration_links::insert_calibration_link;
     use athenaeum_core::models::CalibrationLink;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     if args.frame_ids.is_empty() {
@@ -902,8 +878,7 @@ pub async fn manual_assign_subcalibration(
     use athenaeum_core::db::calibration_links::insert_calibration_link;
     use athenaeum_core::models::CalibrationLink;
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let valid_types = ["Dark", "DarkFlat", "Bias"];
@@ -943,8 +918,7 @@ pub async fn clear_subcalibration_override(
     State(state): State<WebAppState>,
     Json(args): Json<ClearSubcalibrationOverrideArgs>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let deleted = match &args.calibration_type {
@@ -979,8 +953,7 @@ pub async fn bulk_update_calibration_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<BulkUpdateCalibrationMetadataArgs>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     if args.set_ids.is_empty() {
@@ -1065,8 +1038,7 @@ pub async fn bulk_restore_calibration_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<BulkRestoreCalibrationMetadataArgs>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     if args.set_ids.is_empty() {
@@ -1109,8 +1081,7 @@ pub async fn get_custom_metadata_set_ids(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
 ) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock.as_ref().ok_or_else(no_db)?;
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     let mut stmt = conn.prepare(

@@ -13,8 +13,7 @@ pub async fn get_files(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let files = db::get_files(&conn, limit).map_err(|e| e.to_string())?;
@@ -32,8 +31,7 @@ pub async fn get_files_by_directory(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let files = db::get_files_by_directory(&conn, &directory_path, limit).map_err(|e| e.to_string())?;
@@ -51,8 +49,7 @@ pub async fn get_frames_with_missing_metadata(
     category: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let files = db::get_frames_with_missing_metadata(&conn, &category).map_err(|e| e.to_string())?;
@@ -66,8 +63,7 @@ pub async fn get_frames_with_missing_metadata(
 /// Get duplicate file groups (from cache)
 #[tauri::command]
 pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateGroup>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     // Check setting to determine which hash type to use
@@ -112,10 +108,7 @@ pub async fn get_directory_contents(
     }
 
     // Get files from database for this directory
-    println!("📂 get_directory_contents acquiring lock for {}", directory_path);
-    let state_lock = state.ctx.db.lock().unwrap();
-    println!("📂 get_directory_contents lock acquired for {}", directory_path);
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let db_files = db::get_files_by_directory(&conn, &directory_path, None)
@@ -128,7 +121,6 @@ pub async fn get_directory_contents(
 
     subdirectories.sort();
 
-    println!("📂 get_directory_contents done, releasing lock");
     Ok(DirectoryContents {
         subdirectories,
         files: files_in_dir,
@@ -141,8 +133,7 @@ pub async fn get_orphaned_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::OrphanedFile>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     crate::relinking::get_orphaned_file_details(&conn, &file_ids)
@@ -155,8 +146,7 @@ pub async fn delete_orphaned_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     crate::relinking::delete_orphaned_files(&conn, &file_ids)
@@ -174,8 +164,7 @@ pub async fn get_frame_preview(
 
     // Get file path for this frame
     let file_path: String = {
-        let state_lock = state.ctx.db.lock().unwrap();
-        let db = state_lock.as_ref().ok_or("Database not initialized")?;
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
 
         conn.query_row(
@@ -209,8 +198,7 @@ pub async fn get_files_with_frames_by_ids(
     frame_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<FileWithFrame>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids)
@@ -251,8 +239,7 @@ pub async fn get_camera_directories(
     instrume: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     db::get_camera_directories(&conn, &instrume).map_err(|e| e.to_string())
@@ -296,8 +283,7 @@ pub async fn get_camera_directory_contents(
     }
 
     // Get files from database filtered by camera
-    let state_lock = state.ctx.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
     let db_files = db::get_files_by_directory_for_camera(&conn, &directory_path, &instrume, None)

@@ -207,11 +207,9 @@ async fn sse_handler(
 async fn initialize_database(
     State(state): State<WebAppState>,
 ) -> Result<Json<String>, (StatusCode, Json<serde_json::Value>)> {
-    let lock = state.ctx.db.lock().unwrap();
-    if lock.is_some() {
+    if state.ctx.db.get().is_some() {
         return Ok(Json("Database already initialized".to_string()));
     }
-    drop(lock);
     // In web mode, DB is initialized at server start — this is a no-op
     Ok(Json("Database initialized at server start".to_string()))
 }
@@ -228,8 +226,7 @@ async fn get_log_path() -> Json<Option<String>> {
 async fn get_database_path(
     State(state): State<WebAppState>,
 ) -> Json<Option<String>> {
-    let lock = state.ctx.db.lock().unwrap();
-    let path = lock.as_ref().map(|db| db.path().to_string_lossy().to_string());
+    let path = state.ctx.db.get().map(|db| db.path().to_string_lossy().to_string());
     Json(path)
 }
 

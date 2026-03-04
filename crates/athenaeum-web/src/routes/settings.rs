@@ -38,9 +38,7 @@ pub async fn get_setting(
     State(state): State<WebAppState>,
     Json(args): Json<GetSettingArgs>,
 ) -> Result<Json<String>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -62,9 +60,7 @@ pub async fn set_setting(
     State(state): State<WebAppState>,
     Json(args): Json<SetSettingArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -93,9 +89,7 @@ pub async fn get_all_settings(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<Vec<Setting>>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -113,9 +107,7 @@ pub async fn delete_setting(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteSettingArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -191,9 +183,7 @@ pub async fn set_blink_threads(
 ) -> Result<Json<()>, (StatusCode, String)> {
     let threads = args.threads.clamp(1, state.max_blink_threads);
 
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
@@ -220,9 +210,7 @@ pub async fn get_grouping_threshold_deg(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<f64>, (StatusCode, String)> {
-    let lock = state.ctx.db.lock().unwrap();
-    let db = lock
-        .as_ref()
+    let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
