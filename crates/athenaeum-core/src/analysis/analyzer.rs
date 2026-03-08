@@ -5,20 +5,19 @@ use std::sync::Arc;
 use crate::models::FrameAnalysis;
 use super::config::AnalysisConfig;
 
-/// Analyze a single frame file and return metrics.
-/// The returned FrameAnalysis has `frame_id` and `file_id` set to 0 — the caller must fill these in.
-pub fn analyze_frame(
-    path: &str,
+/// Build an `ImageAnalyzer` from an `AnalysisConfig`.
+/// Used by both batch analysis and blink annotation to ensure identical parameters.
+pub fn build_analyzer(
     config: &AnalysisConfig,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
-) -> Result<FrameAnalysis> {
+) -> ImageAnalyzer {
     let mut analyzer = ImageAnalyzer::new()
         .with_detection_sigma(config.detection_sigma as f32)
         .with_min_star_area(config.min_star_area as usize)
         .with_max_star_area(config.max_star_area as usize)
         .with_saturation_fraction(config.saturation_fraction as f32)
+        .with_max_measure(config.max_stars as usize)
         .with_max_stars(config.max_stars as usize)
-        .with_max_eccentricity(config.max_eccentricity as f32)
         .with_trail_threshold(config.trail_threshold as f32);
 
     if !config.use_gaussian_fit {
@@ -29,10 +28,43 @@ pub fn analyze_frame(
         analyzer = analyzer.with_background_mesh(mesh_size as usize);
     }
 
+    if config.use_moffat_fit {
+        analyzer = analyzer.with_moffat_fit();
+    } else {
+        analyzer = analyzer.without_moffat_fit();
+    }
+
+    if config.iterative_background > 0 {
+        analyzer = analyzer.with_iterative_background(config.iterative_background as usize);
+    }
+
+    if config.mrs_noise > 0 {
+        analyzer = analyzer.with_mrs_noise(config.mrs_noise as usize);
+    }
+
+    if let Some(beta) = config.moffat_beta {
+        analyzer = analyzer.with_moffat_beta(beta);
+    }
+
+    if let Some(max_dist) = config.max_distortion {
+        analyzer = analyzer.with_max_distortion(max_dist);
+    }
+
     if let Some(pool) = thread_pool {
         analyzer = analyzer.with_thread_pool(pool);
     }
 
+    analyzer
+}
+
+/// Analyze a single frame file and return metrics.
+/// The returned FrameAnalysis has `frame_id` and `file_id` set to 0 — the caller must fill these in.
+pub fn analyze_frame(
+    path: &str,
+    config: &AnalysisConfig,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
+) -> Result<FrameAnalysis> {
+    let analyzer = build_analyzer(config, thread_pool);
     let result = analyzer.analyze(path)?;
 
     Ok(FrameAnalysis {
@@ -55,6 +87,7 @@ pub fn analyze_frame(
         source_channels: result.source_channels as i64,
         trail_r_squared: result.trail_r_squared as f64,
         possibly_trailed: result.possibly_trailed,
+        median_beta: result.median_beta.map(|v| v as f64),
         quality_score: None,
         config_hash: Some(config.config_hash()),
         analyzed_at: chrono::Utc::now().to_rfc3339(),

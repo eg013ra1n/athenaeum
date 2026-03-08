@@ -841,6 +841,7 @@ export interface FrameAnalysis {
   source_channels: number;
   trail_r_squared: number;
   possibly_trailed: boolean;
+  median_beta: number | null;
   quality_score: number | null;
   config_hash: string | null;
   analyzed_at: string;
@@ -883,6 +884,7 @@ export interface AnnotationMetrics {
   psf_signal: number;
   trail_r_squared: number;
   possibly_trailed: boolean;
+  median_beta: number | null;
 }
 
 /** Response from read_fits_image_annotated command */

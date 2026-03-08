@@ -9,8 +9,8 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
             median_snr, median_hfr, snr_db, snr_weight, psf_signal,
             background, noise, detection_threshold, width, height,
             source_channels, trail_r_squared, possibly_trailed,
-            quality_score, config_hash, analyzed_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            median_beta, quality_score, config_hash, analyzed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             a.frame_id,
             a.file_id,
@@ -30,6 +30,7 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
             a.source_channels,
             a.trail_r_squared,
             a.possibly_trailed,
+            a.median_beta,
             a.quality_score,
             a.config_hash,
             a.analyzed_at,
@@ -45,7 +46,7 @@ pub fn get_frame_analysis(conn: &Connection, frame_id: i64) -> Result<Option<Fra
                 median_snr, median_hfr, snr_db, snr_weight, psf_signal,
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
-                quality_score, config_hash, analyzed_at
+                median_beta, quality_score, config_hash, analyzed_at
          FROM frame_analysis WHERE frame_id = ?1"
     )?;
 
@@ -69,7 +70,7 @@ pub fn get_frame_analyses_by_ids(conn: &Connection, frame_ids: &[i64]) -> Result
                 median_snr, median_hfr, snr_db, snr_weight, psf_signal,
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
-                quality_score, config_hash, analyzed_at
+                median_beta, quality_score, config_hash, analyzed_at
          FROM frame_analysis WHERE frame_id IN ({})",
         placeholders.join(", ")
     );
@@ -92,7 +93,7 @@ pub fn get_frame_analyses_for_frame_set(conn: &Connection, frame_set_id: i64) ->
                 fa.median_snr, fa.median_hfr, fa.snr_db, fa.snr_weight, fa.psf_signal,
                 fa.background, fa.noise, fa.detection_threshold, fa.width, fa.height,
                 fa.source_channels, fa.trail_r_squared, fa.possibly_trailed,
-                fa.quality_score, fa.config_hash, fa.analyzed_at
+                fa.median_beta, fa.quality_score, fa.config_hash, fa.analyzed_at
          FROM frame_analysis fa
          INNER JOIN session_members sm ON sm.frame_id = fa.frame_id
          INNER JOIN sessions s ON s.id = sm.session_id
@@ -155,8 +156,9 @@ fn row_to_analysis(row: &rusqlite::Row) -> Result<FrameAnalysis> {
         source_channels: row.get(16)?,
         trail_r_squared: row.get(17)?,
         possibly_trailed: row.get(18)?,
-        quality_score: row.get(19)?,
-        config_hash: row.get(20)?,
-        analyzed_at: row.get(21)?,
+        median_beta: row.get(19)?,
+        quality_score: row.get(20)?,
+        config_hash: row.get(21)?,
+        analyzed_at: row.get(22)?,
     })
 }

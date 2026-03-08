@@ -2,7 +2,8 @@
 
 use crate::cache::CachedImage;
 use crate::commands::AppState;
-use crate::rustafits_processor::{self, AnnotationMetrics, Resolution};
+use crate::rustafits_processor::{self, AnnotationMetrics, AnnotationSettings, Resolution};
+use athenaeum_core::analysis::config as analysis_config;
 use serde::Serialize;
 use std::path::PathBuf;
 use tauri::State;
@@ -140,7 +141,7 @@ pub async fn read_fits_image_annotated(
     let path_buf = PathBuf::from(&path);
 
     // ── Step 1: Read settings from DB ──
-    let (resolution_str, quality) = {
+    let (resolution_str, quality, ann_settings, analysis_cfg) = {
         if let Some(db) = state.ctx.db.get() {
             let conn = db.conn();
             let res_str = if let Some(res_param) = resolution.as_deref() {
@@ -164,11 +165,22 @@ pub async fn read_fits_image_annotated(
                 _ => None,
             };
 
-            (res_str, q)
+            // Load annotation display settings
+            let ann: AnnotationSettings = match crate::db::get_setting(&conn, "blink.annotation_config") {
+                Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+                _ => AnnotationSettings::default(),
+            };
+
+            // Load analysis config (same settings used by batch analysis)
+            let acfg = analysis_config::load_config(&conn);
+
+            (res_str, q, ann, acfg)
         } else {
             (
                 resolution.as_deref().unwrap_or("preview").to_string(),
                 None,
+                AnnotationSettings::default(),
+                analysis_config::AnalysisConfig::default(),
             )
         }
     };
@@ -181,7 +193,15 @@ pub async fn read_fits_image_annotated(
     };
 
     // ── Step 2: Memory cache lookup (fast path) ──
-    let cache_key = format!("{}:{}:annotated", path, resolution_str);
+    // Include annotation + analysis config hashes for proper cache invalidation
+    let ann_hash = {
+        let json = serde_json::to_string(&ann_settings).unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&json, &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
+    let analysis_hash = analysis_cfg.config_hash();
+    let cache_key = format!("{}:{}:annotated:{:x}:{}", path, resolution_str, ann_hash, &analysis_hash[..8]);
 
     {
         let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
@@ -221,7 +241,7 @@ pub async fn read_fits_image_annotated(
 
     // Cache miss — process with annotations
     let result = tokio::task::block_in_place(|| {
-        rustafits_processor::process_fits_to_jpeg_annotated(&path_buf, res, quality, &state.ctx.image_pool)
+        rustafits_processor::process_fits_to_jpeg_annotated(&path_buf, res, quality, &state.ctx.image_pool, Some(&ann_settings), &analysis_cfg)
     })
     .map_err(|e| {
         let error_msg = format!("Failed to process annotated FITS image: {}", e);

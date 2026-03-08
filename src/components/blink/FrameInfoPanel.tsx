@@ -82,6 +82,9 @@ export const FrameInfoPanel: React.FC<FrameInfoPanelProps> = memo(function Frame
                 </span>
               }
             />
+            {metrics.median_beta != null && (
+              <InfoRow label="Moffat Beta" value={metrics.median_beta.toFixed(2)} />
+            )}
           </div>
         </>
       )}

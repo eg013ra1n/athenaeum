@@ -4,6 +4,8 @@ import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as Settin
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { isTauri } from '../utils/platform';
+import type { AnnotationSettings } from '../types/analysis-config';
+import { DEFAULT_ANNOTATION_SETTINGS } from '../types/analysis-config';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 
@@ -23,6 +25,7 @@ export default function Settings() {
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
   const [checkBeta, setCheckBeta] = useState(false);
+  const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -120,6 +123,19 @@ export default function Settings() {
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
       setCheckBeta(checkBetaVal.toLowerCase() === 'true');
+
+      // Load annotation settings
+      try {
+        const annJson = await api.invoke<string>('get_setting', {
+          key: 'blink.annotation_config',
+          defaultValue: '',
+        });
+        if (annJson) {
+          setAnnotationSettings({ ...DEFAULT_ANNOTATION_SETTINGS, ...JSON.parse(annJson) });
+        }
+      } catch {
+        // ignore, use defaults
+      }
     } catch (err) {
       setError(err as string);
       console.error('Failed to load settings:', err);
@@ -238,6 +254,10 @@ export default function Settings() {
         api.invoke('set_setting', {
           key: 'updates.check_beta',
           value: checkBeta ? 'true' : 'false',
+        }),
+        api.invoke('set_setting', {
+          key: 'blink.annotation_config',
+          value: JSON.stringify(annotationSettings),
         }),
       ]);
 
@@ -657,6 +677,112 @@ export default function Settings() {
               </p>
             </div>
 
+          </div>
+        </div>
+
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Star Annotation Display</h3>
+          <p className="text-xs text-content-muted mb-4">
+            Configure how star annotations appear when toggled on in the Blink Viewer.
+          </p>
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">Color Scheme</label>
+                <select
+                  value={annotationSettings.color_scheme}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, color_scheme: e.target.value }))}
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                >
+                  <option value="eccentricity">Eccentricity</option>
+                  <option value="fwhm">FWHM</option>
+                  <option value="uniform">Uniform (green)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">Line Width</label>
+                <select
+                  value={annotationSettings.line_width}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, line_width: parseInt(e.target.value) }))}
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                >
+                  <option value="1">1 (thin)</option>
+                  <option value="2">2 (medium)</option>
+                  <option value="3">3 (thick)</option>
+                </select>
+              </div>
+            </div>
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={annotationSettings.show_direction_tick}
+                onChange={e => setAnnotationSettings(prev => ({ ...prev, show_direction_tick: e.target.checked }))}
+                className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+              />
+              <span className="text-sm text-content-secondary">Show direction tick on elongated stars</span>
+            </label>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">Eccentricity Good (&lt;)</label>
+                <input
+                  type="number"
+                  value={annotationSettings.ecc_good}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, ecc_good: parseFloat(e.target.value) || 0.5 }))}
+                  min="0" max="1" step="0.05"
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">Eccentricity Warn (&gt;)</label>
+                <input
+                  type="number"
+                  value={annotationSettings.ecc_warn}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, ecc_warn: parseFloat(e.target.value) || 0.6 }))}
+                  min="0" max="1" step="0.05"
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">FWHM Good (ratio &lt;)</label>
+                <input
+                  type="number"
+                  value={annotationSettings.fwhm_good}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, fwhm_good: parseFloat(e.target.value) || 1.3 }))}
+                  min="0.5" max="5" step="0.1"
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">FWHM Warn (ratio &gt;)</label>
+                <input
+                  type="number"
+                  value={annotationSettings.fwhm_warn}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, fwhm_warn: parseFloat(e.target.value) || 2.0 }))}
+                  min="0.5" max="10" step="0.1"
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">Min Radius (px)</label>
+                <input
+                  type="number"
+                  value={annotationSettings.min_radius}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, min_radius: parseFloat(e.target.value) || 6 }))}
+                  min="1" max="30" step="1"
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">Max Radius (px)</label>
+                <input
+                  type="number"
+                  value={annotationSettings.max_radius}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, max_radius: parseFloat(e.target.value) || 60 }))}
+                  min="10" max="200" step="5"
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+            </div>
           </div>
         </div>
 

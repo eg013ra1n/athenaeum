@@ -670,6 +670,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             source_channels INTEGER NOT NULL,
             trail_r_squared REAL NOT NULL DEFAULT 0.0,
             possibly_trailed INTEGER NOT NULL DEFAULT 0,
+            median_beta REAL,
             quality_score REAL,
             config_hash TEXT,
             analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -702,6 +703,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
         conn.execute(
             "ALTER TABLE frame_analysis ADD COLUMN possibly_trailed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Add median_beta to frame_analysis (migration for existing databases)
+    let has_median_beta: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name='median_beta'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_median_beta {
+        conn.execute(
+            "ALTER TABLE frame_analysis ADD COLUMN median_beta REAL",
             [],
         )?;
     }

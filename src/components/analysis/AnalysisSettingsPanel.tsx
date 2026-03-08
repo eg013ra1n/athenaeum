@@ -139,7 +139,7 @@ export function AnalysisSettingsPanel() {
             <input
               type="number"
               value={config.max_stars}
-              onChange={e => updateField('max_stars', parseInt(e.target.value) || 200)}
+              onChange={e => updateField('max_stars', parseInt(e.target.value) || 500)}
               min="10" max="2000" step="10"
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
             />
@@ -177,22 +177,11 @@ export function AnalysisSettingsPanel() {
             <p className="text-xs text-content-muted mt-1">Reject saturated stars (0.5-1.0)</p>
           </div>
           <div>
-            <label className="block text-xs text-content-secondary mb-1">Max Eccentricity</label>
-            <input
-              type="number"
-              value={config.max_eccentricity}
-              onChange={e => updateField('max_eccentricity', parseFloat(e.target.value) || 0.9)}
-              min="0" max="1" step="0.05"
-              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
-            />
-            <p className="text-xs text-content-muted mt-1">Stars above this eccentricity are excluded and their metrics zeroed (0.0-1.0)</p>
-          </div>
-          <div>
             <label className="block text-xs text-content-secondary mb-1">Trail Threshold (R²)</label>
             <input
               type="number"
               value={config.trail_threshold}
-              onChange={e => updateField('trail_threshold', parseFloat(e.target.value) || 0.6)}
+              onChange={e => updateField('trail_threshold', parseFloat(e.target.value) || 0.5)}
               min="0" max="1" step="0.05"
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
             />
@@ -217,6 +206,18 @@ export function AnalysisSettingsPanel() {
               <p className="text-xs text-content-muted">Uses full 2D Gaussian fitting for FWHM/eccentricity measurement. When disabled, uses fast windowed moments approximation.</p>
             </div>
           </label>
+          <label className="flex items-center gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={config.use_moffat_fit}
+              onChange={e => updateField('use_moffat_fit', e.target.checked)}
+              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
+            />
+            <div>
+              <span className="text-sm text-content-secondary">Use Moffat PSF Model</span>
+              <p className="text-xs text-content-muted">Uses Moffat profile fitting instead of Gaussian. More accurate for real optics (reports per-star Beta values). Falls back to Gaussian on non-convergence.</p>
+            </div>
+          </label>
           <div>
             <label className="block text-xs text-content-secondary mb-1">Background Mesh Size (optional)</label>
             <input
@@ -231,6 +232,58 @@ export function AnalysisSettingsPanel() {
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
             />
             <p className="text-xs text-content-muted mt-1">Grid cell size for spatially varying background. Leave empty for global estimation.</p>
+          </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Iterative Background Passes</label>
+            <input
+              type="number"
+              value={config.iterative_background}
+              onChange={e => updateField('iterative_background', Math.max(0, Math.min(5, parseInt(e.target.value) || 0)))}
+              min="0" max="5" step="1"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">Source-masked background re-estimation passes (0 = disabled, 1-5). Requires background mesh to be set.</p>
+          </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">MRS Noise Passes</label>
+            <input
+              type="number"
+              value={config.mrs_noise}
+              onChange={e => updateField('mrs_noise', Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))}
+              min="0" max="10" step="1"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">MRS wavelet noise estimation layers. 0 = legacy MAD, 1+ = wavelet-based (0-10).</p>
+          </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Fixed Moffat Beta</label>
+            <input
+              type="number"
+              value={config.moffat_beta ?? ''}
+              onChange={e => {
+                const val = e.target.value ? parseFloat(e.target.value) : null;
+                updateField('moffat_beta', val && val >= 1.0 && val <= 10.0 ? val : null);
+              }}
+              min="1.0" max="10.0" step="0.1"
+              placeholder="Auto-fit (disabled)"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">Fix Moffat beta parameter instead of fitting. Leave empty for auto-fit.</p>
+          </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Max Distortion</label>
+            <input
+              type="number"
+              value={config.max_distortion ?? ''}
+              onChange={e => {
+                const val = e.target.value ? parseFloat(e.target.value) : null;
+                updateField('max_distortion', val && val >= 0.0 && val <= 1.0 ? val : null);
+              }}
+              min="0.0" max="1.0" step="0.05"
+              placeholder="Disabled"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">Reject stars with distortion above this threshold. Leave empty to disable.</p>
           </div>
         </div>
       </div>

@@ -4,7 +4,7 @@ import { revealItemInDir } from '../../api/desktop';
 import { api } from '../../api';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
-type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'snr_db' | 'psf_signal' | 'snr_weight' | 'trail' | 'score';
+type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'snr_db' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta' | 'score';
 type SortDirection = 'asc' | 'desc';
 
 /** Frame enriched with camera/filter context from the hierarchy */
@@ -156,6 +156,15 @@ export function LightsAnalysisTable({
     return analysisData?.get(frameId);
   }, [analysisData]);
 
+  // Check if any analysis row has median_beta
+  const hasBeta = useMemo(() => {
+    if (!analysisData) return false;
+    for (const a of analysisData.values()) {
+      if (a.median_beta != null) return true;
+    }
+    return false;
+  }, [analysisData]);
+
   const averages = useMemo(() => {
     if (!analysisData || analysisData.size === 0) return null;
 
@@ -171,6 +180,11 @@ export function LightsAnalysisTable({
 
     const withScore = analyzed.filter(f => analysisData.get(f.frame_id)!.quality_score != null);
 
+    const withBeta = analyzed.filter(f => analysisData.get(f.frame_id)!.median_beta != null);
+    const betaAvg = withBeta.length > 0
+      ? withBeta.reduce((acc, f) => acc + (analysisData.get(f.frame_id)!.median_beta ?? 0), 0) / withBeta.length
+      : null;
+
     return {
       count: n,
       exptime,
@@ -182,6 +196,7 @@ export function LightsAnalysisTable({
       psf_signal: sumA(a => a.psf_signal) / n,
       snr_weight: sumA(a => a.snr_weight) / n,
       trail: sumA(a => a.trail_r_squared) / n,
+      beta: betaAvg,
       score: withScore.length > 0
         ? withScore.reduce((acc, f) => acc + (analysisData.get(f.frame_id)!.quality_score ?? 0), 0) / withScore.length
         : null,
@@ -235,6 +250,9 @@ export function LightsAnalysisTable({
           break;
         case 'trail':
           comparison = (aAnalysis?.trail_r_squared ?? -1) - (bAnalysis?.trail_r_squared ?? -1);
+          break;
+        case 'beta':
+          comparison = (aAnalysis?.median_beta ?? -1) - (bAnalysis?.median_beta ?? -1);
           break;
         case 'score':
           comparison = (aAnalysis?.quality_score ?? -1) - (bAnalysis?.quality_score ?? -1);
@@ -300,6 +318,12 @@ export function LightsAnalysisTable({
             <th scope="col" className="px-1.5 py-1.5 text-center bg-orange/10">
               <SortableHeader field="trail" label="Trail R²" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.trail.toFixed(3) : undefined} />
             </th>
+            {/* Beta column — only shown when Moffat data exists */}
+            {hasBeta && (
+              <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
+                <SortableHeader field="beta" label="Beta" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
+              </th>
+            )}
             {/* Score group — purple tint */}
             <th scope="col" className="px-1.5 py-1.5 text-center bg-purple/10">
               <SortableHeader field="score" label="Score" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.score != null ? `${(averages.score * 100).toFixed(0)}%` : undefined} />
@@ -383,6 +407,12 @@ export function LightsAnalysisTable({
                     </span>
                   ) : '-'}
                 </td>
+                {/* Beta column — only shown when Moffat data exists */}
+                {hasBeta && (
+                  <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
+                    {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '-'}
+                  </td>
+                )}
                 {/* Score group — purple tint */}
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-purple/5">
                   {analysis?.quality_score != null ? `${(analysis.quality_score * 100).toFixed(0)}%` : '-'}

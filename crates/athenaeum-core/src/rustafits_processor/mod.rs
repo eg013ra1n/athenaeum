@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
-use astroimage::{annotate_image, AnnotationConfig, ImageAnalyzer, ImageConverter};
+use astroimage::{annotate_image, AnnotationConfig, ImageConverter, ColorScheme};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+
+use crate::analysis::{analyzer::build_analyzer, config::AnalysisConfig};
 
 /// Resolution variants for blink viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +163,69 @@ pub struct AnnotationMetrics {
     pub psf_signal: f32,
     pub trail_r_squared: f32,
     pub possibly_trailed: bool,
+    pub median_beta: Option<f32>,
+}
+
+/// User-configurable annotation display settings.
+/// Stored as JSON in the settings table under key "blink.annotation_config".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationSettings {
+    /// Color scheme: "eccentricity", "fwhm", or "uniform"
+    pub color_scheme: String,
+    /// Draw a direction tick along the elongation axis
+    pub show_direction_tick: bool,
+    /// Minimum ellipse semi-axis radius in output pixels
+    pub min_radius: f32,
+    /// Maximum ellipse semi-axis radius in output pixels
+    pub max_radius: f32,
+    /// Line thickness: 1 = single pixel, 2 = 3px cross, 3 = 5px diamond
+    pub line_width: u8,
+    /// Eccentricity threshold: below this is green (good)
+    pub ecc_good: f32,
+    /// Eccentricity threshold: above this is red (problem)
+    pub ecc_warn: f32,
+    /// FWHM ratio threshold: below this is green (good)
+    pub fwhm_good: f32,
+    /// FWHM ratio threshold: above this is red (problem)
+    pub fwhm_warn: f32,
+}
+
+impl Default for AnnotationSettings {
+    fn default() -> Self {
+        Self {
+            color_scheme: "eccentricity".to_string(),
+            show_direction_tick: true,
+            min_radius: 6.0,
+            max_radius: 60.0,
+            line_width: 2,
+            ecc_good: 0.5,
+            ecc_warn: 0.6,
+            fwhm_good: 1.3,
+            fwhm_warn: 2.0,
+        }
+    }
+}
+
+impl AnnotationSettings {
+    /// Convert to rustafits AnnotationConfig
+    pub fn to_rustafits_config(&self) -> AnnotationConfig {
+        let color_scheme = match self.color_scheme.as_str() {
+            "fwhm" => ColorScheme::Fwhm,
+            "uniform" => ColorScheme::Uniform,
+            _ => ColorScheme::Eccentricity,
+        };
+        AnnotationConfig {
+            color_scheme,
+            show_direction_tick: self.show_direction_tick,
+            min_radius: self.min_radius,
+            max_radius: self.max_radius,
+            line_width: self.line_width.clamp(1, 3),
+            ecc_good: self.ecc_good,
+            ecc_warn: self.ecc_warn,
+            fwhm_good: self.fwhm_good,
+            fwhm_warn: self.fwhm_warn,
+        }
+    }
 }
 
 /// Result of annotated image processing — JPEG bytes + analysis metrics
@@ -174,11 +239,14 @@ pub struct AnnotatedImageResult {
 ///
 /// Runs image analysis to detect stars, draws color-coded ellipses onto the
 /// processed image, and returns both the annotated JPEG and analysis metrics.
+/// Uses the same `AnalysisConfig` as batch analysis for consistent metrics.
 pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
     input_path: P,
     resolution: Resolution,
     quality: Option<u8>,
     pool: &Arc<rayon::ThreadPool>,
+    annotation_settings: Option<&AnnotationSettings>,
+    analysis_config: &AnalysisConfig,
 ) -> Result<AnnotatedImageResult> {
     let input_path = input_path.as_ref();
 
@@ -204,16 +272,15 @@ pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
     let width = processed.width as u32;
     let height = processed.height as u32;
 
-    // Run star analysis
-    let metrics = match ImageAnalyzer::new()
-        .with_max_stars(200)
-        .without_gaussian_fit()
-        .with_thread_pool(pool.clone())
-        .analyze(input_path)
-    {
+    // Run star analysis using the same config as batch analysis
+    let analyzer = build_analyzer(analysis_config, Some(pool.clone()));
+    let metrics = match analyzer.analyze(input_path) {
         Ok(result) => {
             // Burn annotations into the image
-            annotate_image(&mut processed, &result, &AnnotationConfig::default());
+            let ann_config = annotation_settings
+                .map(|s| s.to_rustafits_config())
+                .unwrap_or_default();
+            annotate_image(&mut processed, &result, &ann_config);
 
             Some(AnnotationMetrics {
                 stars_detected: result.stars.len(),
@@ -226,6 +293,7 @@ pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
                 psf_signal: result.psf_signal,
                 trail_r_squared: result.trail_r_squared,
                 possibly_trailed: result.possibly_trailed,
+                median_beta: result.median_beta,
             })
         }
         Err(e) => {
@@ -292,8 +360,7 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
 
     // Build rustafits converter with resolution-specific settings
     let mut converter = ImageConverter::new()
-        .with_thread_pool(pool.clone())
-        .with_quality(resolution.jpeg_quality(quality));
+        .with_thread_pool(pool.clone());
 
     // Apply downscale if needed (for thumbnails)
     if resolution.downscale_factor() > 1 {
@@ -301,17 +368,25 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
     }
 
     // Apply preview mode for faster processing
-    // rustafits 0.2+ handles color/Bayer detection internally
     if resolution.use_preview_mode() {
         converter = converter.with_preview_mode();
     }
 
-    // Convert FITS/XISF to JPEG
-    converter
-        .convert(&input_path, &output_path)
+    // Process FITS/XISF to raw RGB pixels
+    let processed = converter
+        .process(input_path)
+        .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
+
+    let width = processed.width as u32;
+    let height = processed.height as u32;
+    let is_color = processed.is_color;
+
+    // Save processed image to disk as JPEG
+    let jpeg_quality = resolution.jpeg_quality(quality);
+    ImageConverter::save_processed(&processed, output_path, jpeg_quality)
         .with_context(|| {
             format!(
-                "Failed to convert image: {} -> {}",
+                "Failed to save image: {} -> {}",
                 input_path.display(),
                 output_path.display()
             )
@@ -322,16 +397,12 @@ pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
         format!("Failed to read generated JPEG: {}", output_path.display())
     })?;
 
-    // Dimensions set to 0 - frontend determines from JPEG
-    let width = 0;
-    let height = 0;
-
     Ok(ProcessedImage {
         image_data,
         width,
         height,
         format: "jpeg".to_string(),
-        is_color: false, // Not used - rustafits handles color internally
+        is_color,
     })
 }
 
