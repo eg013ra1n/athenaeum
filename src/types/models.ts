@@ -872,25 +872,32 @@ export interface CalibrationMetadataEdits {
   exptime?: number | null;
 }
 
-/** Analysis metrics from star annotation processing */
-export interface AnnotationMetrics {
-  stars_detected: number;
-  median_fwhm: number;
-  median_eccentricity: number;
-  median_snr: number;
-  median_hfr: number;
-  frame_snr: number;
-  snr_weight: number;
-  psf_signal: number;
-  trail_r_squared: number;
-  possibly_trailed: boolean;
-  median_beta: number | null;
+/** Individual star detection result for client-side overlay rendering */
+export interface StarMetric {
+  id: number | null;
+  frame_analysis_id: number;
+  x: number;
+  y: number;
+  peak: number;
+  flux: number;
+  fwhm: number;
+  fwhm_x: number;
+  fwhm_y: number;
+  eccentricity: number;
+  snr: number;
+  hfr: number;
+  theta: number;
+  beta: number | null;
+  fit_method: string;
+  fit_residual: number;
 }
 
-/** Response from read_fits_image_annotated command */
-export interface AnnotatedImageResponse {
-  image_data: number[];
-  metrics: AnnotationMetrics | null;
+/** Response from get_frame_star_metrics command */
+export interface StarMetricsResponse {
+  stars: StarMetric[];
+  metrics: FrameAnalysis;
+  image_width: number;
+  image_height: number;
 }
 
 /** Original calibration set metadata values (backed up before editing) */
