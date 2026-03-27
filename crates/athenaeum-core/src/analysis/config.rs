@@ -6,7 +6,14 @@ fn default_measure_cap() -> u32 { 500 }
 fn default_fit_max_iter() -> u32 { 25 }
 fn default_fit_tolerance() -> f64 { 1e-4 }
 fn default_fit_max_rejects() -> u32 { 5 }
-fn default_batch_concurrency() -> u32 { 3 }
+fn default_batch_concurrency() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // Each concurrent frame needs ~3 rayon pool threads for efficient PSF fitting.
+    // Auto-tune: cores/3 gives good balance of throughput vs per-frame parallelism.
+    (cores / 3).max(2).min(16) as u32
+}
 
 /// Star detection and analysis configuration.
 /// Stored as JSON in the settings table under key "analysis.config".
@@ -39,8 +46,8 @@ pub struct AnalysisConfig {
     /// LM consecutive reject bailout. Default: 5
     #[serde(default = "default_fit_max_rejects")]
     pub fit_max_rejects: u32,
-    /// Concurrent frames during batch analysis. Default: 3.
-    /// Higher values fill more CPU but use more memory (~200MB per concurrent frame).
+    /// Concurrent frames during batch analysis. Default: auto (cores/3, min 2).
+    /// Higher values increase throughput but use more memory (~200MB per concurrent frame).
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: u32,
     /// Quality scoring weights
@@ -166,8 +173,8 @@ impl AnalysisConfig {
         if self.fit_max_rejects < 1 || self.fit_max_rejects > 100 {
             return Err("fit_max_rejects must be between 1 and 100".into());
         }
-        if self.batch_concurrency < 1 || self.batch_concurrency > 8 {
-            return Err("batch_concurrency must be between 1 and 8".into());
+        if self.batch_concurrency < 1 || self.batch_concurrency > 16 {
+            return Err("batch_concurrency must be between 1 and 16".into());
         }
         let w = &self.scoring_weights;
         if w.fwhm < 0.0 || w.eccentricity < 0.0 || w.snr_weight < 0.0 || w.star_count < 0.0 {

@@ -248,7 +248,7 @@ pub async fn analyze_frame_set(
     let config_hash = Arc::new(analysis_config.config_hash());
     let completed = Arc::new(AtomicUsize::new(0));
     let event_tx = state.event_tx.clone();
-    let concurrency = (analysis_config.batch_concurrency.max(1).min(8)) as usize;
+    let concurrency = (analysis_config.batch_concurrency.max(1).min(16)) as usize;
 
     // Use N worker threads pulling from a shared queue instead of par_iter.
     // With par_iter, all frames compete for the pool — each gets ~1 thread and runs
