@@ -56,6 +56,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Annotation state
   const [showAnnotations, setShowAnnotations] = useState(false);
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
+  const showAnnotationsRef = useRef(showAnnotations);
+  const annotationSettingsRef = useRef(annotationSettings);
+  showAnnotationsRef.current = showAnnotations;
+  annotationSettingsRef.current = annotationSettings;
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const blinkIntervalRef = useRef<number | null>(null);
@@ -117,6 +121,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     currentIndex,
     enabled: showAnnotations,
   });
+  const getStarMetricsRef = useRef(getStarMetrics);
+  getStarMetricsRef.current = getStarMetrics;
 
   // Selection counts
   const selectionCount = selectedFrames.size;
@@ -242,18 +248,18 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
 
-    // Draw star overlay if annotations are enabled
-    if (!showAnnotations) return;
-    const metricsResponse = getStarMetrics(currentIndex);
+    // Draw star overlay if annotations are enabled (read from refs for stability)
+    if (!showAnnotationsRef.current) return;
+    const metricsResponse = getStarMetricsRef.current(currentIndexRef.current);
     if (!metricsResponse) return;
 
-    drawStarOverlay(ctx, metricsResponse.stars, annotationSettings, {
+    drawStarOverlay(ctx, metricsResponse.stars, annotationSettingsRef.current, {
       offsetX, offsetY, renderWidth, renderHeight,
       imageWidth: metricsResponse.image_width,
       imageHeight: metricsResponse.image_height,
       flipVertical: metricsResponse.flip_vertical,
     });
-  }, [showAnnotations, currentIndex, getStarMetrics, annotationSettings]);
+  }, []);
 
   // Load a blob URL into an Image element and render to canvas.
   // If the same URL is already loaded, just re-renders (fast path for zoom/pan/overlay changes).
@@ -306,12 +312,16 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
   }, []);
 
-  // Render current frame (image + overlay). Triggers on frame navigation, image load,
-  // annotation toggle, metrics arrival, or settings change.
+  // Render when image loads or frame changes
   useEffect(() => {
     const imageValue = loadedImages.get(currentIndex);
     if (imageValue) renderImage(imageValue);
-  }, [currentIndex, loadedImages, renderImage, showAnnotations, getStarMetrics, annotationSettings]);
+  }, [currentIndex, loadedImages, renderImage]);
+
+  // Re-render when annotation state changes (renderCanvas reads from refs, just needs a kick)
+  useEffect(() => {
+    renderCanvas();
+  }, [showAnnotations, getStarMetrics, annotationSettings, renderCanvas]);
 
   useEffect(() => {
     const updateCanvasSize = () => {
