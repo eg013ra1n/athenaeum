@@ -762,6 +762,10 @@ pub struct StarMetricsResponse {
     pub metrics: FrameAnalysis,
     pub image_width: i64,
     pub image_height: i64,
+    /// Whether the displayed image was vertically flipped during processing.
+    /// When true, star Y coordinates must be flipped: y_display = image_height - 1 - y
+    /// and theta must be negated. Mirrors rustafits annotate.rs compute_annotations().
+    pub flip_vertical: bool,
 }
 
 /// Original calibration set metadata values (backed up before editing)

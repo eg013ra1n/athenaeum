@@ -287,6 +287,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       offsetX, offsetY, renderWidth, renderHeight,
       imageWidth: metricsResponse.image_width,
       imageHeight: metricsResponse.image_height,
+      flipVertical: metricsResponse.flip_vertical,
     };
 
     drawStarOverlay(ctx, metricsResponse.stars, annotationSettings, transform);

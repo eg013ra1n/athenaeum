@@ -182,7 +182,7 @@ pub async fn set_blink_threads(
     Json(args): Json<SetBlinkThreadsArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     let threads = args.threads.clamp(0, state.max_blink_threads);
-    let effective = if threads == 0 { state.max_blink_threads } else { threads };
+    let effective = if threads == 0 { (state.max_blink_threads / 2).max(2) } else { threads };
 
     let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;

@@ -101,8 +101,8 @@ pub async fn set_blink_threads(
             .map_err(|e| e.to_string())?;
     }
 
-    // Rebuild semaphore — 0 means use all available cores
-    let effective = if threads == 0 { max as usize } else { threads as usize };
+    // Rebuild semaphore — 0 means auto (half of available cores)
+    let effective = if threads == 0 { ((max as usize) / 2).max(2) } else { threads as usize };
     *state.image_semaphore.write().unwrap() =
         Arc::new(tokio::sync::Semaphore::new(effective));
 

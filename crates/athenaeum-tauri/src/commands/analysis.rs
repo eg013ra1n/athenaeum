@@ -351,7 +351,18 @@ pub async fn get_frame_star_metrics(
     let analysis_config = config::load_config(&conn);
     let current_hash = analysis_config.config_hash();
 
-    // Check if we have fresh analysis data
+    // Always need the file path for flip_vertical detection and possible on-demand analysis
+    let (file_id, path): (i64, String) = conn.query_row(
+        "SELECT fi.id, fi.path FROM frames f
+         INNER JOIN files fi ON fi.id = f.file_id
+         WHERE f.id = ?1",
+        rusqlite::params![frame_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|e| format!("Frame not found: {}", e))?;
+
+    let flip_vertical = analyzer::detect_flip_vertical(&path);
+
+    // Check if we have fresh analysis data with stars
     if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
         if existing.config_hash.as_deref() == Some(&current_hash) {
             if let Ok(stars) = db_analysis::get_star_metrics_by_frame_id(&conn, frame_id) {
@@ -361,6 +372,7 @@ pub async fn get_frame_star_metrics(
                         image_height: existing.height,
                         metrics: existing,
                         stars,
+                        flip_vertical,
                     });
                 }
             }
@@ -368,14 +380,6 @@ pub async fn get_frame_star_metrics(
     }
 
     // Stale or missing — analyze on-demand
-    let (file_id, path): (i64, String) = conn.query_row(
-        "SELECT fi.id, fi.path FROM frames f
-         INNER JOIN files fi ON fi.id = f.file_id
-         WHERE f.id = ?1",
-        rusqlite::params![frame_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|e| format!("Frame not found: {}", e))?;
-
     drop(conn);
     let _ = db;
 
@@ -411,5 +415,6 @@ pub async fn get_frame_star_metrics(
         image_height: analysis.height,
         metrics: analysis,
         stars,
+        flip_vertical,
     })
 }

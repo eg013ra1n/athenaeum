@@ -15,6 +15,9 @@ export interface OverlayTransform {
   imageWidth: number;
   /** Analysis result height (coordinate space of star x/y) */
   imageHeight: number;
+  /** Whether the display image was vertically flipped during processing.
+   *  Mirrors rustafits ProcessedImage.flip_vertical. */
+  flipVertical: boolean;
 }
 
 /** Compute color for a star based on annotation settings color scheme.
@@ -66,8 +69,13 @@ export function drawStarOverlay(
 
   for (const star of stars) {
     // Position: analysis coords → canvas coords
+    // Mirrors rustafits annotate.rs compute_annotations():
+    //   x_out = star.x * scale_x
+    //   y_out = if flip_vertical { output_height - 1.0 - star.y * scale_y } else { star.y * scale_y }
     const cx = transform.offsetX + star.x * scaleX;
-    const cy = transform.offsetY + star.y * scaleY;
+    const cy = transform.flipVertical
+      ? transform.offsetY + transform.renderHeight - 1 - star.y * scaleY
+      : transform.offsetY + star.y * scaleY;
 
     // Semi-axes: match rustafits — fwhm * scale * 2.5, clamped to fixed canvas-pixel limits.
     // min_radius / max_radius are in canvas pixels (not analysis pixels).
@@ -80,9 +88,12 @@ export function drawStarOverlay(
 
     const color = starColor(star, settings);
 
+    // Theta: negate when flipped (mirrors rustafits annotate.rs)
+    const theta = transform.flipVertical ? -star.theta : star.theta;
+
     // Draw ellipse
     ctx.beginPath();
-    ctx.ellipse(cx, cy, semiMajor, semiMinor, star.theta, 0, 2 * Math.PI);
+    ctx.ellipse(cx, cy, semiMajor, semiMinor, theta, 0, 2 * Math.PI);
     ctx.strokeStyle = color;
     ctx.lineWidth = settings.line_width;
     ctx.stroke();
@@ -90,8 +101,8 @@ export function drawStarOverlay(
     // Direction tick along elongation axis (matches rustafits: only when ecc > 0.15)
     if (settings.show_direction_tick && star.eccentricity > 0.15) {
       const tickLen = semiMajor * 0.5;
-      const ct = Math.cos(star.theta);
-      const st = Math.sin(star.theta);
+      const ct = Math.cos(theta);
+      const st = Math.sin(theta);
       // Edge of ellipse along major axis
       const edgeX = cx + semiMajor * ct;
       const edgeY = cy + semiMajor * st;

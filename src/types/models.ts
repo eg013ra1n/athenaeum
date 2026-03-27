@@ -896,6 +896,7 @@ export interface StarMetric {
 export interface StarMetricsResponse {
   stars: StarMetric[];
   metrics: FrameAnalysis;
+  flip_vertical: boolean;
   image_width: number;
   image_height: number;
 }

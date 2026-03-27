@@ -5,6 +5,28 @@ use std::sync::Arc;
 use crate::models::{FrameAnalysis, StarMetric};
 use super::config::AnalysisConfig;
 
+/// Detect whether a FITS file needs vertical flip for display.
+/// Checks the ROWORDER keyword: "TOP-DOWN" means the converter will flip.
+/// Standard FITS (BOTTOM-UP or absent) means no flip.
+pub fn detect_flip_vertical(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut header_buf = [0u8; 2880 * 5]; // Read up to 5 header blocks
+    let bytes_read = file.read(&mut header_buf).unwrap_or(0);
+    let header = String::from_utf8_lossy(&header_buf[..bytes_read]);
+    for i in (0..header.len()).step_by(80) {
+        let end = (i + 80).min(header.len());
+        let card = &header[i..end];
+        if card.starts_with("ROWORDER") {
+            return card.contains("TOP-DOWN");
+        }
+        if card.starts_with("END") && card[3..].trim().is_empty() {
+            break;
+        }
+    }
+    false
+}
+
 /// Build an `ImageAnalyzer` from an `AnalysisConfig`.
 /// Used by both batch analysis and blink annotation to ensure identical parameters.
 pub fn build_analyzer(

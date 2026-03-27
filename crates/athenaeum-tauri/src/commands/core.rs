@@ -98,7 +98,7 @@ pub async fn initialize_database(
             .unwrap_or_else(|_| settings::defaults::BLINK_THREADS.to_string());
         if let Ok(threads) = saved.parse::<usize>() {
             let max = state.max_blink_threads;
-            let effective = if threads == 0 { max } else { threads.clamp(1, max) };
+            let effective = if threads == 0 { (max / 2).max(2) } else { threads.clamp(1, max) };
             *state.image_semaphore.write().unwrap() =
                 Arc::new(tokio::sync::Semaphore::new(effective));
             println!("🧵 Blink semaphore set to {} permits (from DB, 0=auto)", effective);

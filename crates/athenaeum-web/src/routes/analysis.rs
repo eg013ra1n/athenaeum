@@ -406,6 +406,19 @@ pub async fn get_frame_star_metrics(
         let analysis_config = config::load_config(&conn);
         let current_hash = analysis_config.config_hash();
 
+        // Always need file path for flip_vertical detection
+        let (file_id, path): (i64, String) = conn
+            .query_row(
+                "SELECT fi.id, fi.path FROM frames f
+                 INNER JOIN files fi ON fi.id = f.file_id
+                 WHERE f.id = ?1",
+                rusqlite::params![frame_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| err(format!("Frame not found: {}", e)))?;
+
+        let flip_vertical = analyzer::detect_flip_vertical(&path);
+
         // Check if we have fresh analysis data
         if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
             if existing.config_hash.as_deref() == Some(&current_hash) {
@@ -416,22 +429,12 @@ pub async fn get_frame_star_metrics(
                             image_height: existing.height,
                             metrics: existing,
                             stars,
+                            flip_vertical,
                         }));
                     }
                 }
             }
         }
-
-        // Stale or missing — need to analyze on-demand
-        let (file_id, path): (i64, String) = conn
-            .query_row(
-                "SELECT fi.id, fi.path FROM frames f
-                 INNER JOIN files fi ON fi.id = f.file_id
-                 WHERE f.id = ?1",
-                rusqlite::params![frame_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| err(format!("Frame not found: {}", e)))?;
 
         (analysis_config, current_hash, file_id, path)
     };
@@ -461,10 +464,13 @@ pub async fn get_frame_star_metrics(
     }
     db_analysis::upsert_star_metrics(&conn, analysis_id, &stars).map_err(err)?;
 
+    let flip_vertical = analyzer::detect_flip_vertical(&path);
+
     Ok(Json(StarMetricsResponse {
         image_width: analysis.width,
         image_height: analysis.height,
         metrics: analysis,
         stars,
+        flip_vertical,
     }))
 }
