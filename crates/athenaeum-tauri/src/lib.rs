@@ -53,7 +53,12 @@ pub fn run() {
             let max_threads = std::thread::available_parallelism()
                 .map(|n| n.get().min(16))
                 .unwrap_or(4);
-            let default_permits = max_threads;
+            // Limit concurrent image processing to half of available cores.
+            // Each annotated request runs converter + analyzer sequentially,
+            // both using pool.install(). Too many concurrent requests starve
+            // each other on the pool. Half the cores gives each request ~2
+            // pool threads — good balance of throughput vs per-frame speed.
+            let default_permits = (max_threads / 2).max(2);
             println!("🧵 CPU cores cap: {}, default blink semaphore permits: {}", max_threads, default_permits);
             AppState {
                 ctx: ServiceContext {
@@ -260,6 +265,7 @@ pub fn run() {
             commands::analyze_single_frame,
             commands::get_analysis_for_frame_set,
             commands::delete_analysis_for_frame_set,
+            commands::get_frame_star_metrics,
             commands_rustafits::read_fits_image_rustafits,
             commands_rustafits::read_fits_image_annotated,
         ])

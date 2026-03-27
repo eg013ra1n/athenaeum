@@ -5,7 +5,7 @@ use tauri::{Emitter, State};
 use athenaeum_core::analysis::config::{self, AnalysisConfig};
 use athenaeum_core::analysis::analyzer;
 use athenaeum_core::db::analysis as db_analysis;
-use athenaeum_core::models::FrameAnalysis;
+use athenaeum_core::models::{FrameAnalysis, StarMetric, StarMetricsResponse};
 
 use super::AppState;
 
@@ -131,9 +131,9 @@ pub async fn analyze_frame_set(
     // single-threaded, causing batch-of-N behavior. With limited workers, each frame
     // gets more pool threads for internal parallelism (PSF fitting, background estimation),
     // and work-stealing fills serial gaps between pipeline stages.
-    let results: Vec<Result<(i64, FrameAnalysis), String>> = tokio::task::spawn_blocking(move || {
+    let results: Vec<Result<(i64, FrameAnalysis, Vec<StarMetric>), String>> = tokio::task::spawn_blocking(move || {
         let work = std::sync::Mutex::new(frames_to_analyze.into_iter());
-        let results: std::sync::Mutex<Vec<Result<(i64, FrameAnalysis), String>>> =
+        let results: std::sync::Mutex<Vec<Result<(i64, FrameAnalysis, Vec<StarMetric>), String>>> =
             std::sync::Mutex::new(Vec::with_capacity(total));
 
         std::thread::scope(|s| {
@@ -144,10 +144,10 @@ pub async fn analyze_frame_set(
                         let Some((frame_id, file_id, path)) = item else { break };
 
                         let result = match analyzer::analyze_frame(&path, &img_analyzer, &config_hash) {
-                            Ok(mut analysis) => {
+                            Ok((mut analysis, stars)) => {
                                 analysis.frame_id = frame_id;
                                 analysis.file_id = file_id;
-                                Ok((frame_id, analysis))
+                                Ok((frame_id, analysis, stars))
                             }
                             Err(e) => {
                                 let msg = format!("{}: {}", path, e);
@@ -181,19 +181,24 @@ pub async fn analyze_frame_set(
     }).await.map_err(|e| format!("Analysis task panicked: {}", e))?;
 
     // Partition results
-    let mut all_analyses: Vec<(i64, FrameAnalysis)> = Vec::new();
+    let mut all_analyses: Vec<(i64, FrameAnalysis, Vec<StarMetric>)> = Vec::new();
     let mut errors = Vec::new();
     for result in results {
         match result {
-            Ok(pair) => all_analyses.push(pair),
+            Ok(triple) => all_analyses.push(triple),
             Err(msg) => errors.push(msg),
         }
     }
     let analyzed = all_analyses.len();
     let failed = errors.len();
 
-    // Compute quality scores across all successful analyses
-    let mut analyses: Vec<FrameAnalysis> = all_analyses.into_iter().map(|(_, a)| a).collect();
+    // Separate stars from analyses for quality scoring
+    let mut stars_by_frame: std::collections::HashMap<i64, Vec<StarMetric>> = std::collections::HashMap::new();
+    let mut analyses: Vec<FrameAnalysis> = Vec::new();
+    for (frame_id, analysis, stars) in all_analyses {
+        stars_by_frame.insert(frame_id, stars);
+        analyses.push(analysis);
+    }
     analyzer::compute_quality_scores(&mut analyses, &analysis_config);
 
     // Persist all results in a single transaction
@@ -219,19 +224,31 @@ pub async fn analyze_frame_set(
 
             conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
             for a in &combined {
-                db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
+                let analysis_id = db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
                     let _ = conn.execute_batch("ROLLBACK");
                     e.to_string()
                 })?;
+                if let Some(stars) = stars_by_frame.get(&a.frame_id) {
+                    db_analysis::upsert_star_metrics(&conn, analysis_id, stars).map_err(|e| {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        e.to_string()
+                    })?;
+                }
             }
             conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         } else if !analyses.is_empty() {
             conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
             for a in &analyses {
-                db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
+                let analysis_id = db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
                     let _ = conn.execute_batch("ROLLBACK");
                     e.to_string()
                 })?;
+                if let Some(stars) = stars_by_frame.get(&a.frame_id) {
+                    db_analysis::upsert_star_metrics(&conn, analysis_id, stars).map_err(|e| {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        e.to_string()
+                    })?;
+                }
             }
             conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         }
@@ -275,7 +292,7 @@ pub async fn analyze_single_frame(
     let config_hash = analysis_config.config_hash();
     let path_owned = path.clone();
 
-    let mut analysis = tokio::task::spawn_blocking(move || {
+    let (mut analysis, stars) = tokio::task::spawn_blocking(move || {
         analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
     }).await
         .map_err(|e| format!("Analysis panicked: {}", e))?
@@ -285,11 +302,14 @@ pub async fn analyze_single_frame(
     analysis.file_id = file_id;
     analysis.quality_score = Some(1.0); // Single frame gets perfect score
 
-    // Persist
+    // Persist analysis + stars
     {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-        db_analysis::upsert_frame_analysis(&conn, &analysis).map_err(|e| e.to_string())?;
+        let analysis_id = db_analysis::upsert_frame_analysis(&conn, &analysis)
+            .map_err(|e| e.to_string())?;
+        db_analysis::upsert_star_metrics(&conn, analysis_id, &stars)
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(analysis)
@@ -317,4 +337,79 @@ pub async fn delete_analysis_for_frame_set(
     let conn = db.conn();
     db_analysis::delete_analyses_for_frame_set(&conn, frame_set_id)
         .map_err(|e| e.to_string())
+}
+
+/// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.
+#[tauri::command]
+pub async fn get_frame_star_metrics(
+    state: State<'_, AppState>,
+    frame_id: i64,
+) -> Result<StarMetricsResponse, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let analysis_config = config::load_config(&conn);
+    let current_hash = analysis_config.config_hash();
+
+    // Check if we have fresh analysis data
+    if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
+        if existing.config_hash.as_deref() == Some(&current_hash) {
+            if let Ok(stars) = db_analysis::get_star_metrics_by_frame_id(&conn, frame_id) {
+                if !stars.is_empty() {
+                    return Ok(StarMetricsResponse {
+                        image_width: existing.width,
+                        image_height: existing.height,
+                        metrics: existing,
+                        stars,
+                    });
+                }
+            }
+        }
+    }
+
+    // Stale or missing — analyze on-demand
+    let (file_id, path): (i64, String) = conn.query_row(
+        "SELECT fi.id, fi.path FROM frames f
+         INNER JOIN files fi ON fi.id = f.file_id
+         WHERE f.id = ?1",
+        rusqlite::params![frame_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|e| format!("Frame not found: {}", e))?;
+
+    drop(conn);
+    let _ = db;
+
+    let pool = Arc::clone(&state.ctx.image_pool);
+    let img_analyzer = analyzer::build_analyzer(&analysis_config, Some(Arc::clone(&pool)));
+    let config_hash = current_hash.clone();
+    let path_owned = path.clone();
+
+    let (mut analysis, mut stars) = tokio::task::spawn_blocking(move || {
+        analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
+    }).await
+        .map_err(|e| format!("Analysis panicked: {}", e))?
+        .map_err(|e| format!("Analysis failed: {}", e))?;
+
+    analysis.frame_id = frame_id;
+    analysis.file_id = file_id;
+    analysis.quality_score = Some(1.0);
+
+    // Persist
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    let analysis_id = db_analysis::upsert_frame_analysis(&conn, &analysis)
+        .map_err(|e| e.to_string())?;
+
+    for s in &mut stars {
+        s.frame_analysis_id = analysis_id;
+    }
+    db_analysis::upsert_star_metrics(&conn, analysis_id, &stars)
+        .map_err(|e| e.to_string())?;
+
+    Ok(StarMetricsResponse {
+        image_width: analysis.width,
+        image_height: analysis.height,
+        metrics: analysis,
+        stars,
+    })
 }
