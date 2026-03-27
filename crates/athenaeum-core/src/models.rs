@@ -716,7 +716,7 @@ pub struct FrameAnalysis {
     pub median_eccentricity: f64,
     pub median_snr: f64,
     pub median_hfr: f64,
-    pub snr_db: f64,
+    pub frame_snr: f64,
     pub snr_weight: f64,
     pub psf_signal: f64,
     pub background: f64,

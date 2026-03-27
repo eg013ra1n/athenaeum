@@ -6,13 +6,12 @@ export interface AnalysisConfig {
   saturation_fraction: number;
   max_stars: number;
   trail_threshold: number;
-  use_gaussian_fit: boolean;
-  background_mesh_size: number | null;
-  use_moffat_fit: boolean;
-  iterative_background: number;
-  mrs_noise: number;
-  moffat_beta: number | null;
-  max_distortion: number | null;
+  mrs_layers: number;
+  measure_cap: number;
+  fit_max_iter: number;
+  fit_tolerance: number;
+  fit_max_rejects: number;
+  batch_concurrency: number;
   scoring_weights: ScoringWeights;
 }
 
@@ -32,13 +31,12 @@ export const DEFAULT_ANALYSIS_CONFIG: AnalysisConfig = {
   saturation_fraction: 0.95,
   max_stars: 500,
   trail_threshold: 0.5,
-  use_gaussian_fit: true,
-  background_mesh_size: 64,
-  use_moffat_fit: true,
-  iterative_background: 1,
-  mrs_noise: 0,
-  moffat_beta: null,
-  max_distortion: null,
+  mrs_layers: 4,
+  measure_cap: 500,
+  fit_max_iter: 25,
+  fit_tolerance: 1e-4,
+  fit_max_rejects: 5,
+  batch_concurrency: 3,
   scoring_weights: {
     fwhm: 0.35,
     eccentricity: 0.15,

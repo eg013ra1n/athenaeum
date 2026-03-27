@@ -4,7 +4,7 @@ import { revealItemInDir } from '../../api/desktop';
 import { api } from '../../api';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
-type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'snr_db' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta' | 'score';
+type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta' | 'score';
 type SortDirection = 'asc' | 'desc';
 
 /** Frame enriched with camera/filter context from the hierarchy */
@@ -192,7 +192,7 @@ export function LightsAnalysisTable({
       fwhm: sumA(a => a.median_fwhm) / n,
       eccentricity: sumA(a => a.median_eccentricity) / n,
       median_snr: sumA(a => a.median_snr) / n,
-      snr_db: sumA(a => a.snr_db) / n,
+      frame_snr: sumA(a => a.frame_snr) / n,
       psf_signal: sumA(a => a.psf_signal) / n,
       snr_weight: sumA(a => a.snr_weight) / n,
       trail: sumA(a => a.trail_r_squared) / n,
@@ -239,8 +239,8 @@ export function LightsAnalysisTable({
         case 'median_snr':
           comparison = (aAnalysis?.median_snr ?? -1) - (bAnalysis?.median_snr ?? -1);
           break;
-        case 'snr_db':
-          comparison = (aAnalysis?.snr_db ?? -1) - (bAnalysis?.snr_db ?? -1);
+        case 'frame_snr':
+          comparison = (aAnalysis?.frame_snr ?? -1) - (bAnalysis?.frame_snr ?? -1);
           break;
         case 'psf_signal':
           comparison = (aAnalysis?.psf_signal ?? -1) - (bAnalysis?.psf_signal ?? -1);
@@ -306,7 +306,7 @@ export function LightsAnalysisTable({
               <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.median_snr.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="snr_db" label="SNR (dB)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_db.toFixed(1) : undefined} />
+              <SortableHeader field="frame_snr" label="Frame SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.frame_snr.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.psf_signal.toFixed(1) : undefined} />
@@ -386,7 +386,7 @@ export function LightsAnalysisTable({
                   {analysis ? analysis.median_snr.toFixed(1) : '-'}
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">
-                  {analysis ? analysis.snr_db.toFixed(1) : '-'}
+                  {analysis ? analysis.frame_snr.toFixed(1) : '-'}
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-success/5">
                   {analysis ? analysis.psf_signal.toFixed(1) : '-'}
@@ -400,7 +400,10 @@ export function LightsAnalysisTable({
                     <span className="inline-flex items-center gap-1">
                       {analysis.trail_r_squared.toFixed(3)}
                       {analysis.possibly_trailed && (
-                        <span title="Possible star trails detected">
+                        <span title={analysis.trail_r_squared >= 0.3
+                          ? "Directional trail detected (RA drift)"
+                          : "Guiding issue (wind/vibration)"
+                        }>
                           <AlertTriangle size={14} className="text-amber-400" />
                         </span>
                       )}

@@ -28,7 +28,7 @@ pub mod defaults {
     pub const DUPLICATES_CONTENT_HASH_RESCANNED: &str = "false";
 
     // Blink viewer
-    pub const BLINK_THREADS: &str = "4";
+    pub const BLINK_THREADS: &str = "0"; // 0 = auto (use all available cores)
     pub const BLINK_MEMORY_CACHE_SIZE: &str = "200";
     pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "30";
 }

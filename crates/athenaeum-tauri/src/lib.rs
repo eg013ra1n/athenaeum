@@ -53,7 +53,7 @@ pub fn run() {
             let max_threads = std::thread::available_parallelism()
                 .map(|n| n.get().min(16))
                 .unwrap_or(4);
-            let default_permits = 4usize;
+            let default_permits = max_threads;
             println!("🧵 CPU cores cap: {}, default blink semaphore permits: {}", max_threads, default_permits);
             AppState {
                 ctx: ServiceContext {

@@ -6,6 +6,7 @@ interface UseBlinkCacheArgs {
   currentIndex: number;
   showAnnotations: boolean;
   cacheModeReady: boolean;
+  maxConcurrent: number;
   loadedImages: Map<number, string>;
   annotatedImages: Map<number, string>;
   loadImage: (index: number) => Promise<void>;
@@ -18,7 +19,7 @@ interface UseBlinkCacheResult {
   cacheStats: { elapsedMs: number; frameCount: number } | null;
 }
 
-const MAX_CONCURRENT = 8;
+const DEFAULT_MAX_CONCURRENT = 8;
 
 type JobType = "plain" | "annotated";
 
@@ -36,6 +37,7 @@ export function useBlinkCache({
   currentIndex,
   showAnnotations,
   cacheModeReady,
+  maxConcurrent,
   loadedImages,
   annotatedImages,
   loadImage,
@@ -125,16 +127,21 @@ export function useBlinkCache({
   const updateProgress = useCallback(() => {
     if (unmountedRef.current) return;
     const total = framesRef.current.length;
-    // Total jobs = plain + annotated for all frames
-    const grandTotal = total * 2;
-    let cached = 0;
+    // Count cached frames in each mode separately
+    let plainCached = 0;
+    let annotatedCached = 0;
     for (let i = 0; i < total; i++) {
-      if (loadedImagesRef.current.has(i)) cached++;
-      if (annotatedImagesRef.current.has(i)) cached++;
+      if (loadedImagesRef.current.has(i)) plainCached++;
+      if (annotatedImagesRef.current.has(i)) annotatedCached++;
     }
-    setCacheProgress({ current: cached, total: grandTotal });
+    // Show progress for the active mode (what the user sees)
+    const annOn = showAnnotationsRef.current;
+    const activeCached = annOn ? annotatedCached : plainCached;
+    setCacheProgress({ current: activeCached, total });
 
-    if (cached >= grandTotal && inflightCountRef.current === 0) {
+    // Hide spinner once the active mode is fully cached.
+    // Background mode continues caching silently.
+    if (activeCached >= total) {
       setIsCaching(false);
       if (cacheStartTimeRef.current > 0) {
         setCacheStats({
@@ -152,7 +159,8 @@ export function useBlinkCache({
   const tryDispatch = useCallback(() => {
     if (unmountedRef.current) return;
 
-    while (inflightCountRef.current < MAX_CONCURRENT) {
+    const limit = maxConcurrent || DEFAULT_MAX_CONCURRENT;
+    while (inflightCountRef.current < limit) {
       const job = pickNextJob();
       if (!job) break;
 
@@ -187,7 +195,7 @@ export function useBlinkCache({
     cacheStartTimeRef.current = Date.now();
     setIsCaching(true);
     setCacheStats(null);
-    setCacheProgress({ current: 0, total: frames.length * 2 });
+    setCacheProgress({ current: 0, total: frames.length });
 
     tryDispatch();
 

@@ -80,15 +80,16 @@ pub async fn get_grouping_threshold_deg(state: State<'_, AppState>) -> Result<f6
 }
 
 /// Set the number of concurrent blink image processing threads.
-/// Validates 1..=max_blink_threads, persists to DB, and rebuilds the semaphore.
+/// Validates 0..=max_blink_threads (0 = auto, use all cores), persists to DB,
+/// and rebuilds the semaphore.
 #[tauri::command]
 pub async fn set_blink_threads(
     threads: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let max = state.max_blink_threads as u32;
-    if threads < 1 || threads > max {
-        return Err(format!("Blink threads must be between 1 and {}", max));
+    if threads > max {
+        return Err(format!("Blink threads must be between 0 and {} (0 = auto)", max));
     }
 
     // Persist to DB
@@ -100,11 +101,12 @@ pub async fn set_blink_threads(
             .map_err(|e| e.to_string())?;
     }
 
-    // Rebuild semaphore — in-flight permits on the old Arc complete naturally
+    // Rebuild semaphore — 0 means use all available cores
+    let effective = if threads == 0 { max as usize } else { threads as usize };
     *state.image_semaphore.write().unwrap() =
-        Arc::new(tokio::sync::Semaphore::new(threads as usize));
+        Arc::new(tokio::sync::Semaphore::new(effective));
 
-    println!("🧵 Blink semaphore rebuilt with {} permits", threads);
+    println!("🧵 Blink semaphore rebuilt with {} permits (requested {}, 0=auto)", effective, threads);
     Ok(())
 }
 

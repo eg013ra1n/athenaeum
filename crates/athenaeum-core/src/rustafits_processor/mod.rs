@@ -158,7 +158,7 @@ pub struct AnnotationMetrics {
     pub median_eccentricity: f32,
     pub median_snr: f32,
     pub median_hfr: f32,
-    pub snr_db: f32,
+    pub frame_snr: f32,
     pub snr_weight: f32,
     pub psf_signal: f32,
     pub trail_r_squared: f32,
@@ -237,9 +237,9 @@ pub struct AnnotatedImageResult {
 
 /// Process a FITS/XISF file to JPEG with star annotations burned in.
 ///
-/// Runs image analysis to detect stars, draws color-coded ellipses onto the
-/// processed image, and returns both the annotated JPEG and analysis metrics.
-/// Uses the same `AnalysisConfig` as batch analysis for consistent metrics.
+/// Runs image conversion and star analysis **in parallel** (both read the FITS
+/// file independently). Uses the same `AnalysisConfig` as batch analysis for
+/// consistent metrics.
 pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
     input_path: P,
     resolution: Resolution,
@@ -264,19 +264,37 @@ pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
         converter = converter.with_preview_mode();
     }
 
-    // Process FITS/XISF to raw RGB pixels
+    // Build analyzer and start it on a separate thread immediately.
+    // The analyzer uses the pool internally (via with_thread_pool), so no
+    // outer pool.install() is needed. Conversion runs on the calling thread
+    // in parallel — both overlap naturally via work-stealing on the shared pool.
+    let analyzer = build_analyzer(analysis_config, Some(pool.clone()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path_owned = input_path.to_path_buf();
+    std::thread::spawn(move || {
+        let result = analyzer.analyze(&path_owned);
+        let _ = tx.send(result);
+    });
+
+    // Run conversion on the calling thread — overlaps with analysis above.
+    // converter.process() enters the pool internally via with_thread_pool.
     let mut processed = converter
         .process(input_path)
         .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
 
+    // Wait for analysis to complete (may have finished during conversion).
+    // 5-minute safety net prevents permanently stuck semaphore permits if
+    // analysis hangs on a corrupted file. Not a functional timeout — analysis
+    // has the full 5 minutes to finish.
+    let analysis_result = rx.recv_timeout(std::time::Duration::from_secs(300))
+        .ok();
+
     let width = processed.width as u32;
     let height = processed.height as u32;
 
-    // Run star analysis using the same config as batch analysis
-    let analyzer = build_analyzer(analysis_config, Some(pool.clone()));
-    let metrics = match analyzer.analyze(input_path) {
-        Ok(result) => {
-            // Burn annotations into the image
+    // Apply annotations if analysis succeeded
+    let metrics = match analysis_result {
+        Some(Ok(result)) => {
             let ann_config = annotation_settings
                 .map(|s| s.to_rustafits_config())
                 .unwrap_or_default();
@@ -288,7 +306,7 @@ pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
                 median_eccentricity: result.median_eccentricity,
                 median_snr: result.median_snr,
                 median_hfr: result.median_hfr,
-                snr_db: result.snr_db,
+                frame_snr: result.frame_snr,
                 snr_weight: result.snr_weight,
                 psf_signal: result.psf_signal,
                 trail_r_squared: result.trail_r_squared,
@@ -296,7 +314,7 @@ pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
                 median_beta: result.median_beta,
             })
         }
-        Err(e) => {
+        Some(Err(e)) => {
             eprintln!(
                 "WARNING: Star analysis failed for {}: {}. Returning unannotated image.",
                 input_path.display(),
@@ -304,6 +322,7 @@ pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
             );
             None
         }
+        None => None, // Timed out
     };
 
     // Strip alpha channel if RGBA

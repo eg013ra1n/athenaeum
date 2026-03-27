@@ -830,7 +830,7 @@ export interface FrameAnalysis {
   median_eccentricity: number;
   median_snr: number;
   median_hfr: number;
-  snr_db: number;
+  frame_snr: number;
   snr_weight: number;
   psf_signal: number;
   background: number;
@@ -879,7 +879,7 @@ export interface AnnotationMetrics {
   median_eccentricity: number;
   median_snr: number;
   median_hfr: number;
-  snr_db: number;
+  frame_snr: number;
   snr_weight: number;
   psf_signal: number;
   trail_r_squared: number;

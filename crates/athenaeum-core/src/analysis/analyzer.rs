@@ -16,67 +16,40 @@ pub fn build_analyzer(
         .with_min_star_area(config.min_star_area as usize)
         .with_max_star_area(config.max_star_area as usize)
         .with_saturation_fraction(config.saturation_fraction as f32)
-        .with_max_measure(config.max_stars as usize)
         .with_max_stars(config.max_stars as usize)
-        .with_trail_threshold(config.trail_threshold as f32);
-
-    if !config.use_gaussian_fit {
-        analyzer = analyzer.without_gaussian_fit();
-    }
-
-    if let Some(mesh_size) = config.background_mesh_size {
-        analyzer = analyzer.with_background_mesh(mesh_size as usize);
-    }
-
-    if config.use_moffat_fit {
-        analyzer = analyzer.with_moffat_fit();
-    } else {
-        analyzer = analyzer.without_moffat_fit();
-    }
-
-    if config.iterative_background > 0 {
-        analyzer = analyzer.with_iterative_background(config.iterative_background as usize);
-    }
-
-    if config.mrs_noise > 0 {
-        analyzer = analyzer.with_mrs_noise(config.mrs_noise as usize);
-    }
-
-    if let Some(beta) = config.moffat_beta {
-        analyzer = analyzer.with_moffat_beta(beta);
-    }
-
-    if let Some(max_dist) = config.max_distortion {
-        analyzer = analyzer.with_max_distortion(max_dist);
-    }
+        .with_trail_threshold(config.trail_threshold as f32)
+        .with_mrs_layers(config.mrs_layers as usize)
+        .with_measure_cap(config.measure_cap as usize)
+        .with_fit_max_iter(config.fit_max_iter as usize)
+        .with_fit_tolerance(config.fit_tolerance)
+        .with_fit_max_rejects(config.fit_max_rejects as usize);
 
     if let Some(pool) = thread_pool {
         analyzer = analyzer.with_thread_pool(pool);
     }
-
     analyzer
 }
 
 /// Analyze a single frame file and return metrics.
 /// The returned FrameAnalysis has `frame_id` and `file_id` set to 0 — the caller must fill these in.
+/// Accepts a pre-computed `config_hash` to avoid recomputing SHA256 per frame.
 pub fn analyze_frame(
     path: &str,
-    config: &AnalysisConfig,
-    thread_pool: Option<Arc<rayon::ThreadPool>>,
+    analyzer: &ImageAnalyzer,
+    config_hash: &str,
 ) -> Result<FrameAnalysis> {
-    let analyzer = build_analyzer(config, thread_pool);
     let result = analyzer.analyze(path)?;
 
     Ok(FrameAnalysis {
         id: None,
         frame_id: 0,
         file_id: 0,
-        stars_detected: result.stars.len() as i64,
+        stars_detected: result.stars_detected as i64,
         median_fwhm: result.median_fwhm as f64,
         median_eccentricity: result.median_eccentricity as f64,
         median_snr: result.median_snr as f64,
         median_hfr: result.median_hfr as f64,
-        snr_db: result.snr_db as f64,
+        frame_snr: result.frame_snr as f64,
         snr_weight: result.snr_weight as f64,
         psf_signal: result.psf_signal as f64,
         background: result.background as f64,
@@ -89,7 +62,7 @@ pub fn analyze_frame(
         possibly_trailed: result.possibly_trailed,
         median_beta: result.median_beta.map(|v| v as f64),
         quality_score: None,
-        config_hash: Some(config.config_hash()),
+        config_hash: Some(config_hash.to_string()),
         analyzed_at: chrono::Utc::now().to_rfc3339(),
     })
 }

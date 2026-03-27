@@ -36,6 +36,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [error, setError] = useState<string | null>(null);
   // Gate: wait for backend settings to be ready before loading images
   const [cacheModeReady, setCacheModeReady] = useState(false);
+  // Max concurrent image requests — queried from backend (= available cores)
+  const [maxConcurrent, setMaxConcurrent] = useState(8);
 
   // Selection state
   const [selectedFrames, setSelectedFrames] = useState<Set<number>>(new Set());
@@ -78,11 +80,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   currentIndexRef.current = currentIndex;
   loadedImagesRef.current = loadedImages;
 
-  // Load cache mode setting on mount — must complete before images start loading
-  // Signal ready after a microtask — backend reads its own settings,
-  // so frontend just needs to ensure the component is mounted.
+  // Query backend capacity and signal ready on mount
   useEffect(() => {
-    setCacheModeReady(true);
+    api.invoke<number>('get_blink_threads_max')
+      .then((max) => setMaxConcurrent(max || 8))
+      .catch(() => {}) // fallback already set to 8
+      .finally(() => setCacheModeReady(true));
   }, []);
 
   // Filter FITS and XISF files
@@ -191,6 +194,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     currentIndex,
     showAnnotations,
     cacheModeReady,
+    maxConcurrent,
     loadedImages,
     annotatedImages,
     loadImage,
@@ -293,7 +297,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   useEffect(() => {
     if (!cacheModeReady) return;
     loadImage(currentIndex);
-  }, [currentIndex, loadImage, cacheModeReady]);
+    if (showAnnotations) {
+      loadAnnotatedImage(currentIndex);
+    }
+  }, [currentIndex, loadImage, loadAnnotatedImage, showAnnotations, cacheModeReady]);
 
   // Cleanup blob URLs on unmount
   useEffect(() => {

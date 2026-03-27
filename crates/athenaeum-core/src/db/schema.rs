@@ -659,7 +659,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             median_eccentricity REAL NOT NULL,
             median_snr REAL NOT NULL,
             median_hfr REAL NOT NULL,
-            snr_db REAL NOT NULL,
+            frame_snr REAL NOT NULL,
             snr_weight REAL NOT NULL,
             psf_signal REAL NOT NULL,
             background REAL NOT NULL,
@@ -718,6 +718,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             "ALTER TABLE frame_analysis ADD COLUMN median_beta REAL",
             [],
         )?;
+    }
+
+    // Migration: rename snr_db → frame_snr (rustafits 0.7.1)
+    let has_snr_db: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name='snr_db'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(1) = has_snr_db {
+        conn.execute("ALTER TABLE frame_analysis RENAME COLUMN snr_db TO frame_snr", [])?;
     }
 
     // Calibration set originals table - stores original metadata values before custom edits

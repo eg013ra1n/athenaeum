@@ -1,26 +1,19 @@
 // Analysis route handlers — mirrors athenaeum-tauri/src/commands/analysis.rs
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{extract::State, http::StatusCode, Json};
-use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::time::timeout;
 
 use athenaeum_core::analysis::analyzer;
 use athenaeum_core::analysis::config::{self, AnalysisConfig};
 use athenaeum_core::db::analysis as db_analysis;
 use athenaeum_core::models::FrameAnalysis;
-use athenaeum_core::settings;
 
 use crate::events::SseEvent;
 use crate::WebAppState;
-
-/// Per-frame analysis timeout (seconds).
-const FRAME_ANALYSIS_TIMEOUT_SECS: u64 = 120;
 
 // ── Request / Response structs ───────────────────────────────────────────────
 
@@ -156,30 +149,17 @@ pub async fn analyze_single_frame(
         (analysis_config, file_id, path)
     };
 
-    let thread_pool = Some(Arc::clone(&state.ctx.image_pool));
-    let cfg = analysis_config.clone();
+    let pool = Arc::clone(&state.ctx.image_pool);
+    let img_analyzer = analyzer::build_analyzer(&analysis_config, Some(Arc::clone(&pool)));
+    let config_hash = analysis_config.config_hash();
     let path_owned = path.clone();
 
-    let analysis_future = tokio::task::spawn_blocking(move || {
-        analyzer::analyze_frame(&path_owned, &cfg, thread_pool)
-    });
+    let mut analysis = tokio::task::spawn_blocking(move || {
+        analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
+    }).await
+        .map_err(|e| err(format!("Analysis panicked: {}", e)))?
+        .map_err(|e| err(format!("Analysis failed: {}", e)))?;
 
-    let mut analysis = match timeout(
-        Duration::from_secs(FRAME_ANALYSIS_TIMEOUT_SECS),
-        analysis_future,
-    )
-    .await
-    {
-        Ok(Ok(Ok(a))) => a,
-        Ok(Ok(Err(e))) => return Err(err(format!("Analysis failed: {}", e))),
-        Ok(Err(e)) => return Err(err(format!("Analysis panicked: {}", e))),
-        Err(_) => {
-            return Err(err(format!(
-                "Analysis timed out after {}s for {}",
-                FRAME_ANALYSIS_TIMEOUT_SECS, path
-            )))
-        }
-    };
     analysis.frame_id = frame_id;
     analysis.file_id = file_id;
     analysis.quality_score = Some(1.0); // Single frame gets perfect score
@@ -198,7 +178,8 @@ pub async fn analyze_single_frame(
 
 /// POST /api/analyze_frame_set
 ///
-/// Analyzes all LIGHT frames in a frame set concurrently.
+/// Analyzes all LIGHT frames in a frame set.
+/// Uses rayon par_iter inside pool.install() for natural work-stealing across frames.
 /// Emits `analysis-progress` SSE events during processing.
 pub async fn analyze_frame_set(
     State(state): State<WebAppState>,
@@ -207,28 +188,14 @@ pub async fn analyze_frame_set(
     let frame_set_id = args.frame_set_id;
     let force = args.force.unwrap_or(false);
 
-    // Load config, concurrency setting, and frame list under lock, then release
-    let (analysis_config, frames_to_analyze, concurrency) = {
+    // Load config and frame list under DB lock, then release
+    let (analysis_config, frames_to_analyze) = {
         let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
         let conn = db.conn();
 
         let analysis_config = config::load_config(&conn);
         let config_hash = analysis_config.config_hash();
 
-        let concurrency: usize = state
-            .ctx
-            .settings
-            .get_with_precedence(
-                &conn,
-                settings::keys::BLINK_THREADS,
-                settings::defaults::BLINK_THREADS,
-            )
-            .unwrap_or_else(|_| settings::defaults::BLINK_THREADS.to_string())
-            .parse()
-            .unwrap_or(4)
-            .max(1);
-
-        // Get all LIGHT frame file paths for this frame set
         let mut stmt = conn
             .prepare(
                 "SELECT f.id as frame_id, fi.id as file_id, fi.path
@@ -250,7 +217,6 @@ pub async fn analyze_frame_set(
             .filter_map(|r| r.ok())
             .collect();
 
-        // Filter out already-analyzed frames (unless force)
         let frames_to_analyze: Vec<(i64, i64, String)> = if force {
             frame_rows
         } else {
@@ -259,129 +225,106 @@ pub async fn analyze_frame_set(
                 .filter(|(frame_id, _, _)| {
                     match db_analysis::get_frame_analysis(&conn, *frame_id) {
                         Ok(Some(existing)) => {
-                            // Skip if config hash matches
                             existing.config_hash.as_deref() != Some(&config_hash)
                         }
-                        _ => true, // No existing analysis, needs analysis
+                        _ => true,
                     }
                 })
                 .collect()
         };
 
-        (analysis_config, frames_to_analyze, concurrency)
+        (analysis_config, frames_to_analyze)
     };
 
     let total = frames_to_analyze.len();
-    let thread_pool = Some(Arc::clone(&state.ctx.image_pool));
+
+    // Build analyzer ONCE with shared rayon pool — reused across all frames.
+    let pool = Arc::clone(&state.ctx.image_pool);
+    let img_analyzer = Arc::new(analyzer::build_analyzer(
+        &analysis_config,
+        Some(Arc::clone(&pool)),
+    ));
+    let config_hash = Arc::new(analysis_config.config_hash());
     let completed = Arc::new(AtomicUsize::new(0));
     let event_tx = state.event_tx.clone();
+    let concurrency = (analysis_config.batch_concurrency.max(1).min(8)) as usize;
 
-    // Process frames concurrently using buffer_unordered
-    let results: Vec<Result<(i64, FrameAnalysis), String>> = stream::iter(
-        frames_to_analyze
-            .into_iter()
-            .map(|(frame_id, file_id, path)| {
-                let cfg = analysis_config.clone();
-                let pool = thread_pool.clone();
-                let completed = Arc::clone(&completed);
-                let event_tx = event_tx.clone();
+    // Use N worker threads pulling from a shared queue instead of par_iter.
+    // With par_iter, all frames compete for the pool — each gets ~1 thread and runs
+    // single-threaded, causing batch-of-N behavior. With limited workers, each frame
+    // gets more pool threads for internal parallelism (PSF fitting, background estimation),
+    // and work-stealing fills serial gaps between pipeline stages.
+    let results: Vec<Result<(i64, FrameAnalysis), String>> = tokio::task::spawn_blocking(move || {
+        let work = std::sync::Mutex::new(frames_to_analyze.into_iter());
+        let results: std::sync::Mutex<Vec<Result<(i64, FrameAnalysis), String>>> =
+            std::sync::Mutex::new(Vec::with_capacity(total));
 
-                async move {
-                    let path_owned = path.clone();
-                    let analysis_future = tokio::task::spawn_blocking(move || {
-                        analyzer::analyze_frame(&path_owned, &cfg, pool)
-                    });
+        std::thread::scope(|s| {
+            for _ in 0..concurrency {
+                s.spawn(|| {
+                    loop {
+                        let item = work.lock().unwrap().next();
+                        let Some((frame_id, file_id, path)) = item else { break };
 
-                    let result = match timeout(
-                        Duration::from_secs(FRAME_ANALYSIS_TIMEOUT_SECS),
-                        analysis_future,
-                    )
-                    .await
-                    {
-                        Ok(Ok(Ok(mut analysis))) => {
-                            analysis.frame_id = frame_id;
-                            analysis.file_id = file_id;
-                            Ok((frame_id, analysis))
-                        }
-                        Ok(Ok(Err(e))) => {
-                            let msg = format!("{}: {}", path, e);
-                            eprintln!("Analysis failed for {}", msg);
-                            Err(msg)
-                        }
-                        Ok(Err(e)) => {
-                            let msg = format!("{}: task panicked: {}", path, e);
-                            eprintln!("Analysis panicked for {}", msg);
-                            Err(msg)
-                        }
-                        Err(_) => {
-                            let msg = format!(
-                                "{}: timed out after {}s",
-                                path, FRAME_ANALYSIS_TIMEOUT_SECS
-                            );
-                            eprintln!("Analysis timed out for {}", msg);
-                            Err(msg)
-                        }
-                    };
+                        let result = match analyzer::analyze_frame(&path, &img_analyzer, &config_hash) {
+                            Ok(mut analysis) => {
+                                analysis.frame_id = frame_id;
+                                analysis.file_id = file_id;
+                                Ok((frame_id, analysis))
+                            }
+                            Err(e) => {
+                                let msg = format!("{}: {}", path, e);
+                                eprintln!("Analysis failed for {}", msg);
+                                Err(msg)
+                            }
+                        };
 
-                    // Emit progress after each frame completes
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let filename = std::path::Path::new(&path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| path.clone());
-                    let _ = event_tx.send(SseEvent {
-                        event_name: "analysis-progress".to_string(),
-                        data: serde_json::to_value(AnalysisProgressEvent {
-                            current: done,
-                            total,
-                            current_file: filename,
-                            percent: if total > 0 {
-                                (done as f64 / total as f64) * 100.0
-                            } else {
-                                100.0
-                            },
-                        })
-                        .unwrap_or_default(),
-                    });
+                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        let filename = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.clone());
+                        let _ = event_tx.send(SseEvent {
+                            event_name: "analysis-progress".to_string(),
+                            data: serde_json::to_value(AnalysisProgressEvent {
+                                current: done,
+                                total,
+                                current_file: filename,
+                                percent: if total > 0 { (done as f64 / total as f64) * 100.0 } else { 100.0 },
+                            })
+                            .unwrap_or_default(),
+                        });
 
-                    result
-                }
-            }),
-    )
-    .buffer_unordered(concurrency)
-    .collect()
-    .await;
+                        results.lock().unwrap().push(result);
+                    }
+                });
+            }
+        });
 
-    // Partition results into successes and failures
+        results.into_inner().unwrap()
+    }).await.map_err(|e| err(format!("Analysis task panicked: {}", e)))?;
+
+    // Partition results
     let mut all_analyses: Vec<(i64, FrameAnalysis)> = Vec::new();
     let mut errors = Vec::new();
-    let mut analyzed = 0usize;
-    let mut failed = 0usize;
-
     for result in results {
         match result {
-            Ok(pair) => {
-                all_analyses.push(pair);
-                analyzed += 1;
-            }
-            Err(msg) => {
-                errors.push(msg);
-                failed += 1;
-            }
+            Ok(pair) => all_analyses.push(pair),
+            Err(msg) => errors.push(msg),
         }
     }
+    let analyzed = all_analyses.len();
+    let failed = errors.len();
 
     // Compute quality scores across all successful analyses
     let mut analyses: Vec<FrameAnalysis> = all_analyses.into_iter().map(|(_, a)| a).collect();
     analyzer::compute_quality_scores(&mut analyses, &analysis_config);
 
-    // Persist all results
+    // Persist all results in a single transaction
     {
         let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
         let conn = db.conn();
 
-        // If we analyzed some frames, we also need to recompute scores for
-        // existing analyses in this set (to normalize across the full dataset)
         if !analyses.is_empty() && !force {
             let existing = db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)
                 .map_err(err)?;
@@ -389,26 +332,31 @@ pub async fn analyze_frame_set(
             let mut combined: Vec<FrameAnalysis> = Vec::new();
             let new_frame_ids: HashSet<i64> = analyses.iter().map(|a| a.frame_id).collect();
 
-            // Add existing analyses that weren't re-analyzed
             for existing_a in existing {
                 if !new_frame_ids.contains(&existing_a.frame_id) {
                     combined.push(existing_a);
                 }
             }
-            // Add new analyses
             combined.append(&mut analyses);
-
-            // Recompute quality scores across all
             analyzer::compute_quality_scores(&mut combined, &analysis_config);
 
-            // Save all
+            conn.execute_batch("BEGIN").map_err(err)?;
             for a in &combined {
-                db_analysis::upsert_frame_analysis(&conn, a).map_err(err)?;
+                db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    err(e)
+                })?;
             }
-        } else {
+            conn.execute_batch("COMMIT").map_err(err)?;
+        } else if !analyses.is_empty() {
+            conn.execute_batch("BEGIN").map_err(err)?;
             for a in &analyses {
-                db_analysis::upsert_frame_analysis(&conn, a).map_err(err)?;
+                db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    err(e)
+                })?;
             }
+            conn.execute_batch("COMMIT").map_err(err)?;
         }
     }
 

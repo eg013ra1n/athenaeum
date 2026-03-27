@@ -151,7 +151,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
     const fwhmThreshold = parseFloat(thresholds.fwhm);
     const eccThreshold = parseFloat(thresholds.eccentricity);
     const medianSnrThreshold = parseFloat(thresholds.median_snr);
-    const snrDbThreshold = parseFloat(thresholds.snr_db);
+    const snrDbThreshold = parseFloat(thresholds.frame_snr);
     const psfThreshold = parseFloat(thresholds.psf_signal);
     const snrWtThreshold = parseFloat(thresholds.snr_weight);
     const trailThreshold = parseFloat(thresholds.trail);
@@ -177,8 +177,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
         rejected.add(frame.frame_id);
         continue;
       }
-      // SNR dB < threshold = rejected (worse)
-      if (!isNaN(snrDbThreshold) && a.snr_db < snrDbThreshold) {
+      // Frame SNR < threshold = rejected (worse)
+      if (!isNaN(snrDbThreshold) && a.frame_snr < snrDbThreshold) {
         rejected.add(frame.frame_id);
         continue;
       }
@@ -267,7 +267,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   }, [selectedFrameIds, allFrames, blackholedFileIds, onRefresh]);
 
   const handleExportCsv = useCallback(() => {
-    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM', 'Eccentricity', 'SNR', 'SNR (dB)', 'PSF Signal', 'SNR Weight', 'Trail R²', 'Score'];
+    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM', 'Eccentricity', 'SNR', 'Frame SNR', 'PSF Signal', 'SNR Weight', 'Trail R²', 'Score'];
     const rows = displayedFrames.map(frame => {
       const a = analysisData.get(frame.frame_id);
       return [
@@ -280,7 +280,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
         a ? a.median_fwhm.toFixed(2) : '',
         a ? a.median_eccentricity.toFixed(3) : '',
         a ? a.median_snr.toFixed(1) : '',
-        a ? a.snr_db.toFixed(1) : '',
+        a ? a.frame_snr.toFixed(1) : '',
         a ? a.psf_signal.toFixed(1) : '',
         a ? a.snr_weight.toFixed(1) : '',
         a ? a.trail_r_squared.toFixed(4) : '',

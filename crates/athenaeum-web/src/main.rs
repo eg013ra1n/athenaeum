@@ -94,11 +94,12 @@ async fn main() {
         .expect("Failed to create image processing thread pool");
 
     // Read blink threads setting from DB
-    let blink_threads: usize = db::get_setting(&db.conn(), settings::keys::BLINK_THREADS)
+    let blink_threads_raw: usize = db::get_setting(&db.conn(), settings::keys::BLINK_THREADS)
         .ok()
         .flatten()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(settings::defaults::BLINK_THREADS.parse::<usize>().unwrap_or(4));
+        .unwrap_or(0); // 0 = auto (use all available cores)
+    let blink_threads = if blink_threads_raw == 0 { max_threads } else { blink_threads_raw.clamp(1, max_threads) };
     let image_semaphore = Arc::new(RwLock::new(Arc::new(
         tokio::sync::Semaphore::new(blink_threads),
     )));

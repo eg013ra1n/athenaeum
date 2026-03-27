@@ -194,97 +194,86 @@ export function AnalysisSettingsPanel() {
       <div>
         <h4 className="text-sm font-semibold text-content mb-3">Measurement Method</h4>
         <div className="space-y-3">
-          <label className="flex items-center gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={config.use_gaussian_fit}
-              onChange={e => updateField('use_gaussian_fit', e.target.checked)}
-              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
-            />
-            <div>
-              <span className="text-sm text-content-secondary">Use Gaussian Fit</span>
-              <p className="text-xs text-content-muted">Uses full 2D Gaussian fitting for FWHM/eccentricity measurement. When disabled, uses fast windowed moments approximation.</p>
-            </div>
-          </label>
-          <label className="flex items-center gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={config.use_moffat_fit}
-              onChange={e => updateField('use_moffat_fit', e.target.checked)}
-              className="w-4 h-4 rounded border-border bg-surface-hover text-accent focus:ring-accent"
-            />
-            <div>
-              <span className="text-sm text-content-secondary">Use Moffat PSF Model</span>
-              <p className="text-xs text-content-muted">Uses Moffat profile fitting instead of Gaussian. More accurate for real optics (reports per-star Beta values). Falls back to Gaussian on non-convergence.</p>
-            </div>
-          </label>
           <div>
-            <label className="block text-xs text-content-secondary mb-1">Background Mesh Size (optional)</label>
+            <label className="block text-xs text-content-secondary mb-1">MRS Wavelet Layers</label>
             <input
               type="number"
-              value={config.background_mesh_size ?? ''}
-              onChange={e => {
-                const val = e.target.value ? parseInt(e.target.value) : null;
-                updateField('background_mesh_size', val && val >= 16 ? val : null);
-              }}
-              min="16" step="8"
-              placeholder="Global (disabled)"
-              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
-            />
-            <p className="text-xs text-content-muted mt-1">Grid cell size for spatially varying background. Leave empty for global estimation.</p>
-          </div>
-          <div>
-            <label className="block text-xs text-content-secondary mb-1">Iterative Background Passes</label>
-            <input
-              type="number"
-              value={config.iterative_background}
-              onChange={e => updateField('iterative_background', Math.max(0, Math.min(5, parseInt(e.target.value) || 0)))}
-              min="0" max="5" step="1"
-              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
-            />
-            <p className="text-xs text-content-muted mt-1">Source-masked background re-estimation passes (0 = disabled, 1-5). Requires background mesh to be set.</p>
-          </div>
-          <div>
-            <label className="block text-xs text-content-secondary mb-1">MRS Noise Passes</label>
-            <input
-              type="number"
-              value={config.mrs_noise}
-              onChange={e => updateField('mrs_noise', Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))}
+              value={config.mrs_layers}
+              onChange={e => updateField('mrs_layers', Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))}
               min="0" max="10" step="1"
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
             />
-            <p className="text-xs text-content-muted mt-1">MRS wavelet noise estimation layers. 0 = legacy MAD, 1+ = wavelet-based (0-10).</p>
+            <p className="text-xs text-content-muted mt-1">MRS wavelet noise estimation layers. Higher = more accurate noise on nebula-rich fields. Default: 4 (0-10).</p>
           </div>
+        </div>
+      </div>
+
+      {/* PSF Fitting */}
+      <div>
+        <h4 className="text-sm font-semibold text-content mb-3">PSF Fitting</h4>
+        <div className="grid grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs text-content-secondary mb-1">Fixed Moffat Beta</label>
+            <label className="block text-xs text-content-secondary mb-1">Measure Cap</label>
             <input
               type="number"
-              value={config.moffat_beta ?? ''}
-              onChange={e => {
-                const val = e.target.value ? parseFloat(e.target.value) : null;
-                updateField('moffat_beta', val && val >= 1.0 && val <= 10.0 ? val : null);
-              }}
-              min="1.0" max="10.0" step="0.1"
-              placeholder="Auto-fit (disabled)"
+              value={config.measure_cap}
+              onChange={e => updateField('measure_cap', Math.max(0, parseInt(e.target.value) || 0))}
+              min="0" max="100000" step="100"
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
             />
-            <p className="text-xs text-content-muted mt-1">Fix Moffat beta parameter instead of fitting. Leave empty for auto-fit.</p>
+            <p className="text-xs text-content-muted mt-1">Max stars to PSF-fit. 0 = measure all. Default: 2000.</p>
           </div>
           <div>
-            <label className="block text-xs text-content-secondary mb-1">Max Distortion</label>
+            <label className="block text-xs text-content-secondary mb-1">Fit Max Iterations</label>
             <input
               type="number"
-              value={config.max_distortion ?? ''}
-              onChange={e => {
-                const val = e.target.value ? parseFloat(e.target.value) : null;
-                updateField('max_distortion', val && val >= 0.0 && val <= 1.0 ? val : null);
-              }}
-              min="0.0" max="1.0" step="0.05"
-              placeholder="Disabled"
+              value={config.fit_max_iter}
+              onChange={e => updateField('fit_max_iter', Math.max(1, Math.min(200, parseInt(e.target.value) || 25)))}
+              min="1" max="200" step="5"
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
             />
-            <p className="text-xs text-content-muted mt-1">Reject stars with distortion above this threshold. Leave empty to disable.</p>
+            <p className="text-xs text-content-muted mt-1">LM max iterations. Increase for accuracy, decrease for speed. Default: 25.</p>
           </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Fit Tolerance</label>
+            <input
+              type="number"
+              value={config.fit_tolerance}
+              onChange={e => updateField('fit_tolerance', Math.max(1e-8, Math.min(1e-2, parseFloat(e.target.value) || 1e-4)))}
+              min="1e-8" max="0.01" step="0.0001"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">LM convergence tolerance. Lower = tighter convergence. Default: 0.0001.</p>
+          </div>
+          <div>
+            <label className="block text-xs text-content-secondary mb-1">Fit Max Rejects</label>
+            <input
+              type="number"
+              value={config.fit_max_rejects}
+              onChange={e => updateField('fit_max_rejects', Math.max(1, Math.min(100, parseInt(e.target.value) || 5)))}
+              min="1" max="100" step="1"
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+            />
+            <p className="text-xs text-content-muted mt-1">LM consecutive reject bailout. Default: 5.</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Batch Processing */}
+      <div>
+        <h4 className="text-sm font-semibold text-content mb-3">Batch Processing</h4>
+        <div>
+          <label className="block text-xs text-content-secondary mb-1">Concurrent Frames</label>
+          <input
+            type="number"
+            value={config.batch_concurrency}
+            onChange={e => updateField('batch_concurrency', Math.max(1, Math.min(8, parseInt(e.target.value) || 3)))}
+            min="1" max="8" step="1"
+            className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+          />
+          <p className="text-xs text-content-muted mt-1">
+            Number of frames analyzed simultaneously. Higher values use more CPU but also more memory (~200MB per frame). Start with 3, increase if CPU stays below 90%. Default: 3.
+          </p>
         </div>
       </div>
 

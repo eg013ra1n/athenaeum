@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-fn default_true() -> bool { true }
-fn default_one() -> u32 { 1 }
-fn default_mesh_64() -> Option<u32> { Some(64) }
-fn default_mrs_0() -> u32 { 0 }
+fn default_four() -> u32 { 4 }
+fn default_measure_cap() -> u32 { 500 }
+fn default_fit_max_iter() -> u32 { 25 }
+fn default_fit_tolerance() -> f64 { 1e-4 }
+fn default_fit_max_rejects() -> u32 { 5 }
+fn default_batch_concurrency() -> u32 { 3 }
 
 /// Star detection and analysis configuration.
 /// Stored as JSON in the settings table under key "analysis.config".
@@ -22,27 +24,25 @@ pub struct AnalysisConfig {
     pub max_stars: u32,
     /// R² threshold for trail detection. Default: 0.5 (range 0.0-1.0)
     pub trail_threshold: f64,
-    /// Use 2D Gaussian fit (accurate, slower) vs windowed moments (fast). Default: true
-    pub use_gaussian_fit: bool,
-    /// Mesh-grid background estimation cell size. None = global. Default: 64
-    #[serde(default = "default_mesh_64")]
-    pub background_mesh_size: Option<u32>,
-    /// Use Moffat PSF fitting instead of Gaussian. Reports per-star β values. Default: true
-    #[serde(default = "default_true")]
-    pub use_moffat_fit: bool,
-    /// Iterative source-masked background passes (0 = disabled, 1-5).
-    /// Requires background_mesh_size to be set. Default: 1
-    #[serde(default = "default_one")]
-    pub iterative_background: u32,
-    /// MRS wavelet noise estimation layers (0 = legacy MAD, 1+ = MRS wavelet). Default: 0
-    #[serde(default = "default_mrs_0")]
-    pub mrs_noise: u32,
-    /// Fixed Moffat beta parameter. None = auto-fit (default).
-    #[serde(default)]
-    pub moffat_beta: Option<f32>,
-    /// Reject stars with distortion above this threshold. None = disabled (default).
-    #[serde(default)]
-    pub max_distortion: Option<f32>,
+    /// MRS wavelet noise estimation layers. Default: 4
+    #[serde(default = "default_four", alias = "mrs_noise")]
+    pub mrs_layers: u32,
+    /// Max stars to PSF-fit. 0 = measure all. Default: 2000
+    #[serde(default = "default_measure_cap")]
+    pub measure_cap: u32,
+    /// LM max iterations for measurement pass. Default: 25
+    #[serde(default = "default_fit_max_iter")]
+    pub fit_max_iter: u32,
+    /// LM convergence tolerance for measurement pass. Default: 1e-4
+    #[serde(default = "default_fit_tolerance")]
+    pub fit_tolerance: f64,
+    /// LM consecutive reject bailout. Default: 5
+    #[serde(default = "default_fit_max_rejects")]
+    pub fit_max_rejects: u32,
+    /// Concurrent frames during batch analysis. Default: 3.
+    /// Higher values fill more CPU but use more memory (~200MB per concurrent frame).
+    #[serde(default = "default_batch_concurrency")]
+    pub batch_concurrency: u32,
     /// Quality scoring weights
     pub scoring_weights: ScoringWeights,
 }
@@ -70,13 +70,12 @@ impl Default for AnalysisConfig {
             saturation_fraction: 0.95,
             max_stars: 500,
             trail_threshold: 0.5,
-            use_gaussian_fit: true,
-            background_mesh_size: Some(64),
-            use_moffat_fit: true,
-            iterative_background: 1,
-            mrs_noise: 0,
-            moffat_beta: None,
-            max_distortion: None,
+            mrs_layers: 4,
+            measure_cap: 500,
+            fit_max_iter: 25,
+            fit_tolerance: 1e-4,
+            fit_max_rejects: 5,
+            batch_concurrency: 3,
             scoring_weights: ScoringWeights::default(),
         }
     }
@@ -121,8 +120,12 @@ impl AnalysisConfig {
     }
 
     /// Compute SHA256 hash of the config for staleness detection.
+    /// Excludes `batch_concurrency` since it's a runtime performance knob
+    /// that doesn't affect analysis results.
     pub fn config_hash(&self) -> String {
-        let json = serde_json::to_string(self).unwrap_or_default();
+        let mut for_hash = self.clone();
+        for_hash.batch_concurrency = 0;
+        let json = serde_json::to_string(&for_hash).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
         format!("{:x}", hasher.finalize())
@@ -148,29 +151,23 @@ impl AnalysisConfig {
         if self.trail_threshold < 0.0 || self.trail_threshold > 1.0 {
             return Err("trail_threshold must be between 0.0 and 1.0".into());
         }
-        if let Some(mesh) = self.background_mesh_size {
-            if mesh < 16 {
-                return Err("background_mesh_size must be at least 16".into());
-            }
+        if self.mrs_layers > 10 {
+            return Err("mrs_layers must be between 0 and 10".into());
         }
-        if self.iterative_background > 5 {
-            return Err("iterative_background must be between 0 and 5".into());
+        if self.measure_cap > 100_000 {
+            return Err("measure_cap must be between 0 and 100000".into());
         }
-        if self.iterative_background > 0 && self.background_mesh_size.is_none() {
-            return Err("iterative_background requires background_mesh_size to be set".into());
+        if self.fit_max_iter < 1 || self.fit_max_iter > 200 {
+            return Err("fit_max_iter must be between 1 and 200".into());
         }
-        if self.mrs_noise > 10 {
-            return Err("mrs_noise must be between 0 and 10".into());
+        if self.fit_tolerance <= 0.0 || self.fit_tolerance > 1.0 {
+            return Err("fit_tolerance must be between 0 (exclusive) and 1.0".into());
         }
-        if let Some(beta) = self.moffat_beta {
-            if beta < 1.0 || beta > 10.0 {
-                return Err("moffat_beta must be between 1.0 and 10.0".into());
-            }
+        if self.fit_max_rejects < 1 || self.fit_max_rejects > 100 {
+            return Err("fit_max_rejects must be between 1 and 100".into());
         }
-        if let Some(dist) = self.max_distortion {
-            if dist < 0.0 || dist > 1.0 {
-                return Err("max_distortion must be between 0.0 and 1.0".into());
-            }
+        if self.batch_concurrency < 1 || self.batch_concurrency > 8 {
+            return Err("batch_concurrency must be between 1 and 8".into());
         }
         let w = &self.scoring_weights;
         if w.fwhm < 0.0 || w.eccentricity < 0.0 || w.snr_weight < 0.0 || w.star_count < 0.0 {

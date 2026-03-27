@@ -6,7 +6,7 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
     conn.execute(
         "INSERT OR REPLACE INTO frame_analysis (
             frame_id, file_id, stars_detected, median_fwhm, median_eccentricity,
-            median_snr, median_hfr, snr_db, snr_weight, psf_signal,
+            median_snr, median_hfr, frame_snr, snr_weight, psf_signal,
             background, noise, detection_threshold, width, height,
             source_channels, trail_r_squared, possibly_trailed,
             median_beta, quality_score, config_hash, analyzed_at
@@ -19,7 +19,7 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
             a.median_eccentricity,
             a.median_snr,
             a.median_hfr,
-            a.snr_db,
+            a.frame_snr,
             a.snr_weight,
             a.psf_signal,
             a.background,
@@ -43,7 +43,7 @@ pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64
 pub fn get_frame_analysis(conn: &Connection, frame_id: i64) -> Result<Option<FrameAnalysis>> {
     let mut stmt = conn.prepare(
         "SELECT id, frame_id, file_id, stars_detected, median_fwhm, median_eccentricity,
-                median_snr, median_hfr, snr_db, snr_weight, psf_signal,
+                median_snr, median_hfr, frame_snr, snr_weight, psf_signal,
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
                 median_beta, quality_score, config_hash, analyzed_at
@@ -67,7 +67,7 @@ pub fn get_frame_analyses_by_ids(conn: &Connection, frame_ids: &[i64]) -> Result
     let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
     let sql = format!(
         "SELECT id, frame_id, file_id, stars_detected, median_fwhm, median_eccentricity,
-                median_snr, median_hfr, snr_db, snr_weight, psf_signal,
+                median_snr, median_hfr, frame_snr, snr_weight, psf_signal,
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
                 median_beta, quality_score, config_hash, analyzed_at
@@ -90,7 +90,7 @@ pub fn get_frame_analyses_by_ids(conn: &Connection, frame_ids: &[i64]) -> Result
 pub fn get_frame_analyses_for_frame_set(conn: &Connection, frame_set_id: i64) -> Result<Vec<FrameAnalysis>> {
     let mut stmt = conn.prepare(
         "SELECT fa.id, fa.frame_id, fa.file_id, fa.stars_detected, fa.median_fwhm, fa.median_eccentricity,
-                fa.median_snr, fa.median_hfr, fa.snr_db, fa.snr_weight, fa.psf_signal,
+                fa.median_snr, fa.median_hfr, fa.frame_snr, fa.snr_weight, fa.psf_signal,
                 fa.background, fa.noise, fa.detection_threshold, fa.width, fa.height,
                 fa.source_channels, fa.trail_r_squared, fa.possibly_trailed,
                 fa.median_beta, fa.quality_score, fa.config_hash, fa.analyzed_at
@@ -145,7 +145,7 @@ fn row_to_analysis(row: &rusqlite::Row) -> Result<FrameAnalysis> {
         median_eccentricity: row.get(5)?,
         median_snr: row.get(6)?,
         median_hfr: row.get(7)?,
-        snr_db: row.get(8)?,
+        frame_snr: row.get(8)?,
         snr_weight: row.get(9)?,
         psf_signal: row.get(10)?,
         background: row.get(11)?,

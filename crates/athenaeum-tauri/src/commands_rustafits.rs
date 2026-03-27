@@ -93,6 +93,7 @@ pub async fn read_fits_image_rustafits(
     // Slow path: acquire semaphore for actual processing
     let sem = state.image_semaphore.read().unwrap().clone();
     let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+    let t_process = Instant::now();
 
     // Double-check cache — another request may have filled it while we waited
     {
@@ -121,7 +122,8 @@ pub async fn read_fits_image_rustafits(
         mem_cache.insert(cache_key, CachedImage { data: jpeg_data.clone(), last_accessed: Instant::now() });
     }
 
-    println!("✅ Memory cache: {} bytes in {:?}", jpeg_data.len(), t_start.elapsed());
+    let wait = t_process.duration_since(t_start);
+    println!("✅ Memory cache: {} bytes in {:?} (waited {:?})", jpeg_data.len(), t_process.elapsed(), wait);
     Ok(jpeg_data)
 }
 
@@ -225,6 +227,7 @@ pub async fn read_fits_image_annotated(
     // Slow path: acquire semaphore
     let sem = state.image_semaphore.read().unwrap().clone();
     let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+    let t_process = Instant::now();
 
     // Double-check cache
     {
@@ -263,7 +266,8 @@ pub async fn read_fits_image_annotated(
         state.ctx.annotation_metrics.lock().unwrap().insert(cache_key, m.clone());
     }
 
-    println!("✅ Annotated cache: {} bytes in {:?}", jpeg_data.len(), t_start.elapsed());
+    let wait = t_process.duration_since(t_start);
+    println!("✅ Annotated cache: {} bytes in {:?} (waited {:?})", jpeg_data.len(), t_process.elapsed(), wait);
     Ok(AnnotatedImageResponse {
         image_data: jpeg_data,
         metrics,

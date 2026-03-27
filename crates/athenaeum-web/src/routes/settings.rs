@@ -181,7 +181,8 @@ pub async fn set_blink_threads(
     State(state): State<WebAppState>,
     Json(args): Json<SetBlinkThreadsArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let threads = args.threads.clamp(1, state.max_blink_threads);
+    let threads = args.threads.clamp(0, state.max_blink_threads);
+    let effective = if threads == 0 { state.max_blink_threads } else { threads };
 
     let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
@@ -193,11 +194,11 @@ pub async fn set_blink_threads(
         .persist_setting(&conn, settings::keys::BLINK_THREADS, &threads.to_string())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Rebuild semaphore — in-flight permits on the old Arc complete naturally
+    // Rebuild semaphore — 0 means use all available cores
     *state.image_semaphore.write().unwrap() =
-        std::sync::Arc::new(tokio::sync::Semaphore::new(threads));
+        std::sync::Arc::new(tokio::sync::Semaphore::new(effective));
 
-    eprintln!("Blink semaphore rebuilt with {} permits", threads);
+    eprintln!("Blink semaphore rebuilt with {} permits (requested {}, 0=auto)", effective, threads);
     Ok(Json(()))
 }
 
