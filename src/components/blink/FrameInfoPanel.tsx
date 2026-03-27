@@ -57,40 +57,52 @@ export const FrameInfoPanel: React.FC<FrameInfoPanelProps> = memo(function Frame
       </div>
 
       {/* Analysis Metrics section */}
-      {metrics && (
-        <>
-          <h4 className="text-xs font-semibold text-content-muted uppercase tracking-wider mt-3 mb-1">Analysis</h4>
-          <div className="space-y-0">
-            <InfoRow label="Stars" value={metrics.stars_detected.toString()} />
-            <InfoRow label="FWHM" value={`${metrics.median_fwhm.toFixed(2)} px`} />
-            <InfoRow label="Eccentricity" value={metrics.median_eccentricity.toFixed(3)} />
-            <InfoRow label="SNR" value={metrics.median_snr.toFixed(1)} />
-            <InfoRow label="HFR" value={`${metrics.median_hfr.toFixed(2)} px`} />
-            <InfoRow label="Frame SNR" value={metrics.frame_snr.toFixed(1)} />
-            <InfoRow label="SNR Weight" value={metrics.snr_weight.toFixed(1)} />
-            <InfoRow label="PSF Signal" value={metrics.psf_signal.toFixed(1)} />
-            <InfoRow
-              label="Trail R²"
-              value={
-                <span className="flex items-center gap-1">
-                  {metrics.trail_r_squared.toFixed(3)}
-                  {metrics.possibly_trailed && (
-                    <span title={metrics.trail_r_squared >= 0.3
-                      ? "Directional trail detected (RA drift)"
-                      : "Guiding issue (wind/vibration)"
-                    }>
-                      <AlertTriangle size={12} className="text-warning" />
-                    </span>
-                  )}
-                </span>
-              }
-            />
-            {metrics.median_beta != null && (
-              <InfoRow label="Moffat Beta" value={metrics.median_beta.toFixed(2)} />
-            )}
-          </div>
-        </>
-      )}
+      {metrics && (() => {
+        const plateScale = (currentFrame?.frame?.focallen && currentFrame?.frame?.xpixsz)
+          ? (currentFrame.frame.xpixsz / currentFrame.frame.focallen) * 206.265
+          : null;
+
+        return (
+          <>
+            <h4 className="text-xs font-semibold text-content-muted uppercase tracking-wider mt-3 mb-1">Analysis</h4>
+            <div className="space-y-0">
+              <InfoRow label="Stars" value={metrics.stars_detected.toString()} />
+              <InfoRow label="FWHM (px)" value={metrics.median_fwhm.toFixed(2)} />
+              {plateScale && (
+                <InfoRow label={'FWHM (")'} value={(metrics.median_fwhm * plateScale).toFixed(2)} />
+              )}
+              <InfoRow label="Eccentricity" value={metrics.median_eccentricity.toFixed(3)} />
+              <InfoRow label="SNR" value={metrics.median_snr.toFixed(1)} />
+              <InfoRow label="HFR (px)" value={metrics.median_hfr.toFixed(2)} />
+              {plateScale && (
+                <InfoRow label={'HFR (")'} value={(metrics.median_hfr * plateScale).toFixed(2)} />
+              )}
+              <InfoRow label="Frame SNR (dB)" value={metrics.frame_snr.toFixed(1)} />
+              <InfoRow label="SNR Weight" value={metrics.snr_weight.toFixed(1)} />
+              <InfoRow label="PSF Signal (ADU)" value={metrics.psf_signal.toFixed(1)} />
+              <InfoRow
+                label="Trail R²"
+                value={
+                  <span className="flex items-center gap-1">
+                    {metrics.trail_r_squared.toFixed(3)}
+                    {metrics.possibly_trailed && (
+                      <span title={metrics.trail_r_squared >= 0.3
+                        ? "Directional trail detected (RA drift)"
+                        : "Guiding issue (wind/vibration)"
+                      }>
+                        <AlertTriangle size={12} className="text-warning" />
+                      </span>
+                    )}
+                  </span>
+                }
+              />
+              {metrics.median_beta != null && (
+                <InfoRow label="Moffat \u03B2" value={metrics.median_beta.toFixed(2)} />
+              )}
+            </div>
+          </>
+        );
+      })()}
     </div>
   );
 });
