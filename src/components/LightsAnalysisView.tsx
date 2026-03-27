@@ -267,7 +267,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   }, [selectedFrameIds, allFrames, blackholedFileIds, onRefresh]);
 
   const handleExportCsv = useCallback(() => {
-    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM', 'Eccentricity', 'SNR', 'Frame SNR', 'PSF Signal', 'SNR Weight', 'Trail R²', 'Score'];
+    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM (px)', 'Eccentricity', 'SNR', 'Frame SNR (dB)', 'PSF Signal (ADU)', 'SNR Weight', 'Trail R²', 'Score'];
     const rows = displayedFrames.map(frame => {
       const a = analysisData.get(frame.frame_id);
       return [

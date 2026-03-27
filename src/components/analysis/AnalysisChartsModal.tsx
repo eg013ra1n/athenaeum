@@ -108,7 +108,7 @@ export function AnalysisChartsModal({
             {/* Scrollable chart body */}
             <div className="flex-1 overflow-y-auto px-6 py-4 space-y-6">
               <MetricChart
-                title="FWHM"
+                title="FWHM (px)"
                 metricKey="fwhm"
                 dataPoints={chartData.dataPoints}
                 nightBoundaries={chartData.nightBoundaries}
@@ -142,7 +142,7 @@ export function AnalysisChartsModal({
                 onZoomSelect={handleZoomSelect}
               />
               <MetricChart
-                title="PSF Signal"
+                title="PSF Signal (ADU)"
                 metricKey="psfSignal"
                 dataPoints={chartData.dataPoints}
                 nightBoundaries={chartData.nightBoundaries}

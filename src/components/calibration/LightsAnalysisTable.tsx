@@ -296,7 +296,7 @@ export function LightsAnalysisTable({
               <SortableHeader field="stars" label="Stars" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.stars.toFixed(0) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
-              <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.fwhm.toFixed(2) : undefined} />
+              <SortableHeader field="fwhm" label="FWHM (px)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.fwhm.toFixed(2) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
               <SortableHeader field="eccentricity" label="Eccentricity" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.eccentricity.toFixed(3) : undefined} />
@@ -306,10 +306,10 @@ export function LightsAnalysisTable({
               <SortableHeader field="median_snr" label="SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.median_snr.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="frame_snr" label="Frame SNR" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.frame_snr.toFixed(1) : undefined} />
+              <SortableHeader field="frame_snr" label="Frame SNR (dB)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.frame_snr.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
-              <SortableHeader field="psf_signal" label="PSF Signal" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.psf_signal.toFixed(1) : undefined} />
+              <SortableHeader field="psf_signal" label="PSF Signal (ADU)" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.psf_signal.toFixed(1) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-success/10">
               <SortableHeader field="snr_weight" label="SNR Weight" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.snr_weight.toFixed(1) : undefined} />
@@ -321,7 +321,7 @@ export function LightsAnalysisTable({
             {/* Beta column — only shown when Moffat data exists */}
             {hasBeta && (
               <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
-                <SortableHeader field="beta" label="Beta" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
+                <SortableHeader field="beta" label={`Moffat \u03B2`} currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
               </th>
             )}
             {/* Score group — purple tint */}
