@@ -1,34 +1,17 @@
 use anyhow::Result;
-use astroimage::ImageAnalyzer;
+use astroimage::{ImageAnalyzer, ImageConverter, ImageMetadata, PixelData, AnalysisResult};
 use std::sync::Arc;
 
 use crate::models::{FrameAnalysis, StarMetric};
 use super::config::AnalysisConfig;
 
-/// Detect whether a FITS file needs vertical flip for display.
-/// Checks the ROWORDER keyword: "TOP-DOWN" means the converter will flip.
-/// Standard FITS (BOTTOM-UP or absent) means no flip.
-pub fn detect_flip_vertical(path: &str) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else { return false };
-    let mut header_buf = [0u8; 2880 * 5]; // Read up to 5 header blocks
-    let bytes_read = file.read(&mut header_buf).unwrap_or(0);
-    let header = String::from_utf8_lossy(&header_buf[..bytes_read]);
-    for i in (0..header.len()).step_by(80) {
-        let end = (i + 80).min(header.len());
-        let card = &header[i..end];
-        if card.starts_with("ROWORDER") {
-            return card.contains("TOP-DOWN");
-        }
-        if card.starts_with("END") && card[3..].trim().is_empty() {
-            break;
-        }
-    }
-    false
+/// Read raw pixel data from a FITS/XISF file.
+/// Returns metadata (including flip_vertical) and pixel data for use with `analyze_frame_raw`.
+pub fn read_raw(path: &str) -> Result<(ImageMetadata, PixelData)> {
+    ImageConverter::read_raw(path).map_err(Into::into)
 }
 
 /// Build an `ImageAnalyzer` from an `AnalysisConfig`.
-/// Used by both batch analysis and blink annotation to ensure identical parameters.
 pub fn build_analyzer(
     config: &AnalysisConfig,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
@@ -52,17 +35,34 @@ pub fn build_analyzer(
     analyzer
 }
 
-/// Analyze a single frame file and return aggregate metrics plus per-star data.
-/// The returned FrameAnalysis has `frame_id` and `file_id` set to 0 — the caller must fill these in.
-/// The returned StarMetrics have `frame_analysis_id` set to 0 — the caller must fill this in after insert.
-/// Accepts a pre-computed `config_hash` to avoid recomputing SHA256 per frame.
+/// Analyze a single frame file (reads file internally).
+/// Convenience wrapper around `read_raw` + `analyze_frame_raw`.
 pub fn analyze_frame(
     path: &str,
     analyzer: &ImageAnalyzer,
     config_hash: &str,
-) -> Result<(FrameAnalysis, Vec<StarMetric>)> {
-    let result = analyzer.analyze(path)?;
+) -> Result<(FrameAnalysis, Vec<StarMetric>, bool)> {
+    let (meta, pixels) = read_raw(path)?;
+    let flip_vertical = meta.flip_vertical;
+    let (analysis, stars) = analyze_frame_raw(&meta, &pixels, analyzer, config_hash)?;
+    Ok((analysis, stars, flip_vertical))
+}
 
+/// Analyze pre-loaded pixel data (no file I/O).
+/// Use `read_raw()` to pre-load data, then pass it here for CPU-only analysis.
+/// This enables overlapping I/O of the next frame with analysis of the current one.
+pub fn analyze_frame_raw(
+    meta: &ImageMetadata,
+    pixels: &PixelData,
+    analyzer: &ImageAnalyzer,
+    config_hash: &str,
+) -> Result<(FrameAnalysis, Vec<StarMetric>)> {
+    let result = analyzer.analyze_raw(meta, pixels)?;
+    Ok(map_result(result, config_hash))
+}
+
+/// Map rustafits AnalysisResult to Athenaeum models.
+fn map_result(result: AnalysisResult, config_hash: &str) -> (FrameAnalysis, Vec<StarMetric>) {
     let stars: Vec<StarMetric> = result.stars.iter().map(|s| StarMetric {
         id: None,
         frame_analysis_id: 0,
@@ -108,7 +108,7 @@ pub fn analyze_frame(
         analyzed_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    Ok((analysis, stars))
+    (analysis, stars)
 }
 
 /// Compute relative quality scores for a batch of analyses.
