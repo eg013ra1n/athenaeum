@@ -799,15 +799,17 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       <div className="flex-1 flex overflow-hidden">
         {/* Canvas area */}
         <div className="flex-1 relative bg-black flex items-center justify-center">
-          <canvas
-            ref={canvasRef}
-            className="max-w-full max-h-full"
-            style={{ imageRendering: "pixelated" }}
-          />
-          <canvas
-            ref={overlayCanvasRef}
-            className="absolute inset-0 max-w-full max-h-full pointer-events-none"
-          />
+          {/* Wrapper div: base canvas is in flow (sets size), overlay is absolute on top */}
+          <div className="relative">
+            <canvas
+              ref={canvasRef}
+              style={{ imageRendering: "pixelated" }}
+            />
+            <canvas
+              ref={overlayCanvasRef}
+              className="absolute top-0 left-0 pointer-events-none"
+            />
+          </div>
           <div
             className="absolute inset-0"
             style={{
