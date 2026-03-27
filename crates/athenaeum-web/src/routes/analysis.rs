@@ -154,7 +154,7 @@ pub async fn analyze_single_frame(
     let config_hash = analysis_config.config_hash();
     let path_owned = path.clone();
 
-    let (mut analysis, stars) = tokio::task::spawn_blocking(move || {
+    let (mut analysis, stars, _) = tokio::task::spawn_blocking(move || {
         analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
     }).await
         .map_err(|e| err(format!("Analysis panicked: {}", e)))?
@@ -268,7 +268,7 @@ pub async fn analyze_frame_set(
                         let Some((frame_id, file_id, path)) = item else { break };
 
                         let result = match analyzer::analyze_frame(&path, &img_analyzer, &config_hash) {
-                            Ok((mut analysis, stars)) => {
+                            Ok((mut analysis, stars, _flip)) => {
                                 analysis.frame_id = frame_id;
                                 analysis.file_id = file_id;
                                 Ok((frame_id, analysis, stars))
@@ -390,6 +390,21 @@ pub async fn analyze_frame_set(
 
 // ── Star metrics ─────────────────────────────────────────────────────────────
 
+fn detect_flip_vertical(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut buf = [0u8; 2880 * 5];
+    let n = file.read(&mut buf).unwrap_or(0);
+    let header = String::from_utf8_lossy(&buf[..n]);
+    for i in (0..header.len()).step_by(80) {
+        let end = (i + 80).min(header.len());
+        let card = &header[i..end];
+        if card.starts_with("ROWORDER") { return card.contains("TOP-DOWN"); }
+        if card.starts_with("END") && card[3..].trim().is_empty() { break; }
+    }
+    false
+}
+
 /// POST /api/get_frame_star_metrics
 ///
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.
@@ -417,7 +432,7 @@ pub async fn get_frame_star_metrics(
             )
             .map_err(|e| err(format!("Frame not found: {}", e)))?;
 
-        let flip_vertical = analyzer::detect_flip_vertical(&path);
+        let flip_vertical = detect_flip_vertical(&path);
 
         // Check if we have fresh analysis data
         if let Ok(Some(existing)) = db_analysis::get_frame_analysis(&conn, frame_id) {
@@ -444,7 +459,7 @@ pub async fn get_frame_star_metrics(
     let config_hash = current_hash.clone();
     let path_owned = path.clone();
 
-    let (mut analysis, mut stars) = tokio::task::spawn_blocking(move || {
+    let (mut analysis, mut stars, flip_vertical) = tokio::task::spawn_blocking(move || {
         analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
     }).await
         .map_err(|e| err(format!("Analysis panicked: {}", e)))?
@@ -463,8 +478,6 @@ pub async fn get_frame_star_metrics(
         s.frame_analysis_id = analysis_id;
     }
     db_analysis::upsert_star_metrics(&conn, analysis_id, &stars).map_err(err)?;
-
-    let flip_vertical = analyzer::detect_flip_vertical(&path);
 
     Ok(Json(StarMetricsResponse {
         image_width: analysis.width,
