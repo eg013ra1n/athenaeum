@@ -14,7 +14,6 @@ import { ToolBar, FrameList, FrameInfoPanel } from "./blink";
 import { useBlinkCache } from "../hooks/useBlinkCache";
 import { useStarMetricsCache } from "../hooks/useStarMetricsCache";
 import { drawStarOverlay } from "./blink/StarOverlay";
-import type { OverlayTransform } from "./blink/StarOverlay";
 
 interface BlinkViewerProps {
   frames: FileWithFrame[];
@@ -59,7 +58,6 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const drawOverlayRef = useRef<() => void>(() => {});
   const blinkIntervalRef = useRef<number | null>(null);
   const currentIndexRef = useRef(currentIndex);
   const loadedImagesRef = useRef(loadedImages);
@@ -202,8 +200,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     }, 50) as unknown as number;
   }, []);
 
-  // Draw image to canvas with current zoom and pan
-  const drawImageToCanvas = useCallback(() => {
+  // Render the canvas: draw base image + optional star overlay.
+  // Single function eliminates duplicated transform math and ensures overlay always follows image.
+  const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     const img = currentImageRef.current;
     if (!canvas || !img || !canvas.width || !canvas.height) return;
@@ -217,55 +216,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
     const canvasAspect = canvas.width / canvas.height;
     const imageAspect = imgWidth / imgHeight;
-
     if (!isFinite(canvasAspect) || !isFinite(imageAspect)) return;
 
-    // Calculate fit-to-view dimensions (base dimensions at zoom 1.0)
-    let baseWidth, baseHeight;
-    if (imageAspect > canvasAspect) {
-      baseWidth = canvas.width;
-      baseHeight = canvas.width / imageAspect;
-    } else {
-      baseHeight = canvas.height;
-      baseWidth = canvas.height * imageAspect;
-    }
-
-    // Store base dimensions for pan constraint calculations
-    imageSizeRef.current = { width: baseWidth, height: baseHeight };
-
-    // Apply zoom
-    const zoom = zoomRef.current;
-    const renderWidth = baseWidth * zoom;
-    const renderHeight = baseHeight * zoom;
-
-    // Calculate center position with pan offset
-    const centerX = canvas.width / 2 + panRef.current.x;
-    const centerY = canvas.height / 2 + panRef.current.y;
-    const offsetX = centerX - renderWidth / 2;
-    const offsetY = centerY - renderHeight / 2;
-
-    // Draw
-    ctx.fillStyle = "#000000";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
-  }, []);
-
-  // Draw star annotations directly on the base canvas (after the image).
-  // Must be called after drawImageToCanvas() since it clears the canvas.
-  const drawOverlay = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !showAnnotations) return;
-
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const metricsResponse = getStarMetrics(currentIndex);
-    if (!metricsResponse || !currentImageRef.current) return;
-
-    const img = currentImageRef.current;
-    const canvasAspect = canvas.width / canvas.height;
-    const imageAspect = img.width / img.height;
-
+    // Fit-to-view base dimensions (zoom 1.0)
     let baseWidth: number, baseHeight: number;
     if (imageAspect > canvasAspect) {
       baseWidth = canvas.width;
@@ -274,6 +227,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       baseHeight = canvas.height;
       baseWidth = canvas.height * imageAspect;
     }
+    imageSizeRef.current = { width: baseWidth, height: baseHeight };
 
     const zoom = zoomRef.current;
     const renderWidth = baseWidth * zoom;
@@ -283,18 +237,26 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const offsetX = centerX - renderWidth / 2;
     const offsetY = centerY - renderHeight / 2;
 
-    const transform: OverlayTransform = {
+    // Draw base image
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
+
+    // Draw star overlay if annotations are enabled
+    if (!showAnnotations) return;
+    const metricsResponse = getStarMetrics(currentIndex);
+    if (!metricsResponse) return;
+
+    drawStarOverlay(ctx, metricsResponse.stars, annotationSettings, {
       offsetX, offsetY, renderWidth, renderHeight,
       imageWidth: metricsResponse.image_width,
       imageHeight: metricsResponse.image_height,
       flipVertical: metricsResponse.flip_vertical,
-    };
-
-    drawStarOverlay(ctx, metricsResponse.stars, annotationSettings, transform);
+    });
   }, [showAnnotations, currentIndex, getStarMetrics, annotationSettings]);
-  drawOverlayRef.current = drawOverlay;
 
-  // Render image to canvas from blob URL
+  // Load a blob URL into an Image element and render to canvas.
+  // If the same URL is already loaded, just re-renders (fast path for zoom/pan/overlay changes).
   const renderImage = useCallback((imageValue: string) => {
     const canvas = canvasRef.current;
     if (!canvas || !canvas.width || !canvas.height) return;
@@ -302,10 +264,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx || (ctx as any).isContextLost?.() || renderLockRef.current) return;
 
-    // Reuse if same blob URL is already loaded
     if (currentImageRef.current instanceof HTMLImageElement && currentImageRef.current.src === imageValue) {
-      drawImageToCanvas();
-      drawOverlayRef.current();
+      renderCanvas();
       return;
     }
 
@@ -315,8 +275,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     img.onload = () => {
       try {
         currentImageRef.current = img;
-        drawImageToCanvas();
-        drawOverlayRef.current();
+        renderCanvas();
       } finally {
         renderLockRef.current = false;
       }
@@ -328,10 +287,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
 
     img.src = imageValue;
-  }, [drawImageToCanvas]);
+  }, [renderCanvas]);
 
-  // Ensure current frame loads immediately on navigation (idempotent — skips if already loaded/loading)
-  // Annotated images are handled by the cache system's priority queue (Priority 0 = current frame).
+  // Ensure current frame loads immediately on navigation
   useEffect(() => {
     if (!cacheModeReady) return;
     loadImage(currentIndex);
@@ -348,18 +306,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
   }, []);
 
-  // Render current image (drawOverlayRef is called automatically inside renderImage after draw)
+  // Render current frame (image + overlay). Triggers on frame navigation, image load,
+  // annotation toggle, metrics arrival, or settings change.
   useEffect(() => {
     const imageValue = loadedImages.get(currentIndex);
     if (imageValue) renderImage(imageValue);
-  }, [currentIndex, loadedImages, renderImage]);
-
-  // When annotations/metrics change, re-render to update the overlay
-  useEffect(() => {
-    const imageValue = loadedImages.get(currentIndex);
-    if (imageValue) renderImage(imageValue);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showAnnotations, getStarMetrics, annotationSettings]);
+  }, [currentIndex, loadedImages, renderImage, showAnnotations, getStarMetrics, annotationSettings]);
 
   useEffect(() => {
     const updateCanvasSize = () => {
@@ -374,14 +326,13 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         canvas.height = newHeight;
         const imageValue = loadedImagesRef.current.get(currentIndexRef.current);
         if (imageValue) renderImage(imageValue);
-        drawOverlay();
       }
     };
 
     updateCanvasSize();
     window.addEventListener("resize", updateCanvasSize);
     return () => window.removeEventListener("resize", updateCanvasSize);
-  }, [renderImage, drawOverlay]);
+  }, [renderImage]);
 
   // Blink playback
   useEffect(() => {
@@ -444,9 +395,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     zoomRef.current = 1.0;
     panRef.current = { x: 0, y: 0 };
     updateZoomDisplay(1.0);
-    drawImageToCanvas();
-    drawOverlay();
-  }, [updateZoomDisplay, drawImageToCanvas, drawOverlay]);
+    renderCanvas();
+  }, [updateZoomDisplay, renderCanvas]);
 
   // Zoom in by keyboard (from center)
   const zoomIn = useCallback(() => {
@@ -457,9 +407,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     zoomRef.current = newZoom;
     panRef.current = constrainPan(panRef.current);
     updateZoomDisplay(newZoom);
-    drawImageToCanvas();
-    drawOverlay();
-  }, [constrainPan, updateZoomDisplay, drawImageToCanvas, drawOverlay]);
+    renderCanvas();
+  }, [constrainPan, updateZoomDisplay, renderCanvas]);
 
   // Zoom out by keyboard (from center)
   const zoomOut = useCallback(() => {
@@ -470,9 +419,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     zoomRef.current = newZoom;
     panRef.current = constrainPan(panRef.current);
     updateZoomDisplay(newZoom);
-    drawImageToCanvas();
-    drawOverlay();
-  }, [constrainPan, updateZoomDisplay, drawImageToCanvas, drawOverlay]);
+    renderCanvas();
+  }, [constrainPan, updateZoomDisplay, renderCanvas]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -648,9 +596,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     zoomRef.current = newZoom;
     panRef.current = constrainPan(newPan);
     updateZoomDisplay(newZoom);
-    drawImageToCanvas();
-    drawOverlay();
-  }, [constrainPan, updateZoomDisplay, drawImageToCanvas, drawOverlay]);
+    renderCanvas();
+  }, [constrainPan, updateZoomDisplay, renderCanvas]);
 
   // Handle mouse down for pan start
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -678,9 +625,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
 
     panRef.current = constrainPan(newPan);
-    drawImageToCanvas();
-    drawOverlay();
-  }, [constrainPan, drawImageToCanvas, drawOverlay]);
+    renderCanvas();
+  }, [constrainPan, renderCanvas]);
 
   // Handle mouse up for pan end
   const handleMouseUp = useCallback(() => {
