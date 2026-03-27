@@ -82,7 +82,7 @@ impl Default for AnalysisConfig {
             fit_max_iter: 25,
             fit_tolerance: 1e-4,
             fit_max_rejects: 5,
-            batch_concurrency: 3,
+            batch_concurrency: default_batch_concurrency(),
             scoring_weights: ScoringWeights::default(),
         }
     }

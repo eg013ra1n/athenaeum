@@ -267,8 +267,8 @@ export function AnalysisSettingsPanel() {
           <input
             type="number"
             value={config.batch_concurrency}
-            onChange={e => updateField('batch_concurrency', Math.max(1, Math.min(8, parseInt(e.target.value) || 3)))}
-            min="1" max="8" step="1"
+            onChange={e => updateField('batch_concurrency', Math.max(1, Math.min(16, parseInt(e.target.value) || 3)))}
+            min="1" max="16" step="1"
             className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
           />
           <p className="text-xs text-content-muted mt-1">
