@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
-use astroimage::{annotate_image, AnnotationConfig, ImageConverter, ColorScheme};
+use astroimage::ImageConverter;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
-
-use crate::analysis::{analyzer::build_analyzer, config::AnalysisConfig};
 
 /// Resolution variants for blink viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,22 +148,6 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     })
 }
 
-/// Analysis summary returned alongside annotated images
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnnotationMetrics {
-    pub stars_detected: usize,
-    pub median_fwhm: f32,
-    pub median_eccentricity: f32,
-    pub median_snr: f32,
-    pub median_hfr: f32,
-    pub frame_snr: f32,
-    pub snr_weight: f32,
-    pub psf_signal: f32,
-    pub trail_r_squared: f32,
-    pub possibly_trailed: bool,
-    pub median_beta: Option<f32>,
-}
-
 /// User-configurable annotation display settings.
 /// Stored as JSON in the settings table under key "blink.annotation_config".
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,149 +186,6 @@ impl Default for AnnotationSettings {
             fwhm_warn: 2.0,
         }
     }
-}
-
-impl AnnotationSettings {
-    /// Convert to rustafits AnnotationConfig
-    pub fn to_rustafits_config(&self) -> AnnotationConfig {
-        let color_scheme = match self.color_scheme.as_str() {
-            "fwhm" => ColorScheme::Fwhm,
-            "uniform" => ColorScheme::Uniform,
-            _ => ColorScheme::Eccentricity,
-        };
-        AnnotationConfig {
-            color_scheme,
-            show_direction_tick: self.show_direction_tick,
-            min_radius: self.min_radius,
-            max_radius: self.max_radius,
-            line_width: self.line_width.clamp(1, 3),
-            ecc_good: self.ecc_good,
-            ecc_warn: self.ecc_warn,
-            fwhm_good: self.fwhm_good,
-            fwhm_warn: self.fwhm_warn,
-        }
-    }
-}
-
-/// Result of annotated image processing — JPEG bytes + analysis metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnnotatedImageResult {
-    pub image_data: Vec<u8>,
-    pub metrics: Option<AnnotationMetrics>,
-}
-
-/// Process a FITS/XISF file to JPEG with star annotations burned in.
-///
-/// Runs image conversion and star analysis **in parallel** (both read the FITS
-/// file independently). Uses the same `AnalysisConfig` as batch analysis for
-/// consistent metrics.
-pub fn process_fits_to_jpeg_annotated<P: AsRef<Path>>(
-    input_path: P,
-    resolution: Resolution,
-    quality: Option<u8>,
-    pool: &Arc<rayon::ThreadPool>,
-    annotation_settings: Option<&AnnotationSettings>,
-    analysis_config: &AnalysisConfig,
-) -> Result<AnnotatedImageResult> {
-    let input_path = input_path.as_ref();
-
-    if !input_path.exists() {
-        anyhow::bail!("Input file does not exist: {}", input_path.display());
-    }
-
-    // Build converter with resolution-specific settings
-    let mut converter = ImageConverter::new().with_thread_pool(pool.clone());
-
-    if resolution.downscale_factor() > 1 {
-        converter = converter.with_downscale(resolution.downscale_factor());
-    }
-    if resolution.use_preview_mode() {
-        converter = converter.with_preview_mode();
-    }
-
-    // Build analyzer and start it on a separate thread immediately.
-    // The analyzer uses the pool internally (via with_thread_pool), so no
-    // outer pool.install() is needed. Conversion runs on the calling thread
-    // in parallel — both overlap naturally via work-stealing on the shared pool.
-    let analyzer = build_analyzer(analysis_config, Some(pool.clone()));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let path_owned = input_path.to_path_buf();
-    std::thread::spawn(move || {
-        let result = analyzer.analyze(&path_owned);
-        let _ = tx.send(result);
-    });
-
-    // Run conversion on the calling thread — overlaps with analysis above.
-    // converter.process() enters the pool internally via with_thread_pool.
-    let mut processed = converter
-        .process(input_path)
-        .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
-
-    // Wait for analysis to complete (may have finished during conversion).
-    // 5-minute safety net prevents permanently stuck semaphore permits if
-    // analysis hangs on a corrupted file. Not a functional timeout — analysis
-    // has the full 5 minutes to finish.
-    let analysis_result = rx.recv_timeout(std::time::Duration::from_secs(300))
-        .ok();
-
-    let width = processed.width as u32;
-    let height = processed.height as u32;
-
-    // Apply annotations if analysis succeeded
-    let metrics = match analysis_result {
-        Some(Ok(result)) => {
-            let ann_config = annotation_settings
-                .map(|s| s.to_rustafits_config())
-                .unwrap_or_default();
-            annotate_image(&mut processed, &result, &ann_config);
-
-            Some(AnnotationMetrics {
-                stars_detected: result.stars.len(),
-                median_fwhm: result.median_fwhm,
-                median_eccentricity: result.median_eccentricity,
-                median_snr: result.median_snr,
-                median_hfr: result.median_hfr,
-                frame_snr: result.frame_snr,
-                snr_weight: result.snr_weight,
-                psf_signal: result.psf_signal,
-                trail_r_squared: result.trail_r_squared,
-                possibly_trailed: result.possibly_trailed,
-                median_beta: result.median_beta,
-            })
-        }
-        Some(Err(e)) => {
-            eprintln!(
-                "WARNING: Star analysis failed for {}: {}. Returning unannotated image.",
-                input_path.display(),
-                e
-            );
-            None
-        }
-        None => None, // Timed out
-    };
-
-    // Strip alpha channel if RGBA
-    let rgb_data = if processed.channels == 4 {
-        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-        for chunk in processed.data.chunks_exact(4) {
-            rgb.push(chunk[0]);
-            rgb.push(chunk[1]);
-            rgb.push(chunk[2]);
-        }
-        rgb
-    } else {
-        processed.data
-    };
-
-    // Encode JPEG
-    let jpeg_quality = resolution.jpeg_quality(quality);
-    let image_data = jpeg_encode::encode_rgb_to_jpeg(&rgb_data, width, height, jpeg_quality)
-        .map_err(|e| anyhow::anyhow!(e))?;
-
-    Ok(AnnotatedImageResult {
-        image_data,
-        metrics,
-    })
 }
 
 /// Process FITS/XISF to JPEG and cache it in the specified directory

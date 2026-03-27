@@ -153,7 +153,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_imaging_locations", post(spatial::get_imaging_locations))
         .route("/api/query_frames_in_bounds", post(spatial::query_frames_in_bounds))
         .route("/api/get_frame_preview", post(images::get_frame_preview))
-        .route("/api/read_fits_image_annotated", post(images::read_fits_image_annotated))
         // Calendar
         .route("/api/get_calendar_month_data", post(spatial::get_calendar_month_data))
         // Analysis

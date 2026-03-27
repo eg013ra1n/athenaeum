@@ -98,8 +98,8 @@ async fn main() {
         .ok()
         .flatten()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0); // 0 = auto (use all available cores)
-    let blink_threads = if blink_threads_raw == 0 { max_threads } else { blink_threads_raw.clamp(1, max_threads) };
+        .unwrap_or(0); // 0 = auto (half of available cores)
+    let blink_threads = if blink_threads_raw == 0 { (max_threads / 2).max(2) } else { blink_threads_raw.clamp(1, max_threads) };
     let image_semaphore = Arc::new(RwLock::new(Arc::new(
         tokio::sync::Semaphore::new(blink_threads),
     )));
@@ -129,7 +129,6 @@ async fn main() {
         active_scans: Arc::new(Mutex::new(HashMap::new())),
         active_exports: Arc::new(Mutex::new(HashMap::new())),
         image_pool: Arc::new(image_pool),
-        annotation_metrics: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // SSE broadcast channel

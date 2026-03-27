@@ -73,7 +73,6 @@ pub fn run() {
                             .build()
                             .expect("Failed to create image processing thread pool"),
                     ),
-                    annotation_metrics: Arc::new(Mutex::new(HashMap::new())),
                 },
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),
@@ -267,7 +266,6 @@ pub fn run() {
             commands::delete_analysis_for_frame_set,
             commands::get_frame_star_metrics,
             commands_rustafits::read_fits_image_rustafits,
-            commands_rustafits::read_fits_image_annotated,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
