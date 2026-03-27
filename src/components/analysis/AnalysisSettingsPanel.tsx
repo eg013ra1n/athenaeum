@@ -272,7 +272,7 @@ export function AnalysisSettingsPanel() {
             className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
           />
           <p className="text-xs text-content-muted mt-1">
-            Number of frames analyzed simultaneously. Higher values use more CPU but also more memory (~200MB per frame). Start with 3, increase if CPU stays below 90%. Default: 3.
+            Number of frames analyzed simultaneously. Higher values use more CPU but also more memory (~200MB per frame). Auto-tuned based on CPU cores.
           </p>
         </div>
       </div>
