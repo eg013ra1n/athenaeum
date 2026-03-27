@@ -1,4 +1,4 @@
-import type { FileWithFrame, AnnotationMetrics } from "../../types/models";
+import type { FileWithFrame, FrameAnalysis } from "../../types/models";
 
 /** Props for the main BlinkViewer component */
 export interface BlinkViewerProps {
@@ -61,7 +61,7 @@ export interface FrameListProps {
 /** Props for the FrameInfoPanel component */
 export interface FrameInfoPanelProps {
   currentFrame: FileWithFrame | undefined;
-  metrics: AnnotationMetrics | null;
+  metrics: FrameAnalysis | null;
 }
 
 /** Cache progress state */
