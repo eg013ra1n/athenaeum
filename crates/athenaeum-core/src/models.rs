@@ -733,6 +733,37 @@ pub struct FrameAnalysis {
     pub analyzed_at: String,
 }
 
+/// Individual star detection result with position, shape, and quality metrics.
+/// Used for client-side annotation overlay rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StarMetric {
+    pub id: Option<i64>,
+    pub frame_analysis_id: i64,
+    pub x: f64,
+    pub y: f64,
+    pub peak: f64,
+    pub flux: f64,
+    pub fwhm: f64,
+    pub fwhm_x: f64,
+    pub fwhm_y: f64,
+    pub eccentricity: f64,
+    pub snr: f64,
+    pub hfr: f64,
+    pub theta: f64,
+    pub beta: Option<f64>,
+    pub fit_method: String,
+    pub fit_residual: f64,
+}
+
+/// Response for the get_frame_star_metrics command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StarMetricsResponse {
+    pub stars: Vec<StarMetric>,
+    pub metrics: FrameAnalysis,
+    pub image_width: i64,
+    pub image_height: i64,
+}
+
 /// Original calibration set metadata values (backed up before editing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationSetOriginals {
