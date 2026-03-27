@@ -173,8 +173,8 @@ impl AnalysisConfig {
         if self.fit_max_rejects < 1 || self.fit_max_rejects > 100 {
             return Err("fit_max_rejects must be between 1 and 100".into());
         }
-        if self.batch_concurrency < 1 || self.batch_concurrency > 16 {
-            return Err("batch_concurrency must be between 1 and 16".into());
+        if self.batch_concurrency > 16 {
+            return Err("batch_concurrency must be 0 (auto) or 1-16".into());
         }
         let w = &self.scoring_weights;
         if w.fwhm < 0.0 || w.eccentricity < 0.0 || w.snr_weight < 0.0 || w.star_count < 0.0 {

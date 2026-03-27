@@ -264,15 +264,30 @@ export function AnalysisSettingsPanel() {
         <h4 className="text-sm font-semibold text-content mb-3">Batch Processing</h4>
         <div>
           <label className="block text-xs text-content-secondary mb-1">Concurrent Frames</label>
-          <input
-            type="number"
-            value={config.batch_concurrency}
-            onChange={e => updateField('batch_concurrency', Math.max(1, Math.min(16, parseInt(e.target.value) || 3)))}
-            min="1" max="16" step="1"
-            className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
-          />
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={config.batch_concurrency === 0}
+                onChange={e => updateField('batch_concurrency', e.target.checked ? 0 : 3)}
+                className="rounded border-border"
+              />
+              Auto
+            </label>
+            {config.batch_concurrency !== 0 && (
+              <input
+                type="number"
+                value={config.batch_concurrency}
+                onChange={e => updateField('batch_concurrency', Math.max(1, Math.min(16, parseInt(e.target.value) || 3)))}
+                min="1" max="16" step="1"
+                className="flex-1 bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+              />
+            )}
+          </div>
           <p className="text-xs text-content-muted mt-1">
-            Number of frames analyzed simultaneously. Higher values use more CPU but also more memory (~200MB per frame). Auto-tuned based on CPU cores.
+            {config.batch_concurrency === 0
+              ? "Automatically set based on CPU cores (~1 frame per 3 cores)."
+              : "Number of frames analyzed simultaneously. Higher values use more CPU and memory (~200MB per frame)."}
           </p>
         </div>
       </div>
