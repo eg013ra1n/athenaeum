@@ -2,7 +2,7 @@ use anyhow::Result;
 use astroimage::ImageAnalyzer;
 use std::sync::Arc;
 
-use crate::models::FrameAnalysis;
+use crate::models::{FrameAnalysis, StarMetric};
 use super::config::AnalysisConfig;
 
 /// Build an `ImageAnalyzer` from an `AnalysisConfig`.
@@ -30,17 +30,37 @@ pub fn build_analyzer(
     analyzer
 }
 
-/// Analyze a single frame file and return metrics.
+/// Analyze a single frame file and return aggregate metrics plus per-star data.
 /// The returned FrameAnalysis has `frame_id` and `file_id` set to 0 — the caller must fill these in.
+/// The returned StarMetrics have `frame_analysis_id` set to 0 — the caller must fill this in after insert.
 /// Accepts a pre-computed `config_hash` to avoid recomputing SHA256 per frame.
 pub fn analyze_frame(
     path: &str,
     analyzer: &ImageAnalyzer,
     config_hash: &str,
-) -> Result<FrameAnalysis> {
+) -> Result<(FrameAnalysis, Vec<StarMetric>)> {
     let result = analyzer.analyze(path)?;
 
-    Ok(FrameAnalysis {
+    let stars: Vec<StarMetric> = result.stars.iter().map(|s| StarMetric {
+        id: None,
+        frame_analysis_id: 0,
+        x: s.x as f64,
+        y: s.y as f64,
+        peak: s.peak as f64,
+        flux: s.flux as f64,
+        fwhm: s.fwhm as f64,
+        fwhm_x: s.fwhm_x as f64,
+        fwhm_y: s.fwhm_y as f64,
+        eccentricity: s.eccentricity as f64,
+        snr: s.snr as f64,
+        hfr: s.hfr as f64,
+        theta: s.theta as f64,
+        beta: s.beta.map(|v| v as f64),
+        fit_method: format!("{:?}", s.fit_method),
+        fit_residual: s.fit_residual as f64,
+    }).collect();
+
+    let analysis = FrameAnalysis {
         id: None,
         frame_id: 0,
         file_id: 0,
@@ -64,7 +84,9 @@ pub fn analyze_frame(
         quality_score: None,
         config_hash: Some(config_hash.to_string()),
         analyzed_at: chrono::Utc::now().to_rfc3339(),
-    })
+    };
+
+    Ok((analysis, stars))
 }
 
 /// Compute relative quality scores for a batch of analyses.
