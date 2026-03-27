@@ -690,6 +690,34 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Per-star metrics table — individual star detection results for overlay rendering
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS star_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_analysis_id INTEGER NOT NULL,
+            x REAL NOT NULL,
+            y REAL NOT NULL,
+            peak REAL NOT NULL,
+            flux REAL NOT NULL,
+            fwhm REAL NOT NULL,
+            fwhm_x REAL NOT NULL,
+            fwhm_y REAL NOT NULL,
+            eccentricity REAL NOT NULL,
+            snr REAL NOT NULL,
+            hfr REAL NOT NULL,
+            theta REAL NOT NULL,
+            beta REAL,
+            fit_method TEXT NOT NULL,
+            fit_residual REAL NOT NULL,
+            FOREIGN KEY (frame_analysis_id) REFERENCES frame_analysis(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_star_metrics_analysis_id ON star_metrics(frame_analysis_id)",
+        [],
+    )?;
+
     // Add trail_r_squared and possibly_trailed to frame_analysis (migration for existing databases)
     let has_trail: Result<i64, _> = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('frame_analysis') WHERE name='trail_r_squared'",
