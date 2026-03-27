@@ -289,7 +289,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       imageHeight: metricsResponse.image_height,
     };
 
-    drawStarOverlay(ctx, canvas.width, canvas.height, metricsResponse.stars, annotationSettings, transform);
+    drawStarOverlay(ctx, metricsResponse.stars, annotationSettings, transform);
   }, [showAnnotations, currentIndex, getStarMetrics, annotationSettings]);
   drawOverlayRef.current = drawOverlay;
 

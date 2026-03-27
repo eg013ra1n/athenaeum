@@ -11,13 +11,14 @@ export interface OverlayTransform {
   renderWidth: number;
   /** Rendered image height in canvas pixels (after zoom) */
   renderHeight: number;
-  /** Original FITS image width in pixels */
+  /** Analysis result width (coordinate space of star x/y) */
   imageWidth: number;
-  /** Original FITS image height in pixels */
+  /** Analysis result height (coordinate space of star x/y) */
   imageHeight: number;
 }
 
-/** Compute color for a star based on annotation settings color scheme */
+/** Compute color for a star based on annotation settings color scheme.
+ *  Mirrors rustafits annotate.rs star_color(). */
 function starColor(star: StarMetric, settings: AnnotationSettings): string {
   if (settings.color_scheme === "uniform") {
     return "rgba(0, 255, 0, 0.8)";
@@ -32,7 +33,6 @@ function starColor(star: StarMetric, settings: AnnotationSettings): string {
     good = settings.ecc_good;
     warn = settings.ecc_warn;
   } else {
-    // fwhm
     value = star.fwhm;
     good = settings.fwhm_good;
     warn = settings.fwhm_warn;
@@ -43,11 +43,20 @@ function starColor(star: StarMetric, settings: AnnotationSettings): string {
   return "rgba(255, 0, 0, 0.8)";
 }
 
-/** Draw all star annotations on the overlay canvas */
+/**
+ * Draw all star annotations onto a canvas context.
+ *
+ * Mirrors the coordinate transform in rustafits annotate.rs compute_annotations():
+ *   scale_x = output_width / result.width
+ *   x_out   = star.x * scale_x
+ *   semi_a  = (fwhm_x * scale_x * 2.5).clamp(min_radius, max_radius)
+ *
+ * In the canvas context, "output" space is the rendered image rectangle
+ * (offsetX..offsetX+renderWidth, offsetY..offsetY+renderHeight), and
+ * min_radius/max_radius are in canvas pixels (not scaled by analysis ratio).
+ */
 export function drawStarOverlay(
   ctx: CanvasRenderingContext2D,
-  _canvasWidth: number,
-  _canvasHeight: number,
   stars: StarMetric[],
   settings: AnnotationSettings,
   transform: OverlayTransform,
@@ -56,32 +65,38 @@ export function drawStarOverlay(
   const scaleY = transform.renderHeight / transform.imageHeight;
 
   for (const star of stars) {
+    // Position: analysis coords → canvas coords
     const cx = transform.offsetX + star.x * scaleX;
     const cy = transform.offsetY + star.y * scaleY;
 
-    const rawRadiusX = (star.fwhm_x / 2) * scaleX;
-    const rawRadiusY = (star.fwhm_y / 2) * scaleY;
-    const minR = settings.min_radius * Math.min(scaleX, scaleY);
-    const maxR = settings.max_radius * Math.min(scaleX, scaleY);
-    const radiusX = Math.max(minR, Math.min(maxR, rawRadiusX));
-    const radiusY = Math.max(minR, Math.min(maxR, rawRadiusY));
+    // Semi-axes: match rustafits — fwhm * scale * 2.5, clamped to fixed canvas-pixel limits.
+    // min_radius / max_radius are in canvas pixels (not analysis pixels).
+    const rawA = star.fwhm_x * scaleX * 2.5;
+    const rawB = star.fwhm_y * scaleY * 2.5;
+    const semiMajor = Math.max(settings.min_radius, Math.min(settings.max_radius, rawA));
+    const semiMinor = Math.max(settings.min_radius, Math.min(settings.max_radius, rawB));
 
-    if (radiusX < 0.5 || radiusY < 0.5) continue;
+    if (semiMajor < 0.5 || semiMinor < 0.5) continue;
 
     const color = starColor(star, settings);
 
+    // Draw ellipse
     ctx.beginPath();
-    ctx.ellipse(cx, cy, radiusX, radiusY, star.theta, 0, 2 * Math.PI);
+    ctx.ellipse(cx, cy, semiMajor, semiMinor, star.theta, 0, 2 * Math.PI);
     ctx.strokeStyle = color;
     ctx.lineWidth = settings.line_width;
     ctx.stroke();
 
-    if (settings.show_direction_tick) {
-      const tickLen = radiusX * 0.5;
-      const edgeX = cx + radiusX * Math.cos(star.theta);
-      const edgeY = cy + radiusY * Math.sin(star.theta);
-      const tipX = edgeX + tickLen * Math.cos(star.theta);
-      const tipY = edgeY + tickLen * Math.sin(star.theta);
+    // Direction tick along elongation axis (matches rustafits: only when ecc > 0.15)
+    if (settings.show_direction_tick && star.eccentricity > 0.15) {
+      const tickLen = semiMajor * 0.5;
+      const ct = Math.cos(star.theta);
+      const st = Math.sin(star.theta);
+      // Edge of ellipse along major axis
+      const edgeX = cx + semiMajor * ct;
+      const edgeY = cy + semiMajor * st;
+      const tipX = edgeX + tickLen * ct;
+      const tipY = edgeY + tickLen * st;
 
       ctx.beginPath();
       ctx.moveTo(edgeX, edgeY);
@@ -91,13 +106,4 @@ export function drawStarOverlay(
       ctx.stroke();
     }
   }
-}
-
-/** Clear the overlay canvas */
-export function clearStarOverlay(
-  ctx: CanvasRenderingContext2D,
-  canvasWidth: number,
-  canvasHeight: number,
-): void {
-  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 }
