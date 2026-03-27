@@ -46,14 +46,12 @@ function starColor(star: StarMetric, settings: AnnotationSettings): string {
 /** Draw all star annotations on the overlay canvas */
 export function drawStarOverlay(
   ctx: CanvasRenderingContext2D,
-  canvasWidth: number,
-  canvasHeight: number,
+  _canvasWidth: number,
+  _canvasHeight: number,
   stars: StarMetric[],
   settings: AnnotationSettings,
   transform: OverlayTransform,
 ): void {
-  ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-
   const scaleX = transform.renderWidth / transform.imageWidth;
   const scaleY = transform.renderHeight / transform.imageHeight;
 

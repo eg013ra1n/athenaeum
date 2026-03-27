@@ -13,7 +13,7 @@ import { DEFAULT_ANNOTATION_SETTINGS } from "../types/analysis-config";
 import { ToolBar, FrameList, FrameInfoPanel } from "./blink";
 import { useBlinkCache } from "../hooks/useBlinkCache";
 import { useStarMetricsCache } from "../hooks/useStarMetricsCache";
-import { drawStarOverlay, clearStarOverlay } from "./blink/StarOverlay";
+import { drawStarOverlay } from "./blink/StarOverlay";
 import type { OverlayTransform } from "./blink/StarOverlay";
 
 interface BlinkViewerProps {
@@ -57,9 +57,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Annotation state
   const [showAnnotations, setShowAnnotations] = useState(false);
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const drawOverlayRef = useRef<() => void>(() => {});
   const blinkIntervalRef = useRef<number | null>(null);
   const currentIndexRef = useRef(currentIndex);
   const loadedImagesRef = useRef(loadedImages);
@@ -250,48 +250,36 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     ctx.drawImage(img, offsetX, offsetY, renderWidth, renderHeight);
   }, []);
 
+  // Draw star annotations directly on the base canvas (after the image).
+  // Must be called after drawImageToCanvas() since it clears the canvas.
   const drawOverlay = useCallback(() => {
-    const overlay = overlayCanvasRef.current;
-    const baseCanvas = canvasRef.current;
-    if (!overlay || !baseCanvas) return;
+    const canvas = canvasRef.current;
+    if (!canvas || !showAnnotations) return;
 
-    const ctx = overlay.getContext("2d");
+    const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    if (overlay.width !== baseCanvas.width || overlay.height !== baseCanvas.height) {
-      overlay.width = baseCanvas.width;
-      overlay.height = baseCanvas.height;
-    }
-
-    if (!showAnnotations) {
-      clearStarOverlay(ctx, overlay.width, overlay.height);
-      return;
-    }
-
     const metricsResponse = getStarMetrics(currentIndex);
-    if (!metricsResponse || !currentImageRef.current) {
-      clearStarOverlay(ctx, overlay.width, overlay.height);
-      return;
-    }
+    if (!metricsResponse || !currentImageRef.current) return;
 
     const img = currentImageRef.current;
-    const canvasAspect = baseCanvas.width / baseCanvas.height;
+    const canvasAspect = canvas.width / canvas.height;
     const imageAspect = img.width / img.height;
 
     let baseWidth: number, baseHeight: number;
     if (imageAspect > canvasAspect) {
-      baseWidth = baseCanvas.width;
-      baseHeight = baseCanvas.width / imageAspect;
+      baseWidth = canvas.width;
+      baseHeight = canvas.width / imageAspect;
     } else {
-      baseHeight = baseCanvas.height;
-      baseWidth = baseCanvas.height * imageAspect;
+      baseHeight = canvas.height;
+      baseWidth = canvas.height * imageAspect;
     }
 
     const zoom = zoomRef.current;
     const renderWidth = baseWidth * zoom;
     const renderHeight = baseHeight * zoom;
-    const centerX = baseCanvas.width / 2 + panRef.current.x;
-    const centerY = baseCanvas.height / 2 + panRef.current.y;
+    const centerX = canvas.width / 2 + panRef.current.x;
+    const centerY = canvas.height / 2 + panRef.current.y;
     const offsetX = centerX - renderWidth / 2;
     const offsetY = centerY - renderHeight / 2;
 
@@ -301,8 +289,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       imageHeight: metricsResponse.image_height,
     };
 
-    drawStarOverlay(ctx, overlay.width, overlay.height, metricsResponse.stars, annotationSettings, transform);
+    drawStarOverlay(ctx, canvas.width, canvas.height, metricsResponse.stars, annotationSettings, transform);
   }, [showAnnotations, currentIndex, getStarMetrics, annotationSettings]);
+  drawOverlayRef.current = drawOverlay;
 
   // Render image to canvas from blob URL
   const renderImage = useCallback((imageValue: string) => {
@@ -315,6 +304,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     // Reuse if same blob URL is already loaded
     if (currentImageRef.current instanceof HTMLImageElement && currentImageRef.current.src === imageValue) {
       drawImageToCanvas();
+      drawOverlayRef.current();
       return;
     }
 
@@ -325,6 +315,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       try {
         currentImageRef.current = img;
         drawImageToCanvas();
+        drawOverlayRef.current();
       } finally {
         renderLockRef.current = false;
       }
@@ -356,16 +347,18 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
   }, []);
 
-  // Render current image
+  // Render current image (drawOverlayRef is called automatically inside renderImage after draw)
   useEffect(() => {
     const imageValue = loadedImages.get(currentIndex);
     if (imageValue) renderImage(imageValue);
   }, [currentIndex, loadedImages, renderImage]);
 
-  // Draw overlay whenever annotations, current frame, or metrics change
+  // When annotations/metrics change, re-render to update the overlay
   useEffect(() => {
-    drawOverlay();
-  }, [drawOverlay]);
+    const imageValue = loadedImages.get(currentIndex);
+    if (imageValue) renderImage(imageValue);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAnnotations, getStarMetrics, annotationSettings]);
 
   useEffect(() => {
     const updateCanvasSize = () => {
@@ -799,17 +792,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       <div className="flex-1 flex overflow-hidden">
         {/* Canvas area */}
         <div className="flex-1 relative bg-black flex items-center justify-center">
-          {/* Wrapper div: base canvas is in flow (sets size), overlay is absolute on top */}
-          <div className="relative">
-            <canvas
-              ref={canvasRef}
-              style={{ imageRendering: "pixelated" }}
-            />
-            <canvas
-              ref={overlayCanvasRef}
-              className="absolute top-0 left-0 pointer-events-none"
-            />
-          </div>
+          <canvas
+            ref={canvasRef}
+            style={{ imageRendering: "pixelated" }}
+          />
           <div
             className="absolute inset-0"
             style={{
