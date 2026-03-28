@@ -21,61 +21,50 @@ export function useAnalysisProgress() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [activeAnalyses, setActiveAnalyses] = useState<Map<number, ActiveAnalysis>>(new Map());
   const processingRef = useRef(false);
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
 
-  // Process next queued item. Called when queue changes or current analysis finishes.
-  // Uses functional state updates throughout to avoid stale closures.
-  const processNext = useCallback(() => {
+  // The actual async work — reads from ref, not state
+  const runNext = useCallback(async () => {
     if (processingRef.current) return;
 
-    setQueue(currentQueue => {
-      // Find the first item that needs processing
-      const next = currentQueue[0];
-      if (!next) return currentQueue;
+    const next = queueRef.current[0];
+    if (!next) return;
 
-      processingRef.current = true;
+    processingRef.current = true;
 
-      // Fire off the analysis (async, not awaited here)
-      api.invoke<AnalyzeFrameSetResult>('analyze_frame_set', {
+    try {
+      await api.invoke<AnalyzeFrameSetResult>('analyze_frame_set', {
         frameSetId: next.frameSetId,
         force: next.force ?? false,
-      }).catch(err => {
-        console.error(`Analysis failed for frame set ${next.frameSetId}:`, err);
-        setActiveAnalyses(prev => {
-          const updated = new Map(prev);
-          const entry = updated.get(next.frameSetId);
-          if (entry) {
-            updated.set(next.frameSetId, {
-              ...entry,
-              isComplete: true,
-              result: { analyzed: 0, skipped: 0, failed: 0, errors: [String(err)], cancelled: false },
-            });
-          }
-          return updated;
-        });
-      }).finally(() => {
-        processingRef.current = false;
-        // Remove completed item and trigger next
-        setQueue(q => {
-          const remaining = q.slice(1);
-          // Schedule processNext on next tick if there are more items
-          if (remaining.length > 0) {
-            setTimeout(() => processNext(), 0);
-          }
-          return remaining;
-        });
       });
+    } catch (err) {
+      console.error(`Analysis failed for frame set ${next.frameSetId}:`, err);
+      setActiveAnalyses(prev => {
+        const updated = new Map(prev);
+        const entry = updated.get(next.frameSetId);
+        if (entry) {
+          updated.set(next.frameSetId, {
+            ...entry,
+            isComplete: true,
+            result: { analyzed: 0, skipped: 0, failed: 0, errors: [String(err)], cancelled: false },
+          });
+        }
+        return updated;
+      });
+    }
 
-      // Return queue unchanged — the finally block will remove the item
-      return currentQueue;
-    });
+    processingRef.current = false;
+    setQueue(q => q.slice(1));
+    // After state settles, React will re-render, the effect below will call runNext again
   }, []);
 
-  // When queue grows (new items added), kick the processor
+  // Kick the processor when queue has items and nothing is running
   useEffect(() => {
     if (queue.length > 0 && !processingRef.current) {
-      processNext();
+      runNext();
     }
-  }, [queue.length, processNext]);
+  }, [queue, runNext]);
 
   // Listen for progress and completion events (once on mount)
   useEffect(() => {
@@ -122,7 +111,6 @@ export function useAnalysisProgress() {
   }, []);
 
   const enqueueAnalysis = useCallback((frameSetId: number, frameSetName?: string, force?: boolean) => {
-    // Don't enqueue if already active
     setActiveAnalyses(prev => {
       if (prev.has(frameSetId) && !prev.get(frameSetId)!.isComplete) return prev;
       const updated = new Map(prev);
@@ -159,22 +147,18 @@ export function useAnalysisProgress() {
   }, []);
 
   const cancelAll = useCallback(async () => {
-    // Get current first item before clearing
-    let currentFrameSetId: number | undefined;
-    setQueue(q => {
-      currentFrameSetId = q[0]?.frameSetId;
-      return [];
-    });
-    if (currentFrameSetId != null) {
+    const current = queueRef.current[0];
+    setQueue([]);
+    if (current) {
       try {
-        await api.invoke('cancel_analysis', { frameSetId: currentFrameSetId });
+        await api.invoke('cancel_analysis', { frameSetId: current.frameSetId });
       } catch { /* ignore */ }
     }
     setActiveAnalyses(prev => {
       const updated = new Map(prev);
-      for (const [id, entry] of updated) {
+      for (const [, entry] of updated) {
         if (!entry.isComplete) {
-          updated.set(id, { ...entry, isCancelling: true });
+          updated.set(entry.frameSetId, { ...entry, isCancelling: true });
         }
       }
       return updated;
