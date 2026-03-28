@@ -1,17 +1,16 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Play, Trash2, BarChart3, Download, Check, LineChart } from 'lucide-react';
+import { Play, Trash2, BarChart3, Download, Check, LineChart, X } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
-  AnalyzeFrameSetResult,
-  AnalysisProgressEvent,
 } from '../types/models';
 import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/LightsAnalysisTable';
 import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildMergedCameraFilterTree } from './calibration/utils';
 import { AnalysisChartsModal } from './analysis/AnalysisChartsModal';
+import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
 
 interface LightsAnalysisViewProps {
   hierarchy: CalibrationHierarchyViewData;
@@ -31,10 +30,13 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   const [thresholds, setThresholds] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
   const [defaultThresholds, setDefaultThresholds] = useState<RejectionThresholds | null>(null);
 
-  // Analysis state
+  // Analysis state — uses global context for queue/progress
+  const { enqueueAnalysis, isAnalyzing, cancelAnalysis, activeAnalyses } = useAnalysisProgressContext();
+  const analyzing = isAnalyzing(frameSetId);
+  const currentAnalysis = activeAnalyses.get(frameSetId);
+  const analysisProgress = currentAnalysis?.progress ?? null;
+
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
-  const [analyzing, setAnalyzing] = useState(false);
-  const [analysisProgress, setAnalysisProgress] = useState<AnalysisProgressEvent | null>(null);
   const [csvExportedMsg, setCsvExportedMsg] = useState<string | null>(null);
   const csvTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [chartsOpen, setChartsOpen] = useState(false);
@@ -85,36 +87,17 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
     }
   }, [frameSetId]);
 
-  // Run analysis on all frames
-  const handleAnalyzeAll = useCallback(async (force?: boolean) => {
-    setAnalyzing(true);
-    setAnalysisProgress(null);
+  // Enqueue analysis via global queue
+  const handleAnalyzeAll = useCallback((force?: boolean) => {
+    enqueueAnalysis(frameSetId, frameSetName, force);
+  }, [frameSetId, frameSetName, enqueueAnalysis]);
 
-    // Listen for progress events
-    const unlisten = await api.listen<AnalysisProgressEvent>('analysis-progress', (payload) => {
-      setAnalysisProgress(payload);
-    });
-
-    try {
-      const result = await api.invoke<AnalyzeFrameSetResult>('analyze_frame_set', {
-        frameSetId,
-        force: force ?? false,
-      });
-
-      if (result.errors.length > 0) {
-        console.error('Analysis errors:', result.errors);
-      }
-
-      // Reload analysis data
-      await loadAnalysisData();
-    } catch (err) {
-      console.error('Failed to analyze frame set:', err);
-    } finally {
-      unlisten();
-      setAnalyzing(false);
-      setAnalysisProgress(null);
+  // Reload analysis data when analysis completes
+  useEffect(() => {
+    if (currentAnalysis?.isComplete) {
+      loadAnalysisData();
     }
-  }, [frameSetId, loadAnalysisData]);
+  }, [currentAnalysis?.isComplete, loadAnalysisData]);
 
   const handleClearThresholds = useCallback(() => {
     setThresholds(EMPTY_THRESHOLDS);
@@ -383,7 +366,16 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
         <div className="mb-3 flex-shrink-0">
           <div className="flex items-center justify-between text-xs text-content-muted mb-1">
             <span>{analysisProgress.current_file}</span>
-            <span>{analysisProgress.current} / {analysisProgress.total} ({analysisProgress.percent.toFixed(0)}%)</span>
+            <div className="flex items-center gap-2">
+              <span>{analysisProgress.current} / {analysisProgress.total} ({analysisProgress.percent.toFixed(0)}%)</span>
+              <button
+                onClick={() => cancelAnalysis(frameSetId)}
+                className="text-content-muted hover:text-error transition-colors"
+                title="Cancel analysis"
+              >
+                <X size={14} />
+              </button>
+            </div>
           </div>
           <div className="w-full bg-surface-hover rounded-full h-2">
             <div
