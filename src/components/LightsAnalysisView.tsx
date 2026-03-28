@@ -401,32 +401,31 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
           className="w-80 flex-shrink-0"
         />
 
-        {/* Right panel — Threshold bar + Table */}
+        {/* Right panel — Controls + Table */}
         <div className="flex-1 min-w-0 flex flex-col gap-3">
-          <div className="flex items-center gap-3">
-            <div className="flex-1">
-              <RejectionThresholdBar
-                thresholds={thresholds}
-                onChange={setThresholds}
-                onClear={handleClearThresholds}
-                onLoadDefaults={handleLoadDefaults}
-                hasDefaults={defaultThresholds !== null}
-              />
-            </div>
-            {plateScale && (
+          {plateScale && (
+            <div className="flex items-center gap-2">
               <button
                 onClick={() => setUseArcsec(prev => !prev)}
-                className={`flex-shrink-0 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                className={`px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors ${
                   useArcsec
                     ? 'bg-accent/20 border-accent text-accent'
                     : 'bg-surface-hover border-border text-content-secondary hover:text-content'
                 }`}
-                title="Toggle FWHM/HFR between pixels and arcseconds"
+                title="Toggle star measurement units between pixels and arcseconds"
               >
                 {useArcsec ? 'arcsec' : 'px'}
               </button>
-            )}
-          </div>
+              <span className="text-xs text-content-muted">Star measurement units</span>
+            </div>
+          )}
+          <RejectionThresholdBar
+            thresholds={thresholds}
+            onChange={setThresholds}
+            onClear={handleClearThresholds}
+            onLoadDefaults={handleLoadDefaults}
+            hasDefaults={defaultThresholds !== null}
+          />
 
           <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
             <LightsAnalysisTable

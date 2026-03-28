@@ -87,7 +87,7 @@ export function RejectionThresholdBar({
       <span className="text-xs font-medium text-content-muted uppercase tracking-wide whitespace-nowrap">
         Reject
       </span>
-      <div className="flex items-center gap-2 flex-1">
+      <div className="flex items-center gap-2 flex-1 flex-wrap">
         {THRESHOLD_FIELDS.map((field) => {
           const value = thresholds[field.key];
           const numVal = parseFloat(value);
