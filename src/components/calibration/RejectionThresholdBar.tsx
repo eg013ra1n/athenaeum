@@ -85,9 +85,9 @@ export function RejectionThresholdBar({
   };
 
   return (
-    <div className="flex items-start gap-2 px-3 py-2 bg-surface-elevated border border-border rounded-lg">
-      <div className="flex flex-col items-center gap-0.5 flex-shrink-0 pt-0.5">
-        <span className="text-xs font-medium text-content-muted uppercase tracking-wide">Reject</span>
+    <div className="flex items-start gap-2 px-3 py-1 bg-surface-elevated border border-border rounded-lg">
+      <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+        <span className="h-7 flex items-center text-[10px] font-medium text-content-muted uppercase tracking-wide">Reject</span>
       </div>
       <div className="flex items-start gap-2 flex-1 flex-wrap">
         {THRESHOLD_FIELDS.map((rawField) => {
