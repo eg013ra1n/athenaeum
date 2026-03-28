@@ -223,7 +223,7 @@ dependencies = [
  "r2d2",
  "rayon",
  "rusqlite",
- "rustafits 0.9.0",
+ "rustafits 0.9.1",
  "serde",
  "serde_json",
  "sha2",
@@ -3646,9 +3646,9 @@ dependencies = [
 
 [[package]]
 name = "rustafits"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae991a4dc5aa0f76e98b1934b75972f48d4617279b1a17dbb0930f1929010592"
+checksum = "022c861a94f9c16a7f6353f69aa69b0f9b7d2e538afe0ff159ac0c595a5878ab"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
