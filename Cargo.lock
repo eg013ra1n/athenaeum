@@ -223,7 +223,7 @@ dependencies = [
  "r2d2",
  "rayon",
  "rusqlite",
- "rustafits",
+ "rustafits 0.9.0",
  "serde",
  "serde_json",
  "sha2",
@@ -245,7 +245,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "rusqlite",
- "rustafits",
+ "rustafits 0.8.6",
  "serde",
  "serde_json",
  "tauri",
@@ -3632,6 +3632,23 @@ name = "rustafits"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e00d56d0624c12787c07423c98d96ab788017f241e8a3f42dc3afd0bc2960bf2"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "flate2",
+ "image",
+ "lz4_flex",
+ "quick-xml 0.37.5",
+ "rayon",
+ "ruzstd",
+ "turbojpeg",
+]
+
+[[package]]
+name = "rustafits"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae991a4dc5aa0f76e98b1934b75972f48d4617279b1a17dbb0930f1929010592"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
