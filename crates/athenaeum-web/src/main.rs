@@ -128,6 +128,7 @@ async fn main() {
         memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(cache_size, retention_minutes))),
         active_scans: Arc::new(Mutex::new(HashMap::new())),
         active_exports: Arc::new(Mutex::new(HashMap::new())),
+        active_analyses: Arc::new(Mutex::new(HashMap::new())),
         image_pool: Arc::new(image_pool),
     });
 

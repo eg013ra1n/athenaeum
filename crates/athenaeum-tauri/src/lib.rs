@@ -67,6 +67,7 @@ pub fn run() {
                     memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(400, 30))),
                     active_scans: Arc::new(Mutex::new(HashMap::new())),
                     active_exports: Arc::new(Mutex::new(HashMap::new())),
+                    active_analyses: Arc::new(Mutex::new(HashMap::new())),
                     image_pool: Arc::new(
                         rayon::ThreadPoolBuilder::new()
                             .num_threads(max_threads)

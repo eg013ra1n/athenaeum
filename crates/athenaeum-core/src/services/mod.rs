@@ -22,6 +22,11 @@ pub struct ExportHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
+/// Handle to track an active analysis operation.
+pub struct AnalysisHandle {
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
 /// Shared application state accessible from any backend (Tauri, Axum, CLI).
 pub struct ServiceContext {
     pub db: OnceLock<Database>,
@@ -29,5 +34,6 @@ pub struct ServiceContext {
     pub memory_cache: Arc<Mutex<MemoryImageCache>>,
     pub active_scans: Arc<Mutex<HashMap<i64, ScanHandle>>>,
     pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,
+    pub active_analyses: Arc<Mutex<HashMap<i64, AnalysisHandle>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
 }
