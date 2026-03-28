@@ -854,14 +854,26 @@ export interface AnalyzeFrameSetResult {
   skipped: number;
   failed: number;
   errors: string[];
+  cancelled: boolean;
 }
 
 /** Analysis progress event emitted during batch analysis */
 export interface AnalysisProgressEvent {
+  frame_set_id: number;
   current: number;
   total: number;
   current_file: string;
   percent: number;
+}
+
+/** Analysis complete event emitted when a frame set analysis finishes */
+export interface AnalysisCompleteEvent {
+  frame_set_id: number;
+  analyzed: number;
+  skipped: number;
+  failed: number;
+  errors: string[];
+  cancelled: boolean;
 }
 
 /** Edits to apply to calibration set metadata (selective fields) */
