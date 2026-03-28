@@ -85,23 +85,20 @@ export function RejectionThresholdBar({
   };
 
   return (
-    <div className="flex items-start gap-2 px-3 py-1 bg-surface-elevated border border-border rounded-lg">
-      <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-        <span className="h-7 flex items-center text-[10px] font-medium text-content-muted uppercase tracking-wide">Reject</span>
-      </div>
-      <div className="flex items-start gap-2 flex-1 flex-wrap">
-        {THRESHOLD_FIELDS.map((rawField) => {
-          const field = (useArcsec && rawField.key === 'fwhm')
-            ? { ...rawField, label: 'FWHM (") >', placeholder: '"' }
-            : rawField;
-          const value = thresholds[field.key];
-          const numVal = parseFloat(value);
-          const atMin = !isNaN(numVal) && numVal <= field.min;
-          const atMax = field.max != null && !isNaN(numVal) && numVal >= field.max;
-          const isEmpty = value === '';
+    <div className="flex items-start gap-2 flex-wrap">
+      {THRESHOLD_FIELDS.map((rawField, i) => {
+        const field = (useArcsec && rawField.key === 'fwhm')
+          ? { ...rawField, label: 'FWHM (")', placeholder: '"' }
+          : rawField;
+        const value = thresholds[field.key];
+        const numVal = parseFloat(value);
+        const atMin = !isNaN(numVal) && numVal <= field.min;
+        const atMax = field.max != null && !isNaN(numVal) && numVal >= field.max;
+        const isEmpty = value === '';
 
-          return (
-            <div key={field.key} className="flex flex-col items-center gap-0.5">
+        return (
+          <div key={field.key} className="flex items-start gap-2">
+            <div className="flex flex-col items-center gap-0.5">
               <div className="flex items-center">
                 <button
                   type="button"
@@ -141,21 +138,26 @@ export function RejectionThresholdBar({
               </div>
               <span className="text-[10px] text-content-muted leading-tight whitespace-nowrap">{field.label}</span>
             </div>
-          );
-        })}
-        <div className="flex flex-col items-center gap-0.5">
-          <label className="flex items-center justify-center h-7 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={thresholds.trail === 'true'}
-              onChange={e => handleChange('trail', e.target.checked ? 'true' : '')}
-              className="rounded border-border text-accent focus:ring-accent"
-            />
-          </label>
-          <span className="text-[10px] text-content-muted leading-tight">Trailed</span>
-        </div>
+            {i < THRESHOLD_FIELDS.length - 1 && (
+              <span className="text-border self-center">|</span>
+            )}
+          </div>
+        );
+      })}
+      <span className="text-border self-center">|</span>
+      <div className="flex flex-col items-center gap-0.5">
+        <label className="flex items-center justify-center h-7 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={thresholds.trail === 'true'}
+            onChange={e => handleChange('trail', e.target.checked ? 'true' : '')}
+            className="rounded border-border text-accent focus:ring-accent"
+          />
+        </label>
+        <span className="text-[10px] text-content-muted leading-tight">Trailed</span>
       </div>
-      <div className="flex items-center gap-1.5 flex-shrink-0">
+      <span className="text-border self-center">|</span>
+      <div className="flex items-center gap-1 self-center">
         {hasDefaults && onLoadDefaults && (
           <button
             type="button"
