@@ -1,4 +1,4 @@
-import { Minus, Plus, X, RotateCw } from 'lucide-react';
+import { Minus, Plus, RotateCw } from 'lucide-react';
 
 export interface RejectionThresholds {
   fwhm: string;
@@ -76,8 +76,6 @@ export function RejectionThresholdBar({
   thresholds,
   onChange,
   onClear,
-  onLoadDefaults,
-  hasDefaults,
   useArcsec,
 }: RejectionThresholdBarProps) {
   const handleChange = (field: keyof RejectionThresholds, value: string) => {
@@ -86,7 +84,22 @@ export function RejectionThresholdBar({
 
   return (
     <div className="flex items-start gap-2 flex-wrap">
-      {THRESHOLD_FIELDS.map((rawField, i) => {
+      <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+        <div className="flex items-center gap-1 h-7">
+          <span className="text-[10px] font-medium text-content-muted uppercase tracking-wide">Reject</span>
+          {onClear && (
+            <button
+              type="button"
+              onClick={onClear}
+              className="flex items-center justify-center w-4 h-4 text-content-muted hover:text-content transition-colors"
+              title="Reset rejection thresholds"
+            >
+              <RotateCw size={10} />
+            </button>
+          )}
+        </div>
+      </div>
+      {THRESHOLD_FIELDS.map((rawField) => {
         const field = (useArcsec && rawField.key === 'fwhm')
           ? { ...rawField, label: 'FWHM (")', placeholder: '"' }
           : rawField;
@@ -97,54 +110,48 @@ export function RejectionThresholdBar({
         const isEmpty = value === '';
 
         return (
-          <div key={field.key} className="flex items-start gap-2">
-            <div className="flex flex-col items-center gap-0.5">
-              <div className="flex items-center">
-                <button
-                  type="button"
-                  disabled={isEmpty || atMin}
-                  onClick={() => handleChange(field.key, stepValue(value, field, -1))}
-                  className="flex items-center justify-center w-5 h-7 rounded-l border border-r-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
-                  tabIndex={-1}
-                >
-                  <Minus size={10} />
-                </button>
-                <input
-                  type="number"
-                  step={field.step}
-                  min={field.min}
-                  max={field.max}
-                  value={value}
-                  onChange={e => {
-                    const raw = e.target.value;
-                    if (raw === '') { handleChange(field.key, ''); return; }
-                    const n = parseFloat(raw);
-                    if (isNaN(n)) return;
-                    const clamped = field.max != null ? Math.min(n, field.max) : n;
-                    handleChange(field.key, String(Math.max(field.min, clamped)));
-                  }}
-                  className="w-12 h-7 px-1 text-xs text-center bg-surface-hover text-content border-y border-border focus:outline-none focus:border-accent [appearance:textfield] [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
-                  placeholder={field.placeholder}
-                />
-                <button
-                  type="button"
-                  disabled={atMax}
-                  onClick={() => handleChange(field.key, stepValue(value, field, 1))}
-                  className="flex items-center justify-center w-5 h-7 rounded-r border border-l-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
-                  tabIndex={-1}
-                >
-                  <Plus size={10} />
-                </button>
-              </div>
-              <span className="text-[10px] text-content-muted leading-tight whitespace-nowrap">{field.label}</span>
+          <div key={field.key} className="flex flex-col items-center gap-0.5">
+            <div className="flex items-center">
+              <button
+                type="button"
+                disabled={isEmpty || atMin}
+                onClick={() => handleChange(field.key, stepValue(value, field, -1))}
+                className="flex items-center justify-center w-5 h-7 rounded-l border border-r-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
+                tabIndex={-1}
+              >
+                <Minus size={10} />
+              </button>
+              <input
+                type="number"
+                step={field.step}
+                min={field.min}
+                max={field.max}
+                value={value}
+                onChange={e => {
+                  const raw = e.target.value;
+                  if (raw === '') { handleChange(field.key, ''); return; }
+                  const n = parseFloat(raw);
+                  if (isNaN(n)) return;
+                  const clamped = field.max != null ? Math.min(n, field.max) : n;
+                  handleChange(field.key, String(Math.max(field.min, clamped)));
+                }}
+                className="w-12 h-7 px-1 text-xs text-center bg-surface-hover text-content border-y border-border focus:outline-none focus:border-accent [appearance:textfield] [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                placeholder={field.placeholder}
+              />
+              <button
+                type="button"
+                disabled={atMax}
+                onClick={() => handleChange(field.key, stepValue(value, field, 1))}
+                className="flex items-center justify-center w-5 h-7 rounded-r border border-l-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
+                tabIndex={-1}
+              >
+                <Plus size={10} />
+              </button>
             </div>
-            {i < THRESHOLD_FIELDS.length - 1 && (
-              <span className="text-border self-center">|</span>
-            )}
+            <span className="text-[10px] text-content-muted leading-tight whitespace-nowrap">{field.label}</span>
           </div>
         );
       })}
-      <span className="text-border self-center">|</span>
       <div className="flex flex-col items-center gap-0.5">
         <label className="flex items-center justify-center h-7 cursor-pointer select-none">
           <input
@@ -155,29 +162,6 @@ export function RejectionThresholdBar({
           />
         </label>
         <span className="text-[10px] text-content-muted leading-tight">Trailed</span>
-      </div>
-      <span className="text-border self-center">|</span>
-      <div className="flex items-center gap-1 self-center">
-        {hasDefaults && onLoadDefaults && (
-          <button
-            type="button"
-            onClick={onLoadDefaults}
-            className="flex items-center justify-center w-6 h-6 text-content-muted hover:text-content transition-colors"
-            title="Load saved defaults"
-          >
-            <RotateCw size={14} />
-          </button>
-        )}
-        {onClear && (
-          <button
-            type="button"
-            onClick={onClear}
-            className="flex items-center justify-center w-6 h-6 text-content-muted hover:text-content transition-colors"
-            title="Clear all thresholds"
-          >
-            <X size={14} />
-          </button>
-        )}
       </div>
     </div>
   );
