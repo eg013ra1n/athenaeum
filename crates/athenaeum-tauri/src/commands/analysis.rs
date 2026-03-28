@@ -45,10 +45,21 @@ pub async fn reset_analysis_config(
 
 #[derive(Clone, Serialize)]
 struct AnalysisProgressEvent {
+    frame_set_id: i64,
     current: usize,
     total: usize,
     current_file: String,
     percent: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct AnalysisCompleteEvent {
+    frame_set_id: i64,
+    analyzed: usize,
+    skipped: usize,
+    failed: usize,
+    errors: Vec<String>,
+    cancelled: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -57,6 +68,7 @@ pub struct AnalyzeFrameSetResult {
     pub skipped: usize,
     pub failed: usize,
     pub errors: Vec<String>,
+    pub cancelled: bool,
 }
 
 /// Analyze all LIGHT frames in a frame set.
@@ -124,6 +136,7 @@ pub async fn analyze_frame_set(
     ));
     let config_hash = Arc::new(analysis_config.config_hash());
     let completed = Arc::new(AtomicUsize::new(0));
+    let app_handle_complete = app_handle.clone();
     let concurrency = if analysis_config.batch_concurrency == 0 {
         // Auto: ~1 worker per 3 pool threads
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -170,6 +183,7 @@ pub async fn analyze_frame_set(
                         let _ = app_handle.emit(
                             "analysis-progress",
                             AnalysisProgressEvent {
+                                frame_set_id,
                                 current: done,
                                 total,
                                 current_file: filename,
@@ -262,11 +276,21 @@ pub async fn analyze_frame_set(
 
     let skipped = total.saturating_sub(analyzed + failed);
 
+    let _ = app_handle_complete.emit("analysis-complete", AnalysisCompleteEvent {
+        frame_set_id,
+        analyzed,
+        skipped,
+        failed,
+        errors: errors.clone(),
+        cancelled: false,
+    });
+
     Ok(AnalyzeFrameSetResult {
         analyzed,
         skipped,
         failed,
         errors,
+        cancelled: false,
     })
 }
 

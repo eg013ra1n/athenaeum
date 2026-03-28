@@ -42,14 +42,26 @@ pub struct AnalyzeFrameSetResult {
     pub skipped: usize,
     pub failed: usize,
     pub errors: Vec<String>,
+    pub cancelled: bool,
 }
 
 #[derive(Clone, Serialize)]
 struct AnalysisProgressEvent {
+    frame_set_id: i64,
     current: usize,
     total: usize,
     current_file: String,
     percent: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct AnalysisCompleteEvent {
+    frame_set_id: i64,
+    analyzed: usize,
+    skipped: usize,
+    failed: usize,
+    errors: Vec<String>,
+    cancelled: bool,
 }
 
 // ── Error helper ─────────────────────────────────────────────────────────────
@@ -248,6 +260,7 @@ pub async fn analyze_frame_set(
     let config_hash = Arc::new(analysis_config.config_hash());
     let completed = Arc::new(AtomicUsize::new(0));
     let event_tx = state.event_tx.clone();
+    let event_tx_complete = event_tx.clone();
     let concurrency = if analysis_config.batch_concurrency == 0 {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         (cores / 3).max(2).min(16)
@@ -293,6 +306,7 @@ pub async fn analyze_frame_set(
                         let _ = event_tx.send(SseEvent {
                             event_name: "analysis-progress".to_string(),
                             data: serde_json::to_value(AnalysisProgressEvent {
+                                frame_set_id,
                                 current: done,
                                 total,
                                 current_file: filename,
@@ -385,11 +399,25 @@ pub async fn analyze_frame_set(
 
     let skipped = total.saturating_sub(analyzed + failed);
 
+    let _ = event_tx_complete.send(SseEvent {
+        event_name: "analysis-complete".to_string(),
+        data: serde_json::to_value(AnalysisCompleteEvent {
+            frame_set_id,
+            analyzed,
+            skipped,
+            failed,
+            errors: errors.clone(),
+            cancelled: false,
+        })
+        .unwrap_or_default(),
+    });
+
     Ok(Json(AnalyzeFrameSetResult {
         analyzed,
         skipped,
         failed,
         errors,
+        cancelled: false,
     }))
 }
 
