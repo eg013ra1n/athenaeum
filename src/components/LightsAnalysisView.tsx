@@ -38,6 +38,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   const [csvExportedMsg, setCsvExportedMsg] = useState<string | null>(null);
   const csvTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [chartsOpen, setChartsOpen] = useState(false);
+  const [useArcsec, setUseArcsec] = useState(false);
 
   const { nodes, framesByKey, allFrames } = useMemo(
     () => buildMergedCameraFilterTree(hierarchy),
@@ -133,6 +134,16 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
     }
     return frames;
   }, [checkedKeys, allFrames, framesByKey]);
+
+  // Plate scale from first frame with optics data (arcsec/pixel)
+  const plateScale = useMemo(() => {
+    for (const f of allFrames) {
+      if (f.focallen && f.xpixsz) {
+        return (f.xpixsz / f.focallen) * 206.265;
+      }
+    }
+    return null;
+  }, [allFrames]);
 
   // Count of frames in checked filter groups (for the action bar)
   const checkedFrameCount = useMemo(() => {
@@ -392,13 +403,30 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
 
         {/* Right panel — Threshold bar + Table */}
         <div className="flex-1 min-w-0 flex flex-col gap-3">
-          <RejectionThresholdBar
-            thresholds={thresholds}
-            onChange={setThresholds}
-            onClear={handleClearThresholds}
-            onLoadDefaults={handleLoadDefaults}
-            hasDefaults={defaultThresholds !== null}
-          />
+          <div className="flex items-center gap-3">
+            <div className="flex-1">
+              <RejectionThresholdBar
+                thresholds={thresholds}
+                onChange={setThresholds}
+                onClear={handleClearThresholds}
+                onLoadDefaults={handleLoadDefaults}
+                hasDefaults={defaultThresholds !== null}
+              />
+            </div>
+            {plateScale && (
+              <button
+                onClick={() => setUseArcsec(prev => !prev)}
+                className={`flex-shrink-0 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                  useArcsec
+                    ? 'bg-accent/20 border-accent text-accent'
+                    : 'bg-surface-hover border-border text-content-secondary hover:text-content'
+                }`}
+                title="Toggle FWHM/HFR between pixels and arcseconds"
+              >
+                {useArcsec ? 'arcsec' : 'px'}
+              </button>
+            )}
+          </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
             <LightsAnalysisTable
@@ -409,6 +437,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
               onBlackhole={handleBlackhole}
               analysisData={analysisData}
               rejectedFrameIds={rejectedFrameIds}
+              plateScale={useArcsec ? plateScale : null}
             />
           </div>
         </div>

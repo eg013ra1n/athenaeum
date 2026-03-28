@@ -25,6 +25,8 @@ interface LightsAnalysisTableProps {
   analysisData?: Map<number, FrameAnalysis>;
   /** Frame IDs that are below rejection thresholds */
   rejectedFrameIds?: Set<number>;
+  /** Plate scale in arcsec/pixel. When set, FWHM/HFR display in arcseconds. */
+  plateScale?: number | null;
 }
 
 function formatDateTime(dateStr: string | null): string {
@@ -100,6 +102,7 @@ export function LightsAnalysisTable({
   onBlackhole,
   analysisData,
   rejectedFrameIds,
+  plateScale,
 }: LightsAnalysisTableProps) {
   const [sortField, setSortField] = useState<SortField | null>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
@@ -298,7 +301,7 @@ export function LightsAnalysisTable({
               <SortableHeader field="stars" label="Stars" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.stars.toFixed(0) : undefined} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
-              <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.fwhm.toFixed(2) : undefined} unit="px" />
+              <SortableHeader field="fwhm" label="FWHM" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? (plateScale ? (averages.fwhm * plateScale).toFixed(2) : averages.fwhm.toFixed(2)) : undefined} unit={plateScale ? '"' : 'px'} />
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center bg-accent/10">
               <SortableHeader field="eccentricity" label="Eccentricity" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages ? averages.eccentricity.toFixed(3) : undefined} />
@@ -378,7 +381,7 @@ export function LightsAnalysisTable({
                   {analysis ? analysis.stars_detected : '-'}
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
-                  {analysis ? analysis.median_fwhm.toFixed(2) : '-'}
+                  {analysis ? (plateScale ? (analysis.median_fwhm * plateScale).toFixed(2) : analysis.median_fwhm.toFixed(2)) : '-'}
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
                   {analysis ? analysis.median_eccentricity.toFixed(3) : '-'}

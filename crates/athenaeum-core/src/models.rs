@@ -617,6 +617,7 @@ pub struct LightFrameWithCalibration {
     pub exptime: Option<f64>,
     pub telescop: Option<String>,
     pub focallen: Option<f64>,
+    pub xpixsz: Option<f64>,
     pub binning: Option<String>,
     pub ccd_temp: Option<f64>,
     pub swcreate: Option<String>,

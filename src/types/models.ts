@@ -737,6 +737,7 @@ export interface LightFrameWithCalibration {
   exptime: number | null;
   telescop: string | null;
   focallen: number | null;
+  xpixsz: number | null;
   binning: string | null;
   ccd_temp: number | null;
   swcreate: string | null;
