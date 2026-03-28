@@ -5,6 +5,8 @@ import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
 import { ExportProgressProvider } from '../contexts/ExportProgressContext';
 import { ExportProgressIndicator } from './ExportProgressIndicator';
+import { AnalysisProgressProvider } from '../contexts/AnalysisProgressContext';
+import { AnalysisQueueIndicator } from './AnalysisQueueIndicator';
 import Logo from '../assets/athenaeum.png';
 
 export default function Layout() {
@@ -31,6 +33,7 @@ export default function Layout() {
   return (
     <ScanProgressProvider>
       <ExportProgressProvider>
+        <AnalysisProgressProvider>
         <div className="flex h-screen bg-surface text-content">
           {/* Sidebar Navigation */}
           <aside
@@ -66,6 +69,8 @@ export default function Layout() {
               ))}
             </nav>
 
+            <AnalysisQueueIndicator collapsed={collapsed} />
+
             <div className={`${collapsed ? 'p-2' : 'p-4'} pt-0`}>
               <button
                 onClick={() => setCollapsed(c => !c)}
@@ -88,6 +93,7 @@ export default function Layout() {
           <ScanProgressIndicator />
           <ExportProgressIndicator />
         </div>
+        </AnalysisProgressProvider>
       </ExportProgressProvider>
     </ScanProgressProvider>
   );
