@@ -163,6 +163,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/delete_analysis_for_frame_set", post(analysis::delete_analysis_for_frame_set))
         .route("/api/analyze_single_frame", post(analysis::analyze_single_frame))
         .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
+        .route("/api/cancel_analysis", post(analysis::cancel_analysis))
         .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))
         // Core
         .route("/api/initialize_database", post(initialize_database))

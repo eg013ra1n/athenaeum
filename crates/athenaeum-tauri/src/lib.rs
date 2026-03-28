@@ -262,6 +262,7 @@ pub fn run() {
             commands::set_analysis_config,
             commands::reset_analysis_config,
             commands::analyze_frame_set,
+            commands::cancel_analysis,
             commands::analyze_single_frame,
             commands::get_analysis_for_frame_set,
             commands::delete_analysis_for_frame_set,

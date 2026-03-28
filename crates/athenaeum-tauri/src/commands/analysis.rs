@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use serde::Serialize;
 use tauri::{Emitter, State};
 use athenaeum_core::analysis::config::{self, AnalysisConfig};
@@ -83,6 +83,22 @@ pub async fn analyze_frame_set(
 ) -> Result<AnalyzeFrameSetResult, String> {
     let force = force.unwrap_or(false);
 
+    // Guard against concurrent analysis of same frame set
+    {
+        let analyses = state.ctx.active_analyses.lock().unwrap();
+        if analyses.contains_key(&frame_set_id) {
+            return Err("Analysis already in progress for this frame set".into());
+        }
+    }
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut analyses = state.ctx.active_analyses.lock().unwrap();
+        analyses.insert(frame_set_id, athenaeum_core::services::AnalysisHandle {
+            cancel_flag: cancel_flag.clone(),
+        });
+    }
+
     // Load config and frame list under DB lock, then release
     let (analysis_config, frames_to_analyze) = {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
@@ -137,6 +153,7 @@ pub async fn analyze_frame_set(
     let config_hash = Arc::new(analysis_config.config_hash());
     let completed = Arc::new(AtomicUsize::new(0));
     let app_handle_complete = app_handle.clone();
+    let cancel_flag_worker = Arc::clone(&cancel_flag);
     let concurrency = if analysis_config.batch_concurrency == 0 {
         // Auto: ~1 worker per 3 pool threads
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -159,6 +176,7 @@ pub async fn analyze_frame_set(
             for _ in 0..concurrency {
                 s.spawn(|| {
                     loop {
+                        if cancel_flag_worker.load(Ordering::Relaxed) { break; }
                         let item = work.lock().unwrap().next();
                         let Some((frame_id, file_id, path)) = item else { break };
 
@@ -199,6 +217,14 @@ pub async fn analyze_frame_set(
 
         results.into_inner().unwrap()
     }).await.map_err(|e| format!("Analysis task panicked: {}", e))?;
+
+    let was_cancelled = cancel_flag.load(Ordering::Relaxed);
+
+    // Clean up active_analyses entry (always, even on early return)
+    {
+        let mut analyses = state.ctx.active_analyses.lock().unwrap();
+        analyses.remove(&frame_set_id);
+    }
 
     // Partition results
     let mut all_analyses: Vec<(i64, FrameAnalysis, Vec<StarMetric>)> = Vec::new();
@@ -282,7 +308,7 @@ pub async fn analyze_frame_set(
         skipped,
         failed,
         errors: errors.clone(),
-        cancelled: false,
+        cancelled: was_cancelled,
     });
 
     Ok(AnalyzeFrameSetResult {
@@ -290,8 +316,23 @@ pub async fn analyze_frame_set(
         skipped,
         failed,
         errors,
-        cancelled: false,
+        cancelled: was_cancelled,
     })
+}
+
+/// Cancel an active analysis.
+#[tauri::command]
+pub async fn cancel_analysis(
+    frame_set_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let analyses = state.ctx.active_analyses.lock().unwrap();
+    if let Some(handle) = analyses.get(&frame_set_id) {
+        handle.cancel_flag.store(true, Ordering::SeqCst);
+        Ok(())
+    } else {
+        Err("No active analysis for this frame set".into())
+    }
 }
 
 /// Analyze a single frame.
