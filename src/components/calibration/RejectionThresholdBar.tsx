@@ -85,13 +85,12 @@ export function RejectionThresholdBar({
   };
 
   return (
-    <div className="flex items-center gap-3 px-3 py-2 bg-surface-elevated border border-border rounded-lg">
-      <span className="text-xs font-medium text-content-muted uppercase tracking-wide whitespace-nowrap">
-        Reject
-      </span>
-      <div className="flex items-center gap-2 flex-1 flex-wrap">
+    <div className="flex items-start gap-2 px-3 py-2 bg-surface-elevated border border-border rounded-lg">
+      <div className="flex flex-col items-center gap-0.5 flex-shrink-0 pt-0.5">
+        <span className="text-xs font-medium text-content-muted uppercase tracking-wide">Reject</span>
+      </div>
+      <div className="flex items-start gap-2 flex-1 flex-wrap">
         {THRESHOLD_FIELDS.map((rawField) => {
-          // Override FWHM label/placeholder when in arcsec mode
           const field = (useArcsec && rawField.key === 'fwhm')
             ? { ...rawField, label: 'FWHM (") >', placeholder: '"' }
             : rawField;
@@ -102,14 +101,13 @@ export function RejectionThresholdBar({
           const isEmpty = value === '';
 
           return (
-            <div key={field.key} className="flex items-center gap-1">
-              <label className="text-xs text-content-secondary whitespace-nowrap">{field.label}</label>
+            <div key={field.key} className="flex flex-col items-center gap-0.5">
               <div className="flex items-center">
                 <button
                   type="button"
                   disabled={isEmpty || atMin}
                   onClick={() => handleChange(field.key, stepValue(value, field, -1))}
-                  className="flex items-center justify-center w-5 h-6 rounded-l border border-r-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
+                  className="flex items-center justify-center w-5 h-7 rounded-l border border-r-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
                   tabIndex={-1}
                 >
                   <Minus size={10} />
@@ -128,31 +126,34 @@ export function RejectionThresholdBar({
                     const clamped = field.max != null ? Math.min(n, field.max) : n;
                     handleChange(field.key, String(Math.max(field.min, clamped)));
                   }}
-                  className="w-14 h-6 px-1 text-xs text-center bg-surface-hover text-content border-y border-border focus:outline-none focus:border-accent [appearance:textfield] [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
+                  className="w-12 h-7 px-1 text-xs text-center bg-surface-hover text-content border-y border-border focus:outline-none focus:border-accent [appearance:textfield] [&::-webkit-inner-spin-button]:hidden [&::-webkit-outer-spin-button]:hidden"
                   placeholder={field.placeholder}
                 />
                 <button
                   type="button"
                   disabled={atMax}
                   onClick={() => handleChange(field.key, stepValue(value, field, 1))}
-                  className="flex items-center justify-center w-5 h-6 rounded-r border border-l-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
+                  className="flex items-center justify-center w-5 h-7 rounded-r border border-l-0 border-border bg-surface-hover hover:bg-surface-elevated text-content-muted disabled:opacity-30 disabled:cursor-default transition-colors"
                   tabIndex={-1}
                 >
                   <Plus size={10} />
                 </button>
               </div>
+              <span className="text-[10px] text-content-muted leading-tight whitespace-nowrap">{field.label}</span>
             </div>
           );
         })}
-        <label className="flex items-center gap-1 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={thresholds.trail === 'true'}
-            onChange={e => handleChange('trail', e.target.checked ? 'true' : '')}
-            className="rounded border-border text-accent focus:ring-accent"
-          />
-          <span className="text-xs text-content-secondary whitespace-nowrap">Trailed</span>
-        </label>
+        <div className="flex flex-col items-center gap-0.5">
+          <label className="flex items-center justify-center h-7 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={thresholds.trail === 'true'}
+              onChange={e => handleChange('trail', e.target.checked ? 'true' : '')}
+              className="rounded border-border text-accent focus:ring-accent"
+            />
+          </label>
+          <span className="text-[10px] text-content-muted leading-tight">Trailed</span>
+        </div>
       </div>
       <div className="flex items-center gap-1.5 flex-shrink-0">
         {hasDefaults && onLoadDefaults && (

@@ -408,10 +408,10 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
         <div className="flex-1 min-w-0 flex flex-col gap-3">
           <div className="flex items-start gap-3">
             {plateScale && (
-              <div className="flex flex-col items-center gap-1 flex-shrink-0">
+              <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
                 <button
                   onClick={() => setUseArcsec(prev => !prev)}
-                  className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                  className={`w-10 h-7 text-xs font-medium rounded-lg border transition-colors ${
                     useArcsec
                       ? 'bg-accent/20 border-accent text-accent'
                       : 'bg-surface-hover border-border text-content-secondary hover:text-content'
