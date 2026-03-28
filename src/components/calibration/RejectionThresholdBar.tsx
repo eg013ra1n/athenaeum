@@ -34,7 +34,7 @@ export const THRESHOLD_FIELDS: ThresholdFieldDef[] = [
 
 export const EMPTY_THRESHOLDS: RejectionThresholds = {
   fwhm: '',
-  eccentricity: '',
+  eccentricity: '0.8',
   median_snr: '',
   frame_snr: '',
   psf_signal: '',
