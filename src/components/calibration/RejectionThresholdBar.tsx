@@ -51,6 +51,8 @@ interface RejectionThresholdBarProps {
   onClear?: () => void;
   onLoadDefaults?: () => void;
   hasDefaults?: boolean;
+  /** When true, FWHM label/placeholder shows arcsec instead of px */
+  useArcsec?: boolean;
 }
 
 function stepValue(
@@ -77,6 +79,7 @@ export function RejectionThresholdBar({
   onClear,
   onLoadDefaults,
   hasDefaults,
+  useArcsec,
 }: RejectionThresholdBarProps) {
   const handleChange = (field: keyof RejectionThresholds, value: string) => {
     onChange({ ...thresholds, [field]: value });
@@ -88,7 +91,11 @@ export function RejectionThresholdBar({
         Reject
       </span>
       <div className="flex items-center gap-2 flex-1 flex-wrap">
-        {THRESHOLD_FIELDS.map((field) => {
+        {THRESHOLD_FIELDS.map((rawField) => {
+          // Override FWHM label/placeholder when in arcsec mode
+          const field = (useArcsec && rawField.key === 'fwhm')
+            ? { ...rawField, label: 'FWHM (") >', placeholder: '"' }
+            : rawField;
           const value = thresholds[field.key];
           const numVal = parseFloat(value);
           const atMin = !isNaN(numVal) && numVal <= field.min;

@@ -159,7 +159,10 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   // Compute rejected frame IDs from thresholds
   const rejectedFrameIds = useMemo(() => {
     const rejected = new Set<number>();
-    const fwhmThreshold = parseFloat(thresholds.fwhm);
+    // When in arcsec mode, the user enters thresholds in arcsec — convert back to pixels for comparison
+    const ps = (useArcsec && plateScale) ? plateScale : null;
+    const rawFwhm = parseFloat(thresholds.fwhm);
+    const fwhmThreshold = ps ? rawFwhm / ps : rawFwhm;
     const eccThreshold = parseFloat(thresholds.eccentricity);
     const medianSnrThreshold = parseFloat(thresholds.median_snr);
     const snrDbThreshold = parseFloat(thresholds.frame_snr);
@@ -221,7 +224,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
     }
 
     return rejected;
-  }, [thresholds, displayedFrames, analysisData]);
+  }, [thresholds, displayedFrames, analysisData, useArcsec, plateScale]);
 
   // Auto-select rejected frames when thresholds change
   useEffect(() => {
@@ -427,6 +430,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
                 onClear={handleClearThresholds}
                 onLoadDefaults={handleLoadDefaults}
                 hasDefaults={defaultThresholds !== null}
+                useArcsec={useArcsec && !!plateScale}
               />
             </div>
           </div>
