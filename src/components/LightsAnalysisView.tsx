@@ -401,31 +401,35 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
           className="w-80 flex-shrink-0"
         />
 
-        {/* Right panel — Controls + Table */}
+        {/* Right panel — Threshold bar + Table */}
         <div className="flex-1 min-w-0 flex flex-col gap-3">
-          {plateScale && (
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setUseArcsec(prev => !prev)}
-                className={`px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors ${
-                  useArcsec
-                    ? 'bg-accent/20 border-accent text-accent'
-                    : 'bg-surface-hover border-border text-content-secondary hover:text-content'
-                }`}
-                title="Toggle star measurement units between pixels and arcseconds"
-              >
-                {useArcsec ? 'arcsec' : 'px'}
-              </button>
-              <span className="text-xs text-content-muted">Star measurement units</span>
+          <div className="flex items-start gap-3">
+            {plateScale && (
+              <div className="flex flex-col items-center gap-1 flex-shrink-0">
+                <button
+                  onClick={() => setUseArcsec(prev => !prev)}
+                  className={`px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                    useArcsec
+                      ? 'bg-accent/20 border-accent text-accent'
+                      : 'bg-surface-hover border-border text-content-secondary hover:text-content'
+                  }`}
+                  title="Toggle star measurement units between pixels and arcseconds"
+                >
+                  {useArcsec ? '"' : 'px'}
+                </button>
+                <span className="text-[10px] text-content-muted leading-tight">units</span>
+              </div>
+            )}
+            <div className="flex-1 min-w-0">
+              <RejectionThresholdBar
+                thresholds={thresholds}
+                onChange={setThresholds}
+                onClear={handleClearThresholds}
+                onLoadDefaults={handleLoadDefaults}
+                hasDefaults={defaultThresholds !== null}
+              />
             </div>
-          )}
-          <RejectionThresholdBar
-            thresholds={thresholds}
-            onChange={setThresholds}
-            onClear={handleClearThresholds}
-            onLoadDefaults={handleLoadDefaults}
-            hasDefaults={defaultThresholds !== null}
-          />
+          </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
             <LightsAnalysisTable
