@@ -29,7 +29,6 @@ export const THRESHOLD_FIELDS: ThresholdFieldDef[] = [
   { key: 'frame_snr', label: 'Frame SNR (dB) <', placeholder: 'dB', step: 0.5, min: 0 },
   { key: 'psf_signal', label: 'PSF (ADU) <', placeholder: 'ADU', step: 1, min: 0 },
   { key: 'snr_weight', label: 'SNR Wt <', placeholder: 'wt', step: 0.1, min: 0 },
-  { key: 'trail', label: 'Trail >', placeholder: 'R\u00B2', step: 0.01, min: 0, max: 1 },
   { key: 'score', label: 'Score <', placeholder: '%', step: 1, min: 0, max: 100 },
 ];
 
@@ -138,6 +137,15 @@ export function RejectionThresholdBar({
             </div>
           );
         })}
+        <label className="flex items-center gap-1 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={thresholds.trail === 'true'}
+            onChange={e => handleChange('trail', e.target.checked ? 'true' : '')}
+            className="rounded border-border text-accent focus:ring-accent"
+          />
+          <span className="text-xs text-content-secondary whitespace-nowrap">Trailed</span>
+        </label>
       </div>
       <div className="flex items-center gap-1.5 flex-shrink-0">
         {hasDefaults && onLoadDefaults && (

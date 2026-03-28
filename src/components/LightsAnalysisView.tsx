@@ -168,7 +168,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
     const snrDbThreshold = parseFloat(thresholds.frame_snr);
     const psfThreshold = parseFloat(thresholds.psf_signal);
     const snrWtThreshold = parseFloat(thresholds.snr_weight);
-    const trailThreshold = parseFloat(thresholds.trail);
+    const rejectTrailed = thresholds.trail === 'true';
     const starsThreshold = parseFloat(thresholds.stars);
     const scoreThreshold = parseFloat(thresholds.score);
 
@@ -206,8 +206,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
         rejected.add(frame.frame_id);
         continue;
       }
-      // Trail R² > threshold = rejected (trailed)
-      if (!isNaN(trailThreshold) && a.trail_r_squared > trailThreshold) {
+      // Reject frames flagged as trailed
+      if (rejectTrailed && a.possibly_trailed) {
         rejected.add(frame.frame_id);
         continue;
       }
