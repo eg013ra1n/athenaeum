@@ -34,9 +34,19 @@ export function useAnalysisProgress() {
     processingRef.current = true;
 
     try {
-      await api.invoke<AnalyzeFrameSetResult>('analyze_frame_set', {
+      const result = await api.invoke<AnalyzeFrameSetResult>('analyze_frame_set', {
         frameSetId: next.frameSetId,
         force: next.force ?? false,
+      });
+      // Mark complete from the return value (the event listener may also fire — that's fine,
+      // the state updater is idempotent since isComplete is already true)
+      setActiveAnalyses(prev => {
+        const updated = new Map(prev);
+        const entry = updated.get(next.frameSetId);
+        if (entry) {
+          updated.set(next.frameSetId, { ...entry, isComplete: true, result });
+        }
+        return updated;
       });
     } catch (err) {
       console.error(`Analysis failed for frame set ${next.frameSetId}:`, err);
