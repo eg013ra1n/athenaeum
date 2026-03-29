@@ -311,7 +311,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
       <div className="flex items-center gap-3 mb-3 flex-shrink-0">
         <button
           onClick={() => handleAnalyzeAll(false)}
-          disabled={analyzing}
+          disabled={analyzing || analyzedCount >= totalLightFrames}
           className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
         >
           <BarChart3 size={16} />
