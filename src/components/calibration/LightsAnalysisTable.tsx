@@ -4,7 +4,7 @@ import { revealItemInDir } from '../../api/desktop';
 import { api } from '../../api';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
-type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta' | 'score';
+type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
 type SortDirection = 'asc' | 'desc';
 
 /** Frame enriched with camera/filter context from the hierarchy */
@@ -17,7 +17,6 @@ export interface EnrichedLightFrame extends LightFrameWithCalibration {
 
 interface LightsAnalysisTableProps {
   frames: EnrichedLightFrame[];
-  blackholedFileIds: Set<number>;
   selectedFrameIds: Set<number>;
   onSelectionChange: (selectedIds: Set<number>) => void;
   onBlackhole?: (fileId: number) => void;
@@ -96,7 +95,6 @@ function SortableHeader({
 
 export function LightsAnalysisTable({
   frames,
-  blackholedFileIds,
   selectedFrameIds,
   onSelectionChange,
   onBlackhole,
@@ -183,8 +181,6 @@ export function LightsAnalysisTable({
     const framesWithExp = analyzed.filter(f => f.exptime != null);
     const exptime = framesWithExp.reduce((acc, f) => acc + f.exptime!, 0);
 
-    const withScore = analyzed.filter(f => analysisData.get(f.frame_id)!.quality_score != null);
-
     const withBeta = analyzed.filter(f => analysisData.get(f.frame_id)!.median_beta != null);
     const betaAvg = withBeta.length > 0
       ? withBeta.reduce((acc, f) => acc + (analysisData.get(f.frame_id)!.median_beta ?? 0), 0) / withBeta.length
@@ -202,9 +198,6 @@ export function LightsAnalysisTable({
       snr_weight: sumA(a => a.snr_weight) / n,
       trail: sumA(a => a.trail_r_squared) / n,
       beta: betaAvg,
-      score: withScore.length > 0
-        ? withScore.reduce((acc, f) => acc + (analysisData.get(f.frame_id)!.quality_score ?? 0), 0) / withScore.length
-        : null,
     };
   }, [frames, analysisData]);
 
@@ -258,9 +251,6 @@ export function LightsAnalysisTable({
           break;
         case 'beta':
           comparison = (aAnalysis?.median_beta ?? -1) - (bAnalysis?.median_beta ?? -1);
-          break;
-        case 'score':
-          comparison = (aAnalysis?.quality_score ?? -1) - (bAnalysis?.quality_score ?? -1);
           break;
       }
 
@@ -329,10 +319,6 @@ export function LightsAnalysisTable({
                 <SortableHeader field="beta" label={`Moffat \u03B2`} currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
               </th>
             )}
-            {/* Score group — purple tint */}
-            <th scope="col" className="px-1.5 py-1.5 text-center bg-purple/10">
-              <SortableHeader field="score" label="Score" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.score != null ? `${(averages.score * 100).toFixed(0)}%` : undefined} />
-            </th>
             <th scope="col" className="w-20 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
               Actions
             </th>
@@ -340,7 +326,6 @@ export function LightsAnalysisTable({
         </thead>
         <tbody className="divide-y divide-border">
           {sortedFrames.map((frame, idx) => {
-            const isBlackholed = blackholedFileIds.has(frame.file_id);
             const isSelected = selectedFrameIds.has(frame.frame_id);
             const isRejected = rejectedFrameIds?.has(frame.frame_id) ?? false;
             const analysis = getAnalysis(frame.frame_id);
@@ -351,7 +336,6 @@ export function LightsAnalysisTable({
                 className={`
                   ${isRejected ? 'bg-error/10' : idx % 2 === 0 ? 'bg-surface-elevated' : 'bg-surface'}
                   hover:bg-surface-hover transition-colors
-                  ${isBlackholed ? 'opacity-50' : ''}
                 `}
               >
                 {/* Identity group — no tint */}
@@ -363,17 +347,17 @@ export function LightsAnalysisTable({
                     className="rounded border-border text-accent focus:ring-accent cursor-pointer"
                   />
                 </td>
-                <td className={`px-1.5 py-1 text-sm font-mono text-content-secondary ${isBlackholed ? 'line-through' : ''}`}>
+                <td className="px-1.5 py-1 text-sm font-mono text-content-secondary">
                   {formatDateTime(frame.date_obs)}
                 </td>
-                <td className={`px-1.5 py-1 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center">
                   {frame.camera}
                 </td>
-                <td className={`px-1.5 py-1 text-sm text-content-secondary text-center ${isBlackholed ? 'line-through' : ''}`}>
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center">
                   {frame.filter ?? '-'}
                 </td>
                 {/* Exposure group — gold tint */}
-                <td className={`px-1.5 py-1 text-sm text-content-secondary text-center bg-warning/5 ${isBlackholed ? 'line-through' : ''}`}>
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-warning/5">
                   {frame.exptime !== null ? `${frame.exptime}s` : '-'}
                 </td>
                 {/* Image Quality group — frost blue tint */}
@@ -421,10 +405,6 @@ export function LightsAnalysisTable({
                     {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '-'}
                   </td>
                 )}
-                {/* Score group — purple tint */}
-                <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-purple/5">
-                  {analysis?.quality_score != null ? `${(analysis.quality_score * 100).toFixed(0)}%` : '-'}
-                </td>
                 <td className="w-20 px-1.5 py-1 text-center">
                   <div className="flex items-center justify-center gap-1">
                     <button
@@ -434,15 +414,13 @@ export function LightsAnalysisTable({
                     >
                       <FolderOpen size={14} />
                     </button>
-                    {!isBlackholed && (
-                      <button
-                        onClick={e => handleBlackhole(e, frame.file_id)}
-                        className="inline-flex items-center p-1 text-content-muted hover:text-error bg-surface-hover hover:bg-surface-hover rounded transition-colors"
-                        title="Move to Black Hole"
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    )}
+                    <button
+                      onClick={e => handleBlackhole(e, frame.file_id)}
+                      className="inline-flex items-center p-1 text-content-muted hover:text-error bg-surface-hover hover:bg-surface-hover rounded transition-colors"
+                      title="Move to Black Hole"
+                    >
+                      <Trash2 size={14} />
+                    </button>
                   </div>
                 </td>
               </tr>

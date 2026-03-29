@@ -1,7 +1,7 @@
 // Duplicate detection and black hole management commands
 
 use crate::db::{self};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use super::AppState;
 
@@ -24,6 +24,7 @@ pub async fn move_to_black_hole(
     file_id: i64,
     from_where: String,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<i64, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -35,7 +36,14 @@ pub async fn move_to_black_hole(
         })
         .map_err(|e| e.to_string())?;
 
-    db::add_to_black_hole(&conn, file_id, &from_where, &original_path).map_err(|e| e.to_string())
+    let id = db::add_to_black_hole(&conn, file_id, &from_where, &original_path).map_err(|e| e.to_string())?;
+
+    let _ = app_handle.emit("blackhole-changed", serde_json::json!({
+        "file_id": file_id,
+        "action": "blackholed"
+    }));
+
+    Ok(id)
 }
 
 /// Get all files in the black hole
@@ -92,11 +100,19 @@ pub async fn get_blackholed_file_ids(
 pub async fn restore_from_black_hole(
     file_id: i64,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    db::remove_from_black_hole(&conn, file_id).map_err(|e| e.to_string())
+    db::remove_from_black_hole(&conn, file_id).map_err(|e| e.to_string())?;
+
+    let _ = app_handle.emit("blackhole-changed", serde_json::json!({
+        "file_id": file_id,
+        "action": "restored"
+    }));
+
+    Ok(())
 }
 
 /// Permanently delete a file (send to void)

@@ -1,5 +1,10 @@
 // TypeScript interfaces matching Rust models
 
+export interface BlackholeChangedEvent {
+  file_id: number;
+  action: 'blackholed' | 'restored';
+}
+
 export enum FileFormat {
   FITS = "FITS",
   XISF = "XISF",

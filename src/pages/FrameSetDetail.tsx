@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api } from '../api';
 import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, Play, BarChart3, Crosshair } from 'lucide-react';
@@ -9,6 +9,7 @@ import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
+import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
 
 type FrameSetTab = 'calibration' | 'analysis';
 
@@ -58,6 +59,19 @@ export default function FrameSetDetail() {
 
   // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
   const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
+
+  // Reactive blackhole state — derives file IDs from hierarchy, fetches status, listens for events
+  const allFileIds = useMemo(() => {
+    if (!calibrationHierarchy) return [];
+    const ids: number[] = [];
+    for (const dg of calibrationHierarchy.date_groups)
+      for (const cg of dg.camera_groups)
+        for (const fg of cg.filter_groups)
+          for (const f of fg.light_frames)
+            ids.push(f.file_id);
+    return ids;
+  }, [calibrationHierarchy]);
+  const { blackholedFileIds } = useBlackholeEvents(allFileIds);
 
   // Load both detail and calibration data on mount and when navigating back
   useEffect(() => {
@@ -450,6 +464,7 @@ export default function FrameSetDetail() {
               <div className="flex-1 min-h-0">
                 <CalibrationHierarchyViewComponent
                   data={calibrationHierarchy}
+                  blackholedFileIds={blackholedFileIds}
                   onRefresh={refreshCalibrationHierarchy}
                   onBlink={handleBlink}
                   onBlinkSelected={handleBlink}
@@ -463,6 +478,7 @@ export default function FrameSetDetail() {
               hierarchy={calibrationHierarchy}
               frameSetId={parseInt(id!)}
               frameSetName={detail?.frames_set?.name ?? undefined}
+              blackholedFileIds={blackholedFileIds}
               onRefresh={refreshCalibrationHierarchy}
               onBlink={handleBlink}
             />

@@ -12,15 +12,6 @@ export interface AnalysisConfig {
   fit_tolerance: number;
   fit_max_rejects: number;
   batch_concurrency: number;
-  scoring_weights: ScoringWeights;
-}
-
-/** Weights for composite quality score calculation */
-export interface ScoringWeights {
-  fwhm: number;
-  eccentricity: number;
-  snr_weight: number;
-  star_count: number;
 }
 
 /** Default analysis configuration values */
@@ -37,12 +28,6 @@ export const DEFAULT_ANALYSIS_CONFIG: AnalysisConfig = {
   fit_tolerance: 1e-4,
   fit_max_rejects: 5,
   batch_concurrency: 3,
-  scoring_weights: {
-    fwhm: 0.35,
-    eccentricity: 0.15,
-    snr_weight: 0.40,
-    star_count: 0.10,
-  },
 };
 
 /** Star annotation display settings */

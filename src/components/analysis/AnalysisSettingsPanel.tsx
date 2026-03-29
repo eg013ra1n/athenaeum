@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Save, RotateCw } from 'lucide-react';
 import { api } from '../../api';
-import type { AnalysisConfig, ScoringWeights } from '../../types/analysis-config';
+import type { AnalysisConfig } from '../../types/analysis-config';
 import { THRESHOLD_FIELDS, EMPTY_THRESHOLDS, type RejectionThresholds } from '../calibration/RejectionThresholdBar';
 
 export function AnalysisSettingsPanel() {
@@ -87,13 +87,6 @@ export function AnalysisSettingsPanel() {
     setConfig(prev => prev ? { ...prev, [field]: value } : prev);
   }, []);
 
-  const updateWeight = useCallback(<K extends keyof ScoringWeights>(field: K, value: number) => {
-    setConfig(prev => prev ? {
-      ...prev,
-      scoring_weights: { ...prev.scoring_weights, [field]: value },
-    } : prev);
-  }, []);
-
   if (loading || !config) {
     return (
       <div className="text-center py-8 text-content-muted">
@@ -101,9 +94,6 @@ export function AnalysisSettingsPanel() {
       </div>
     );
   }
-
-  const weightsSum = config.scoring_weights.fwhm + config.scoring_weights.eccentricity
-    + config.scoring_weights.snr_weight + config.scoring_weights.star_count;
 
   return (
     <div className="space-y-6">
@@ -289,39 +279,6 @@ export function AnalysisSettingsPanel() {
               ? "Automatically set based on CPU cores (~1 frame per 3 cores)."
               : "Number of frames analyzed simultaneously. Higher values use more CPU and memory (~200MB per frame)."}
           </p>
-        </div>
-      </div>
-
-      {/* Scoring Weights */}
-      <div>
-        <h4 className="text-sm font-semibold text-content mb-3">
-          Scoring Weights
-          <span className="ml-2 text-xs font-normal text-content-muted">
-            (sum: {weightsSum.toFixed(2)}, auto-normalized to 1.0)
-          </span>
-        </h4>
-        <div className="space-y-3">
-          {([
-            { key: 'fwhm' as const, label: 'FWHM Weight', desc: 'Focus quality (lower FWHM = better)' },
-            { key: 'eccentricity' as const, label: 'Eccentricity Weight', desc: 'Tracking/guiding (lower = better)' },
-            { key: 'snr_weight' as const, label: 'SNR Weight', desc: 'Signal quality (higher = better)' },
-            { key: 'star_count' as const, label: 'Star Count Weight', desc: 'Transparency proxy (more = better)' },
-          ]).map(({ key, label, desc }) => (
-            <div key={key}>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-xs text-content-secondary">{label}</label>
-                <span className="text-xs text-content-muted">{config.scoring_weights[key].toFixed(2)}</span>
-              </div>
-              <input
-                type="range"
-                value={config.scoring_weights[key]}
-                onChange={e => updateWeight(key, parseFloat(e.target.value))}
-                min="0" max="1" step="0.05"
-                className="w-full"
-              />
-              <p className="text-xs text-content-muted">{desc}</p>
-            </div>
-          ))}
         </div>
       </div>
 

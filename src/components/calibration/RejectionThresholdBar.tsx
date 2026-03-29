@@ -9,7 +9,6 @@ export interface RejectionThresholds {
   snr_weight: string;
   trail: string;
   stars: string;
-  score: string;
 }
 
 export interface ThresholdFieldDef {
@@ -29,7 +28,6 @@ export const THRESHOLD_FIELDS: ThresholdFieldDef[] = [
   { key: 'frame_snr', label: 'Frame SNR (dB) <', placeholder: 'dB', step: 0.5, min: 0 },
   { key: 'psf_signal', label: 'PSF (ADU) <', placeholder: 'ADU', step: 1, min: 0 },
   { key: 'snr_weight', label: 'SNR Wt <', placeholder: 'wt', step: 0.1, min: 0 },
-  { key: 'score', label: 'Score <', placeholder: '%', step: 1, min: 0, max: 100 },
 ];
 
 export const EMPTY_THRESHOLDS: RejectionThresholds = {
@@ -41,7 +39,6 @@ export const EMPTY_THRESHOLDS: RejectionThresholds = {
   snr_weight: '',
   trail: '',
   stars: '',
-  score: '',
 };
 
 interface RejectionThresholdBarProps {

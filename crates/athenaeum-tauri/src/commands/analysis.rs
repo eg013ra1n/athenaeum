@@ -245,44 +245,12 @@ pub async fn analyze_frame_set(
         stars_by_frame.insert(frame_id, stars);
         analyses.push(analysis);
     }
-    analyzer::compute_quality_scores(&mut analyses, &analysis_config);
-
     // Persist all results in a single transaction
     {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
 
-        // If incremental (not force), combine with existing analyses for scoring
-        if !analyses.is_empty() && !force {
-            let existing = db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)
-                .map_err(|e| e.to_string())?;
-
-            let mut combined: Vec<FrameAnalysis> = Vec::new();
-            let new_frame_ids: std::collections::HashSet<i64> = analyses.iter().map(|a| a.frame_id).collect();
-
-            for existing_a in existing {
-                if !new_frame_ids.contains(&existing_a.frame_id) {
-                    combined.push(existing_a);
-                }
-            }
-            combined.append(&mut analyses);
-            analyzer::compute_quality_scores(&mut combined, &analysis_config);
-
-            conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
-            for a in &combined {
-                let analysis_id = db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    e.to_string()
-                })?;
-                if let Some(stars) = stars_by_frame.get(&a.frame_id) {
-                    db_analysis::upsert_star_metrics(&conn, analysis_id, stars).map_err(|e| {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        e.to_string()
-                    })?;
-                }
-            }
-            conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-        } else if !analyses.is_empty() {
+        if !analyses.is_empty() {
             conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
             for a in &analyses {
                 let analysis_id = db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
@@ -371,7 +339,6 @@ pub async fn analyze_single_frame(
 
     analysis.frame_id = frame_id;
     analysis.file_id = file_id;
-    analysis.quality_score = Some(1.0); // Single frame gets perfect score
 
     // Persist analysis + stars
     {
@@ -482,7 +449,6 @@ pub async fn get_frame_star_metrics(
 
     analysis.frame_id = frame_id;
     analysis.file_id = file_id;
-    analysis.quality_score = Some(1.0);
 
     // Persist
     let db = state.ctx.db.get().ok_or("Database not initialized")?;

@@ -50,22 +50,6 @@ pub struct AnalysisConfig {
     /// Higher values increase throughput but use more memory (~200MB per concurrent frame).
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: u32,
-    /// Quality scoring weights
-    pub scoring_weights: ScoringWeights,
-}
-
-/// Weights for composite quality score calculation.
-/// Normalized to sum = 1.0 before use.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScoringWeights {
-    /// Weight for FWHM (lower is better). Default: 0.35
-    pub fwhm: f64,
-    /// Weight for eccentricity (lower is better). Default: 0.15
-    pub eccentricity: f64,
-    /// Weight for SNR weight (higher is better). Default: 0.40
-    pub snr_weight: f64,
-    /// Weight for star count (higher is better). Default: 0.10
-    pub star_count: f64,
 }
 
 impl Default for AnalysisConfig {
@@ -83,34 +67,6 @@ impl Default for AnalysisConfig {
             fit_tolerance: 1e-4,
             fit_max_rejects: 5,
             batch_concurrency: default_batch_concurrency(),
-            scoring_weights: ScoringWeights::default(),
-        }
-    }
-}
-
-impl Default for ScoringWeights {
-    fn default() -> Self {
-        Self {
-            fwhm: 0.35,
-            eccentricity: 0.15,
-            snr_weight: 0.40,
-            star_count: 0.10,
-        }
-    }
-}
-
-impl ScoringWeights {
-    /// Return normalized weights that sum to 1.0
-    pub fn normalized(&self) -> ScoringWeights {
-        let sum = self.fwhm + self.eccentricity + self.snr_weight + self.star_count;
-        if sum <= 0.0 {
-            return ScoringWeights::default();
-        }
-        ScoringWeights {
-            fwhm: self.fwhm / sum,
-            eccentricity: self.eccentricity / sum,
-            snr_weight: self.snr_weight / sum,
-            star_count: self.star_count / sum,
         }
     }
 }
@@ -175,10 +131,6 @@ impl AnalysisConfig {
         }
         if self.batch_concurrency > 16 {
             return Err("batch_concurrency must be 0 (auto) or 1-16".into());
-        }
-        let w = &self.scoring_weights;
-        if w.fwhm < 0.0 || w.eccentricity < 0.0 || w.snr_weight < 0.0 || w.star_count < 0.0 {
-            return Err("Scoring weights must be non-negative".into());
         }
         Ok(())
     }

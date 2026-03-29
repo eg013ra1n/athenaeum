@@ -5,6 +5,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
 use crate::WebAppState;
+use crate::events::SseEvent;
 
 // ── Request body types ────────────────────────────────────────────────────────
 
@@ -107,6 +108,11 @@ pub async fn move_to_black_hole(
     let id = athenaeum_core::db::add_to_black_hole(&conn, args.file_id, &args.from_where, &original_path)
         .map_err(db_err)?;
 
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "file_id": args.file_id, "action": "blackholed" }),
+    });
+
     Ok(Json(id))
 }
 
@@ -170,6 +176,12 @@ pub async fn restore_from_black_hole(
     let conn = db.conn();
 
     athenaeum_core::db::remove_from_black_hole(&conn, args.file_id).map_err(db_err)?;
+
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "file_id": args.file_id, "action": "restored" }),
+    });
+
     Ok(Json(()))
 }
 

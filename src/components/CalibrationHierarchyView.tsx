@@ -12,9 +12,11 @@ import { CalibrationGroupModal } from './calibration/CalibrationGroupModal';
 import type { FlatGroupData, DarkOnlyGroupData } from './calibration/CalibrationGroupCard';
 import type { EnrichedLightFrame } from './calibration/LightsAnalysisTable';
 import { buildCameraFilterTree } from './calibration/utils';
+import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 
 interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
+  blackholedFileIds: Set<number>;
   useBiasForDarkOptimization?: boolean;
   onRefresh?: () => void;
   onBlink?: (frameIds: number[]) => void;
@@ -30,6 +32,7 @@ interface ModalState {
 
 export function CalibrationHierarchyView({
   data,
+  blackholedFileIds,
   useBiasForDarkOptimization = false,
   onRefresh,
   onBlink: _onBlink,
@@ -43,9 +46,19 @@ export function CalibrationHierarchyView({
   const isPreCalibration = data.calibrated_frames === 0;
 
   // Build camera→filter tree from hierarchy data
-  const { nodes, framesByKey, allFrames } = useMemo(
+  const { nodes, framesByKey, allFrames: allFramesRaw } = useMemo(
     () => buildCameraFilterTree(data),
     [data]
+  );
+
+  // Split into active and blackholed frames
+  const allFrames = useMemo(
+    () => allFramesRaw.filter(f => !blackholedFileIds.has(f.file_id)),
+    [allFramesRaw, blackholedFileIds]
+  );
+  const blackholedFrames = useMemo(
+    () => allFramesRaw.filter(f => blackholedFileIds.has(f.file_id)),
+    [allFramesRaw, blackholedFileIds]
   );
 
   // CameraFilterTree checkbox state (for filtering)
@@ -199,25 +212,28 @@ export function CalibrationHierarchyView({
           />
 
           {/* Right Panel */}
-          {isPreCalibration ? (
-            /* Pre-calibration: flat sortable table */
-            <div className="flex-1 min-w-0 overflow-y-auto border border-border rounded-xl">
-              <CalibrationLightsTable
-                frames={displayedFrames}
-                selectedFrameIds={selectedFrameIds}
-                onSelectionChange={setSelectedFrameIds}
+          <div className="flex-1 min-w-0 flex flex-col">
+            {isPreCalibration ? (
+              /* Pre-calibration: flat sortable table */
+              <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
+                <CalibrationLightsTable
+                  frames={displayedFrames}
+                  selectedFrameIds={selectedFrameIds}
+                  onSelectionChange={setSelectedFrameIds}
+                />
+              </div>
+            ) : (
+              /* Post-calibration: card view */
+              <CalibrationCardView
+                data={data}
+                allFrames={allFrames}
+                visibleFrameIds={visibleFrameIds}
+                onOpenGroup={handleOpenGroup}
+                onManualCalibration={openManualCalibrationForFrameIds}
               />
-            </div>
-          ) : (
-            /* Post-calibration: card view */
-            <CalibrationCardView
-              data={data}
-              allFrames={allFrames}
-              visibleFrameIds={visibleFrameIds}
-              onOpenGroup={handleOpenGroup}
-              onManualCalibration={openManualCalibrationForFrameIds}
-            />
-          )}
+            )}
+            <BlackholedFramesSection frames={blackholedFrames} />
+          </div>
         </div>
       ) : (
         /* Empty State */

@@ -9,6 +9,7 @@ import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/LightsAnalysisTable';
 import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildMergedCameraFilterTree } from './calibration/utils';
+import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { AnalysisChartsModal } from './analysis/AnalysisChartsModal';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
 
@@ -16,16 +17,16 @@ interface LightsAnalysisViewProps {
   hierarchy: CalibrationHierarchyViewData;
   frameSetId: number;
   frameSetName?: string;
+  blackholedFileIds: Set<number>;
   onRefresh?: () => void;
   onBlink?: (frameIds: number[]) => void;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefresh, onBlink }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh: _onRefresh, onBlink }: LightsAnalysisViewProps) {
   // Tree checkbox state — which filter groups are checked (for filtering the table)
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
   // Table row selection — which individual frames are selected (for mass actions)
   const [selectedFrameIds, setSelectedFrameIds] = useState<Set<number>>(new Set());
-  const [blackholedFileIds, setBlackholedFileIds] = useState<Set<number>>(new Set());
   const [blackholing, setBlackholing] = useState(false);
   const [thresholds, setThresholds] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
   const [defaultThresholds, setDefaultThresholds] = useState<RejectionThresholds | null>(null);
@@ -42,9 +43,19 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   const [chartsOpen, setChartsOpen] = useState(false);
   const [useArcsec, setUseArcsec] = useState(false);
 
-  const { nodes, framesByKey, allFrames } = useMemo(
+  const { nodes, framesByKey, allFrames: allFramesRaw } = useMemo(
     () => buildMergedCameraFilterTree(hierarchy),
     [hierarchy]
+  );
+
+  // Split into active and blackholed frames
+  const allFrames = useMemo(
+    () => allFramesRaw.filter(f => !blackholedFileIds.has(f.file_id)),
+    [allFramesRaw, blackholedFileIds]
+  );
+  const blackholedFrames = useMemo(
+    () => allFramesRaw.filter(f => blackholedFileIds.has(f.file_id)),
+    [allFramesRaw, blackholedFileIds]
   );
 
   // Load existing analysis data on mount
@@ -153,7 +164,6 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
     const snrWtThreshold = parseFloat(thresholds.snr_weight);
     const rejectTrailed = thresholds.trail === 'true';
     const starsThreshold = parseFloat(thresholds.stars);
-    const scoreThreshold = parseFloat(thresholds.score);
 
     for (const frame of displayedFrames) {
       const a = analysisData.get(frame.frame_id);
@@ -199,11 +209,6 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
         rejected.add(frame.frame_id);
         continue;
       }
-      // Score < threshold (as percentage) = rejected (worse)
-      if (!isNaN(scoreThreshold) && a.quality_score != null && a.quality_score * 100 < scoreThreshold) {
-        rejected.add(frame.frame_id);
-        continue;
-      }
     }
 
     return rejected;
@@ -221,7 +226,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
   }, []);
 
   const handleBlackhole = useCallback((fileId: number) => {
-    setBlackholedFileIds(prev => new Set([...prev, fileId]));
+    // Deselect the blackholed frame; state update happens via event
     setSelectedFrameIds(prev => {
       const frame = allFrames.find(f => f.file_id === fileId);
       if (frame) {
@@ -231,8 +236,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
       }
       return prev;
     });
-    onRefresh?.();
-  }, [onRefresh, allFrames]);
+  }, [allFrames]);
 
   const handleBlinkSelected = useCallback(() => {
     if (selectedFrameIds.size === 0) return;
@@ -243,7 +247,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
     if (selectedFrameIds.size === 0) return;
 
     const fileIds = allFrames
-      .filter(f => selectedFrameIds.has(f.frame_id) && !blackholedFileIds.has(f.file_id))
+      .filter(f => selectedFrameIds.has(f.frame_id))
       .map(f => f.file_id);
 
     if (fileIds.length === 0) return;
@@ -253,18 +257,16 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
       for (const fileId of fileIds) {
         await api.invoke('move_to_black_hole', { fileId, fromWhere: 'frame_set_detail' });
       }
-      setBlackholedFileIds(prev => new Set([...prev, ...fileIds]));
       setSelectedFrameIds(new Set());
-      onRefresh?.();
     } catch (err) {
       console.error('Failed to blackhole selected frames:', err);
     } finally {
       setBlackholing(false);
     }
-  }, [selectedFrameIds, allFrames, blackholedFileIds, onRefresh]);
+  }, [selectedFrameIds, allFrames]);
 
   const handleExportCsv = useCallback(() => {
-    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM (px)', 'Eccentricity', 'SNR', 'Frame SNR (dB)', 'PSF Signal (ADU)', 'SNR Weight', 'Trail R\u00B2', 'Score'];
+    const headers = ['Filename', 'Date/Time', 'Camera', 'Filter', 'Exposure', 'Stars', 'FWHM (px)', 'Eccentricity', 'SNR', 'Frame SNR (dB)', 'PSF Signal (ADU)', 'SNR Weight', 'Trail R\u00B2'];
     const rows = displayedFrames.map(frame => {
       const a = analysisData.get(frame.frame_id);
       return [
@@ -281,7 +283,6 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
         a ? a.psf_signal.toFixed(1) : '',
         a ? a.snr_weight.toFixed(1) : '',
         a ? a.trail_r_squared.toFixed(4) : '',
-        a?.quality_score != null ? (a.quality_score * 100).toFixed(1) : '',
       ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
     });
 
@@ -431,7 +432,6 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
           <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
             <LightsAnalysisTable
               frames={displayedFrames}
-              blackholedFileIds={blackholedFileIds}
               selectedFrameIds={selectedFrameIds}
               onSelectionChange={setSelectedFrameIds}
               onBlackhole={handleBlackhole}
@@ -440,6 +440,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, onRefr
               plateScale={useArcsec ? plateScale : null}
             />
           </div>
+
+          <BlackholedFramesSection frames={blackholedFrames} />
         </div>
       </div>
 
