@@ -594,11 +594,6 @@ export default function Objects() {
       );
     }
 
-    // Custom sets only
-    if (filters.showOnlyCustom) {
-      result = result.filter(fs => fs.frames_set.is_custom);
-    }
-
     // Date range filter
     if (filters.dateFrom || filters.dateTo) {
       result = result.filter(fs => {

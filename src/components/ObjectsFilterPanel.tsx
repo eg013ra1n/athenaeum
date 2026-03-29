@@ -1,10 +1,9 @@
-import { Search, Calendar, Star, MapPin, X } from 'lucide-react';
+import { Search, Calendar, MapPin, X } from 'lucide-react';
 import { DateInputGroup, toISODate, isoToDateParts, generateYears } from './DateRangeFilter';
 
 export interface ObjectsFilterState {
   dateFrom: string | null;
   dateTo: string | null;
-  showOnlyCustom: boolean;
   nameSearch: string;
   coordRa: string;
   coordDec: string;
@@ -16,7 +15,6 @@ export interface ObjectsFilterState {
 export const emptyFilterState: ObjectsFilterState = {
   dateFrom: null,
   dateTo: null,
-  showOnlyCustom: false,
   nameSearch: '',
   coordRa: '',
   coordDec: '',
@@ -43,7 +41,6 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
 
   const hasActiveFilters =
     filters.nameSearch.trim() !== '' ||
-    filters.showOnlyCustom ||
     filters.dateFrom !== null ||
     filters.dateTo !== null ||
     filters.coordEnabled;
@@ -89,24 +86,6 @@ export function ObjectsFilterPanel({ filters, onChange, isOpen }: ObjectsFilterP
               years={generateYears()}
             />
           </div>
-        </div>
-
-        {/* Custom Sets Toggle */}
-        <div className="flex flex-col">
-          <label className={labelClass}>
-            <Star size={12} className="inline mr-1" />
-            Custom Only
-          </label>
-          <button
-            onClick={() => updateFilter('showOnlyCustom', !filters.showOnlyCustom)}
-            className={`px-3 py-1.5 rounded text-sm transition-colors ${
-              filters.showOnlyCustom
-                ? 'bg-orange text-white'
-                : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
-            }`}
-          >
-            {filters.showOnlyCustom ? 'On' : 'Off'}
-          </button>
         </div>
 
         {/* Coordinates */}
@@ -267,7 +246,6 @@ export function angularDistance(ra1: number, dec1: number, ra2: number, dec2: nu
 export function countActiveFilters(filters: ObjectsFilterState): number {
   let count = 0;
   if (filters.nameSearch.trim()) count++;
-  if (filters.showOnlyCustom) count++;
   if (filters.dateFrom || filters.dateTo) count++;
   if (filters.coordEnabled) count++;
   return count;

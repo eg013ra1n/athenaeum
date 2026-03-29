@@ -3629,9 +3629,9 @@ dependencies = [
 
 [[package]]
 name = "rustafits"
-version = "0.9.2"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adacb23f0ab3bdeb1aae387d8abc74401ba579dc7101a46ce12958902cea59d2"
+checksum = "952ca636741bd8c9925b7bb5f4556d38aef08cd1a95cc0a762c268855156a48e"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
