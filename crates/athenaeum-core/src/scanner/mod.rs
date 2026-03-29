@@ -79,7 +79,7 @@ pub fn scan_directory(
 
     // Find all FITS/XISF files
     let files: Vec<PathBuf> = WalkDir::new(root_path)
-        .follow_links(false)
+        .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -598,7 +598,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     let mut discovery_count = 0usize;
 
     for entry in WalkDir::new(root_path)
-        .follow_links(false)
+        .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())

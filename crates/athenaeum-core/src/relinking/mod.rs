@@ -85,7 +85,7 @@ pub fn relink_files(
     let mut matched_file_ids = std::collections::HashSet::new();
 
     for entry in WalkDir::new(new_root)
-        .follow_links(false)
+        .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
     {
