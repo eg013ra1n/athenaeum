@@ -8,6 +8,10 @@ interface MergedCameraFilterTreeProps {
   checkedKeys: Set<string>;
   onCheckedChange: (keys: Set<string>) => void;
   className?: string;
+  /** Text shown in header when items are checked (e.g. "3 groups · 42 frames") */
+  checkedLabel?: string;
+  /** Optional footer rendered inside the tree container with a top border separator */
+  footer?: React.ReactNode;
 }
 
 /** Styled checkbox matching NavigationTree's StyledCheckbox */
@@ -49,7 +53,7 @@ function StyledCheckbox({
   );
 }
 
-export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '' }: MergedCameraFilterTreeProps) {
+export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '', checkedLabel, footer }: MergedCameraFilterTreeProps) {
   const [expandedCameras, setExpandedCameras] = useState<Set<string>>(
     () => new Set(nodes.map(n => n.camera))
   );
@@ -67,11 +71,6 @@ export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, cl
       return next;
     });
   }, []);
-
-  const totalFrames = useMemo(
-    () => nodes.reduce((sum, n) => sum + n.totalFrameCount, 0),
-    [nodes]
-  );
 
   const allFilterKeys = useMemo(
     () => nodes.flatMap(n => n.filters.map(f => f.key)),
@@ -150,7 +149,7 @@ export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, cl
             title="Select all"
           />
           <span className="text-xs text-content-muted">
-            {nodes.length} camera{nodes.length !== 1 ? 's' : ''} · {totalFrames} frames
+            {checkedKeys.size > 0 && checkedLabel ? checkedLabel : 'Select all'}
           </span>
         </div>
         <button
@@ -248,6 +247,11 @@ export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, cl
           </div>
         )}
       </div>
+      {footer && (
+        <div className="border-t border-border/50 px-2 py-1.5">
+          {footer}
+        </div>
+      )}
     </nav>
   );
 }

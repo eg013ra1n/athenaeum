@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, Play, BarChart3, Crosshair } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -55,7 +55,7 @@ export default function FrameSetDetail() {
   const [loadingCalibration, setLoadingCalibration] = useState(false);
 
   // Tab state
-  const [activeTab, setActiveTab] = useState<FrameSetTab>('calibration');
+  const [activeTab, setActiveTab] = useState<FrameSetTab>('analysis');
 
   // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
   const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
@@ -150,22 +150,7 @@ export default function FrameSetDetail() {
     return frameIds;
   }, [calibrationHierarchy]);
 
-  // Get all LIGHT frame IDs from the calibration hierarchy
-  const getAllLightFrameIds = useCallback((): number[] => {
-    if (!calibrationHierarchy) return [];
-
-    const frameIds: number[] = [];
-    for (const dateGroup of calibrationHierarchy.date_groups) {
-      for (const cameraGroup of dateGroup.camera_groups) {
-        for (const filterGroup of cameraGroup.filter_groups) {
-          frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
-        }
-      }
-    }
-    return frameIds;
-  }, [calibrationHierarchy]);
-
-  // Handle blink from CalibrationHierarchyView - load full frame data
+  // Handle blink from LightsAnalysisView - load full frame data
   const handleBlink = useCallback(async (frameIds: number[]) => {
     if (frameIds.length === 0) {
       showAlert('No Frames', 'No frames selected for blink', 'warning');
@@ -417,8 +402,8 @@ export default function FrameSetDetail() {
       {/* Tab Bar */}
       <div className="flex items-center gap-1 border-b border-border mb-3 flex-shrink-0">
         {([
-          { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
+          { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
         ]).map(({ key, label, icon: Icon }) => (
           <button
             key={key}
@@ -451,23 +436,12 @@ export default function FrameSetDetail() {
                   frameSetName={detail.frames_set?.name || 'Untitled'}
                   onComplete={loadData}
                 />
-                <button
-                  onClick={() => handleBlink(getAllLightFrameIds())}
-                  disabled={getAllLightFrameIds().length === 0}
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
-                  title="Blink through all LIGHT frames in this frame set"
-                >
-                  <Play size={16} />
-                  Blink All
-                </button>
               </div>
               <div className="flex-1 min-h-0">
                 <CalibrationHierarchyViewComponent
                   data={calibrationHierarchy}
                   blackholedFileIds={blackholedFileIds}
                   onRefresh={refreshCalibrationHierarchy}
-                  onBlink={handleBlink}
-                  onBlinkSelected={handleBlink}
                   onSplit={handleOpenSplitDialog}
                   onCreateCustomSet={handleOpenCreateDialog}
                 />
@@ -481,6 +455,8 @@ export default function FrameSetDetail() {
               blackholedFileIds={blackholedFileIds}
               onRefresh={refreshCalibrationHierarchy}
               onBlink={handleBlink}
+              onSplit={handleOpenSplitDialog}
+              onCreateCustomSet={handleOpenCreateDialog}
             />
           )
         ) : (

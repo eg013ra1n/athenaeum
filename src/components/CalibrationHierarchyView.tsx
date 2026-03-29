@@ -1,17 +1,18 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { api } from '../api';
-import { Scissors, Plus, Play, Settings } from 'lucide-react';
+import { Scissors, Plus, Settings, Calendar, Camera, X } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
+import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import { CalibrationLightsTable } from './calibration/CalibrationLightsTable';
 import { CalibrationCardView } from './calibration/CalibrationCardView';
 import { CalibrationGroupModal } from './calibration/CalibrationGroupModal';
 import type { FlatGroupData, DarkOnlyGroupData } from './calibration/CalibrationGroupCard';
 import type { EnrichedLightFrame } from './calibration/LightsAnalysisTable';
-import { buildCameraFilterTree } from './calibration/utils';
+import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 
 interface CalibrationHierarchyViewProps {
@@ -19,8 +20,6 @@ interface CalibrationHierarchyViewProps {
   blackholedFileIds: Set<number>;
   useBiasForDarkOptimization?: boolean;
   onRefresh?: () => void;
-  onBlink?: (frameIds: number[]) => void;
-  onBlinkSelected?: (frameIds: number[]) => void;
   onSplit?: (selectedFilterKeys: Set<string>) => void;
   onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
 }
@@ -35,21 +34,37 @@ export function CalibrationHierarchyView({
   blackholedFileIds,
   useBiasForDarkOptimization = false,
   onRefresh,
-  onBlink: _onBlink,
-  onBlinkSelected,
   onSplit,
   onCreateCustomSet,
 }: CalibrationHierarchyViewProps) {
-  // onBlink is aliased to _onBlink — in the new design, onBlinkSelected handles all blink actions.
-  // The prop is kept for interface compatibility with FrameSetDetail which passes it.
-  void _onBlink;
   const isPreCalibration = data.calibrated_frames === 0;
 
-  // Build camera→filter tree from hierarchy data
-  const { nodes, framesByKey, allFrames: allFramesRaw } = useMemo(
-    () => buildCameraFilterTree(data),
-    [data]
-  );
+  // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
+  const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-night');
+
+  // Load persisted view mode on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const saved = await api.invoke<string>('get_setting', { key: 'ui.tree_view_mode', defaultValue: 'by-night' });
+        if (saved === 'by-camera') setViewMode('by-camera');
+      } catch { /* use default */ }
+    })();
+  }, []);
+
+  const handleViewModeChange = useCallback((mode: 'by-night' | 'by-camera') => {
+    setViewMode(mode);
+    setCheckedKeys(new Set());
+    api.invoke('set_setting', { key: 'ui.tree_view_mode', value: mode }).catch(() => {});
+  }, []);
+
+  // Build both tree structures
+  const dateTree = useMemo(() => buildCameraFilterTree(data), [data]);
+  const mergedTree = useMemo(() => buildMergedCameraFilterTree(data), [data]);
+
+  // Select based on viewMode
+  const framesByKey = viewMode === 'by-night' ? dateTree.framesByKey : mergedTree.framesByKey;
+  const allFramesRaw = viewMode === 'by-night' ? dateTree.allFrames : mergedTree.allFrames;
 
   // Split into active and blackholed frames
   const allFrames = useMemo(
@@ -86,8 +101,8 @@ export function CalibrationHierarchyView({
       const keyFrames = framesByKey.get(key);
       if (keyFrames) frames.push(...keyFrames);
     }
-    return frames;
-  }, [checkedKeys, allFrames, framesByKey]);
+    return frames.filter(f => !blackholedFileIds.has(f.file_id));
+  }, [checkedKeys, allFrames, framesByKey, blackholedFileIds]);
 
   // Visible frame IDs for card view filtering
   const visibleFrameIds = useMemo(() => {
@@ -106,17 +121,6 @@ export function CalibrationHierarchyView({
     setCheckedKeys(keys);
     setSelectedFrameIds(new Set());
   }, []);
-
-  // Blink selected frames (pre-cal table selection)
-  const handleBlinkSelected = useCallback(() => {
-    if (!onBlinkSelected) return;
-
-    if (selectedFrameIds.size > 0) {
-      onBlinkSelected([...selectedFrameIds]);
-    } else if (checkedKeys.size > 0) {
-      onBlinkSelected(displayedFrames.map(f => f.frame_id));
-    }
-  }, [onBlinkSelected, selectedFrameIds, checkedKeys, displayedFrames]);
 
   // Split with checked filter keys
   const handleSplit = useCallback(() => {
@@ -196,20 +200,93 @@ export function CalibrationHierarchyView({
 
   // Determine action bar visibility and counts
   const showPreCalActionBar = isPreCalibration && selectedFrameIds.size > 0;
-  const showFilterActionBar = !isPreCalibration && checkedKeys.size > 0 && (onBlinkSelected || onSplit || onCreateCustomSet);
+  const showFilterActionBar = !isPreCalibration && checkedKeys.size > 0 && (onSplit || onCreateCustomSet);
 
   return (
     <div className="flex flex-col h-full">
       {/* Main Content */}
       {data.date_groups.length > 0 ? (
         <div className="flex flex-1 min-h-0 gap-4">
-          {/* Left Panel — CameraFilterTree */}
-          <CameraFilterTree
-            nodes={nodes}
-            checkedKeys={checkedKeys}
-            onCheckedChange={handleCheckedChange}
-            className="w-80 flex-shrink-0"
-          />
+          {/* Left Panel — Tree with view toggle */}
+          <div className="w-80 flex-shrink-0 flex flex-col">
+            {/* View Mode Toggle */}
+            <div className="flex mb-1 rounded-lg border border-border/50 overflow-hidden">
+              <button
+                onClick={() => handleViewModeChange('by-night')}
+                className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1 text-xs font-medium transition-colors ${
+                  viewMode === 'by-night'
+                    ? 'bg-accent/20 text-accent'
+                    : 'bg-surface-elevated/50 text-content-muted hover:text-content-secondary'
+                }`}
+              >
+                <Calendar size={12} />
+                By Night
+              </button>
+              <button
+                onClick={() => handleViewModeChange('by-camera')}
+                className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1 text-xs font-medium transition-colors ${
+                  viewMode === 'by-camera'
+                    ? 'bg-accent/20 text-accent'
+                    : 'bg-surface-elevated/50 text-content-muted hover:text-content-secondary'
+                }`}
+              >
+                <Camera size={12} />
+                By Camera
+              </button>
+            </div>
+
+            {/* Tree */}
+            {(() => {
+              const treeFooter = checkedKeys.size > 0 && (onSplit || onCreateCustomSet) ? (
+                <>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {onSplit && (
+                      <button
+                        onClick={handleSplit}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                      >
+                        <Scissors size={14} aria-hidden="true" />
+                        Split
+                      </button>
+                    )}
+                    {onCreateCustomSet && (
+                      <button
+                        onClick={handleCreateCustomSet}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-success hover:brightness-90 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-success"
+                      >
+                        <Plus size={14} aria-hidden="true" />
+                        Create Set
+                      </button>
+                    )}
+                  </div>
+                </>
+              ) : undefined;
+
+              const label = checkedKeys.size > 0
+                ? `${checkedKeys.size} group${checkedKeys.size !== 1 ? 's' : ''} · ${checkedFrameCount} frame${checkedFrameCount !== 1 ? 's' : ''}`
+                : undefined;
+
+              return viewMode === 'by-night' ? (
+                <CameraFilterTree
+                  nodes={dateTree.nodes}
+                  checkedKeys={checkedKeys}
+                  onCheckedChange={handleCheckedChange}
+                  className="flex-1 min-h-0"
+                  checkedLabel={label}
+                  footer={treeFooter}
+                />
+              ) : (
+                <MergedCameraFilterTree
+                  nodes={mergedTree.nodes}
+                  checkedKeys={checkedKeys}
+                  onCheckedChange={handleCheckedChange}
+                  className="flex-1 min-h-0"
+                  checkedLabel={label}
+                  footer={treeFooter}
+                />
+              );
+            })()}
+          </div>
 
           {/* Right Panel */}
           <div className="flex-1 min-w-0 flex flex-col">
@@ -233,6 +310,55 @@ export function CalibrationHierarchyView({
               />
             )}
             <BlackholedFramesSection frames={blackholedFrames} />
+
+            {/* Pre-cal action bar: when table rows are selected */}
+            {showPreCalActionBar && (
+              <div className="mt-1 bg-surface-elevated/80 rounded-lg px-2 py-1.5 border border-border/50">
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setSelectedFrameIds(new Set())}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover text-content-secondary hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
+                  >
+                    <X size={14} aria-hidden="true" />
+                    Clear Selection
+                  </button>
+                  <div className="text-sm text-content-secondary">
+                    <span className="font-medium text-content">{selectedFrameIds.size}</span>{' '}
+                    frame{selectedFrameIds.size !== 1 ? 's' : ''}
+                  </div>
+                  <span className="text-content-muted">|</span>
+                  <button
+                    onClick={handleManualCalibrationPreCal}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                  >
+                    <Settings size={14} aria-hidden="true" />
+                    Assign Calibration
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Post-cal action bar: when tree groups are checked */}
+            {showFilterActionBar && (
+              <div className="mt-1 bg-surface-elevated/80 rounded-lg px-2 py-1.5 border border-border/50">
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setCheckedKeys(new Set())}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover text-content-secondary hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
+                  >
+                    <X size={14} aria-hidden="true" />
+                    Clear Selection
+                  </button>
+                  <div className="text-sm text-content-secondary">
+                    <span className="font-medium text-content">{checkedKeys.size}</span>{' '}
+                    group{checkedKeys.size !== 1 ? 's' : ''}
+                    <span className="text-content-muted ml-1">
+                      ({checkedFrameCount} frame{checkedFrameCount !== 1 ? 's' : ''})
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       ) : (
@@ -240,104 +366,6 @@ export function CalibrationHierarchyView({
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center py-16 px-8 bg-surface-elevated rounded-xl border border-border">
             <p className="text-lg text-content-muted">No frames found in this frame set.</p>
-          </div>
-        </div>
-      )}
-
-      {/* Pre-cal action bar: when table rows are selected */}
-      {showPreCalActionBar && (
-        <div className="mt-3 bg-surface-elevated/80 rounded-lg p-3 border border-border/50">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              {onBlinkSelected && (
-                <>
-                  <button
-                    onClick={() => onBlinkSelected([...selectedFrameIds])}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-cyan-600 hover:bg-cyan-700 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500"
-                  >
-                    <Play size={14} aria-hidden="true" />
-                    Blink ({selectedFrameIds.size})
-                  </button>
-                  <span className="text-content-muted">|</span>
-                </>
-              )}
-              <button
-                onClick={handleManualCalibrationPreCal}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-              >
-                <Settings size={14} aria-hidden="true" />
-                Assign Calibration
-              </button>
-            </div>
-            <div className="flex items-center gap-3">
-              <div className="text-sm text-content-secondary">
-                <span className="font-medium text-content">{selectedFrameIds.size}</span>{' '}
-                frame{selectedFrameIds.size !== 1 ? 's' : ''}
-              </div>
-              <button
-                onClick={() => setSelectedFrameIds(new Set())}
-                className="px-3 py-1.5 text-content-muted hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Post-cal action bar: when CameraFilterTree groups are checked */}
-      {showFilterActionBar && (
-        <div className="mt-3 bg-surface-elevated/80 rounded-lg p-3 border border-border/50">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              {onBlinkSelected && (
-                <>
-                  <button
-                    onClick={handleBlinkSelected}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-cyan-600 hover:bg-cyan-700 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-cyan-500"
-                  >
-                    <Play size={14} aria-hidden="true" />
-                    Blink Selected ({checkedFrameCount})
-                  </button>
-                  {(onSplit || onCreateCustomSet) && (
-                    <span className="text-content-muted">|</span>
-                  )}
-                </>
-              )}
-              {onSplit && (
-                <button
-                  onClick={handleSplit}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                >
-                  <Scissors size={14} aria-hidden="true" />
-                  Split
-                </button>
-              )}
-              {onCreateCustomSet && (
-                <button
-                  onClick={handleCreateCustomSet}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-success hover:brightness-90 text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-success"
-                >
-                  <Plus size={14} aria-hidden="true" />
-                  Create Set
-                </button>
-              )}
-            </div>
-            <div className="flex items-center gap-3">
-              <div className="text-sm text-content-secondary">
-                <span className="font-medium text-content">{checkedKeys.size}</span>{' '}
-                group{checkedKeys.size !== 1 ? 's' : ''}
-                <span className="text-content-muted ml-1">
-                  ({checkedFrameCount} frame{checkedFrameCount !== 1 ? 's' : ''})
-                </span>
-              </div>
-              <button
-                onClick={() => setCheckedKeys(new Set())}
-                className="px-3 py-1.5 text-content-muted hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
-              >
-                Clear
-              </button>
-            </div>
           </div>
         </div>
       )}

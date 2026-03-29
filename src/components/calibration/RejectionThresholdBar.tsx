@@ -3,12 +3,9 @@ import { Minus, Plus, RotateCw } from 'lucide-react';
 export interface RejectionThresholds {
   fwhm: string;
   eccentricity: string;
-  median_snr: string;
   frame_snr: string;
-  psf_signal: string;
   snr_weight: string;
   trail: string;
-  stars: string;
 }
 
 export interface ThresholdFieldDef {
@@ -21,24 +18,18 @@ export interface ThresholdFieldDef {
 }
 
 export const THRESHOLD_FIELDS: ThresholdFieldDef[] = [
-  { key: 'stars', label: 'Stars <', placeholder: '#', step: 1, min: 0 },
   { key: 'fwhm', label: 'FWHM (px) >', placeholder: 'px', step: 0.1, min: 0 },
   { key: 'eccentricity', label: 'Ecc >', placeholder: '0.8', step: 0.01, min: 0, max: 1 },
-  { key: 'median_snr', label: 'SNR <', placeholder: 'ratio', step: 1, min: 0 },
   { key: 'frame_snr', label: 'Frame SNR (dB) <', placeholder: 'dB', step: 0.5, min: 0 },
-  { key: 'psf_signal', label: 'PSF (ADU) <', placeholder: 'ADU', step: 1, min: 0 },
   { key: 'snr_weight', label: 'SNR Wt <', placeholder: 'wt', step: 0.1, min: 0 },
 ];
 
 export const EMPTY_THRESHOLDS: RejectionThresholds = {
   fwhm: '',
   eccentricity: '0.8',
-  median_snr: '',
   frame_snr: '',
-  psf_signal: '',
   snr_weight: '',
   trail: '',
-  stars: '',
 };
 
 interface RejectionThresholdBarProps {

@@ -8,6 +8,10 @@ interface CameraFilterTreeProps {
   checkedKeys: Set<string>;
   onCheckedChange: (keys: Set<string>) => void;
   className?: string;
+  /** Text shown in header when items are checked (e.g. "3 groups · 42 frames") */
+  checkedLabel?: string;
+  /** Optional footer rendered inside the tree container with a top border separator */
+  footer?: React.ReactNode;
 }
 
 /** Styled checkbox matching NavigationTree's StyledCheckbox */
@@ -49,7 +53,7 @@ function StyledCheckbox({
   );
 }
 
-export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '' }: CameraFilterTreeProps) {
+export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '', checkedLabel, footer }: CameraFilterTreeProps) {
   const [expandedDates, setExpandedDates] = useState<Set<string>>(
     () => new Set(nodes.map(n => n.dateKey))
   );
@@ -80,11 +84,6 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
       return next;
     });
   }, []);
-
-  const totalFrames = useMemo(
-    () => nodes.reduce((sum, n) => sum + n.totalFrameCount, 0),
-    [nodes]
-  );
 
   const allFilterKeys = useMemo(
     () => nodes.flatMap(n => n.cameras.flatMap(c => c.filters.map(f => f.key))),
@@ -202,7 +201,7 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
             title="Select all"
           />
           <span className="text-xs text-content-muted">
-            {nodes.length} night{nodes.length !== 1 ? 's' : ''} · {totalFrames} frames
+            {checkedKeys.size > 0 && checkedLabel ? checkedLabel : 'Select all'}
           </span>
         </div>
         <button
@@ -342,6 +341,11 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
           </div>
         )}
       </div>
+      {footer && (
+        <div className="border-t border-border/50 px-2 py-1.5">
+          {footer}
+        </div>
+      )}
     </nav>
   );
 }
