@@ -111,6 +111,7 @@ export function BlackholedFramesSection({ frames, analysisData, onBlink }: Black
         )}
       </button>
       {expanded && (
+        <div className="max-h-64 overflow-y-auto">
         <table className="w-full" role="table">
           <thead className="bg-surface sticky top-0 z-10">
             <tr>
@@ -201,6 +202,7 @@ export function BlackholedFramesSection({ frames, analysisData, onBlink }: Black
             })}
           </tbody>
         </table>
+        </div>
       )}
 
       <ConfirmDialog

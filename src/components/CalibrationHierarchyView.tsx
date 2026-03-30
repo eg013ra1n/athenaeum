@@ -19,6 +19,8 @@ interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
   blackholedFileIds: Set<number>;
   useBiasForDarkOptimization?: boolean;
+  /** Stacked SNR per filter key, passed through to the tree */
+  filterSnrMap?: Map<string, number>;
   onRefresh?: () => void;
   onSplit?: (selectedFilterKeys: Set<string>) => void;
   onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
@@ -33,6 +35,7 @@ export function CalibrationHierarchyView({
   data,
   blackholedFileIds,
   useBiasForDarkOptimization = false,
+  filterSnrMap,
   onRefresh,
   onSplit,
   onCreateCustomSet,
@@ -273,6 +276,7 @@ export function CalibrationHierarchyView({
                   onCheckedChange={handleCheckedChange}
                   className="flex-1 min-h-0"
                   checkedLabel={label}
+                  filterSnrMap={filterSnrMap}
                   footer={treeFooter}
                 />
               ) : (
@@ -282,6 +286,7 @@ export function CalibrationHierarchyView({
                   onCheckedChange={handleCheckedChange}
                   className="flex-1 min-h-0"
                   checkedLabel={label}
+                  filterSnrMap={filterSnrMap}
                   footer={treeFooter}
                 />
               );

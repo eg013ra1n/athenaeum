@@ -10,6 +10,8 @@ interface MergedCameraFilterTreeProps {
   className?: string;
   /** Text shown in header when items are checked (e.g. "3 groups · 42 frames") */
   checkedLabel?: string;
+  /** Stacked SNR per filter key (dB), displayed next to filter label */
+  filterSnrMap?: Map<string, number>;
   /** Optional footer rendered inside the tree container with a top border separator */
   footer?: React.ReactNode;
 }
@@ -53,7 +55,7 @@ function StyledCheckbox({
   );
 }
 
-export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '', checkedLabel, footer }: MergedCameraFilterTreeProps) {
+export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, className = '', checkedLabel, filterSnrMap, footer }: MergedCameraFilterTreeProps) {
   const [expandedCameras, setExpandedCameras] = useState<Set<string>>(
     () => new Set(nodes.map(n => n.camera))
   );
@@ -227,6 +229,11 @@ export function MergedCameraFilterTree({ nodes, checkedKeys, onCheckedChange, cl
                           <Aperture size={14} className="text-accent flex-shrink-0" />
                           <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
                             {filter.label}
+                            {filterSnrMap?.has(filter.key) && (
+                              <span className="text-[10px] text-content-muted ml-1" title="Stacked SNR (optimal weighting)">
+                                {filterSnrMap.get(filter.key)!.toFixed(1)} dB
+                              </span>
+                            )}
                           </span>
                           <span className="text-xs text-content-muted flex-shrink-0 tabular-nums">
                             {filter.frameCount}

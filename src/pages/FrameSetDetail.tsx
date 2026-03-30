@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api } from '../api';
 import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView } from '../types/models';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
@@ -10,6 +10,7 @@ import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
 import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
+import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../components/calibration/utils';
 
 type FrameSetTab = 'calibration' | 'analysis';
 
@@ -60,6 +61,9 @@ export default function FrameSetDetail() {
   // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
   const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
 
+  // Analysis data for SNR display in tree
+  const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
+
   // Reactive blackhole state — derives file IDs from hierarchy, fetches status, listens for events
   const allFileIds = useMemo(() => {
     if (!calibrationHierarchy) return [];
@@ -73,10 +77,56 @@ export default function FrameSetDetail() {
   }, [calibrationHierarchy]);
   const { blackholedFileIds } = useBlackholeEvents(allFileIds);
 
-  // Load both detail and calibration data on mount and when navigating back
+  // Compute stacked SNR per filter group for calibration tab tree: dB→linear, sqrt(sum(linear²)), back to dB
+  const calibrationFilterSnrMap = useMemo(() => {
+    if (!calibrationHierarchy || analysisData.size === 0) return undefined;
+    const dateTree = buildCameraFilterTree(calibrationHierarchy);
+    const mergedTree = buildMergedCameraFilterTree(calibrationHierarchy);
+    const map = new Map<string, number>();
+    for (const tree of [dateTree, mergedTree]) {
+      for (const [key, frames] of tree.framesByKey) {
+        if (map.has(key)) continue;
+        let sumSq = 0;
+        let count = 0;
+        for (const f of frames) {
+          if (blackholedFileIds.has(f.file_id)) continue;
+          const a = analysisData.get(f.frame_id);
+          if (a) {
+            const linear = Math.pow(10, a.frame_snr / 20);
+            sumSq += linear * linear;
+            count++;
+          }
+        }
+        if (count > 0) {
+          const stackedLinear = Math.sqrt(sumSq);
+          map.set(key, 20 * Math.log10(stackedLinear));
+        }
+      }
+    }
+    return map.size > 0 ? map : undefined;
+  }, [calibrationHierarchy, analysisData, blackholedFileIds]);
+
+  // Load data on mount and when navigating back
   useEffect(() => {
     loadData();
   }, [id, location.key]);
+
+  // Refresh analysis data when analysis completes
+  useEffect(() => {
+    if (!id) return;
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      unlisten = await api.listen('analysis-complete', async () => {
+        try {
+          const results = await api.invoke<FrameAnalysis[]>('get_analysis_for_frame_set', { frameSetId: parseInt(id) });
+          const aMap = new Map<number, FrameAnalysis>();
+          for (const a of results) aMap.set(a.frame_id, a);
+          setAnalysisData(aMap);
+        } catch { /* ignore */ }
+      });
+    })();
+    return () => { unlisten?.(); };
+  }, [id]);
 
   const loadData = async () => {
     if (!id) return;
@@ -86,18 +136,24 @@ export default function FrameSetDetail() {
       setLoadingCalibration(true);
       setError(null);
 
-      // Load both in parallel
-      const [detailResult, hierarchyResult] = await Promise.all([
+      // Load all in parallel
+      const [detailResult, hierarchyResult, analysisResult] = await Promise.all([
         api.invoke<FrameSetDetail>('get_frame_set_detail', {
           framesSetId: parseInt(id),
         }),
         api.invoke<CalibrationHierarchyView>('get_calibration_hierarchy_for_frame_set', {
           frameSetId: parseInt(id),
         }),
+        api.invoke<FrameAnalysis[]>('get_analysis_for_frame_set', {
+          frameSetId: parseInt(id),
+        }).catch(() => [] as FrameAnalysis[]),
       ]);
 
       setDetail(detailResult);
       setCalibrationHierarchy(hierarchyResult);
+      const aMap = new Map<number, FrameAnalysis>();
+      for (const a of analysisResult) aMap.set(a.frame_id, a);
+      setAnalysisData(aMap);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -441,6 +497,7 @@ export default function FrameSetDetail() {
                 <CalibrationHierarchyViewComponent
                   data={calibrationHierarchy}
                   blackholedFileIds={blackholedFileIds}
+                  filterSnrMap={calibrationFilterSnrMap}
                   onRefresh={refreshCalibrationHierarchy}
                   onSplit={handleOpenSplitDialog}
                   onCreateCustomSet={handleOpenCreateDialog}

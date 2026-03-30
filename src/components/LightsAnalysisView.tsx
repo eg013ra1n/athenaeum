@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Play, Trash2, BarChart3, Download, Check, LineChart, X, Scissors, Plus, Calendar, Camera, RotateCcw } from 'lucide-react';
+import { Play, Trash2, BarChart3, Download, Check, LineChart, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -53,6 +53,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   const [blackholing, setBlackholing] = useState(false);
   const [thresholds, setThresholds] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
   const [defaultThresholds, setDefaultThresholds] = useState<RejectionThresholds | null>(null);
+  const [rejectActive, setRejectActive] = useState(true);
 
   // Analysis state — uses global context for queue/progress
   const { enqueueAnalysis, isAnalyzing, cancelAnalysis, activeAnalyses } = useAnalysisProgressContext();
@@ -83,6 +84,31 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     () => allFramesRaw.filter(f => blackholedFileIds.has(f.file_id)),
     [allFramesRaw, blackholedFileIds]
   );
+
+  // Compute stacked SNR per filter group: convert dB→linear, sqrt(sum(linear²)), back to dB
+  const filterSnrMap = useMemo(() => {
+    if (analysisData.size === 0) return undefined;
+    const map = new Map<string, number>();
+    const allKeys = viewMode === 'by-night' ? dateTree.framesByKey : mergedTree.framesByKey;
+    for (const [key, frames] of allKeys) {
+      let sumSq = 0;
+      let count = 0;
+      for (const f of frames) {
+        if (blackholedFileIds.has(f.file_id)) continue;
+        const a = analysisData.get(f.frame_id);
+        if (a) {
+          const linear = Math.pow(10, a.frame_snr / 20);
+          sumSq += linear * linear;
+          count++;
+        }
+      }
+      if (count > 0) {
+        const stackedLinear = Math.sqrt(sumSq);
+        map.set(key, 20 * Math.log10(stackedLinear));
+      }
+    }
+    return map.size > 0 ? map : undefined;
+  }, [analysisData, viewMode, dateTree.framesByKey, mergedTree.framesByKey, blackholedFileIds]);
 
   // Load existing analysis data on mount
   useEffect(() => {
@@ -136,9 +162,35 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     }
   }, [currentAnalysis?.isComplete, loadAnalysisData]);
 
+  // Plate scale from first frame with optics data (arcsec/pixel)
+  const plateScale = useMemo(() => {
+    for (const f of allFrames) {
+      if (f.focallen && f.xpixsz) {
+        return (f.xpixsz / f.focallen) * 206.265;
+      }
+    }
+    return null;
+  }, [allFrames]);
+
+  // Compute auto FWHM threshold: median × 1.8, in current units
+  const computeAutoFwhm = useCallback((): string => {
+    if (analysisData.size === 0) return '';
+    const fwhmValues: number[] = [];
+    for (const f of allFrames) {
+      const a = analysisData.get(f.frame_id);
+      if (a) fwhmValues.push(a.median_fwhm);
+    }
+    if (fwhmValues.length === 0) return '';
+    fwhmValues.sort((a, b) => a - b);
+    const median = fwhmValues[Math.floor(fwhmValues.length / 2)];
+    let value = median * 1.8;
+    if (useArcsec && plateScale) value *= plateScale;
+    return value.toFixed(2);
+  }, [analysisData, allFrames, useArcsec, plateScale]);
+
   const handleClearThresholds = useCallback(() => {
-    setThresholds(EMPTY_THRESHOLDS);
-  }, []);
+    setThresholds({ ...EMPTY_THRESHOLDS, fwhm: computeAutoFwhm() });
+  }, [computeAutoFwhm]);
 
   const handleLoadDefaults = useCallback(() => {
     if (defaultThresholds) setThresholds(defaultThresholds);
@@ -163,15 +215,29 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     return frames.filter(f => !blackholedFileIds.has(f.file_id));
   }, [checkedKeys, allFrames, framesByKey, blackholedFileIds]);
 
-  // Plate scale from first frame with optics data (arcsec/pixel)
-  const plateScale = useMemo(() => {
-    for (const f of allFrames) {
-      if (f.focallen && f.xpixsz) {
-        return (f.xpixsz / f.focallen) * 206.265;
+  const toggleUnits = useCallback(() => {
+    setUseArcsec(prev => {
+      const next = !prev;
+      if (plateScale) {
+        setThresholds(t => {
+          const val = parseFloat(t.fwhm);
+          if (isNaN(val)) return t;
+          const converted = next ? val * plateScale : val / plateScale;
+          return { ...t, fwhm: converted.toFixed(2) };
+        });
       }
-    }
-    return null;
-  }, [allFrames]);
+      return next;
+    });
+  }, [plateScale]);
+
+  // Auto-fill FWHM rejection with median×1.8 when analysis data loads and field is empty
+  useEffect(() => {
+    if (analysisData.size === 0) return;
+    setThresholds(prev => {
+      if (prev.fwhm !== '') return prev;
+      return { ...prev, fwhm: computeAutoFwhm() };
+    });
+  }, [analysisData, computeAutoFwhm]);
 
   // Count of frames in checked filter groups (for the action bar)
   const checkedFrameCount = useMemo(() => {
@@ -230,29 +296,18 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     return rejected;
   }, [thresholds, displayedFrames, analysisData, useArcsec, plateScale]);
 
-  // Auto-select rejected frames when thresholds change
+  // Auto-select rejected frames when thresholds change (only if reject mode is active)
   useEffect(() => {
-    setSelectedFrameIds(rejectedFrameIds);
-  }, [rejectedFrameIds]);
+    if (rejectActive) {
+      setSelectedFrameIds(rejectedFrameIds);
+    }
+  }, [rejectedFrameIds, rejectActive]);
 
   // Clear table selection when tree filter changes
   const handleCheckedChange = useCallback((keys: Set<string>) => {
     setCheckedKeys(keys);
     setSelectedFrameIds(new Set());
   }, []);
-
-  const handleBlackhole = useCallback((fileId: number) => {
-    // Deselect the blackholed frame; state update happens via event
-    setSelectedFrameIds(prev => {
-      const frame = allFrames.find(f => f.file_id === fileId);
-      if (frame) {
-        const next = new Set(prev);
-        next.delete(frame.frame_id);
-        return next;
-      }
-      return prev;
-    });
-  }, [allFrames]);
 
   const handleBlinkSelected = useCallback(() => {
     if (selectedFrameIds.size === 0) return;
@@ -419,6 +474,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                 onCheckedChange={handleCheckedChange}
                 className="flex-1 min-h-0"
                 checkedLabel={label}
+                filterSnrMap={filterSnrMap}
                 footer={treeFooter}
               />
             ) : (
@@ -428,6 +484,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                 onCheckedChange={handleCheckedChange}
                 className="flex-1 min-h-0"
                 checkedLabel={label}
+                filterSnrMap={filterSnrMap}
                 footer={treeFooter}
               />
             );
@@ -444,13 +501,13 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                 <button
                   onClick={() => handleAnalyzeAll(false)}
                   disabled={analyzing}
-                  className="h-7 inline-flex items-center gap-1.5 px-3 text-xs font-medium bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+                  className="w-20 h-7 inline-flex items-center justify-center gap-1.5 text-xs font-medium bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
                 >
                   <BarChart3 size={12} />
                   {analyzing ? 'Analyzing...' : 'Analyze'}
                 </button>
                 <span className="text-[10px] text-content-muted leading-tight">
-                  {analyzedCount > 0 ? `${analyzedCount}/${totalLightFrames}` : 'analyze'}
+                  {analyzedCount > 0 ? `${analyzedCount}/${totalLightFrames}` : 'Analyze'}
                 </span>
               </div>
             ) : (
@@ -458,12 +515,12 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                 <button
                   onClick={() => handleAnalyzeAll(true)}
                   disabled={analyzing}
-                  className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-success/20 hover:bg-success/30 text-success rounded-lg border border-success/30 transition-colors disabled:opacity-30 disabled:cursor-default"
+                  className="w-20 h-7 inline-flex items-center justify-center text-xs font-medium bg-success/20 hover:bg-success/30 text-success rounded-lg border border-success/30 transition-colors disabled:opacity-30 disabled:cursor-default"
                   title="Re-analyze all frames"
                 >
                   <BarChart3 size={12} />
                 </button>
-                <span className="text-[10px] text-content-muted leading-tight">re-analyze</span>
+                <span className="text-[10px] text-content-muted leading-tight">Re-Analyze</span>
               </div>
             )}
 
@@ -473,7 +530,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
             {plateScale && (
               <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
                 <button
-                  onClick={() => setUseArcsec(prev => !prev)}
+                  onClick={toggleUnits}
                   className={`w-10 h-7 text-xs font-medium rounded-lg border transition-colors ${
                     useArcsec
                       ? 'bg-accent/20 border-accent text-accent'
@@ -483,26 +540,37 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                 >
                   {useArcsec ? '"' : 'px'}
                 </button>
-                <span className="text-[10px] text-content-muted leading-tight">units</span>
+                <span className="text-[10px] text-content-muted leading-tight">Units</span>
               </div>
             )}
 
-            {/* Selection actions — always visible, disabled when nothing selected */}
+            {/* Selection: clear + invert split button */}
             <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-              <div className="h-7 inline-flex items-center gap-1">
-                <span className={`text-xs font-medium ${hasSelection ? 'text-content' : 'text-content-muted/30'}`}>
-                  {hasSelection ? selectedFrameIds.size : 0}
-                </span>
+              <div className="flex h-7">
                 <button
                   onClick={() => setSelectedFrameIds(new Set())}
                   disabled={!hasSelection}
-                  className="inline-flex items-center p-1 text-content-muted hover:text-content rounded transition-colors disabled:opacity-30 disabled:cursor-default"
+                  className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-l-lg border border-r-0 border-border transition-colors disabled:opacity-30 disabled:cursor-default"
                   title="Clear selection"
                 >
-                  <RotateCcw size={10} />
+                  {hasSelection ? selectedFrameIds.size : 0}
+                </button>
+                <button
+                  onClick={() => {
+                    const all = new Set(displayedFrames.map(f => f.frame_id));
+                    const inverted = new Set<number>();
+                    for (const id of all) {
+                      if (!selectedFrameIds.has(id)) inverted.add(id);
+                    }
+                    setSelectedFrameIds(inverted);
+                  }}
+                  className="w-7 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-r-lg border border-border transition-colors"
+                  title="Invert selection"
+                >
+                  <ArrowLeftRight size={10} />
                 </button>
               </div>
-              <span className="text-[10px] text-content-muted leading-tight">selected</span>
+              <span className="text-[10px] text-content-muted leading-tight">Selection</span>
             </div>
             <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
               <button
@@ -513,7 +581,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               >
                 <Play size={12} />
               </button>
-              <span className="text-[10px] text-content-muted leading-tight">blink</span>
+              <span className="text-[10px] text-content-muted leading-tight">Blink</span>
             </div>
             <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
               <button
@@ -524,7 +592,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               >
                 <Trash2 size={12} />
               </button>
-              <span className="text-[10px] text-content-muted leading-tight">blackhole</span>
+              <span className="text-[10px] text-content-muted leading-tight">Blackhole</span>
             </div>
 
             <span className="text-border h-7 flex items-center">|</span>
@@ -537,6 +605,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               onLoadDefaults={handleLoadDefaults}
               hasDefaults={defaultThresholds !== null}
               useArcsec={useArcsec && !!plateScale}
+              rejectActive={rejectActive}
+              onToggleReject={() => setRejectActive(prev => !prev)}
             />
 
             <span className="text-border h-7 flex items-center">|</span>
@@ -551,7 +621,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               >
                 <Download size={12} />
               </button>
-              <span className="text-[10px] text-content-muted leading-tight">csv</span>
+              <span className="text-[10px] text-content-muted leading-tight">CSV</span>
             </div>
             <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
               <button
@@ -562,7 +632,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               >
                 <LineChart size={12} />
               </button>
-              <span className="text-[10px] text-content-muted leading-tight">charts</span>
+              <span className="text-[10px] text-content-muted leading-tight">Charts</span>
             </div>
           </div>
 
@@ -578,7 +648,6 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               frames={displayedFrames}
               selectedFrameIds={selectedFrameIds}
               onSelectionChange={setSelectedFrameIds}
-              onBlackhole={handleBlackhole}
               analysisData={analysisData}
               rejectedFrameIds={rejectedFrameIds}
               plateScale={useArcsec ? plateScale : null}

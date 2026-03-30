@@ -26,7 +26,7 @@ export const THRESHOLD_FIELDS: ThresholdFieldDef[] = [
 
 export const EMPTY_THRESHOLDS: RejectionThresholds = {
   fwhm: '',
-  eccentricity: '0.8',
+  eccentricity: '0.7',
   frame_snr: '',
   snr_weight: '',
   trail: '',
@@ -40,6 +40,9 @@ interface RejectionThresholdBarProps {
   hasDefaults?: boolean;
   /** When true, FWHM label/placeholder shows arcsec instead of px */
   useArcsec?: boolean;
+  /** When true, rejection auto-selects frames; when false, only highlights */
+  rejectActive?: boolean;
+  onToggleReject?: () => void;
 }
 
 function stepValue(
@@ -65,6 +68,8 @@ export function RejectionThresholdBar({
   onChange,
   onClear,
   useArcsec,
+  rejectActive = true,
+  onToggleReject,
 }: RejectionThresholdBarProps) {
   const handleChange = (field: keyof RejectionThresholds, value: string) => {
     onChange({ ...thresholds, [field]: value });
@@ -73,19 +78,18 @@ export function RejectionThresholdBar({
   return (
     <div className="flex items-start gap-2 flex-wrap">
       <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-        <div className="flex items-center gap-1 h-7">
-          <span className="text-[10px] font-medium text-content-muted uppercase tracking-wide">Reject</span>
-          {onClear && (
-            <button
-              type="button"
-              onClick={onClear}
-              className="flex items-center justify-center w-4 h-4 text-content-muted hover:text-content transition-colors"
-              title="Reset rejection thresholds"
-            >
-              <RotateCw size={10} />
-            </button>
-          )}
-        </div>
+        <button
+          onClick={onToggleReject}
+          className={`h-7 px-2 text-[10px] font-medium uppercase tracking-wide rounded-lg border transition-colors ${
+            rejectActive
+              ? 'bg-error/20 border-error/30 text-error'
+              : 'bg-surface-hover border-border text-content-muted hover:text-content-secondary'
+          }`}
+          title={rejectActive ? 'Rejection active: auto-selects rejected frames' : 'Rejection inactive: only highlights rejected frames'}
+        >
+          Reject
+        </button>
+        <span className="text-[10px] text-content-muted leading-tight">{rejectActive ? 'Select' : 'Highlight'}</span>
       </div>
       {THRESHOLD_FIELDS.map((rawField) => {
         const field = (useArcsec && rawField.key === 'fwhm')
@@ -151,6 +155,19 @@ export function RejectionThresholdBar({
         </label>
         <span className="text-[10px] text-content-muted leading-tight">Trailed</span>
       </div>
+      {onClear && (
+        <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+          <button
+            type="button"
+            onClick={onClear}
+            className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-lg border border-border transition-colors"
+            title="Reset rejection thresholds"
+          >
+            <RotateCw size={12} />
+          </button>
+          <span className="text-[10px] text-content-muted leading-tight">Reset</span>
+        </div>
+      )}
     </div>
   );
 }

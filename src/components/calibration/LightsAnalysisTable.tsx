@@ -1,7 +1,6 @@
 import { useState, useMemo, useCallback } from 'react';
-import { FolderOpen, Trash2, AlertTriangle } from 'lucide-react';
+import { FolderOpen, AlertTriangle } from 'lucide-react';
 import { revealItemInDir } from '../../api/desktop';
-import { api } from '../../api';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
 type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
@@ -19,7 +18,6 @@ interface LightsAnalysisTableProps {
   frames: EnrichedLightFrame[];
   selectedFrameIds: Set<number>;
   onSelectionChange: (selectedIds: Set<number>) => void;
-  onBlackhole?: (fileId: number) => void;
   /** Analysis data keyed by frame_id */
   analysisData?: Map<number, FrameAnalysis>;
   /** Frame IDs that are below rejection thresholds */
@@ -97,7 +95,6 @@ export function LightsAnalysisTable({
   frames,
   selectedFrameIds,
   onSelectionChange,
-  onBlackhole,
   analysisData,
   rejectedFrameIds,
   plateScale,
@@ -122,16 +119,6 @@ export function LightsAnalysisTable({
       console.error('Failed to reveal:', err);
     }
   }, []);
-
-  const handleBlackhole = useCallback(async (e: React.MouseEvent, fileId: number) => {
-    e.stopPropagation();
-    try {
-      await api.invoke('move_to_black_hole', { fileId, fromWhere: 'frame_set_detail' });
-      onBlackhole?.(fileId);
-    } catch (err) {
-      console.error('Failed to move to black hole:', err);
-    }
-  }, [onBlackhole]);
 
   const toggleFrame = useCallback((frameId: number) => {
     const next = new Set(selectedFrameIds);
@@ -319,8 +306,8 @@ export function LightsAnalysisTable({
                 <SortableHeader field="beta" label={`Moffat \u03B2`} currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
               </th>
             )}
-            <th scope="col" className="w-20 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
-              Actions
+            <th scope="col" className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
+              Locate
             </th>
           </tr>
         </thead>
@@ -405,23 +392,14 @@ export function LightsAnalysisTable({
                     {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '-'}
                   </td>
                 )}
-                <td className="w-20 px-1.5 py-1 text-center">
-                  <div className="flex items-center justify-center gap-1">
-                    <button
-                      onClick={e => handleReveal(e, frame.file_path)}
-                      className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"
-                      title="Reveal in file explorer"
-                    >
-                      <FolderOpen size={14} />
-                    </button>
-                    <button
-                      onClick={e => handleBlackhole(e, frame.file_id)}
-                      className="inline-flex items-center p-1 text-content-muted hover:text-error bg-surface-hover hover:bg-surface-hover rounded transition-colors"
-                      title="Move to Black Hole"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
+                <td className="w-12 px-1.5 py-1 text-center">
+                  <button
+                    onClick={e => handleReveal(e, frame.file_path)}
+                    className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"
+                    title="Reveal in file explorer"
+                  >
+                    <FolderOpen size={14} />
+                  </button>
                 </td>
               </tr>
             );
