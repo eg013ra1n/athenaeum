@@ -7,6 +7,8 @@ export interface BlinkViewerProps {
   onClose: () => void;
   /** Context for actions - 'light' or 'calibration' */
   sourceType?: 'light' | 'calibration';
+  /** Frame set ID — used to load analysis data for the frame list */
+  frameSetId?: number;
   /** Callback when frames are removed (sent to blackhole) */
   onFramesRemoved?: (frameIds: number[]) => void;
 }
@@ -46,9 +48,16 @@ export interface ToolBarProps {
   cacheProgress: { current: number; total: number };
   cacheStats: { elapsedMs: number; frameCount: number } | null;
 
+  // Help overlay
+  showHelp: boolean;
+  onToggleHelp: () => void;
+
   // Close
   onClose: () => void;
 }
+
+export type SortField = 'time' | 'filter' | 'exptime' | 'fwhm' | 'eccentricity' | 'frame_snr';
+export type SortDirection = 'asc' | 'desc';
 
 /** Props for the FrameList component */
 export interface FrameListProps {
@@ -57,10 +66,15 @@ export interface FrameListProps {
   selectedFrames: Set<number>;
   blackholedFileIds: Set<number>;
   loadingIndices: Set<number>;
+  analysisMap: Map<number, FrameAnalysis>;
+  sortField: SortField;
+  sortDirection: SortDirection;
+  onSortChange: (field: SortField) => void;
   onFrameClick: (index: number, e: React.MouseEvent) => void;
   onCheckboxClick: (index: number, e: React.MouseEvent) => void;
   onSelectAll: () => void;
   onClearSelection: () => void;
+  onInvertSelection: () => void;
 }
 
 /** Props for the FrameInfoPanel component */

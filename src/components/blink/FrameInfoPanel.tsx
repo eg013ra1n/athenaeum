@@ -1,70 +1,69 @@
-import React, { memo } from "react";
+import React, { memo, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import type { FrameInfoPanelProps } from "./types";
 
-/** Format date for display */
 function formatDate(dateStr: string | null | undefined): string {
   if (!dateStr) return "-";
   try {
     const date = new Date(dateStr);
-    return date.toLocaleDateString() + " " + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  } catch {
-    return dateStr;
-  }
+    return date.toLocaleDateString() + " " + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch { return dateStr; }
 }
 
-/** Format temperature for display */
 function formatTemp(temp: number | null | undefined): string {
   if (temp === null || temp === undefined) return "-";
   return `${temp.toFixed(1)}°C`;
 }
 
-/** Info row with label and value */
 const InfoRow: React.FC<{ label: string; value: string | React.ReactNode }> = ({ label, value }) => (
-  <div className="flex justify-between text-xs py-0.5">
+  <div className="flex justify-between text-xs py-1 border-b border-border/30 last:border-b-0">
     <span className="text-content-muted">{label}</span>
     <span className="text-content-secondary font-medium">{value}</span>
   </div>
 );
 
-/** Right sidebar panel showing FITS header info and analysis metrics */
+type Tab = 'metrics' | 'header';
+
 export const FrameInfoPanel: React.FC<FrameInfoPanelProps> = memo(function FrameInfoPanel({
   currentFrame,
   metrics,
 }) {
+  const [activeTab, setActiveTab] = useState<Tab>('metrics');
+
+  const plateScale = (currentFrame?.frame?.focallen && currentFrame?.frame?.xpixsz)
+    ? (currentFrame.frame.xpixsz / currentFrame.frame.focallen) * 206.265
+    : null;
+
   return (
-    <div className="border-t border-border px-3 py-2 overflow-y-auto flex-shrink-0" style={{ maxHeight: '45%' }}>
-      {/* FITS Header section */}
-      <h4 className="text-xs font-semibold text-content-muted uppercase tracking-wider mb-1">Frame Info</h4>
-      <div className="space-y-0">
-        <InfoRow label="File" value={currentFrame?.file.filename || "-"} />
-        <InfoRow label="Date" value={formatDate(currentFrame?.frame?.date_obs)} />
-        {currentFrame?.frame?.telescop && (
-          <InfoRow label="Telescope" value={currentFrame.frame.telescop} />
-        )}
-        {currentFrame?.frame?.instrume && (
-          <InfoRow label="Camera" value={currentFrame.frame.instrume} />
-        )}
-        <InfoRow label="Gain" value={currentFrame?.frame?.gain?.toString() ?? "-"} />
-        <InfoRow label="Offset" value={currentFrame?.frame?.offset?.toString() ?? "-"} />
-        <InfoRow label="Temp" value={formatTemp(currentFrame?.frame?.ccd_temp)} />
-        {currentFrame?.frame?.filter && (
-          <InfoRow label="Filter" value={currentFrame.frame.filter} />
-        )}
-        {currentFrame?.frame?.exptime && (
-          <InfoRow label="Exposure" value={`${currentFrame.frame.exptime}s`} />
-        )}
+    <div className="border-t border-border flex flex-col flex-shrink-0" style={{ maxHeight: '45%' }}>
+      {/* Tab bar */}
+      <div className="flex border-b border-border/50 bg-surface">
+        <button
+          onClick={() => setActiveTab('metrics')}
+          className={`flex-1 px-3 py-1.5 text-xs font-medium tracking-wide transition-colors ${
+            activeTab === 'metrics'
+              ? 'text-accent border-b-2 border-accent -mb-px'
+              : 'text-content-muted hover:text-content-secondary'
+          }`}
+        >
+          Metrics
+        </button>
+        <button
+          onClick={() => setActiveTab('header')}
+          className={`flex-1 px-3 py-1.5 text-xs font-medium tracking-wide transition-colors ${
+            activeTab === 'header'
+              ? 'text-accent border-b-2 border-accent -mb-px'
+              : 'text-content-muted hover:text-content-secondary'
+          }`}
+        >
+          Header
+        </button>
       </div>
 
-      {/* Analysis Metrics section */}
-      {metrics && (() => {
-        const plateScale = (currentFrame?.frame?.focallen && currentFrame?.frame?.xpixsz)
-          ? (currentFrame.frame.xpixsz / currentFrame.frame.focallen) * 206.265
-          : null;
-
-        return (
-          <>
-            <h4 className="text-xs font-semibold text-content-muted uppercase tracking-wider mt-3 mb-1">Analysis</h4>
+      {/* Tab content */}
+      <div className="px-3 py-1.5 overflow-y-auto">
+        {activeTab === 'metrics' ? (
+          metrics ? (
             <div className="space-y-0">
               <InfoRow label="Stars" value={metrics.stars_detected.toString()} />
               <InfoRow label="FWHM (px)" value={metrics.median_fwhm.toFixed(2)} />
@@ -72,7 +71,6 @@ export const FrameInfoPanel: React.FC<FrameInfoPanelProps> = memo(function Frame
                 <InfoRow label={'FWHM (")'} value={(metrics.median_fwhm * plateScale).toFixed(2)} />
               )}
               <InfoRow label="Eccentricity" value={metrics.median_eccentricity.toFixed(3)} />
-              <InfoRow label="SNR" value={metrics.median_snr.toFixed(1)} />
               <InfoRow label="HFR (px)" value={metrics.median_hfr.toFixed(2)} />
               {plateScale && (
                 <InfoRow label={'HFR (")'} value={(metrics.median_hfr * plateScale).toFixed(2)} />
@@ -97,12 +95,34 @@ export const FrameInfoPanel: React.FC<FrameInfoPanelProps> = memo(function Frame
                 }
               />
               {metrics.median_beta != null && (
-                <InfoRow label="Moffat \u03B2" value={metrics.median_beta.toFixed(2)} />
+                <InfoRow label="Moffat β" value={metrics.median_beta.toFixed(2)} />
               )}
             </div>
-          </>
-        );
-      })()}
+          ) : (
+            <p className="text-xs text-content-muted py-2">No analysis data</p>
+          )
+        ) : (
+          <div className="space-y-0">
+            <InfoRow label="File" value={currentFrame?.file.filename || "-"} />
+            <InfoRow label="Date" value={formatDate(currentFrame?.frame?.date_obs)} />
+            {currentFrame?.frame?.telescop && (
+              <InfoRow label="Telescope" value={currentFrame.frame.telescop} />
+            )}
+            {currentFrame?.frame?.instrume && (
+              <InfoRow label="Camera" value={currentFrame.frame.instrume} />
+            )}
+            <InfoRow label="Gain" value={currentFrame?.frame?.gain?.toString() ?? "-"} />
+            <InfoRow label="Offset" value={currentFrame?.frame?.offset?.toString() ?? "-"} />
+            <InfoRow label="Temp" value={formatTemp(currentFrame?.frame?.ccd_temp)} />
+            {currentFrame?.frame?.filter && (
+              <InfoRow label="Filter" value={currentFrame.frame.filter} />
+            )}
+            {currentFrame?.frame?.exptime != null && (
+              <InfoRow label="Exposure" value={`${currentFrame.frame.exptime}s`} />
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 });

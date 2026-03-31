@@ -9,6 +9,7 @@ import {
   RotateCcw,
   Star,
   ScanEye,
+  Info,
 } from "lucide-react";
 import type { ToolBarProps } from "./types";
 
@@ -33,6 +34,8 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   fullResMode,
   loadingFullRes,
   onToggleFullRes,
+  showHelp,
+  onToggleHelp,
   isCaching,
   cacheProgress,
   cacheStats,
@@ -168,14 +171,22 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           </>
         )}
 
-        <div className="text-xs text-content-muted mr-2">
-          Space: Select | Enter: Play | ↑↓: Navigate | ←→: Speed | A: Stars | +/-: Zoom | 0: Reset
-        </div>
+        <button
+          onClick={onToggleHelp}
+          className={`p-2 rounded transition-colors ${
+            showHelp
+              ? "bg-accent text-surface"
+              : "bg-surface-elevated text-content hover:bg-surface-hover"
+          }`}
+          title="Toggle keyboard shortcuts"
+        >
+          <Info size={20} />
+        </button>
         <button
           onClick={onClose}
-          className="px-2 py-1 text-sm text-content-muted hover:text-content hover:bg-surface-elevated rounded transition-colors"
+          className="px-3 py-2 text-sm font-medium text-content rounded bg-surface-elevated hover:bg-surface-hover transition-colors"
         >
-          [Close]
+          Close
         </button>
       </div>
     </div>

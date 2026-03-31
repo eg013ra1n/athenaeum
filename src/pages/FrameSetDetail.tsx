@@ -634,6 +634,7 @@ export default function FrameSetDetail() {
           initialIndex={0}
           onClose={() => setBlinkFrames(null)}
           sourceType="light"
+          frameSetId={id ? parseInt(id) : undefined}
           onFramesRemoved={() => {
             // Refresh calibration hierarchy when frames are blackholed
             refreshCalibrationHierarchy();

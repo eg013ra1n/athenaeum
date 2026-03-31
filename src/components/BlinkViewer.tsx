@@ -7,7 +7,7 @@ import {
   Trash2,
   AlertTriangle,
 } from "lucide-react";
-import type { FileWithFrame } from "../types/models";
+import type { FrameAnalysis } from "../types/models";
 import type { AnnotationSettings } from "../types/analysis-config";
 import { DEFAULT_ANNOTATION_SETTINGS } from "../types/analysis-config";
 import { ToolBar, FrameList, FrameInfoPanel } from "./blink";
@@ -15,21 +15,14 @@ import { useBlinkCache } from "../hooks/useBlinkCache";
 import { useStarMetricsCache } from "../hooks/useStarMetricsCache";
 import { drawStarOverlay } from "./blink/StarOverlay";
 
-interface BlinkViewerProps {
-  frames: FileWithFrame[];
-  initialIndex?: number;
-  onClose: () => void;
-  /** Context for actions - 'light' or 'calibration' */
-  sourceType?: 'light' | 'calibration';
-  /** Callback when frames are removed (sent to blackhole) */
-  onFramesRemoved?: (frameIds: number[]) => void;
-}
+import type { BlinkViewerProps, SortField, SortDirection } from "./blink/types";
 
 const BlinkViewer: React.FC<BlinkViewerProps> = ({
   frames,
   initialIndex = 0,
   onClose,
   sourceType = 'light',
+  frameSetId,
   onFramesRemoved,
 }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
@@ -57,12 +50,36 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [showAnnotations, setShowAnnotations] = useState(false);
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
   const [fullResMode, setFullResMode] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const [loadingFullRes, setLoadingFullRes] = useState(false);
   const fullResBlobRef = useRef<string | null>(null);
   const showAnnotationsRef = useRef(showAnnotations);
   const annotationSettingsRef = useRef(annotationSettings);
   showAnnotationsRef.current = showAnnotations;
   annotationSettingsRef.current = annotationSettings;
+
+  // Resizable sidebar (stored in pixels, clamped on render)
+  const [sidebarWidth, setSidebarWidth] = useState(320);
+  const isDraggingDivider = useRef(false);
+
+  // Load persisted sidebar width
+  useEffect(() => {
+    (async () => {
+      try {
+        const saved = await api.invoke<string>('get_setting', { key: 'ui.blink_sidebar_px', defaultValue: '320' });
+        const val = parseInt(saved);
+        if (!isNaN(val) && val >= 200 && val <= 800) setSidebarWidth(val);
+      } catch { /* use default */ }
+    })();
+  }, []);
+
+  // Analysis data + sorting
+  const [analysisMap, setAnalysisMap] = useState<Map<number, FrameAnalysis>>(new Map());
+  const [sortField, setSortField] = useState<SortField>('time');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+
+  const sortedIndicesRef = useRef<number[]>([]);
+  const sortedPositionOfRef = useRef<Map<number, number>>(new Map());
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const blinkIntervalRef = useRef<number | null>(null);
@@ -343,7 +360,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       const canvas = canvasRef.current;
       if (!canvas) return;
 
-      const newWidth = window.innerWidth * 0.75;
+      const clampedSidebar = Math.max(200, Math.min(window.innerWidth * 0.4, sidebarWidth));
+      const newWidth = window.innerWidth - clampedSidebar - 4; // 4px for divider
       const newHeight = window.innerHeight - 48;
 
       if (canvas.width !== newWidth || canvas.height !== newHeight) {
@@ -357,13 +375,18 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     updateCanvasSize();
     window.addEventListener("resize", updateCanvasSize);
     return () => window.removeEventListener("resize", updateCanvasSize);
-  }, [renderImage]);
+  }, [renderImage, sidebarWidth]);
 
   // Blink playback
   useEffect(() => {
     if (isPlaying) {
       blinkIntervalRef.current = setInterval(() => {
-        setCurrentIndex((prev) => (prev + 1 >= fitsFrames.length ? 0 : prev + 1));
+        setCurrentIndex((prev) => {
+          const si = sortedIndicesRef.current;
+          const sp = sortedPositionOfRef.current;
+          const pos = sp.get(prev) ?? 0;
+          return pos + 1 >= si.length ? si[0] : si[pos + 1];
+        });
       }, 1000 / blinkSpeed);
     } else if (blinkIntervalRef.current) {
       clearInterval(blinkIntervalRef.current);
@@ -512,12 +535,19 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         case "ArrowUp":
           e.preventDefault();
           setIsPlaying(false);
-          setCurrentIndex((p) => Math.max(0, p - 1));
+          setCurrentIndex((p) => {
+            const pos = sortedPositionOfRef.current.get(p) ?? 0;
+            return pos > 0 ? sortedIndicesRef.current[pos - 1] : p;
+          });
           break;
         case "ArrowDown":
           e.preventDefault();
           setIsPlaying(false);
-          setCurrentIndex((p) => Math.min(fitsFrames.length - 1, p + 1));
+          setCurrentIndex((p) => {
+            const si = sortedIndicesRef.current;
+            const pos = sortedPositionOfRef.current.get(p) ?? 0;
+            return pos < si.length - 1 ? si[pos + 1] : p;
+          });
           break;
         case "ArrowLeft":
           e.preventDefault();
@@ -578,16 +608,90 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     check();
   }, [frames]);
 
+  // Load analysis data on mount
+  useEffect(() => {
+    if (!frameSetId) return;
+    (async () => {
+      try {
+        const results = await api.invoke<FrameAnalysis[]>('get_analysis_for_frame_set', { frameSetId });
+        const map = new Map<number, FrameAnalysis>();
+        for (const a of results) map.set(a.frame_id, a);
+        setAnalysisMap(map);
+      } catch (err) {
+        console.error('Failed to load analysis data:', err);
+      }
+    })();
+  }, [frameSetId]);
+
+  // Sort handler
+  const handleSortChange = useCallback((field: SortField) => {
+    if (field === sortField) {
+      setSortDirection(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortDirection('asc');
+    }
+  }, [sortField]);
+
+  // Sorted indices — shared between FrameList display and blink navigation
+  const sortedIndices = useMemo(() => {
+    const indices = fitsFrames.map((_, i) => i);
+    indices.sort((a, b) => {
+      const fa = fitsFrames[a];
+      const fb = fitsFrames[b];
+      const aa = fa.frame?.id ? analysisMap.get(fa.frame.id) : undefined;
+      const ab = fb.frame?.id ? analysisMap.get(fb.frame.id) : undefined;
+      let cmp = 0;
+      switch (sortField) {
+        case 'time':
+          cmp = (fa.frame?.date_obs ?? '').localeCompare(fb.frame?.date_obs ?? '');
+          break;
+        case 'filter':
+          cmp = (fa.frame?.filter ?? '').localeCompare(fb.frame?.filter ?? '');
+          break;
+        case 'exptime':
+          cmp = (fa.frame?.exptime ?? 0) - (fb.frame?.exptime ?? 0);
+          break;
+        case 'fwhm':
+          cmp = (aa?.median_fwhm ?? Infinity) - (ab?.median_fwhm ?? Infinity);
+          break;
+        case 'eccentricity':
+          cmp = (aa?.median_eccentricity ?? Infinity) - (ab?.median_eccentricity ?? Infinity);
+          break;
+        case 'frame_snr':
+          cmp = (aa?.frame_snr ?? -Infinity) - (ab?.frame_snr ?? -Infinity);
+          break;
+      }
+      return sortDirection === 'asc' ? cmp : -cmp;
+    });
+    return indices;
+  }, [fitsFrames, analysisMap, sortField, sortDirection]);
+
+  // Map from original index to position in sorted order
+  const sortedPositionOf = useMemo(() => {
+    const map = new Map<number, number>();
+    sortedIndices.forEach((origIdx, sortPos) => map.set(origIdx, sortPos));
+    return map;
+  }, [sortedIndices]);
+  sortedIndicesRef.current = sortedIndices;
+  sortedPositionOfRef.current = sortedPositionOf;
+
   // Handlers
   const handlePrevious = useCallback(() => {
     setIsPlaying(false);
-    setCurrentIndex((p) => Math.max(0, p - 1));
-  }, []);
+    setCurrentIndex((p) => {
+      const pos = sortedPositionOf.get(p) ?? 0;
+      return pos > 0 ? sortedIndices[pos - 1] : p;
+    });
+  }, [sortedIndices, sortedPositionOf]);
 
   const handleNext = useCallback(() => {
     setIsPlaying(false);
-    setCurrentIndex((p) => Math.min(fitsFrames.length - 1, p + 1));
-  }, [fitsFrames.length]);
+    setCurrentIndex((p) => {
+      const pos = sortedPositionOf.get(p) ?? 0;
+      return pos < sortedIndices.length - 1 ? sortedIndices[pos + 1] : p;
+    });
+  }, [sortedIndices, sortedPositionOf]);
 
   const handleTogglePlay = useCallback(() => setIsPlaying((p) => !p), []);
 
@@ -638,6 +742,16 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setSelectedFrames(new Set());
     setLastSelectedIndex(null);
   }, []);
+
+  const handleInvertSelection = useCallback(() => {
+    setSelectedFrames(prev => {
+      const inverted = new Set<number>();
+      for (let i = 0; i < fitsFrames.length; i++) {
+        if (!prev.has(i)) inverted.add(i);
+      }
+      return inverted;
+    });
+  }, [fitsFrames.length]);
 
   // Handle mouse wheel for zoom
   const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
@@ -807,6 +921,8 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         fullResMode={fullResMode}
         loadingFullRes={loadingFullRes}
         onToggleFullRes={handleToggleFullRes}
+        showHelp={showHelp}
+        onToggleHelp={() => setShowHelp(prev => !prev)}
         isCaching={isCaching}
         cacheProgress={cacheProgress}
         cacheStats={cacheStats}
@@ -850,10 +966,55 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               {error}
             </div>
           )}
+          {showHelp && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20 pointer-events-none">
+              <div className="bg-surface/90 backdrop-blur-sm rounded-xl px-8 py-6 text-sm text-content space-y-2 shadow-2xl">
+                <h3 className="text-base font-semibold text-content mb-3">Keyboard Shortcuts</h3>
+                <div className="grid grid-cols-2 gap-x-8 gap-y-1.5 text-xs">
+                  <span className="text-content-muted">Space</span><span>Select / Deselect</span>
+                  <span className="text-content-muted">Enter</span><span>Play / Pause</span>
+                  <span className="text-content-muted">↑ ↓</span><span>Navigate frames</span>
+                  <span className="text-content-muted">← →</span><span>Adjust speed</span>
+                  <span className="text-content-muted">A</span><span>Toggle annotations</span>
+                  <span className="text-content-muted">+ / -</span><span>Zoom in / out</span>
+                  <span className="text-content-muted">0 / Home</span><span>Reset zoom</span>
+                  <span className="text-content-muted">Ctrl+A</span><span>Select all</span>
+                  <span className="text-content-muted">Shift+Click</span><span>Range select</span>
+                  <span className="text-content-muted">Esc</span><span>Close viewer</span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
+        {/* Draggable divider */}
+        <div
+          className="w-1 cursor-col-resize bg-border/50 hover:bg-accent/50 active:bg-accent transition-colors flex-shrink-0"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            isDraggingDivider.current = true;
+            const onMove = (ev: MouseEvent) => {
+              if (!isDraggingDivider.current) return;
+              const px = window.innerWidth - ev.clientX;
+              const clamped = Math.max(200, Math.min(window.innerWidth * 0.4, px));
+              setSidebarWidth(clamped);
+            };
+            const onUp = () => {
+              isDraggingDivider.current = false;
+              document.removeEventListener('mousemove', onMove);
+              document.removeEventListener('mouseup', onUp);
+              setSidebarWidth(prev => {
+                api.invoke('set_setting', { key: 'ui.blink_sidebar_px', value: String(Math.round(prev)) }).catch(() => {});
+                return prev;
+              });
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+          }}
+        />
+
         {/* Right sidebar: Frame list + Info panel */}
-        <div className="w-1/4 bg-surface border-l border-border flex flex-col">
+        <div className="bg-surface flex flex-col flex-shrink-0" style={{ width: `${Math.max(200, Math.min(window.innerWidth * 0.4, sidebarWidth))}px` }}>
           {/* Frame list — takes available space */}
           <div className="flex-1 min-h-0">
             <FrameList
@@ -862,16 +1023,24 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
               selectedFrames={selectedFrames}
               blackholedFileIds={blackholedFileIds}
               loadingIndices={loadingIndices}
+              analysisMap={analysisMap}
+              sortField={sortField}
+              sortDirection={sortDirection}
+              onSortChange={handleSortChange}
               onFrameClick={handleFrameClick}
               onCheckboxClick={handleCheckboxClick}
               onSelectAll={handleSelectAll}
               onClearSelection={handleClearSelection}
+              onInvertSelection={handleInvertSelection}
             />
           </div>
           {/* Info panel — fixed at bottom */}
           <FrameInfoPanel
             currentFrame={currentFrame}
-            metrics={showAnnotations ? (getStarMetrics(currentIndex)?.metrics ?? null) : null}
+            metrics={
+              (showAnnotations ? getStarMetrics(currentIndex)?.metrics : null)
+              ?? (currentFrame?.frame?.id ? analysisMap.get(currentFrame.frame.id) ?? null : null)
+            }
           />
         </div>
       </div>
