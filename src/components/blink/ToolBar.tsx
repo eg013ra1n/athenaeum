@@ -8,6 +8,7 @@ import {
   Trash2,
   RotateCcw,
   Star,
+  ScanEye,
 } from "lucide-react";
 import type { ToolBarProps } from "./types";
 
@@ -29,6 +30,9 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   isBlackholing,
   showAnnotations,
   onToggleAnnotations,
+  fullResMode,
+  loadingFullRes,
+  onToggleFullRes,
   isCaching,
   cacheProgress,
   cacheStats,
@@ -91,6 +95,20 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           title={showAnnotations ? "Hide star annotations (A)" : "Show star annotations (A)"}
         >
           <Star size={20} />
+        </button>
+
+        {/* Full resolution toggle */}
+        <button
+          onClick={onToggleFullRes}
+          disabled={loadingFullRes}
+          className={`p-2 rounded transition-colors ${
+            fullResMode
+              ? "bg-accent text-surface"
+              : "bg-surface-elevated text-content hover:bg-surface-hover"
+          } disabled:opacity-50 disabled:cursor-not-allowed`}
+          title={fullResMode ? "Switch to preview resolution" : "Switch to full resolution"}
+        >
+          {loadingFullRes ? <Loader2 size={20} className="animate-spin" /> : <ScanEye size={20} />}
         </button>
       </div>
 

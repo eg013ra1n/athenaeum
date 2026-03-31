@@ -36,6 +36,11 @@ export interface ToolBarProps {
   showAnnotations: boolean;
   onToggleAnnotations: () => void;
 
+  // Full resolution
+  fullResMode: boolean;
+  loadingFullRes: boolean;
+  onToggleFullRes: () => void;
+
   // Caching
   isCaching: boolean;
   cacheProgress: { current: number; total: number };

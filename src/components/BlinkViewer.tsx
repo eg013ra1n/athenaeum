@@ -56,6 +56,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Annotation state
   const [showAnnotations, setShowAnnotations] = useState(false);
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
+  const [fullResMode, setFullResMode] = useState(false);
+  const [loadingFullRes, setLoadingFullRes] = useState(false);
+  const fullResBlobRef = useRef<string | null>(null);
   const showAnnotationsRef = useRef(showAnnotations);
   const annotationSettingsRef = useRef(annotationSettings);
   showAnnotationsRef.current = showAnnotations;
@@ -309,6 +312,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           URL.revokeObjectURL(value);
         }
       });
+      if (fullResBlobRef.current) URL.revokeObjectURL(fullResBlobRef.current);
     };
   }, []);
 
@@ -322,6 +326,17 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   useEffect(() => {
     renderCanvas();
   }, [showAnnotations, getStarMetrics, annotationSettings, renderCanvas]);
+
+  // Reset full-res mode when navigating to a different frame
+  useEffect(() => {
+    if (fullResMode) {
+      if (fullResBlobRef.current) {
+        URL.revokeObjectURL(fullResBlobRef.current);
+        fullResBlobRef.current = null;
+      }
+      setFullResMode(false);
+    }
+  }, [currentIndex]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const updateCanvasSize = () => {
@@ -374,6 +389,56 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const handleToggleAnnotations = useCallback(() => {
     setShowAnnotations((prev) => !prev);
   }, []);
+
+  // Toggle full-resolution rendering for the current frame
+  const handleToggleFullRes = useCallback(async () => {
+    if (fullResMode) {
+      // Turn off: revert to preview image
+      if (fullResBlobRef.current) {
+        URL.revokeObjectURL(fullResBlobRef.current);
+        fullResBlobRef.current = null;
+      }
+      setFullResMode(false);
+      // Re-render with preview image
+      const previewUrl = loadedImagesRef.current.get(currentIndex);
+      if (previewUrl) renderImage(previewUrl);
+      return;
+    }
+
+    const frame = fitsFrames[currentIndex];
+    if (!frame || loadingFullRes) return;
+
+    setLoadingFullRes(true);
+    try {
+      const imageData = isTauri
+        ? await api.invoke<Uint8Array>("read_fits_image_rustafits", {
+            path: frame.file.path,
+            resolution: "full",
+          })
+        : await api.invoke<Uint8Array>("get_frame_preview", {
+            frameId: frame.file.id,
+            resolution: "full",
+          });
+
+      const binaryData = imageData instanceof Uint8Array
+        ? imageData
+        : new Uint8Array(imageData as number[]);
+
+      // Revoke previous full-res blob if any
+      if (fullResBlobRef.current) URL.revokeObjectURL(fullResBlobRef.current);
+
+      const blob = new Blob([binaryData], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      fullResBlobRef.current = url;
+
+      setFullResMode(true);
+      renderImage(url);
+    } catch (err) {
+      console.error("Failed to load full-res image:", err);
+    } finally {
+      setLoadingFullRes(false);
+    }
+  }, [fullResMode, loadingFullRes, currentIndex, fitsFrames, renderImage]);
 
   // Constrain pan to keep at least 10% of image visible
   const constrainPan = useCallback((newPan: { x: number; y: number }) => {
@@ -739,6 +804,9 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         isBlackholing={isBlackholing}
         showAnnotations={showAnnotations}
         onToggleAnnotations={handleToggleAnnotations}
+        fullResMode={fullResMode}
+        loadingFullRes={loadingFullRes}
+        onToggleFullRes={handleToggleFullRes}
         isCaching={isCaching}
         cacheProgress={cacheProgress}
         cacheStats={cacheStats}
