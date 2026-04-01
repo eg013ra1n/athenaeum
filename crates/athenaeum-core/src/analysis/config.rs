@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-fn default_four() -> u32 { 4 }
+fn default_zero() -> u32 { 0 }
 fn default_measure_cap() -> u32 { 500 }
 fn default_fit_max_iter() -> u32 { 25 }
 fn default_fit_tolerance() -> f64 { 1e-4 }
@@ -31,8 +31,8 @@ pub struct AnalysisConfig {
     pub max_stars: u32,
     /// R² threshold for trail detection. Default: 0.5 (range 0.0-1.0)
     pub trail_threshold: f64,
-    /// MRS wavelet noise estimation layers. Default: 4
-    #[serde(default = "default_four", alias = "mrs_noise")]
+    /// MRS wavelet noise estimation layers. Default: 0 (disabled)
+    #[serde(default = "default_zero", alias = "mrs_noise")]
     pub mrs_layers: u32,
     /// Max stars to PSF-fit. 0 = measure all. Default: 2000
     #[serde(default = "default_measure_cap")]
@@ -61,8 +61,8 @@ impl Default for AnalysisConfig {
             saturation_fraction: 0.95,
             max_stars: 500,
             trail_threshold: 0.5,
-            mrs_layers: 4,
-            measure_cap: 500,
+            mrs_layers: 0,
+            measure_cap: 2000,
             fit_max_iter: 25,
             fit_tolerance: 1e-4,
             fit_max_rejects: 5,
