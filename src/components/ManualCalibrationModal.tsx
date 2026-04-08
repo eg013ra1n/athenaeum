@@ -142,11 +142,19 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     return `${temp.toFixed(1)}°C`;
   };
 
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const fmtDt = (iso: string) => {
+    const d = new Date(iso);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
   const formatDateRange = (range: [string, string] | null | undefined) => {
     if (!range) return 'N/A';
-    const start = range[0].substring(0, 10);
-    const end = range[1].substring(0, 10);
-    return start === end ? start : `${start} - ${end}`;
+    const s = new Date(range[0]);
+    const e = new Date(range[1]);
+    if (s.toDateString() === e.toDateString()) {
+      return `${fmtDt(range[0])} – ${pad(e.getHours())}:${pad(e.getMinutes())}:${pad(e.getSeconds())}`;
+    }
+    return `${fmtDt(range[0])} – ${fmtDt(range[1])}`;
   };
 
   const formatMatchScore = (score: number) => {
@@ -174,6 +182,29 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     const { set, match_score, match_details } = setWithScore;
     const scoreInfo = formatMatchScore(match_score);
 
+    const fmtDateJsx = (iso: string) => {
+      const d = new Date(iso);
+      return <>{d.getFullYear()}-{pad(d.getMonth() + 1)}-<span className="font-bold">{pad(d.getDate())}</span> {pad(d.getHours())}:{pad(d.getMinutes())}:{pad(d.getSeconds())}</>;
+    };
+    const dateRange = (() => {
+      if (!set.date_start) return <>{set.date_display}</>;
+      if (!set.date_end || set.date_start === set.date_end) return fmtDateJsx(set.date_start);
+      const s = new Date(set.date_start);
+      const e = new Date(set.date_end);
+      if (s.toDateString() === e.toDateString()) {
+        return <>{fmtDateJsx(set.date_start)} – {pad(e.getHours())}:{pad(e.getMinutes())}:{pad(e.getSeconds())}</>;
+      }
+      return <>{fmtDateJsx(set.date_start)} – {fmtDateJsx(set.date_end)}</>;
+    })();
+
+    // Determine if cal set is older or younger than light frames
+    const calDateLabel = (() => {
+      if (!lightParams?.date_range || !set.date_start) return '';
+      const calDate = new Date(set.date_start).getTime();
+      const lightMid = (new Date(lightParams.date_range[0]).getTime() + new Date(lightParams.date_range[1]).getTime()) / 2;
+      return calDate < lightMid ? 'old' : 'young';
+    })();
+
     return (
       <div
         onClick={onSelect}
@@ -183,79 +214,59 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
             : 'border-border hover:border-border bg-surface-elevated/30'
         }`}
       >
-        <div className="flex items-start justify-between mb-2">
-          <div className="flex items-center gap-2">
-            {isSelected && <Check className="w-4 h-4 text-accent" />}
-            <span className="font-medium text-content">
-              {type === 'flat' && set.filter ? `${set.filter}` : type.charAt(0).toUpperCase() + type.slice(1)}
-              {set.exptime !== null && type !== 'flat' && ` (${set.exptime}s)`}
+        {/* Top row: date range (prominent) + score */}
+        <div className="flex items-start justify-between mb-1.5">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Calendar className="w-3.5 h-3.5 text-content-muted flex-shrink-0" />
+            <span className={`text-sm truncate ${match_details.date_diff_days > 30 ? 'text-warning' : 'text-content'}`}>
+              {dateRange}
             </span>
-            {isCurrent && (
-              <span className="text-xs px-2 py-0.5 rounded bg-surface-hover text-content-secondary">Current</span>
-            )}
-            {set.is_master && (
-              <span className="text-xs px-2 py-0.5 rounded bg-yellow-500/20 text-yellow-400">Master</span>
+            {match_details.date_diff_days > 0 && (
+              <span className={`text-xs font-medium flex-shrink-0 ${match_details.date_diff_days > 30 ? 'text-warning' : 'text-content-muted'}`}>
+                {match_details.date_diff_days}d {calDateLabel}
+              </span>
             )}
           </div>
-          <div className={`text-sm font-medium ${scoreInfo.color}`}>
-            {Math.round(match_score * 100)}% {scoreInfo.label}
+          <div className={`text-xs font-medium flex-shrink-0 ml-2 ${scoreInfo.color}`}>
+            {Math.round(match_score * 100)}%
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-2 text-sm">
-          <div className="flex items-center gap-2 text-content-muted">
-            <Camera className="w-3 h-3" />
-            <span className={match_details.instrume_match ? 'text-content-secondary' : 'text-orange'}>
-              {set.instrume || 'Unknown'}
-              {!match_details.instrume_match && ' (mismatch)'}
+        {/* Second row: filter + camera + badges */}
+        <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+          {isSelected && <Check className="w-3.5 h-3.5 text-accent flex-shrink-0" />}
+          {type === 'flat' && set.filter && (
+            <span className={`text-sm font-semibold ${match_details.filter_match ? 'text-accent' : 'text-warning'}`}>
+              {set.filter}
             </span>
-          </div>
-          <div className="flex items-center gap-2 text-content-muted">
-            <Hash className="w-3 h-3" />
-            <span className={match_details.binning_match ? 'text-content-secondary' : 'text-orange'}>
-              {set.binning || 'N/A'}
-              {!match_details.binning_match && ' (mismatch)'}
-            </span>
-          </div>
-          <div className="flex items-center gap-2 text-content-muted">
-            <Thermometer className="w-3 h-3" />
-            <span className="text-content-secondary">
-              {formatTemp(set.ccd_temp)}
-              {match_details.temp_diff !== null && (
-                <span className={match_details.temp_diff > 2 ? 'text-orange' : 'text-content-muted'}>
-                  {' '}
-                  ({match_details.temp_diff > 0 ? '+' : ''}
-                  {match_details.temp_diff?.toFixed(1)}°C)
-                </span>
-              )}
-            </span>
-          </div>
-          <div className="flex items-center gap-2 text-content-muted">
-            <Calendar className="w-3 h-3" />
-            <span className={match_details.date_diff_days > 30 ? 'text-orange' : 'text-content-secondary'}>
-              {set.date_start ? new Date(set.date_start).toLocaleDateString('en-GB') : set.date_display}
-              {match_details.date_diff_days > 0 && ` (${match_details.date_diff_days}d)`}
-            </span>
-          </div>
-          <div className="flex items-center gap-2 text-content-muted">
-            <Clock className="w-3 h-3" />
-            <span className="text-content-secondary">
-              {set.date_start ? new Date(set.date_start).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'N/A'}
-            </span>
-          </div>
-          {set.gain !== null && (
-            <div className="flex items-center gap-2 text-content-muted">
-              <span className="text-content-muted text-xs">Gain:</span>
-              <span className={match_details.gain_match ? 'text-content-secondary' : 'text-orange'}>
-                {set.gain}
-                {!match_details.gain_match && ' (mismatch)'}
-              </span>
-            </div>
           )}
-          <div className="flex items-center gap-2 text-content-muted">
-            <span className="text-content-muted text-xs">Frames:</span>
-            <span className="text-content-secondary">{set.frame_count}</span>
-          </div>
+          <span className={`text-sm ${match_details.instrume_match ? 'text-content-secondary' : 'text-warning'}`}>
+            {set.instrume || 'Unknown'}
+          </span>
+          {set.exptime !== null && (
+            <span className="text-sm text-content-secondary">{set.exptime}s</span>
+          )}
+          {isCurrent && (
+            <span className="text-[10px] px-1.5 py-px rounded bg-surface-hover text-content-secondary">Current</span>
+          )}
+          {set.is_master && (
+            <span className="text-[10px] px-1.5 py-px rounded bg-yellow-500/20 text-yellow-400">Master</span>
+          )}
+        </div>
+
+        {/* Third row: secondary params */}
+        <div className="flex items-center gap-3 text-xs text-content-muted">
+          <span>{set.frame_count} frames</span>
+          <span className={match_details.binning_match ? '' : 'text-warning'}>{set.binning || '—'}</span>
+          {set.gain !== null && (
+            <span className={match_details.gain_match ? '' : 'text-warning'}>G{set.gain}</span>
+          )}
+          <span>
+            {formatTemp(set.ccd_temp)}
+            {match_details.temp_diff !== null && match_details.temp_diff > 2 && (
+              <span className="text-warning"> Δ{match_details.temp_diff.toFixed(1)}°</span>
+            )}
+          </span>
         </div>
       </div>
     );
@@ -362,6 +373,18 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
             ) : lightParams ? (
               <div className="space-y-3 text-sm">
                 <div className="flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-content-muted" />
+                  <span className="text-content-muted">Dates:</span>
+                </div>
+                <div className="text-content text-sm ml-6">
+                  {formatDateRange(lightParams.date_range)}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Hash className="w-4 h-4 text-content-muted" />
+                  <span className="text-content-muted">Frames:</span>
+                  <span className="text-content">{lightParams.frame_count}</span>
+                </div>
+                <div className="flex items-center gap-2">
                   <Camera className="w-4 h-4 text-content-muted" />
                   <span className="text-content-muted">Camera:</span>
                   <span className="text-content">{lightParams.instrume || 'Unknown'}</span>
@@ -399,18 +422,6 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
                   <span className="text-content">
                     {lightParams.avg_exptime?.toFixed(1) ?? 'N/A'}s
                   </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Calendar className="w-4 h-4 text-content-muted" />
-                  <span className="text-content-muted">Dates:</span>
-                </div>
-                <div className="text-content text-xs ml-6">
-                  {formatDateRange(lightParams.date_range)}
-                </div>
-                <div className="flex items-center gap-2">
-                  <Hash className="w-4 h-4 text-content-muted" />
-                  <span className="text-content-muted">Frames:</span>
-                  <span className="text-content">{lightParams.frame_count}</span>
                 </div>
 
                 {/* Current Selections - use backend data as source of truth */}

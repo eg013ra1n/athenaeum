@@ -1,18 +1,17 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { api } from '../api';
-import { Scissors, Plus, Settings, Calendar, Camera, X } from 'lucide-react';
+import { Scissors, Plus, Calendar, Camera, X, ScanSearch } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
+  FrameAnalysis,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
 import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
-import { CalibrationLightsTable } from './calibration/CalibrationLightsTable';
-import { CalibrationCardView } from './calibration/CalibrationCardView';
-import { CalibrationGroupModal } from './calibration/CalibrationGroupModal';
-import type { FlatGroupData, DarkOnlyGroupData } from './calibration/CalibrationGroupCard';
 import type { EnrichedLightFrame } from './calibration/LightsAnalysisTable';
+import { CalibrationTableView } from './calibration/CalibrationTableView';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
+import { CalibrationFinderButton } from './CalibrationFinderButton';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 
 interface CalibrationHierarchyViewProps {
@@ -21,14 +20,18 @@ interface CalibrationHierarchyViewProps {
   useBiasForDarkOptimization?: boolean;
   /** Stacked SNR per filter key, passed through to the tree */
   filterSnrMap?: Map<string, number>;
+  /** Analysis data keyed by frame_id, for computing metrics in table rows */
+  analysisData?: Map<number, FrameAnalysis>;
+  /** Frame set ID for calibration finder */
+  frameSetId?: number;
+  /** Frame set name for calibration finder */
+  frameSetName?: string;
+  /** Callback when calibration matching completes */
+  onCalibrationComplete?: () => void;
   onRefresh?: () => void;
+  onBlink?: (frameIds: number[]) => void;
   onSplit?: (selectedFilterKeys: Set<string>) => void;
   onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
-}
-
-interface ModalState {
-  type: 'flat' | 'dark';
-  data: FlatGroupData | DarkOnlyGroupData;
 }
 
 export function CalibrationHierarchyView({
@@ -36,11 +39,17 @@ export function CalibrationHierarchyView({
   blackholedFileIds,
   useBiasForDarkOptimization = false,
   filterSnrMap,
+  analysisData,
+  frameSetId,
+  frameSetName,
+  onCalibrationComplete,
   onRefresh,
+  onBlink,
   onSplit,
   onCreateCustomSet,
 }: CalibrationHierarchyViewProps) {
-  const isPreCalibration = data.calibrated_frames === 0;
+  // Re-assign mode toggle
+  const [reassignMode, setReassignMode] = useState(false);
 
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-night');
@@ -83,11 +92,6 @@ export function CalibrationHierarchyView({
   const [checkedKeys, setCheckedKeys] = useState<Set<string>>(new Set());
 
   // Pre-cal: table row selection
-  const [selectedFrameIds, setSelectedFrameIds] = useState<Set<number>>(new Set());
-
-  // Post-cal: group modal state
-  const [modalData, setModalData] = useState<ModalState | null>(null);
-
   // Manual calibration modal state
   const [manualModalOpen, setManualModalOpen] = useState(false);
   const [manualModalFrameIds, setManualModalFrameIds] = useState<number[]>([]);
@@ -119,30 +123,20 @@ export function CalibrationHierarchyView({
     return displayedFrames.length;
   }, [checkedKeys, displayedFrames]);
 
-  // Clear table selection when tree filter changes
+  // Clear tree filter
   const handleCheckedChange = useCallback((keys: Set<string>) => {
     setCheckedKeys(keys);
-    setSelectedFrameIds(new Set());
   }, []);
 
   // Split with checked filter keys
   const handleSplit = useCallback(() => {
-    if (onSplit && checkedKeys.size > 0) {
-      onSplit(checkedKeys);
-    }
+    if (onSplit && checkedKeys.size > 0) onSplit(checkedKeys);
   }, [onSplit, checkedKeys]);
 
   // Create custom set with checked filter keys
   const handleCreateCustomSet = useCallback(() => {
-    if (onCreateCustomSet && checkedKeys.size > 0) {
-      onCreateCustomSet(checkedKeys);
-    }
+    if (onCreateCustomSet && checkedKeys.size > 0) onCreateCustomSet(checkedKeys);
   }, [onCreateCustomSet, checkedKeys]);
-
-  // Open card group detail modal
-  const handleOpenGroup = useCallback((type: 'flat' | 'dark', groupData: FlatGroupData | DarkOnlyGroupData) => {
-    setModalData({ type, data: groupData });
-  }, []);
 
   // Open manual calibration modal for specific frame IDs
   const openManualCalibrationForFrameIds = useCallback((frameIds: number[]) => {
@@ -153,12 +147,6 @@ export function CalibrationHierarchyView({
     setManualModalCurrentBias(null);
     setManualModalOpen(true);
   }, []);
-
-  // Open manual calibration modal for pre-cal selected frames
-  const handleManualCalibrationPreCal = useCallback(() => {
-    if (selectedFrameIds.size === 0) return;
-    openManualCalibrationForFrameIds([...selectedFrameIds]);
-  }, [selectedFrameIds, openManualCalibrationForFrameIds]);
 
   // Handle manual calibration apply
   const handleManualCalibrationApply = useCallback(
@@ -201,16 +189,14 @@ export function CalibrationHierarchyView({
     [manualModalFrameIds, manualModalCurrentFlat, manualModalCurrentDark, manualModalCurrentBias, onRefresh]
   );
 
-  // Determine action bar visibility and counts
-  const showPreCalActionBar = isPreCalibration && selectedFrameIds.size > 0;
-  const showFilterActionBar = !isPreCalibration && checkedKeys.size > 0 && (onSplit || onCreateCustomSet);
+  const showFilterActionBar = checkedKeys.size > 0 && (onSplit || onCreateCustomSet);
 
   return (
     <div className="flex flex-col h-full">
       {/* Main Content */}
       {data.date_groups.length > 0 ? (
         <div className="flex flex-1 min-h-0 gap-4">
-          {/* Left Panel — Tree with view toggle */}
+          {/* Left Panel — Find Calibration + Tree */}
           <div className="w-80 flex-shrink-0 flex flex-col">
             {/* View Mode Toggle */}
             <div className="flex mb-1 rounded-lg border border-border/50 overflow-hidden">
@@ -294,72 +280,61 @@ export function CalibrationHierarchyView({
           </div>
 
           {/* Right Panel */}
-          <div className="flex-1 min-w-0 flex flex-col">
-            {isPreCalibration ? (
-              /* Pre-calibration: flat sortable table */
-              <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
-                <CalibrationLightsTable
-                  frames={displayedFrames}
-                  selectedFrameIds={selectedFrameIds}
-                  onSelectionChange={setSelectedFrameIds}
-                />
+          <div className="flex-1 min-w-0 flex flex-col gap-2">
+            {/* Toolbar */}
+            {frameSetId && frameSetName && (
+              <div className="flex items-start gap-2 flex-wrap flex-shrink-0">
+                <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+                  <CalibrationFinderButton
+                    frameSetId={frameSetId}
+                    frameSetName={frameSetName}
+                    onComplete={() => { onCalibrationComplete?.(); onRefresh?.(); }}
+                  />
+                  <span className="text-[10px] text-content-muted leading-tight">
+                    {data.calibrated_frames}/{data.total_frames}
+                  </span>
+                </div>
+                <button
+                  onClick={() => setReassignMode(v => !v)}
+                  className={`h-7 inline-flex items-center gap-1.5 px-3 text-xs font-medium rounded-lg transition-colors ${
+                    reassignMode
+                      ? 'bg-accent text-white hover:brightness-90'
+                      : 'bg-surface-elevated text-content-secondary hover:text-content hover:bg-surface-hover border border-border/50'
+                  }`}
+                  title={reassignMode ? 'Exit Re-assign mode' : 'Enter Re-assign mode — select individual frames to reassign calibration'}
+                >
+                  <ScanSearch size={12} />
+                  Re-assign
+                </button>
               </div>
-            ) : (
-              /* Post-calibration: card view */
-              <CalibrationCardView
-                data={data}
-                allFrames={allFrames}
-                visibleFrameIds={visibleFrameIds}
-                onOpenGroup={handleOpenGroup}
-                onManualCalibration={openManualCalibrationForFrameIds}
-              />
             )}
+
+            <CalibrationTableView
+              data={data}
+              allFrames={allFrames}
+              visibleFrameIds={visibleFrameIds}
+              analysisData={analysisData}
+              onManualCalibration={openManualCalibrationForFrameIds}
+              onBlink={onBlink}
+              reassignMode={reassignMode}
+            />
             <BlackholedFramesSection frames={blackholedFrames} />
 
-            {/* Pre-cal action bar: when table rows are selected */}
-            {showPreCalActionBar && (
-              <div className="mt-1 bg-surface-elevated/80 rounded-lg px-2 py-1.5 border border-border/50">
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setSelectedFrameIds(new Set())}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover text-content-secondary hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
-                  >
-                    <X size={14} aria-hidden="true" />
-                    Clear Selection
-                  </button>
-                  <div className="text-sm text-content-secondary">
-                    <span className="font-medium text-content">{selectedFrameIds.size}</span>{' '}
-                    frame{selectedFrameIds.size !== 1 ? 's' : ''}
-                  </div>
-                  <span className="text-content-muted">|</span>
-                  <button
-                    onClick={handleManualCalibrationPreCal}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                  >
-                    <Settings size={14} aria-hidden="true" />
-                    Assign Calibration
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Post-cal action bar: when tree groups are checked */}
+            {/* Action bar: when tree groups are checked */}
             {showFilterActionBar && (
               <div className="mt-1 bg-surface-elevated/80 rounded-lg px-2 py-1.5 border border-border/50">
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => setCheckedKeys(new Set())}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover text-content-secondary hover:text-content text-sm rounded transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-border"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:bg-surface-hover text-content-secondary hover:text-content text-sm rounded transition-colors"
                   >
-                    <X size={14} aria-hidden="true" />
+                    <X size={14} />
                     Clear Selection
                   </button>
                   <div className="text-sm text-content-secondary">
                     <span className="font-medium text-content">{checkedKeys.size}</span>{' '}
                     group{checkedKeys.size !== 1 ? 's' : ''}
-                    <span className="text-content-muted ml-1">
-                      ({checkedFrameCount} frame{checkedFrameCount !== 1 ? 's' : ''})
-                    </span>
+                    <span className="text-content-muted ml-1">({checkedFrameCount} frame{checkedFrameCount !== 1 ? 's' : ''})</span>
                   </div>
                 </div>
               </div>
@@ -367,27 +342,11 @@ export function CalibrationHierarchyView({
           </div>
         </div>
       ) : (
-        /* Empty State */
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center py-16 px-8 bg-surface-elevated rounded-xl border border-border">
             <p className="text-lg text-content-muted">No frames found in this frame set.</p>
           </div>
         </div>
-      )}
-
-      {/* Calibration Group Modal */}
-      {modalData && (
-        <CalibrationGroupModal
-          type={modalData.type}
-          data={modalData.data}
-          allLightFrames={allFrames}
-          onClose={() => setModalData(null)}
-          onRefresh={() => {
-            setModalData(null);
-            onRefresh?.();
-          }}
-          onManualCalibration={openManualCalibrationForFrameIds}
-        />
       )}
 
       {/* Manual Calibration Modal */}

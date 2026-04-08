@@ -3,7 +3,14 @@ import type {
   CalibrationFilterGroup,
 } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
-import type { AggregatedWarning } from './WarningPanel';
+
+/** Warning with additional context for display */
+export interface AggregatedWarning {
+  message: string;
+  type: 'missing_calibration' | 'date' | 'temperature';
+  filter?: string;
+  camera?: string;
+}
 
 export interface DateCameraFilterNode {
   dateKey: string;

@@ -60,10 +60,10 @@ export function CalibrationFinderButton({ frameSetId, frameSetName, onComplete }
       <button
         onClick={handleFindCalibration}
         disabled={isProcessing}
-        className="inline-flex items-center gap-2 px-4 py-2 bg-purple hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
+        className="h-7 inline-flex items-center gap-1.5 px-3 text-xs font-medium bg-purple hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
         title="Find and link calibration data for this frame set"
       >
-        <Zap size={16} />
+        <Zap size={12} />
         {isProcessing ? 'Finding...' : 'Find Calibration'}
       </button>
 

@@ -6,7 +6,6 @@ import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnal
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
-import { CalibrationFinderButton } from '../components/CalibrationFinderButton';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
 import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
@@ -485,25 +484,19 @@ export default function FrameSetDetail() {
           </div>
         ) : calibrationHierarchy ? (
           activeTab === 'calibration' ? (
-            <div className="flex flex-col h-full">
-              <div className="flex items-center gap-3 mb-3 flex-shrink-0">
-                <CalibrationFinderButton
-                  frameSetId={parseInt(id!)}
-                  frameSetName={detail.frames_set?.name || 'Untitled'}
-                  onComplete={loadData}
-                />
-              </div>
-              <div className="flex-1 min-h-0">
-                <CalibrationHierarchyViewComponent
-                  data={calibrationHierarchy}
-                  blackholedFileIds={blackholedFileIds}
-                  filterSnrMap={calibrationFilterSnrMap}
-                  onRefresh={refreshCalibrationHierarchy}
-                  onSplit={handleOpenSplitDialog}
-                  onCreateCustomSet={handleOpenCreateDialog}
-                />
-              </div>
-            </div>
+            <CalibrationHierarchyViewComponent
+              data={calibrationHierarchy}
+              blackholedFileIds={blackholedFileIds}
+              filterSnrMap={calibrationFilterSnrMap}
+              analysisData={analysisData}
+              frameSetId={parseInt(id!)}
+              frameSetName={detail.frames_set?.name || 'Untitled'}
+              onCalibrationComplete={loadData}
+              onRefresh={refreshCalibrationHierarchy}
+              onBlink={handleBlink}
+              onSplit={handleOpenSplitDialog}
+              onCreateCustomSet={handleOpenCreateDialog}
+            />
           ) : (
             <LightsAnalysisView
               hierarchy={calibrationHierarchy}
