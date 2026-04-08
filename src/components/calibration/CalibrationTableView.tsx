@@ -90,6 +90,15 @@ function formatTempRange(temps: (number | null)[]): string {
   return `${min.toFixed(1)}–${max.toFixed(1)}°`;
 }
 
+function formatIntegration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.round(seconds % 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 // ── Derived data types ─────────────────────────────────────────────────────
 
 export interface LightRow {
@@ -102,6 +111,7 @@ export interface LightRow {
   tempRange: string;
   dateRange: string;
   camera: string | null;
+  focallen: number | null;
   flatSetId: number | null;
   flatSet: CalibrationSetWithFrameCount | null;
   darkSetId: number | null;
@@ -112,6 +122,7 @@ export interface LightRow {
   avgFwhm: number | null;
   avgEcc: number | null;
   avgSnr: number | null;
+  totalIntegration: number | null;
   // for sorting
   sortTemp: number | null;
   sortDate: string | null;
@@ -126,6 +137,7 @@ interface FlatRow {
   frameCount: number;
   dateRange: string;
   camera: string | null;
+  focallen: number | null;
   subCalSetId: number | null;
   subCalType: 'Dark' | 'DarkFlat' | 'Bias' | null;
   gain: number | null;
@@ -361,6 +373,7 @@ function deriveTableData(
           tempRange: formatTempRange(temps),
           dateRange: formatFrameDateRange(groupFrames),
           camera: instrume,
+          focallen: groupFrames[0]?.focallen ?? null,
           flatSetId: combo.flatId,
           flatSet: flatSet ?? null,
           darkSetId: combo.darkId,
@@ -371,6 +384,7 @@ function deriveTableData(
           avgFwhm,
           avgEcc,
           avgSnr,
+          totalIntegration: fg.exptime != null ? groupFrames.length * fg.exptime : null,
           sortTemp: temps.filter((t): t is number => t != null).reduce((a, b) => a + b, 0) / (temps.filter(t => t != null).length || 1) || null,
           sortDate: dates[0] ?? null,
         });
@@ -396,6 +410,7 @@ function deriveTableData(
       frameCount: s.frame_count,
       dateRange: formatSetDateRange(s.date_start, s.date_end),
       camera: s.instrume,
+      focallen: s.focallen,
       subCalSetId: subCal?.set.id ?? null,
       subCalType: subCal?.calibration_type ?? null,
       gain: s.gain,
@@ -592,7 +607,7 @@ function SetIdBadge({
 
 // ── Lights Table ───────────────────────────────────────────────────────────
 
-type LightSortField = 'frameCount' | 'filter' | 'exptime' | 'sortTemp' | 'sortDate' | 'camera' | 'flatSetId' | 'darkSetId' | 'avgFwhm' | 'avgEcc' | 'avgSnr';
+type LightSortField = 'frameCount' | 'filter' | 'exptime' | 'sortTemp' | 'sortDate' | 'camera' | 'focallen' | 'flatSetId' | 'darkSetId' | 'avgFwhm' | 'avgEcc' | 'avgSnr' | 'totalIntegration';
 
 function LightsTable({
   rows,
@@ -646,11 +661,13 @@ function LightsTable({
             <SortTh field="sortTemp" label="Temp" {...thProps} />
             <SortTh field="sortDate" label="Date Range" {...thProps} />
             <SortTh field="camera" label="Camera" {...thProps} />
+            <SortTh field="focallen" label="FL" {...thProps} />
             <SortTh field="flatSetId" label="Flat" {...thProps} />
             <SortTh field="darkSetId" label="Dark" {...thProps} />
             {!compact && <SortTh field="avgFwhm" label="FWHM" {...thProps} />}
             {!compact && <SortTh field="avgEcc" label="Ecc" {...thProps} />}
             {!compact && <SortTh field="avgSnr" label="SNR" {...thProps} />}
+            {!compact && <SortTh field="totalIntegration" label="Total" {...thProps} />}
           </tr>
         </thead>
         <tbody>
@@ -683,6 +700,7 @@ function LightsTable({
                 <td className="px-1.5 py-1 text-sm text-content-secondary">{row.tempRange}</td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary whitespace-nowrap">{row.dateRange}</td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary whitespace-nowrap">{row.camera ?? '—'}</td>
+                <td className="px-1.5 py-1 text-sm text-content-secondary">{row.focallen != null ? `${row.focallen}mm` : '—'}</td>
                 <td className="px-1.5 py-1 text-sm">
                   {row.flatSetId != null ? (
                     <SetIdBadge
@@ -716,6 +734,11 @@ function LightsTable({
                     {row.avgSnr != null ? row.avgSnr.toFixed(1) : '—'}
                   </td>
                 )}
+                {!compact && (
+                  <td className="px-1.5 py-1 text-sm text-content-secondary whitespace-nowrap">
+                    {row.totalIntegration != null ? formatIntegration(row.totalIntegration) : '—'}
+                  </td>
+                )}
               </tr>
             );
           })}
@@ -727,7 +750,7 @@ function LightsTable({
 
 // ── Flats Table ────────────────────────────────────────────────────────────
 
-type FlatSortField = 'setId' | 'filter' | 'exptime' | 'sortTemp' | 'binning' | 'frameCount' | 'sortDate' | 'camera' | 'subCalSetId' | 'gain' | 'offset' | 'usedByLightCount';
+type FlatSortField = 'setId' | 'filter' | 'exptime' | 'sortTemp' | 'binning' | 'frameCount' | 'sortDate' | 'camera' | 'focallen' | 'subCalSetId' | 'gain' | 'offset' | 'usedByLightCount';
 
 function FlatsTable({
   rows,
@@ -779,6 +802,7 @@ function FlatsTable({
             <SortTh field="frameCount" label="Frames" {...thProps} />
             <SortTh field="sortDate" label="Date Range" {...thProps} />
             <SortTh field="camera" label="Camera" {...thProps} />
+            <SortTh field="focallen" label="FL" {...thProps} />
             <SortTh field="subCalSetId" label="SubCal" {...thProps} />
             {!compact && <SortTh field="gain" label="G" {...thProps} />}
             {!compact && <th className="px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary whitespace-nowrap sticky top-0 z-10 bg-surface-elevated">B</th>}
@@ -812,6 +836,7 @@ function FlatsTable({
                 <td className="px-1.5 py-1 text-sm text-content-secondary tabular-nums">{row.frameCount}</td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary whitespace-nowrap">{row.dateRange}</td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary whitespace-nowrap">{row.camera ?? '—'}</td>
+                <td className="px-1.5 py-1 text-sm text-content-secondary">{row.focallen != null ? `${row.focallen}mm` : '—'}</td>
                 <td className="px-1.5 py-1 text-sm">
                   {row.subCalSetId != null ? (
                     <SetIdBadge

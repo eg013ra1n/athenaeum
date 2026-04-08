@@ -3,7 +3,7 @@ import { FolderOpen, AlertTriangle } from 'lucide-react';
 import { revealItemInDir } from '../../api/desktop';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
-type SortField = 'date' | 'filter' | 'camera' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
+type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
 type SortDirection = 'asc' | 'desc';
 
 /** Frame enriched with camera/filter context from the hierarchy */
@@ -209,6 +209,9 @@ export function LightsAnalysisTable({
         case 'camera':
           comparison = a.camera.localeCompare(b.camera);
           break;
+        case 'focallen':
+          comparison = (a.focallen ?? 0) - (b.focallen ?? 0);
+          break;
         case 'exptime':
           comparison = (a.exptime ?? 0) - (b.exptime ?? 0);
           break;
@@ -268,6 +271,9 @@ export function LightsAnalysisTable({
             </th>
             <th scope="col" className="px-1.5 py-1.5 text-center">
               <SortableHeader field="filter" label="Filter" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
+            </th>
+            <th scope="col" className="px-1.5 py-1.5 text-center">
+              <SortableHeader field="focallen" label="FL" currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} />
             </th>
             {/* Exposure group — gold tint */}
             <th scope="col" className="px-1.5 py-1.5 text-center bg-warning/10">
@@ -342,6 +348,9 @@ export function LightsAnalysisTable({
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center">
                   {frame.filter ?? '-'}
+                </td>
+                <td className="px-1.5 py-1 text-sm text-content-secondary text-center">
+                  {frame.focallen != null ? `${frame.focallen}mm` : '-'}
                 </td>
                 {/* Exposure group — gold tint */}
                 <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-warning/5">
