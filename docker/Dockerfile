@@ -3,11 +3,23 @@ FROM rust:1.85-bookworm AS rust-builder
 
 WORKDIR /build
 
+# rustafits → turbojpeg → turbojpeg-sys requires cmake + nasm to build
+# libjpeg-turbo from source. Matches rustafits's own release.yml setup.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nasm cmake \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy workspace manifests first for layer caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/athenaeum-core/Cargo.toml crates/athenaeum-core/Cargo.toml
 COPY crates/athenaeum-web/Cargo.toml crates/athenaeum-web/Cargo.toml
 COPY crates/jpeg-encode/Cargo.toml crates/jpeg-encode/Cargo.toml
+
+# Copy rustafits submodule in full — it's a path dep workspace member.
+# Cannot use the dummy-src trick because rustafits has a renamed [lib]
+# (name = "astroimage") and two [[bin]] targets that would all need stubs.
+# rustafits changes infrequently so the cache hit rate is still acceptable.
+COPY rustafits/ rustafits/
 
 # Create dummy lib/main to cache dependency compilation
 RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/athenaeum-core/src/lib.rs \

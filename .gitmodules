@@ -1,0 +1,3 @@
+[submodule "rustafits"]
+	path = rustafits
+	url = https://github.com/eg013ra1n/rustafits.git
