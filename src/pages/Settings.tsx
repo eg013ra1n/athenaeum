@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3 } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
+import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
 import type { AnnotationSettings } from '../types/analysis-config';
 import { DEFAULT_ANNOTATION_SETTINGS } from '../types/analysis-config';
@@ -41,7 +42,7 @@ export default function Settings() {
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
   // Tab state
-  const [activeTab, setActiveTab] = useState<'general' | 'calibration' | 'analysis'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'calibration' | 'analysis' | 'plate_solving'>('general');
 
   useEffect(() => {
     loadSettings();
@@ -386,6 +387,17 @@ export default function Settings() {
           <BarChart3 size={18} />
           Analysis
         </button>
+        <button
+          onClick={() => setActiveTab('plate_solving')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg transition-colors ${
+            activeTab === 'plate_solving'
+              ? 'bg-surface-elevated text-white border-b-2 border-accent'
+              : 'text-content-muted hover:text-content hover:bg-surface-elevated/50'
+          }`}
+        >
+          <ScanSearch size={18} />
+          Plate Solving
+        </button>
       </div>
 
       {/* Calibration Matching Tab */}
@@ -409,6 +421,19 @@ export default function Settings() {
             Changes here affect new analyses — existing results keep their original settings until re-analyzed.
           </p>
           <AnalysisSettingsPanel />
+        </div>
+      )}
+
+      {/* Plate Solving Tab */}
+      {activeTab === 'plate_solving' && (
+        <div className="bg-surface-elevated rounded-lg p-6">
+          <h3 className="text-xl font-semibold mb-4">Plate Solving Configuration</h3>
+          <p className="text-content-muted mb-6">
+            Configure the astrometric plate solver used to determine sky coordinates for frames
+            that are missing RA/Dec metadata. The solver matches detected stars against the bundled
+            Tycho-2 catalog to compute a full WCS solution.
+          </p>
+          <PlateSolveSettingsPanel />
         </div>
       )}
 

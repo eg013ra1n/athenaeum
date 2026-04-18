@@ -797,31 +797,68 @@ pub fn get_files_by_directory_for_camera(
 
 /// Get frames with missing metadata
 /// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
+///
+/// Each returned row includes a `has_duplicate` flag that is true when another
+/// file in the catalog shares either the same `content_hash` or the same
+/// `metadata_hash`. That covers both exact-byte duplicates (content hash) and
+/// "same header/size/filename" near-duplicates (metadata hash), matching how
+/// the rest of the app treats duplicates.
 pub fn get_frames_with_missing_metadata(
     conn: &Connection,
     category: &str,
-) -> Result<Vec<(File, Frame)>> {
+) -> Result<Vec<MissingMetadataRow>> {
+    // "Missing coordinates" catches three sentinel patterns that FITS
+    // pipelines write instead of leaving fields NULL:
+    //   1. numeric ra/dec = NULL
+    //   2. numeric (ra, dec) = (0, 0) — literal zero, no one images at 0,0
+    //   3. sexagesimal objctra/objctdec that stringify to all-zero after
+    //      stripping whitespace, signs, and colons — e.g. "00 00 00",
+    //      "+00 00 00", "00:00:00". Thousands of LIGHT frames in typical
+    //      libraries have these because the acquisition software wrote a
+    //      placeholder rather than the real RA/Dec.
+    //
+    // A frame counts as "missing coordinates" when BOTH the numeric side
+    // and the sexagesimal side are in one of the above states. The same
+    // clause is inlined into the "all" branch below.
+    let coords_missing_clause =
+        "((fr.ra IS NULL AND fr.dec IS NULL) OR (fr.ra = 0 AND fr.dec = 0)) \
+         AND (\
+             fr.objctra IS NULL OR fr.objctdec IS NULL \
+             OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctra, ' ', ''), '+', ''), '-', ''), ':', '') = '000000' \
+             OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctdec, ' ', ''), '+', ''), '-', ''), ':', '') = '000000'\
+         )";
+    // LIGHT-only categories: coordinates and object. Darks/flats/bias legitimately
+    // have no RA/Dec and no target OBJECT — surfacing them under those chips would
+    // be noise. For instrument/datetime/frametype, all frame types qualify because
+    // the user may need to fix a missing camera/date/type on any kind of frame.
     let (missing_clause, imagetyp_filter) = match category {
-        "coordinates" => ("(fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
+        "coordinates" => (coords_missing_clause, "UPPER(fr.imagetyp) = 'LIGHT' AND"),
         "object" => ("fr.object IS NULL OR fr.object = ''", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
-        "datetime" => ("fr.date_obs IS NULL", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
-        "instrument" => ("fr.instrume IS NULL OR fr.instrume = ''", "UPPER(fr.imagetyp) = 'LIGHT' AND"),
+        "datetime" => ("fr.date_obs IS NULL", ""),
+        "instrument" => ("fr.instrume IS NULL OR fr.instrume = ''", ""),
         "frametype" => ("(fr.imagetyp IS NULL OR fr.imagetyp = '')", ""),
         _ => (
-            "(UPPER(fr.imagetyp) = 'LIGHT' AND (((fr.ra IS NULL AND fr.dec IS NULL) AND (fr.objctra IS NULL OR fr.objctdec IS NULL)) OR (fr.object IS NULL OR fr.object = '') OR fr.date_obs IS NULL OR (fr.instrume IS NULL OR fr.instrume = ''))) OR (fr.imagetyp IS NULL OR fr.imagetyp = '')",
+            "(UPPER(fr.imagetyp) = 'LIGHT' AND ((((fr.ra IS NULL AND fr.dec IS NULL) OR (fr.ra = 0 AND fr.dec = 0)) AND (fr.objctra IS NULL OR fr.objctdec IS NULL OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctra, ' ', ''), '+', ''), '-', ''), ':', '') = '000000' OR REPLACE(REPLACE(REPLACE(REPLACE(fr.objctdec, ' ', ''), '+', ''), '-', ''), ':', '') = '000000')) OR (fr.object IS NULL OR fr.object = ''))) OR fr.date_obs IS NULL OR (fr.instrume IS NULL OR fr.instrume = '') OR (fr.imagetyp IS NULL OR fr.imagetyp = '')",
             ""
         ),
     };
 
+    // `has_duplicate` is a LEFT JOIN against the cached `duplicate_group_files`
+    // table (populated by the existing duplicate-detection pipeline). No row
+    // means the file isn't in any detected duplicate group; any match means it
+    // is. Uses the `idx_dup_group_files_file` index for O(1) lookups.
     let query = format!(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
+                CASE WHEN dgf.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_duplicate
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
+         LEFT JOIN duplicate_group_files dgf ON dgf.file_id = f.id
          WHERE {} ({})
+         GROUP BY f.id
          ORDER BY f.modified_at DESC",
         imagetyp_filter, missing_clause
     );
@@ -888,10 +925,106 @@ pub fn get_frames_with_missing_metadata(
             rotation: row.get(41).ok(),
         };
 
-        Ok((file, frame))
+        let has_duplicate: i32 = row.get(42)?;
+
+        Ok(MissingMetadataRow {
+            file,
+            frame,
+            has_duplicate: has_duplicate != 0,
+        })
     })?;
 
     results.collect()
+}
+
+/// Bulk-update selected metadata fields on the given frames.
+///
+/// Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type
+/// actions. DB-only update — the underlying FITS files on disk are NOT touched.
+/// Every row that gets any field updated also has `override = 1` set, matching
+/// the existing pattern so re-scanners know the DB row beats the on-disk header.
+///
+/// Only fields that are `Some` in `edits` are written. If `edits` has no fields,
+/// the call is a no-op and returns 0.
+///
+/// `imagetyp` is normalized via `ImageType::from_str` when recognized so the
+/// stored string matches what `insert_frame` produces (the Debug form of the
+/// enum variant, e.g. `"Dark"`, `"MasterDark"`). Unknown strings are stored
+/// as-given.
+pub fn bulk_update_frame_metadata(
+    conn: &Connection,
+    frame_ids: &[i64],
+    edits: &FrameMetadataEdits,
+) -> Result<usize> {
+    if frame_ids.is_empty() {
+        return Ok(0);
+    }
+    if edits.instrume.is_none()
+        && edits.date_obs.is_none()
+        && edits.imagetyp.is_none()
+        && edits.is_master.is_none()
+    {
+        return Ok(0);
+    }
+
+    // Build the SET clauses and collect parameters in order.
+    use rusqlite::types::Value;
+    let mut set_clauses: Vec<&str> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+
+    if let Some(instrume) = &edits.instrume {
+        set_clauses.push("instrume = ?");
+        values.push(Value::Text(instrume.clone()));
+    }
+    if let Some(date_obs) = &edits.date_obs {
+        set_clauses.push("date_obs = ?");
+        values.push(Value::Text(date_obs.clone()));
+    }
+    if let Some(imagetyp) = &edits.imagetyp {
+        let normalized = ImageType::from_str(imagetyp)
+            .map(|t| format!("{:?}", t))
+            .unwrap_or_else(|| imagetyp.clone());
+        set_clauses.push("imagetyp = ?");
+        values.push(Value::Text(normalized));
+    }
+    if let Some(is_master) = edits.is_master {
+        set_clauses.push("is_master = ?");
+        values.push(Value::Integer(if is_master { 1 } else { 0 }));
+    }
+    // Always flag touched rows as override so rescans preserve the edit.
+    set_clauses.push("override = 1");
+
+    let id_placeholders: String = frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    for id in frame_ids {
+        values.push(Value::Integer(*id));
+    }
+
+    let sql = format!(
+        "UPDATE frames SET {} WHERE id IN ({})",
+        set_clauses.join(", "),
+        id_placeholders
+    );
+
+    let count = conn
+        .execute(&sql, rusqlite::params_from_iter(values.iter()))
+        .map_err(|e| {
+            eprintln!("bulk_update_frame_metadata failed: {} (sql={})", e, sql);
+            e
+        })?;
+
+    Ok(count)
+}
+
+/// Return the distinct non-empty INSTRUME values seen in the `frames` table,
+/// alphabetically sorted. Used by the Set Camera modal to populate its dropdown.
+pub fn get_distinct_instrumes(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT instrume FROM frames \
+         WHERE instrume IS NOT NULL AND TRIM(instrume) != '' \
+         ORDER BY instrume COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
 }
 
 /// Find duplicates by filename and metadata, or by content hash
@@ -922,7 +1055,7 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
 
     let mut stmt = conn.prepare(&query)?;
 
-    let groups = stmt.query_map([], |row| {
+    let mut groups: Vec<DuplicateGroup> = stmt.query_map([], |row| {
         let paths_str: String = row.get(3)?;
         let file_paths: Vec<String> = paths_str.split('|').map(|s| s.to_string()).collect();
 
@@ -938,10 +1071,101 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
             file_count: row.get(2)?,
             file_paths,
             file_ids,
+            files: Vec::new(),
         })
+    })?
+    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    enrich_duplicate_groups(conn, &mut groups)?;
+    Ok(groups)
+}
+
+/// Fetch per-file metadata (modified_at, scan-root assignment) for every file
+/// in `groups` and fill in each group's `files` field. Scan-root assignment is
+/// a longest-prefix match against `scan_roots.path` computed in Rust so the
+/// caller doesn't need to add a join per row.
+fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> Result<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    // Load scan roots once. Small table; a fresh read every call is cheaper
+    // than caching and getting stale.
+    let mut sr_stmt = conn.prepare("SELECT id, path FROM scan_roots ORDER BY length(path) DESC")?;
+    let scan_roots: Vec<(i64, String)> = sr_stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // One SELECT covering every file id across every group. Pulls the frame
+    // row (imagetyp, date_obs, filename) via LEFT JOIN so files without an
+    // extracted frame still come through with None-y frame fields.
+    let mut all_ids: Vec<i64> = groups.iter().flat_map(|g| g.file_ids.iter().copied()).collect();
+    all_ids.sort_unstable();
+    all_ids.dedup();
+    if all_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders: String = std::iter::repeat("?").take(all_ids.len()).collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT f.id, f.path, f.filename, f.modified_at, fr.imagetyp, fr.date_obs
+         FROM files f
+         LEFT JOIN frames fr ON fr.file_id = f.id
+         WHERE f.id IN ({})",
+        placeholders
+    );
+    let params_vec: Vec<rusqlite::types::Value> = all_ids.iter().map(|i| rusqlite::types::Value::Integer(*i)).collect();
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+        let id: i64 = row.get(0)?;
+        let path: String = row.get(1)?;
+        let filename: String = row.get(2)?;
+        let modified_at_str: String = row.get(3)?;
+        let imagetyp: Option<String> = row.get(4)?;
+        let date_obs: Option<String> = row.get(5)?;
+        Ok((id, path, filename, modified_at_str, imagetyp, date_obs))
     })?;
 
-    groups.collect()
+    struct Row {
+        path: String,
+        filename: String,
+        modified_at: chrono::DateTime<chrono::Utc>,
+        imagetyp: Option<String>,
+        date_obs: Option<String>,
+    }
+    let mut by_id: std::collections::HashMap<i64, Row> = std::collections::HashMap::new();
+    for row in rows {
+        let (id, path, filename, modified_at_str, imagetyp, date_obs) = row?;
+        let modified_at = chrono::DateTime::parse_from_rfc3339(&modified_at_str)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+        by_id.insert(id, Row { path, filename, modified_at, imagetyp, date_obs });
+    }
+
+    for group in groups.iter_mut() {
+        let mut files: Vec<crate::models::DuplicateFile> = Vec::with_capacity(group.file_ids.len());
+        for file_id in &group.file_ids {
+            let Some(r) = by_id.get(file_id) else { continue };
+            let (scan_root_id, scan_root_path) = scan_roots
+                .iter()
+                .find(|(_, sr_path)| r.path.starts_with(sr_path.as_str()))
+                .map(|(id, sr_path)| (Some(*id), Some(sr_path.clone())))
+                .unwrap_or((None, None));
+            files.push(crate::models::DuplicateFile {
+                file_id: *file_id,
+                path: r.path.clone(),
+                filename: r.filename.clone(),
+                modified_at: r.modified_at,
+                scan_root_id,
+                scan_root_path,
+                imagetyp: r.imagetyp.clone(),
+                date_obs: r.date_obs.clone(),
+            });
+        }
+        group.files = files;
+    }
+
+    Ok(())
 }
 
 /// Rebuild the duplicate groups cache tables
@@ -1086,9 +1310,11 @@ pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Resul
             file_count: files.len() as i32,  // Use actual count after filtering
             file_paths,
             file_ids,
+            files: Vec::new(),
         });
     }
 
+    enrich_duplicate_groups(conn, &mut result)?;
     Ok(result)
 }
 

@@ -126,7 +126,33 @@ pub struct ScanRoot {
     pub last_scan_errors: Option<Vec<String>>,
 }
 
-/// Duplicate detection result
+/// A single file inside a duplicate group, enriched with the metadata the
+/// frontend needs to apply "keep" rules (modified time, assigned scan root)
+/// and to display meaningful per-group summaries (filename, frame type,
+/// observation date).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateFile {
+    pub file_id: i64,
+    pub path: String,
+    pub filename: String,
+    pub modified_at: DateTime<Utc>,
+    /// Longest-prefix match against `scan_roots.path`. `None` when the file
+    /// isn't inside any registered scan root (shouldn't happen for scanned
+    /// libraries, but we don't want to drop the row).
+    pub scan_root_id: Option<i64>,
+    pub scan_root_path: Option<String>,
+    /// IMAGETYP from the frame row (raw string — e.g. "LIGHT", "FLAT").
+    /// `None` if no frame row or the field was missing.
+    pub imagetyp: Option<String>,
+    /// DATE-OBS from the frame row (RFC3339). `None` if not set.
+    pub date_obs: Option<String>,
+}
+
+/// Duplicate detection result.
+///
+/// `file_paths` + `file_ids` are kept as parallel-array convenience fields
+/// for existing consumers (folder view, etc.); new code should use `files`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateGroup {
     pub id: Option<i64>,
@@ -135,6 +161,17 @@ pub struct DuplicateGroup {
     pub file_count: i32,
     pub file_paths: Vec<String>,
     pub file_ids: Vec<i64>,
+    #[serde(default)]
+    pub files: Vec<DuplicateFile>,
+}
+
+/// Result of a bulk move-to-black-hole operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkMoveResult {
+    pub moved: usize,
+    /// Per-file failures — (file_id, error message). Empty on full success.
+    pub failed: Vec<(i64, String)>,
 }
 
 /// Black hole entry (soft-deleted file)
@@ -214,6 +251,18 @@ pub struct Session {
 pub struct FileWithFrame {
     pub file: File,
     pub frame: Option<Frame>,
+}
+
+/// DTO: a row on the Missing Metadata page. Extends `FileWithFrame` with a
+/// duplicate-detection flag so the UI can show which missing-metadata files
+/// also have a duplicate somewhere in the catalog. Uses camelCase on the
+/// wire to match the frontend convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingMetadataRow {
+    pub file: File,
+    pub frame: Frame,
+    pub has_duplicate: bool,
 }
 
 /// DTO: Session with its frames
@@ -694,6 +743,22 @@ pub struct CalibrationMetadataEdits {
     pub offset: Option<f64>,
     pub binning: Option<String>,
     pub exptime: Option<f64>,
+}
+
+/// Bulk edits for light/calibration frame metadata in the `frames` table.
+/// Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type actions.
+/// None means don't change that field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameMetadataEdits {
+    pub instrume: Option<String>,
+    /// RFC 3339 / ISO 8601 datetime string (frontend converts from user input).
+    pub date_obs: Option<String>,
+    /// Raw IMAGETYP value — "LIGHT", "DARK", "FLAT", "BIAS", "DARKFLAT".
+    /// For master variants, pair with `is_master = Some(true)` and a base
+    /// type (e.g. `imagetyp = "DARK"`, `is_master = true` → master dark).
+    pub imagetyp: Option<String>,
+    pub is_master: Option<bool>,
 }
 
 /// Excluded frame entry (frame excluded during auto-generation)

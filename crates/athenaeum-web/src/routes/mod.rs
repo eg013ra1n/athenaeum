@@ -26,6 +26,7 @@ mod spatial;
 mod images;
 mod missing_files;
 mod analysis;
+mod plate_solve;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -60,6 +61,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_camera_directories", post(files::get_camera_directories))
         .route("/api/get_camera_directory_contents", post(files::get_camera_directory_contents))
         .route("/api/get_frames_with_missing_metadata", post(files::get_frames_with_missing_metadata))
+        .route("/api/bulk_update_frame_metadata", post(files::bulk_update_frame_metadata))
+        .route("/api/get_distinct_instrumes", post(files::get_distinct_instrumes))
         .route("/api/get_files_with_frames_by_ids", post(files::get_files_with_frames_by_ids))
         .route("/api/browse_directories", post(files::browse_directories))
         // Settings
@@ -129,6 +132,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Duplicates / black hole
         .route("/api/get_duplicates", post(duplicates::get_duplicates))
         .route("/api/move_to_black_hole", post(duplicates::move_to_black_hole))
+        .route("/api/bulk_move_to_black_hole", post(duplicates::bulk_move_to_black_hole))
         .route("/api/get_black_hole_files", post(duplicates::get_black_hole_files))
         .route("/api/get_blackholed_file_ids", post(duplicates::get_blackholed_file_ids))
         .route("/api/restore_from_black_hole", post(duplicates::restore_from_black_hole))
@@ -165,6 +169,20 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
         .route("/api/cancel_analysis", post(analysis::cancel_analysis))
         .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))
+        // Plate solving
+        .route("/api/get_plate_solve_config", post(plate_solve::get_plate_solve_config))
+        .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))
+        .route("/api/reset_plate_solve_config", post(plate_solve::reset_plate_solve_config))
+        .route("/api/plate_solve_frame", post(plate_solve::plate_solve_frame))
+        .route("/api/plate_solve_batch", post(plate_solve::plate_solve_batch))
+        .route("/api/cancel_plate_solve", post(plate_solve::cancel_plate_solve))
+        .route("/api/autofind_objects_from_coordinates", post(plate_solve::autofind_objects_from_coordinates))
+        .route("/api/cancel_autofind_objects", post(plate_solve::cancel_autofind_objects))
+        .route("/api/get_plate_solve_result", post(plate_solve::get_plate_solve_result))
+        .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
+        .route("/api/download_tycho2_catalog", post(plate_solve::download_tycho2_catalog))
+        .route("/api/get_quad_index_status", post(plate_solve::get_quad_index_status))
+        .route("/api/build_quad_index", post(plate_solve::build_quad_index))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_app_version", post(get_app_version))

@@ -18,6 +18,39 @@ pub async fn set_scan_root_duplicates_flag(
     db::update_scan_root_duplicates_flag(&conn, id, enabled).map_err(|e| e.to_string())
 }
 
+/// Move a batch of files to the black hole in a single transaction, emitting
+/// progress events as it runs. Used by the duplicates batch-deletion UI.
+///
+/// Returns `BulkMoveResult { moved, failed }`. Per-file failures don't abort
+/// the batch — they're logged and reported in `failed`.
+#[tauri::command]
+pub async fn bulk_move_to_black_hole(
+    file_ids: Vec<i64>,
+    from_where: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::models::BulkMoveResult, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
+    let result = db::bulk_move_to_black_hole(&conn, &file_ids, &from_where, Some(&emitter))
+        .map_err(|e| {
+            eprintln!("bulk_move_to_black_hole failed: {}", e);
+            e.to_string()
+        })?;
+
+    // Fire a single `blackhole-changed` event so other views (Black Hole
+    // tab, file manager, missing-metadata) invalidate their caches. The
+    // payload intentionally has no file_id — consumers should just refresh.
+    let _ = app_handle.emit("blackhole-changed", serde_json::json!({
+        "action": "bulk-blackholed",
+        "count": result.moved,
+    }));
+
+    Ok(result)
+}
+
 /// Move a file to the black hole (soft delete)
 #[tauri::command]
 pub async fn move_to_black_hole(

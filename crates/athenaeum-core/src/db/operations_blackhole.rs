@@ -1,10 +1,23 @@
 // Black Hole (soft delete) operations
 
-use crate::models::{BlackHoleEntry, FolderSimilarity};
+use crate::events::{emit_event, ProgressEmitter};
+use crate::models::{BlackHoleEntry, BulkMoveResult, FolderSimilarity};
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::collections::HashMap;
+use std::time::Instant;
+
+/// Progress event payload for `bulk-move-to-black-hole-progress`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkMoveProgressEvent {
+    pub current: usize,
+    pub total: usize,
+    pub percent: f64,
+    pub current_file: Option<String>,
+}
 
 /// Add a file to the black hole (soft delete)
 pub fn add_to_black_hole(
@@ -22,6 +35,96 @@ pub fn add_to_black_hole(
     )?;
 
     Ok(conn.last_insert_rowid())
+}
+
+/// Move a batch of files to the black hole in a single transaction, emitting
+/// progress events as each file is processed.
+///
+/// Per-file failures (e.g. file already in black hole, file row missing) are
+/// logged to stderr and collected into `BulkMoveResult::failed` — they do NOT
+/// abort the whole batch. A connection-level error (transaction begin/commit
+/// fails) returns `Err` and leaves the DB unchanged.
+pub fn bulk_move_to_black_hole(
+    conn: &Connection,
+    file_ids: &[i64],
+    from_where: &str,
+    emitter: Option<&dyn ProgressEmitter>,
+) -> Result<BulkMoveResult> {
+    let total = file_ids.len();
+    let now = Utc::now().to_rfc3339();
+
+    conn.execute("BEGIN TRANSACTION", [])?;
+
+    let mut moved: usize = 0;
+    let mut failed: Vec<(i64, String)> = Vec::new();
+    let mut last_emit = Instant::now();
+
+    for (idx, file_id) in file_ids.iter().enumerate() {
+        // Resolve the file's current path (for black_hole.original_path).
+        let path: rusqlite::Result<String> = conn.query_row(
+            "SELECT path FROM files WHERE id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        );
+
+        let path = match path {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "bulk_move_to_black_hole: file_id {} not found: {}",
+                    file_id, e
+                );
+                failed.push((*file_id, format!("file row not found: {}", e)));
+                continue;
+            }
+        };
+
+        let insert = conn.execute(
+            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![file_id, from_where, now, path],
+        );
+
+        match insert {
+            Ok(_) => moved += 1,
+            Err(e) => {
+                eprintln!(
+                    "bulk_move_to_black_hole: failed to move file_id {} ({}): {}",
+                    file_id, path, e
+                );
+                failed.push((*file_id, e.to_string()));
+            }
+        }
+
+        // Throttle progress emission to ~10 Hz so 5k-file batches don't spam
+        // the event bus, but always emit the final one.
+        let now_i = Instant::now();
+        let is_last = idx + 1 == total;
+        if now_i.duration_since(last_emit).as_millis() >= 100 || is_last {
+            if let Some(e) = emitter {
+                let percent = if total > 0 {
+                    ((idx + 1) as f64 / total as f64) * 100.0
+                } else {
+                    100.0
+                };
+                emit_event(
+                    e,
+                    "bulk-move-to-black-hole-progress",
+                    &BulkMoveProgressEvent {
+                        current: idx + 1,
+                        total,
+                        percent,
+                        current_file: Some(path),
+                    },
+                );
+            }
+            last_emit = now_i;
+        }
+    }
+
+    conn.execute("COMMIT", [])?;
+
+    Ok(BulkMoveResult { moved, failed })
 }
 
 /// Get all files in the black hole, optionally filtered by source

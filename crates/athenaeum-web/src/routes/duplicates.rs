@@ -5,7 +5,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
 use crate::WebAppState;
-use crate::events::SseEvent;
+use crate::events::{SseEvent, SseProgressEmitter};
 
 // ── Request body types ────────────────────────────────────────────────────────
 
@@ -13,6 +13,13 @@ use crate::events::SseEvent;
 #[serde(rename_all = "camelCase")]
 pub struct MoveToBlackHoleArgs {
     pub file_id: i64,
+    pub from_where: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkMoveToBlackHoleArgs {
+    pub file_ids: Vec<i64>,
     pub from_where: String,
 }
 
@@ -114,6 +121,33 @@ pub async fn move_to_black_hole(
     });
 
     Ok(Json(id))
+}
+
+/// Move a batch of files to the black hole in a single transaction, emitting
+/// SSE progress events as it runs. Mirrors the Tauri `bulk_move_to_black_hole`
+/// command.
+pub async fn bulk_move_to_black_hole(
+    State(state): State<WebAppState>,
+    Json(args): Json<BulkMoveToBlackHoleArgs>,
+) -> Result<Json<athenaeum_core::models::BulkMoveResult>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    let emitter = SseProgressEmitter::new(state.event_tx.clone());
+    let result = athenaeum_core::db::bulk_move_to_black_hole(
+        &conn,
+        &args.file_ids,
+        &args.from_where,
+        Some(&emitter),
+    )
+    .map_err(db_err)?;
+
+    let _ = state.event_tx.send(SseEvent {
+        event_name: "blackhole-changed".to_string(),
+        data: serde_json::json!({ "action": "bulk-blackholed", "count": result.moved }),
+    });
+
+    Ok(Json(result))
 }
 
 /// List files currently sitting in the black hole.

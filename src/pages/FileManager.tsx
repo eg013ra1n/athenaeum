@@ -7,16 +7,17 @@ import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveT
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
 import { format } from 'date-fns';
 import DirectoryTree from '../components/DirectoryTree';
-import type { ScanResult, RelinkResult, FileWithFrame, MissingFileRecord } from '../types/models';
+import type { ScanResult, RelinkResult, MissingFileRecord } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { ScanSummaryModal } from '../components/ScanSummaryModal';
 import { MissingFilesPanel } from '../components/MissingFilesPanel';
 import { FolderBrowserModal } from '../components/FolderBrowserModal';
+import { MissingMetadataView } from '../components/missing-metadata/MissingMetadataView';
+import { DuplicatesView } from '../components/duplicates/DuplicatesView';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
-type MissingCategory = 'all' | 'coordinates' | 'object' | 'datetime' | 'instrument' | 'frametype';
 
 export default function FileManager() {
   const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, relinkScanRoot } = useScanRootsWithAvailability();
@@ -25,18 +26,12 @@ export default function FileManager() {
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
   const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
-  const [typeFilter, setTypeFilter] = useState<string>('All Types');
   const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [missingMetadataCount, setMissingMetadataCount] = useState<number | null>(null);
   const [scanResultMap, setScanResultMap] = useState<Record<number, ScanResult>>({});
   const [scanError, setScanError] = useState<string | null>(null);
-  const [movingToBlackHole, setMovingToBlackHole] = useState<Record<string, boolean>>({});
   const [relinkingRootId, setRelinkingRootId] = useState<number | null>(null);
   const [relinkResult, setRelinkResult] = useState<RelinkResult | null>(null);
-  // Missing metadata tab state
-  const [missingCategory, setMissingCategory] = useState<MissingCategory>('all');
-  const [missingFrames, setMissingFrames] = useState<FileWithFrame[]>([]);
-  const [loadingMissing, setLoadingMissing] = useState(false);
-  const [missingError, setMissingError] = useState<string | null>(null);
   const [scanSummaryModal, setScanSummaryModal] = useState<{
     isOpen: boolean;
     rootId: number | null;
@@ -170,28 +165,6 @@ export default function FileManager() {
       console.error('Failed to refresh missing files:', error);
     }
   };
-
-  // Load frames with missing metadata
-  const loadMissingMetadata = async (category: MissingCategory) => {
-    try {
-      setLoadingMissing(true);
-      setMissingError(null);
-      const frames = await api.invoke<FileWithFrame[]>('get_frames_with_missing_metadata', { category });
-      setMissingFrames(frames);
-    } catch (error) {
-      console.error('Failed to load missing metadata:', error);
-      setMissingError(typeof error === 'string' ? error : 'Failed to load frames with missing metadata');
-    } finally {
-      setLoadingMissing(false);
-    }
-  };
-
-  // Load missing metadata when tab is selected or category changes
-  useEffect(() => {
-    if (activeTab === 'missing-metadata') {
-      loadMissingMetadata(missingCategory);
-    }
-  }, [activeTab, missingCategory]);
 
   // Handle adding a new directory
   const handleAddDirectory = async () => {
@@ -393,7 +366,7 @@ export default function FileManager() {
         >
           <div className="flex items-center gap-2">
             <AlertCircle size={16} />
-            Missing Metadata
+            Missing Metadata{missingMetadataCount != null ? ` (${missingMetadataCount})` : ''}
           </div>
         </button>
       </div>
@@ -739,163 +712,12 @@ export default function FileManager() {
 
           {/* File View */}
           {duplicatesView === 'files' && (
-            <div className="bg-surface-elevated rounded-lg p-4">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-lg font-semibold">Duplicate Groups ({duplicates.length})</h3>
-                <div className="flex items-center gap-3">
-                  <select
-                    value={typeFilter}
-                    onChange={(e) => setTypeFilter(e.target.value)}
-                    className="bg-surface-hover border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-                  >
-                    <option value="All Types">All Types</option>
-                    <option value="Lights">Lights</option>
-                    <option value="Darks">Darks</option>
-                    <option value="Flats">Flats</option>
-                    <option value="Bias">Bias</option>
-                    <option value="Other">Other</option>
-                  </select>
-                  <button
-                    onClick={refreshDuplicates}
-                    disabled={dupsLoading}
-                    className="text-sm text-accent hover:text-accent-hover disabled:opacity-50"
-                  >
-                    {dupsLoading ? 'Loading...' : 'Refresh'}
-                  </button>
-                </div>
-              </div>
-
-              {dupsError && (
-                <div className="mb-4 p-3 bg-error-muted border border-error/50 rounded">
-                  <p className="text-error text-sm">Error: {String(dupsError)}</p>
-                </div>
-              )}
-
-              {dupsLoading ? (
-                <div className="flex items-center justify-center py-12">
-                  <Loader2 className="animate-spin mr-2" size={24} />
-                  <span className="text-content-muted">Loading duplicates...</span>
-                </div>
-              ) : duplicates.length === 0 ? (
-                <div className="text-content-muted text-center py-12">
-                  <CheckCircle2 className="mx-auto mb-3 text-success" size={48} />
-                  <p className="font-semibold mb-1">No duplicates found!</p>
-                  <p className="text-sm">All your files are unique.</p>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {duplicates.filter(group => {
-                    if (typeFilter === 'All Types') return true;
-
-                    // Determine type from file paths
-                    const samplePath = group.file_paths[0]?.toLowerCase() || '';
-                    if (typeFilter === 'Lights' && (samplePath.includes('/lights/') || samplePath.includes('/light/'))) return true;
-                    if (typeFilter === 'Darks' && (samplePath.includes('/darks/') || samplePath.includes('/dark/') || samplePath.includes('/calibration/darks'))) return true;
-                    if (typeFilter === 'Flats' && (samplePath.includes('/flats/') || samplePath.includes('/flat/') || samplePath.includes('/calibration/flats'))) return true;
-                    if (typeFilter === 'Bias' && samplePath.includes('/bias/') || samplePath.includes('/calibration/bias')) return true;
-                    if (typeFilter === 'Other' &&
-                        !samplePath.includes('/lights/') && !samplePath.includes('/light/') &&
-                        !samplePath.includes('/darks/') && !samplePath.includes('/dark/') &&
-                        !samplePath.includes('/flats/') && !samplePath.includes('/flat/') &&
-                        !samplePath.includes('/bias/')) return true;
-                    return false;
-                  }).map((group, idx) => (
-                    <div key={idx} className="bg-surface rounded-lg p-4 border border-border">
-                      <div className="flex items-center justify-between mb-3">
-                        <div className="flex items-center gap-3">
-                          <Copy className="text-warning" size={20} />
-                          <div>
-                            <span className="font-semibold text-warning">
-                              {group.file_count} identical files
-                            </span>
-                            <span className="text-content-muted text-sm ml-3">
-                              Size: {(group.size / 1024 / 1024).toFixed(2)} MB each
-                            </span>
-                          </div>
-                        </div>
-                        <span className="text-xs font-mono text-content-muted">
-                          Hash: {group.content_hash.substring(0, 12)}...
-                        </span>
-                      </div>
-
-                      <div className="space-y-2">
-                        {group.file_paths.map((path, pathIdx) => {
-                          const fileId = group.file_ids[pathIdx];
-                          return (
-                            <div
-                              key={pathIdx}
-                              className="flex items-center justify-between p-3 bg-surface-elevated rounded hover:bg-surface-hover transition"
-                            >
-                              <div className="flex-1 min-w-0">
-                                <p className="font-mono text-sm truncate" title={path}>
-                                  {path}
-                                </p>
-                                <p className="text-xs text-content-muted mt-1">
-                                  Copy {pathIdx + 1} of {group.file_count}
-                                </p>
-                              </div>
-                              <button
-                                onClick={() => {
-                                  showConfirm(
-                                    'Move to Black Hole',
-                                    `Move "${path}" to Black Hole?`,
-                                    async () => {
-                                      try {
-                                        setMovingToBlackHole(prev => ({ ...prev, [path]: true }));
-                                        await moveToBlackHole(fileId, 'duplicates');
-                                        await refreshDuplicates();
-                                      } catch (err) {
-                                        showAlert('Move Failed', `Failed: ${String(err)}`, 'error');
-                                      } finally {
-                                        setMovingToBlackHole(prev => ({ ...prev, [path]: false }));
-                                      }
-                                    },
-                                    true
-                                  );
-                                }}
-                                disabled={movingToBlackHole[path]}
-                                title="Move to Black Hole"
-                                className="ml-4 p-2 text-error hover:text-error/90 hover:bg-error-muted rounded transition disabled:opacity-50"
-                              >
-                                {movingToBlackHole[path] ? (
-                                  <Loader2 className="animate-spin" size={16} />
-                                ) : (
-                                  <Trash2 size={16} />
-                                )}
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      <div className="mt-3 pt-3 border-t border-border text-sm">
-                        <span className="text-content-muted">
-                          Total wasted space: {((group.size * (group.file_count - 1)) / 1024 / 1024).toFixed(2)} MB
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-
-                  {/* Summary */}
-                  <div className="bg-info-muted border border-info/50 rounded-lg p-4">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="font-semibold text-info/80">Total Duplicates Summary</p>
-                        <p className="text-sm text-content-muted mt-1">
-                          {duplicates.reduce((acc, g) => acc + g.file_count, 0)} duplicate files in {duplicates.length} groups
-                        </p>
-                      </div>
-                      <div className="text-right">
-                        <p className="text-2xl font-bold text-info/80">
-                          {(duplicates.reduce((acc, g) => acc + (g.size * (g.file_count - 1)), 0) / 1024 / 1024 / 1024).toFixed(2)} GB
-                        </p>
-                        <p className="text-sm text-content-muted">wasted space</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
+            <DuplicatesView
+              duplicates={duplicates}
+              loading={dupsLoading}
+              error={dupsError ? String(dupsError) : null}
+              refresh={refreshDuplicates}
+            />
           )}
 
           {/* Folder View */}
@@ -1057,118 +879,7 @@ export default function FileManager() {
 
       {/* Missing Metadata Tab */}
       {activeTab === 'missing-metadata' && (
-        <div className="bg-surface-elevated rounded-lg p-4">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-lg font-semibold">Frames with Missing Metadata</h3>
-            <div className="flex items-center gap-3">
-              <select
-                value={missingCategory}
-                onChange={(e) => setMissingCategory(e.target.value as MissingCategory)}
-                className="bg-surface-hover border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-              >
-                <option value="all">All Missing</option>
-                <option value="coordinates">Missing Coordinates</option>
-                <option value="object">Missing Object Name</option>
-                <option value="datetime">Missing Date/Time</option>
-                <option value="instrument">Missing Instrument</option>
-                <option value="frametype">Missing Frame Type</option>
-              </select>
-              <button
-                onClick={() => loadMissingMetadata(missingCategory)}
-                disabled={loadingMissing}
-                className="text-sm text-accent hover:text-accent-hover disabled:opacity-50"
-              >
-                {loadingMissing ? 'Loading...' : 'Refresh'}
-              </button>
-            </div>
-          </div>
-
-          {/* Results count */}
-          <div className="mb-4 text-sm text-content-muted">
-            Showing {missingFrames.length} frames with missing metadata
-          </div>
-
-          {missingError && (
-            <div className="mb-4 p-3 bg-error-muted border border-error/50 rounded">
-              <p className="text-error text-sm">Error: {missingError}</p>
-            </div>
-          )}
-
-          {loadingMissing ? (
-            <div className="flex items-center justify-center py-12">
-              <Loader2 className="animate-spin mr-2" size={24} />
-              <span className="text-content-muted">Loading frames...</span>
-            </div>
-          ) : missingFrames.length === 0 ? (
-            <div className="text-content-muted text-center py-12">
-              <CheckCircle2 className="mx-auto mb-3 text-success" size={48} />
-              <p className="font-semibold mb-1">All metadata complete!</p>
-              <p className="text-sm">No frames are missing the selected metadata.</p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead className="bg-surface sticky top-0">
-                  <tr>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase">File</th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase">Missing</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  {missingFrames.map((item, idx) => {
-                    const frame = item.frame;
-                    const missing: string[] = [];
-
-                    // Check what's missing
-                    if (frame) {
-                      const hasCoords = (frame.ra !== null && frame.dec !== null) ||
-                                        (frame.objctra !== null && frame.objctdec !== null);
-                      if (!hasCoords) missing.push('Coordinates');
-                      if (!frame.object) missing.push('Object');
-                      if (!frame.date_obs) missing.push('Date');
-                      if (!frame.instrume) missing.push('Instrument');
-                    }
-
-                    return (
-                      <tr key={item.file.id || idx} className="hover:bg-surface-hover transition">
-                        <td className="px-4 py-3">
-                          <div className="flex flex-col">
-                            <span className="font-medium text-sm truncate max-w-md" title={item.file.path}>
-                              {item.file.filename}
-                            </span>
-                            <span className="text-xs text-content-muted truncate max-w-md" title={item.file.path}>
-                              {item.file.path}
-                            </span>
-                          </div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="flex flex-wrap gap-1">
-                            {missing.map((m) => (
-                              <span
-                                key={m}
-                                className={`px-2 py-0.5 rounded text-xs font-medium ${
-                                  m === 'Coordinates'
-                                    ? 'bg-error-muted text-error border border-error/50'
-                                    : m === 'Object'
-                                    ? 'bg-orange/25 text-orange border border-orange/50'
-                                    : m === 'Date'
-                                    ? 'bg-warning-muted text-warning border border-warning/50'
-                                    : 'bg-info-muted text-accent border border-info/50'
-                                }`}
-                              >
-                                {m}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
+        <MissingMetadataView onCountChange={setMissingMetadataCount} />
       )}
 
       {/* Confirm Dialog */}

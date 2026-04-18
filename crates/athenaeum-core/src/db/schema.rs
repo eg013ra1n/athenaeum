@@ -776,5 +776,63 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Plate solve results - WCS solutions from plate solving
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS plate_solves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id INTEGER NOT NULL UNIQUE,
+            crpix1 REAL NOT NULL,
+            crpix2 REAL NOT NULL,
+            crval1 REAL NOT NULL,
+            crval2 REAL NOT NULL,
+            cd1_1 REAL NOT NULL,
+            cd1_2 REAL NOT NULL,
+            cd2_1 REAL NOT NULL,
+            cd2_2 REAL NOT NULL,
+            sip_order INTEGER,
+            sip_a_coeffs TEXT,
+            sip_b_coeffs TEXT,
+            sip_ap_coeffs TEXT,
+            sip_bp_coeffs TEXT,
+            matched_stars INTEGER NOT NULL,
+            total_detected INTEGER NOT NULL,
+            rms_residual_px REAL NOT NULL,
+            rms_residual_arcsec REAL NOT NULL,
+            pixel_scale_arcsec REAL NOT NULL,
+            field_rotation_deg REAL NOT NULL,
+            solve_time_ms INTEGER NOT NULL,
+            catalog_used TEXT NOT NULL,
+            algorithm_used TEXT NOT NULL,
+            solved_at TEXT NOT NULL,
+            expected_catalog_stars_in_fov INTEGER,
+            inlier_ratio REAL,
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plate_solves_frame_id ON plate_solves(frame_id)",
+        [],
+    )?;
+
+    // Migration: add density-aware confidence metrics to plate_solves
+    // (rustafits v1.1.0 / Phase 2 density-aware acceptance).
+    let has_expected_in_fov: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('plate_solves') WHERE name='expected_catalog_stars_in_fov'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_expected_in_fov {
+        conn.execute(
+            "ALTER TABLE plate_solves ADD COLUMN expected_catalog_stars_in_fov INTEGER",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE plate_solves ADD COLUMN inlier_ratio REAL",
+            [],
+        )?;
+    }
+
     Ok(())
 }

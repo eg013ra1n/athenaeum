@@ -1,0 +1,111 @@
+<h2>Plate Solving Architecture: Where Does Each Piece Live?</h2>
+<p class="subtitle">Three crates need new code: rustafits (pure algorithms), athenaeum-core (I/O + orchestration), athenaeum-tauri/web (commands/routes)</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Composable Modules (Requirements Doc Approach)</h3>
+      <p>Each algorithm is its own module with a focused API. CatalogEngine + PlateSolveService orchestrate them.</p>
+      <div style="margin-top: 12px; font-family: monospace; font-size: 13px; line-height: 1.6; color: #b0b0b0;">
+        <div style="margin-bottom: 8px; color: #7dd3fc;"><strong>rustafits/src/</strong></div>
+        <div style="padding-left: 16px;">
+          <div>analysis/ <span style="color:#666">(existing star detection)</span></div>
+          <div style="color: #4ade80;">platesolving/</div>
+          <div style="padding-left: 16px; color: #4ade80;">
+            pattern_matcher.rs <span style="color:#666">— quad hash build + match (trait: QuadHasher)</span><br>
+            quad_distance.rs <span style="color:#666">— astrometry.net approach A</span><br>
+            quad_interior.rs <span style="color:#666">— tetra3 approach B</span><br>
+            ransac.rs <span style="color:#666">— outlier rejection</span><br>
+            transform.rs <span style="color:#666">— affine/projective/SIP fitting</span><br>
+            wcs.rs <span style="color:#666">— WcsSolution (pixel↔sky, FITS headers)</span><br>
+            projection.rs <span style="color:#666">— gnomonic TAN projection</span><br>
+            proper_motion.rs <span style="color:#666">— epoch propagation</span><br>
+            types.rs <span style="color:#666">— CatalogStar, StarMatch, SolveHints, etc.</span>
+          </div>
+        </div>
+        <div style="margin-top: 12px; margin-bottom: 8px; color: #c084fc;"><strong>athenaeum-core/src/</strong></div>
+        <div style="padding-left: 16px; color: #c084fc;">
+          catalog/ <span style="color:#666">— HEALpix binary format, cone search, memmap</span><br>
+          plate_solve/ <span style="color:#666">— PlateSolveService orchestration + DB storage</span>
+        </div>
+        <div style="margin-top: 12px; margin-bottom: 8px; color: #fb923c;"><strong>athenaeum-tauri + web</strong></div>
+        <div style="padding-left: 16px; color: #fb923c;">
+          commands/plate_solve.rs <span style="color:#666">— thin wrappers with progress events</span><br>
+          routes/plate_solve.rs <span style="color:#666">— HTTP + SSE equivalents</span>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top: 16px;">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Each module testable independently</li>
+          <li>Registration reuses PatternMatcher without CatalogEngine</li>
+          <li>Matches the well-designed requirements doc</li>
+          <li>QuadHasher trait lets us benchmark both approaches</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>More files and interfaces to maintain</li>
+          <li>More complex dependency graph between modules</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Monolithic Pipeline</h3>
+      <p>Single <code>plate_solve()</code> function in athenaeum-core that calls rustafits internally. Less composable but fewer moving parts.</p>
+      <div style="margin-top: 12px; font-family: monospace; font-size: 13px; line-height: 1.6; color: #b0b0b0;">
+        <div style="margin-bottom: 8px; color: #7dd3fc;"><strong>rustafits/src/</strong></div>
+        <div style="padding-left: 16px;">
+          <div style="color: #4ade80;">platesolving.rs <span style="color:#666">— everything in one 1500-line file</span></div>
+        </div>
+        <div style="margin-top: 12px; margin-bottom: 8px; color: #c084fc;"><strong>athenaeum-core/src/</strong></div>
+        <div style="padding-left: 16px; color: #c084fc;">
+          plate_solve.rs <span style="color:#666">— catalog + orchestration + storage in one module</span>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top: 16px;">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Fewer files to navigate</li>
+          <li>Simpler to implement initially</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Hard to reuse for registration (different pipeline)</li>
+          <li>Hard to test individual components</li>
+          <li>Single file grows unwieldy fast</li>
+          <li>Can't swap quad hash implementations cleanly</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Hybrid: Modules in rustafits, Simple Service in core</h3>
+      <p>Keep rustafits modular (same as A) but simplify athenaeum-core to a single service module instead of catalog/ + plate_solve/ separation.</p>
+      <div style="margin-top: 12px; font-family: monospace; font-size: 13px; line-height: 1.6; color: #b0b0b0;">
+        <div style="margin-bottom: 8px; color: #7dd3fc;"><strong>rustafits/src/</strong></div>
+        <div style="padding-left: 16px;">
+          <div style="color: #4ade80;">platesolving/ <span style="color:#666">— same modular structure as A</span></div>
+        </div>
+        <div style="margin-top: 12px; margin-bottom: 8px; color: #c084fc;"><strong>athenaeum-core/src/</strong></div>
+        <div style="padding-left: 16px; color: #c084fc;">
+          plate_solve/ <span style="color:#666">— CatalogEngine + PlateSolveService + DB ops in one module dir</span><br>
+          <span style="padding-left: 16px; color:#666">mod.rs, catalog.rs, service.rs, storage.rs</span>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top: 16px;">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>rustafits stays clean and composable</li>
+          <li>athenaeum-core simpler — one domain module</li>
+          <li>Still testable at the algorithm level</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>catalog.rs may grow large with download + conversion + cone search</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+</div>

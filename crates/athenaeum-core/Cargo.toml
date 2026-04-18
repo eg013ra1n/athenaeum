@@ -18,7 +18,17 @@ anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.36"
 uuid = { version = "1", features = ["v4"] }
-rustafits = { path = "../../rustafits" }
+rustafits = { path = "../../rustafits", features = ["debug-pipeline"] }
 sha2 = "0.10"
 base64 = "0.22"
 jpeg-encode = { path = "../jpeg-encode" }
+memmap2 = "0.9"
+byteorder = "1"
+cdshealpix = "0.7"
+flate2 = "1.0"
+reqwest = { version = "0.12", features = ["blocking"] }
+
+[dev-dependencies]
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+imageproc = { version = "0.25", default-features = false }

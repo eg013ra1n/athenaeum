@@ -140,6 +140,22 @@ export interface ExportTemplate {
   description: string | null;
 }
 
+/** One file inside a duplicate group, enriched with the metadata the batch
+ *  deletion UI needs to apply keep-rules and display meaningful summaries. */
+export interface DuplicateFile {
+  fileId: number;
+  path: string;
+  filename: string;
+  modifiedAt: string; // ISO 8601
+  /** Longest-prefix match against scan_roots.path, or null if not inside one. */
+  scanRootId: number | null;
+  scanRootPath: string | null;
+  /** Raw IMAGETYP from the FITS header ("LIGHT", "FLAT", etc). */
+  imagetyp: string | null;
+  /** DATE-OBS as an RFC3339 string. */
+  dateObs: string | null;
+}
+
 export interface DuplicateGroup {
   id: number | null;
   size: number;
@@ -147,6 +163,23 @@ export interface DuplicateGroup {
   file_count: number;
   file_paths: string[];
   file_ids: number[];
+  /** Enriched per-file info. Empty for groups returned by legacy callers. */
+  files: DuplicateFile[];
+}
+
+/** Result of a bulk move-to-black-hole operation. */
+export interface BulkMoveResult {
+  moved: number;
+  /** (file_id, error message) pairs for rows that couldn't be moved. */
+  failed: Array<[number, string]>;
+}
+
+/** Payload for the `bulk-move-to-black-hole-progress` event. */
+export interface BulkMoveProgressEvent {
+  current: number;
+  total: number;
+  percent: number;
+  currentFile: string | null;
 }
 
 export interface BlackHoleEntry {
@@ -930,4 +963,31 @@ export interface CalibrationSetOriginals {
   binning: string | null;
   exptime: number | null;
   saved_at: string;  // ISO 8601
+}
+
+/**
+ * Row returned by the Missing Metadata endpoint. Same shape as FileWithFrame
+ * plus a duplicate-detection flag computed server-side (true when another
+ * file shares the same content_hash or metadata_hash).
+ */
+export interface MissingMetadataRow {
+  file: File;
+  frame: Frame;
+  hasDuplicate: boolean;
+}
+
+/**
+ * Bulk edits for light/calibration frame metadata in the `frames` table.
+ * Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type
+ * actions. `null`/omitted fields are left unchanged. Serde uses `camelCase`
+ * on the wire, matching Rust struct `FrameMetadataEdits`.
+ */
+export interface FrameMetadataEdits {
+  instrume?: string | null;
+  /** ISO 8601 / RFC 3339 datetime string */
+  dateObs?: string | null;
+  /** Raw IMAGETYP — "LIGHT" | "DARK" | "FLAT" | "BIAS" | "DARKFLAT" */
+  imagetyp?: string | null;
+  /** True when the frame type is a master variant (paired with imagetyp) */
+  isMaster?: boolean | null;
 }

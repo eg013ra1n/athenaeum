@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback } from 'react';
-import { FolderOpen, AlertTriangle } from 'lucide-react';
+import { FolderOpen, AlertTriangle, CheckCircle, MapPin } from 'lucide-react';
 import { revealItemInDir } from '../../api/desktop';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
@@ -312,6 +312,9 @@ export function LightsAnalysisTable({
                 <SortableHeader field="beta" label={`Moffat \u03B2`} currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
               </th>
             )}
+            <th scope="col" className="w-16 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
+              WCS
+            </th>
             <th scope="col" className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
               Locate
             </th>
@@ -401,6 +404,25 @@ export function LightsAnalysisTable({
                     {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '-'}
                   </td>
                 )}
+                <td className="w-16 px-1.5 py-1 text-center">
+                  {frame.ra != null && frame.dec != null ? (
+                    <span
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-success/15 text-success border border-success/40"
+                      title={`RA ${frame.ra.toFixed(4)}, Dec ${frame.dec.toFixed(4)}`}
+                    >
+                      <CheckCircle size={11} />
+                      WCS
+                    </span>
+                  ) : (
+                    <span
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-warning/15 text-warning border border-warning/40"
+                      title="No WCS coordinates"
+                    >
+                      <MapPin size={11} />
+                      No WCS
+                    </span>
+                  )}
+                </td>
                 <td className="w-12 px-1.5 py-1 text-center">
                   <button
                     onClick={e => handleReveal(e, frame.file_path)}

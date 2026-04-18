@@ -1,7 +1,7 @@
 // File route handlers — mirrors athenaeum-tauri/src/commands/files.rs
 
 use athenaeum_core::db;
-use athenaeum_core::models::FileWithFrame;
+use athenaeum_core::models::{FileWithFrame, FrameMetadataEdits, MissingMetadataRow};
 use axum::{extract::State, http::StatusCode, Json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -244,23 +244,69 @@ pub async fn get_camera_directory_contents(
 pub async fn get_frames_with_missing_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramesWithMissingMetadataArgs>,
-) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
+) -> Result<Json<Vec<MissingMetadataRow>>, (StatusCode, String)> {
     let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
-    let files = db::get_frames_with_missing_metadata(&conn, &args.category)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows = db::get_frames_with_missing_metadata(&conn, &args.category)
+        .map_err(|e| {
+            eprintln!("get_frames_with_missing_metadata route failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
-    Ok(Json(
-        files
-            .into_iter()
-            .map(|(file, frame)| FileWithFrame {
-                file,
-                frame: Some(frame),
-            })
-            .collect(),
-    ))
+    Ok(Json(rows))
+}
+
+// ── Bulk frame metadata edits ────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct BulkUpdateFrameMetadataArgs {
+    #[serde(rename = "frameIds")]
+    pub frame_ids: Vec<i64>,
+    pub edits: FrameMetadataEdits,
+}
+
+/// POST /api/bulk_update_frame_metadata
+///
+/// DB-only bulk update of camera / date_obs / imagetyp / is_master on the given
+/// frames. Used by the Missing Metadata page's Set Camera / Set Date / Set
+/// Frame Type actions. Returns the number of rows updated.
+pub async fn bulk_update_frame_metadata(
+    State(state): State<WebAppState>,
+    Json(args): Json<BulkUpdateFrameMetadataArgs>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    let count = db::bulk_update_frame_metadata(&conn, &args.frame_ids, &args.edits)
+        .map_err(|e| {
+            eprintln!("bulk_update_frame_metadata route failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    Ok(Json(count))
+}
+
+/// POST /api/get_distinct_instrumes
+///
+/// Returns the distinct non-empty INSTRUME values from the frames table,
+/// alphabetically sorted. Feeds the Set Camera modal dropdown.
+pub async fn get_distinct_instrumes(
+    State(state): State<WebAppState>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    let cameras = db::get_distinct_instrumes(&conn)
+        .map_err(|e| {
+            eprintln!("get_distinct_instrumes route failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    Ok(Json(cameras))
 }
 
 /// POST /api/get_files_with_frames_by_ids

@@ -1,0 +1,180 @@
+<h2>Plate Solving UI — Three Integration Points</h2>
+<p class="subtitle">Where plate solving surfaces in the existing Athenaeum interface</p>
+
+<div class="section">
+  <h3>1. Settings Page — New "Plate Solving" Tab</h3>
+  <p>Follows the existing tab pattern (general | calibration | analysis | <strong>plate solving</strong>)</p>
+  <div class="mockup">
+    <div class="mockup-header">Settings → Plate Solving</div>
+    <div class="mockup-body" style="padding: 20px; font-size: 13px;">
+      <div style="display: flex; gap: 24px;">
+        <!-- Left column: Catalog status -->
+        <div style="flex: 1;">
+          <div style="color: #7dd3fc; font-weight: 600; margin-bottom: 12px; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px;">Star Catalogs</div>
+
+          <div style="background: #1e293b; border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 3px solid #4ade80;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <div style="font-weight: 600;">Tycho-2</div>
+                <div style="color: #94a3b8; font-size: 12px;">~2.5M stars · V &lt; 11.5 · Public domain</div>
+              </div>
+              <span style="background: #166534; color: #4ade80; padding: 2px 8px; border-radius: 4px; font-size: 11px;">Bundled ✓</span>
+            </div>
+          </div>
+
+          <div style="background: #1e293b; border-radius: 8px; padding: 14px; margin-bottom: 10px; border-left: 3px solid #64748b;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <div style="font-weight: 600;">Gaia DR3</div>
+                <div style="color: #94a3b8; font-size: 12px;">~100M stars · mag &lt; 14 · ~1.2 GB download</div>
+              </div>
+              <span style="background: #334155; color: #94a3b8; padding: 2px 8px; border-radius: 4px; font-size: 11px;">Not installed</span>
+            </div>
+            <div style="color: #64748b; font-size: 11px; margin-top: 6px;">Available in future update</div>
+          </div>
+        </div>
+
+        <!-- Right column: Solver settings -->
+        <div style="flex: 1;">
+          <div style="color: #7dd3fc; font-weight: 600; margin-bottom: 12px; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px;">Solver Parameters</div>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+            <div>
+              <div style="color: #94a3b8; font-size: 11px; margin-bottom: 4px;">Algorithm</div>
+              <div style="background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; font-size: 12px;">
+                ▾ Quad Interior (tetra3)
+              </div>
+            </div>
+            <div>
+              <div style="color: #94a3b8; font-size: 11px; margin-bottom: 4px;">Max Stars</div>
+              <div style="background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; font-size: 12px;">100</div>
+            </div>
+            <div>
+              <div style="color: #94a3b8; font-size: 11px; margin-bottom: 4px;">SIP Order</div>
+              <div style="background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; font-size: 12px;">3</div>
+            </div>
+            <div>
+              <div style="color: #94a3b8; font-size: 11px; margin-bottom: 4px;">RANSAC Threshold (px)</div>
+              <div style="background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; font-size: 12px;">2.5</div>
+            </div>
+          </div>
+
+          <div style="margin-top: 14px;">
+            <div style="color: #94a3b8; font-size: 11px; margin-bottom: 4px;">Minimum Matched Stars</div>
+            <div style="background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; font-size: 12px; width: fit-content;">6</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>2. FileManager — Missing Metadata Batch Solve</h3>
+  <p>The existing "missing-metadata" tab already shows frames missing coordinates. Add a "Plate Solve All" action button.</p>
+  <div class="mockup">
+    <div class="mockup-header">File Manager → Missing Metadata → Coordinates</div>
+    <div class="mockup-body" style="padding: 16px; font-size: 13px;">
+      <!-- Filter bar -->
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <div style="display: flex; gap: 6px;">
+          <span style="background: #334155; padding: 4px 10px; border-radius: 4px; font-size: 11px;">All (47)</span>
+          <span style="background: #1e40af; padding: 4px 10px; border-radius: 4px; font-size: 11px; color: #93c5fd;">Coordinates (23)</span>
+          <span style="background: #334155; padding: 4px 10px; border-radius: 4px; font-size: 11px;">Object (8)</span>
+          <span style="background: #334155; padding: 4px 10px; border-radius: 4px; font-size: 11px;">DateTime (3)</span>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button style="background: #7c3aed; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer;">
+            ⟡ Plate Solve Selected (5)
+          </button>
+          <button style="background: #4f46e5; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer;">
+            ⟡ Plate Solve All (23)
+          </button>
+        </div>
+      </div>
+
+      <!-- Frame list -->
+      <div style="background: #0f172a; border-radius: 6px; overflow: hidden;">
+        <div style="display: grid; grid-template-columns: 24px 1fr 120px 80px 80px 100px; padding: 8px 12px; color: #64748b; font-size: 11px; border-bottom: 1px solid #1e293b;">
+          <div>☐</div><div>File</div><div>Camera</div><div>Exp</div><div>Filter</div><div>Status</div>
+        </div>
+        <div style="display: grid; grid-template-columns: 24px 1fr 120px 80px 80px 100px; padding: 8px 12px; border-bottom: 1px solid #1e293b;">
+          <div>☑</div><div style="color: #e2e8f0;">NGC7000_L_001.fits</div><div style="color: #94a3b8;">ASI2600MM</div><div style="color: #94a3b8;">300s</div><div style="color: #94a3b8;">L</div><div><span style="color: #f59e0b; font-size: 11px;">No coords</span></div>
+        </div>
+        <div style="display: grid; grid-template-columns: 24px 1fr 120px 80px 80px 100px; padding: 8px 12px; border-bottom: 1px solid #1e293b;">
+          <div>☑</div><div style="color: #e2e8f0;">NGC7000_L_002.fits</div><div style="color: #94a3b8;">ASI2600MM</div><div style="color: #94a3b8;">300s</div><div style="color: #94a3b8;">L</div><div><span style="color: #f59e0b; font-size: 11px;">No coords</span></div>
+        </div>
+        <div style="display: grid; grid-template-columns: 24px 1fr 120px 80px 80px 100px; padding: 8px 12px; border-bottom: 1px solid #1e293b;">
+          <div>☐</div><div style="color: #e2e8f0;">M31_Ha_001.fits</div><div style="color: #94a3b8;">ASI533MC</div><div style="color: #94a3b8;">600s</div><div style="color: #94a3b8;">Ha</div><div><span style="color: #4ade80; font-size: 11px;">Solving…</span></div>
+        </div>
+        <div style="display: grid; grid-template-columns: 24px 1fr 120px 80px 80px 100px; padding: 8px 12px;">
+          <div>☐</div><div style="color: #e2e8f0;">M31_Ha_002.fits</div><div style="color: #94a3b8;">ASI533MC</div><div style="color: #94a3b8;">600s</div><div style="color: #94a3b8;">Ha</div><div><span style="color: #64748b; font-size: 11px;">Queued</span></div>
+        </div>
+      </div>
+
+      <!-- Progress bar -->
+      <div style="margin-top: 12px; background: #1e293b; border-radius: 6px; padding: 10px 14px;">
+        <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px;">
+          <span>Plate solving: M31_Ha_001.fits</span>
+          <span style="color: #94a3b8;">3 / 23 · 12 matched stars · 0.3" RMS</span>
+        </div>
+        <div style="background: #334155; height: 4px; border-radius: 2px;">
+          <div style="background: #7c3aed; height: 4px; border-radius: 2px; width: 13%;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>3. Frame Set Detail — Per-Frame Solve</h3>
+  <p>In the calibration hierarchy view, individual frames get a "Plate Solve" action. Solved frames show coordinates + quality badge.</p>
+  <div class="mockup">
+    <div class="mockup-header">Frame Set: NGC 7000 → Light Frames</div>
+    <div class="mockup-body" style="padding: 16px; font-size: 13px;">
+      <div style="background: #0f172a; border-radius: 6px; overflow: hidden;">
+        <!-- Already solved frame -->
+        <div style="padding: 10px 14px; border-bottom: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <div style="color: #e2e8f0;">NGC7000_L_001.fits</div>
+            <div style="color: #94a3b8; font-size: 11px; margin-top: 2px;">
+              RA 20h58m47.2s · Dec +44°19'48" · 1.05"/px · 0.28" RMS
+              <span style="background: #166534; color: #4ade80; padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-left: 6px;">WCS ✓</span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <button style="background: #334155; color: #94a3b8; border: none; padding: 4px 10px; border-radius: 4px; font-size: 11px;">Re-solve</button>
+          </div>
+        </div>
+
+        <!-- Unsolved frame -->
+        <div style="padding: 10px 14px; border-bottom: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <div style="color: #e2e8f0;">NGC7000_L_002.fits</div>
+            <div style="color: #94a3b8; font-size: 11px; margin-top: 2px;">
+              No coordinates
+              <span style="background: #78350f; color: #f59e0b; padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-left: 6px;">No WCS</span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <button style="background: #7c3aed; color: white; border: none; padding: 4px 10px; border-radius: 4px; font-size: 11px;">Plate Solve</button>
+          </div>
+        </div>
+
+        <!-- Failed solve -->
+        <div style="padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <div style="color: #e2e8f0;">NGC7000_L_003.fits</div>
+            <div style="color: #94a3b8; font-size: 11px; margin-top: 2px;">
+              Failed: only 3 stars matched (minimum 6)
+              <span style="background: #7f1d1d; color: #f87171; padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-left: 6px;">Failed</span>
+            </div>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <button style="background: #7c3aed; color: white; border: none; padding: 4px 10px; border-radius: 4px; font-size: 11px;">Retry</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

@@ -7,6 +7,8 @@ import { ExportProgressProvider } from '../contexts/ExportProgressContext';
 import { ExportProgressIndicator } from './ExportProgressIndicator';
 import { AnalysisProgressProvider } from '../contexts/AnalysisProgressContext';
 import { AnalysisQueueIndicator } from './AnalysisQueueIndicator';
+import { PlateSolveProgressProvider } from '../contexts/PlateSolveProgressContext';
+import { PlateSolveQueueIndicator } from './PlateSolveQueueIndicator';
 import Logo from '../assets/athenaeum.png';
 
 export default function Layout() {
@@ -34,6 +36,7 @@ export default function Layout() {
     <ScanProgressProvider>
       <ExportProgressProvider>
         <AnalysisProgressProvider>
+        <PlateSolveProgressProvider>
         <div className="flex h-screen bg-surface text-content">
           {/* Sidebar Navigation */}
           <aside
@@ -70,6 +73,7 @@ export default function Layout() {
             </nav>
 
             <AnalysisQueueIndicator collapsed={collapsed} />
+            <PlateSolveQueueIndicator collapsed={collapsed} />
 
             <div className={`${collapsed ? 'p-2' : 'p-4'} pt-0`}>
               <button
@@ -93,6 +97,7 @@ export default function Layout() {
           <ScanProgressIndicator />
           <ExportProgressIndicator />
         </div>
+        </PlateSolveProgressProvider>
         </AnalysisProgressProvider>
       </ExportProgressProvider>
     </ScanProgressProvider>

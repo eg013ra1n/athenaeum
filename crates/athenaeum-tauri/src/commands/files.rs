@@ -43,21 +43,52 @@ pub async fn get_files_by_directory(
 }
 
 /// Get frames with missing metadata
-/// category: "all", "coordinates", "object", "datetime", "instrument"
+/// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
 #[tauri::command]
 pub async fn get_frames_with_missing_metadata(
     category: String,
     state: State<'_, AppState>,
-) -> Result<Vec<FileWithFrame>, String> {
+) -> Result<Vec<MissingMetadataRow>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    let files = db::get_frames_with_missing_metadata(&conn, &category).map_err(|e| e.to_string())?;
+    db::get_frames_with_missing_metadata(&conn, &category).map_err(|e| {
+        eprintln!("get_frames_with_missing_metadata failed: {}", e);
+        e.to_string()
+    })
+}
 
-    Ok(files
-        .into_iter()
-        .map(|(file, frame)| FileWithFrame { file: file, frame: Some(frame) })
-        .collect())
+/// Bulk-update metadata fields (camera / date_obs / imagetyp / is_master) on
+/// a set of frames. DB-only — the FITS files on disk are NOT rewritten.
+/// Returns the number of rows updated.
+#[tauri::command]
+pub async fn bulk_update_frame_metadata(
+    frame_ids: Vec<i64>,
+    edits: FrameMetadataEdits,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::bulk_update_frame_metadata(&conn, &frame_ids, &edits).map_err(|e| {
+        eprintln!("bulk_update_frame_metadata command failed: {}", e);
+        e.to_string()
+    })
+}
+
+/// Return the distinct non-empty INSTRUME values from the `frames` table,
+/// alphabetically sorted. Feeds the Set Camera modal's existing-cameras list.
+#[tauri::command]
+pub async fn get_distinct_instrumes(
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_distinct_instrumes(&conn).map_err(|e| {
+        eprintln!("get_distinct_instrumes command failed: {}", e);
+        e.to_string()
+    })
 }
 
 /// Get duplicate file groups (from cache)

@@ -68,6 +68,9 @@ pub fn run() {
                     active_scans: Arc::new(Mutex::new(HashMap::new())),
                     active_exports: Arc::new(Mutex::new(HashMap::new())),
                     active_analyses: Arc::new(Mutex::new(HashMap::new())),
+                    active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+                    quad_index: Arc::new(std::sync::RwLock::new(None)),
+                    dso_catalog: Arc::new(std::sync::RwLock::new(None)),
                     image_pool: Arc::new(
                         rayon::ThreadPoolBuilder::new()
                             .num_threads(max_threads)
@@ -146,6 +149,8 @@ pub fn run() {
             commands::get_files,
             commands::get_files_by_directory,
             commands::get_frames_with_missing_metadata,
+            commands::bulk_update_frame_metadata,
+            commands::get_distinct_instrumes,
             commands::get_duplicates,
             commands::get_directory_contents,
             commands::get_camera_directories,
@@ -189,6 +194,7 @@ pub fn run() {
             commands::set_scan_root_duplicates_flag,
             commands::set_scan_root_unique_camera_flag,
             commands::move_to_black_hole,
+            commands::bulk_move_to_black_hole,
             commands::get_black_hole_files,
             commands::get_blackholed_file_ids,
             commands::restore_from_black_hole,
@@ -267,6 +273,20 @@ pub fn run() {
             commands::get_analysis_for_frame_set,
             commands::delete_analysis_for_frame_set,
             commands::get_frame_star_metrics,
+            // Plate solve commands
+            commands::get_plate_solve_config,
+            commands::set_plate_solve_config,
+            commands::reset_plate_solve_config,
+            commands::plate_solve_frame,
+            commands::plate_solve_batch,
+            commands::cancel_plate_solve,
+            commands::autofind_objects_from_coordinates,
+            commands::cancel_autofind_objects,
+            commands::get_plate_solve_result,
+            commands::get_catalog_status,
+            commands::download_tycho2_catalog,
+            commands::get_quad_index_status,
+            commands::build_quad_index,
             commands_rustafits::read_fits_image_rustafits,
         ])
         .run(tauri::generate_context!())
