@@ -6,19 +6,24 @@
 use std::sync::{Arc, RwLock};
 
 // Re-export core service types so commands can use them directly
-pub use athenaeum_core::services::{ServiceContext, ScanHandle, ExportHandle};
+pub use athenaeum_core::services::{ServiceContext, ExportHandle};
 
 /// Tauri-specific app state wrapping the shared ServiceContext.
 ///
 /// The `ctx` field holds all backend-agnostic state. Tauri-only fields
-/// (semaphore, max_blink_threads) live here alongside it.
+/// (semaphore, max_blink_threads) live here alongside it. `ctx` is `Arc`-wrapped
+/// so background tasks (monitor service, etc.) can hold their own reference.
 pub struct AppState {
-    pub ctx: ServiceContext,
+    pub ctx: Arc<ServiceContext>,
     /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
     /// can be swapped at runtime when the user changes blink.threads.
     pub image_semaphore: RwLock<Arc<tokio::sync::Semaphore>>,
     /// CPU-based upper bound for blink threads (min(vCPUs, 16))
     pub max_blink_threads: usize,
+    /// Handle to the background folder-monitoring service. Commands use this
+    /// to `kick()` the loop awake when settings change so the user doesn't
+    /// have to wait for the next scheduled tick.
+    pub monitor: athenaeum_core::monitor::MonitorService,
 }
 
 pub mod core;

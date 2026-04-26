@@ -91,6 +91,21 @@ export function useScanRoots() {
     }
   }, []);
 
+  const toggleMonitorEnabled = useCallback(async (id: number, enabled: boolean): Promise<void> => {
+    try {
+      await api.invoke('set_scan_root_monitor_enabled', { id, enabled });
+      setScanRoots((prev) =>
+        prev.map((root) =>
+          root.id === id ? { ...root, monitor_enabled: enabled } : root
+        )
+      );
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    }
+  }, []);
+
   useEffect(() => {
     fetchScanRoots();
   }, [fetchScanRoots]);
@@ -103,6 +118,7 @@ export function useScanRoots() {
     deleteScanRoot,
     toggleDuplicatesFlag,
     toggleUniqueCameraFlag,
+    toggleMonitorEnabled,
     refresh: fetchScanRoots,
   };
 }
@@ -199,6 +215,21 @@ export function useScanRootsWithAvailability() {
     }
   }, []);
 
+  const toggleMonitorEnabled = useCallback(async (id: number, enabled: boolean): Promise<void> => {
+    try {
+      await api.invoke('set_scan_root_monitor_enabled', { id, enabled });
+      setScanRoots((prev) =>
+        prev.map((root) =>
+          root.id === id ? { ...root, monitor_enabled: enabled } : root
+        )
+      );
+      setError(null);
+    } catch (e) {
+      setError(e as string);
+      throw e;
+    }
+  }, []);
+
   const relinkScanRoot = useCallback(async (rootId: number, newPath: string) => {
     try {
       setLoading(true);
@@ -239,6 +270,7 @@ export function useScanRootsWithAvailability() {
     deleteScanRoot,
     toggleDuplicatesFlag,
     toggleUniqueCameraFlag,
+    toggleMonitorEnabled,
     relinkScanRoot,
     refresh: fetchScanRootsWithAvailability,
   };

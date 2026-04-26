@@ -1221,3 +1221,186 @@ pub async fn unarchive_frame_set(
     athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, false).map_err(db_err)?;
     Ok(Json(()))
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 2: auto-merge web mirror
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct FindNewFramesArgs {
+    pub frames_set_id: i64,
+    pub scan_first: bool,
+}
+
+/// POST /api/find_new_frames_for_set — mirror of the Tauri command.
+///
+/// Note: in web mode the "scan disks first" option awaits any in-flight
+/// scans but does not itself fire a fresh scan — callers can use the
+/// existing /api/start_scan_with_progress route for that explicitly. This
+/// keeps the request bounded (a fresh scan over many NAS roots would tie up
+/// an Axum worker for minutes).
+pub async fn find_new_frames_for_set(
+    State(state): State<WebAppState>,
+    Json(args): Json<FindNewFramesArgs>,
+) -> Result<Json<athenaeum_core::models::FindNewFramesResult>, (StatusCode, String)> {
+    let mut scan_was_awaited = false;
+
+    if args.scan_first {
+        let active_initially = {
+            let scans = state.ctx.active_scans.lock().unwrap();
+            !scans.is_empty()
+        };
+
+        if active_initially {
+            scan_was_awaited = true;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+            loop {
+                let still_active = {
+                    let scans = state.ctx.active_scans.lock().unwrap();
+                    !scans.is_empty()
+                };
+                if !still_active {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Timed out waiting for active scan to finish".to_string(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+    let threshold_deg = state
+        .ctx
+        .settings
+        .get_grouping_threshold_deg(&conn)
+        .map_err(db_err)?;
+    let candidates = athenaeum_core::auto_merge::find_candidates_for_set(
+        &conn,
+        args.frames_set_id,
+        threshold_deg,
+    )
+    .map_err(db_err)?;
+
+    Ok(Json(athenaeum_core::models::FindNewFramesResult {
+        candidates,
+        scan_was_awaited,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct AutoMergeArgs {
+    pub frames_set_id: i64,
+    pub frame_ids: Vec<i64>,
+    pub source: String,
+}
+
+/// POST /api/auto_merge_new_frames_for_set
+pub async fn auto_merge_new_frames_for_set(
+    State(state): State<WebAppState>,
+    Json(args): Json<AutoMergeArgs>,
+) -> Result<Json<athenaeum_core::models::MergeReport>, (StatusCode, String)> {
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
+
+    let candidates = {
+        let conn = db_ref.conn();
+        let threshold_deg = state
+            .ctx
+            .settings
+            .get_grouping_threshold_deg(&conn)
+            .map_err(db_err)?;
+        let all = athenaeum_core::auto_merge::find_candidates_for_set(
+            &conn,
+            args.frames_set_id,
+            threshold_deg,
+        )
+        .map_err(db_err)?;
+        let wanted: std::collections::HashSet<i64> = args.frame_ids.iter().copied().collect();
+        all.into_iter()
+            .filter(|c| wanted.contains(&c.frame_id))
+            .collect::<Vec<_>>()
+    };
+
+    let threshold_arcmin = {
+        let conn = db_ref.conn();
+        state
+            .ctx
+            .settings
+            .get_grouping_threshold_arcsec(&conn)
+            .map_err(db_err)?
+            / 60.0
+    };
+    let gap_hours = {
+        let conn = db_ref.conn();
+        state
+            .ctx
+            .settings
+            .get_session_gap_threshold_hours(&conn)
+            .unwrap_or(6.0)
+    };
+
+    let frames_set_name: Option<String> = {
+        let conn = db_ref.conn();
+        conn.query_row(
+            "SELECT name FROM frames_set WHERE id = ?1",
+            rusqlite::params![args.frames_set_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    let mut conn = db_ref.conn();
+    let report = athenaeum_core::auto_merge::merge_candidates(
+        &mut conn,
+        args.frames_set_id,
+        candidates,
+        &args.source,
+        threshold_arcmin,
+        gap_hours,
+    )
+    .map_err(db_err)?;
+
+    if report.added_count > 0 {
+        let payload = athenaeum_core::monitor::orchestrator::AutoMergeCompleteEvent {
+            frames_set_id: args.frames_set_id,
+            frames_set_name,
+            source: report.source.clone(),
+            added_count: report.added_count,
+            skipped_count: report.skipped_count,
+            threshold_arcmin,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let emitter = crate::events::SseProgressEmitter::new(state.event_tx.clone());
+        athenaeum_core::events::emit_event(&emitter, "auto-merge-complete", &payload);
+    }
+
+    Ok(Json(report))
+}
+
+#[derive(Deserialize)]
+pub struct GetMergeLogArgs {
+    pub frames_set_id: i64,
+    pub limit: Option<i64>,
+}
+
+/// POST /api/get_frame_set_merge_log
+pub async fn get_frame_set_merge_log(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetMergeLogArgs>,
+) -> Result<Json<Vec<athenaeum_core::models::MergeLogEntry>>, (StatusCode, String)> {
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+    let entries = athenaeum_core::auto_merge::log_ops::get_log_entries(
+        &conn,
+        args.frames_set_id,
+        args.limit,
+    )
+    .map_err(db_err)?;
+    Ok(Json(entries))
+}

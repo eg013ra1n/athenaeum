@@ -17,6 +17,8 @@ pub mod frames_set_merge;
 pub mod logging;
 pub mod events;
 pub mod scanner;
+pub mod monitor;
+pub mod auto_merge;
 pub mod export;
 pub mod rustafits_processor;
 pub mod cache;

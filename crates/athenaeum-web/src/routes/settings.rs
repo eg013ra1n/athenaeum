@@ -77,6 +77,12 @@ pub async fn set_setting(
     } else if args.key == settings::keys::BLINK_MEMORY_RETENTION_MINUTES {
         let minutes: u64 = args.value.parse().unwrap_or(30);
         state.ctx.memory_cache.lock().unwrap().set_retention(minutes);
+    } else if args.key == settings::keys::MONITORING_INTERVAL_MINUTES
+        || args.key == settings::keys::MONITORING_ENABLED_GLOBAL
+    {
+        // Wake the monitor loop so the new interval / enabled flag takes
+        // effect now instead of after the current sleep expires.
+        state.monitor.kick();
     }
 
     Ok(Json(()))

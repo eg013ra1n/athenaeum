@@ -27,6 +27,10 @@ export default function Settings() {
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
   const [checkBeta, setCheckBeta] = useState(false);
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
+  const [monitoringIntervalMinutes, setMonitoringIntervalMinutes] = useState('10');
+  const [monitoringEnabledGlobal, setMonitoringEnabledGlobal] = useState(true);
+  const [autoMergeOnButtonClick, setAutoMergeOnButtonClick] = useState(false);
+  const [autoMergeOnMonitorDetect, setAutoMergeOnMonitorDetect] = useState(false);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -124,6 +128,34 @@ export default function Settings() {
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
       setCheckBeta(checkBetaVal.toLowerCase() === 'true');
+
+      // Load monitoring settings
+      try {
+        const [intervalVal, enabledVal, mergeButton, mergeMonitor] = await Promise.all([
+          api.invoke<string>('get_setting', {
+            key: 'monitoring.interval_minutes',
+            defaultValue: '10',
+          }),
+          api.invoke<string>('get_setting', {
+            key: 'monitoring.enabled_global',
+            defaultValue: 'true',
+          }),
+          api.invoke<string>('get_setting', {
+            key: 'auto_merge.on_button_click',
+            defaultValue: 'false',
+          }),
+          api.invoke<string>('get_setting', {
+            key: 'auto_merge.on_monitor_detect',
+            defaultValue: 'false',
+          }),
+        ]);
+        setMonitoringIntervalMinutes(intervalVal);
+        setMonitoringEnabledGlobal(enabledVal.toLowerCase() === 'true');
+        setAutoMergeOnButtonClick(mergeButton.toLowerCase() === 'true');
+        setAutoMergeOnMonitorDetect(mergeMonitor.toLowerCase() === 'true');
+      } catch {
+        // ignore, use defaults
+      }
 
       // Load annotation settings
       try {
@@ -259,6 +291,22 @@ export default function Settings() {
         api.invoke('set_setting', {
           key: 'blink.annotation_config',
           value: JSON.stringify(annotationSettings),
+        }),
+        api.invoke('set_setting', {
+          key: 'monitoring.interval_minutes',
+          value: monitoringIntervalMinutes,
+        }),
+        api.invoke('set_setting', {
+          key: 'monitoring.enabled_global',
+          value: monitoringEnabledGlobal ? 'true' : 'false',
+        }),
+        api.invoke('set_setting', {
+          key: 'auto_merge.on_button_click',
+          value: autoMergeOnButtonClick ? 'true' : 'false',
+        }),
+        api.invoke('set_setting', {
+          key: 'auto_merge.on_monitor_detect',
+          value: autoMergeOnMonitorDetect ? 'true' : 'false',
         }),
       ]);
 
@@ -546,6 +594,101 @@ export default function Settings() {
                 is 6 hours.
               </p>
             </div>
+          </div>
+        </div>
+
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Monitoring</h3>
+
+          <div className="space-y-4">
+            {/* Global enable switch */}
+            <div>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={monitoringEnabledGlobal}
+                  onChange={(e) => setMonitoringEnabledGlobal(e.target.checked)}
+                  className="w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
+                />
+                <span className="text-sm font-medium text-content-secondary">
+                  Enable background monitoring
+                </span>
+              </label>
+              <p className="text-xs text-content-muted mt-2">
+                Master switch. When off, no scan roots are polled even if individually marked
+                as "Monitor". New files are still picked up on manual scan.
+              </p>
+            </div>
+
+            {/* Polling interval */}
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Polling interval (minutes)
+              </label>
+              <input
+                type="number"
+                min="1"
+                max="1440"
+                step="1"
+                value={monitoringIntervalMinutes}
+                onChange={(e) => setMonitoringIntervalMinutes(e.target.value)}
+                disabled={!monitoringEnabledGlobal}
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent disabled:opacity-50"
+              />
+              <p className="text-xs text-content-muted mt-2">
+                How often to re-scan each monitor-enabled folder for new files. The scanner
+                is idempotent, so short intervals are fine on local drives but may be costly
+                for large NAS directories. Default is 10 minutes.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Auto-merge</h3>
+          <p className="text-xs text-content-muted mb-3">
+            When enabled, new unclustered light frames that fall within the grouping
+            threshold of an existing frame set are automatically attached to that set.
+            Every merge is recorded in the frame set's History tab so you can audit what
+            the algorithm did. Both settings default to off.
+          </p>
+          <div className="space-y-3">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoMergeOnButtonClick}
+                onChange={(e) => setAutoMergeOnButtonClick(e.target.checked)}
+                className="mt-0.5 w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
+              />
+              <div>
+                <span className="text-sm font-medium text-content-secondary">
+                  Skip confirmation on "Find new images"
+                </span>
+                <p className="text-xs text-content-muted mt-0.5">
+                  When on, clicking the button merges all candidates immediately without
+                  showing a preview dialog.
+                </p>
+              </div>
+            </label>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoMergeOnMonitorDetect}
+                onChange={(e) => setAutoMergeOnMonitorDetect(e.target.checked)}
+                className="mt-0.5 w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
+              />
+              <div>
+                <span className="text-sm font-medium text-content-secondary">
+                  Auto-attach during background monitoring
+                </span>
+                <p className="text-xs text-content-muted mt-0.5">
+                  When on, background scans that discover new lights automatically attach
+                  them to the nearest matching frame set (within the grouping threshold)
+                  without user intervention. You'll see a toast + notification bell entry
+                  for each auto-merge.
+                </p>
+              </div>
+            </label>
           </div>
         </div>
 

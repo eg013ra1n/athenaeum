@@ -2,12 +2,9 @@
 
 use athenaeum_core::db;
 use athenaeum_core::models::ScanRoot;
-use athenaeum_core::scanner::scan_directory_parallel;
-use athenaeum_core::services::ScanHandle;
 use axum::{extract::State, http::StatusCode, Json};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::events::SseProgressEmitter;
 use crate::WebAppState;
@@ -149,6 +146,7 @@ pub async fn add_scan_root(
         unique_camera: false,
         last_scan: None,
         last_scan_errors: None,
+        monitor_enabled: false,
     }))
 }
 
@@ -197,106 +195,36 @@ pub async fn start_scan_with_progress(
     Json(args): Json<StartScanArgs>,
 ) -> Result<Json<ScanResultDto>, (StatusCode, String)> {
     let root_id = args.root_id;
+    let emitter = SseProgressEmitter::new(state.event_tx.clone());
 
-    // Reject duplicate concurrent scans for the same root
-    {
-        let scans = state.ctx.active_scans.lock().unwrap();
-        if scans.contains_key(&root_id) {
-            return Err((StatusCode::CONFLICT, "Scan already in progress for this root".to_string()));
-        }
-    }
-
-    // Create cancellation flag and register the handle
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut scans = state.ctx.active_scans.lock().unwrap();
-        scans.insert(
-            root_id,
-            ScanHandle {
-                root_id,
-                cancel_flag: cancel_flag.clone(),
-            },
-        );
-    }
-
-    // Gather everything needed before entering the blocking task
-    let (scan_result, reconcile) = {
-        let db = state.ctx.db.get().ok_or_else(|| {
-            // Clean up active scan registration on early error
-            let mut scans = state.ctx.active_scans.lock().unwrap();
-            scans.remove(&root_id);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string())
+    let outcome = athenaeum_core::scanner::run_registered_scan(&state.ctx, &emitter, root_id)
+        .map_err(|e| {
+            let status = if e.contains("already in progress") {
+                StatusCode::CONFLICT
+            } else if e.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, e)
         })?;
+    let mut scan_result = outcome.result;
+    let reconcile = outcome.reconcile;
+
+    // Interactive-only follow-up: rebuild calibration sets if reconciliation renamed frames.
+    if reconcile.frames_renamed > 0 {
+        let db = state.ctx.db.get().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database not initialized".to_string(),
+        ))?;
         let conn = db.conn();
-
-        // Reconcile unique_camera instrume suffix state before scanning
-        let reconcile = db::reconcile_unique_camera_instrume(&conn, root_id)
-            .map_err(|e| {
-                let mut scans = state.ctx.active_scans.lock().unwrap();
-                scans.remove(&root_id);
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Reconciliation failed: {}", e))
-            })?;
-
-        let roots = db::get_scan_roots(&conn).map_err(|e| {
-            let mut scans = state.ctx.active_scans.lock().unwrap();
-            scans.remove(&root_id);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-        let root = roots
-            .into_iter()
-            .find(|r| r.id == Some(root_id))
-            .ok_or_else(|| {
-                let mut scans = state.ctx.active_scans.lock().unwrap();
-                scans.remove(&root_id);
-                (StatusCode::NOT_FOUND, "Scan root not found".to_string())
-            })?;
-
-        let use_content_hash = state.ctx.settings
-            .get_duplicates_use_content_hash(&conn)
-            .unwrap_or(false);
-
-        let emitter = SseProgressEmitter::new(state.event_tx.clone());
-
-        // scan_directory_parallel holds the Connection reference for its full
-        // duration, so it must run while the DB lock is held. The lock is
-        // released when `lock` drops at the end of this block.
-        let mut result = scan_directory_parallel(
-            Path::new(&root.path),
-            root_id,
-            &conn,
-            &emitter,
-            use_content_hash,
-            cancel_flag,
-            root.unique_camera,
-        );
-
-        // If reconciliation changed frames, wipe and rebuild calibration sets
-        if reconcile.frames_renamed > 0 {
-            if let Err(e) = db::delete_calibration_sets_for_root(&conn, root_id) {
-                eprintln!("Failed to delete cal sets for root {}: {}", root_id, e);
-            }
-            match recreate_calibration_sets_for_root(&conn, root_id) {
-                Ok(count) => result.calibration_sets_created = count,
-                Err(e) => eprintln!("Failed to recreate cal sets for root {}: {}", root_id, e),
-            }
+        if let Err(e) = db::delete_calibration_sets_for_root(&conn, root_id) {
+            eprintln!("Failed to delete cal sets for root {}: {}", root_id, e);
         }
-
-        // Persist last-scan timestamp and any errors
-        if let Err(e) = db::update_scan_root_timestamp(&conn, root_id) {
-            eprintln!("Failed to update scan root timestamp for root {}: {}", root_id, e);
+        match recreate_calibration_sets_for_root(&conn, root_id) {
+            Ok(count) => scan_result.calibration_sets_created = count,
+            Err(e) => eprintln!("Failed to recreate cal sets for root {}: {}", root_id, e),
         }
-        if let Err(e) = db::update_scan_root_errors(&conn, root_id, &result.errors) {
-            eprintln!("Failed to persist scan errors for root {}: {}", root_id, e);
-        }
-
-        (result, reconcile)
-    };
-
-    // Deregister the active scan
-    {
-        let mut scans = state.ctx.active_scans.lock().unwrap();
-        scans.remove(&root_id);
     }
 
     Ok(Json(ScanResultDto {
@@ -496,6 +424,37 @@ pub async fn get_active_scans(
 ) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
     let scans = state.ctx.active_scans.lock().unwrap();
     Ok(Json(scans.keys().cloned().collect()))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetMonitorEnabledArgs {
+    pub id: i64,
+    pub enabled: bool,
+}
+
+/// POST /api/set_scan_root_monitor_enabled
+///
+/// Toggle the background-monitoring flag for a scan root. The monitor service
+/// picks up the new value on its next tick.
+pub async fn set_scan_root_monitor_enabled(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetMonitorEnabledArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database not initialized".to_string(),
+    ))?;
+    let conn = db.conn();
+    db::set_scan_root_monitor_enabled(&conn, args.id, args.enabled)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Wake the monitor loop so the user gets an immediate scan instead of
+    // waiting for the current sleep to finish. Only relevant when enabling.
+    if args.enabled {
+        state.monitor.kick();
+    }
+
+    Ok(Json(()))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

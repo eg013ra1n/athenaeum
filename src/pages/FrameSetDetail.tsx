@@ -1,17 +1,19 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis } from '../types/models';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search } from 'lucide-react';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
+import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
+import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
 import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../components/calibration/utils';
 
-type FrameSetTab = 'calibration' | 'analysis';
+type FrameSetTab = 'calibration' | 'analysis' | 'history';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -56,6 +58,63 @@ export default function FrameSetDetail() {
 
   // Tab state
   const [activeTab, setActiveTab] = useState<FrameSetTab>('analysis');
+  const [showFindNewDialog, setShowFindNewDialog] = useState(false);
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
+  const [findNewBusy, setFindNewBusy] = useState(false);
+
+  // Handle "Find new images" click: if the user has trusted auto-merge for
+  // the button path, skip the preview dialog and merge directly; otherwise,
+  // open the dialog for manual confirmation.
+  const handleFindNewClick = useCallback(async () => {
+    const trustSetting = await api.invoke<string>('get_setting', {
+      key: 'auto_merge.on_button_click',
+      defaultValue: 'false',
+    });
+    if (trustSetting.toLowerCase() !== 'true') {
+      setShowFindNewDialog(true);
+      return;
+    }
+
+    setFindNewBusy(true);
+    try {
+      const result = await api.invoke<FindNewFramesResult>('find_new_frames_for_set', {
+        framesSetId: parseInt(id!),
+        scanFirst: false,
+      });
+      if (result.candidates.length === 0) {
+        setAlertDialog({
+          isOpen: true,
+          title: 'No new images',
+          message: 'No unclustered lights match this target\'s coordinates.',
+          variant: 'info',
+        });
+        return;
+      }
+      const report = await api.invoke<MergeReport>('auto_merge_new_frames_for_set', {
+        framesSetId: parseInt(id!),
+        frameIds: result.candidates.map((c) => c.frame_id),
+        source: 'button',
+      });
+      loadData();
+      setHistoryRefreshKey((k) => k + 1);
+      setAlertDialog({
+        isOpen: true,
+        title: 'Merge complete',
+        message: `Added ${report.added_count} frame${report.added_count === 1 ? '' : 's'}${report.skipped_count ? `, skipped ${report.skipped_count}` : ''}. See the History tab for details.`,
+        variant: 'info',
+      });
+    } catch (e) {
+      setAlertDialog({
+        isOpen: true,
+        title: 'Find new images failed',
+        message: String(e),
+        variant: 'error',
+      });
+    } finally {
+      setFindNewBusy(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
 
   // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
   const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
@@ -440,16 +499,34 @@ export default function FrameSetDetail() {
               </div>
             )}
           </div>
-          <div className="flex items-center gap-1.5 text-sm text-content-muted">
-            <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
-            <span>·</span>
-            <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
-            <span>·</span>
-            <span><span className="font-medium text-warning">{calibrationHierarchy?.uncalibrated_frames ?? '-'}</span> uncalibrated</span>
-            <span>·</span>
-            <span><span className="font-medium text-accent">{calibrationHierarchy?.date_groups.length ?? '-'}</span> sessions</span>
-            <span>·</span>
-            <span className="font-medium text-content">{formatExposureTime(detail.frames_set?.total_exp_time)}</span>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleFindNewClick}
+              disabled={
+                findNewBusy || !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+              }
+              title={
+                !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+                  ? 'No coordinates — nothing to match against'
+                  : 'Find new images for this object'
+              }
+              className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Search size={14} />
+              {findNewBusy ? 'Merging…' : 'Find new images'}
+            </button>
+            <div className="flex items-center gap-1.5 text-sm text-content-muted">
+              <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
+              <span>·</span>
+              <span><span className="font-medium text-success">{calibrationHierarchy?.calibrated_frames ?? '-'}</span> calibrated</span>
+              <span>·</span>
+              <span><span className="font-medium text-warning">{calibrationHierarchy?.uncalibrated_frames ?? '-'}</span> uncalibrated</span>
+              <span>·</span>
+              <span><span className="font-medium text-accent">{calibrationHierarchy?.date_groups.length ?? '-'}</span> sessions</span>
+              <span>·</span>
+              <span className="font-medium text-content">{formatExposureTime(detail.frames_set?.total_exp_time)}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -459,6 +536,7 @@ export default function FrameSetDetail() {
         {([
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
           { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
+          { key: 'history' as FrameSetTab, label: 'History', icon: History },
         ]).map(({ key, label, icon: Icon }) => (
           <button
             key={key}
@@ -483,7 +561,9 @@ export default function FrameSetDetail() {
             <p className="text-content-muted">Loading calibration data...</p>
           </div>
         ) : calibrationHierarchy ? (
-          activeTab === 'calibration' ? (
+          activeTab === 'history' ? (
+            <FrameSetHistoryTab key={historyRefreshKey} frameSetId={parseInt(id!)} />
+          ) : activeTab === 'calibration' ? (
             <CalibrationHierarchyViewComponent
               data={calibrationHierarchy}
               blackholedFileIds={blackholedFileIds}
@@ -654,6 +734,27 @@ export default function FrameSetDetail() {
         variant={alertDialog.variant}
         onClose={() => setAlertDialog({ ...alertDialog, isOpen: false })}
       />
+
+      {/* Find New Images Dialog */}
+      {showFindNewDialog && (
+        <FindNewImagesDialog
+          frameSetId={parseInt(id!)}
+          frameSetName={detail.frames_set?.name || 'Untitled'}
+          onClose={() => setShowFindNewDialog(false)}
+          onMerged={(report) => {
+            setShowFindNewDialog(false);
+            // Refresh frame set detail + history list
+            loadData();
+            setHistoryRefreshKey((k) => k + 1);
+            setAlertDialog({
+              isOpen: true,
+              title: 'Merge complete',
+              message: `Added ${report.added_count} frame${report.added_count === 1 ? '' : 's'}${report.skipped_count ? `, skipped ${report.skipped_count}` : ''}. See the History tab for details.`,
+              variant: 'info',
+            });
+          }}
+        />
+      )}
     </div>
   );
 }

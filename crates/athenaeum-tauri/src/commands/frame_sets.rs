@@ -1208,3 +1208,204 @@ pub struct ReclassifyResult {
     pub frames_updated: usize,
     pub cameras_refreshed: Vec<String>,
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 2: auto-merge — find new images for a frame set and optionally merge
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Find LIGHT frames in the catalog that would match this frame set by
+/// coordinate proximity but aren't currently in any set.
+///
+/// When `scan_first` is true, the caller wants disks re-scanned before
+/// matching. To avoid duplicate scan work:
+///  - if any monitor-enabled root is already being scanned, wait for all
+///    active scans to finish (polling `active_scans` every 500 ms, 5 min cap)
+///  - otherwise, run one scan cycle across all monitor-enabled roots, then
+///    do the match
+/// The returned `scan_was_awaited` flag tells the UI whether it waited vs.
+/// triggered a fresh scan, so the "Waiting for running scan…" banner can be
+/// shown accurately.
+#[tauri::command]
+pub async fn find_new_frames_for_set(
+    frames_set_id: i64,
+    scan_first: bool,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<FindNewFramesResult, String> {
+    let mut scan_was_awaited = false;
+
+    if scan_first {
+        // Check whether any active scan is running. If so, await completion
+        // instead of firing another scan on the same root.
+        let active_initially = {
+            let scans = state.ctx.active_scans.lock().unwrap();
+            !scans.is_empty()
+        };
+
+        if active_initially {
+            scan_was_awaited = true;
+            // Poll until no active scans remain. Cap at 5 minutes.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+            loop {
+                let still_active = {
+                    let scans = state.ctx.active_scans.lock().unwrap();
+                    !scans.is_empty()
+                };
+                if !still_active {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("Timed out waiting for active scan to finish".to_string());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        } else {
+            // No scan running — kick off a scan on each monitor-enabled root.
+            // The scanner is idempotent, so this is cheap on unchanged dirs.
+            let roots: Vec<i64> = {
+                let db = state.ctx.db.get().ok_or("Database not initialized")?;
+                let conn = db.conn();
+                db::get_scan_roots(&conn)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .filter(|r| r.enabled && r.monitor_enabled)
+                    .filter_map(|r| r.id)
+                    .collect()
+            };
+
+            let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
+            for root_id in roots {
+                if let Err(e) = crate::scanner::run_registered_scan(&state.ctx, &emitter, root_id) {
+                    if !e.contains("already in progress") {
+                        eprintln!("[find_new_frames] scan of root {} failed: {}", root_id, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Match pass: unclustered lights within the configured threshold.
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    let threshold_deg = state
+        .ctx
+        .settings
+        .get_grouping_threshold_deg(&conn)
+        .map_err(|e| format!("Failed to read threshold: {}", e))?;
+
+    let candidates = crate::auto_merge::find_candidates_for_set(&conn, frames_set_id, threshold_deg)
+        .map_err(|e| format!("Failed to find candidates: {}", e))?;
+
+    Ok(FindNewFramesResult {
+        candidates,
+        scan_was_awaited,
+    })
+}
+
+/// Attach the given frames to the frame set (via session detection + append)
+/// and record an audit-log entry. `source` must be "button" or "monitor".
+///
+/// Frames are re-resolved from `frame_ids` so the backend can't be tricked
+/// by a stale client-supplied `CandidateFrame` payload.
+#[tauri::command]
+pub async fn auto_merge_new_frames_for_set(
+    frames_set_id: i64,
+    frame_ids: Vec<i64>,
+    source: String,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<MergeReport, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+
+    // Rebuild CandidateFrame structs from frame_ids so clients can't inject
+    // fabricated coordinates past the validation loop.
+    let candidates = {
+        let conn = db.conn();
+        let threshold_deg = state
+            .ctx
+            .settings
+            .get_grouping_threshold_deg(&conn)
+            .map_err(|e| format!("Failed to read threshold: {}", e))?;
+        let all = crate::auto_merge::find_candidates_for_set(&conn, frames_set_id, threshold_deg)
+            .map_err(|e| format!("Failed to find candidates: {}", e))?;
+        let wanted: std::collections::HashSet<i64> = frame_ids.iter().copied().collect();
+        all.into_iter()
+            .filter(|c| wanted.contains(&c.frame_id))
+            .collect::<Vec<_>>()
+    };
+
+    let threshold_arcmin = {
+        let conn = db.conn();
+        state
+            .ctx
+            .settings
+            .get_grouping_threshold_arcsec(&conn)
+            .map_err(|e| format!("Failed to read threshold: {}", e))?
+            / 60.0
+    };
+    let gap_hours = {
+        let conn = db.conn();
+        state
+            .ctx
+            .settings
+            .get_session_gap_threshold_hours(&conn)
+            .unwrap_or(6.0)
+    };
+
+    // Look up the set's name (best effort) to make the event payload useful
+    // for the frontend toast/notification.
+    let frames_set_name: Option<String> = {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT name FROM frames_set WHERE id = ?1",
+            rusqlite::params![frames_set_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    // merge_candidates opens its own transaction on the connection.
+    let mut conn = db.conn();
+    let report = crate::auto_merge::merge_candidates(
+        &mut conn,
+        frames_set_id,
+        candidates,
+        &source,
+        threshold_arcmin,
+        gap_hours,
+    )
+    .map_err(|e| format!("Auto-merge failed: {}", e))?;
+
+    // Fire the event if the merge actually added frames. The frontend
+    // dedupes by (frames_set_id, timestamp) so duplicate emits from
+    // rapid-fire merges are harmless.
+    if report.added_count > 0 {
+        let payload = crate::monitor::orchestrator::AutoMergeCompleteEvent {
+            frames_set_id,
+            frames_set_name,
+            source: report.source.clone(),
+            added_count: report.added_count,
+            skipped_count: report.skipped_count,
+            threshold_arcmin,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let emitter = crate::tauri_events::TauriProgressEmitter(app_handle);
+        crate::events::emit_event(&emitter, "auto-merge-complete", &payload);
+    }
+
+    Ok(report)
+}
+
+/// Read the auto-merge audit log for a frame set, newest first.
+#[tauri::command]
+pub async fn get_frame_set_merge_log(
+    frames_set_id: i64,
+    limit: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<Vec<MergeLogEntry>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    crate::auto_merge::log_ops::get_log_entries(&conn, frames_set_id, limit)
+        .map_err(|e| e.to_string())
+}

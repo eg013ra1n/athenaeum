@@ -636,6 +636,43 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add monitor_enabled to scan_roots table (migration for existing databases)
+    // Enables per-root opt-in background polling for new files.
+    let has_monitor_enabled: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_roots') WHERE name='monitor_enabled'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_monitor_enabled {
+        conn.execute(
+            "ALTER TABLE scan_roots ADD COLUMN monitor_enabled INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Frame set merge log - persistent audit history for auto-merge operations
+    // (both button-triggered and monitor-triggered). Survives indefinitely; row
+    // contains JSON blobs with the full per-frame breakdown for drill-down.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS frame_set_merge_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frames_set_id INTEGER NOT NULL,
+            occurred_at TEXT NOT NULL,
+            source TEXT NOT NULL CHECK(source IN ('button', 'monitor')),
+            threshold_arcmin REAL NOT NULL,
+            frames_added_json TEXT NOT NULL,
+            frames_skipped_json TEXT NOT NULL,
+            added_count INTEGER NOT NULL,
+            skipped_count INTEGER NOT NULL,
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_merge_log_set ON frame_set_merge_log(frames_set_id, occurred_at DESC)",
+        [],
+    )?;
+
     // Excluded frames table - stores frames excluded during auto-generation
     conn.execute(
         "CREATE TABLE IF NOT EXISTS excluded_frames (

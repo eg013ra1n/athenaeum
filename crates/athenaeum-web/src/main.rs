@@ -54,6 +54,9 @@ pub struct WebAppState {
     pub image_semaphore: Arc<RwLock<Arc<tokio::sync::Semaphore>>>,
     /// CPU-based upper bound for blink threads (min(vCPUs, 16)).
     pub max_blink_threads: usize,
+    /// Handle to the background folder-monitoring service. Routes use this
+    /// to `kick()` the loop awake when monitor-relevant settings change.
+    pub monitor: athenaeum_core::monitor::MonitorService,
 }
 
 #[tokio::main]
@@ -145,6 +148,7 @@ async fn main() {
         export_dir: config.export_dir,
         image_semaphore,
         max_blink_threads: max_threads,
+        monitor: athenaeum_core::monitor::MonitorService::new(),
     };
 
     // Spawn background sweeper for stale memory-cache entries (every 60s)
@@ -156,6 +160,20 @@ async fn main() {
                 let mut cache = memory_cache.lock().unwrap();
                 cache.evict_stale();
             }
+        });
+    }
+
+    // Spawn background folder-monitoring service (no startup delay — the
+    // server has typically been running continuously in web mode). The
+    // handle lives in WebAppState so routes can `kick()` it; we run a clone.
+    {
+        let ctx_clone = Arc::clone(&state.ctx);
+        let emitter = Arc::new(events::SseProgressEmitter::new(state.event_tx.clone()));
+        let monitor = state.monitor.clone();
+        tokio::spawn(async move {
+            monitor
+                .run_loop(ctx_clone, emitter, Duration::ZERO)
+                .await;
         });
     }
 

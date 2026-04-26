@@ -45,6 +45,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_missing_files_counts", post(scan_roots::get_missing_files_counts))
         .route("/api/rescan_all_for_content_hash", post(scan_roots::rescan_all_for_content_hash))
         .route("/api/relink_scan_root", post(scan_roots::relink_scan_root))
+        .route("/api/set_scan_root_monitor_enabled", post(scan_roots::set_scan_root_monitor_enabled))
         // Missing files
         .route("/api/check_missing_files_in_scan_root", post(missing_files::check_missing_files_in_scan_root))
         .route("/api/sync_missing_files", post(missing_files::sync_missing_files))
@@ -94,6 +95,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/update_frame_set_flat_pattern", post(frame_sets::update_frame_set_flat_pattern))
         .route("/api/archive_frame_set", post(frame_sets::archive_frame_set))
         .route("/api/unarchive_frame_set", post(frame_sets::unarchive_frame_set))
+        .route("/api/find_new_frames_for_set", post(frame_sets::find_new_frames_for_set))
+        .route("/api/auto_merge_new_frames_for_set", post(frame_sets::auto_merge_new_frames_for_set))
+        .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
         // Excluded frames
         .route("/api/get_excluded_frames", post(frame_sets::get_excluded_frames))
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))

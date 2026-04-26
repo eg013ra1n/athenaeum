@@ -19,6 +19,8 @@ pub use athenaeum_core::events;
 pub use athenaeum_core::export;
 pub use athenaeum_core::rustafits_processor;
 pub use athenaeum_core::cache;
+pub use athenaeum_core::auto_merge;
+pub use athenaeum_core::monitor;
 
 // Tauri-specific modules
 pub mod tauri_events;
@@ -61,7 +63,7 @@ pub fn run() {
             let default_permits = (max_threads / 2).max(2);
             println!("🧵 CPU cores cap: {}, default blink semaphore permits: {}", max_threads, default_permits);
             AppState {
-                ctx: ServiceContext {
+                ctx: Arc::new(ServiceContext {
                     db: OnceLock::new(),
                     settings: Arc::new(SettingsManager::new()),
                     memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(400, 30))),
@@ -77,11 +79,12 @@ pub fn run() {
                             .build()
                             .expect("Failed to create image processing thread pool"),
                     ),
-                },
+                }),
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),
                 )),
                 max_blink_threads: max_threads,
+                monitor: athenaeum_core::monitor::MonitorService::new(),
             }
         })
         .setup(|app| {
@@ -130,6 +133,21 @@ pub fn run() {
                 }
             });
 
+            // Spawn background folder-monitoring service. Deferred 3s so the
+            // initial UI render doesn't compete with scanner I/O. The handle
+            // lives in AppState so commands can `kick()` it when relevant
+            // settings change; we run a clone here.
+            {
+                let ctx_clone = Arc::clone(&state.ctx);
+                let emitter_arc = Arc::new(tauri_events::TauriProgressEmitter(app_handle.clone()));
+                let monitor = state.monitor.clone();
+                tauri::async_runtime::spawn(async move {
+                    monitor
+                        .run_loop(ctx_clone, emitter_arc, Duration::from_secs(3))
+                        .await;
+                });
+            }
+
             logging::log("INFO", "Athenaeum started, Tauri setup complete");
             Ok(())
         })
@@ -177,6 +195,9 @@ pub fn run() {
             commands::create_custom_frames_set,
             commands::archive_frame_set,
             commands::unarchive_frame_set,
+            commands::find_new_frames_for_set,
+            commands::auto_merge_new_frames_for_set,
+            commands::get_frame_set_merge_log,
             commands::get_equipment_cameras,
             commands::create_dark_library,
             commands::get_dark_library,
@@ -193,6 +214,7 @@ pub fn run() {
             commands::clear_image_cache,
             commands::set_scan_root_duplicates_flag,
             commands::set_scan_root_unique_camera_flag,
+            commands::set_scan_root_monitor_enabled,
             commands::move_to_black_hole,
             commands::bulk_move_to_black_hole,
             commands::get_black_hole_files,

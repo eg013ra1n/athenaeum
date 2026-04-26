@@ -107,8 +107,33 @@ impl Database {
     }
 
     /// Get a pooled connection (replaces the old `MutexGuard<Connection>`).
+    ///
+    /// Defensive cleanup: a few call sites still use raw `BEGIN`/`COMMIT`
+    /// with `?` propagation in between, which leaks the transaction onto
+    /// the pooled connection if any intermediate query fails. The next
+    /// caller to grab that connection would then see "cannot start a
+    /// transaction within a transaction". Roll back any leftover
+    /// transaction on checkout so a poisoned connection can't take down
+    /// later commands. We log when we find one so the underlying call site
+    /// is fixable.
     pub fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
-        self.pool.get().expect("Failed to get DB connection from pool")
+        let conn = self
+            .pool
+            .get()
+            .expect("Failed to get DB connection from pool");
+        if !conn.is_autocommit() {
+            crate::logging::log(
+                "WARN",
+                "[db] pooled connection had an open transaction on checkout — rolling back",
+            );
+            if let Err(e) = conn.execute("ROLLBACK", []) {
+                crate::logging::log(
+                    "ERROR",
+                    &format!("[db] defensive ROLLBACK failed: {}", e),
+                );
+            }
+        }
+        conn
     }
 
     /// Get the database file path.

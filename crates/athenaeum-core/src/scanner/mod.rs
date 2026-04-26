@@ -778,7 +778,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     // Begin transaction for batch insert
     crate::logging::log("INFO", &format!("Phase 2: Starting DB inserts for {} results", processed_results.len()));
-    let _ = conn.execute("BEGIN TRANSACTION", []);
+    if let Err(e) = conn.execute("BEGIN TRANSACTION", []) {
+        crate::logging::log("ERROR", &format!("Phase 2: BEGIN TRANSACTION failed: {}", e));
+        result.errors.push(format!("Failed to start DB transaction: {}", e));
+        emit_scan_complete(emitter, root_id, &result);
+        return result;
+    }
 
     // Use iter_mut to avoid cloning Frame structs during insert
     let total_results = processed_results.len();
@@ -898,12 +903,21 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         }
     }
 
-    // Commit transaction
-    let _ = conn.execute("COMMIT", []);
+    // Commit transaction. If COMMIT fails, the transaction stays open on
+    // the connection; ROLLBACK explicitly so it doesn't poison the pool.
+    if let Err(e) = conn.execute("COMMIT", []) {
+        crate::logging::log("ERROR", &format!("Phase 2: COMMIT failed: {}", e));
+        result.errors.push(format!("DB commit failed: {}", e));
+        if let Err(rb) = conn.execute("ROLLBACK", []) {
+            crate::logging::log("ERROR", &format!("Phase 2: ROLLBACK after failed COMMIT failed: {}", rb));
+        }
+    }
 
     // Force WAL checkpoint to consolidate writes and reduce post-scan CPU activity
     // TRUNCATE mode moves all data from WAL to main DB and truncates the WAL file
-    let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []);
+    if let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []) {
+        crate::logging::log("WARN", &format!("Phase 2: WAL checkpoint failed: {}", e));
+    }
 
     // Collect errors
     result.errors = match Arc::try_unwrap(errors) {
@@ -984,4 +998,105 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     emit_scan_complete(emitter, root_id, &result);
 
     result
+}
+
+/// Outcome of a registered scan — includes scan result and reconciliation info.
+/// Returned by `run_registered_scan` so callers (Tauri command / monitor / web route)
+/// can build their own DTOs and decide whether to recreate calibration sets.
+pub struct RegisteredScanOutcome {
+    pub result: ScanResult,
+    pub reconcile: crate::db::ReconcileResult,
+}
+
+/// Run a scan against a scan root with full lifecycle management:
+/// - Fails fast if a scan is already active for this root.
+/// - Registers a `ScanHandle` in `ctx.active_scans` (with cancel flag).
+/// - Reconciles `unique_camera` suffix state.
+/// - Runs `scan_directory_parallel` with progress events via `emitter`.
+/// - Persists `last_scan` timestamp and scan errors.
+/// - Removes the `ScanHandle` from `active_scans` before returning.
+///
+/// This helper is the shared engine behind both the interactive Tauri
+/// `start_scan_with_progress` command and the background monitor service.
+/// It does NOT recreate calibration sets after reconciliation — that step is
+/// interactive-only (monitor cycles never toggle `unique_camera`).
+pub fn run_registered_scan<E: ProgressEmitter>(
+    ctx: &crate::services::ServiceContext,
+    emitter: &E,
+    root_id: i64,
+) -> Result<RegisteredScanOutcome, String> {
+    use crate::services::ScanHandle;
+    use std::sync::atomic::AtomicBool;
+
+    // Reject concurrent scans on the same root.
+    {
+        let scans = ctx.active_scans.lock().unwrap();
+        if scans.contains_key(&root_id) {
+            return Err("Scan already in progress for this root".to_string());
+        }
+    }
+
+    // Register scan handle with cancel flag.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut scans = ctx.active_scans.lock().unwrap();
+        scans.insert(
+            root_id,
+            ScanHandle { root_id, cancel_flag: cancel_flag.clone() },
+        );
+    }
+
+    // Ensure the handle is removed on every exit path via a drop guard.
+    struct ScanHandleGuard<'a> {
+        ctx: &'a crate::services::ServiceContext,
+        root_id: i64,
+    }
+    impl<'a> Drop for ScanHandleGuard<'a> {
+        fn drop(&mut self) {
+            let mut scans = self.ctx.active_scans.lock().unwrap();
+            scans.remove(&self.root_id);
+        }
+    }
+    let _guard = ScanHandleGuard { ctx, root_id };
+
+    let db = ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Reconcile unique_camera state before scanning.
+    let reconcile = crate::db::reconcile_unique_camera_instrume(&conn, root_id)
+        .map_err(|e| format!("Reconciliation failed: {}", e))?;
+
+    // Look up root config.
+    let roots = crate::db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
+    let root = roots
+        .into_iter()
+        .find(|r| r.id == Some(root_id))
+        .ok_or("Scan root not found")?;
+
+    let use_content_hash = ctx
+        .settings
+        .get_duplicates_use_content_hash(&conn)
+        .unwrap_or(false);
+
+    let result = scan_directory_parallel(
+        Path::new(&root.path),
+        root_id,
+        &conn,
+        emitter,
+        use_content_hash,
+        cancel_flag,
+        root.unique_camera,
+    );
+
+    // Persist last_scan timestamp.
+    if let Err(e) = crate::db::update_scan_root_timestamp(&conn, root_id) {
+        eprintln!("Failed to update scan timestamp for root {}: {}", root_id, e);
+    }
+
+    // Persist scan errors so they survive app restarts.
+    if let Err(e) = crate::db::update_scan_root_errors(&conn, root_id, &result.errors) {
+        eprintln!("Failed to persist scan errors: {}", e);
+    }
+
+    Ok(RegisteredScanOutcome { result, reconcile })
 }

@@ -127,6 +127,7 @@ export interface ScanRoot {
   unique_camera: boolean;
   last_scan: string | null; // ISO 8601 datetime
   last_scan_errors: string[] | null;
+  monitor_enabled: boolean;
 }
 
 export interface ScanRootWithAvailability extends ScanRoot {
@@ -990,4 +991,63 @@ export interface FrameMetadataEdits {
   imagetyp?: string | null;
   /** True when the frame type is a master variant (paired with imagetyp) */
   isMaster?: boolean | null;
+}
+
+/**
+ * Auto-merge: reason a candidate frame was skipped.
+ * Mirrors Rust `SkipReason` (serde rename_all = "snake_case").
+ */
+export type SkipReason = "no_coords" | "outside_threshold" | "already_in_set";
+
+/**
+ * A light frame eligible for merging into a frame set. Mirrors Rust `CandidateFrame`.
+ */
+export interface CandidateFrame {
+  frame_id: number;
+  file_id: number;
+  filename: string;
+  ra: number | null;
+  dec: number | null;
+  date_obs: string | null;
+  filter: string | null;
+  instrume: string | null;
+}
+
+/** A frame that was skipped during an auto-merge, with the reason. */
+export interface SkippedFrame {
+  frame_id: number;
+  filename: string;
+  reason: SkipReason;
+}
+
+/** Result of `find_new_frames_for_set`. */
+export interface FindNewFramesResult {
+  candidates: CandidateFrame[];
+  scan_was_awaited: boolean;
+}
+
+/** Report returned after merging candidates into a frame set. */
+export interface MergeReport {
+  frames_set_id: number;
+  added_count: number;
+  skipped_count: number;
+  frames_added: CandidateFrame[];
+  frames_skipped: SkippedFrame[];
+  threshold_arcmin: number;
+  /** "button" | "monitor" */
+  source: string;
+}
+
+/** One row of the per-frame-set merge audit log. */
+export interface MergeLogEntry {
+  id: number;
+  frames_set_id: number;
+  occurred_at: string;
+  /** "button" | "monitor" */
+  source: string;
+  threshold_arcmin: number;
+  frames_added: CandidateFrame[];
+  frames_skipped: SkippedFrame[];
+  added_count: number;
+  skipped_count: number;
 }

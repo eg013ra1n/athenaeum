@@ -97,7 +97,7 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 /// Get all scan roots
 pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, enabled, find_duplicates, unique_camera, last_scan, last_scan_errors FROM scan_roots ORDER BY path"
+        "SELECT id, path, enabled, find_duplicates, unique_camera, last_scan, last_scan_errors, monitor_enabled FROM scan_roots ORDER BY path"
     )?;
 
     let roots = stmt.query_map([], |row| {
@@ -118,10 +118,20 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
             unique_camera: row.get::<_, i32>(4)? == 1,
             last_scan,
             last_scan_errors,
+            monitor_enabled: row.get::<_, i32>(7)? == 1,
         })
     })?;
 
     roots.collect()}
+
+/// Set monitor_enabled flag for a scan root
+pub fn set_scan_root_monitor_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE scan_roots SET monitor_enabled = ?1 WHERE id = ?2",
+        params![if enabled { 1 } else { 0 }, id],
+    )?;
+    Ok(())
+}
 
 /// Insert or update a scan root
 pub fn upsert_scan_root(conn: &Connection, path: &str) -> Result<i64> {
@@ -1657,22 +1667,35 @@ pub fn create_session(
     Ok(conn.last_insert_rowid())
 }
 
-/// Insert session members (bulk insert)
+/// Insert session members (bulk insert).
+///
+/// Tolerates being called either standalone (caller passes a fresh `&conn`)
+/// or from inside an outer transaction (caller passes `&tx`, which derefs to
+/// `&Connection`). Standalone callers get a local batch transaction for
+/// fsync amortization; in-transaction callers join the existing tx so we
+/// don't trigger SQLite's "cannot start a transaction within a transaction".
 pub fn insert_session_members(
     conn: &Connection,
     session_id: i64,
     frame_ids: &[i64],
 ) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-
-    for frame_id in frame_ids {
-        conn.execute(
-            "INSERT OR IGNORE INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
-            params![session_id, frame_id],
-        )?;
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction()?;
+        for frame_id in frame_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                params![session_id, frame_id],
+            )?;
+        }
+        tx.commit()?;
+    } else {
+        for frame_id in frame_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                params![session_id, frame_id],
+            )?;
+        }
     }
-
-    tx.commit()?;
     Ok(())
 }
 
@@ -1699,22 +1722,32 @@ pub fn reassign_imaging_night_to_frame_set(
     Ok(())
 }
 
-/// Move sessions from one night to another
+/// Move sessions from one night to another.
+///
+/// Tolerates outer-transaction callers (see `insert_session_members` above
+/// for the same pattern and rationale).
 pub fn move_sessions_to_night(
     conn: &Connection,
     session_ids: &[i64],
     target_night_id: i64,
 ) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-
-    for session_id in session_ids {
-        conn.execute(
-            "UPDATE sessions SET imaging_night_id = ?1 WHERE id = ?2",
-            params![target_night_id, session_id],
-        )?;
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction()?;
+        for session_id in session_ids {
+            tx.execute(
+                "UPDATE sessions SET imaging_night_id = ?1 WHERE id = ?2",
+                params![target_night_id, session_id],
+            )?;
+        }
+        tx.commit()?;
+    } else {
+        for session_id in session_ids {
+            conn.execute(
+                "UPDATE sessions SET imaging_night_id = ?1 WHERE id = ?2",
+                params![target_night_id, session_id],
+            )?;
+        }
     }
-
-    tx.commit()?;
     Ok(())
 }
 

@@ -9,6 +9,9 @@ import { AnalysisProgressProvider } from '../contexts/AnalysisProgressContext';
 import { AnalysisQueueIndicator } from './AnalysisQueueIndicator';
 import { PlateSolveProgressProvider } from '../contexts/PlateSolveProgressContext';
 import { PlateSolveQueueIndicator } from './PlateSolveQueueIndicator';
+import { NotificationProvider } from '../contexts/NotificationContext';
+import { NotificationBell } from './NotificationBell';
+import { ToastStack } from './Toast';
 import Logo from '../assets/athenaeum.png';
 
 export default function Layout() {
@@ -33,6 +36,7 @@ export default function Layout() {
   ];
 
   return (
+    <NotificationProvider>
     <ScanProgressProvider>
       <ExportProgressProvider>
         <AnalysisProgressProvider>
@@ -74,6 +78,7 @@ export default function Layout() {
 
             <AnalysisQueueIndicator collapsed={collapsed} />
             <PlateSolveQueueIndicator collapsed={collapsed} />
+            <NotificationBell collapsed={collapsed} />
 
             <div className={`${collapsed ? 'p-2' : 'p-4'} pt-0`}>
               <button
@@ -96,10 +101,12 @@ export default function Layout() {
           {/* Global progress indicators */}
           <ScanProgressIndicator />
           <ExportProgressIndicator />
+          <ToastStack />
         </div>
         </PlateSolveProgressProvider>
         </AnalysisProgressProvider>
       </ExportProgressProvider>
     </ScanProgressProvider>
+    </NotificationProvider>
   );
 }

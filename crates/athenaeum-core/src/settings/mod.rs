@@ -31,6 +31,12 @@ pub mod defaults {
     pub const BLINK_THREADS: &str = "0"; // 0 = auto (half of available cores)
     pub const BLINK_MEMORY_CACHE_SIZE: &str = "200";
     pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "30";
+
+    // Background scan monitoring
+    pub const MONITORING_INTERVAL_MINUTES: &str = "1";
+    pub const MONITORING_ENABLED_GLOBAL: &str = "true";
+    pub const AUTO_MERGE_ON_BUTTON_CLICK: &str = "false";
+    pub const AUTO_MERGE_ON_MONITOR_DETECT: &str = "false";
 }
 
 /// Setting keys used throughout the application
@@ -55,6 +61,12 @@ pub mod keys {
     pub const BLINK_THREADS: &str = "blink.threads";
     pub const BLINK_MEMORY_CACHE_SIZE: &str = "blink.memory_cache_size";
     pub const BLINK_MEMORY_RETENTION_MINUTES: &str = "blink.memory_retention_minutes";
+
+    // Background scan monitoring (see docs spec 2026-04-23 auto-scanning)
+    pub const MONITORING_INTERVAL_MINUTES: &str = "monitoring.interval_minutes";
+    pub const MONITORING_ENABLED_GLOBAL: &str = "monitoring.enabled_global";
+    pub const AUTO_MERGE_ON_BUTTON_CLICK: &str = "auto_merge.on_button_click";
+    pub const AUTO_MERGE_ON_MONITOR_DETECT: &str = "auto_merge.on_monitor_detect";
 }
 
 /// Runtime overrides for settings (session-specific)

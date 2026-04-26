@@ -20,7 +20,7 @@ type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
 
 export default function FileManager() {
-  const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, relinkScanRoot } = useScanRootsWithAvailability();
+  const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, toggleMonitorEnabled, relinkScanRoot } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning } = useScanProgressContext();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
@@ -491,6 +491,25 @@ export default function FileManager() {
                             className="w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
                           />
                           <span className="text-sm text-content-secondary">Unique camera</span>
+                        </label>
+                        <label
+                          className="flex items-center gap-2 px-3 py-2 bg-surface-hover rounded cursor-pointer hover:brightness-110 transition"
+                          title="Periodically scan this folder in the background for newly-added frames. Uses the global monitoring interval from Settings."
+                        >
+                          <input
+                            type="checkbox"
+                            checked={root.monitor_enabled}
+                            onChange={async (e) => {
+                              if (!root.id) return;
+                              try {
+                                await toggleMonitorEnabled(root.id, e.target.checked);
+                              } catch (err) {
+                                console.error('Failed to toggle monitor:', err);
+                              }
+                            }}
+                            className="w-4 h-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0 bg-surface-hover"
+                          />
+                          <span className="text-sm text-content-secondary">Monitor</span>
                         </label>
                         <button
                           onClick={() => root.id && handleStartScan(root.id)}

@@ -3,14 +3,13 @@
 use crate::db::{self};
 use crate::tauri_events::TauriProgressEmitter;
 use crate::models::*;
-use crate::scanner::{scan_directory, scan_directory_parallel, emit_progress};
+use crate::scanner::{self, scan_directory, emit_progress};
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tauri::State;
 
-use super::{AppState, ScanHandle};
+use super::AppState;
 use super::utils::normalize_path;
 
 #[tauri::command]
@@ -83,6 +82,7 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
         unique_camera: false,
         last_scan: None,
         last_scan_errors: None,
+        monitor_enabled: false,
     })
 }
 
@@ -447,6 +447,35 @@ pub async fn set_scan_root_unique_camera_flag(
     Ok(())
 }
 
+/// Toggle the background-monitoring flag for a scan root. The monitor service
+/// polls only roots with this flag set. Persists immediately; the next monitor
+/// tick respects the new value.
+#[tauri::command]
+pub async fn set_scan_root_monitor_enabled(
+    id: i64,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::set_scan_root_monitor_enabled(&conn, id, enabled)
+        .map_err(|e| e.to_string())?;
+
+    crate::logging::log(
+        "INFO",
+        &format!("monitor_enabled={} for scan_root id={}", enabled, id),
+    );
+
+    // Wake the monitor loop so the user gets an immediate scan instead of
+    // waiting for the current sleep to finish. Only relevant when enabling.
+    if enabled {
+        state.monitor.kick();
+    }
+
+    Ok(())
+}
+
 /// Query calibration frame IDs under a scan root and recreate calibration sets
 fn recreate_calibration_sets_for_root(
     conn: &rusqlite::Connection,
@@ -529,80 +558,24 @@ pub async fn start_scan_with_progress(
     println!("🔵 start_scan_with_progress called for root_id={}", root_id);
     crate::logging::log("INFO", &format!("Scan started for root_id={}", root_id));
 
-    // Check if already scanning this root
-    {
-        let scans = state.ctx.active_scans.lock().unwrap();
-        if scans.contains_key(&root_id) {
-            println!("🔴 Scan already in progress for root_id={}", root_id);
-            return Err("Scan already in progress for this root".to_string());
-        }
-    }
+    let scan_emitter = TauriProgressEmitter(app_handle.clone());
 
-    // Create cancel flag and register scan
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut scans = state.ctx.active_scans.lock().unwrap();
-        scans.insert(root_id, ScanHandle {
-            root_id,
-            cancel_flag: cancel_flag.clone(),
-        });
-    }
+    // Run the shared scan engine (registers handle, reconciles, scans, persists).
+    let outcome = scanner::run_registered_scan(&state.ctx, &scan_emitter, root_id)?;
+    let mut result = outcome.result;
+    let reconcile = outcome.reconcile;
 
-    // Get scan root info and perform scan
-    let (result, reconcile) = {
+    // Interactive-only follow-up: if reconciliation renamed frames, rebuild
+    // calibration sets under this root. Monitor cycles never trigger this path
+    // because they don't toggle `unique_camera`.
+    if reconcile.frames_renamed > 0 {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-
-        // Reconcile unique_camera instrume suffix state before scanning
-        let reconcile = db::reconcile_unique_camera_instrume(&conn, root_id)
-            .map_err(|e| format!("Reconciliation failed: {}", e))?;
-
-        let roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
-        let root = roots
-            .into_iter()
-            .find(|r| r.id == Some(root_id))
-            .ok_or("Scan root not found")?;
-
-        let use_content_hash = state.ctx.settings
-            .get_duplicates_use_content_hash(&conn)
-            .unwrap_or(false);
-
-        // Perform the parallel scan with progress events
-        let scan_emitter = TauriProgressEmitter(app_handle.clone());
-        let mut result = scan_directory_parallel(
-            Path::new(&root.path),
-            root_id,
-            &conn,
-            &scan_emitter,
-            use_content_hash,
-            cancel_flag.clone(),
-            root.unique_camera,
-        );
-
-        // If reconciliation changed frames, wipe and rebuild calibration sets
-        if reconcile.frames_renamed > 0 {
-            db::delete_calibration_sets_for_root(&conn, root_id)
-                .map_err(|e| format!("Failed to delete cal sets: {}", e))?;
-            let cal_sets_created = recreate_calibration_sets_for_root(&conn, root_id)
-                .map_err(|e| format!("Failed to recreate cal sets: {}", e))?;
-            result.calibration_sets_created = cal_sets_created;
-        }
-
-        // Update last_scan timestamp
-        db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
-
-        // Persist scan errors so they survive app restarts
-        if let Err(e) = db::update_scan_root_errors(&conn, root_id, &result.errors) {
-            eprintln!("Failed to persist scan errors: {}", e);
-        }
-
-        (result, reconcile)
-    };
-
-    // Remove from active scans
-    {
-        let mut scans = state.ctx.active_scans.lock().unwrap();
-        scans.remove(&root_id);
+        db::delete_calibration_sets_for_root(&conn, root_id)
+            .map_err(|e| format!("Failed to delete cal sets: {}", e))?;
+        let cal_sets_created = recreate_calibration_sets_for_root(&conn, root_id)
+            .map_err(|e| format!("Failed to recreate cal sets: {}", e))?;
+        result.calibration_sets_created = cal_sets_created;
     }
 
     crate::logging::log("INFO", &format!(

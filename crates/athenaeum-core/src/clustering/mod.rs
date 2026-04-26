@@ -151,22 +151,63 @@ impl FrameCluster {
 }
 
 /// Normalize coordinates from a Frame to ClusterableFrame
+/// True if a sexagesimal RA/Dec string is the all-zero sentinel that
+/// acquisition software writes when the real value is unknown
+/// (e.g. "00 00 00", "+00:00:00", "00:00:00.0"). Strips spaces, signs,
+/// colons, and decimal points before checking. Mirrors the missing-coords
+/// clause in `db::operations::get_frames_with_missing_metadata`.
+fn sexagesimal_is_zero_sentinel(s: &str) -> bool {
+    let stripped: String = s
+        .chars()
+        .filter(|c| !matches!(*c, ' ' | '+' | '-' | ':' | '.'))
+        .collect();
+    !stripped.is_empty() && stripped.chars().all(|c| c == '0')
+}
+
+fn numeric_coords_missing_or_zero(ra: Option<f64>, dec: Option<f64>) -> bool {
+    match (ra, dec) {
+        (None, None) => true,
+        (Some(r), Some(d)) if r == 0.0 && d == 0.0 => true,
+        _ => false,
+    }
+}
+
+fn sexagesimal_coords_missing_or_zero(ra: Option<&String>, dec: Option<&String>) -> bool {
+    match (ra, dec) {
+        (None, _) | (_, None) => true,
+        (Some(r), Some(d)) => sexagesimal_is_zero_sentinel(r) || sexagesimal_is_zero_sentinel(d),
+    }
+}
+
 pub fn normalize_frame_coordinates(frame: &Frame) -> Result<ClusterableFrame> {
-    // Try to get numeric RA/Dec first
-    let (ra_deg, dec_deg) = if let (Some(ra), Some(dec)) = (frame.ra, frame.dec) {
-        (ra, dec)
-    } else if let (Some(objctra), Some(objctdec)) = (&frame.objctra, &frame.objctdec) {
-        // Parse sexagesimal strings
+    let numeric_bad = numeric_coords_missing_or_zero(frame.ra, frame.dec);
+    let sexagesimal_bad =
+        sexagesimal_coords_missing_or_zero(frame.objctra.as_ref(), frame.objctdec.as_ref());
+
+    // Both sides unusable → frame must show up under "missing metadata"
+    // instead of being auto-clustered into a junk (0, 0) frame set.
+    if numeric_bad && sexagesimal_bad {
+        return Err(anyhow!(
+            "Frame {} has missing or zero coordinates (ra={:?}, dec={:?}, objctra={:?}, objctdec={:?})",
+            frame.id.unwrap_or(-1),
+            frame.ra,
+            frame.dec,
+            frame.objctra,
+            frame.objctdec,
+        ));
+    }
+
+    // Prefer numeric when it's usable; fall back to sexagesimal otherwise.
+    let (ra_deg, dec_deg) = if !numeric_bad {
+        (frame.ra.unwrap(), frame.dec.unwrap())
+    } else {
+        let objctra = frame.objctra.as_ref().unwrap();
+        let objctdec = frame.objctdec.as_ref().unwrap();
         let ra = parse_ra_sexagesimal(objctra)
             .map_err(|e| anyhow!("Failed to parse OBJCTRA '{}': {}", objctra, e))?;
         let dec = parse_dec_sexagesimal(objctdec)
             .map_err(|e| anyhow!("Failed to parse OBJCTDEC '{}': {}", objctdec, e))?;
         (ra, dec)
-    } else {
-        return Err(anyhow!(
-            "Frame {} has no valid coordinates (RA/DEC or OBJCTRA/OBJCTDEC)",
-            frame.id.unwrap_or(-1)
-        ));
     };
 
     Ok(ClusterableFrame {

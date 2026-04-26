@@ -161,7 +161,15 @@ export default function Objects() {
     }
   };
 
-  // Helper function to detect suggested merges between new and existing sets
+  // Helper function to detect suggested merges between new and existing sets.
+  //
+  // A suggestion is emitted only when both sides agree:
+  //   1. Names match exactly after normalization (lowercase + collapsed whitespace).
+  //      Substring matching is wrong here — "M 4" is a prefix of "M 42" and they
+  //      are different objects.
+  //   2. Centroid coordinates are within the user's grouping threshold.
+  //      Two unrelated targets occasionally share a name string; coord
+  //      proximity is the authoritative same-object signal.
   const detectSuggestedMerges = (
     oldSets: FramesSetWithCount[],
     newSets: FramesSetWithCount[]
@@ -174,28 +182,40 @@ export default function Objects() {
       reason: string;
     }> = [];
 
+    const normalize = (n: string | null) =>
+      (n || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
     // Find sets that are in newSets but not in oldSets (newly created)
     const oldSetIds = new Set(oldSets.map(s => s.frames_set.id));
     const recentSets = newSets.filter(s => !oldSetIds.has(s.frames_set.id!));
 
-    // For each recently created set, find potential matches in existing sets
     for (const recentSet of recentSets) {
-      const recentName = (recentSet.frames_set.name || '').toLowerCase();
+      const recentName = normalize(recentSet.frames_set.name);
+      if (!recentName) continue;
+
+      const recentRa = parseRa(recentSet.frames_set.objctra || '');
+      const recentDec = parseDec(recentSet.frames_set.objctdec || '');
+      if (recentRa === null || recentDec === null) continue;
 
       for (const existingSet of oldSets) {
-        const existingName = (existingSet.frames_set.name || '').toLowerCase();
+        const existingName = normalize(existingSet.frames_set.name);
+        if (existingName !== recentName) continue;
 
-        // Check if names match (case-insensitive, contains)
-        const nameMatch = recentName && existingName &&
-          (recentName.includes(existingName) || existingName.includes(recentName));
+        const existingRa = parseRa(existingSet.frames_set.objctra || '');
+        const existingDec = parseDec(existingSet.frames_set.objctdec || '');
+        if (existingRa === null || existingDec === null) continue;
 
-        if (nameMatch && recentSet.frames_set.id && existingSet.frames_set.id) {
+        const distDeg = angularDistance(recentRa, recentDec, existingRa, existingDec);
+        if (distDeg > defaultThreshold) continue;
+
+        if (recentSet.frames_set.id && existingSet.frames_set.id) {
+          const distArcmin = distDeg * 60;
           suggestions.push({
             sourceId: recentSet.frames_set.id,
             targetId: existingSet.frames_set.id,
             sourceName: recentSet.frames_set.name || 'Untitled',
             targetName: existingSet.frames_set.name || 'Untitled',
-            reason: `Same object: "${existingName}"`
+            reason: `Same object "${existingName}" · ${distArcmin.toFixed(1)}′ apart`,
           });
           break; // Only suggest one match per new set
         }

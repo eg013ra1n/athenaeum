@@ -124,6 +124,7 @@ pub struct ScanRoot {
     pub unique_camera: bool,
     pub last_scan: Option<DateTime<Utc>>,
     pub last_scan_errors: Option<Vec<String>>,
+    pub monitor_enabled: bool,
 }
 
 /// A single file inside a duplicate group, enriched with the metadata the
@@ -846,4 +847,67 @@ pub struct CalibrationSetOriginals {
     pub binning: Option<String>,
     pub exptime: Option<f64>,
     pub saved_at: String,  // ISO 8601
+}
+
+/// Reason a frame was skipped during auto-merge candidate evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    NoCoords,
+    OutsideThreshold,
+    AlreadyInSet,
+}
+
+/// A candidate light frame eligible for merging into a frame set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateFrame {
+    pub frame_id: i64,
+    pub file_id: i64,
+    pub filename: String,
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
+    pub date_obs: Option<DateTime<Utc>>,
+    pub filter: Option<String>,
+    pub instrume: Option<String>,
+}
+
+/// A frame skipped during auto-merge, with reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedFrame {
+    pub frame_id: i64,
+    pub filename: String,
+    pub reason: SkipReason,
+}
+
+/// Result of `find_new_frames_for_set` command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindNewFramesResult {
+    pub candidates: Vec<CandidateFrame>,
+    pub scan_was_awaited: bool,
+}
+
+/// Report produced by merging candidates into a frame set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeReport {
+    pub frames_set_id: i64,
+    pub added_count: i64,
+    pub skipped_count: i64,
+    pub frames_added: Vec<CandidateFrame>,
+    pub frames_skipped: Vec<SkippedFrame>,
+    pub threshold_arcmin: f64,
+    pub source: String,
+}
+
+/// One row of the frame-set merge audit log, as returned to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeLogEntry {
+    pub id: i64,
+    pub frames_set_id: i64,
+    pub occurred_at: DateTime<Utc>,
+    pub source: String,
+    pub threshold_arcmin: f64,
+    pub frames_added: Vec<CandidateFrame>,
+    pub frames_skipped: Vec<SkippedFrame>,
+    pub added_count: i64,
+    pub skipped_count: i64,
 }
