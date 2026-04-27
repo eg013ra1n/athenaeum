@@ -444,7 +444,7 @@ fn render_native_crop(
     {
         let img = rgb_from_processed(&full)?;
         let mut img = img;
-        let fy = |y: f64| (h as f64 - 1.0 - y);
+        let fy = |y: f64| h as f64 - 1.0 - y;
         for &(x, y) in &top {
             draw_bigcross(&mut img, x as i32, fy(y) as i32, 20, Rgb([0, 255, 255]));
         }
