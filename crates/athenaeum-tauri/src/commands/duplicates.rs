@@ -184,6 +184,20 @@ pub async fn get_duplicate_folders(
     db::find_duplicate_folders(&conn, similarity_threshold).map_err(|e| e.to_string())
 }
 
+/// Deep-verify two files are byte-identical. Use as an opt-in safety net
+/// before destructive operations on duplicates — `compute_xxhash` only
+/// samples 3×512 KiB regions of a file, so two genuinely different large
+/// files can collide in the sampled hash.
+#[tauri::command]
+pub async fn verify_files_byte_identical(
+    path1: String,
+    path2: String,
+) -> Result<bool, String> {
+    let p1 = std::path::PathBuf::from(&path1);
+    let p2 = std::path::PathBuf::from(&path2);
+    athenaeum_core::duplicates::verify_byte_identical(&p1, &p2).map_err(|e| e.to_string())
+}
+
 /// Backfill fingerprints for existing FITS headers
 #[tauri::command]
 pub async fn backfill_header_fingerprints(

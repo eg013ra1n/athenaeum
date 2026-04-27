@@ -224,6 +224,7 @@ pub fn run() {
             commands::send_all_to_void,
             commands::get_duplicate_folders,
             commands::backfill_header_fingerprints,
+            commands::verify_files_byte_identical,
             commands::relink_scan_root,
             commands::get_orphaned_files,
             commands::delete_orphaned_files,

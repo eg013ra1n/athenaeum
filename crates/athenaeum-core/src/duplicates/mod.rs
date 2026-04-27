@@ -81,9 +81,10 @@ pub fn find_duplicates(conn: &rusqlite::Connection, use_content_hash: bool) -> R
     crate::db::find_duplicate_groups(conn, use_content_hash).map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-/// Verify two files are byte-identical (optional safeguard)
-/// Used before destructive operations on duplicates
-#[allow(dead_code)]
+/// Verify two files are byte-identical (optional safeguard).
+/// Use as an opt-in deep-verify step before destructive operations on
+/// duplicates — the sampling hash (`compute_xxhash`) is fast but lossy on
+/// huge files where only the sampled regions are compared.
 pub fn verify_byte_identical(path1: &Path, path2: &Path) -> Result<bool> {
     use std::io::Read;
 

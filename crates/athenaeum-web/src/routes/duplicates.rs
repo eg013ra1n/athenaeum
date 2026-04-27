@@ -292,6 +292,26 @@ pub async fn set_scan_root_unique_camera_flag(
     Ok(Json(()))
 }
 
+/// Deep-verify two files are byte-identical. Opt-in safety net before
+/// destructive operations on duplicates — `compute_xxhash` only samples
+/// 3×512 KiB regions, so two genuinely different large files can collide.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyFilesByteIdenticalArgs {
+    pub path1: String,
+    pub path2: String,
+}
+
+pub async fn verify_files_byte_identical(
+    Json(args): Json<VerifyFilesByteIdenticalArgs>,
+) -> Result<Json<bool>, (StatusCode, String)> {
+    let p1 = std::path::PathBuf::from(&args.path1);
+    let p2 = std::path::PathBuf::from(&args.path2);
+    athenaeum_core::duplicates::verify_byte_identical(&p1, &p2)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 /// Backfill fingerprints for existing FITS headers that are missing them.
 pub async fn backfill_header_fingerprints(
     State(state): State<WebAppState>,
