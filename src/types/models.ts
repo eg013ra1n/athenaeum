@@ -168,6 +168,52 @@ export interface DuplicateGroup {
   files: DuplicateFile[];
 }
 
+// ── Duplicates picker rule chain ─────────────────────────────────────────────
+//
+// The duplicates view auto-marks files for deletion using an ordered chain of
+// rules. Each rule either picks a deletion set for a group or abstains; the
+// first non-abstaining rule wins per group. A rule that would mark every file
+// in a group also abstains (safety) so we never produce a group with no
+// keepers.
+
+export type RuleKind =
+  | 'master_root'
+  | 'path_contains'
+  | 'oldest_mtime'
+  | 'shortest_path';
+
+interface BaseRule {
+  enabled: boolean;
+}
+
+export interface MasterRootRule extends BaseRule {
+  kind: 'master_root';
+  config: { rootId: number | null };
+}
+
+export interface PathContainsRule extends BaseRule {
+  kind: 'path_contains';
+  config: { patterns: string[]; caseSensitive: boolean };
+}
+
+export interface OldestMtimeRule extends BaseRule {
+  kind: 'oldest_mtime';
+  config: Record<string, never>;
+}
+
+export interface ShortestPathRule extends BaseRule {
+  kind: 'shortest_path';
+  config: Record<string, never>;
+}
+
+export type Rule =
+  | MasterRootRule
+  | PathContainsRule
+  | OldestMtimeRule
+  | ShortestPathRule;
+
+export type RuleChain = Rule[];
+
 /** Result of a bulk move-to-black-hole operation. */
 export interface BulkMoveResult {
   moved: number;

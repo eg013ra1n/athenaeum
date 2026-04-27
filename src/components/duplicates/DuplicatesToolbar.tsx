@@ -1,16 +1,21 @@
 import React from 'react';
-import { AlertTriangle, ChevronsDownUp, ChevronsUpDown, RefreshCw, RotateCcw, Shield, Trash2 } from 'lucide-react';
-import type { ScanRootWithAvailability } from '../../types/models';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+  Trash2,
+} from 'lucide-react';
+import type { VerifyPhase } from '../../hooks/useDeepVerify';
 
 export type SortMode = 'wasted-desc' | 'count-desc' | 'size-desc';
 
 interface DuplicatesToolbarProps {
   loading: boolean;
   onRefresh: () => void;
-
-  scanRoots: ScanRootWithAvailability[];
-  masterRootId: number | null;
-  onMasterRootChange: (id: number | null) => void;
 
   sortMode: SortMode;
   onSortChange: (mode: SortMode) => void;
@@ -35,6 +40,16 @@ interface DuplicatesToolbarProps {
 
   onMoveToBlackHole: () => void;
   moveDisabled: boolean;
+
+  // ── Deep-verify props ─────────────────────────────────────────────────────
+  verifyPhase: VerifyPhase;
+  /** True when a clean verify pass completed (no mismatches, no errors, no cancellation). */
+  verifyClean: boolean;
+  onDeepVerify: () => void;
+  onCancelVerify: () => void;
+  /** Disabled when there are no groups at all, verify is already running, or
+   *  a bulk move is in progress. */
+  deepVerifyDisabled: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -50,9 +65,6 @@ function formatBytes(bytes: number): string {
 export const DuplicatesToolbar: React.FC<DuplicatesToolbarProps> = ({
   loading,
   onRefresh,
-  scanRoots,
-  masterRootId,
-  onMasterRootChange,
   sortMode,
   onSortChange,
   totalGroups,
@@ -66,7 +78,15 @@ export const DuplicatesToolbar: React.FC<DuplicatesToolbarProps> = ({
   onCollapseAll,
   onMoveToBlackHole,
   moveDisabled,
+  verifyPhase,
+  verifyClean,
+  onDeepVerify,
+  onCancelVerify,
+  deepVerifyDisabled,
 }) => {
+  const verifyRunning = verifyPhase === 'running';
+  const effectiveMoveDisabled = moveDisabled;
+
   return (
     <div className="flex items-center gap-3 flex-wrap pb-3 border-b border-border">
       <button
@@ -78,29 +98,6 @@ export const DuplicatesToolbar: React.FC<DuplicatesToolbarProps> = ({
         <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
         {loading ? 'Loading…' : 'Refresh'}
       </button>
-
-      <span className="text-border h-7 flex items-center">|</span>
-
-      {/* Master root selector */}
-      <div className="flex items-center gap-2">
-        <Shield size={14} className="text-accent" />
-        <label className="text-xs text-content-muted" htmlFor="master-root-select">
-          Master root:
-        </label>
-        <select
-          id="master-root-select"
-          value={masterRootId ?? ''}
-          onChange={(e) => onMasterRootChange(e.target.value === '' ? null : Number(e.target.value))}
-          className="h-7 bg-surface-hover border border-border rounded-lg px-2 text-xs focus:outline-none focus:ring-2 focus:ring-accent max-w-[320px]"
-        >
-          <option value="">— None (manual) —</option>
-          {scanRoots.map((root) => (
-            <option key={root.id!} value={root.id!}>
-              {root.path}
-            </option>
-          ))}
-        </select>
-      </div>
 
       <span className="text-border h-7 flex items-center">|</span>
 
@@ -155,21 +152,54 @@ export const DuplicatesToolbar: React.FC<DuplicatesToolbarProps> = ({
 
       <button
         onClick={onResetToRule}
-        title="Reset every group to the master-root rule's defaults"
+        title="Reapply the rule chain to every group, dropping any manual checkbox edits"
         className="h-7 px-2.5 inline-flex items-center gap-1 text-xs font-medium rounded-lg border border-border bg-surface-hover hover:bg-surface-elevated text-content-secondary hover:text-content transition-colors"
       >
         <RotateCcw size={12} />
-        Reset to rule
+        Reapply rules
       </button>
 
+      {/* Verify all duplicates button */}
+      {verifyRunning ? (
+        <button
+          onClick={onCancelVerify}
+          title="Cancel verification"
+          aria-label="Cancel verification"
+          className="h-7 px-2.5 inline-flex items-center gap-1 text-xs font-medium rounded-lg border border-warning/60 bg-warning-muted hover:bg-warning/20 text-warning transition-colors"
+        >
+          <ShieldCheck size={12} className="animate-pulse" />
+          Cancel verify
+        </button>
+      ) : (
+        <button
+          onClick={onDeepVerify}
+          disabled={deepVerifyDisabled}
+          title="Run a byte-by-byte comparison on every file in every group to confirm true duplicates"
+          aria-label="Verify all duplicates"
+          className="h-7 px-2.5 inline-flex items-center gap-1 text-xs font-medium rounded-lg border border-border bg-surface-hover hover:bg-surface-elevated text-content-secondary hover:text-content transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <ShieldCheck size={12} />
+          Verify all duplicates
+        </button>
+      )}
+
+      {/* Move button */}
       <button
         onClick={onMoveToBlackHole}
-        disabled={moveDisabled}
-        className="h-7 px-3 inline-flex items-center gap-1.5 text-xs font-semibold rounded-lg bg-error hover:bg-error/90 text-white transition-colors disabled:bg-surface-hover disabled:text-content-muted disabled:cursor-not-allowed"
+        disabled={effectiveMoveDisabled}
+        className={`h-7 px-3 inline-flex items-center gap-1.5 text-xs font-semibold rounded-lg transition-colors ${
+          effectiveMoveDisabled
+            ? 'bg-surface-hover text-content-muted cursor-not-allowed'
+            : 'bg-error hover:bg-error/90 text-white'
+        }`}
       >
-        <Trash2 size={12} />
+        {verifyClean ? (
+          <CheckCircle2 size={12} className="text-green-300" />
+        ) : (
+          <Trash2 size={12} />
+        )}
         {deleteCount > 0
-          ? `Move ${deleteCount.toLocaleString()} files (${groupsWithDeletions} groups) to Black Hole`
+          ? `Move ${deleteCount.toLocaleString()} files to Black Hole`
           : 'Move to Black Hole'}
       </button>
     </div>
