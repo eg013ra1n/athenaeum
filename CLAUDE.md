@@ -82,7 +82,7 @@ This project uses a Tauri stack: Rust backend + React/TypeScript frontend. Be aw
   - `scanner/` - Multi-threaded directory traversal with walkdir + rayon
   - `duplicates/` - xxHash XXH3_64 computation and duplicate detection
   - `calibration/` - Calibration frame matching algorithms (see Calibration Matching System below)
-  - `clustering/` - Sky coordinate-based frame set clustering with DBSCAN
+  - `clustering/` - Sky coordinate-based frame set clustering (seed-and-grow single-link)
   - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
   - `settings/` - Settings management with runtime and database persistence
   - `export/` - Path template resolution and file copying
@@ -133,7 +133,7 @@ Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, ex
 
 ### Key Technical Decisions
 
-**Frame Set Clustering**: Uses DBSCAN algorithm to group LIGHT frames by sky coordinates (RA/Dec). Frames within a configurable threshold distance are automatically grouped into frame sets. This enables organizing frames by target object without manual tagging.
+**Frame Set Clustering**: Uses a seed-and-grow single-link clustering algorithm to group LIGHT frames by sky coordinates (RA/Dec). For each unassigned frame (in deterministic RA→Dec→DATE-OBS order), a new cluster is seeded; the cluster then iteratively absorbs any unassigned frame within `threshold_deg` of the cluster's current center. After each member is added, the center is recomputed as the spherical mean of all members so far — so the cluster center *moves* during growth. This is intentional: it lets dithered or mosaicked fields collapse into a single frame set, even when the dither/mosaic span exceeds the threshold. The trade-off is that long chains of frames each within `threshold_deg` of the running mean can also merge, even if the chain endpoints are farther apart than the threshold. Distance is great-circle (spherical law of cosines), so RA wraparound and high-declination compression are handled correctly. The algorithm is **not** DBSCAN — there is no min_pts, no core/border/noise distinction, and every frame ends up in some cluster (singletons allowed).
 
 **Coordinate Parsing**: Supports multiple RA/Dec formats:
 
@@ -147,7 +147,7 @@ Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, ex
 2. Database persisted settings
 3. Default values
 
-Common settings include `grouping_threshold_arcmin` for frame set clustering.
+Common settings include `grouping.threshold.value` (default `3.0`) and `grouping.threshold.unit` (default `deg`, also accepts `arcmin` and `arcsec`) for frame set clustering. Internally consumed via `SettingsManager::get_grouping_threshold_deg`.
 
 **Auto-Generate Frame Sets**:
 
@@ -298,7 +298,7 @@ The calibration matching system is fully configurable via UI (Settings → Calib
 - **Backend**: Use `cargo test` with mock file systems and in-memory SQLite
 - **FITS Parser**: Test with real FITS files from common observatories
 - **Coordinate Parsing**: Test HMS/DMS and decimal degree conversions with edge cases
-- **Frame Set Clustering**: Test DBSCAN algorithm with various coordinate distributions
+- **Frame Set Clustering**: Test seed-and-grow algorithm with various coordinate distributions (including RA wraparound and zero-leg fallback to sexagesimal)
 - **Settings System**: Test precedence (runtime > DB > default) and persistence
 - **Export Templates**: Test token resolution with edge cases (missing values, special chars)
 - **Duplicate Detection**: Verify hash consistency (when implemented)
@@ -341,14 +341,19 @@ console.log(`Created ${result.sets_created} sets with ${result.frames_clustered}
 ```typescript
 // Get a setting with default
 const threshold = await invoke<string>('get_setting', {
-  key: 'grouping_threshold_arcmin',
-  defaultValue: '15'
+  key: 'grouping.threshold.value',
+  defaultValue: '3.0'
 });
 
 // Set a setting
 await invoke('set_setting', {
-  key: 'grouping_threshold_arcmin',
-  value: '20'
+  key: 'grouping.threshold.value',
+  value: '15.0'
+});
+// Unit is configured separately:
+await invoke('set_setting', {
+  key: 'grouping.threshold.unit',
+  value: 'arcmin'
 });
 ```
 

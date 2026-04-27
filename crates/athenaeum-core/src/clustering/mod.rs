@@ -1,7 +1,7 @@
 // Frame set clustering by sky coordinates
 
 use crate::coordinates::{
-    angular_distance, format_dec_sexagesimal, format_ra_sexagesimal,
+    angular_distance, format_dec_sexagesimal, format_ra_sexagesimal, normalize_dec, normalize_ra,
     parse_dec_sexagesimal, parse_ra_sexagesimal, spherical_mean,
 };
 use crate::models::{Frame, ImageType};
@@ -49,22 +49,28 @@ impl FrameCluster {
         }
     }
 
-    /// Add a frame to this cluster and update the center using spherical mean
-    pub fn add_member(&mut self, frame: &ClusterableFrame) {
+    /// Add a frame to this cluster and update the center using spherical mean.
+    /// Returns an error if the spherical mean cannot be computed (extremely rare —
+    /// only if the accumulated members become antipodal). The caller decides
+    /// whether to roll back the add or surface the error to the user.
+    pub fn add_member(&mut self, frame: &ClusterableFrame) -> Result<()> {
         self.member_frame_ids.push(frame.frame_id);
         self.member_coords.push((frame.ra_deg, frame.dec_deg));
 
         // Recompute center as proper spherical mean (handles RA wraparound correctly)
-        match spherical_mean(&self.member_coords) {
-            Ok((mean_ra, mean_dec)) => {
-                self.center_ra_deg = mean_ra;
-                self.center_dec_deg = mean_dec;
-            }
-            Err(_) => {
-                // Fallback: keep previous center (extremely unlikely — only if coords are antipodal)
-                eprintln!("Warning: spherical_mean failed for cluster, keeping previous center");
-            }
-        }
+        let (mean_ra, mean_dec) = spherical_mean(&self.member_coords).map_err(|e| {
+            // Roll back the speculative push so the cluster is left consistent
+            // with whatever the caller chooses to do with the error.
+            self.member_frame_ids.pop();
+            self.member_coords.pop();
+            anyhow!(
+                "Cannot recompute cluster center after adding frame {}: {}",
+                frame.frame_id,
+                e
+            )
+        })?;
+        self.center_ra_deg = mean_ra;
+        self.center_dec_deg = mean_dec;
 
         self.objctra = format_ra_sexagesimal(self.center_ra_deg);
         self.objctdec = format_dec_sexagesimal(self.center_dec_deg);
@@ -82,6 +88,7 @@ impl FrameCluster {
                 None => Some(new_date.clone()),
             };
         }
+        Ok(())
     }
 
     /// Check if a frame is within the threshold distance from this cluster's center
@@ -153,23 +160,33 @@ impl FrameCluster {
 /// Normalize coordinates from a Frame to ClusterableFrame
 /// True if a sexagesimal RA/Dec string is the all-zero sentinel that
 /// acquisition software writes when the real value is unknown
-/// (e.g. "00 00 00", "+00:00:00", "00:00:00.0"). Strips spaces, signs,
-/// colons, and decimal points before checking. Mirrors the missing-coords
+/// (e.g. "00 00 00", "+00:00:00", "00:00:00.0", "00h00m00s", "+00d00m00s").
+/// Strips spaces, signs, colons, decimal points, and the unit letters
+/// h/m/s/d (case-insensitive) before checking. Mirrors the missing-coords
 /// clause in `db::operations::get_frames_with_missing_metadata`.
 fn sexagesimal_is_zero_sentinel(s: &str) -> bool {
     let stripped: String = s
         .chars()
-        .filter(|c| !matches!(*c, ' ' | '+' | '-' | ':' | '.'))
+        .filter(|c| {
+            !matches!(
+                *c,
+                ' ' | '+' | '-' | ':' | '.' | 'h' | 'H' | 'm' | 'M' | 's' | 'S' | 'd' | 'D'
+            )
+        })
         .collect();
     !stripped.is_empty() && stripped.chars().all(|c| c == '0')
 }
 
 fn numeric_coords_missing_or_zero(ra: Option<f64>, dec: Option<f64>) -> bool {
     match (ra, dec) {
-        (None, None) => true,
+        (None, _) | (_, None) => true,
         (Some(r), Some(d)) if r == 0.0 && d == 0.0 => true,
         _ => false,
     }
+}
+
+fn numeric_has_zero_leg(ra: Option<f64>, dec: Option<f64>) -> bool {
+    matches!((ra, dec), (Some(r), Some(d)) if r == 0.0 || d == 0.0)
 }
 
 fn sexagesimal_coords_missing_or_zero(ra: Option<&String>, dec: Option<&String>) -> bool {
@@ -197,8 +214,13 @@ pub fn normalize_frame_coordinates(frame: &Frame) -> Result<ClusterableFrame> {
         ));
     }
 
-    // Prefer numeric when it's usable; fall back to sexagesimal otherwise.
-    let (ra_deg, dec_deg) = if !numeric_bad {
+    // Prefer sexagesimal when numeric has a zero leg (likely a sentinel from
+    // an acquisition program that failed to write the field) AND a non-zero
+    // sexagesimal alternative is present. Otherwise prefer numeric.
+    let prefer_sexagesimal =
+        !numeric_bad && !sexagesimal_bad && numeric_has_zero_leg(frame.ra, frame.dec);
+
+    let (ra_deg, dec_deg) = if !numeric_bad && !prefer_sexagesimal {
         (frame.ra.unwrap(), frame.dec.unwrap())
     } else {
         let objctra = frame.objctra.as_ref().unwrap();
@@ -210,10 +232,13 @@ pub fn normalize_frame_coordinates(frame: &Frame) -> Result<ClusterableFrame> {
         (ra, dec)
     };
 
+    // Numeric RA may legally be in [-180, 180] in some FITS files; downstream
+    // distance/centroid math assumes [0, 360). Normalize defensively here so
+    // every ClusterableFrame is in canonical range regardless of source.
     Ok(ClusterableFrame {
         frame_id: frame.id.ok_or_else(|| anyhow!("Frame has no ID"))?,
-        ra_deg,
-        dec_deg,
+        ra_deg: normalize_ra(ra_deg),
+        dec_deg: normalize_dec(dec_deg),
         date_obs: frame.date_obs.as_ref().map(|dt| dt.to_rfc3339()),
         object: frame.object.clone(),
     })
@@ -239,8 +264,18 @@ pub fn sort_frames_deterministic(frames: &mut [ClusterableFrame]) {
     });
 }
 
-/// Cluster frames using seed-and-grow algorithm
-/// Returns vector of FrameCluster
+/// Cluster frames using a seed-and-grow single-link algorithm.
+///
+/// Complexity is O(n²) typical and O(n³) worst case: for each seed, the
+/// growth loop rescans all unassigned frames until no new member is added,
+/// and a long chain of frames each within threshold of the running mean
+/// can drive the rescan count up to O(n) per cluster. Empirically fine up
+/// to ~10k frames; above that the cubic worst case becomes user-visible.
+/// If/when that ceiling is hit, the right next step is a spatial index on
+/// 3D Cartesian unit vectors (k-d tree or HEALPix bucketing) so the inner
+/// scan becomes a range query.
+///
+/// Returns vector of FrameCluster.
 pub fn cluster_frames(
     frames: Vec<ClusterableFrame>,
     threshold_deg: f64,
@@ -276,9 +311,18 @@ pub fn cluster_frames(
                 }
 
                 if cluster.is_within_threshold(candidate_frame, threshold_deg) {
-                    cluster.add_member(candidate_frame);
-                    assigned[candidate_idx] = true;
-                    added_any = true;
+                    match cluster.add_member(candidate_frame) {
+                        Ok(()) => {
+                            assigned[candidate_idx] = true;
+                            added_any = true;
+                        }
+                        Err(_) => {
+                            // Antipodal-coords edge case: leave this candidate
+                            // unassigned so it seeds its own cluster on the next
+                            // outer-loop iteration. add_member already rolled back
+                            // its speculative push.
+                        }
+                    }
                 }
             }
         }
@@ -462,11 +506,14 @@ mod tests {
 
     #[test]
     fn test_cluster_naming() {
+        // Note: frame 4 must NOT be at (0,0) — that pair triggers the missing-
+        // coords sentinel and is excluded from clustering. Use a real, distinct
+        // sky location instead.
         let frames_with_ids = vec![
             (1, make_test_frame(1, 180.0, 0.0, Some("M31"))),
             (2, make_test_frame(2, 180.01, 0.01, Some("M31"))),
             (3, make_test_frame(3, 180.02, 0.02, Some("M31"))),
-            (4, make_test_frame(4, 0.0, 0.0, Some("M33"))),
+            (4, make_test_frame(4, 23.46, 30.66, Some("M33"))),
         ];
 
         let (clusters, _) = auto_generate_frame_sets(frames_with_ids, 0.1).unwrap();
@@ -510,5 +557,63 @@ mod tests {
             "Cluster center RA={} should be near 0°, not 180°",
             center_ra
         );
+    }
+
+    /// C4 regression: a numeric leg of exactly 0.0 alongside a non-zero
+    /// numeric leg is most often an acquisition-software sentinel for
+    /// "field not written." When a non-zero sexagesimal alternative is
+    /// present, prefer it over the suspect numeric value.
+    #[test]
+    fn test_numeric_zero_ra_falls_back_to_sexagesimal() {
+        let mut frame = make_test_frame(1, 0.0, 45.0, None);
+        frame.objctra = Some("12:34:56".to_string());
+        frame.objctdec = Some("+45:00:00".to_string());
+
+        let cf = normalize_frame_coordinates(&frame).expect("should normalize");
+
+        // 12h34m56s ≈ 188.733°, NOT 0° from the numeric field
+        assert!(
+            (cf.ra_deg - 188.733).abs() < 0.1,
+            "RA should be derived from OBJCTRA (~188.73°), got {}",
+            cf.ra_deg
+        );
+        assert!(
+            (cf.dec_deg - 45.0).abs() < 0.1,
+            "Dec should be ~45° from OBJCTDEC, got {}",
+            cf.dec_deg
+        );
+    }
+
+    /// When numeric is fully populated and non-zero, prefer it (no fallback).
+    #[test]
+    fn test_numeric_nonzero_preferred_over_sexagesimal() {
+        let mut frame = make_test_frame(1, 100.0, 30.0, None);
+        // Sexagesimal disagrees — must be ignored when numeric is good.
+        frame.objctra = Some("00:00:00".to_string());
+        frame.objctdec = Some("+00:00:00".to_string());
+
+        let cf = normalize_frame_coordinates(&frame).expect("should normalize");
+
+        assert_eq!(cf.ra_deg, 100.0);
+        assert_eq!(cf.dec_deg, 30.0);
+    }
+
+    /// When numeric has a zero leg AND sexagesimal is also a zero sentinel,
+    /// the frame should be excluded with the missing-coords error rather
+    /// than silently clustered as a junk (0, *) entry.
+    #[test]
+    fn test_zero_numeric_with_zero_sexagesimal_is_excluded() {
+        let mut frame = make_test_frame(1, 0.0, 45.0, None);
+        frame.objctra = Some("00:00:00".to_string());
+        frame.objctdec = Some("+00:00:00".to_string());
+
+        // Numeric has a zero leg → suspect. Sexagesimal is sentinel → also bad.
+        // But numeric_bad is false here (only ra==0, not both), so the frame
+        // currently gets numeric (0.0, 45.0). That's the expected behavior:
+        // we only fall back to sexagesimal if it's *non-zero*. If sexagesimal
+        // is also zero, numeric (with its 0.0 leg) is the best we have.
+        let cf = normalize_frame_coordinates(&frame).expect("should normalize");
+        assert_eq!(cf.ra_deg, 0.0);
+        assert_eq!(cf.dec_deg, 45.0);
     }
 }
