@@ -13,6 +13,13 @@ stages:
 variables:
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
   npm_config_cache: "${CI_PROJECT_DIR}/.npm"
+  # Pull in the rustafits submodule on every job's checkout. Without this
+  # the runner logs "Skipping Git submodules setup" and `cargo metadata`
+  # fails with "failed to read rustafits/Cargo.toml" because the workspace
+  # member isn't on disk. `recursive` covers any nested submodule rustafits
+  # itself might add later.
+  GIT_SUBMODULE_STRATEGY: recursive
+  GIT_SUBMODULE_DEPTH: 1
 
 # --- Windows Build ---
 build:windows:
@@ -294,6 +301,9 @@ mirror:github:
   variables:
     GIT_STRATEGY: clone
     GIT_DEPTH: 1
+    # The mirror only needs the parent's commits — skip the submodule
+    # fetch that the global GIT_SUBMODULE_STRATEGY would otherwise trigger.
+    GIT_SUBMODULE_STRATEGY: none
   before_script:
     - eval $(ssh-agent -s)
     - chmod 400 "$GITHUB_DEPLOY_KEY"
