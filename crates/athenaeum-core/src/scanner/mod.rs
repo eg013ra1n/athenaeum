@@ -17,6 +17,18 @@ use std::sync::{Arc, Mutex};
 use crate::events::{ProgressEmitter, emit_event};
 use walkdir::WalkDir;
 
+/// Convert a path to UTF-8 string for DB persistence.
+/// Rejects non-UTF-8 paths instead of silently corrupting them via U+FFFD
+/// replacement (which would break any subsequent path-based lookup).
+fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
+    path.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!(
+            "Path is not valid UTF-8 and cannot be persisted: {}",
+            path.display()
+        ))
+}
+
 /// Result from processing a single file (for collecting before batch insert)
 #[derive(Clone)]
 pub struct FileProcessResult {
@@ -24,6 +36,9 @@ pub struct FileProcessResult {
     pub frame: Frame,
     pub header: Option<String>,
     pub imagetyp: Option<ImageType>,
+    /// Non-fatal hash failure encountered during processing. The file was
+    /// still parsed and is in the result; only its content_hash is None.
+    pub hash_error: Option<String>,
 }
 
 /// Progress event sent to frontend via Tauri events
@@ -77,9 +92,12 @@ pub fn scan_directory(
         cancelled: false,
     };
 
-    // Find all FITS/XISF files
+    // Find all FITS/XISF files. max_depth caps recursion in case follow_links
+    // hits a pathological symlink loop (walkdir's loop detection isn't
+    // bulletproof on every filesystem); 64 is well past any realistic archive.
     let files: Vec<PathBuf> = WalkDir::new(root_path)
         .follow_links(true)
+        .max_depth(64)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -131,13 +149,55 @@ pub fn scan_directory(
             });
         }
 
-        // Skip if already in database
-        if file_exists(conn, &file_path.to_string_lossy()).unwrap_or(false) {
-            *skipped.lock().unwrap() += 1;
-            continue;
+        // Skip if already in database AND on-disk metadata still matches.
+        // If size or modified_at changed, treat as "modified" — purge the
+        // stale row (CASCADE clears frames/headers) so process_file can
+        // re-insert clean state.
+        let path_str = file_path.to_string_lossy().to_string();
+        let existing = conn
+            .query_row(
+                "SELECT size, modified_at FROM files WHERE path = ?1",
+                rusqlite::params![path_str],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .ok();
+        if let Some((db_size, db_modified)) = existing {
+            let on_disk = std::fs::metadata(file_path).ok().map(|m| {
+                let size = m.len() as i64;
+                let modified = m
+                    .modified()
+                    .ok()
+                    .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
+                (size, modified)
+            });
+            let unchanged = matches!(
+                on_disk.as_ref(),
+                Some((s, Some(m))) if *s == db_size && m.as_str() == db_modified
+            );
+            if unchanged {
+                *skipped.lock().unwrap() += 1;
+                continue;
+            }
+            // Modified in place — purge the stale row before re-processing.
+            if let Err(e) = conn.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![path_str]) {
+                errors.lock().unwrap().push(format!(
+                    "{}: failed to purge stale row before re-process: {}",
+                    file_path.display(),
+                    e
+                ));
+                continue;
+            }
         }
 
-        match process_file(file_path, conn, use_content_hash, unique_camera, root_id) {
+        let mut hash_errors_local: Vec<String> = Vec::new();
+        match process_file(
+            file_path,
+            conn,
+            use_content_hash,
+            unique_camera,
+            root_id,
+            &mut hash_errors_local,
+        ) {
             Ok(frame_info) => {
                 *processed.lock().unwrap() += 1;
 
@@ -164,6 +224,9 @@ pub fn scan_directory(
                     .unwrap()
                     .push(format!("{}: {}", file_path.display(), e));
             }
+        }
+        if !hash_errors_local.is_empty() {
+            errors.lock().unwrap().extend(hash_errors_local);
         }
     }
 
@@ -235,7 +298,15 @@ pub fn scan_directory(
 
 /// Process a single file: hash, parse metadata, insert into database
 /// Returns Some((frame_id, imagetyp)) for successfully processed frames with known imagetyp
-fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, unique_camera: bool, root_id: i64) -> anyhow::Result<Option<(i64, ImageType)>> {
+/// Any non-fatal hash failures are pushed to `hash_errors_out` (prefixed `hash_error:`).
+fn process_file(
+    path: &PathBuf,
+    conn: &Connection,
+    use_content_hash: bool,
+    unique_camera: bool,
+    root_id: i64,
+    hash_errors_out: &mut Vec<String>,
+) -> anyhow::Result<Option<(i64, ImageType)>> {
     // Get file metadata
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len() as i64;
@@ -261,7 +332,7 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
         .unwrap_or("")
         .to_string();
 
-    let current_path = path.to_string_lossy().to_string();
+    let current_path = path_to_utf8(path)?;
 
     // Check if file already exists at this exact path
     if file_exists(conn, &current_path)? {
@@ -344,7 +415,11 @@ fn process_file(path: &PathBuf, conn: &Connection, use_content_hash: bool, uniqu
                 Some(hash)
             }
             Err(e) => {
-                println!("Warning: Failed to compute content hash for '{}': {}", current_path, e);
+                // Surface the failure so the user knows duplicate detection
+                // skipped this file. Previously silently dropped to None.
+                let msg = format!("hash_error: {}: failed to compute content hash: {}", current_path, e);
+                crate::logging::log("WARN", &msg);
+                hash_errors_out.push(msg);
                 None
             }
         }
@@ -514,16 +589,27 @@ fn process_file_parallel(
         .unwrap_or("")
         .to_string();
 
-    let current_path = path.to_string_lossy().to_string();
+    let current_path = path_to_utf8(path).map_err(|e| e.to_string())?;
 
     // Compute metadata hash
     let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
 
-    // Compute content hash if enabled
-    let content_hash = if use_content_hash {
-        crate::duplicates::compute_xxhash(path).ok()
+    // Compute content hash if enabled. Surface failures to the caller as
+    // hash_error so duplicate detection coverage gaps are visible to the user.
+    let (content_hash, hash_error) = if use_content_hash {
+        match crate::duplicates::compute_xxhash(path) {
+            Ok(hash) => (Some(hash), None),
+            Err(e) => {
+                let msg = format!(
+                    "hash_error: {}: failed to compute content hash: {}",
+                    path.display(),
+                    e
+                );
+                (None, Some(msg))
+            }
+        }
     } else {
-        None
+        (None, None)
     };
 
     // Create file record (id will be assigned during insert)
@@ -559,6 +645,7 @@ fn process_file_parallel(
         frame,
         header,
         imagetyp,
+        hash_error,
     })
 }
 
@@ -599,6 +686,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     for entry in WalkDir::new(root_path)
         .follow_links(true)
+        .max_depth(64)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -650,16 +738,22 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         return result;
     }
 
-    // Build a set of existing file paths for quick lookup
-    crate::logging::log("INFO", "Building existing paths set from DB...");
-    let existing_paths: std::collections::HashSet<String> = {
-        let mut paths = std::collections::HashSet::new();
-        match conn.prepare("SELECT path FROM files") {
+    // Build a map of existing file paths to their stored (size, modified_at).
+    // We use this to classify each on-disk file as new / unchanged / modified
+    // so that in-place modifications get re-parsed instead of silently
+    // skipped (the previous path-only filter). modified_at is stored as
+    // RFC3339 in the DB and compared as a string for an exact-match check.
+    crate::logging::log("INFO", "Building existing files map from DB...");
+    let existing_files: std::collections::HashMap<String, (i64, String)> = {
+        let mut map = std::collections::HashMap::new();
+        match conn.prepare("SELECT path, size, modified_at FROM files") {
             Ok(mut stmt) => {
-                match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                match stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                }) {
                     Ok(rows) => {
-                        for path in rows.flatten() {
-                            paths.insert(path);
+                        for entry in rows.flatten() {
+                            map.insert(entry.0, (entry.1, entry.2));
                         }
                     }
                     Err(e) => {
@@ -671,17 +765,84 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 crate::logging::log("ERROR", &format!("Failed to prepare existing files query: {}", e));
             }
         }
-        paths
+        map
     };
 
-    // Filter out files that already exist in database
+    // Classify each discovered file. Modified files are re-processed by
+    // deleting the old row first (CASCADE removes frames/headers/etc.).
+    let mut modified_paths_to_purge: Vec<String> = Vec::new();
     let new_files: Vec<PathBuf> = files
         .into_iter()
-        .filter(|p| !existing_paths.contains(&p.to_string_lossy().to_string()))
+        .filter(|p| {
+            let path_str = p.to_string_lossy().to_string();
+            match existing_files.get(&path_str) {
+                None => true, // New file
+                Some((db_size, db_modified)) => {
+                    // Compare against current on-disk metadata. If we can't
+                    // stat the file, treat it as unchanged (the parallel
+                    // process_file_parallel will surface the I/O error).
+                    match std::fs::metadata(p) {
+                        Ok(meta) => {
+                            let on_disk_size = meta.len() as i64;
+                            let on_disk_modified = meta
+                                .modified()
+                                .ok()
+                                .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
+                            let unchanged = on_disk_size == *db_size
+                                && on_disk_modified.as_deref() == Some(db_modified.as_str());
+                            if unchanged {
+                                false
+                            } else {
+                                modified_paths_to_purge.push(path_str);
+                                true
+                            }
+                        }
+                        Err(_) => false,
+                    }
+                }
+            }
+        })
         .collect();
 
+    // Purge stale rows for modified files so insert can proceed cleanly.
+    // Wrapped in a small transaction to keep the cascade atomic.
+    if !modified_paths_to_purge.is_empty() {
+        crate::logging::log(
+            "INFO",
+            &format!(
+                "Detected {} modified file(s); purging stale catalog rows for re-processing",
+                modified_paths_to_purge.len()
+            ),
+        );
+        if let Err(e) = conn.execute("BEGIN TRANSACTION", []) {
+            crate::logging::log("ERROR", &format!("M1 purge: BEGIN failed: {}", e));
+        } else {
+            let mut purge_failed = false;
+            for path in &modified_paths_to_purge {
+                if let Err(e) = conn.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![path]) {
+                    crate::logging::log("ERROR", &format!("M1 purge: DELETE failed for {}: {}", path, e));
+                    result.errors.push(format!("Failed to purge stale row for modified file {}: {}", path, e));
+                    purge_failed = true;
+                    break;
+                }
+            }
+            let final_stmt = if purge_failed { "ROLLBACK" } else { "COMMIT" };
+            if let Err(e) = conn.execute(final_stmt, []) {
+                crate::logging::log("ERROR", &format!("M1 purge: {} failed: {}", final_stmt, e));
+            }
+        }
+    }
+
     result.files_skipped = result.files_found - new_files.len();
-    crate::logging::log("INFO", &format!("New files to process: {} (skipped {})", new_files.len(), result.files_skipped));
+    crate::logging::log(
+        "INFO",
+        &format!(
+            "Files to process: {} ({} unchanged, {} modified)",
+            new_files.len(),
+            result.files_skipped,
+            modified_paths_to_purge.len()
+        ),
+    );
 
     // Check for cancellation before processing
     if cancel_flag.load(Ordering::SeqCst) {
@@ -736,13 +897,36 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 );
             }
 
-            match process_file_parallel(path, use_content_hash) {
-                Ok(result) => Some(result),
-                Err(e) => {
+            // Catch panics from FITS/XISF parsing (rare unwrap()s on malformed
+            // headers). Without this, rayon swallows the panic and the file
+            // silently disappears from the result with no error trail.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process_file_parallel(path, use_content_hash)
+            }));
+
+            match outcome {
+                Ok(Ok(r)) => Some(r),
+                Ok(Err(e)) => {
                     errors
                         .lock()
                         .unwrap()
                         .push(format!("{}: {}", path.display(), e));
+                    None
+                }
+                Err(panic_payload) => {
+                    let msg = panic_payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            panic_payload
+                                .downcast_ref::<&'static str>()
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}: panic during processing: {}", path.display(), msg));
                     None
                 }
             }
@@ -764,6 +948,14 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     // Phase 2: Sequential database inserts in a transaction
     emit_progress(emitter, root_id, 0, processed_results.len(), None, "inserting");
+
+    // Collect non-fatal hash errors from Phase 1 so users see which files
+    // had no content_hash computed (duplicate detection coverage gaps).
+    for r in processed_results.iter() {
+        if let Some(ref msg) = r.hash_error {
+            errors.lock().unwrap().push(msg.clone());
+        }
+    }
 
     // Track calibration frame IDs
     let mut flat_frame_ids: Vec<i64> = Vec::new();
@@ -787,10 +979,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     // Use iter_mut to avoid cloning Frame structs during insert
     let total_results = processed_results.len();
+    let mut cancelled_mid_insert = false;
     for (idx, file_result) in processed_results.iter_mut().enumerate() {
         // Check for cancellation every 10 files
         if idx % 10 == 0 && cancel_flag.load(Ordering::SeqCst) {
             result.cancelled = true;
+            cancelled_mid_insert = true;
             break;
         }
 
@@ -901,6 +1095,25 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 ));
             }
         }
+    }
+
+    // If the user cancelled mid-batch, ROLLBACK rather than commit a partial
+    // transaction. Cancellation is supposed to mean "abort," not "keep what
+    // I've partially inserted so far."
+    if cancelled_mid_insert {
+        crate::logging::log("INFO", "Phase 2: Cancelled mid-batch, rolling back transaction");
+        if let Err(rb) = conn.execute("ROLLBACK", []) {
+            crate::logging::log("ERROR", &format!("Phase 2: ROLLBACK after cancel failed: {}", rb));
+            result.errors.push(format!("DB rollback after cancel failed: {}", rb));
+        }
+        // No COMMIT, no WAL checkpoint — caller still gets a populated result
+        // (with cancelled=true) but the catalog is unchanged.
+        result.errors = match Arc::try_unwrap(errors) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+            Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
+        emit_scan_complete(emitter, root_id, &result);
+        return result;
     }
 
     // Commit transaction. If COMMIT fails, the transaction stays open on
@@ -1028,18 +1241,15 @@ pub fn run_registered_scan<E: ProgressEmitter>(
     use crate::services::ScanHandle;
     use std::sync::atomic::AtomicBool;
 
-    // Reject concurrent scans on the same root.
-    {
-        let scans = ctx.active_scans.lock().unwrap();
-        if scans.contains_key(&root_id) {
-            return Err("Scan already in progress for this root".to_string());
-        }
-    }
-
-    // Register scan handle with cancel flag.
+    // Atomically check-and-register so two concurrent calls cannot both
+    // pass the "no scan in progress" check and both insert (previously the
+    // mutex was released between contains_key and insert).
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
         let mut scans = ctx.active_scans.lock().unwrap();
+        if scans.contains_key(&root_id) {
+            return Err("Scan already in progress for this root".to_string());
+        }
         scans.insert(
             root_id,
             ScanHandle { root_id, cancel_flag: cancel_flag.clone() },
