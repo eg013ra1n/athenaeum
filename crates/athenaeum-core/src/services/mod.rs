@@ -34,6 +34,14 @@ pub struct PlateSolveHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
+/// Handle to track an active archive operation (ZIP archive feature).
+/// Only one archive operation can run at a time, but the map allows
+/// querying state by operation_id.
+pub struct ArchiveHandle {
+    pub operation_id: i64,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
 /// Shared application state accessible from any backend (Tauri, Axum, CLI).
 pub struct ServiceContext {
     pub db: OnceLock<Database>,
@@ -43,6 +51,10 @@ pub struct ServiceContext {
     pub active_exports: Arc<Mutex<HashMap<i64, ExportHandle>>>,
     pub active_analyses: Arc<Mutex<HashMap<i64, AnalysisHandle>>>,
     pub active_plate_solves: Arc<Mutex<HashMap<i64, PlateSolveHandle>>>,
+    /// Active archive operations (ZIP archive feature). Capped at one at a
+    /// time by command-layer enforcement; HashMap form keeps the same shape
+    /// as the other active-handle maps for consistency.
+    pub active_archives: Arc<Mutex<HashMap<i64, ArchiveHandle>>>,
     /// Lazy-loaded pre-built all-sky quad index for plate solving.
     /// None until the user builds the index or the app detects an existing one.
     pub quad_index: Arc<RwLock<Option<Arc<QuadIndex>>>>,
