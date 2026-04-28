@@ -69,14 +69,18 @@ build:linux:
     - tags
   before_script:
     - source "$HOME/.cargo/env"
-    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
-    # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
-    # from source on every fresh build. Idempotent: skips apt entirely once
-    # the tools are on the runner.
+    # cmake + nasm are required by rustafits → turbojpeg-sys → libjpeg-turbo (built from source).
+    # They must be pre-installed on the runner host because the gitlab-runner user
+    # cannot sudo non-interactively. One-time setup on the runner host:
+    #   sudo apt-get install -y cmake nasm
     - |
-      if ! command -v cmake >/dev/null || ! command -v nasm >/dev/null; then
-        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake nasm
+      missing=()
+      command -v cmake >/dev/null || missing+=(cmake)
+      command -v nasm  >/dev/null || missing+=(nasm)
+      if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: missing build deps on runner: ${missing[*]}"
+        echo "Run on the runner host: sudo apt-get install -y cmake nasm"
+        exit 1
       fi
   cache:
     key: "main-linux"
@@ -169,11 +173,15 @@ update-cache:linux:
   when: manual
   before_script:
     - source "$HOME/.cargo/env"
-    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
+    # cmake + nasm must be pre-installed on the runner host (see build:linux for details).
     - |
-      if ! command -v cmake >/dev/null || ! command -v nasm >/dev/null; then
-        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake nasm
+      missing=()
+      command -v cmake >/dev/null || missing+=(cmake)
+      command -v nasm  >/dev/null || missing+=(nasm)
+      if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: missing build deps on runner: ${missing[*]}"
+        echo "Run on the runner host: sudo apt-get install -y cmake nasm"
+        exit 1
       fi
   cache:
     key: "main-linux"
