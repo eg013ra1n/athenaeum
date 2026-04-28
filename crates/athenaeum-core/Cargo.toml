@@ -26,6 +26,7 @@ memmap2 = "0.9"
 byteorder = "1"
 cdshealpix = "0.7"
 flate2 = "1.0"
+zip = { version = "2", default-features = false, features = ["deflate", "time"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 
