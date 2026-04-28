@@ -39,6 +39,17 @@ build:windows:
       - target/
       - .npm/
   script:
+    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
+    # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
+    # from source on every fresh build. Idempotent: install only what's
+    # missing, then refresh PATH so this job sees the new binaries.
+    - |
+      $missing = @('cmake','nasm') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+      if ($missing) {
+        Write-Host "Installing missing build tools: $($missing -join ', ')"
+        choco install -y --no-progress $missing
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+      }
     - if (Test-Path "target\release\bundle") { Remove-Item -Recurse -Force "target\release\bundle" }
     - npm install
     - npm run tauri build
@@ -58,6 +69,15 @@ build:linux:
     - tags
   before_script:
     - source "$HOME/.cargo/env"
+    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
+    # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
+    # from source on every fresh build. Idempotent: skips apt entirely once
+    # the tools are on the runner.
+    - |
+      if ! command -v cmake >/dev/null || ! command -v nasm >/dev/null; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake nasm
+      fi
   cache:
     key: "main-linux"
     policy: pull
@@ -94,6 +114,10 @@ build:macos:
       - target/
       - .npm/
   script:
+    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
+    # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
+    # from source on every fresh build.
+    - for tool in cmake nasm; do command -v $tool >/dev/null || brew install $tool; done
     - export PATH="$HOME/.cargo/bin:$PATH"
     - which cargo && rustc --print sysroot
     - rustup target add x86_64-apple-darwin
@@ -126,6 +150,13 @@ update-cache:windows:
       - target/
       - .npm/
   script:
+    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
+    - |
+      $missing = @('cmake','nasm') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+      if ($missing) {
+        choco install -y --no-progress $missing
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+      }
     - npm install
     - npm run tauri build
 
@@ -138,6 +169,12 @@ update-cache:linux:
   when: manual
   before_script:
     - source "$HOME/.cargo/env"
+    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
+    - |
+      if ! command -v cmake >/dev/null || ! command -v nasm >/dev/null; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake nasm
+      fi
   cache:
     key: "main-linux"
     policy: push
@@ -167,6 +204,8 @@ update-cache:macos:
       - target/
       - .npm/
   script:
+    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
+    - for tool in cmake nasm; do command -v $tool >/dev/null || brew install $tool; done
     - export PATH="$HOME/.cargo/bin:$PATH"
     - rustup target add x86_64-apple-darwin
     - npm install
