@@ -437,6 +437,9 @@ fn process_file(
         created_at: Utc::now(),
         metadata_hash: Some(metadata_hash),
         content_hash,
+        archived_in_operation: None,
+        archive_zip_path: None,
+        archive_path_in_zip: None,
     };
 
     let file_id = insert_file(conn, &file)?;
@@ -623,6 +626,9 @@ fn process_file_parallel(
         created_at: Utc::now(),
         metadata_hash: Some(metadata_hash),
         content_hash,
+        archived_in_operation: None,
+        archive_zip_path: None,
+        archive_path_in_zip: None,
     };
 
     // Parse metadata and extract header in a single read for FITS files

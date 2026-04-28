@@ -188,6 +188,9 @@ mod tests {
                 .with_timezone(&Utc),
             metadata_hash: None,
             content_hash: None,
+            archived_in_operation: None,
+            archive_zip_path: None,
+            archive_path_in_zip: None,
         };
 
         let frame = Frame {

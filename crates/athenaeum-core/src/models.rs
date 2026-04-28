@@ -13,6 +13,11 @@ pub struct File {
     pub created_at: DateTime<Utc>,
     pub metadata_hash: Option<String>,
     pub content_hash: Option<String>,
+    // ZIP archive feature — populated when this file's data has been moved
+    // into a zip in the archive root. Original `path` is preserved for restore.
+    pub archived_in_operation: Option<i64>,
+    pub archive_zip_path: Option<String>,
+    pub archive_path_in_zip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -216,6 +221,9 @@ pub struct FramesSet {
     pub avg_rotation: Option<f64>,
     pub min_rotation: Option<f64>,
     pub max_rotation: Option<f64>,
+    // ZIP archive feature — populated when this frame set has been ZIP-archived
+    pub archived_at: Option<String>,          // ISO 8601 timestamp string
+    pub archive_operation_id: Option<i64>,
 }
 
 /// Application settings
