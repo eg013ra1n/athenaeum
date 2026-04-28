@@ -6115,7 +6115,7 @@ This checklist is for the planner, not the implementer.
 **Spec coverage:**
 
 | Spec section | Plan task |
-|---|---|
+| ------------ | --------- |
 | §3.1 Settings keys | Task 3 |
 | §3.2 Schema additions | Task 2 |
 | §3.3 State machine | Tasks 6 (enum) + 7 (transitions) + 14 (executor) |
@@ -6152,10 +6152,6 @@ Plan complete and saved to `docs/superpowers/plans/2026-04-29-archive-feature.md
 **2. Inline Execution** — execute tasks in this session using executing-plans, batch execution with checkpoints.
 
 Which approach?
-
-
-
-
 
 
 
