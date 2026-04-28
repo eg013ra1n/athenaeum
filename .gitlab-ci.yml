@@ -8,7 +8,6 @@ stages:
   - build
   - deploy
   - release
-  - mirror
 
 variables:
   CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
@@ -290,27 +289,3 @@ publish_version:
   after_script:
     - ssh-agent -k 2>/dev/null || true
 
-# --- Mirror to GitHub (main and tags) ---
-mirror:github:
-  stage: mirror
-  tags:
-    - linux
-  only:
-    - main
-    - tags
-  variables:
-    GIT_STRATEGY: clone
-    GIT_DEPTH: 1
-    # The mirror only needs the parent's commits — skip the submodule
-    # fetch that the global GIT_SUBMODULE_STRATEGY would otherwise trigger.
-    GIT_SUBMODULE_STRATEGY: none
-  before_script:
-    - eval $(ssh-agent -s)
-    - chmod 400 "$GITHUB_DEPLOY_KEY"
-    - ssh-add "$GITHUB_DEPLOY_KEY"
-    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
-  script:
-    - bash scripts/sync-github.sh "git@github.com:eg013ra1n/athenaeum.git"
-  after_script:
-    - ssh-agent -k 2>/dev/null || true
