@@ -37,6 +37,9 @@ pub mod defaults {
     pub const MONITORING_ENABLED_GLOBAL: &str = "true";
     pub const AUTO_MERGE_ON_BUTTON_CLICK: &str = "false";
     pub const AUTO_MERGE_ON_MONITOR_DETECT: &str = "false";
+
+    // Archive feature
+    pub const ARCHIVE_COMPRESSION: &str = "store"; // "store" | "deflate"
 }
 
 /// Setting keys used throughout the application
@@ -67,6 +70,10 @@ pub mod keys {
     pub const MONITORING_ENABLED_GLOBAL: &str = "monitoring.enabled_global";
     pub const AUTO_MERGE_ON_BUTTON_CLICK: &str = "auto_merge.on_button_click";
     pub const AUTO_MERGE_ON_MONITOR_DETECT: &str = "auto_merge.on_monitor_detect";
+
+    // Archive feature
+    pub const ARCHIVE_ROOT_PATH: &str = "archive.root_path";
+    pub const ARCHIVE_COMPRESSION: &str = "archive.compression";
 }
 
 /// Runtime overrides for settings (session-specific)
@@ -225,6 +232,25 @@ impl SettingsManager {
         )?;
         Ok(value.to_lowercase() == "true")
     }
+
+    /// Get the configured archive root path (or None if unset).
+    pub fn get_archive_root_path(&self, conn: &Connection) -> Result<Option<String>> {
+        let value = self.get_with_precedence(conn, keys::ARCHIVE_ROOT_PATH, "")?;
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    }
+
+    /// Get the archive compression mode ("store" or "deflate").
+    pub fn get_archive_compression(&self, conn: &Connection) -> Result<String> {
+        self.get_with_precedence(
+            conn,
+            keys::ARCHIVE_COMPRESSION,
+            defaults::ARCHIVE_COMPRESSION,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -300,5 +326,37 @@ mod tests {
         db_set_setting(&conn, keys::GROUPING_THRESHOLD_UNIT, "deg").unwrap();
         let arcsec = manager.get_grouping_threshold_arcsec(&conn).unwrap();
         assert_eq!(arcsec, 3600.0);
+    }
+
+    #[test]
+    fn test_archive_root_path_unset_returns_none() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        let value = manager.get_archive_root_path(&conn).unwrap();
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_archive_root_path_set_returns_some() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        manager.persist_setting(&conn, keys::ARCHIVE_ROOT_PATH, "/tmp/archive").unwrap();
+        assert_eq!(
+            manager.get_archive_root_path(&conn).unwrap(),
+            Some("/tmp/archive".to_string())
+        );
+    }
+
+    #[test]
+    fn test_archive_compression_default_is_store() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        assert_eq!(manager.get_archive_compression(&conn).unwrap(), "store");
     }
 }
