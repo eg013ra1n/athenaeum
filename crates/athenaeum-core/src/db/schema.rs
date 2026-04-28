@@ -319,6 +319,62 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Archive operations - one row per archive operation (ZIP archive feature)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS archive_operations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frames_set_id INTEGER NOT NULL,
+            archive_root_path TEXT NOT NULL,
+            flats_disposition TEXT,
+            darks_disposition TEXT,
+            bias_disposition TEXT,
+            darkflats_disposition TEXT,
+            compression TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            error_message TEXT,
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Archive operation files - frozen plan: one row per file the operation will touch
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS archive_operation_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id INTEGER NOT NULL,
+            file_id INTEGER,
+            source_path TEXT NOT NULL,
+            target_zip_path TEXT NOT NULL,
+            target_path_in_zip TEXT NOT NULL,
+            expected_hash TEXT NOT NULL,
+            disposition TEXT NOT NULL,
+            frame_role TEXT NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            FOREIGN KEY (operation_id) REFERENCES archive_operations(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // Archive operation steps - audit log: one row per (file, stage) pair
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS archive_operation_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id INTEGER NOT NULL,
+            operation_file_id INTEGER,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            actual_hash TEXT,
+            error_message TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            FOREIGN KEY (operation_id) REFERENCES archive_operations(id) ON DELETE CASCADE,
+            FOREIGN KEY (operation_file_id) REFERENCES archive_operation_files(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -439,6 +495,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_dup_group_files_file ON duplicate_group_files(file_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archive_files_op ON archive_operation_files(operation_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archive_steps_op ON archive_operation_steps(operation_id, status)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archive_ops_status ON archive_operations(status)",
         [],
     )?;
     conn.execute(
@@ -871,5 +939,116 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add archived_at to frames_set table (ZIP archive feature)
+    let has_archived_at: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='archived_at'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_archived_at {
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN archived_at TEXT",
+            [],
+        )?;
+    }
+
+    // Add archive_operation_id to frames_set table (ZIP archive feature)
+    let has_archive_op_id: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name='archive_operation_id'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_archive_op_id {
+        conn.execute(
+            "ALTER TABLE frames_set ADD COLUMN archive_operation_id INTEGER",
+            [],
+        )?;
+    }
+
+    // Add archived_in_operation to files table (ZIP archive feature)
+    let has_archived_in_op: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='archived_in_operation'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_archived_in_op {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN archived_in_operation INTEGER",
+            [],
+        )?;
+    }
+
+    // Add archive_zip_path to files table (ZIP archive feature)
+    let has_archive_zip_path: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='archive_zip_path'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_archive_zip_path {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN archive_zip_path TEXT",
+            [],
+        )?;
+    }
+
+    // Add archive_path_in_zip to files table (ZIP archive feature)
+    let has_archive_path_in_zip: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='archive_path_in_zip'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_archive_path_in_zip {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN archive_path_in_zip TEXT",
+            [],
+        )?;
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod archive_schema_tests {
+    use super::*;
+
+    #[test]
+    fn test_archive_tables_created() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for table in &["archive_operations", "archive_operation_files", "archive_operation_steps"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "expected table {} to exist", table);
+        }
+    }
+
+    #[test]
+    fn test_archive_columns_added() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // frames_set columns
+        for col in &["archived_at", "archive_operation_id"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('frames_set') WHERE name=?1",
+                [col],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "expected frames_set.{} to exist", col);
+        }
+
+        // files columns
+        for col in &["archived_in_operation", "archive_zip_path", "archive_path_in_zip"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name=?1",
+                [col],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "expected files.{} to exist", col);
+        }
+    }
 }
