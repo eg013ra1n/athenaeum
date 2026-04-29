@@ -6,7 +6,7 @@ use crate::archive::models::{
 };
 use crate::archive::staging;
 use crate::archive::zip_reader::verify_zip_contents;
-use crate::archive::zip_writer::{build_zip, ZipEntry};
+use crate::archive::zip_writer::{build_zip_with_progress, ZipEntry};
 use crate::duplicates::compute_xxhash;
 use crate::events::{emit_event, ProgressEmitter};
 use anyhow::{Context, Result};
@@ -198,22 +198,30 @@ fn zip_phase(
         by_zip.entry(f.target_zip_path.clone()).or_default().push(f);
     }
 
-    let total_zips = by_zip.len();
+    let total_files = files.len();
     let existing = existing_done_steps(conn, operation_id, ArchiveStage::ZipAdd)?;
 
-    for (idx, (zip_path_str, group)) in by_zip.iter().enumerate() {
-        check_cancel(cancel)?;
-        emit_event(emitter, "archive-progress", &ArchiveProgress {
-            operation_id,
-            stage: "zipping".into(),
-            current: idx + 1,
-            total: total_zips,
-            message: format!("Building zip {}/{}", idx + 1, total_zips),
-        });
+    // Running counter of files processed across all zips in this stage.
+    // Includes files in already-Done zips (counted as already-progressed) plus
+    // files newly written in this run, so the bar advances smoothly from 0 to
+    // total_files regardless of whether the operation is fresh or resumed.
+    let mut zipped_so_far: usize = 0;
 
-        // If every file in this zip already has a Done zip_add step, skip.
+    for (zip_path_str, group) in by_zip.iter() {
+        check_cancel(cancel)?;
+
+        // If every file in this zip already has a Done zip_add step, skip
+        // building but still advance the counter so percentage reflects reality.
         let all_done = group.iter().all(|f| existing.contains(&f.id));
         if all_done {
+            zipped_so_far += group.len();
+            emit_event(emitter, "archive-progress", &ArchiveProgress {
+                operation_id,
+                stage: "zipping".into(),
+                current: zipped_so_far,
+                total: total_files,
+                message: format!("Skipped (already zipped): {}", zip_path_str),
+            });
             continue;
         }
 
@@ -242,11 +250,39 @@ fn zip_phase(
             step_ids.push(Some(sid));
         }
 
-        match build_zip(&zip_path, &entries, compression) {
+        // Emit a progress event before this zip starts (current count, plus
+        // a friendly "Building <filename>" message).
+        let zip_filename = zip_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("zip");
+        emit_event(emitter, "archive-progress", &ArchiveProgress {
+            operation_id,
+            stage: "zipping".into(),
+            current: zipped_so_far,
+            total: total_files,
+            message: format!("Building {}", zip_filename),
+        });
+
+        let zipped_at_start = zipped_so_far;
+        // Per-entry progress callback: called after each entry is fully written.
+        let progress_cb = |idx_in_zip: usize, _total_in_zip: usize| {
+            let current = zipped_at_start + idx_in_zip;
+            emit_event(emitter, "archive-progress", &ArchiveProgress {
+                operation_id,
+                stage: "zipping".into(),
+                current,
+                total: total_files,
+                message: format!("Building {} ({}/{})", zip_filename, current, total_files),
+            });
+        };
+
+        match build_zip_with_progress(&zip_path, &entries, compression, Some(&progress_cb)) {
             Ok(_) => {
                 for sid in step_ids.into_iter().flatten() {
                     adb::update_step(conn, sid, StepStatus::Done, None, None)?;
                 }
+                zipped_so_far = zipped_at_start + group.len();
             }
             Err(e) => {
                 let msg = format!("{:#}", e);
@@ -272,21 +308,38 @@ fn verify_zip_phase(
     for f in files {
         by_zip.entry(f.target_zip_path.clone()).or_default().push(f.target_path_in_zip.clone());
     }
-    let total = by_zip.len();
-    for (idx, (zp, expected_entries)) in by_zip.iter().enumerate() {
+    // Total = file count across all zips, so progress is smooth even when
+    // there's only one zip with hundreds of entries.
+    let total_files = files.len();
+    let mut verified_so_far: usize = 0;
+    for (zp, expected_entries) in by_zip.iter() {
         check_cancel(cancel)?;
+        let zip_name = std::path::Path::new(zp)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("zip");
         emit_event(emitter, "archive-progress", &ArchiveProgress {
             operation_id,
             stage: "zip_verifying".into(),
-            current: idx + 1,
-            total,
-            message: format!("Verifying zip {}/{}", idx + 1, total),
+            current: verified_so_far,
+            total: total_files,
+            message: format!("Verifying {}", zip_name),
         });
         // Stage-level step (no operation_file_id)
         let sid = adb::insert_step(conn, operation_id, None, ArchiveStage::VerifyZip)?;
         adb::update_step(conn, sid, StepStatus::InProgress, None, None)?;
         match verify_zip_contents(Path::new(zp), expected_entries) {
-            Ok(_) => adb::update_step(conn, sid, StepStatus::Done, None, None)?,
+            Ok(_) => {
+                adb::update_step(conn, sid, StepStatus::Done, None, None)?;
+                verified_so_far += expected_entries.len();
+                emit_event(emitter, "archive-progress", &ArchiveProgress {
+                    operation_id,
+                    stage: "zip_verifying".into(),
+                    current: verified_so_far,
+                    total: total_files,
+                    message: format!("Verified {} ({}/{})", zip_name, verified_so_far, total_files),
+                });
+            }
             Err(e) => {
                 let msg = format!("{:#}", e);
                 adb::update_step(conn, sid, StepStatus::Failed, None, Some(&msg))?;
@@ -358,17 +411,22 @@ fn finalize_phase(
     archive_root: &Path,
     emitter: &dyn ProgressEmitter,
 ) -> Result<()> {
+    // Total work units: one per moved file (catalog update) + 2 (mark frame set + cleanup staging).
+    let move_count = files.iter().filter(|f| f.disposition == "move").count();
+    let total_units = move_count + 2;
+    let mut done_units: usize = 0;
+
     emit_event(emitter, "archive-progress", &ArchiveProgress {
         operation_id,
         stage: "finalizing".into(),
-        current: 0,
-        total: 1,
+        current: done_units,
+        total: total_units,
         message: "Finalizing".into(),
     });
     let sid = adb::insert_step(conn, operation_id, None, ArchiveStage::Finalize)?;
     adb::update_step(conn, sid, StepStatus::InProgress, None, None)?;
 
-    // Mark moved files
+    // Mark moved files (one progress tick per moved file)
     for f in files {
         if f.disposition == "move" {
             if let Some(file_id) = f.file_id {
@@ -376,21 +434,37 @@ fn finalize_phase(
                     conn, file_id, operation_id, &f.target_zip_path, &f.target_path_in_zip,
                 )?;
             }
+            done_units += 1;
+            emit_event(emitter, "archive-progress", &ArchiveProgress {
+                operation_id,
+                stage: "finalizing".into(),
+                current: done_units,
+                total: total_units,
+                message: format!("Updating catalog ({}/{})", done_units, total_units),
+            });
         }
     }
     adb::mark_frame_set_archived(conn, *frames_set_id, operation_id)?;
+    done_units += 1;
+    emit_event(emitter, "archive-progress", &ArchiveProgress {
+        operation_id,
+        stage: "finalizing".into(),
+        current: done_units,
+        total: total_units,
+        message: "Marking frame set archived".into(),
+    });
 
     // Cleanup staging
     staging::cleanup_staging(archive_root, operation_id)?;
     adb::update_step(conn, sid, StepStatus::Done, None, None)?;
+    done_units += 1;
 
-    // Emit a final progress event so the UI moves from 0% to 100% on the
-    // finalizing bar before the worker closes out.
+    // Final 100% event so the bar reaches the end before the worker closes out.
     emit_event(emitter, "archive-progress", &ArchiveProgress {
         operation_id,
         stage: "finalizing".into(),
-        current: 1,
-        total: 1,
+        current: done_units,
+        total: total_units,
         message: "Finalized".into(),
     });
     Ok(())

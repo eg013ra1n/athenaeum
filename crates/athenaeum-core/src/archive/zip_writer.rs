@@ -21,6 +21,18 @@ pub struct ZipEntry {
 /// Caller is responsible for ensuring `zip_path`'s parent directory exists.
 /// Overwrites any existing file at `zip_path`.
 pub fn build_zip(zip_path: &Path, entries: &[ZipEntry], compression: ArchiveCompression) -> Result<()> {
+    build_zip_with_progress(zip_path, entries, compression, None)
+}
+
+/// Variant of `build_zip` that calls `on_entry(idx_done, total)` after each
+/// entry is fully written, where `idx_done` ranges 1..=total. Useful for
+/// emitting per-entry progress to the UI during a long-running zip build.
+pub fn build_zip_with_progress(
+    zip_path: &Path,
+    entries: &[ZipEntry],
+    compression: ArchiveCompression,
+    on_entry: Option<&dyn Fn(usize, usize)>,
+) -> Result<()> {
     let file = File::create(zip_path)
         .with_context(|| format!("failed to create zip file {}", zip_path.display()))?;
     let mut zw = ZipWriter::new(BufWriter::new(file));
@@ -34,8 +46,9 @@ pub fn build_zip(zip_path: &Path, entries: &[ZipEntry], compression: ArchiveComp
         .large_file(true); // safe even for sub-4GB files; required for >4GB
 
     let mut buf = vec![0u8; 64 * 1024];
+    let total = entries.len();
 
-    for entry in entries {
+    for (idx, entry) in entries.iter().enumerate() {
         zw.start_file(&entry.path_in_zip, options)
             .with_context(|| format!("zip start_file failed for {}", entry.path_in_zip))?;
 
@@ -50,6 +63,10 @@ pub fn build_zip(zip_path: &Path, entries: &[ZipEntry], compression: ArchiveComp
             use std::io::Write;
             zw.write_all(&buf[..n])
                 .with_context(|| format!("zip write failed for {}", entry.path_in_zip))?;
+        }
+
+        if let Some(cb) = on_entry {
+            cb(idx + 1, total);
         }
     }
 
