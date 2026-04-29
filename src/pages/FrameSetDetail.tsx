@@ -18,7 +18,7 @@ import { RestoreDialog } from '../components/archive/RestoreDialog';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { revealItemInDir } from '../api/desktop';
 import { isTauri } from '../utils/platform';
-import { Upload, ExternalLink } from 'lucide-react';
+import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history';
@@ -622,10 +622,9 @@ export default function FrameSetDetail() {
                       }
                     }}
                     title="Reveal the archive zip(s) in the system file manager"
-                    className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110"
+                    className="flex items-center justify-center rounded-lg border border-border bg-surface-hover p-1.5 text-content-muted hover:text-content hover:brightness-110"
                   >
-                    <ExternalLink size={14} />
-                    Reveal in file manager
+                    <FolderOpen size={14} />
                   </button>
                 )}
               </>
