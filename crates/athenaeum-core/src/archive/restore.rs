@@ -90,6 +90,25 @@ pub fn run_restore(
         return Ok(());
     }
 
+    // Pre-flight: every zip referenced in the plan must exist on disk before
+    // we touch the temp dir. Catches the case where the user moved or deleted
+    // zip files outside the app, and gives them a clear list of what's missing.
+    let unique_zip_paths: HashSet<&str> = files.iter().map(|f| f.target_zip_path.as_str()).collect();
+    let mut missing: Vec<&str> = unique_zip_paths
+        .iter()
+        .filter(|p| !Path::new(p).is_file())
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        anyhow::bail!(
+            "{} archive zip file{} not found at the expected location — they may have been moved or deleted:\n  {}",
+            missing.len(),
+            if missing.len() == 1 { "" } else { "s" },
+            missing.join("\n  "),
+        );
+    }
+
     let archive_root = Path::new(&op.archive_root_path);
     let temp_dir = restore_temp_dir(archive_root, operation_id);
     // Always start with a clean temp dir; previous runs may have left files behind.
@@ -100,6 +119,35 @@ pub fn run_restore(
         .with_context(|| format!("create temp dir {}", temp_dir.display()))?;
 
     let mode = classify_target(target_root_path, &files);
+
+    // From here on, ANY error path needs to clean the temp dir. Wrap the rest
+    // of the work and intercept Err to cleanup before propagating.
+    let result =
+        run_restore_inner(conn, operation_id, &op, &files, total, &temp_dir, mode,
+                          overwrite_existing, keep_zip_after_restore, cancel, emitter);
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            cleanup_temp(&temp_dir);
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_restore_inner(
+    conn: &Connection,
+    operation_id: i64,
+    op: &crate::archive::models::ArchiveOperation,
+    files: &[crate::archive::models::ArchiveOperationFile],
+    total: usize,
+    temp_dir: &Path,
+    mode: RestoreTargetMode<'_>,
+    overwrite_existing: bool,
+    keep_zip_after_restore: bool,
+    cancel: &CancelFlag,
+    emitter: &dyn ProgressEmitter,
+) -> Result<()> {
 
     let emit = |emitter: &dyn ProgressEmitter, stage: &str, current: usize, total: usize, msg: String| {
         let prog = RestoreProgress {
@@ -291,7 +339,7 @@ pub fn run_restore(
         .iter()
         .filter_map(|(f, _)| f.file_id)
         .collect();
-    for f in &files {
+    for f in files {
         if let Some(fid) = f.file_id {
             if !restored_ids.contains(&fid) {
                 adb::unmark_file_archived(conn, fid, None)?;
@@ -300,7 +348,7 @@ pub fn run_restore(
     }
 
     // Stage: cleanup -----------------------------------------------------------
-    cleanup_temp(&temp_dir);
+    cleanup_temp(temp_dir);
 
     if !keep_zip_after_restore {
         let zip_paths: Vec<String> = {
@@ -517,5 +565,72 @@ mod tests {
             "SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0),
         ).unwrap();
         assert!(archived_at.is_none());
+    }
+
+    /// Pre-flight check fires when a zip file referenced by the plan no longer
+    /// exists on disk. Restore must abort with a clear error before creating
+    /// the temp dir or touching any catalog rows.
+    #[test]
+    fn restore_aborts_when_zip_is_missing() {
+        let arch = TempDir::new().unwrap();
+        let scan = TempDir::new().unwrap();
+
+        let l1 = scan.path().join("M31/L_001.fits");
+        std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
+        std::fs::write(&l1, b"x").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1000, ?1, 'L_001.fits', 1, '2025-10-12', 'FITS')",
+            [l1.to_str().unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp)
+             VALUES (10000, 1000, 'M31', 'T', 'C', 'Light')",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 10000)", []).unwrap();
+
+        let plan = build_plan(
+            &conn, 1, arch.path(),
+            &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+            ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+        // Manually delete the zip to simulate the user moving it away.
+        for entry in std::fs::read_dir(arch.path()).unwrap().flatten() {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("zip") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+
+        let restore_target = TempDir::new().unwrap();
+        let err = run_restore(
+            &conn, op_id, restore_target.path(),
+            false, false, &cancel, &NullEmitter,
+        ).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("not found"), "expected missing-zip error, got: {}", msg);
+
+        // Catalog must remain untouched.
+        let archived_at: Option<String> = conn.query_row(
+            "SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0),
+        ).unwrap();
+        assert!(archived_at.is_some(), "frame set should still be marked archived");
+
+        // Temp dir must NOT have been created since the bail happened first.
+        let temp = restore_temp_dir(arch.path(), op_id);
+        assert!(!temp.exists(), "temp dir should not exist after preflight bail");
     }
 }

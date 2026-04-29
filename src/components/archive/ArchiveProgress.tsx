@@ -49,12 +49,16 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
       ? Math.round((progress.current / progress.total) * 100)
       : 0;
 
+  // Restore doesn't roll back — it just stops mid-flight if it fails. So
+  // pick a different terminal label depending on whether the worker was an
+  // archive (rollback restores sources) or a restore (no rollback).
+  const isRestoreFinish = finished?.kind === 'restore';
   const statusLabel = finished
     ? finished.outcome === 'completed'
       ? 'Completed'
       : finished.outcome === 'cancelled'
-        ? 'Cancelled — rolled back'
-        : 'Failed — rolled back'
+        ? isRestoreFinish ? 'Cancelled' : 'Cancelled — rolled back'
+        : isRestoreFinish ? 'Failed' : 'Failed — rolled back'
     : progress?.message ?? 'Starting…';
 
   const barColor = finished
