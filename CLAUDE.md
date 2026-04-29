@@ -86,6 +86,7 @@ This project uses a Tauri stack: Rust backend + React/TypeScript frontend. Be aw
   - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
   - `settings/` - Settings management with runtime and database persistence
   - `export/` - Path template resolution and file copying
+  - `archive/` - ZIP archive feature: planner, executor, rollback, resume, restore (see Archive Feature below)
   - `commands/` - **Modular Tauri commands** organized by domain (see below)
   - `commands_rustafits.rs` - Specialized FITS image rendering commands
 
@@ -128,6 +129,12 @@ See `src-tauri/src/db/schema.rs` for full schema. Key tables:
 - `export_templates` - Saved export path templates
 - `fits_header` - Complete original FITS header storage
 - `settings` - Application configuration (key-value pairs)
+- `archive_roots` - User-configured destination folders for ZIP archives (multi-folder support; `is_default` flag picks the default destination)
+- `archive_operations` - One row per ZIP archive operation (state machine: planning → copying → verifying → zipping → zip_verifying → deleting_sources → finalizing → completed; plus cancelled / rolling_back / rolled_back / failed)
+- `archive_operation_files` - Frozen plan: one row per file the operation touches (source_path, target_zip_path, target_path_in_zip, expected_hash, disposition, frame_role)
+- `archive_operation_steps` - Audit log: one row per (file, stage) pair for resume + rollback
+- `frames_set.archived_at` + `archive_operation_id` - Set when a frame set has been ZIP-archived (separate from the legacy `is_archived` boolean — see Archive Feature lifecycle)
+- `files.archived_in_operation` + `archive_zip_path` + `archive_path_in_zip` - Set on every `files` row whose data was *moved* into a zip; copied calibrations leave the row untouched
 
 Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, exptime, filter
 
@@ -224,6 +231,45 @@ The calibration matching system is fully configurable via UI (Settings → Calib
 - Flats→DarkFlat/Dark: Same as Lights→Dark (no filter matching)
 - Flats→Bias: Same as Lights→Bias
 
+### Archive Feature
+
+Athenaeum can move a finished frame set's data into a `.zip` per frame type (Lights / Flats / Darks / Bias / DarkFlats) inside a user-configured archive folder, while preserving the catalog metadata. The full design and implementation plan are in `docs/superpowers/specs/2026-04-29-archive-feature-design.md` and `docs/superpowers/plans/2026-04-29-archive-feature.md`.
+
+**Three-state lifecycle for a frame set:**
+
+| State | DB columns | Toolbar button on FrameSetDetail |
+| ----- | ---------- | -------------------------------- |
+| Stage / WIP | `is_archived = 0` | **Find new images** + **Move to Archive** |
+| In Archive section, not zipped | `is_archived = 1`, `archived_at = NULL` | **Move and ZIP** |
+| Zipped | `archived_at IS NOT NULL` | **Unarchive** + folder-icon reveal-in-file-manager |
+
+The legacy `is_archived` boolean is the soft-hide flag toggled by the existing `archive_frame_set` / `unarchive_frame_set` commands (used by the Objects page tabs). The new ZIP archive feature adds `archived_at` + `archive_operation_id` on `frames_set` and treats them as a separate axis. A frame set must already be in the Archive section (`is_archived = 1`) before the planner will allow zipping — `archive::planner::build_plan` enforces this.
+
+**Module structure (`crates/athenaeum-core/src/archive/`):**
+
+- `models.rs` - `ArchiveOperation`, `ArchiveOperationFile`, `ArchiveOperationStep`, `Dispositions`, `FrameRole`, `ArchiveCompression`, `ConflictResolution` enums and structs
+- `db.rs` - CRUD for the three archive_* tables; `mark_frame_set_archived` (zip markers only), `clear_zip_markers` (rollback), `unmark_frame_set_archived` (full Unarchive — clears zip markers AND `is_archived`)
+- `path_layout.rs` - Zip filename generation (`{Object}_{Start}_{End}_{Telescope}_{Camera}_{FrameType}.zip`) and per-file path-in-zip computation (`<UniqueScanRootName>/<rel-path>/<filename>`)
+- `staging.rs` - Per-operation staging dir under `<archive_root>/.athenaeum_staging/op_<id>/`
+- `zip_writer.rs` - `build_zip` + `build_zip_with_progress` (per-entry callback for smooth progress)
+- `zip_reader.rs` - `verify_zip_contents` (entry list match)
+- `shared_calibration.rs` - `find_shared_calibration_sets` — detects when a calibration is linked to other (non-archived) frame sets, used to disable Move in the disposition dialog
+- `planner.rs` - `build_plan` (no DB writes) + `commit_plan` (writes archive_operations + archive_operation_files); validates is_archived=1 + archived_at=NULL up front; per-file frame_role priority dedup (`light > flat > darkflat > dark > bias`); collision detection on existing zip filenames
+- `executor.rs` - `run_operation` drives stages 2–7 with cooperative cancellation. Per-file progress on every stage including zip and finalize (zip uses `build_zip_with_progress`; finalize total = move_count + 2)
+- `rollback.rs` - `rollback_operation`: restores deleted sources from staging back to original, deletes partial/finished zips, clears zip markers via `clear_zip_markers` (leaves is_archived intact since the frame set was in the archive section before)
+- `resume.rs` - `find_unfinished_operations` + `resume_operation` (re-runs executor; idempotent step log skips already-Done steps)
+- `restore.rs` - **Reconcile-based restore**: extract every entry to `<archive_root>/.athenaeum_restore_temp/op_<id>/`, hash-verify, then for each file skip if already on disk at `source_path` (preserves copy-disposition calibrations and user edits) else copy to target. Catalog updates only touch restored files. Cleans temp + optionally deletes zips.
+
+**Tauri commands (`crates/athenaeum-tauri/src/commands/archive.rs`):**
+
+Folder management: `list_archive_roots`, `add_archive_root`, `delete_archive_root`, `set_default_archive_root`. Operation lifecycle: `plan_archive_operation`, `start_archive_operation`, `cancel_archive_operation`, `list_unfinished_archive_operations`, `resume_archive_operation`, `rollback_archive_operation`. Browsing: `list_archived_frame_sets`, `list_archive_zips` (returns unique zips of an operation with size/exists for the expandable section + reveal-in-file-manager). Restore: `start_restore_operation`, `get_restore_suggestions`. Cleanup: `delete_archive`. The legacy single-folder `archive.root_path` setting is auto-migrated into `archive_roots` on first read of `list_archive_roots`. Both Tauri and Axum (`crates/athenaeum-web/src/routes/archive.rs`) expose the same surface.
+
+**Multi-folder archive roots:** stored in the `archive_roots` table. `start_archive_operation` and `plan_archive_operation` accept an optional `archive_root_path`. Resolution: explicit value > only-configured-root > `is_default` row > error. The disposition dialog renders a destination dropdown when 2+ roots are configured. The File Manager → Monitored Directories tab has an Archive Folders subsection with add/delete/star-as-default and an expandable per-folder view that lists archived frame sets stored there and their zip files (each with reveal-in-file-manager).
+
+**Progress events:** unified on the `archive-progress` Tauri event channel for both archive *and* restore stages. The `archive-finished` event fires when the worker exits with `{ operation_id, outcome: "completed"|"cancelled"|"failed", kind?: "restore" }` so the `ArchiveProgress` widget auto-dismisses with the right color (green/yellow/red). Restore also emits on the legacy `archive-restore-progress` channel for compatibility.
+
+**Restore semantics (the safe one):** the zip is the inventory; restore makes disk match by filling gaps. For each `archive_operation_files` row: if the file already exists at `source_path`, skip (no duplicate, no overwrite); else copy from temp → target. Target is the original `source_path` when the user picked "original location" mode, or `<picked>/<path-in-zip>` when picking a scan root or custom folder. This handles copy-disposition calibrations cleanly (originals stay put) and the cross-archive move case (where archive A copied X and archive B later moved X — restoring A first puts X back, restoring B later sees it in place and skips).
+
 ## Development Workflow
 
 1. **Adding New Tauri Commands**:
@@ -237,6 +283,7 @@ The calibration matching system is fully configurable via UI (Settings → Calib
      - `duplicates.rs` - Duplicate detection and black hole management
      - `cache.rs` - Image cache operations
      - `spatial.rs` - Sky coordinate queries and spatial operations
+     - `archive.rs` - ZIP archive feature: folder management, plan/start/cancel/resume/rollback operations, list archived frame sets, list zips, restore, delete
    - Add command function to the appropriate module with `#[tauri::command]`
    - Ensure it's exported in `commands/mod.rs` (use `pub use module_name::*;`)
    - Add to `invoke_handler` in `src-tauri/src/lib.rs` as `commands::command_name`
