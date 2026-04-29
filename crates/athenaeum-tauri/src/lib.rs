@@ -312,6 +312,19 @@ pub fn run() {
             commands::get_quad_index_status,
             commands::build_quad_index,
             commands_rustafits::read_fits_image_rustafits,
+            // Archive commands
+            commands::get_archive_settings,
+            commands::set_archive_root_path,
+            commands::set_archive_compression,
+            commands::plan_archive_operation,
+            commands::start_archive_operation,
+            commands::cancel_archive_operation,
+            commands::list_unfinished_archive_operations,
+            commands::resume_archive_operation,
+            commands::rollback_archive_operation,
+            commands::list_archived_frame_sets,
+            commands::start_restore_operation,
+            commands::delete_archive,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -41,6 +41,7 @@ pub mod export;
 pub mod analysis;
 pub mod plate_solve;
 pub mod utils;
+pub mod archive;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -57,3 +58,4 @@ pub use calendar::*;
 pub use export::*;
 pub use analysis::*;
 pub use plate_solve::*;
+pub use archive::*;
