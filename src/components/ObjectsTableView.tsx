@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw, Archive, ArchiveRestore } from 'lucide-react';
+import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw, Archive } from 'lucide-react';
 import type { FramesSetWithCount } from '../types/models';
 
 export type ObjectsTab = 'stage' | 'wip' | 'archive';
@@ -25,7 +25,6 @@ interface ObjectsTableViewProps {
   onEditingNameChange: (name: string) => void;
   onMarkAsCustom: (setId: number) => void;
   onArchive: (setId: number) => void;
-  onUnarchive: (setId: number) => void;
 }
 
 export function ObjectsTableView({
@@ -46,7 +45,6 @@ export function ObjectsTableView({
   onEditingNameChange,
   onMarkAsCustom,
   onArchive,
-  onUnarchive,
 }: ObjectsTableViewProps) {
   const [sortField, setSortField] = useState<SortField>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
@@ -272,15 +270,7 @@ export function ObjectsTableView({
                     >
                       <Pencil size={12} />
                     </button>
-                    {activeTab === 'archive' ? (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); onUnarchive(frames_set.id!); }}
-                        className="p-1 text-content-muted hover:text-accent hover:bg-surface-hover rounded transition-colors"
-                        title="Unarchive"
-                      >
-                        <ArchiveRestore size={12} />
-                      </button>
-                    ) : (
+                    {activeTab !== 'archive' && (
                       <button
                         onClick={(e) => { e.stopPropagation(); onArchive(frames_set.id!); }}
                         className="p-1 text-content-muted hover:text-content hover:bg-surface-hover rounded transition-colors"

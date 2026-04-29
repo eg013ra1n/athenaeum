@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2, RotateCw, FileX, Archive, ArchiveRestore } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2, RotateCw, FileX, Archive } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import {
@@ -347,16 +347,6 @@ export default function Objects() {
     } catch (err) {
       setError(err as string);
       console.error('Failed to archive frame set:', err);
-    }
-  };
-
-  const handleUnarchive = async (setId: number) => {
-    try {
-      await api.invoke('unarchive_frame_set', { framesSetId: setId });
-      await loadFrameSets();
-    } catch (err) {
-      setError(err as string);
-      console.error('Failed to unarchive frame set:', err);
     }
   };
 
@@ -1051,7 +1041,6 @@ export default function Objects() {
           onEditingNameChange={setEditingName}
           onMarkAsCustom={handleMarkAsCustom}
           onArchive={handleArchive}
-          onUnarchive={handleUnarchive}
         />
       ) : (
         <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3 ${isDragging || isMergeMode ? 'select-none' : ''}`}>
@@ -1199,18 +1188,7 @@ export default function Objects() {
                   <Eye size={13} />
                   View
                 </button>
-                {activeTab === 'archive' ? (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleUnarchive(frames_set.id!);
-                    }}
-                    className="px-2 py-1 bg-surface-hover hover:bg-accent/20 text-content-muted hover:text-accent rounded transition-colors"
-                    title="Unarchive"
-                  >
-                    <ArchiveRestore size={13} />
-                  </button>
-                ) : (
+                {activeTab !== 'archive' && (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
