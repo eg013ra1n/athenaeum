@@ -1,8 +1,20 @@
-//! Restore: extract zip(s) back to disk and update files.path.
+//! Restore: extract zip(s) into a temp dir, then copy only the *missing*
+//! files to their final locations. Files already in place at the catalog's
+//! recorded source path are left alone — this preserves both copy-disposition
+//! calibrations (whose originals were never deleted) and any user edits made
+//! after the archive ran.
 //!
-//! Implementation note: we record restore stages in the SAME archive_operation_steps
-//! table, using stage names "restore_extract" and "restore_verify". This keeps a
-//! single source of truth for the operation's history without a parallel table.
+//! Stages:
+//! - extract:        every entry of every zip → temp dir, hash-verified
+//!                   against the plan's expected_hash.
+//! - reconcile:      per-file decide whether to skip (already on disk) or
+//!                   restore (copy temp → target). Target is either the
+//!                   original source_path (preserves layout) or
+//!                   `<picked>/<path-in-zip>` for an alternate target.
+//! - update_catalog: clear archive markers for restored files; rewrite
+//!                   `files.path` only when the restore target differs from
+//!                   the original.
+//! - cleanup:        delete temp dir, optionally delete zips.
 
 use crate::archive::db as adb;
 use crate::duplicates::compute_xxhash;
@@ -28,12 +40,40 @@ pub struct RestoreProgress {
     pub message: String,
 }
 
-/// Run a restore for the given archive operation.
-///
-/// `target_root_path` is the user-chosen directory; files are extracted as
-/// `<target_root_path>/<target_path_in_zip>`, preserving the scan-root prefix.
-/// On success: clear archive markers + rewrite `files.path` to the new locations.
-/// On verify failure: keep the zip, mark restore failed, do NOT auto-rollback partial extracts.
+/// Where extracted files should land if they need restoring.
+enum RestoreTargetMode<'a> {
+    /// Each file restores to its catalog source_path (the location it was
+    /// archived from). Reconstructs the original layout exactly.
+    Original,
+    /// Each file restores to `<root>/<path-in-zip>`. Used when the user
+    /// explicitly picked a scan root or custom folder.
+    UnderRoot(&'a Path),
+}
+
+/// Compute the temp directory used during a restore.
+fn restore_temp_dir(archive_root: &Path, operation_id: i64) -> PathBuf {
+    archive_root
+        .join(".athenaeum_restore_temp")
+        .join(format!("op_{}", operation_id))
+}
+
+/// Decide whether `target_root_path` represents "restore to original" or
+/// "restore under an alternate root". Heuristic: if every plan file's
+/// source_path lives under `target_root_path`, the user picked original
+/// (or something equivalent that produces the same layout).
+fn classify_target<'a>(
+    target_root_path: &'a Path,
+    files: &[crate::archive::models::ArchiveOperationFile],
+) -> RestoreTargetMode<'a> {
+    let target = target_root_path.to_string_lossy();
+    let all_under = files.iter().all(|f| f.source_path.starts_with(target.as_ref()));
+    if all_under {
+        RestoreTargetMode::Original
+    } else {
+        RestoreTargetMode::UnderRoot(target_root_path)
+    }
+}
+
 pub fn run_restore(
     conn: &Connection,
     operation_id: i64,
@@ -46,138 +86,222 @@ pub fn run_restore(
     let op = adb::get_operation(conn, operation_id)?;
     let files = adb::list_operation_files(conn, operation_id)?;
     let total = files.len();
-
-    // Stage: extract ----------------------------------------------------------
-    // Open each unique zip lazily; process files one at a time to avoid
-    // holding a ZipFile borrow across loop iterations.
-    let mut buf = vec![0u8; 64 * 1024];
-
-    // Collect per-file: (target_zip_path, target_path_in_zip, dest, skipped).
-    let mut extracted: Vec<(String, String, PathBuf, bool)> = Vec::with_capacity(files.len());
-
-    // We open each archive fresh per file to avoid lifetime conflicts between
-    // `ZipFile` (which borrows the archive) and the HashMap containing archives.
-    // For typical operation sizes this is cheap — zip's central directory parse
-    // is O(N entries) not O(file size).
-    for (idx, f) in files.iter().enumerate() {
-        if cancel.load(Ordering::SeqCst) {
-            anyhow::bail!("restore cancelled");
-        }
-        // Emit on both the unified "archive-progress" channel (so the existing
-        // ArchiveProgress UI picks it up) and the legacy "archive-restore-progress"
-        // channel (kept for backwards compatibility with any other listener).
-        let prog = RestoreProgress {
-            operation_id,
-            stage: "extract".into(),
-            current: idx + 1,
-            total,
-            message: format!("Extracting {}/{}", idx + 1, total),
-        };
-        emit_event(emitter, "archive-progress", &prog);
-        emit_event(emitter, "archive-restore-progress", &prog);
-
-        let dest = target_root_path.join(&f.target_path_in_zip);
-        if dest.exists() && !overwrite_existing {
-            // Skip — caller decided to preserve existing files
-            extracted.push((f.target_zip_path.clone(), f.target_path_in_zip.clone(), dest, true));
-            continue;
-        }
-
-        // Open zip for this file.
-        let file = File::open(&f.target_zip_path)
-            .with_context(|| format!("open zip {}", f.target_zip_path))?;
-        let mut archive = zip::ZipArchive::new(BufReader::new(file))
-            .with_context(|| format!("parse zip {}", f.target_zip_path))?;
-
-        let mut entry = archive.by_name(&f.target_path_in_zip)
-            .with_context(|| format!("entry not found in zip: {}", f.target_path_in_zip))?;
-
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create dir {}", parent.display()))?;
-        }
-        let mut out = File::create(&dest)
-            .with_context(|| format!("create dest {}", dest.display()))?;
-
-        loop {
-            let n = entry.read(&mut buf)?;
-            if n == 0 { break; }
-            out.write_all(&buf[..n])?;
-        }
-        drop(out);
-        drop(entry);
-
-        extracted.push((f.target_zip_path.clone(), f.target_path_in_zip.clone(), dest, false));
+    if total == 0 {
+        return Ok(());
     }
 
-    // Stage: verify -----------------------------------------------------------
-    let mut written_files: Vec<(&crate::archive::models::ArchiveOperationFile, PathBuf)> =
-        Vec::with_capacity(files.len());
-
-    for (idx, (f, (_zip, _piz, dest, skipped))) in files.iter().zip(extracted.iter()).enumerate() {
-        if cancel.load(Ordering::SeqCst) {
-            anyhow::bail!("restore cancelled");
-        }
-        let prog = RestoreProgress {
-            operation_id,
-            stage: "verify".into(),
-            current: idx + 1,
-            total,
-            message: format!("Verifying {}/{}", idx + 1, total),
-        };
-        emit_event(emitter, "archive-progress", &prog);
-        emit_event(emitter, "archive-restore-progress", &prog);
-
-        if *skipped {
-            // Skipped during extract (overwrite=false + existing). Don't verify.
-            continue;
-        }
-
-        let actual = compute_xxhash(dest)
-            .with_context(|| format!("hash {}", dest.display()))?;
-        if actual != f.expected_hash {
-            anyhow::bail!(
-                "restore verify failed for {}: expected {} got {}",
-                dest.display(), f.expected_hash, actual,
-            );
-        }
-        written_files.push((f, dest.clone()));
+    let archive_root = Path::new(&op.archive_root_path);
+    let temp_dir = restore_temp_dir(archive_root, operation_id);
+    // Always start with a clean temp dir; previous runs may have left files behind.
+    if temp_dir.exists() {
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
+    std::fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("create temp dir {}", temp_dir.display()))?;
 
-    // Stage: update_catalog ---------------------------------------------------
-    // One progress unit per file path rewrite + 1 for the frame set unmark.
-    let catalog_total = written_files.len() + 1;
-    let mut catalog_done: usize = 0;
-    let emit_catalog = |emitter: &dyn ProgressEmitter, done: usize, total: usize, msg: String| {
+    let mode = classify_target(target_root_path, &files);
+
+    let emit = |emitter: &dyn ProgressEmitter, stage: &str, current: usize, total: usize, msg: String| {
         let prog = RestoreProgress {
             operation_id,
-            stage: "update_catalog".into(),
-            current: done,
+            stage: stage.to_string(),
+            current,
             total,
             message: msg,
         };
         emit_event(emitter, "archive-progress", &prog);
         emit_event(emitter, "archive-restore-progress", &prog);
     };
-    emit_catalog(emitter, catalog_done, catalog_total, "Updating catalog".into());
 
-    for (f, new_path) in &written_files {
+    // Stage: extract -----------------------------------------------------------
+    // Extract every entry into the temp dir, verifying the hash against the plan.
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut temp_paths: Vec<PathBuf> = Vec::with_capacity(total);
+
+    for (idx, f) in files.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            cleanup_temp(&temp_dir);
+            anyhow::bail!("restore cancelled");
+        }
+
+        let temp_path = temp_dir.join(&f.target_path_in_zip);
+        if let Some(parent) = temp_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create dir {}", parent.display()))?;
+        }
+
+        let zip_file = File::open(&f.target_zip_path)
+            .with_context(|| format!("open zip {}", f.target_zip_path))?;
+        let mut archive = zip::ZipArchive::new(BufReader::new(zip_file))
+            .with_context(|| format!("parse zip {}", f.target_zip_path))?;
+        let mut entry = archive
+            .by_name(&f.target_path_in_zip)
+            .with_context(|| format!("entry not found in zip: {}", f.target_path_in_zip))?;
+
+        let mut out = File::create(&temp_path)
+            .with_context(|| format!("create temp file {}", temp_path.display()))?;
+        loop {
+            let n = entry.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])?;
+        }
+        drop(out);
+        drop(entry);
+
+        // Verify hash against plan immediately — catches corrupt zips before
+        // we proceed to the reconcile step.
+        let actual = compute_xxhash(&temp_path)
+            .with_context(|| format!("hash {}", temp_path.display()))?;
+        if actual != f.expected_hash {
+            cleanup_temp(&temp_dir);
+            anyhow::bail!(
+                "zip integrity check failed for {}: expected {} got {}",
+                f.target_path_in_zip, f.expected_hash, actual,
+            );
+        }
+        temp_paths.push(temp_path);
+
+        emit(
+            emitter,
+            "extract",
+            idx + 1,
+            total,
+            format!("Extracting {}/{}", idx + 1, total),
+        );
+    }
+
+    // Stage: reconcile ---------------------------------------------------------
+    // For each file: skip if already on disk at source_path; else copy temp → target.
+    // We track which files actually got restored so the catalog phase only
+    // touches those rows.
+    let mut restored: Vec<(&crate::archive::models::ArchiveOperationFile, PathBuf)> =
+        Vec::with_capacity(total);
+
+    for (idx, (f, temp_path)) in files.iter().zip(temp_paths.iter()).enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            cleanup_temp(&temp_dir);
+            anyhow::bail!("restore cancelled");
+        }
+
+        let original = Path::new(&f.source_path);
+        let already_in_place = original.is_file() && !overwrite_existing;
+
+        if already_in_place {
+            emit(
+                emitter,
+                "reconcile",
+                idx + 1,
+                total,
+                format!("Skipping (already on disk): {}", f.source_path),
+            );
+            continue;
+        }
+
+        // Pick the destination path based on mode.
+        let dest = match mode {
+            RestoreTargetMode::Original => original.to_path_buf(),
+            RestoreTargetMode::UnderRoot(root) => root.join(&f.target_path_in_zip),
+        };
+
+        if dest.exists() && !overwrite_existing {
+            // The on-disk target is not the original `source_path` (we'd have
+            // taken the skip branch above) but something exists there. Don't
+            // clobber it.
+            emit(
+                emitter,
+                "reconcile",
+                idx + 1,
+                total,
+                format!("Skipping (target exists): {}", dest.display()),
+            );
+            continue;
+        }
+
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create dir {}", parent.display()))?;
+        }
+        std::fs::copy(temp_path, &dest)
+            .with_context(|| format!("copy {} -> {}", temp_path.display(), dest.display()))?;
+
+        restored.push((f, dest));
+        emit(
+            emitter,
+            "reconcile",
+            idx + 1,
+            total,
+            format!("Restored {}/{}", idx + 1, total),
+        );
+    }
+
+    // Stage: update_catalog ----------------------------------------------------
+    // For each restored file, clear archive markers and rewrite path if it
+    // changed. Files that were skipped (already on disk) need no catalog
+    // change — their rows were either never marked (copy disposition) or
+    // their `path` already matched the on-disk location.
+    let catalog_total = restored.len() + 1;
+    let mut catalog_done: usize = 0;
+    emit(
+        emitter,
+        "update_catalog",
+        catalog_done,
+        catalog_total,
+        "Updating catalog".into(),
+    );
+
+    for (f, new_path) in &restored {
         if let Some(file_id) = f.file_id {
-            adb::unmark_file_archived(conn, file_id, Some(new_path.to_str().unwrap()))?;
+            // If the new path differs from the catalog's source_path, rewrite it.
+            // Otherwise just clear the archive markers in place.
+            let path_changed = new_path.to_str() != Some(f.source_path.as_str());
+            if path_changed {
+                adb::unmark_file_archived(conn, file_id, Some(new_path.to_str().unwrap()))?;
+            } else {
+                adb::unmark_file_archived(conn, file_id, None)?;
+            }
         }
         catalog_done += 1;
-        emit_catalog(
+        emit(
             emitter,
+            "update_catalog",
             catalog_done,
             catalog_total,
             format!("Updating paths ({}/{})", catalog_done, catalog_total),
         );
     }
+
+    // Even when nothing was restored (everything was already on disk), the
+    // frame set's archived_at must still be cleared so it returns to active view.
     adb::unmark_frame_set_archived(conn, op.frames_set_id)?;
     catalog_done += 1;
-    emit_catalog(emitter, catalog_done, catalog_total, "Frame set unarchived".into());
+    emit(
+        emitter,
+        "update_catalog",
+        catalog_done,
+        catalog_total,
+        "Frame set unarchived".into(),
+    );
 
-    // Stage: cleanup ----------------------------------------------------------
+    // For files that weren't restored (skipped because already on disk), still
+    // clear any leftover archive markers on their catalog rows. Otherwise the
+    // row would keep pointing to a now-orphaned zip path.
+    let restored_ids: HashSet<i64> = restored
+        .iter()
+        .filter_map(|(f, _)| f.file_id)
+        .collect();
+    for f in &files {
+        if let Some(fid) = f.file_id {
+            if !restored_ids.contains(&fid) {
+                adb::unmark_file_archived(conn, fid, None)?;
+            }
+        }
+    }
+
+    // Stage: cleanup -----------------------------------------------------------
+    cleanup_temp(&temp_dir);
+
     if !keep_zip_after_restore {
         let zip_paths: Vec<String> = {
             let mut seen: HashSet<String> = HashSet::new();
@@ -195,23 +319,23 @@ pub fn run_restore(
         let cleanup_total = zip_paths.len();
         for (idx, zp) in zip_paths.iter().enumerate() {
             let _ = std::fs::remove_file(zp);
-            let prog = RestoreProgress {
-                operation_id,
-                stage: "cleanup".into(),
-                current: idx + 1,
-                total: cleanup_total,
-                message: format!(
-                    "Removing zip {}/{}",
-                    idx + 1,
-                    cleanup_total
-                ),
-            };
-            emit_event(emitter, "archive-progress", &prog);
-            emit_event(emitter, "archive-restore-progress", &prog);
+            emit(
+                emitter,
+                "cleanup",
+                idx + 1,
+                cleanup_total,
+                format!("Removing zip {}/{}", idx + 1, cleanup_total),
+            );
         }
     }
 
     Ok(())
+}
+
+fn cleanup_temp(temp_dir: &Path) {
+    if temp_dir.exists() {
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }
 
 #[cfg(test)]
@@ -222,8 +346,11 @@ mod tests {
     use crate::archive::planner::{build_plan, commit_plan};
     use crate::db::schema::init_db;
     use crate::events::NullEmitter;
+    use rusqlite::params;
     use tempfile::TempDir;
 
+    /// End-to-end smoke test: archive a single light, restore to an alternate
+    /// target, verify the catalog points at the new location.
     #[test]
     fn full_archive_then_restore_cycle() {
         let arch = TempDir::new().unwrap();
@@ -263,23 +390,21 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
 
-        // Source is gone, archived_at is set
-        assert!(!l1.exists());
+        assert!(!l1.exists(), "source should have been moved into the zip");
 
-        // Now restore to a different target
         run_restore(
             &conn, op_id, restore_target.path(),
-            true, false, &cancel, &NullEmitter,
+            false, false, &cancel, &NullEmitter,
         ).unwrap();
 
-        // zip should have been deleted (keep_zip_after_restore = false)
+        // Zip should be gone (keep_zip_after_restore=false).
         let zips: Vec<_> = std::fs::read_dir(arch.path()).unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "zip").unwrap_or(false))
             .collect();
         assert_eq!(zips.len(), 0);
 
-        // Verify path was rewritten
+        // Catalog path rewritten to the new target.
         let new_path: String = conn.query_row(
             "SELECT path FROM files WHERE id = 1000", [], |r| r.get(0),
         ).unwrap();
@@ -287,11 +412,110 @@ mod tests {
         let restored_content = std::fs::read(&new_path).unwrap();
         assert_eq!(restored_content, b"original-content");
 
-        // Frame set is no longer archived
+        // Frame set marker cleared.
         let archived_at: Option<String> = conn.query_row(
             "SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0),
         ).unwrap();
         assert!(archived_at.is_none());
 
+        // Temp dir gone.
+        let temp = restore_temp_dir(arch.path(), op_id);
+        assert!(!temp.exists());
+    }
+
+    /// Reconcile bug-fix: archive with a copy-disposition dark, then restore.
+    /// The dark is still on disk at its original location, so restore should
+    /// SKIP it and not duplicate. Catalog should remain consistent.
+    #[test]
+    fn restore_skips_copy_disposition_files_already_on_disk() {
+        let arch = TempDir::new().unwrap();
+        let scan = TempDir::new().unwrap();
+
+        let l1 = scan.path().join("M31/L_001.fits");
+        let d1 = scan.path().join("Cal/MasterDark.fits");
+        std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(d1.parent().unwrap()).unwrap();
+        std::fs::write(&l1, b"light-content").unwrap();
+        std::fs::write(&d1, b"dark-content-original").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1000, ?1, 'L_001.fits', 13, '2025-10-12', 'FITS'),
+                    (2000, ?2, 'MasterDark.fits', 21, '2025-10-10', 'FITS')",
+            params![l1.to_str().unwrap(), d1.to_str().unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp, is_master)
+             VALUES (10000, 1000, 'M31', 'T', 'C', 'Light', 0),
+                    (20000, 2000, NULL, 'T', 'C', 'Dark', 1)",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 10000)", []).unwrap();
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date) VALUES (500, 'Dark', '2025-10-10')", []).unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, 20000)", []).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (10000, 'frame', 500, 'Dark', '2025-10-12')",
+            [],
+        ).unwrap();
+
+        let plan = build_plan(
+            &conn, 1, arch.path(),
+            &Dispositions {
+                flats: None,
+                darks: Some(crate::archive::models::ArchiveDisposition::Copy),
+                bias: None,
+                darkflats: None,
+            },
+            ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+        // Light moved → gone; dark copied → stays.
+        assert!(!l1.exists());
+        assert!(d1.exists());
+
+        // Restore to original locations.
+        run_restore(
+            &conn, op_id, scan.path(),
+            false, false, &cancel, &NullEmitter,
+        ).unwrap();
+
+        // Light is back at its original path (was the only one missing).
+        assert!(l1.exists());
+        let l1_content = std::fs::read(&l1).unwrap();
+        assert_eq!(l1_content, b"light-content");
+
+        // Dark is still at its original path with its original content (untouched).
+        assert!(d1.exists());
+        let d1_content = std::fs::read(&d1).unwrap();
+        assert_eq!(d1_content, b"dark-content-original");
+
+        // Catalog: dark's path should still point to its original location, no
+        // archive markers leaking through.
+        let dark_row: (String, Option<i64>, Option<String>) = conn.query_row(
+            "SELECT path, archived_in_operation, archive_zip_path FROM files WHERE id = 2000",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(dark_row.0, d1.to_str().unwrap());
+        assert!(dark_row.1.is_none());
+        assert!(dark_row.2.is_none());
+
+        // Frame set is no longer archived.
+        let archived_at: Option<String> = conn.query_row(
+            "SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0),
+        ).unwrap();
+        assert!(archived_at.is_none());
     }
 }
