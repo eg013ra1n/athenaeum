@@ -321,6 +321,8 @@ export interface FramesSet {
   name: string | null;
   is_custom: boolean;
   is_archived: boolean;
+  archived_at: string | null;        // ISO 8601; non-null means ZIP-archived
+  archive_operation_id: number | null;
   date_obs_start: string | null;
   date_obs_end: string | null;
   objctra: string | null;
