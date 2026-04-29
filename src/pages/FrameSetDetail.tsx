@@ -566,35 +566,11 @@ export default function FrameSetDetail() {
             )}
           </div>
           <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={handleFindNewClick}
-              disabled={
-                findNewBusy || !detail.frames_set?.objctra || !detail.frames_set?.objctdec
-              }
-              title={
-                !detail.frames_set?.objctra || !detail.frames_set?.objctdec
-                  ? 'No coordinates — nothing to match against'
-                  : 'Find new images for this object'
-              }
-              className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Search size={14} />
-              {findNewBusy ? 'Merging…' : 'Find new images'}
-            </button>
-            {!detail.frames_set?.archived_at && (
-              <button
-                type="button"
-                onClick={handleArchiveClick}
-                disabled={archiving}
-                title="Move and ZIP this frame set"
-                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <ArchiveIcon size={14} />
-                {archiving ? 'Archiving…' : 'Move and ZIP'}
-              </button>
-            )}
-            {detail.frames_set?.archived_at && (
+            {/* Single contextual action button: depends on the frame set state.
+                stage / wip (is_archived=0) → Find new images
+                in archive, not yet zipped → Move and ZIP
+                already zipped (archived_at set) → Unarchive */}
+            {detail.frames_set?.archived_at ? (
               <button
                 type="button"
                 onClick={async () => {
@@ -610,11 +586,39 @@ export default function FrameSetDetail() {
                     alert(`Failed to load archive details: ${e}`);
                   }
                 }}
-                title="Restore this archived frame set"
+                title="Unarchive this frame set: extract files from the zip and bring it back to the active view"
                 className="flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 text-accent px-3 py-1.5 text-sm hover:bg-accent/20"
               >
                 <Upload size={14} />
-                Restore
+                Unarchive
+              </button>
+            ) : detail.frames_set?.is_archived ? (
+              <button
+                type="button"
+                onClick={handleArchiveClick}
+                disabled={archiving}
+                title="Move this frame set's files into a zip archive"
+                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ArchiveIcon size={14} />
+                {archiving ? 'Archiving…' : 'Move and ZIP'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleFindNewClick}
+                disabled={
+                  findNewBusy || !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+                }
+                title={
+                  !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+                    ? 'No coordinates — nothing to match against'
+                    : 'Find new images for this object'
+                }
+                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Search size={14} />
+                {findNewBusy ? 'Merging…' : 'Find new images'}
               </button>
             )}
             <div className="flex items-center gap-1.5 text-sm text-content-muted">

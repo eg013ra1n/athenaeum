@@ -37,7 +37,7 @@ fn archive_then_restore_then_archive_again() {
     init_db(&conn).unwrap();
     conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
         [scan.path().to_str().unwrap()]).unwrap();
-    conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+    conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
     conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
     conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
     for (file_id, path, frame_id) in [(1000, &l1, 10000), (1001, &l2, 10001)] {
@@ -106,6 +106,10 @@ fn archive_then_restore_then_archive_again() {
         "SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0),
     ).unwrap();
     assert!(archived_at.is_none());
+
+    // After restore, the frame set is back in active/wip view (is_archived=0).
+    // To re-archive, the user must first move it back to the Archive section.
+    conn.execute("UPDATE frames_set SET is_archived = 1 WHERE id = 1", []).unwrap();
 
     // Re-archive (should work now that everything is back)
     let plan2 = build_plan(

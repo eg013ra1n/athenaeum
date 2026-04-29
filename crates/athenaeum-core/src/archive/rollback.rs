@@ -93,8 +93,9 @@ pub fn rollback_operation(
     staging::cleanup_staging(&archive_root, operation_id)?;
     adb::update_step(conn, sid, StepStatus::Done, None, None)?;
 
-    // 4. Unmark catalog rows (frame set + any files we already marked).
-    adb::unmark_frame_set_archived(conn, op.frames_set_id)?;
+    // 4. Clear zip markers on the frame set, but keep is_archived as-is —
+    //    the frame set was in the Archive section before the failed op started.
+    adb::clear_zip_markers(conn, op.frames_set_id)?;
     for f in &files {
         if let Some(file_id) = f.file_id {
             adb::unmark_file_archived(conn, file_id, None)?;
@@ -150,7 +151,7 @@ mod tests {
         init_db(&conn).unwrap();
         conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
             [scan.path().to_str().unwrap()]).unwrap();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
         conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
              VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
         conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();

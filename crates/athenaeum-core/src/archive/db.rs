@@ -254,24 +254,40 @@ pub fn list_unfinished_operations(conn: &Connection) -> Result<Vec<ArchiveOperat
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
 }
 
-/// Mark a frames_set as ZIP-archived. Sets archived_at, archive_operation_id,
-/// AND is_archived (so existing UI hide logic continues to work).
+/// Mark a frames_set as ZIP-archived (transition: in Archive section → zipped).
+/// Sets archived_at + archive_operation_id only. Does NOT touch is_archived,
+/// because the frame set must already be in the Archive section before zipping.
 pub fn mark_frame_set_archived(conn: &Connection, frames_set_id: i64, operation_id: i64) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "UPDATE frames_set
-         SET archived_at = ?1, archive_operation_id = ?2, is_archived = 1
+         SET archived_at = ?1, archive_operation_id = ?2
          WHERE id = ?3",
         params![now, operation_id, frames_set_id],
     )?;
     Ok(())
 }
 
-/// Clear archive markers from a frames_set (used by rollback and restore).
+/// Fully unarchive: clear zip markers AND remove from the Archive section.
+/// Used by the user-facing "Unarchive" action — brings the frame set all the
+/// way back to active view (stage/wip).
 pub fn unmark_frame_set_archived(conn: &Connection, frames_set_id: i64) -> Result<()> {
     conn.execute(
         "UPDATE frames_set
          SET archived_at = NULL, archive_operation_id = NULL, is_archived = 0
+         WHERE id = ?1",
+        [frames_set_id],
+    )?;
+    Ok(())
+}
+
+/// Partial revert used by rollback only: clear zip markers but leave is_archived
+/// untouched. The frame set was in the Archive section before the failed op,
+/// so it should remain there after rollback.
+pub fn clear_zip_markers(conn: &Connection, frames_set_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE frames_set
+         SET archived_at = NULL, archive_operation_id = NULL
          WHERE id = ?1",
         [frames_set_id],
     )?;
@@ -328,9 +344,10 @@ mod tests {
     fn setup() -> (Connection, i64) {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        // Insert a frame_set so foreign key works
+        // The frame set must already be in the Archive section (is_archived=1)
+        // before any zip operation can be planned/run against it.
         conn.execute(
-            "INSERT INTO frames_set (id, name) VALUES (1, 'TestSet')",
+            "INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'TestSet', 1)",
             [],
         ).unwrap();
         (conn, 1)
@@ -407,6 +424,8 @@ mod tests {
         let op_id = insert_operation(&conn, fs_id, "/tmp", None, None, None, None, "store").unwrap();
         mark_frame_set_archived(&conn, fs_id, op_id).unwrap();
 
+        // mark_frame_set_archived only sets the zip markers; is_archived was
+        // already 1 from the setup fixture and stays 1.
         let (archived_at, op, is_arch): (Option<String>, Option<i64>, i32) = conn.query_row(
             "SELECT archived_at, archive_operation_id, is_archived FROM frames_set WHERE id = ?1",
             [fs_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -415,6 +434,18 @@ mod tests {
         assert_eq!(op, Some(op_id));
         assert_eq!(is_arch, 1);
 
+        // clear_zip_markers only clears the zip markers — is_archived stays 1.
+        clear_zip_markers(&conn, fs_id).unwrap();
+        let (archived_at, op, is_arch): (Option<String>, Option<i64>, i32) = conn.query_row(
+            "SELECT archived_at, archive_operation_id, is_archived FROM frames_set WHERE id = ?1",
+            [fs_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert!(archived_at.is_none());
+        assert!(op.is_none());
+        assert_eq!(is_arch, 1);
+
+        // Re-mark to test the full unarchive path next.
+        mark_frame_set_archived(&conn, fs_id, op_id).unwrap();
         unmark_frame_set_archived(&conn, fs_id).unwrap();
         let (archived_at, op, is_arch): (Option<String>, Option<i64>, i32) = conn.query_row(
             "SELECT archived_at, archive_operation_id, is_archived FROM frames_set WHERE id = ?1",

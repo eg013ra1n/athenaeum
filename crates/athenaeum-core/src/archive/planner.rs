@@ -45,6 +45,23 @@ pub fn build_plan(
     dispositions: &Dispositions,
     compression: ArchiveCompression,
 ) -> Result<ArchivePlan> {
+    // Guard: a frame set must be in the Archive section (is_archived=1) and
+    // not already zipped before we plan. Frame sets in stage/wip should use
+    // the existing archive_frame_set flow first.
+    let (is_archived, archived_at): (i32, Option<String>) = conn.query_row(
+        "SELECT is_archived, archived_at FROM frames_set WHERE id = ?1",
+        [frames_set_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if is_archived == 0 {
+        anyhow::bail!(
+            "frame set must be moved to the Archive section before it can be zipped"
+        );
+    }
+    if archived_at.is_some() {
+        anyhow::bail!("frame set is already zipped");
+    }
+
     let frame_set = load_frame_set_metadata(conn, frames_set_id)?;
     let scan_roots = load_all_scan_roots(conn)?;
     let prefix_map = path_layout::resolve_scan_root_prefixes(&scan_roots);
@@ -429,8 +446,8 @@ mod tests {
 
         // Frame set
         conn.execute(
-            "INSERT INTO frames_set (id, name, date_obs_start, date_obs_end)
-             VALUES (1, 'M31', '2025-10-12T00:00:00Z', '2025-10-12T08:00:00Z')",
+            "INSERT INTO frames_set (id, name, is_archived, date_obs_start, date_obs_end)
+             VALUES (1, 'M31', 1, '2025-10-12T00:00:00Z', '2025-10-12T08:00:00Z')",
             [],
         ).unwrap();
         conn.execute(

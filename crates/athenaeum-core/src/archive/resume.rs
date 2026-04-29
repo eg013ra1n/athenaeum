@@ -53,7 +53,7 @@ mod tests {
         init_db(&conn).unwrap();
         conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
             [scan.path().to_str().unwrap()]).unwrap();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
         conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
              VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
         conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
