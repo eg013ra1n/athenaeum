@@ -600,9 +600,20 @@ fn reparse_and_update_in_place(
         );
     }
 
+    // Wrap all DB writes in a transaction so a process kill / cancellation
+    // mid-update can't leave a half-updated row (e.g. files synced but
+    // frames stale, or fits_header deleted but not re-inserted). The
+    // pre-parse work above (metadata stat, format detection, FITS parse,
+    // hash computation, frame_count read) is read-only and intentionally
+    // stays OUTSIDE the transaction. `unchecked_transaction` skips
+    // transaction-state checking — fine here because we own the only
+    // reference; the returned `Transaction` auto-rollbacks on drop if
+    // commit() is not called.
+    let tx = conn.unchecked_transaction()?;
+
     // UPDATE files in place. Mirrors insert_file's column list (path,
     // filename, created_at intentionally not touched).
-    conn.execute(
+    tx.execute(
         "UPDATE files
          SET size = ?1, modified_at = ?2, format = ?3,
              metadata_hash = ?4, content_hash = ?5
@@ -632,7 +643,7 @@ fn reparse_and_update_in_place(
         let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
         let is_master_int = if frame.is_master { 1i64 } else { 0i64 };
         let override_int = if frame.override_ { 1i64 } else { 0i64 };
-        conn.execute(
+        tx.execute(
             "UPDATE frames SET
                 object = ?1, date_obs = ?2, telescop = ?3, instrume = ?4,
                 exptime = ?5, filter = ?6, imagetyp = ?7, is_master = ?8,
@@ -685,11 +696,14 @@ fn reparse_and_update_in_place(
         // suffix applied (so both the UPDATE and INSERT branches share the
         // same instrume substitution logic), leave id = None so the
         // canonical insert allocates a fresh auto-increment id.
+        // `Transaction` derefs to `Connection`, so &*tx satisfies
+        // insert_frame's `&Connection` parameter while keeping the write
+        // inside the transaction.
         let mut frame_for_insert = frame.clone();
         frame_for_insert.id = None;
         frame_for_insert.file_id = file_id;
         frame_for_insert.instrume = new_instrume.clone();
-        insert_frame(conn, &frame_for_insert)?;
+        insert_frame(&tx, &frame_for_insert)?;
     }
 
     // fits_header has UNIQUE(file_id) — DELETE then INSERT so the
@@ -697,17 +711,18 @@ fn reparse_and_update_in_place(
     // fits_header rows, so this is safe.
     if let Some(h) = header_text {
         let fingerprint = crate::fingerprint::compute_header_fingerprint(&h);
-        conn.execute(
+        tx.execute(
             "DELETE FROM fits_header WHERE file_id = ?1",
             rusqlite::params![file_id],
         )?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO fits_header (file_id, header, header_fingerprint)
              VALUES (?1, ?2, ?3)",
             rusqlite::params![file_id, h, fingerprint],
         )?;
     }
 
+    tx.commit()?;
     Ok(())
 }
 
@@ -967,22 +982,30 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         return result;
     }
 
-    // Build a map of existing file paths to their stored (size, modified_at).
-    // We use this to classify each on-disk file as new / unchanged / modified
-    // so that in-place modifications get re-parsed instead of silently
-    // skipped (the previous path-only filter). modified_at is stored as
-    // RFC3339 in the DB and compared as a string for an exact-match check.
+    // Build a map of existing file paths to their stored (id, size,
+    // modified_at). We use this to classify each on-disk file as new /
+    // unchanged / modified so that in-place modifications get re-parsed
+    // instead of silently skipped (the previous path-only filter).
+    // modified_at is stored as RFC3339 in the DB and compared as a string
+    // for an exact-match check. The `id` is carried through so the write
+    // loop below can dispatch UPDATE-in-place without a per-file
+    // `SELECT id FROM files` (N+1) query.
     crate::logging::log("INFO", "Building existing files map from DB...");
-    let existing_files: std::collections::HashMap<String, (i64, String)> = {
+    let existing_files: std::collections::HashMap<String, (i64, i64, String)> = {
         let mut map = std::collections::HashMap::new();
-        match conn.prepare("SELECT path, size, modified_at FROM files") {
+        match conn.prepare("SELECT path, id, size, modified_at FROM files") {
             Ok(mut stmt) => {
                 match stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
                 }) {
                     Ok(rows) => {
                         for entry in rows.flatten() {
-                            map.insert(entry.0, (entry.1, entry.2));
+                            map.insert(entry.0, (entry.1, entry.2, entry.3));
                         }
                     }
                     Err(e) => {
@@ -997,19 +1020,20 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         map
     };
 
-    // Classify each discovered file. Modified files are re-processed by
-    // deleting the old row first (CASCADE removes frames/headers/etc.).
-    let mut modified_paths_to_purge: Vec<String> = Vec::new();
+    // Classification: each on-disk file is either NEW (no DB row) or
+    // MODIFIED (DB row exists but size/mtime drifted). Unchanged files are
+    // dropped here. The sequential write phase below dispatches NEW vs
+    // MODIFIED separately (INSERT vs UPDATE-in-place). For modified files
+    // we carry the `file_id` along with the path so the write loop never
+    // needs to re-query it.
+    let mut modified_paths: Vec<(String, i64)> = Vec::new();
     let new_files: Vec<PathBuf> = files
         .into_iter()
         .filter(|p| {
             let path_str = p.to_string_lossy().to_string();
             match existing_files.get(&path_str) {
-                None => true, // New file
-                Some((db_size, db_modified)) => {
-                    // Compare against current on-disk metadata. If we can't
-                    // stat the file, treat it as unchanged (the parallel
-                    // process_file_parallel will surface the I/O error).
+                None => true,
+                Some((db_id, db_size, db_modified)) => {
                     match std::fs::metadata(p) {
                         Ok(meta) => {
                             let on_disk_size = meta.len() as i64;
@@ -1022,7 +1046,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                             if unchanged {
                                 false
                             } else {
-                                modified_paths_to_purge.push(path_str);
+                                modified_paths.push((path_str, *db_id));
                                 true
                             }
                         }
@@ -1033,43 +1057,14 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         })
         .collect();
 
-    // Purge stale rows for modified files so insert can proceed cleanly.
-    // Wrapped in a small transaction to keep the cascade atomic.
-    if !modified_paths_to_purge.is_empty() {
-        crate::logging::log(
-            "INFO",
-            &format!(
-                "Detected {} modified file(s); purging stale catalog rows for re-processing",
-                modified_paths_to_purge.len()
-            ),
-        );
-        if let Err(e) = conn.execute("BEGIN TRANSACTION", []) {
-            crate::logging::log("ERROR", &format!("M1 purge: BEGIN failed: {}", e));
-        } else {
-            let mut purge_failed = false;
-            for path in &modified_paths_to_purge {
-                if let Err(e) = conn.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![path]) {
-                    crate::logging::log("ERROR", &format!("M1 purge: DELETE failed for {}: {}", path, e));
-                    result.errors.push(format!("Failed to purge stale row for modified file {}: {}", path, e));
-                    purge_failed = true;
-                    break;
-                }
-            }
-            let final_stmt = if purge_failed { "ROLLBACK" } else { "COMMIT" };
-            if let Err(e) = conn.execute(final_stmt, []) {
-                crate::logging::log("ERROR", &format!("M1 purge: {} failed: {}", final_stmt, e));
-            }
-        }
-    }
-
     result.files_skipped = result.files_found - new_files.len();
     crate::logging::log(
         "INFO",
         &format!(
-            "Files to process: {} ({} unchanged, {} modified)",
+            "Files to process: {} ({} unchanged, {} modified — will UPDATE in place)",
             new_files.len(),
             result.files_skipped,
-            modified_paths_to_purge.len()
+            modified_paths.len(),
         ),
     );
 
@@ -1206,6 +1201,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         return result;
     }
 
+    // Path -> file_id lookup for the write-loop's UPDATE-in-place branch.
+    // Built from the classification phase's `modified_paths` so we don't
+    // need a per-file `SELECT id FROM files` (N+1) query.
+    let modified_files_by_path: std::collections::HashMap<String, i64> =
+        modified_paths.iter().cloned().collect();
+
     // Use iter_mut to avoid cloning Frame structs during insert
     let total_results = processed_results.len();
     let mut cancelled_mid_insert = false;
@@ -1271,7 +1272,43 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             }
         }
 
-        // Insert file
+        // If this file is a modified existing row (not a new file), use the
+        // non-destructive in-place UPDATE path. Preserves files.id +
+        // frames.id and therefore every junction-table linkage. The
+        // `file_id` is plumbed through from the classification phase, so
+        // no per-row SELECT is needed here.
+        if let Some(&file_id) = modified_files_by_path.get(&file_result.file.path) {
+            let path_buf = PathBuf::from(&file_result.file.path);
+            match reparse_and_update_in_place(
+                &path_buf, file_id, conn, use_content_hash, unique_camera, root_id,
+            ) {
+                Ok(()) => {
+                    result.files_processed += 1;
+                    // Track image type for calibration set creation, BUT
+                    // intentionally do NOT push to flat_frame_ids /
+                    // dark_frame_ids / etc. — those drive
+                    // create_calibration_sets_from_scan_with_masters which
+                    // would create a duplicate calibration set if we did.
+                    // The original calibration_set_frames row already
+                    // points at frames.id (preserved) and stays valid.
+                    if let Some(ref imagetyp) = file_result.imagetyp {
+                        if matches!(imagetyp, ImageType::Light) {
+                            lights_count += 1;
+                        }
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    result.errors.push(format!(
+                        "{}: in-place re-parse failed: {}",
+                        file_result.file.path, e,
+                    ));
+                    continue;
+                }
+            }
+        }
+
+        // New file path — existing INSERT behavior.
         match insert_file(conn, &file_result.file) {
             Ok(file_id) => {
                 // Update frame file_id in place (avoids clone of 32-field struct)
@@ -1698,5 +1735,65 @@ mod inplace_tests {
             )
             .unwrap();
         assert_eq!(frame_count, 1, "orphaned files row must get a fresh frames row");
+    }
+
+    /// Same invariant as `rescan_after_mtime_change_preserves_session_members`
+    /// but exercises `scan_directory_parallel` — the path monitoring uses. Until
+    /// Task 5 lands, this test fails because the parallel scan still does
+    /// DELETE + re-INSERT in the classification phase.
+    #[test]
+    fn parallel_rescan_after_mtime_change_preserves_session_members() {
+        let scan = TempDir::new().unwrap();
+        let f = scan.path().join("M33/L_001.fits");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&f);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M33')", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let scan1 = scan_directory_parallel(
+            scan.path(), 1, &conn, &NullEmitter, false, cancel.clone(), false,
+        );
+        assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
+
+        let frame_id: i64 = conn.query_row(
+            "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+            [f.to_str().unwrap()], |r| r.get(0),
+        ).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)",
+            params![frame_id]).unwrap();
+
+        // Touch — advance mtime by at least one filesystem tick.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let bytes = std::fs::read(&f).unwrap();
+        std::fs::write(&f, bytes).unwrap();
+
+        // Rescan via the parallel path.
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let scan2 = scan_directory_parallel(
+            scan.path(), 1, &conn, &NullEmitter, false, cancel2, false,
+        );
+        assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
+        assert!(!scan2.cancelled);
+
+        let frame_id_after: i64 = conn.query_row(
+            "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+            [f.to_str().unwrap()], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(frame_id, frame_id_after,
+            "frame.id must be preserved across parallel in-place re-parse");
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1",
+            params![frame_id_after], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "session membership must survive the parallel re-parse");
     }
 }
