@@ -383,6 +383,16 @@ fn finalize_phase(
     // Cleanup staging
     staging::cleanup_staging(archive_root, operation_id)?;
     adb::update_step(conn, sid, StepStatus::Done, None, None)?;
+
+    // Emit a final progress event so the UI moves from 0% to 100% on the
+    // finalizing bar before the worker closes out.
+    emit_event(emitter, "archive-progress", &ArchiveProgress {
+        operation_id,
+        stage: "finalizing".into(),
+        current: 1,
+        total: 1,
+        message: "Finalized".into(),
+    });
     Ok(())
 }
 

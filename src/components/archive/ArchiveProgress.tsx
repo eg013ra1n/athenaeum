@@ -6,22 +6,58 @@ import type { ArchiveProgressEvent } from '../../types/archive';
 interface Props {
   operationId: number;
   onClose?: () => void;
+  onFinished?: (outcome: string) => void;
 }
 
-export function ArchiveProgress({ operationId, onClose }: Props) {
+interface FinishedEvent {
+  operation_id: number;
+  outcome: 'completed' | 'cancelled' | 'failed' | string;
+}
+
+export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
   const [progress, setProgress] = useState<ArchiveProgressEvent | null>(null);
+  const [finished, setFinished] = useState<FinishedEvent | null>(null);
 
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
+    let unlistenProgress: (() => void) | null = null;
+    let unlistenFinished: (() => void) | null = null;
     api.listen<ArchiveProgressEvent>('archive-progress', (payload) => {
       if (payload.operation_id === operationId) setProgress(payload);
-    }).then(fn => { unlisten = fn; });
-    return () => { unlisten?.(); };
-  }, [operationId]);
+    }).then(fn => { unlistenProgress = fn; });
+    api.listen<FinishedEvent>('archive-finished', (payload) => {
+      if (payload.operation_id !== operationId) return;
+      setFinished(payload);
+      onFinished?.(payload.outcome);
+      // Brief pause so the user sees the final state, then dismiss.
+      window.setTimeout(() => { onClose?.(); }, 1500);
+    }).then(fn => { unlistenFinished = fn; });
+    return () => {
+      unlistenProgress?.();
+      unlistenFinished?.();
+    };
+  }, [operationId, onClose, onFinished]);
 
-  const percent = progress && progress.total > 0
-    ? Math.round((progress.current / progress.total) * 100)
-    : 0;
+  const percent = finished
+    ? 100
+    : progress && progress.total > 0
+      ? Math.round((progress.current / progress.total) * 100)
+      : 0;
+
+  const statusLabel = finished
+    ? finished.outcome === 'completed'
+      ? 'Completed'
+      : finished.outcome === 'cancelled'
+        ? 'Cancelled — rolled back'
+        : 'Failed — rolled back'
+    : progress?.message ?? 'Starting…';
+
+  const barColor = finished
+    ? finished.outcome === 'completed'
+      ? 'bg-success'
+      : finished.outcome === 'cancelled'
+        ? 'bg-warning'
+        : 'bg-error'
+    : 'bg-accent';
 
   return (
     <div className="border border-border rounded-lg p-3 bg-surface-elevated shadow-lg">
@@ -29,34 +65,31 @@ export function ArchiveProgress({ operationId, onClose }: Props) {
         <span className="text-sm font-medium text-content">
           Archive operation #{operationId}
         </span>
-        <button
-          onClick={async () => {
-            try {
-              await cancelArchiveOperation(operationId);
-            } catch (e) {
-              console.error('cancel archive failed', e);
-            }
-            onClose?.();
-          }}
-          className="text-xs px-2 py-1 border border-border rounded hover:bg-warning/10 text-content-muted hover:text-warning transition-colors"
-        >
-          Cancel
-        </button>
+        {!finished && (
+          <button
+            onClick={async () => {
+              try {
+                await cancelArchiveOperation(operationId);
+              } catch (e) {
+                console.error('cancel archive failed', e);
+              }
+            }}
+            className="text-xs px-2 py-1 border border-border rounded hover:bg-warning/10 text-content-muted hover:text-warning transition-colors"
+          >
+            Cancel
+          </button>
+        )}
       </div>
-      {progress ? (
-        <div className="text-xs text-content-muted space-y-1">
-          <p className="truncate">{progress.message}</p>
-          <div className="w-full h-1.5 bg-surface rounded-full overflow-hidden">
-            <div
-              className="h-full bg-accent transition-all duration-300"
-              style={{ width: `${percent}%` }}
-            />
-          </div>
-          <p className="text-right">{percent}%</p>
+      <div className="text-xs text-content-muted space-y-1">
+        <p className="truncate">{statusLabel}</p>
+        <div className="w-full h-1.5 bg-surface rounded-full overflow-hidden">
+          <div
+            className={`h-full ${barColor} transition-all duration-300`}
+            style={{ width: `${percent}%` }}
+          />
         </div>
-      ) : (
-        <p className="text-xs text-content-muted">Starting…</p>
-      )}
+        <p className="text-right">{percent}%</p>
+      </div>
     </div>
   );
 }

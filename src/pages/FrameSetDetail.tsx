@@ -14,9 +14,11 @@ import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../components/calibration/utils';
 import { ArchiveDispositionDialog } from '../components/archive/ArchiveDispositionDialog';
 import { ArchiveProgress } from '../components/archive/ArchiveProgress';
-import { getArchiveSettings, setArchiveRootPath, startArchiveOperation } from '../api/archive';
+import { RestoreDialog } from '../components/archive/RestoreDialog';
+import { getArchiveSettings, setArchiveRootPath, startArchiveOperation, listArchivedFrameSets } from '../api/archive';
 import { pickDirectory } from '../api/desktop';
-import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
+import { Upload } from 'lucide-react';
+import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history';
 
@@ -73,6 +75,7 @@ export default function FrameSetDetail() {
   const [archiveCompression, setArchiveCompression] = useState<ArchiveCompression>('store');
   const [archiving, setArchiving] = useState(false);
   const [activeArchiveOpId, setActiveArchiveOpId] = useState<number | null>(null);
+  const [restoreItem, setRestoreItem] = useState<ArchivedFrameSetSummary | null>(null);
 
   // Handle "Find new images" click: if the user has trusted auto-merge for
   // the button path, skip the preview dialog and merge directly; otherwise,
@@ -579,20 +582,41 @@ export default function FrameSetDetail() {
               <Search size={14} />
               {findNewBusy ? 'Merging…' : 'Find new images'}
             </button>
-            <button
-              type="button"
-              onClick={handleArchiveClick}
-              disabled={archiving || !!detail.frames_set?.archived_at}
-              title={
-                detail.frames_set?.archived_at
-                  ? 'This frame set is already archived'
-                  : 'Move and ZIP this frame set'
-              }
-              className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <ArchiveIcon size={14} />
-              {archiving ? 'Archiving…' : 'Move and ZIP'}
-            </button>
+            {!detail.frames_set?.archived_at && (
+              <button
+                type="button"
+                onClick={handleArchiveClick}
+                disabled={archiving}
+                title="Move and ZIP this frame set"
+                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ArchiveIcon size={14} />
+                {archiving ? 'Archiving…' : 'Move and ZIP'}
+              </button>
+            )}
+            {detail.frames_set?.archived_at && (
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const items = await listArchivedFrameSets();
+                    const match = items.find(it => it.frames_set_id === detail.frames_set?.id);
+                    if (match) {
+                      setRestoreItem(match);
+                    } else {
+                      alert('Could not find this frame set in the archive list. It may have been deleted.');
+                    }
+                  } catch (e) {
+                    alert(`Failed to load archive details: ${e}`);
+                  }
+                }}
+                title="Restore this archived frame set"
+                className="flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 text-accent px-3 py-1.5 text-sm hover:bg-accent/20"
+              >
+                <Upload size={14} />
+                Restore
+              </button>
+            )}
             <div className="flex items-center gap-1.5 text-sm text-content-muted">
               <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
               <span>·</span>
@@ -849,9 +873,25 @@ export default function FrameSetDetail() {
         <div className="fixed bottom-4 right-4 z-40 w-80">
           <ArchiveProgress
             operationId={activeArchiveOpId}
-            onClose={() => setActiveArchiveOpId(null)}
+            onClose={() => {
+              setActiveArchiveOpId(null);
+              // Reload detail so the archived state (badge / Restore button) appears.
+              loadData();
+            }}
           />
         </div>
+      )}
+
+      {/* Restore Dialog (when an archived frame set is opened) */}
+      {restoreItem && (
+        <RestoreDialog
+          item={restoreItem}
+          onCancel={() => setRestoreItem(null)}
+          onCompleted={() => {
+            setRestoreItem(null);
+            loadData();
+          }}
+        />
       )}
     </div>
   );

@@ -107,28 +107,38 @@ pub async fn start_archive_operation(
         let db = ctx_for_worker.db.get().expect("db");
         let conn = db.conn();
         let result = executor::run_operation(&conn, op_id, &cancel_flag, &emitter);
-        match result {
+        let outcome = match result {
             Ok(()) => {
                 eprintln!("archive operation {} completed", op_id);
+                "completed"
             }
             Err(e) => {
-                if executor::was_cancelled(&e) {
+                let outcome = if executor::was_cancelled(&e) {
                     let _ = adb::update_operation_status(
                         &conn, op_id, ArchiveStatus::Cancelled, None,
                     );
+                    "cancelled"
                 } else {
                     eprintln!("archive operation {} failed: {:#}", op_id, e);
                     let msg = format!("{:#}", e);
                     let _ = adb::update_operation_status(
                         &conn, op_id, ArchiveStatus::Failed, Some(&msg),
                     );
-                }
+                    "failed"
+                };
                 // Auto-rollback on cancel or failure.
                 if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
                     eprintln!("rollback for {} failed: {:#}", op_id, rb_err);
                 }
+                outcome
             }
-        }
+        };
+        // Tell the UI the operation is over so the progress widget can dismiss.
+        athenaeum_core::events::emit_event(
+            &emitter,
+            "archive-finished",
+            &serde_json::json!({ "operation_id": op_id, "outcome": outcome }),
+        );
         // Remove from active map regardless of outcome.
         let mut map = ctx_for_worker.active_archives.lock().unwrap();
         map.remove(&op_id);
