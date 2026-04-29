@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
-import { Files, Calendar, Target, Focus, Camera, Layers, Settings, Trash2, Info, ChevronsLeft, ChevronsRight } from 'lucide-react';
+import { Files, Calendar, Target, Focus, Camera, Layers, Settings, Trash2, Info, ChevronsLeft, ChevronsRight, Archive as ArchiveIcon } from 'lucide-react';
+import { ArchiveResumeBanner } from './archive/ArchiveResumeBanner';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
 import { ExportProgressProvider } from '../contexts/ExportProgressContext';
@@ -30,6 +31,7 @@ export default function Layout() {
     { to: '/skychart', icon: Focus, label: 'Sky Chart' },
     { to: '/calendar', icon: Calendar, label: 'Shoot Calendar' },
     { to: '/export', icon: Layers, label: 'Export' },
+    { to: '/archive', icon: ArchiveIcon, label: 'Archive' },
     { to: '/blackhole', icon: Trash2, label: 'Black Hole' },
     { to: '/settings', icon: Settings, label: 'Settings' },
     { to: '/about', icon: Info, label: 'About' },
@@ -94,8 +96,11 @@ export default function Layout() {
           </aside>
 
           {/* Main Content */}
-          <main className="flex-1 overflow-auto">
-            <Outlet />
+          <main className="flex-1 overflow-auto flex flex-col">
+            <ArchiveResumeBanner />
+            <div className="flex-1 overflow-auto">
+              <Outlet />
+            </div>
           </main>
 
           {/* Global progress indicators */}
