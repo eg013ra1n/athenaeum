@@ -17,6 +17,7 @@ use std::sync::Arc;
 // ── Request structs ───────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OperationIdRequest {
     pub operation_id: i64,
 }
@@ -32,6 +33,7 @@ pub struct SetCompressionRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanRequest {
     pub frames_set_id: i64,
     pub dispositions: Dispositions,
@@ -39,6 +41,7 @@ pub struct PlanRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartRequest {
     pub frames_set_id: i64,
     pub dispositions: Dispositions,
@@ -47,6 +50,7 @@ pub struct StartRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartRestoreRequest {
     pub operation_id: i64,
     pub target_root_path: String,
