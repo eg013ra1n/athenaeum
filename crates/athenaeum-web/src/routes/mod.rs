@@ -27,6 +27,7 @@ mod images;
 mod missing_files;
 mod analysis;
 mod plate_solve;
+mod archive;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -188,6 +189,19 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/download_tycho2_catalog", post(plate_solve::download_tycho2_catalog))
         .route("/api/get_quad_index_status", post(plate_solve::get_quad_index_status))
         .route("/api/build_quad_index", post(plate_solve::build_quad_index))
+        // Archive feature
+        .route("/api/get_archive_settings", post(archive::get_archive_settings))
+        .route("/api/set_archive_root_path", post(archive::set_archive_root_path))
+        .route("/api/set_archive_compression", post(archive::set_archive_compression))
+        .route("/api/plan_archive_operation", post(archive::plan_archive_operation))
+        .route("/api/start_archive_operation", post(archive::start_archive_operation))
+        .route("/api/cancel_archive_operation", post(archive::cancel_archive_operation))
+        .route("/api/list_unfinished_archive_operations", post(archive::list_unfinished_archive_operations))
+        .route("/api/resume_archive_operation", post(archive::resume_archive_operation))
+        .route("/api/rollback_archive_operation", post(archive::rollback_archive_operation))
+        .route("/api/list_archived_frame_sets", post(archive::list_archived_frame_sets))
+        .route("/api/start_restore_operation", post(archive::start_restore_operation))
+        .route("/api/delete_archive", post(archive::delete_archive))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_app_version", post(get_app_version))
