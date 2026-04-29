@@ -895,9 +895,12 @@ export default function FrameSetDetail() {
         <RestoreDialog
           item={restoreItem}
           onCancel={() => setRestoreItem(null)}
-          onCompleted={() => {
+          onStarted={(opId) => {
             setRestoreItem(null);
-            loadData();
+            // Mount the progress widget; the existing ArchiveProgress component
+            // listens to the same `archive-progress` + `archive-finished` events
+            // that restore now emits.
+            setActiveArchiveOpId(opId);
           }}
         />
       )}

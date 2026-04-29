@@ -532,7 +532,7 @@ pub async fn start_restore_operation(
         let emitter = SseProgressEmitter::new(event_tx);
         let db = ctx.db.get().expect("db");
         let conn = db.conn();
-        if let Err(e) = restore::run_restore(
+        let outcome = match restore::run_restore(
             &conn,
             op_id,
             Path::new(&target_root_path),
@@ -541,8 +541,17 @@ pub async fn start_restore_operation(
             &cancel_flag,
             &emitter,
         ) {
-            eprintln!("restore {} failed: {:#}", op_id, e);
-        }
+            Ok(()) => "completed",
+            Err(e) => {
+                eprintln!("restore {} failed: {:#}", op_id, e);
+                if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
+            }
+        };
+        athenaeum_core::events::emit_event(
+            &emitter,
+            "archive-finished",
+            &serde_json::json!({ "operation_id": op_id, "outcome": outcome, "kind": "restore" }),
+        );
         ctx.active_archives.lock().unwrap().remove(&op_id);
     });
     Ok(StatusCode::OK)

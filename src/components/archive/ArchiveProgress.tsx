@@ -12,7 +12,13 @@ interface Props {
 interface FinishedEvent {
   operation_id: number;
   outcome: 'completed' | 'cancelled' | 'failed' | string;
+  /** Optional discriminator: when set to "restore", the worker was running a
+   *  restore (Unarchive). The widget tweaks its title accordingly. */
+  kind?: 'restore' | string;
 }
+
+// Restore-stage labels emitted by the Rust restore module.
+const RESTORE_STAGES = new Set(['extract', 'verify', 'update_catalog', 'cleanup']);
 
 export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
   const [progress, setProgress] = useState<ArchiveProgressEvent | null>(null);
@@ -63,7 +69,12 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
     <div className="border border-border rounded-lg p-3 bg-surface-elevated shadow-lg">
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-medium text-content">
-          Archive operation #{operationId}
+          {(() => {
+            const isRestore =
+              finished?.kind === 'restore' ||
+              (progress?.stage && RESTORE_STAGES.has(progress.stage));
+            return `${isRestore ? 'Restore' : 'Archive'} operation #${operationId}`;
+          })()}
         </span>
         {!finished && (
           <button

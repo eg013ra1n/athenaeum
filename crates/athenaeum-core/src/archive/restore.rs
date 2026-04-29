@@ -63,13 +63,18 @@ pub fn run_restore(
         if cancel.load(Ordering::SeqCst) {
             anyhow::bail!("restore cancelled");
         }
-        emit_event(emitter, "archive-restore-progress", &RestoreProgress {
+        // Emit on both the unified "archive-progress" channel (so the existing
+        // ArchiveProgress UI picks it up) and the legacy "archive-restore-progress"
+        // channel (kept for backwards compatibility with any other listener).
+        let prog = RestoreProgress {
             operation_id,
             stage: "extract".into(),
             current: idx + 1,
             total,
             message: format!("Extracting {}/{}", idx + 1, total),
-        });
+        };
+        emit_event(emitter, "archive-progress", &prog);
+        emit_event(emitter, "archive-restore-progress", &prog);
 
         let dest = target_root_path.join(&f.target_path_in_zip);
         if dest.exists() && !overwrite_existing {
@@ -113,13 +118,15 @@ pub fn run_restore(
         if cancel.load(Ordering::SeqCst) {
             anyhow::bail!("restore cancelled");
         }
-        emit_event(emitter, "archive-restore-progress", &RestoreProgress {
+        let prog = RestoreProgress {
             operation_id,
             stage: "verify".into(),
             current: idx + 1,
             total,
             message: format!("Verifying {}/{}", idx + 1, total),
-        });
+        };
+        emit_event(emitter, "archive-progress", &prog);
+        emit_event(emitter, "archive-restore-progress", &prog);
 
         if *skipped {
             // Skipped during extract (overwrite=false + existing). Don't verify.
@@ -138,20 +145,69 @@ pub fn run_restore(
     }
 
     // Stage: update_catalog ---------------------------------------------------
+    // One progress unit per file path rewrite + 1 for the frame set unmark.
+    let catalog_total = written_files.len() + 1;
+    let mut catalog_done: usize = 0;
+    let emit_catalog = |emitter: &dyn ProgressEmitter, done: usize, total: usize, msg: String| {
+        let prog = RestoreProgress {
+            operation_id,
+            stage: "update_catalog".into(),
+            current: done,
+            total,
+            message: msg,
+        };
+        emit_event(emitter, "archive-progress", &prog);
+        emit_event(emitter, "archive-restore-progress", &prog);
+    };
+    emit_catalog(emitter, catalog_done, catalog_total, "Updating catalog".into());
+
     for (f, new_path) in &written_files {
         if let Some(file_id) = f.file_id {
             adb::unmark_file_archived(conn, file_id, Some(new_path.to_str().unwrap()))?;
         }
+        catalog_done += 1;
+        emit_catalog(
+            emitter,
+            catalog_done,
+            catalog_total,
+            format!("Updating paths ({}/{})", catalog_done, catalog_total),
+        );
     }
     adb::unmark_frame_set_archived(conn, op.frames_set_id)?;
+    catalog_done += 1;
+    emit_catalog(emitter, catalog_done, catalog_total, "Frame set unarchived".into());
 
     // Stage: cleanup ----------------------------------------------------------
     if !keep_zip_after_restore {
-        let mut seen: HashSet<String> = HashSet::new();
-        for f in &files {
-            if seen.insert(f.target_zip_path.clone()) {
-                let _ = std::fs::remove_file(&f.target_zip_path);
-            }
+        let zip_paths: Vec<String> = {
+            let mut seen: HashSet<String> = HashSet::new();
+            files
+                .iter()
+                .filter_map(|f| {
+                    if seen.insert(f.target_zip_path.clone()) {
+                        Some(f.target_zip_path.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let cleanup_total = zip_paths.len();
+        for (idx, zp) in zip_paths.iter().enumerate() {
+            let _ = std::fs::remove_file(zp);
+            let prog = RestoreProgress {
+                operation_id,
+                stage: "cleanup".into(),
+                current: idx + 1,
+                total: cleanup_total,
+                message: format!(
+                    "Removing zip {}/{}",
+                    idx + 1,
+                    cleanup_total
+                ),
+            };
+            emit_event(emitter, "archive-progress", &prog);
+            emit_event(emitter, "archive-restore-progress", &prog);
         }
     }
 

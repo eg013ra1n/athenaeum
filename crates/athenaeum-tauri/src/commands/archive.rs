@@ -498,12 +498,22 @@ pub async fn start_restore_operation(
         let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
         let db = ctx.db.get().expect("db");
         let conn = db.conn();
-        if let Err(e) = restore::run_restore(
+        let outcome = match restore::run_restore(
             &conn, operation_id, Path::new(&target_root_path),
             overwrite_existing, keep_zip_after_restore, &cancel_flag, &emitter,
         ) {
-            eprintln!("restore {} failed: {:#}", operation_id, e);
-        }
+            Ok(()) => "completed",
+            Err(e) => {
+                eprintln!("restore {} failed: {:#}", operation_id, e);
+                if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
+            }
+        };
+        // Tell the UI the restore is over so the progress widget can dismiss.
+        athenaeum_core::events::emit_event(
+            &emitter,
+            "archive-finished",
+            &serde_json::json!({ "operation_id": operation_id, "outcome": outcome, "kind": "restore" }),
+        );
         ctx.active_archives.lock().unwrap().remove(&operation_id);
     });
     Ok(())

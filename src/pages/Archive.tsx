@@ -4,11 +4,13 @@ import { Archive as ArchiveIcon, Trash2, Upload } from 'lucide-react';
 import { listArchivedFrameSets, deleteArchive } from '../api/archive';
 import type { ArchivedFrameSetSummary } from '../types/archive';
 import { RestoreDialog } from '../components/archive/RestoreDialog';
+import { ArchiveProgress } from '../components/archive/ArchiveProgress';
 
 export default function Archive() {
   const [items, setItems] = useState<ArchivedFrameSetSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [restoreFor, setRestoreFor] = useState<ArchivedFrameSetSummary | null>(null);
+  const [activeOpId, setActiveOpId] = useState<number | null>(null);
   const navigate = useNavigate();
 
   const reload = useCallback(() => {
@@ -127,11 +129,23 @@ export default function Archive() {
         <RestoreDialog
           item={restoreFor}
           onCancel={() => setRestoreFor(null)}
-          onCompleted={() => {
+          onStarted={(opId) => {
             setRestoreFor(null);
-            reload();
+            setActiveOpId(opId);
           }}
         />
+      )}
+
+      {activeOpId !== null && (
+        <div className="fixed bottom-4 right-4 z-40 w-80">
+          <ArchiveProgress
+            operationId={activeOpId}
+            onClose={() => {
+              setActiveOpId(null);
+              reload();
+            }}
+          />
+        </div>
       )}
     </div>
   );

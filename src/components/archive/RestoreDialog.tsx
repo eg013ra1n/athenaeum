@@ -6,12 +6,15 @@ import type { ArchivedFrameSetSummary } from '../../types/archive';
 interface Props {
   item: ArchivedFrameSetSummary;
   onCancel: () => void;
-  onCompleted: () => void;
+  /** Called immediately after the restore worker is dispatched, with the
+   *  operation_id so the parent page can mount a progress widget. The actual
+   *  restore continues asynchronously. */
+  onStarted: (operationId: number) => void;
 }
 
 type Mode = 'original' | 'scan_root' | 'custom';
 
-export function RestoreDialog({ item, onCancel, onCompleted }: Props) {
+export function RestoreDialog({ item, onCancel, onStarted }: Props) {
   const [mode, setMode] = useState<Mode>('original');
   const [originalPath, setOriginalPath] = useState<string | null>(null);
   const [originalExists, setOriginalExists] = useState(false);
@@ -74,7 +77,8 @@ export function RestoreDialog({ item, onCancel, onCompleted }: Props) {
     setBusy(true);
     try {
       await startRestoreOperation(item.operation_id, target, overwrite, keepZip);
-      onCompleted();
+      // Hand off to parent: dialog closes, progress widget appears in its place.
+      onStarted(item.operation_id);
     } catch (e) {
       console.error('restore failed', e);
       alert(`Restore failed: ${e}`);
