@@ -6,6 +6,7 @@ import type {
   ArchivePlan,
   ArchiveRoot,
   ArchiveSettings,
+  ArchiveZip,
   ConflictResolution,
   Dispositions,
 } from '../types/archive';
@@ -88,6 +89,10 @@ export async function rollbackArchiveOperation(operationId: number): Promise<voi
 
 export async function listArchivedFrameSets(): Promise<ArchivedFrameSetSummary[]> {
   return api.invoke<ArchivedFrameSetSummary[]>('list_archived_frame_sets');
+}
+
+export async function listArchiveZips(operationId: number): Promise<ArchiveZip[]> {
+  return api.invoke<ArchiveZip[]>('list_archive_zips', { operationId });
 }
 
 export async function startRestoreOperation(

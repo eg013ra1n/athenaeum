@@ -99,3 +99,11 @@ export interface ArchiveRoot {
   label: string | null;
   is_default: boolean;
 }
+
+export interface ArchiveZip {
+  path: string;
+  filename: string;
+  frame_role: FrameRole | string;
+  exists: boolean;
+  size_bytes: number;
+}

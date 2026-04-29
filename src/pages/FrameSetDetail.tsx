@@ -15,8 +15,10 @@ import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../component
 import { ArchiveDispositionDialog } from '../components/archive/ArchiveDispositionDialog';
 import { ArchiveProgress } from '../components/archive/ArchiveProgress';
 import { RestoreDialog } from '../components/archive/RestoreDialog';
-import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets } from '../api/archive';
-import { Upload } from 'lucide-react';
+import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
+import { revealItemInDir } from '../api/desktop';
+import { isTauri } from '../utils/platform';
+import { Upload, ExternalLink } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history';
@@ -576,27 +578,57 @@ export default function FrameSetDetail() {
                 in archive, not yet zipped → Move and ZIP
                 already zipped (archived_at set) → Unarchive */}
             {detail.frames_set?.archived_at ? (
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    const items = await listArchivedFrameSets();
-                    const match = items.find(it => it.frames_set_id === detail.frames_set?.id);
-                    if (match) {
-                      setRestoreItem(match);
-                    } else {
-                      alert('Could not find this frame set in the archive list. It may have been deleted.');
+              <>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const items = await listArchivedFrameSets();
+                      const match = items.find(it => it.frames_set_id === detail.frames_set?.id);
+                      if (match) {
+                        setRestoreItem(match);
+                      } else {
+                        alert('Could not find this frame set in the archive list. It may have been deleted.');
+                      }
+                    } catch (e) {
+                      alert(`Failed to load archive details: ${e}`);
                     }
-                  } catch (e) {
-                    alert(`Failed to load archive details: ${e}`);
-                  }
-                }}
-                title="Unarchive this frame set: extract files from the zip and bring it back to the active view"
-                className="flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 text-accent px-3 py-1.5 text-sm hover:bg-accent/20"
-              >
-                <Upload size={14} />
-                Unarchive
-              </button>
+                  }}
+                  title="Unarchive this frame set: extract files from the zip and bring it back to the active view"
+                  className="flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 text-accent px-3 py-1.5 text-sm hover:bg-accent/20"
+                >
+                  <Upload size={14} />
+                  Unarchive
+                </button>
+                {isTauri && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const opId = detail.frames_set?.archive_operation_id;
+                      if (!opId) {
+                        alert('No archive operation linked to this frame set.');
+                        return;
+                      }
+                      try {
+                        const zips = await listArchiveZips(opId);
+                        const target = zips.find(z => z.exists) ?? zips[0];
+                        if (!target) {
+                          alert('No zip files recorded for this archive operation.');
+                          return;
+                        }
+                        await revealItemInDir(target.path);
+                      } catch (e) {
+                        alert(`Failed to open file manager: ${e}`);
+                      }
+                    }}
+                    title="Reveal the archive zip(s) in the system file manager"
+                    className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110"
+                  >
+                    <ExternalLink size={14} />
+                    Reveal in file manager
+                  </button>
+                )}
+              </>
             ) : detail.frames_set?.is_archived ? (
               <button
                 type="button"

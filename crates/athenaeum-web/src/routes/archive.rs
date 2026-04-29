@@ -450,6 +450,55 @@ pub async fn rollback_archive_operation(
     Ok(StatusCode::OK)
 }
 
+pub async fn list_archive_zips(
+    State(state): State<WebAppState>,
+    Json(req): Json<OperationIdRequest>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let db = state
+        .ctx
+        .db
+        .get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT target_zip_path, frame_role
+             FROM archive_operation_files
+             WHERE operation_id = ?1
+             ORDER BY
+                CASE frame_role
+                    WHEN 'light' THEN 0
+                    WHEN 'flat'  THEN 1
+                    WHEN 'darkflat' THEN 2
+                    WHEN 'dark'  THEN 3
+                    WHEN 'bias'  THEN 4
+                    ELSE 5
+                END,
+                target_zip_path",
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows = stmt
+        .query_map([req.operation_id], |row| {
+            let path: String = row.get(0)?;
+            let frame_role: String = row.get(1)?;
+            let p = std::path::Path::new(&path);
+            let filename = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let exists = p.is_file();
+            let size_bytes = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+            Ok(serde_json::json!({
+                "path": path,
+                "filename": filename,
+                "frame_role": frame_role,
+                "exists": exists,
+                "size_bytes": size_bytes,
+            }))
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(rows))
+}
+
 pub async fn list_archived_frame_sets(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {

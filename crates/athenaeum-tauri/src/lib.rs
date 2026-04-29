@@ -323,6 +323,7 @@ pub fn run() {
             commands::resume_archive_operation,
             commands::rollback_archive_operation,
             commands::list_archived_frame_sets,
+            commands::list_archive_zips,
             commands::start_restore_operation,
             commands::get_restore_suggestions,
             commands::delete_archive,

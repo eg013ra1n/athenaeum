@@ -200,6 +200,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/resume_archive_operation", post(archive::resume_archive_operation))
         .route("/api/rollback_archive_operation", post(archive::rollback_archive_operation))
         .route("/api/list_archived_frame_sets", post(archive::list_archived_frame_sets))
+        .route("/api/list_archive_zips", post(archive::list_archive_zips))
         .route("/api/start_restore_operation", post(archive::start_restore_operation))
         .route("/api/get_restore_suggestions", post(archive::get_restore_suggestions))
         .route("/api/delete_archive", post(archive::delete_archive))
