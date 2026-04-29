@@ -205,6 +205,61 @@ pub async fn resume_archive_operation(
 }
 
 #[tauri::command]
+pub async fn get_restore_suggestions(
+    state: State<'_, AppState>,
+    operation_id: i64,
+) -> Result<serde_json::Value, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    // Take the first operation file and strip the target_path_in_zip from
+    // the source_path; what remains is the original parent directory.
+    // All files in a single operation share the same parent (since prefixes
+    // are scan-root-relative).
+    let suggested: Option<String> = conn
+        .query_row(
+            "SELECT source_path, target_path_in_zip
+             FROM archive_operation_files
+             WHERE operation_id = ?1
+             LIMIT 1",
+            [operation_id],
+            |row| {
+                let source_path: String = row.get(0)?;
+                let path_in_zip: String = row.get(1)?;
+                if let Some(stripped) = source_path.strip_suffix(&path_in_zip) {
+                    let trimmed = stripped.trim_end_matches('/');
+                    Ok(if trimmed.is_empty() { None } else { Some(trimmed.to_string()) })
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Existing scan roots
+    let mut stmt = conn
+        .prepare("SELECT path FROM scan_roots ORDER BY path")
+        .map_err(|e| e.to_string())?;
+    let scan_roots: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+
+    // Whether the suggested original path still exists and is writable.
+    let suggested_exists = suggested
+        .as_ref()
+        .map(|p| std::path::Path::new(p).is_dir())
+        .unwrap_or(false);
+
+    Ok(serde_json::json!({
+        "suggested_original_path": suggested,
+        "suggested_original_exists": suggested_exists,
+        "scan_roots": scan_roots,
+    }))
+}
+
+#[tauri::command]
 pub async fn rollback_archive_operation(
     app: AppHandle,
     state: State<'_, AppState>,

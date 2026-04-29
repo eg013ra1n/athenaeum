@@ -255,6 +255,58 @@ pub async fn cancel_archive_operation(
     }
 }
 
+pub async fn get_restore_suggestions(
+    State(state): State<WebAppState>,
+    Json(req): Json<OperationIdRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let db = state
+        .ctx
+        .db
+        .get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+
+    let suggested: Option<String> = conn
+        .query_row(
+            "SELECT source_path, target_path_in_zip
+             FROM archive_operation_files
+             WHERE operation_id = ?1
+             LIMIT 1",
+            [req.operation_id],
+            |row| {
+                let source_path: String = row.get(0)?;
+                let path_in_zip: String = row.get(1)?;
+                if let Some(stripped) = source_path.strip_suffix(&path_in_zip) {
+                    let trimmed = stripped.trim_end_matches('/');
+                    Ok(if trimmed.is_empty() { None } else { Some(trimmed.to_string()) })
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut stmt = conn
+        .prepare("SELECT path FROM scan_roots ORDER BY path")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let scan_roots: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let suggested_exists = suggested
+        .as_ref()
+        .map(|p| std::path::Path::new(p).is_dir())
+        .unwrap_or(false);
+
+    Ok(Json(serde_json::json!({
+        "suggested_original_path": suggested,
+        "suggested_original_exists": suggested_exists,
+        "scan_roots": scan_roots,
+    })))
+}
+
 pub async fn list_unfinished_archive_operations(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<ArchiveOperationSummary>>, (StatusCode, String)> {

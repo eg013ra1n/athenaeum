@@ -324,6 +324,7 @@ pub fn run() {
             commands::rollback_archive_operation,
             commands::list_archived_frame_sets,
             commands::start_restore_operation,
+            commands::get_restore_suggestions,
             commands::delete_archive,
         ])
         .run(tauri::generate_context!())

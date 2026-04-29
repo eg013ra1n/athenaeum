@@ -84,3 +84,13 @@ export async function startRestoreOperation(
 export async function deleteArchive(operationId: number): Promise<void> {
   await api.invoke('delete_archive', { operationId });
 }
+
+export interface RestoreSuggestions {
+  suggested_original_path: string | null;
+  suggested_original_exists: boolean;
+  scan_roots: string[];
+}
+
+export async function getRestoreSuggestions(operationId: number): Promise<RestoreSuggestions> {
+  return api.invoke<RestoreSuggestions>('get_restore_suggestions', { operationId });
+}
