@@ -23,9 +23,12 @@ interface LightsAnalysisViewProps {
   onBlink?: (frameIds: number[]) => void;
   onSplit?: (selectedFilterKeys: Set<string>) => void;
   onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
+  /** When true, hide the "Locate" column in the table — used when the frame
+   *  set is ZIP-archived and source files are no longer on disk. */
+  hideLocateColumn?: boolean;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh: _onRefresh, onBlink, onSplit, onCreateCustomSet }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh: _onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');
 
@@ -651,6 +654,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               analysisData={analysisData}
               rejectedFrameIds={rejectedFrameIds}
               plateScale={useArcsec ? plateScale : null}
+              hideLocateColumn={hideLocateColumn}
             />
           </div>
 

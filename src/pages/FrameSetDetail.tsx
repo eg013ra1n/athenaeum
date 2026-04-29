@@ -758,6 +758,7 @@ export default function FrameSetDetail() {
               onBlink={handleBlink}
               onSplit={handleOpenSplitDialog}
               onCreateCustomSet={handleOpenCreateDialog}
+              hideLocateColumn={!!detail?.frames_set?.archived_at}
             />
           )
         ) : (

@@ -24,6 +24,9 @@ interface LightsAnalysisTableProps {
   rejectedFrameIds?: Set<number>;
   /** Plate scale in arcsec/pixel. When set, FWHM/HFR display in arcseconds. */
   plateScale?: number | null;
+  /** When true, hide the "Locate" column entirely. Use for ZIP-archived frame
+   *  sets where the source file paths no longer point to anything on disk. */
+  hideLocateColumn?: boolean;
 }
 
 function formatDateTime(dateStr: string | null): string {
@@ -98,6 +101,7 @@ export function LightsAnalysisTable({
   analysisData,
   rejectedFrameIds,
   plateScale,
+  hideLocateColumn,
 }: LightsAnalysisTableProps) {
   const [sortField, setSortField] = useState<SortField | null>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
@@ -315,9 +319,11 @@ export function LightsAnalysisTable({
             <th scope="col" className="w-16 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
               WCS
             </th>
-            <th scope="col" className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
-              Locate
-            </th>
+            {!hideLocateColumn && (
+              <th scope="col" className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
+                Locate
+              </th>
+            )}
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
@@ -423,15 +429,17 @@ export function LightsAnalysisTable({
                     </span>
                   )}
                 </td>
-                <td className="w-12 px-1.5 py-1 text-center">
-                  <button
-                    onClick={e => handleReveal(e, frame.file_path)}
-                    className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"
-                    title="Reveal in file explorer"
-                  >
-                    <FolderOpen size={14} />
-                  </button>
-                </td>
+                {!hideLocateColumn && (
+                  <td className="w-12 px-1.5 py-1 text-center">
+                    <button
+                      onClick={e => handleReveal(e, frame.file_path)}
+                      className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"
+                      title="Reveal in file explorer"
+                    >
+                      <FolderOpen size={14} />
+                    </button>
+                  </td>
+                )}
               </tr>
             );
           })}
