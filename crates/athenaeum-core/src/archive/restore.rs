@@ -285,10 +285,9 @@ fn run_restore_inner(
     }
 
     // Stage: update_catalog ----------------------------------------------------
-    // For each restored file, clear archive markers and rewrite path if it
-    // changed. Files that were skipped (already on disk) need no catalog
-    // change — their rows were either never marked (copy disposition) or
-    // their `path` already matched the on-disk location.
+    // For each restored file, sync archive markers + path/mtime/size to match
+    // the destination file as it now exists on disk. This is what prevents the
+    // scanner's modified-file detection from later wiping these rows.
     let catalog_total = restored.len() + 1;
     let mut catalog_done: usize = 0;
     emit(
@@ -301,14 +300,19 @@ fn run_restore_inner(
 
     for (f, new_path) in &restored {
         if let Some(file_id) = f.file_id {
-            // If the new path differs from the catalog's source_path, rewrite it.
-            // Otherwise just clear the archive markers in place.
+            let meta = std::fs::metadata(new_path)
+                .with_context(|| format!("stat restored file {}", new_path.display()))?;
+            let new_size = meta.len() as i64;
+            let new_mtime = chrono::DateTime::<chrono::Utc>::from(
+                meta.modified()
+                    .with_context(|| format!("read modified_at for {}", new_path.display()))?
+            ).to_rfc3339();
+
+            // Rewrite path only if it differs from the catalog's source_path;
+            // mtime/size are always synced (they're the whole point of this fix).
             let path_changed = new_path.to_str() != Some(f.source_path.as_str());
-            if path_changed {
-                adb::unmark_file_archived(conn, file_id, Some(new_path.to_str().unwrap()), None, None)?;
-            } else {
-                adb::unmark_file_archived(conn, file_id, None, None, None)?;
-            }
+            let path_arg = if path_changed { new_path.to_str() } else { None };
+            adb::unmark_file_archived(conn, file_id, path_arg, Some(&new_mtime), Some(new_size))?;
         }
         catalog_done += 1;
         emit(
@@ -333,8 +337,9 @@ fn run_restore_inner(
     );
 
     // For files that weren't restored (skipped because already on disk), still
-    // clear any leftover archive markers on their catalog rows. Otherwise the
-    // row would keep pointing to a now-orphaned zip path.
+    // clear any leftover archive markers. Also reconcile modified_at/size with
+    // disk if they drifted — this is the recovery path for catalogs that were
+    // previously corrupted by an older restore cycle.
     let restored_ids: HashSet<i64> = restored
         .iter()
         .filter_map(|(f, _)| f.file_id)
@@ -342,7 +347,25 @@ fn run_restore_inner(
     for f in files {
         if let Some(fid) = f.file_id {
             if !restored_ids.contains(&fid) {
-                adb::unmark_file_archived(conn, fid, None, None, None)?;
+                // Stat the on-disk file at source_path. If it doesn't exist
+                // (file genuinely missing) we still clear markers so the row
+                // doesn't keep pointing at an orphaned zip.
+                let on_disk = std::fs::metadata(&f.source_path).ok();
+                let (mtime_arg, size_arg) = match on_disk {
+                    Some(m) => {
+                        let mtime = m.modified()
+                            .ok()
+                            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+                        let size = m.len() as i64;
+                        (mtime, Some(size))
+                    }
+                    None => (None, None),
+                };
+                adb::unmark_file_archived(
+                    conn, fid, None,
+                    mtime_arg.as_deref(),
+                    size_arg,
+                )?;
             }
         }
     }
@@ -459,6 +482,22 @@ mod tests {
         assert!(new_path.starts_with(restore_target.path().to_str().unwrap()));
         let restored_content = std::fs::read(&new_path).unwrap();
         assert_eq!(restored_content, b"original-content");
+
+        // Lock the Task 3 fix: catalog modified_at + size MUST match the
+        // freshly-extracted file. Without this sync, a subsequent monitor
+        // scan would classify the restored file as 'modified' and DELETE+
+        // re-INSERT it, orphaning frames and breaking session_members JOINs.
+        let (db_size, db_mtime): (i64, String) = conn.query_row(
+            "SELECT size, modified_at FROM files WHERE id = 1000",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        let on_disk_meta = std::fs::metadata(&new_path).unwrap();
+        let on_disk_size = on_disk_meta.len() as i64;
+        let on_disk_mtime = chrono::DateTime::<chrono::Utc>::from(
+            on_disk_meta.modified().unwrap()
+        ).to_rfc3339();
+        assert_eq!(db_size, on_disk_size, "catalog size must match restored file");
+        assert_eq!(db_mtime, on_disk_mtime, "catalog modified_at must match restored file");
 
         // Frame set marker cleared.
         let archived_at: Option<String> = conn.query_row(
