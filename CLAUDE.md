@@ -181,6 +181,8 @@ Common settings include `grouping.threshold.value` (default `3.0`) and `grouping
 
 **Export Path Templating**: Supports tokens like `{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`, `{TELESCOP}`, `{INSTRUME}`, `{EXPTIME}`, `{FILTER}`, `{IMAGETYP}`, `{FRAME_FOLDER}`, with fallbacks (`{OBJECT|Unknown}`) and transforms (`:slug` for slugification).
 
+**Scanner re-parse is non-destructive (UPDATE in place, not DELETE+INSERT)**: When a scanned file's `(size, modified_at)` has drifted from the catalog, the scanner re-parses and UPDATEs the existing `files`/`frames`/`fits_header` rows inside a single transaction so `files.id` and `frames.id` are preserved. This keeps junction tables (`session_members`, `calibration_set_frames`, `calibration_set_to_frames`, `frame_tags`) intact across legitimate in-place modifications (FITS edited by another tool, archive→restore round-trips, network FS clock drift). On parse failure the existing row is left untouched — better stale than missing. Implemented in `scanner::reparse_and_update_in_place` and used by both `scan_directory` and `scan_directory_parallel`.
+
 ### Calibration Matching System
 
 The calibration matching system is fully configurable via UI (Settings → Calibration Matching tab). All calibration-related settings are stored in a unified `CalibrationMatchingConfig` JSON structure in the `settings` table under key `calibration.matching_config`.
