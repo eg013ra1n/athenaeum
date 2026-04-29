@@ -311,28 +311,42 @@ pub fn mark_file_archived(
     Ok(())
 }
 
-/// Clear archive markers from a file. Optionally rewrite path (used by restore).
+/// Clear archive markers from a file row. Optional inputs let callers also
+/// rewrite the path, refresh the on-disk modified_at, and refresh the size.
+/// All four columns move atomically in a single UPDATE so a partial commit
+/// (e.g., crash mid-write) can never leave the row half-updated.
+///
+/// Restore uses this to push the freshly-extracted file's metadata into the
+/// catalog so that subsequent scanner mtime checks see DB == disk and skip
+/// the file as unchanged.
 pub fn unmark_file_archived(
     conn: &Connection,
     file_id: i64,
     new_path: Option<&str>,
+    new_modified_at: Option<&str>,
+    new_size: Option<i64>,
 ) -> Result<()> {
-    if let Some(path) = new_path {
-        conn.execute(
-            "UPDATE files
-             SET archived_in_operation = NULL, archive_zip_path = NULL, archive_path_in_zip = NULL,
-                 path = ?1
-             WHERE id = ?2",
-            params![path, file_id],
-        )?;
-    } else {
-        conn.execute(
-            "UPDATE files
-             SET archived_in_operation = NULL, archive_zip_path = NULL, archive_path_in_zip = NULL
-             WHERE id = ?1",
-            [file_id],
-        )?;
-    }
+    // Build the SET clause dynamically. The four archive marker columns are
+    // always cleared; path/modified_at/size are conditional.
+    let mut sets: Vec<&str> = vec![
+        "archived_in_operation = NULL",
+        "archive_zip_path = NULL",
+        "archive_path_in_zip = NULL",
+    ];
+    if new_path.is_some() { sets.push("path = ?"); }
+    if new_modified_at.is_some() { sets.push("modified_at = ?"); }
+    if new_size.is_some() { sets.push("size = ?"); }
+
+    let sql = format!("UPDATE files SET {} WHERE id = ?", sets.join(", "));
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(p) = new_path { params_vec.push(Box::new(p.to_string())); }
+    if let Some(m) = new_modified_at { params_vec.push(Box::new(m.to_string())); }
+    if let Some(s) = new_size { params_vec.push(Box::new(s)); }
+    params_vec.push(Box::new(file_id));
+
+    let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    conn.execute(&sql, refs.as_slice())?;
     Ok(())
 }
 
@@ -454,5 +468,144 @@ mod tests {
         assert!(archived_at.is_none());
         assert!(op.is_none());
         assert_eq!(is_arch, 0);
+    }
+
+    #[test]
+    fn unmark_file_archived_updates_modified_at_and_size() {
+        let (conn, _) = setup();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format,
+                                archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (42, '/orig/path.fits', 'path.fits', 100, '2020-01-01T00:00:00+00:00',
+                     'FITS', 7, '/arch/x.zip', 'Lights/path.fits')",
+            [],
+        ).unwrap();
+
+        unmark_file_archived(
+            &conn, 42,
+            Some("/new/path.fits"),
+            Some("2026-04-29T19:35:00+00:00"),
+            Some(150),
+        ).unwrap();
+
+        let (path, mtime, size, archived_op): (String, String, i64, Option<i64>) = conn.query_row(
+            "SELECT path, modified_at, size, archived_in_operation FROM files WHERE id = 42",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(path, "/new/path.fits");
+        assert_eq!(mtime, "2026-04-29T19:35:00+00:00");
+        assert_eq!(size, 150);
+        assert!(archived_op.is_none());
+    }
+
+    #[test]
+    fn unmark_file_archived_with_no_optional_args_only_clears_markers() {
+        let (conn, _) = setup();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format,
+                                archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (43, '/p.fits', 'p.fits', 100, '2020-01-01T00:00:00+00:00',
+                     'FITS', 7, '/arch/x.zip', 'Lights/p.fits')",
+            [],
+        ).unwrap();
+
+        unmark_file_archived(&conn, 43, None, None, None).unwrap();
+
+        let (path, mtime, size, archived_op): (String, String, i64, Option<i64>) = conn.query_row(
+            "SELECT path, modified_at, size, archived_in_operation FROM files WHERE id = 43",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(path, "/p.fits"); // unchanged
+        assert_eq!(mtime, "2020-01-01T00:00:00+00:00"); // unchanged
+        assert_eq!(size, 100); // unchanged
+        assert!(archived_op.is_none()); // markers cleared
+    }
+
+    /// Pins the SET-clause ↔ value-binding ordering. The dynamic builder appends
+    /// path/modified_at/size to the SET clause in that fixed order, and the
+    /// param vector is built in the same order. If anyone ever reorders one
+    /// without the other, this test fires before the bug ships.
+    #[test]
+    fn unmark_file_archived_partial_updates_dont_swap_columns() {
+        let (conn, _) = setup();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format,
+                                archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (44, '/orig.fits', 'orig.fits', 100, '2020-01-01T00:00:00+00:00',
+                     'FITS', 7, '/arch/x.zip', 'Lights/orig.fits')",
+            [],
+        ).unwrap();
+
+        // Update only modified_at + size; leave path alone.
+        unmark_file_archived(
+            &conn, 44,
+            None,
+            Some("2026-04-29T19:35:00+00:00"),
+            Some(150),
+        ).unwrap();
+
+        let (path, mtime, size, archived_op): (String, String, i64, Option<i64>) = conn.query_row(
+            "SELECT path, modified_at, size, archived_in_operation FROM files WHERE id = 44",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(path, "/orig.fits", "path should NOT have been touched");
+        assert_eq!(mtime, "2026-04-29T19:35:00+00:00", "modified_at should be the new value");
+        assert_eq!(size, 150, "size should be the new value");
+        assert!(archived_op.is_none(), "archive markers always cleared");
+
+        // And the inverse: update only path; leave mtime/size alone. This locks
+        // in that we don't accidentally bind the path string into the size
+        // column when path is the only Some arg.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format,
+                                archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (45, '/orig2.fits', 'orig2.fits', 200, '2021-06-01T00:00:00+00:00',
+                     'FITS', 8, '/arch/y.zip', 'Lights/orig2.fits')",
+            [],
+        ).unwrap();
+
+        unmark_file_archived(
+            &conn, 45,
+            Some("/new2.fits"),
+            None,
+            None,
+        ).unwrap();
+
+        let (path, mtime, size, archived_op): (String, String, i64, Option<i64>) = conn.query_row(
+            "SELECT path, modified_at, size, archived_in_operation FROM files WHERE id = 45",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(path, "/new2.fits", "path should be the new value");
+        assert_eq!(mtime, "2021-06-01T00:00:00+00:00", "modified_at should NOT have been touched");
+        assert_eq!(size, 200, "size should NOT have been touched");
+        assert!(archived_op.is_none(), "archive markers always cleared");
+
+        // And one more: non-contiguous Some pattern (path + size, no mtime).
+        // This is the trickiest case — if the builder appends mtime to SET in a
+        // different position from the params vec, the size value will land in
+        // the modified_at column.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format,
+                                archived_in_operation, archive_zip_path, archive_path_in_zip)
+             VALUES (46, '/orig3.fits', 'orig3.fits', 300, '2022-09-01T00:00:00+00:00',
+                     'FITS', 9, '/arch/z.zip', 'Lights/orig3.fits')",
+            [],
+        ).unwrap();
+
+        unmark_file_archived(
+            &conn, 46,
+            Some("/new3.fits"),
+            None,
+            Some(350),
+        ).unwrap();
+
+        let (path, mtime, size, archived_op): (String, String, i64, Option<i64>) = conn.query_row(
+            "SELECT path, modified_at, size, archived_in_operation FROM files WHERE id = 46",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(path, "/new3.fits");
+        assert_eq!(mtime, "2022-09-01T00:00:00+00:00", "mtime untouched even when size is updated");
+        assert_eq!(size, 350);
+        assert!(archived_op.is_none());
     }
 }

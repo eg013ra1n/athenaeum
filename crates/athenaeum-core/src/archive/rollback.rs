@@ -98,7 +98,7 @@ pub fn rollback_operation(
     adb::clear_zip_markers(conn, op.frames_set_id)?;
     for f in &files {
         if let Some(file_id) = f.file_id {
-            adb::unmark_file_archived(conn, file_id, None)?;
+            adb::unmark_file_archived(conn, file_id, None, None, None)?;
         }
     }
 

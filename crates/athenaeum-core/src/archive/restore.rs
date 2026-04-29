@@ -305,9 +305,9 @@ fn run_restore_inner(
             // Otherwise just clear the archive markers in place.
             let path_changed = new_path.to_str() != Some(f.source_path.as_str());
             if path_changed {
-                adb::unmark_file_archived(conn, file_id, Some(new_path.to_str().unwrap()))?;
+                adb::unmark_file_archived(conn, file_id, Some(new_path.to_str().unwrap()), None, None)?;
             } else {
-                adb::unmark_file_archived(conn, file_id, None)?;
+                adb::unmark_file_archived(conn, file_id, None, None, None)?;
             }
         }
         catalog_done += 1;
@@ -342,7 +342,7 @@ fn run_restore_inner(
     for f in files {
         if let Some(fid) = f.file_id {
             if !restored_ids.contains(&fid) {
-                adb::unmark_file_archived(conn, fid, None)?;
+                adb::unmark_file_archived(conn, fid, None, None, None)?;
             }
         }
     }
