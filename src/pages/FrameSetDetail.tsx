@@ -74,6 +74,7 @@ export default function FrameSetDetail() {
   const [showArchiveDialog, setShowArchiveDialog] = useState(false);
   const [archiveCompression, setArchiveCompression] = useState<ArchiveCompression>('store');
   const [archiving, setArchiving] = useState(false);
+  const [movingToArchive, setMovingToArchive] = useState(false);
   const [activeArchiveOpId, setActiveArchiveOpId] = useState<number | null>(null);
   const [restoreItem, setRestoreItem] = useState<ArchivedFrameSetSummary | null>(null);
 
@@ -130,6 +131,23 @@ export default function FrameSetDetail() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  const handleMoveToArchive = useCallback(async () => {
+    if (!detail?.frames_set?.id) return;
+    setMovingToArchive(true);
+    try {
+      await api.invoke('archive_frame_set', { framesSetId: detail.frames_set.id });
+      // Reload so the toolbar contextual button switches from "Find new images +
+      // Move to Archive" to "Move and ZIP".
+      await loadData();
+    } catch (e) {
+      console.error('move to archive failed', e);
+      alert(`Failed to move to archive: ${e}`);
+    } finally {
+      setMovingToArchive(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.frames_set?.id]);
 
   const handleArchiveClick = useCallback(async () => {
     // Verify there's at least one archive folder configured before opening the dialog.
@@ -640,22 +658,34 @@ export default function FrameSetDetail() {
                 {archiving ? 'Archiving…' : 'Move and ZIP'}
               </button>
             ) : (
-              <button
-                type="button"
-                onClick={handleFindNewClick}
-                disabled={
-                  findNewBusy || !detail.frames_set?.objctra || !detail.frames_set?.objctdec
-                }
-                title={
-                  !detail.frames_set?.objctra || !detail.frames_set?.objctdec
-                    ? 'No coordinates — nothing to match against'
-                    : 'Find new images for this object'
-                }
-                className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <Search size={14} />
-                {findNewBusy ? 'Merging…' : 'Find new images'}
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={handleFindNewClick}
+                  disabled={
+                    findNewBusy || !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+                  }
+                  title={
+                    !detail.frames_set?.objctra || !detail.frames_set?.objctdec
+                      ? 'No coordinates — nothing to match against'
+                      : 'Find new images for this object'
+                  }
+                  className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Search size={14} />
+                  {findNewBusy ? 'Merging…' : 'Find new images'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleMoveToArchive}
+                  disabled={movingToArchive}
+                  title="Move this frame set to the Archive tab. You can then zip it from there."
+                  className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <ArchiveIcon size={14} />
+                  {movingToArchive ? 'Moving…' : 'Move to Archive'}
+                </button>
+              </>
             )}
             <div className="flex items-center gap-1.5 text-sm text-content-muted">
               <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
