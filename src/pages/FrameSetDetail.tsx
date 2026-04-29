@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -12,6 +12,11 @@ import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
 import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../components/calibration/utils';
+import { ArchiveDispositionDialog } from '../components/archive/ArchiveDispositionDialog';
+import { ArchiveProgress } from '../components/archive/ArchiveProgress';
+import { getArchiveSettings, setArchiveRootPath, startArchiveOperation } from '../api/archive';
+import { pickDirectory } from '../api/desktop';
+import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history';
 
@@ -61,6 +66,13 @@ export default function FrameSetDetail() {
   const [showFindNewDialog, setShowFindNewDialog] = useState(false);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
+
+  // Archive state
+  const [showArchiveDialog, setShowArchiveDialog] = useState(false);
+  const [archiveRoot, setArchiveRoot] = useState<string | null>(null);
+  const [archiveCompression, setArchiveCompression] = useState<ArchiveCompression>('store');
+  const [archiving, setArchiving] = useState(false);
+  const [activeArchiveOpId, setActiveArchiveOpId] = useState<number | null>(null);
 
   // Handle "Find new images" click: if the user has trusted auto-merge for
   // the button path, skip the preview dialog and merge directly; otherwise,
@@ -115,6 +127,49 @@ export default function FrameSetDetail() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  const handleArchiveClick = useCallback(async () => {
+    const settings = await getArchiveSettings();
+    if (!settings.rootPath) {
+      const choice = window.confirm(
+        "You haven't set an archive folder yet. Choose one now?"
+      );
+      if (!choice) return;
+      const picked = await pickDirectory();
+      if (!picked) return;
+      await setArchiveRootPath(picked);
+      setArchiveRoot(picked);
+    } else {
+      setArchiveRoot(settings.rootPath);
+    }
+    setArchiveCompression(settings.compression);
+    setShowArchiveDialog(true);
+  }, []);
+
+  const handleStartArchive = useCallback(async (
+    dispositions: Dispositions,
+    compression: ArchiveCompression,
+    conflictResolution: ConflictResolution,
+  ) => {
+    if (!detail?.frames_set?.id) return;
+    setShowArchiveDialog(false);
+    setArchiving(true);
+    try {
+      const opId = await startArchiveOperation(
+        detail.frames_set.id,
+        dispositions,
+        compression,
+        conflictResolution,
+      );
+      setActiveArchiveOpId(opId);
+    } catch (e) {
+      console.error('start archive failed', e);
+      alert(`Archive failed to start: ${e}`);
+    } finally {
+      setArchiving(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.frames_set?.id]);
 
   // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
   const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
@@ -477,7 +532,15 @@ export default function FrameSetDetail() {
             >
               <ArrowLeft size={18} />
             </button>
-            <h1 className="text-xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="text-xl font-bold">{detail.frames_set?.name || 'Untitled'}</h1>
+              {detail.frames_set?.archived_at && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-warning/20 text-warning text-xs font-medium">
+                  <ArchiveIcon size={12} />
+                  Archived
+                </span>
+              )}
+            </div>
             {detail.frames_set?.objctra && detail.frames_set?.objctdec && (
               <div className="flex items-center gap-2 text-content-muted">
                 <MapPin size={16} />
@@ -515,6 +578,20 @@ export default function FrameSetDetail() {
             >
               <Search size={14} />
               {findNewBusy ? 'Merging…' : 'Find new images'}
+            </button>
+            <button
+              type="button"
+              onClick={handleArchiveClick}
+              disabled={archiving || !!detail.frames_set?.archived_at}
+              title={
+                detail.frames_set?.archived_at
+                  ? 'This frame set is already archived'
+                  : 'Move and ZIP this frame set'
+              }
+              className="flex items-center gap-2 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <ArchiveIcon size={14} />
+              {archiving ? 'Archiving…' : 'Move and ZIP'}
             </button>
             <div className="flex items-center gap-1.5 text-sm text-content-muted">
               <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
@@ -754,6 +831,27 @@ export default function FrameSetDetail() {
             });
           }}
         />
+      )}
+
+      {/* Archive Disposition Dialog */}
+      {showArchiveDialog && archiveRoot && detail.frames_set?.id && (
+        <ArchiveDispositionDialog
+          framesSetId={detail.frames_set.id}
+          archiveRootPath={archiveRoot}
+          defaultCompression={archiveCompression}
+          onCancel={() => setShowArchiveDialog(false)}
+          onStart={handleStartArchive}
+        />
+      )}
+
+      {/* Archive Progress */}
+      {activeArchiveOpId !== null && (
+        <div className="fixed bottom-4 right-4 z-40 w-80">
+          <ArchiveProgress
+            operationId={activeArchiveOpId}
+            onClose={() => setActiveArchiveOpId(null)}
+          />
+        </div>
       )}
     </div>
   );
