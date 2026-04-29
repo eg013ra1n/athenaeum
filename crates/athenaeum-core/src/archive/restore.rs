@@ -633,4 +633,156 @@ mod tests {
         let temp = restore_temp_dir(arch.path(), op_id);
         assert!(!temp.exists(), "temp dir should not exist after preflight bail");
     }
+
+    /// Pins the M33 data-loss bug: archive (move) → restore → monitor scan
+    /// must leave the JOIN chain `session_members → frames → files` intact for
+    /// every restored frame. Production runs with `PRAGMA foreign_keys = 0`, so
+    /// the failure mode is orphaning rather than CASCADE — when the scanner's
+    /// modified-file branch DELETEs and re-INSERTs `files` with a fresh id, the
+    /// original `frames` row keeps pointing at a now-missing `files.id` and the
+    /// frame becomes unreachable through the JOIN.
+    #[test]
+    fn archive_then_restore_then_scan_preserves_session_members() {
+        use crate::scanner::scan_directory_parallel;
+        use crate::events::NullEmitter;
+        use std::sync::atomic::AtomicBool;
+
+        let arch = TempDir::new().unwrap();
+        let scan = TempDir::new().unwrap();
+
+        // Use a real FITS file so process_file_parallel can parse it. The
+        // simplest synthetic FITS that fitsio accepts is created by writing a
+        // minimal SIMPLE/BITPIX/NAXIS=0/END header.
+        let l1 = scan.path().join("M33/L_001.fits");
+        std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
+        write_minimal_fits(&l1);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Match production: SQLite has FKs off by default, and the production
+        // catalog runs that way too (verified via PRAGMA foreign_keys on the
+        // live DB). The bug therefore is NOT a CASCADE wipe — it's orphaning:
+        // the scanner DELETEs the files row, leaving the original frames row
+        // pointing at a now-missing files.id; then re-INSERTs a fresh files
+        // row + fresh frames row with new IDs, but session_members still
+        // references the ORIGINAL frames.id. The JOIN chain through files
+        // breaks at the orphaned frames.file_id, so the UI sees an empty set.
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M33', 1)", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+
+        let l1_size = std::fs::metadata(&l1).unwrap().len() as i64;
+        let l1_mtime = chrono::DateTime::<chrono::Utc>::from(
+            std::fs::metadata(&l1).unwrap().modified().unwrap()
+        ).to_rfc3339();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1000, ?1, 'L_001.fits', ?2, ?3, 'FITS')",
+            params![l1.to_str().unwrap(), l1_size, l1_mtime],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp)
+             VALUES (10000, 1000, 'M33', 'T', 'C', 'Light')",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 10000)", []).unwrap();
+
+        // Archive (move).
+        let plan = build_plan(
+            &conn, 1, arch.path(),
+            &Dispositions { flats: None, darks: None, bias: None, darkflats: None },
+            ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+        assert!(!l1.exists(), "source should have been moved into the zip");
+
+        // Restore.
+        run_restore(
+            &conn, op_id, scan.path(),
+            false, false, &cancel, &NullEmitter,
+        ).unwrap();
+        assert!(l1.exists(), "file should have been restored");
+
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let scan_result = scan_directory_parallel(
+            scan.path(), 1, &conn, &NullEmitter,
+            false, cancel2, false,
+        );
+        assert!(
+            scan_result.errors.is_empty(),
+            "scan must succeed without errors, got: {:?}",
+            scan_result.errors,
+        );
+        assert!(!scan_result.cancelled, "scan must not be cancelled");
+
+        // The whole point of the test: a monitor scan after restore must NOT
+        // strip the frame's reachability through session_members. Express this
+        // as a JOIN through the chain the UI relies on. With FKs off (production
+        // default), the bug manifests as orphaning: the original `frames` row
+        // points at a now-deleted `files` row, and the new `frames` row from
+        // re-insert has no session_members. Either way, this JOIN should still
+        // return exactly one matching row when the catalog is healthy.
+        let joined_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_members sm
+             JOIN frames f ON f.id = sm.frame_id
+             JOIN files fi ON fi.id = f.file_id
+             WHERE sm.session_id = 100 AND fi.path = ?1",
+            [l1.to_str().unwrap()], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            joined_count, 1,
+            "frame must remain reachable through session_members → frames → files \
+             JOIN after restore + scan (production runs with FKs off; orphaning is \
+             the actual failure mode)",
+        );
+
+        // The catalog's view of (size, modified_at) must match disk so the next
+        // scan classifies the file as unchanged.
+        let (db_size, db_mtime): (i64, String) = conn.query_row(
+            "SELECT size, modified_at FROM files WHERE path = ?1",
+            [l1.to_str().unwrap()], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        let on_disk_size = std::fs::metadata(&l1).unwrap().len() as i64;
+        let on_disk_mtime = chrono::DateTime::<chrono::Utc>::from(
+            std::fs::metadata(&l1).unwrap().modified().unwrap()
+        ).to_rfc3339();
+        assert_eq!(db_size, on_disk_size);
+        assert_eq!(db_mtime, on_disk_mtime);
+    }
+
+    /// Minimal FITS file the in-house parser can read. Empty primary HDU.
+    /// Each card is exactly 80 bytes; the header block is padded to 2880.
+    fn write_minimal_fits(path: &Path) {
+        fn card(s: &str) -> [u8; 80] {
+            assert!(s.len() <= 80, "card too long: {:?} ({} bytes)", s, s.len());
+            let mut out = [b' '; 80];
+            out[..s.len()].copy_from_slice(s.as_bytes());
+            out
+        }
+
+        let cards: [[u8; 80]; 8] = [
+            card("SIMPLE  =                    T / file conforms to FITS standard"),
+            card("BITPIX  =                    8 / number of bits per data pixel"),
+            card("NAXIS   =                    0 / number of data axes"),
+            card("OBJECT  = 'M33     '           / target name"),
+            card("TELESCOP= 'T       '"),
+            card("INSTRUME= 'C       '"),
+            card("IMAGETYP= 'Light   '"),
+            card("END"),
+        ];
+
+        let mut header: Vec<u8> = Vec::with_capacity(2880);
+        for c in &cards {
+            header.extend_from_slice(c);
+        }
+        while header.len() < 2880 {
+            header.push(b' ');
+        }
+        std::fs::write(path, header).unwrap();
+    }
 }
