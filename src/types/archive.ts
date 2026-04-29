@@ -92,3 +92,10 @@ export interface ArchiveProgressEvent {
   total: number;
   message: string;
 }
+
+export interface ArchiveRoot {
+  id: number;
+  path: string;
+  label: string | null;
+  is_default: boolean;
+}

@@ -4,6 +4,7 @@ import type {
   ArchivedFrameSetSummary,
   ArchiveOperationSummary,
   ArchivePlan,
+  ArchiveRoot,
   ArchiveSettings,
   ConflictResolution,
   Dispositions,
@@ -25,11 +26,13 @@ export async function planArchiveOperation(
   framesSetId: number,
   dispositions: Dispositions,
   compression: ArchiveCompression,
+  archiveRootPath?: string | null,
 ): Promise<ArchivePlan> {
   return api.invoke<ArchivePlan>('plan_archive_operation', {
     framesSetId,
     dispositions,
     compression,
+    archiveRootPath: archiveRootPath ?? null,
   });
 }
 
@@ -38,13 +41,33 @@ export async function startArchiveOperation(
   dispositions: Dispositions,
   compression: ArchiveCompression,
   conflictResolution: ConflictResolution,
+  archiveRootPath?: string | null,
 ): Promise<number> {
   return api.invoke<number>('start_archive_operation', {
     framesSetId,
     dispositions,
     compression,
     conflictResolution,
+    archiveRootPath: archiveRootPath ?? null,
   });
+}
+
+// Multi-folder archive root management
+
+export async function listArchiveRoots(): Promise<ArchiveRoot[]> {
+  return api.invoke<ArchiveRoot[]>('list_archive_roots');
+}
+
+export async function addArchiveRoot(path: string, label?: string | null): Promise<number> {
+  return api.invoke<number>('add_archive_root', { path, label: label ?? null });
+}
+
+export async function deleteArchiveRoot(id: number): Promise<void> {
+  await api.invoke('delete_archive_root', { id });
+}
+
+export async function setDefaultArchiveRoot(id: number): Promise<void> {
+  await api.invoke('set_default_archive_root', { id });
 }
 
 export async function cancelArchiveOperation(operationId: number): Promise<void> {

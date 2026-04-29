@@ -15,8 +15,7 @@ import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../component
 import { ArchiveDispositionDialog } from '../components/archive/ArchiveDispositionDialog';
 import { ArchiveProgress } from '../components/archive/ArchiveProgress';
 import { RestoreDialog } from '../components/archive/RestoreDialog';
-import { getArchiveSettings, setArchiveRootPath, startArchiveOperation, listArchivedFrameSets } from '../api/archive';
-import { pickDirectory } from '../api/desktop';
+import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets } from '../api/archive';
 import { Upload } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
 
@@ -71,7 +70,6 @@ export default function FrameSetDetail() {
 
   // Archive state
   const [showArchiveDialog, setShowArchiveDialog] = useState(false);
-  const [archiveRoot, setArchiveRoot] = useState<string | null>(null);
   const [archiveCompression, setArchiveCompression] = useState<ArchiveCompression>('store');
   const [archiving, setArchiving] = useState(false);
   const [activeArchiveOpId, setActiveArchiveOpId] = useState<number | null>(null);
@@ -132,20 +130,25 @@ export default function FrameSetDetail() {
   }, [id]);
 
   const handleArchiveClick = useCallback(async () => {
-    const settings = await getArchiveSettings();
-    if (!settings.rootPath) {
-      const choice = window.confirm(
-        "You haven't set an archive folder yet. Choose one now?"
-      );
-      if (!choice) return;
-      const picked = await pickDirectory();
-      if (!picked) return;
-      await setArchiveRootPath(picked);
-      setArchiveRoot(picked);
-    } else {
-      setArchiveRoot(settings.rootPath);
+    // Verify there's at least one archive folder configured before opening the dialog.
+    try {
+      const roots = await listArchiveRoots();
+      if (roots.length === 0) {
+        alert('No archive folders configured yet. Add one in File Manager → Archive Folders, then come back.');
+        return;
+      }
+    } catch (e) {
+      console.error('Failed to list archive roots', e);
+      alert(`Failed to load archive folders: ${e}`);
+      return;
     }
-    setArchiveCompression(settings.compression);
+    // Pull compression default from settings.
+    try {
+      const settings = await getArchiveSettings();
+      setArchiveCompression(settings.compression);
+    } catch (e) {
+      console.error('Failed to load archive compression setting', e);
+    }
     setShowArchiveDialog(true);
   }, []);
 
@@ -153,6 +156,7 @@ export default function FrameSetDetail() {
     dispositions: Dispositions,
     compression: ArchiveCompression,
     conflictResolution: ConflictResolution,
+    archiveRootPath: string,
   ) => {
     if (!detail?.frames_set?.id) return;
     setShowArchiveDialog(false);
@@ -163,6 +167,7 @@ export default function FrameSetDetail() {
         dispositions,
         compression,
         conflictResolution,
+        archiveRootPath,
       );
       setActiveArchiveOpId(opId);
     } catch (e) {
@@ -862,10 +867,9 @@ export default function FrameSetDetail() {
       )}
 
       {/* Archive Disposition Dialog */}
-      {showArchiveDialog && archiveRoot && detail.frames_set?.id && (
+      {showArchiveDialog && detail.frames_set?.id && (
         <ArchiveDispositionDialog
           framesSetId={detail.frames_set.id}
-          archiveRootPath={archiveRoot}
           defaultCompression={archiveCompression}
           onCancel={() => setShowArchiveDialog(false)}
           onStart={handleStartArchive}

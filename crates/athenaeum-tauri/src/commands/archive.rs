@@ -4,10 +4,163 @@ use super::AppState;
 use athenaeum_core::archive::{db as adb, executor, planner, resume, restore, rollback, models::*};
 use athenaeum_core::services::ArchiveHandle;
 use athenaeum_core::settings::keys;
+use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
+
+/// Migrate the legacy single-folder `archive.root_path` setting into the
+/// archive_roots table on first call. Idempotent: if the table already has
+/// rows, do nothing.
+fn migrate_legacy_archive_root(conn: &Connection, settings: &athenaeum_core::settings::SettingsManager) -> Result<(), String> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM archive_roots", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if count > 0 {
+        return Ok(());
+    }
+    if let Some(legacy) = settings.get_archive_root_path(conn).map_err(|e| e.to_string())? {
+        if !legacy.trim().is_empty() {
+            conn.execute(
+                "INSERT OR IGNORE INTO archive_roots (path, label, is_default) VALUES (?1, NULL, 1)",
+                [&legacy],
+            ).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve which archive root path to use for an operation. If the caller
+/// passed an explicit path, validate it's a known archive root. Otherwise
+/// pick the default (or the only one if just one exists). Errors when no
+/// archive roots are configured or no default is set with multiple roots.
+fn resolve_archive_root(
+    conn: &Connection,
+    settings: &athenaeum_core::settings::SettingsManager,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    migrate_legacy_archive_root(conn, settings)?;
+    if let Some(p) = requested {
+        let known: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archive_roots WHERE path = ?1", [p], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if known == 0 {
+            return Err(format!("'{}' is not a configured archive folder", p));
+        }
+        return Ok(p.to_string());
+    }
+    let rows: Vec<(String, i32)> = {
+        let mut stmt = conn
+            .prepare("SELECT path, is_default FROM archive_roots ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        mapped
+    };
+    if rows.is_empty() {
+        return Err("no archive folders configured — add one in File Manager → Archive Folders".into());
+    }
+    if rows.len() == 1 {
+        return Ok(rows[0].0.clone());
+    }
+    if let Some((path, _)) = rows.iter().find(|(_, d)| *d == 1) {
+        return Ok(path.clone());
+    }
+    Err("multiple archive folders configured but no default — pick a destination explicitly".into())
+}
+
+#[tauri::command]
+pub async fn list_archive_roots(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    migrate_legacy_archive_root(&conn, &state.ctx.settings)?;
+    let mut stmt = conn
+        .prepare("SELECT id, path, label, is_default FROM archive_roots ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "path": row.get::<_, String>(1)?,
+                "label": row.get::<_, Option<String>>(2)?,
+                "is_default": row.get::<_, i32>(3)? == 1,
+            }))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+#[tauri::command]
+pub async fn add_archive_root(
+    state: State<'_, AppState>,
+    path: String,
+    label: Option<String>,
+) -> Result<i64, String> {
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(format!("'{}' is not a directory", path));
+    }
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    migrate_legacy_archive_root(&conn, &state.ctx.settings)?;
+    // First root added becomes default automatically.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM archive_roots", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let is_default = if count == 0 { 1 } else { 0 };
+    conn.execute(
+        "INSERT INTO archive_roots (path, label, is_default) VALUES (?1, ?2, ?3)",
+        params![path, label, is_default],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn.last_insert_rowid())
+}
+
+#[tauri::command]
+pub async fn delete_archive_root(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    let was_default: i32 = conn
+        .query_row("SELECT is_default FROM archive_roots WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap_or(0);
+    conn.execute("DELETE FROM archive_roots WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    // If we deleted the default, promote the lowest-id remaining row to default.
+    if was_default == 1 {
+        if let Ok(new_default_id) = conn.query_row(
+            "SELECT id FROM archive_roots ORDER BY id LIMIT 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            conn.execute(
+                "UPDATE archive_roots SET is_default = 1 WHERE id = ?1",
+                [new_default_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_default_archive_root(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    conn.execute("UPDATE archive_roots SET is_default = 0", [])
+        .map_err(|e| e.to_string())?;
+    let n = conn
+        .execute("UPDATE archive_roots SET is_default = 1 WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err(format!("archive root id {} not found", id));
+    }
+    Ok(())
+}
 
 #[tauri::command]
 pub async fn get_archive_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
@@ -51,12 +204,11 @@ pub async fn plan_archive_operation(
     frames_set_id: i64,
     dispositions: Dispositions,
     compression: ArchiveCompression,
+    archive_root_path: Option<String>,
 ) -> Result<ArchivePlan, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    let root = state.ctx.settings.get_archive_root_path(&conn)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "archive root path is not set".to_string())?;
+    let root = resolve_archive_root(&conn, &state.ctx.settings, archive_root_path.as_deref())?;
     planner::build_plan(
         &conn, frames_set_id, Path::new(&root), &dispositions, compression,
     ).map_err(|e| format!("{:#}", e))
@@ -70,6 +222,7 @@ pub async fn start_archive_operation(
     dispositions: Dispositions,
     compression: ArchiveCompression,
     conflict_resolution: ConflictResolution,
+    archive_root_path: Option<String>,
 ) -> Result<i64, String> {
     // One-at-a-time enforcement.
     {
@@ -81,9 +234,7 @@ pub async fn start_archive_operation(
     let ctx = state.ctx.clone();
     let db = ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    let root = ctx.settings.get_archive_root_path(&conn)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "archive root path is not set".to_string())?;
+    let root = resolve_archive_root(&conn, &ctx.settings, archive_root_path.as_deref())?;
 
     // Build + commit the plan synchronously.
     let plan = planner::build_plan(

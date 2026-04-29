@@ -203,6 +203,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/start_restore_operation", post(archive::start_restore_operation))
         .route("/api/get_restore_suggestions", post(archive::get_restore_suggestions))
         .route("/api/delete_archive", post(archive::delete_archive))
+        .route("/api/list_archive_roots", post(archive::list_archive_roots))
+        .route("/api/add_archive_root", post(archive::add_archive_root))
+        .route("/api/delete_archive_root", post(archive::delete_archive_root))
+        .route("/api/set_default_archive_root", post(archive::set_default_archive_root))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_app_version", post(get_app_version))

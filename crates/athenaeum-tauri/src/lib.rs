@@ -326,6 +326,10 @@ pub fn run() {
             commands::start_restore_operation,
             commands::get_restore_suggestions,
             commands::delete_archive,
+            commands::list_archive_roots,
+            commands::add_archive_root,
+            commands::delete_archive_root,
+            commands::set_default_archive_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

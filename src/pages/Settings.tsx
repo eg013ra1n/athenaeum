@@ -1,12 +1,11 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon } from 'lucide-react';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
-import { getArchiveSettings, setArchiveRootPath, setArchiveCompression as apiSetArchiveCompression } from '../api/archive';
-import { pickDirectory } from '../api/desktop';
+import { getArchiveSettings, setArchiveCompression as apiSetArchiveCompression } from '../api/archive';
 import type { ArchiveCompression } from '../types/archive';
 import type { AnnotationSettings } from '../types/analysis-config';
 import { DEFAULT_ANNOTATION_SETTINGS } from '../types/analysis-config';
@@ -35,8 +34,7 @@ export default function Settings() {
   const [autoMergeOnButtonClick, setAutoMergeOnButtonClick] = useState(false);
   const [autoMergeOnMonitorDetect, setAutoMergeOnMonitorDetect] = useState(false);
 
-  // Archive feature state
-  const [archiveRootPath, setArchiveRootPathState] = useState<string | null>(null);
+  // Archive compression preference (folder list lives in File Manager now)
   const [archiveCompression, setArchiveCompressionState] = useState<ArchiveCompression>('store');
   const [archiveSaving, setArchiveSaving] = useState(false);
 
@@ -61,40 +59,10 @@ export default function Settings() {
     api.invoke<number>('get_blink_threads_max').then(setBlinkThreadsMax).catch(console.error);
     getArchiveSettings()
       .then((s) => {
-        setArchiveRootPathState(s.rootPath);
         setArchiveCompressionState(s.compression);
       })
       .catch(console.error);
   }, []);
-
-  const handlePickArchiveFolder = async () => {
-    try {
-      const picked = await pickDirectory();
-      if (!picked) return;
-      setArchiveSaving(true);
-      await setArchiveRootPath(picked);
-      setArchiveRootPathState(picked);
-    } catch (e) {
-      console.error('Failed to set archive folder', e);
-      alert(`Failed to set archive folder: ${e}`);
-    } finally {
-      setArchiveSaving(false);
-    }
-  };
-
-  const handleClearArchiveFolder = async () => {
-    if (!window.confirm('Clear the archive folder setting? You\'ll be prompted to choose one again next time you archive a frame set.')) return;
-    try {
-      setArchiveSaving(true);
-      await setArchiveRootPath('');
-      setArchiveRootPathState(null);
-    } catch (e) {
-      console.error('Failed to clear archive folder', e);
-      alert(`Failed to clear archive folder: ${e}`);
-    } finally {
-      setArchiveSaving(false);
-    }
-  };
 
   const handleArchiveCompressionChange = async (next: ArchiveCompression) => {
     try {
@@ -1076,71 +1044,32 @@ export default function Settings() {
         </div>
       </div>
 
-      {/* Archive Section */}
+      {/* Archive Section — folder list moved to File Manager → Archive Folders.
+          Only compression (a global preference) lives here now. */}
       <div className="mt-6 bg-surface-elevated rounded-lg p-6">
         <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
           <ArchiveIcon size={20} />
           Archive
         </h3>
-        <div className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-2">
-              Archive folder
-            </label>
-            <p className="text-xs text-content-muted mb-3">
-              Destination for ZIP archives produced by the &ldquo;Move and ZIP&rdquo; action on a frame set. Lights are moved here; calibrations move or copy depending on your choices.
-            </p>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                readOnly
-                value={archiveRootPath ?? 'Not set'}
-                className="flex-1 px-3 py-2 bg-surface-hover border border-border rounded text-sm font-mono text-content-muted"
-              />
-              {isTauri && (
-                <button
-                  onClick={handlePickArchiveFolder}
-                  disabled={archiveSaving}
-                  className="flex items-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded transition-colors text-sm"
-                >
-                  <FolderOpen size={16} />
-                  {archiveRootPath ? 'Change' : 'Choose folder'}
-                </button>
-              )}
-              {archiveRootPath && (
-                <button
-                  onClick={handleClearArchiveFolder}
-                  disabled={archiveSaving}
-                  className="px-3 py-2 border border-border rounded text-sm hover:bg-surface-hover disabled:opacity-50"
-                >
-                  Clear
-                </button>
-              )}
-            </div>
-            {!isTauri && !archiveRootPath && (
-              <p className="text-xs text-warning mt-2">
-                In web mode, set the archive folder via the &ldquo;Move and ZIP&rdquo; flow on a frame set.
-              </p>
-            )}
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-2">
-              Compression
-            </label>
-            <select
-              value={archiveCompression}
-              onChange={(e) => handleArchiveCompressionChange(e.target.value as ArchiveCompression)}
-              disabled={archiveSaving}
-              className="px-3 py-2 bg-surface-hover border border-border rounded text-sm"
-            >
-              <option value="store">Store (no compression — fastest, archive size ≈ source size)</option>
-              <option value="deflate">Deflate (smaller, slower — marginal savings on raw FITS)</option>
-            </select>
-            <p className="text-xs text-content-muted mt-2">
-              FITS files compress poorly; Store is the recommended default.
-            </p>
-          </div>
+        <p className="text-xs text-content-muted mb-4">
+          Manage destination folders for archives in <span className="text-content">File Manager → Archive Folders</span>.
+        </p>
+        <div>
+          <label className="block text-sm font-medium text-content-secondary mb-2">
+            Compression
+          </label>
+          <select
+            value={archiveCompression}
+            onChange={(e) => handleArchiveCompressionChange(e.target.value as ArchiveCompression)}
+            disabled={archiveSaving}
+            className="px-3 py-2 bg-surface-hover border border-border rounded text-sm"
+          >
+            <option value="store">Store (no compression — fastest, archive size ≈ source size)</option>
+            <option value="deflate">Deflate (smaller, slower — marginal savings on raw FITS)</option>
+          </select>
+          <p className="text-xs text-content-muted mt-2">
+            FITS files compress poorly; Store is the recommended default.
+          </p>
         </div>
       </div>
 

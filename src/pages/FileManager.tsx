@@ -15,6 +15,7 @@ import { MissingFilesPanel } from '../components/MissingFilesPanel';
 import { FolderBrowserModal } from '../components/FolderBrowserModal';
 import { MissingMetadataView } from '../components/missing-metadata/MissingMetadataView';
 import { DuplicatesView } from '../components/duplicates/DuplicatesView';
+import { ArchiveFoldersSection } from '../components/archive/ArchiveFoldersSection';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
@@ -676,6 +677,8 @@ export default function FileManager() {
               )}
             </div>
           )}
+
+          <ArchiveFoldersSection />
         </div>
       )}
 

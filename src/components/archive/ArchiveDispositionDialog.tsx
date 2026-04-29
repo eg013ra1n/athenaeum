@@ -2,22 +2,23 @@ import { useEffect, useState } from 'react';
 import type {
   ArchiveCompression,
   ArchivePlan,
+  ArchiveRoot,
   ConflictResolution,
   Dispositions,
   FrameRole,
 } from '../../types/archive';
-import { planArchiveOperation } from '../../api/archive';
+import { listArchiveRoots, planArchiveOperation } from '../../api/archive';
 import { ArchiveConflictDialog } from './ArchiveConflictDialog';
 
 interface Props {
   framesSetId: number;
-  archiveRootPath: string;
   defaultCompression: ArchiveCompression;
   onCancel: () => void;
   onStart: (
     dispositions: Dispositions,
     compression: ArchiveCompression,
     conflict: ConflictResolution,
+    archiveRootPath: string,
   ) => void;
 }
 
@@ -31,11 +32,32 @@ export function ArchiveDispositionDialog(props: Props) {
   const [planError, setPlanError] = useState<string | null>(null);
   const [showConflict, setShowConflict] = useState(false);
 
+  // Multi-folder destination support
+  const [archiveRoots, setArchiveRoots] = useState<ArchiveRoot[]>([]);
+  const [selectedRootPath, setSelectedRootPath] = useState<string | null>(null);
+  const [rootsLoaded, setRootsLoaded] = useState(false);
+
+  // Load archive roots once on mount
   useEffect(() => {
+    listArchiveRoots()
+      .then((roots) => {
+        setArchiveRoots(roots);
+        const def = roots.find(r => r.is_default) ?? roots[0];
+        setSelectedRootPath(def?.path ?? null);
+      })
+      .catch((e) => {
+        console.error('Failed to load archive roots', e);
+      })
+      .finally(() => setRootsLoaded(true));
+  }, []);
+
+  // Re-plan whenever dispositions, compression, or selected root change
+  useEffect(() => {
+    if (!rootsLoaded || !selectedRootPath) return;
     let cancelled = false;
     setPlanning(true);
     setPlanError(null);
-    planArchiveOperation(props.framesSetId, dispositions, compression)
+    planArchiveOperation(props.framesSetId, dispositions, compression, selectedRootPath)
       .then(p => { if (!cancelled) setPlan(p); })
       .catch(err => {
         console.error('plan failed', err);
@@ -43,7 +65,7 @@ export function ArchiveDispositionDialog(props: Props) {
       })
       .finally(() => { if (!cancelled) setPlanning(false); });
     return () => { cancelled = true; };
-  }, [props.framesSetId, dispositions, compression]);
+  }, [props.framesSetId, dispositions, compression, selectedRootPath, rootsLoaded]);
 
   const sharedRoles = new Set(plan?.shared_calibrations.map(s => s.frame_role) ?? []);
 
@@ -77,12 +99,12 @@ export function ArchiveDispositionDialog(props: Props) {
   }
 
   function handleStart() {
-    if (!plan) return;
+    if (!plan || !selectedRootPath) return;
     if (plan.conflicts.length > 0) {
       setShowConflict(true);
       return;
     }
-    props.onStart(dispositions, compression, 'overwrite');
+    props.onStart(dispositions, compression, 'overwrite', selectedRootPath);
   }
 
   return (
@@ -92,6 +114,31 @@ export function ArchiveDispositionDialog(props: Props) {
         <p className="text-sm text-content-muted mb-4">
           Lights will always be moved. Choose what to do with calibration frames.
         </p>
+
+        {archiveRoots.length === 0 ? (
+          <p className="text-sm text-warning mb-4">
+            No archive folders configured. Add one in File Manager → Archive Folders before archiving.
+          </p>
+        ) : archiveRoots.length === 1 ? (
+          <div className="mb-4 text-xs text-content-muted">
+            Destination: <span className="font-mono text-content">{archiveRoots[0].path}</span>
+          </div>
+        ) : (
+          <>
+            <h3 className="text-sm font-medium text-content mb-2">Destination archive folder</h3>
+            <select
+              value={selectedRootPath ?? ''}
+              onChange={(e) => setSelectedRootPath(e.target.value)}
+              className="w-full bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-sm text-content mb-4 focus:outline-none focus:border-accent"
+            >
+              {archiveRoots.map((r) => (
+                <option key={r.id} value={r.path}>
+                  {r.path}{r.is_default ? '  (default)' : ''}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
 
         <h3 className="text-sm font-medium text-content mb-2">Calibrations</h3>
         <div className="mb-4 rounded-lg border border-border bg-surface px-3">
@@ -156,7 +203,7 @@ export function ArchiveDispositionDialog(props: Props) {
           </button>
           <button
             onClick={handleStart}
-            disabled={planning || !plan}
+            disabled={planning || !plan || !selectedRootPath || archiveRoots.length === 0}
             className="px-4 py-1.5 rounded-lg bg-accent text-white text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:brightness-110 transition-colors"
           >
             Start Archiving
@@ -164,13 +211,13 @@ export function ArchiveDispositionDialog(props: Props) {
         </div>
       </div>
 
-      {showConflict && plan && (
+      {showConflict && plan && selectedRootPath && (
         <ArchiveConflictDialog
           conflicts={plan.conflicts}
           onCancel={() => setShowConflict(false)}
           onResolve={(resolution) => {
             setShowConflict(false);
-            props.onStart(dispositions, compression, resolution);
+            props.onStart(dispositions, compression, resolution, selectedRootPath);
           }}
         />
       )}

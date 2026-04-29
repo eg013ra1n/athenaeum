@@ -319,6 +319,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Archive roots - user-configured destination folders for ZIP archives
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS archive_roots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            label TEXT,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+
     // Archive operations - one row per archive operation (ZIP archive feature)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS archive_operations (
