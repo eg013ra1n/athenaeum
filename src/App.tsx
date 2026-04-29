@@ -14,6 +14,7 @@ import SkyChart from './pages/SkyChart';
 import Settings from './pages/Settings';
 import About from './pages/About';
 import ExcludedFrames from './pages/ExcludedFrames';
+import Archive from './pages/Archive';
 
 function App() {
   const [dbInitialized, setDbInitialized] = useState(false);
@@ -67,6 +68,7 @@ function App() {
           <Route path="skychart" element={<SkyChart />} />
           <Route path="equipment" element={<Equipment />} />
           <Route path="export" element={<Export />} />
+          <Route path="archive" element={<Archive />} />
           <Route path="blackhole" element={<BlackHole />} />
           <Route path="settings" element={<Settings />} />
           <Route path="about" element={<About />} />
