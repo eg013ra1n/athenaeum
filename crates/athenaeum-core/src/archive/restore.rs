@@ -410,7 +410,7 @@ fn cleanup_temp(temp_dir: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::archive::executor::run_operation;
     use crate::archive::models::{ArchiveCompression, ConflictResolution, Dispositions};
@@ -796,7 +796,7 @@ mod tests {
 
     /// Minimal FITS file the in-house parser can read. Empty primary HDU.
     /// Each card is exactly 80 bytes; the header block is padded to 2880.
-    fn write_minimal_fits(path: &Path) {
+    pub(crate) fn write_minimal_fits(path: &Path) {
         fn card(s: &str) -> [u8; 80] {
             assert!(s.len() <= 80, "card too long: {:?} ({} bytes)", s, s.len());
             let mut out = [b' '; 80];

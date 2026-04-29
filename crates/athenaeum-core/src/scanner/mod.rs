@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::events::{ProgressEmitter, emit_event};
+use anyhow::Context;
 use walkdir::WalkDir;
 
 /// Convert a path to UTF-8 string for DB persistence.
@@ -150,18 +151,20 @@ pub fn scan_directory(
         }
 
         // Skip if already in database AND on-disk metadata still matches.
-        // If size or modified_at changed, treat as "modified" — purge the
-        // stale row (CASCADE clears frames/headers) so process_file can
-        // re-insert clean state.
+        // If size or modified_at changed, re-parse and UPDATE in place so
+        // files.id and frames.id are preserved — junction tables
+        // (session_members, calibration_set_frames, frame_tags) survive
+        // the rescan. The previous DELETE-and-reinsert path silently
+        // orphaned session memberships any time mtime drifted.
         let path_str = file_path.to_string_lossy().to_string();
         let existing = conn
             .query_row(
-                "SELECT size, modified_at FROM files WHERE path = ?1",
+                "SELECT id, size, modified_at FROM files WHERE path = ?1",
                 rusqlite::params![path_str],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
             )
             .ok();
-        if let Some((db_size, db_modified)) = existing {
+        if let Some((file_id, db_size, db_modified)) = existing {
             let on_disk = std::fs::metadata(file_path).ok().map(|m| {
                 let size = m.len() as i64;
                 let modified = m
@@ -178,15 +181,25 @@ pub fn scan_directory(
                 *skipped.lock().unwrap() += 1;
                 continue;
             }
-            // Modified in place — purge the stale row before re-processing.
-            if let Err(e) = conn.execute("DELETE FROM files WHERE path = ?1", rusqlite::params![path_str]) {
-                errors.lock().unwrap().push(format!(
-                    "{}: failed to purge stale row before re-process: {}",
-                    file_path.display(),
-                    e
-                ));
-                continue;
+            // Modified in place — re-parse and UPDATE existing rows. On
+            // parse failure, leave the catalog row untouched so the
+            // bookkeeping (junction tables, calibration links) stays
+            // valid; just record the error and move on.
+            match reparse_and_update_in_place(
+                file_path, file_id, conn, use_content_hash, unique_camera, root_id,
+            ) {
+                Ok(()) => {
+                    *processed.lock().unwrap() += 1;
+                }
+                Err(e) => {
+                    errors.lock().unwrap().push(format!(
+                        "{}: failed to re-parse modified file in place: {}",
+                        file_path.display(),
+                        e
+                    ));
+                }
             }
+            continue;
         }
 
         let mut hash_errors_local: Vec<String> = Vec::new();
@@ -486,6 +499,216 @@ fn process_file(
 
     // Return frame info if imagetyp is known
     Ok(imagetyp.map(|it| (frame_id, it)))
+}
+
+/// Re-parse a file whose on-disk metadata has drifted from the catalog and
+/// UPDATE the existing files / frames / fits_header rows in place. Preserves
+/// files.id and frames.id so every junction-table linkage (session_members,
+/// calibration_set_frames, calibration_set_to_frames, frame_tags) survives.
+///
+/// Returns Ok(()) on success. On parse failure, leaves the DB row untouched
+/// and returns Err — the caller should log it as a non-fatal error so the
+/// rest of the scan continues.
+fn reparse_and_update_in_place(
+    path: &PathBuf,
+    file_id: i64,
+    conn: &Connection,
+    use_content_hash: bool,
+    unique_camera: bool,
+    root_id: i64,
+) -> anyhow::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    let size = metadata.len() as i64;
+    let modified_dt = chrono::DateTime::<Utc>::from(metadata.modified()?);
+
+    let format = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .map(|e| if e == "xisf" { FileFormat::XISF } else { FileFormat::FITS })
+        .unwrap_or(FileFormat::FITS);
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Parse FIRST. If parse fails, we leave the DB alone — better stale
+    // than missing.
+    let (frame, header_text) = match format {
+        FileFormat::FITS => {
+            let (f, h) = parse_fits_with_header(path, file_id)?;
+            (f, Some(h))
+        }
+        FileFormat::XISF => {
+            let f = parse_xisf(path, file_id)?;
+            let h = extract_xisf_header(path).ok();
+            (f, h)
+        }
+    };
+
+    let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
+    let content_hash = if use_content_hash {
+        Some(
+            crate::duplicates::compute_xxhash(path)
+                .with_context(|| format!("compute content hash for {}", path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    let new_instrume = if unique_camera {
+        frame.instrume.as_ref().map(|i| {
+            // Strip a previous " N<digits>" suffix before re-applying so we
+            // don't accumulate "N1 N1 N1" on repeated rescans.
+            let base = if let Some(pos) = i.rfind(" N") {
+                let suffix = &i[pos + 2..];
+                if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                    &i[..pos]
+                } else {
+                    i.as_str()
+                }
+            } else {
+                i.as_str()
+            };
+            format!("{} N{}", base, root_id)
+        })
+    } else {
+        frame.instrume.clone()
+    };
+
+    // Defensive: ensure no more than one frames row points at this file_id.
+    // frame_count == 1 → UPDATE in place (the common case).
+    // frame_count == 0 → INSERT a fresh frames row. This recovers from an
+    //                    earlier scan that inserted a `files` row but failed
+    //                    to parse the FITS, leaving an orphaned files row
+    //                    with no `frames`. Without this branch, that orphan
+    //                    stays stuck because subsequent scans classify the
+    //                    file as "unchanged" (mtime matches) and the
+    //                    "new file" branch never runs (the files row exists).
+    // frame_count > 1  → bail; we don't know which row to update.
+    let frame_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM frames WHERE file_id = ?1",
+        rusqlite::params![file_id],
+        |r| r.get(0),
+    )?;
+    if frame_count > 1 {
+        anyhow::bail!(
+            "expected at most 1 frames row for file_id={}, found {}",
+            file_id,
+            frame_count,
+        );
+    }
+
+    // UPDATE files in place. Mirrors insert_file's column list (path,
+    // filename, created_at intentionally not touched).
+    conn.execute(
+        "UPDATE files
+         SET size = ?1, modified_at = ?2, format = ?3,
+             metadata_hash = ?4, content_hash = ?5
+         WHERE id = ?6",
+        rusqlite::params![
+            size,
+            modified_dt.to_rfc3339(),
+            format!("{:?}", format),
+            Some(metadata_hash),
+            content_hash,
+            file_id,
+        ],
+    )?;
+
+    // UPDATE frames in place if a row exists; otherwise INSERT one. The
+    // INSERT branch handles the case where a previous scan inserted the
+    // `files` row but failed to parse the FITS — leaving an orphaned files
+    // row with no `frames`. Without this branch, that orphan stays stuck
+    // because the file would now be classified as "unchanged" on every
+    // subsequent scan.
+    if frame_count == 1 {
+        // Mirrors insert_frame's column list. Note that imagetyp is stored
+        // as the Debug form of ImageType (matches insert_frame),
+        // is_master/override are written as i64 booleans, and bayerpat is
+        // included (added via migration; see schema.rs).
+        let imagetyp_str = frame.imagetyp.as_ref().map(|t| format!("{:?}", t));
+        let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
+        let is_master_int = if frame.is_master { 1i64 } else { 0i64 };
+        let override_int = if frame.override_ { 1i64 } else { 0i64 };
+        conn.execute(
+            "UPDATE frames SET
+                object = ?1, date_obs = ?2, telescop = ?3, instrume = ?4,
+                exptime = ?5, filter = ?6, imagetyp = ?7, is_master = ?8,
+                gain = ?9, offset = ?10, binning = ?11, xbinning = ?12,
+                ybinning = ?13, ccd_temp = ?14, set_temp = ?15, focallen = ?16,
+                xpixsz = ?17, ypixsz = ?18, naxis1 = ?19, naxis2 = ?20,
+                ra = ?21, dec = ?22, sitelat = ?23, lat_obs = ?24,
+                sitelong = ?25, long_obs = ?26, objctra = ?27, objctdec = ?28,
+                override = ?29, swcreate = ?30, bayerpat = ?31, rotation = ?32
+             WHERE file_id = ?33",
+            rusqlite::params![
+                frame.object,
+                date_obs_str,
+                frame.telescop,
+                new_instrume,
+                frame.exptime,
+                frame.filter,
+                imagetyp_str,
+                is_master_int,
+                frame.gain,
+                frame.offset,
+                frame.binning,
+                frame.xbinning,
+                frame.ybinning,
+                frame.ccd_temp,
+                frame.set_temp,
+                frame.focallen,
+                frame.xpixsz,
+                frame.ypixsz,
+                frame.naxis1,
+                frame.naxis2,
+                frame.ra,
+                frame.dec,
+                frame.sitelat,
+                frame.lat_obs,
+                frame.sitelong,
+                frame.long_obs,
+                frame.objctra,
+                frame.objctdec,
+                override_int,
+                frame.swcreate,
+                frame.bayerpat,
+                frame.rotation,
+                file_id,
+            ],
+        )?;
+    } else {
+        // frame_count == 0: insert a new frames row pointing at file_id.
+        // Build a Frame with the correct file_id and the unique-camera
+        // suffix applied (so both the UPDATE and INSERT branches share the
+        // same instrume substitution logic), leave id = None so the
+        // canonical insert allocates a fresh auto-increment id.
+        let mut frame_for_insert = frame.clone();
+        frame_for_insert.id = None;
+        frame_for_insert.file_id = file_id;
+        frame_for_insert.instrume = new_instrume.clone();
+        insert_frame(conn, &frame_for_insert)?;
+    }
+
+    // fits_header has UNIQUE(file_id) — DELETE then INSERT so the
+    // header_fingerprint reflects the new bytes. No FK references
+    // fits_header rows, so this is safe.
+    if let Some(h) = header_text {
+        let fingerprint = crate::fingerprint::compute_header_fingerprint(&h);
+        conn.execute(
+            "DELETE FROM fits_header WHERE file_id = ?1",
+            rusqlite::params![file_id],
+        )?;
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![file_id, h, fingerprint],
+        )?;
+    }
+
+    Ok(())
 }
 
 pub struct ScanResult {
@@ -1315,4 +1538,165 @@ pub fn run_registered_scan<E: ProgressEmitter>(
     }
 
     Ok(RegisteredScanOutcome { result, reconcile })
+}
+
+#[cfg(test)]
+mod inplace_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use crate::events::NullEmitter;
+    use rusqlite::params;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    /// Re-touching a FITS file (simulating a restore round-trip or a user
+    /// edit) must NOT remove the frame from its session. The scanner should
+    /// re-parse and UPDATE in place, preserving frames.id so the
+    /// session_members → frames → files JOIN stays intact.
+    #[test]
+    fn rescan_after_mtime_change_preserves_session_members() {
+        let scan = TempDir::new().unwrap();
+        let f = scan.path().join("M33/L_001.fits");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&f);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (1, 'M33')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (10, 1, '2025-10-12', '2025-10-13')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')",
+            [],
+        )
+        .unwrap();
+
+        // First scan inserts the file/frame; we then manually link it into a session.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let scan1 = scan_directory_parallel(
+            scan.path(),
+            1,
+            &conn,
+            &NullEmitter,
+            false,
+            cancel.clone(),
+            false,
+        );
+        assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
+        assert!(!scan1.cancelled);
+
+        let frame_id: i64 = conn
+            .query_row(
+                "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+                [f.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)",
+            params![frame_id],
+        )
+        .unwrap();
+
+        // Touch the file: write the same bytes back, which advances mtime
+        // by at least one filesystem tick. Sleep first so the new mtime is
+        // strictly greater than the old one (avoids same-second collision).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let bytes = std::fs::read(&f).unwrap();
+        std::fs::write(&f, bytes).unwrap();
+
+        // Rescan via the serial path (the path Task 4 fixes).
+        let scan2 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
+        assert!(!scan2.cancelled);
+
+        // frame.id must be unchanged AND the session membership must survive.
+        let frame_id_after: i64 = conn
+            .query_row(
+                "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+                [f.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            frame_id, frame_id_after,
+            "frame.id must be preserved across in-place re-parse"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1",
+                params![frame_id_after],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "session membership must survive the re-parse");
+    }
+
+    /// Recovery path: a previous scan inserted the `files` row but the FITS
+    /// parse failed, leaving zero `frames` rows. After the user fixes the
+    /// file (mtime advances), the next scan must INSERT a fresh `frames` row
+    /// rather than bailing.
+    #[test]
+    fn rescan_recovers_orphaned_files_row_with_no_frames() {
+        let scan = TempDir::new().unwrap();
+        let f = scan.path().join("M33/L_002.fits");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&f);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        // Manually insert a `files` row with no matching `frames`. Simulates
+        // the orphan that a previous parse-failure scan would have left.
+        let f_size = std::fs::metadata(&f).unwrap().len() as i64;
+        let f_mtime = chrono::DateTime::<chrono::Utc>::from(
+            std::fs::metadata(&f).unwrap().modified().unwrap(),
+        )
+        .to_rfc3339();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (5000, ?1, 'L_002.fits', ?2, ?3, 'FITS')",
+            params![f.to_str().unwrap(), f_size, f_mtime],
+        )
+        .unwrap();
+
+        // Touch file so the scanner classifies it as "modified" (not
+        // "unchanged"). Sleep first so the new mtime is strictly greater.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let bytes = std::fs::read(&f).unwrap();
+        std::fs::write(&f, bytes).unwrap();
+
+        // Rescan via the serial path that Task 4 fixed.
+        let result = scan_directory(scan.path(), &conn, None, false, false, 1);
+        assert!(result.errors.is_empty(), "rescan must succeed: {:?}", result.errors);
+        assert!(!result.cancelled);
+
+        // Now there must be exactly one frames row pointing at file_id=5000.
+        let frame_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames WHERE file_id = 5000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(frame_count, 1, "orphaned files row must get a fresh frames row");
+    }
 }
