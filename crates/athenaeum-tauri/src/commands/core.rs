@@ -22,37 +22,24 @@ struct VersionJson {
     download_url: String,
 }
 
-/// Parse a version string into (major, minor, patch, is_prerelease).
-/// Handles formats like "0.2.0", "0.2.0-beta.1", "v0.2.0-beta.1".
-/// Pre-release versions sort below their base version (0.2.0 > 0.2.0-beta.1).
-fn parse_version(s: &str) -> (u32, u32, u32, bool) {
-    let s = s.trim_start_matches('v');
-    // Split off pre-release suffix (e.g., "0.2.0-beta.1" → "0.2.0" + Some("beta.1"))
-    let (base, prerelease) = match s.split_once('-') {
-        Some((b, _)) => (b, true),
-        None => (s, false),
-    };
-    let mut parts = base.split('.');
-    (
-        parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
-        parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
-        parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
-        prerelease,
-    )
-}
-
+/// True iff `latest` is strictly newer than `current` per SemVer 2.0
+/// precedence. Both sides may have an optional leading `v`. Parse failures
+/// are logged and treated as "not newer" so a malformed manifest can never
+/// produce a false-positive update prompt.
 fn version_is_newer(latest: &str, current: &str) -> bool {
-    let (lmaj, lmin, lpatch, lpre) = parse_version(latest);
-    let (cmaj, cmin, cpatch, cpre) = parse_version(current);
-
-    let l_base = (lmaj, lmin, lpatch);
-    let c_base = (cmaj, cmin, cpatch);
-
-    match l_base.cmp(&c_base) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        // Same base version: stable > pre-release
-        std::cmp::Ordering::Equal => cpre && !lpre,
+    let parse = |s: &str| -> Option<semver::Version> {
+        let trimmed = s.trim().trim_start_matches('v');
+        match semver::Version::parse(trimmed) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("version_is_newer: failed to parse {:?}: {}", s, e);
+                None
+            }
+        }
+    };
+    match (parse(latest), parse(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
     }
 }
 
@@ -208,4 +195,48 @@ pub async fn check_for_updates(state: State<'_, super::AppState>) -> Result<Upda
         is_update_available,
         download_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_is_newer;
+
+    #[test]
+    fn beta_8_is_newer_than_beta_7() {
+        assert!(version_is_newer("0.2.0-beta.8", "0.2.0-beta.7"));
+    }
+
+    #[test]
+    fn stable_is_newer_than_pre_release_of_same_base() {
+        assert!(version_is_newer("0.2.0", "0.2.0-beta.9"));
+    }
+
+    #[test]
+    fn pre_release_is_not_newer_than_stable_of_same_base() {
+        assert!(!version_is_newer("0.2.0-beta.9", "0.2.0"));
+    }
+
+    #[test]
+    fn higher_minor_is_newer_regardless_of_pre_release() {
+        assert!(version_is_newer("0.3.0", "0.2.0-beta.99"));
+        assert!(version_is_newer("0.3.0-beta.1", "0.2.0"));
+    }
+
+    #[test]
+    fn equal_versions_are_not_newer() {
+        assert!(!version_is_newer("0.2.0-beta.8", "0.2.0-beta.8"));
+        assert!(!version_is_newer("0.2.0", "0.2.0"));
+    }
+
+    #[test]
+    fn leading_v_is_stripped() {
+        assert!(version_is_newer("v0.2.0-beta.8", "0.2.0-beta.7"));
+        assert!(version_is_newer("0.2.0-beta.8", "v0.2.0-beta.7"));
+    }
+
+    #[test]
+    fn unparseable_returns_false() {
+        assert!(!version_is_newer("garbage", "0.2.0-beta.8"));
+        assert!(!version_is_newer("0.2.0-beta.8", ""));
+    }
 }
