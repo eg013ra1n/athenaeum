@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
-import { Files, Calendar, Target, Focus, Camera, Layers, Settings, Trash2, Info, ChevronsLeft, ChevronsRight, Archive as ArchiveIcon } from 'lucide-react';
+import { Files, Calendar, Target, Focus, Camera, Layers, Settings, Trash2, Info, ChevronsLeft, ChevronsRight } from 'lucide-react';
 import { ArchiveResumeBanner } from './archive/ArchiveResumeBanner';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
@@ -31,7 +31,6 @@ export default function Layout() {
     { to: '/skychart', icon: Focus, label: 'Sky Chart' },
     { to: '/calendar', icon: Calendar, label: 'Shoot Calendar' },
     { to: '/export', icon: Layers, label: 'Export' },
-    { to: '/archive', icon: ArchiveIcon, label: 'Archive' },
     { to: '/blackhole', icon: Trash2, label: 'Black Hole' },
     { to: '/settings', icon: Settings, label: 'Settings' },
     { to: '/about', icon: Info, label: 'About' },
