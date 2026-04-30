@@ -102,6 +102,9 @@ pub async fn check_missing_files_in_scan_root(
             )
             .map_err(|e| db_err(format!("Failed to get scan root: {}", e)))?;
 
+        // Exclude files known to be inside an archive zip — their on-disk
+        // paths intentionally don't exist post-archive, so the existence
+        // check below would falsely flag them as missing.
         let mut stmt = conn
             .prepare(
                 "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
@@ -109,7 +112,7 @@ pub async fn check_missing_files_in_scan_root(
                         fr.object, fr.date_obs
                  FROM files f
                  LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE f.path LIKE ?1",
+                 WHERE f.path LIKE ?1 AND f.archived_in_operation IS NULL",
             )
             .map_err(db_err)?;
 
@@ -232,26 +235,28 @@ pub async fn recheck_missing_files(
         let conn = db.conn();
         let now = chrono::Utc::now().to_rfc3339();
 
+        // Pull `archived_in_operation` alongside the path so we can drop
+        // rows for files that have since been moved into an archive zip.
         let mut stmt = conn
             .prepare(
-                "SELECT mf.id, mf.file_id, f.path
+                "SELECT mf.id, mf.file_id, f.path, f.archived_in_operation
                  FROM missing_files mf
                  JOIN files f ON f.id = mf.file_id
                  WHERE mf.scan_root_id = ?1",
             )
             .map_err(db_err)?;
 
-        let files: Vec<(i64, i64, String)> = stmt
-            .query_map([root_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        let files: Vec<(i64, i64, String, Option<i64>)> = stmt
+            .query_map([root_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
 
-        // Check each file in parallel
+        // "Found" means archived (catalog says it's in a zip) OR present on disk.
         let found_mf_ids: Vec<i64> = files
             .par_iter()
-            .filter_map(|(mf_id, _file_id, path)| {
-                if Path::new(path).exists() {
+            .filter_map(|(mf_id, _file_id, path, archived_op)| {
+                if archived_op.is_some() || Path::new(path).exists() {
                     Some(*mf_id)
                 } else {
                     None

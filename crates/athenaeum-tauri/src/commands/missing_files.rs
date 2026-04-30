@@ -204,29 +204,35 @@ pub async fn recheck_missing_files(
         let conn = db.conn();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Get all missing files for this root
+        // Get all missing files for this root. Also pull `archived_in_operation`
+        // so we can drop rows for files that have since been moved into an
+        // archive zip — those aren't missing in any meaningful sense, just
+        // relocated to a known place.
         let mut stmt = conn
             .prepare(
-                "SELECT mf.id, mf.file_id, f.path
+                "SELECT mf.id, mf.file_id, f.path, f.archived_in_operation
                  FROM missing_files mf
                  JOIN files f ON f.id = mf.file_id
                  WHERE mf.scan_root_id = ?1",
             )
             .map_err(|e| e.to_string())?;
 
-        let files: Vec<(i64, i64, String)> = stmt
+        let files: Vec<(i64, i64, String, Option<i64>)> = stmt
             .query_map([root_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
 
-        // Check each file in parallel - filesystem checks are I/O bound
+        // "Found" means: archived (catalog says it's in a zip) OR present on
+        // disk. Both cases delete the missing_files row. Filesystem checks
+        // are parallelised because they're I/O bound; the archive check is
+        // a cheap field read so we do it inline.
         let found_file_ids: Vec<i64> = files
             .par_iter()
-            .filter_map(|(mf_id, _file_id, path)| {
-                if Path::new(path).exists() {
+            .filter_map(|(mf_id, _file_id, path, archived_op)| {
+                if archived_op.is_some() || Path::new(path).exists() {
                     Some(*mf_id)
                 } else {
                     None

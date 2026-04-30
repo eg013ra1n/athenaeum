@@ -347,8 +347,12 @@ pub async fn check_missing_files_in_scan_root(
             )
             .map_err(|e| format!("Failed to get scan root: {}", e))?;
 
-        // Get all files under this scan root
-        // Use LEFT JOIN instead of subqueries to avoid N+1 query problem
+        // Get all files under this scan root, excluding files known to live
+        // inside an archive zip (`archived_in_operation IS NOT NULL`). Their
+        // on-disk paths intentionally don't exist post-archive — flagging
+        // them as "missing" would fill the missing_files table with false
+        // positives the user has to manually clear.
+        // Use LEFT JOIN instead of subqueries to avoid N+1 query problem.
         let mut stmt = conn
             .prepare(
                 "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
@@ -357,7 +361,7 @@ pub async fn check_missing_files_in_scan_root(
                         fr.date_obs
                  FROM files f
                  LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE f.path LIKE ?1"
+                 WHERE f.path LIKE ?1 AND f.archived_in_operation IS NULL"
             )
             .map_err(|e| e.to_string())?;
 
