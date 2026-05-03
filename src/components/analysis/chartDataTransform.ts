@@ -2,17 +2,136 @@ import type { FrameAnalysis } from '../../types/models';
 import type { EnrichedLightFrame } from '../calibration/LightsAnalysisTable';
 import { getFilterColor, buildSeriesLabel } from '../../utils/filterColors';
 
+// ============================================================
+// Metric registry — all plottable metrics live here.
+// Adding a new metric: add an entry; the chart picker, accessor,
+// label, and unit handling all read from this registry.
+// ============================================================
+
+export interface MetricDefinition {
+  key: string;
+  label: string;
+  unit?: string;
+  precision: number;
+  hint?: string;
+  /** Returns the metric value in its native unit, or null when unavailable. */
+  accessor: (frame: EnrichedLightFrame, analysis: FrameAnalysis | null) => number | null;
+  /**
+   * If FWHM-style display unit conversion (px ↔ arcsec) applies, set true.
+   * Only `median_fwhm` uses this today.
+   */
+  arcsecConvertible?: boolean;
+}
+
+export const METRIC_REGISTRY: Record<string, MetricDefinition> = {
+  median_fwhm: {
+    key: 'median_fwhm',
+    label: 'FWHM',
+    unit: 'px',
+    precision: 2,
+    hint: 'lower is better',
+    accessor: (_f, a) => a?.median_fwhm ?? null,
+    arcsecConvertible: true,
+  },
+  median_hfr: {
+    key: 'median_hfr',
+    label: 'HFR',
+    unit: 'px',
+    precision: 2,
+    hint: 'lower is better',
+    accessor: (_f, a) => a?.median_hfr ?? null,
+  },
+  median_eccentricity: {
+    key: 'median_eccentricity',
+    label: 'Eccentricity',
+    precision: 3,
+    hint: 'lower is better',
+    accessor: (_f, a) => a?.median_eccentricity ?? null,
+  },
+  median_snr: {
+    key: 'median_snr',
+    label: 'SNR (median)',
+    precision: 1,
+    hint: 'higher is better',
+    accessor: (_f, a) => a?.median_snr ?? null,
+  },
+  frame_snr: {
+    key: 'frame_snr',
+    label: 'Frame SNR',
+    unit: 'dB',
+    precision: 1,
+    hint: 'higher is better',
+    accessor: (_f, a) => a?.frame_snr ?? null,
+  },
+  snr_weight: {
+    key: 'snr_weight',
+    label: 'SNR Weight',
+    precision: 2,
+    hint: 'higher is better',
+    accessor: (_f, a) => a?.snr_weight ?? null,
+  },
+  psf_signal: {
+    key: 'psf_signal',
+    label: 'PSF Signal',
+    unit: 'ADU',
+    precision: 1,
+    hint: 'higher is better',
+    accessor: (_f, a) => a?.psf_signal ?? null,
+  },
+  stars_detected: {
+    key: 'stars_detected',
+    label: 'Stars',
+    precision: 0,
+    hint: 'higher is better',
+    accessor: (_f, a) => a?.stars_detected ?? null,
+  },
+  background: {
+    key: 'background',
+    label: 'Background',
+    unit: 'ADU',
+    precision: 1,
+    accessor: (_f, a) => a?.background ?? null,
+  },
+  noise: {
+    key: 'noise',
+    label: 'Noise',
+    unit: 'ADU',
+    precision: 2,
+    accessor: (_f, a) => a?.noise ?? null,
+  },
+  trail_r_squared: {
+    key: 'trail_r_squared',
+    label: 'Trail R²',
+    precision: 3,
+    hint: 'lower is better',
+    accessor: (_f, a) => a?.trail_r_squared ?? null,
+  },
+  median_beta: {
+    key: 'median_beta',
+    label: 'Moffat β',
+    precision: 2,
+    accessor: (_f, a) => a?.median_beta ?? null,
+  },
+};
+
+export const METRIC_KEYS = Object.keys(METRIC_REGISTRY);
+
+// ============================================================
+// Chart data shaping
+// ============================================================
+
 export interface ChartDataPoint {
+  frameId: number;
+  fileId: number;
   timestamp: number;
   compressedX: number;
   dateLabel: string;
   filename: string;
   seriesKey: string;
-  fwhm: number | null;
-  eccentricity: number | null;
-  snr: number | null;
-  stars: number | null;
-  psfSignal: number | null;
+  /** Reference to the underlying frame — read by metric accessors at render time. */
+  frame: EnrichedLightFrame;
+  /** Reference to the underlying analysis row (null when frame hasn't been analyzed yet). */
+  analysis: FrameAnalysis | null;
 }
 
 export interface NightBoundary {
@@ -58,13 +177,11 @@ export function compressedToReal(compressed: number, segments: TimeSegment[]): n
       return seg.realStart + (compressed - seg.compressedStart);
     }
   }
-  // In a gap between segments — return nearest segment boundary
   for (let i = 0; i < segments.length - 1; i++) {
     if (compressed > segments[i].compressedEnd && compressed < segments[i + 1].compressedStart) {
       return segments[i].realEnd;
     }
   }
-  // Before first or after last
   if (segments.length > 0) {
     if (compressed <= segments[0].compressedStart) {
       return segments[0].realStart - (segments[0].compressedStart - compressed);
@@ -76,36 +193,30 @@ export function compressedToReal(compressed: number, segments: TimeSegment[]): n
 }
 
 /**
- * Transform displayed frames + analysis data into chart-ready data.
- * Joins frames with analysis by frame_id, sorts by time, detects session
- * boundaries, and builds a compressed timeline that collapses multi-day gaps.
+ * Transform displayed frames into chart-ready data.
+ * Frames without `date_obs` are skipped (no X-axis position).
+ * Frames without analysis are still included (analysis ref is null) so capture-side
+ * metrics like exptime/gain/temp can be plotted before analysis runs.
  */
 export function transformToChartData(
   frames: EnrichedLightFrame[],
   analysisData: Map<number, FrameAnalysis>
 ): ChartDataResult {
-  // 1. Join frames with analysis, filter out missing date_obs or analysis
-  const joined: { frame: EnrichedLightFrame; analysis: FrameAnalysis; ts: number }[] = [];
+  const joined: { frame: EnrichedLightFrame; analysis: FrameAnalysis | null; ts: number }[] = [];
 
   for (const frame of frames) {
     if (!frame.date_obs) continue;
-    const analysis = analysisData.get(frame.frame_id);
-    if (!analysis) continue;
-
     const ts = new Date(frame.date_obs).getTime();
     if (isNaN(ts)) continue;
-
-    joined.push({ frame, analysis, ts });
+    joined.push({ frame, analysis: analysisData.get(frame.frame_id) ?? null, ts });
   }
 
-  // 2. Sort by timestamp ascending
   joined.sort((a, b) => a.ts - b.ts);
 
   if (joined.length === 0) {
     return { dataPoints: [], nightBoundaries: [], seriesList: [], segments: [] };
   }
 
-  // 3. Detect multiple cameras and assign shapes by camera
   const cameraList = [...new Set(joined.map((j) => j.frame.camera))];
   const multipleCamera = cameraList.length > 1;
   const cameraShapeMap = new Map<string, DotShape>();
@@ -113,10 +224,9 @@ export function transformToChartData(
     cameraShapeMap.set(cameraList[i], DOT_SHAPES[i % DOT_SHAPES.length]);
   }
 
-  // 4. Detect sessions (groups separated by >4h gaps)
+  // Detect sessions (groups separated by >4h gaps)
   const segmentRanges: { startIdx: number; endIdx: number }[] = [];
   let segStart = 0;
-
   for (let i = 1; i < joined.length; i++) {
     if (joined[i].ts - joined[i - 1].ts > FOUR_HOURS_MS) {
       segmentRanges.push({ startIdx: segStart, endIdx: i - 1 });
@@ -125,16 +235,12 @@ export function transformToChartData(
   }
   segmentRanges.push({ startIdx: segStart, endIdx: joined.length - 1 });
 
-  // 5. Build compressed timeline — proportional within sessions, fixed small gaps between
   let totalDuration = 0;
   for (const seg of segmentRanges) {
     totalDuration += joined[seg.endIdx].ts - joined[seg.startIdx].ts;
   }
 
-  // Gap = 3% of total data duration (min 1 minute), only if multiple segments
-  const gapSize = segmentRanges.length > 1
-    ? Math.max(totalDuration * 0.03, 60_000)
-    : 0;
+  const gapSize = segmentRanges.length > 1 ? Math.max(totalDuration * 0.03, 60_000) : 0;
 
   const segments: TimeSegment[] = [];
   let compressedPos = 0;
@@ -154,14 +260,12 @@ export function transformToChartData(
     compressedPos += duration + gapSize;
   }
 
-  // Compress a real timestamp to compressed-axis position
   const compress = (ts: number): number => {
     for (const seg of segments) {
       if (ts >= seg.realStart && ts <= seg.realEnd) {
         return seg.compressedStart + (ts - seg.realStart);
       }
     }
-    // Fallback: nearest segment boundary
     let best = segments[0].compressedStart;
     let minDist = Math.abs(ts - segments[0].realStart);
     for (const seg of segments) {
@@ -173,7 +277,6 @@ export function transformToChartData(
     return best;
   };
 
-  // 6. Build series info map and data points
   const seriesMap = new Map<string, SeriesInfo>();
   const dataPoints: ChartDataPoint[] = [];
 
@@ -190,20 +293,18 @@ export function transformToChartData(
     }
 
     dataPoints.push({
+      frameId: frame.frame_id,
+      fileId: frame.file_id,
       timestamp: ts,
       compressedX: compress(ts),
       dateLabel: formatChartDate(ts),
       filename: frame.filename,
       seriesKey,
-      fwhm: analysis.median_fwhm,
-      eccentricity: analysis.median_eccentricity,
-      snr: analysis.median_snr,
-      stars: analysis.stars_detected,
-      psfSignal: analysis.psf_signal,
+      frame,
+      analysis,
     });
   }
 
-  // 7. Night boundaries — placed in compressed gaps between segments
   const nightBoundaries: NightBoundary[] = [];
   for (let i = 1; i < segments.length; i++) {
     const compressedMidpoint = (segments[i - 1].compressedEnd + segments[i].compressedStart) / 2;

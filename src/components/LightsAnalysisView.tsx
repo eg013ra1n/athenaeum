@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Play, Trash2, BarChart3, Download, Check, LineChart, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight } from 'lucide-react';
+import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -11,7 +11,7 @@ import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/Ligh
 import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
-import { AnalysisChartsModal } from './analysis/AnalysisChartsModal';
+import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
 
 interface LightsAnalysisViewProps {
@@ -67,8 +67,11 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
   const [csvExportedMsg, setCsvExportedMsg] = useState<string | null>(null);
   const csvTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [chartsOpen, setChartsOpen] = useState(false);
+  const [frameViewMode, setFrameViewMode] = useState<'table' | 'chart'>('table');
   const [useArcsec, setUseArcsec] = useState(false);
+  const [defaultFwhmUnit, setDefaultFwhmUnit] = useState<'px' | 'arcsec'>('px');
+  const defaultUnitAppliedRef = useRef(false);
+  const [defaultsLoaded, setDefaultsLoaded] = useState(false);
 
   // Build both tree structures
   const dateTree = useMemo(() => buildCameraFilterTree(hierarchy), [hierarchy]);
@@ -118,22 +121,52 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     loadAnalysisData();
   }, [frameSetId]);
 
-  // Load saved rejection defaults on mount
+  // Load saved rejection defaults + FWHM default unit on mount.
+  // FWHM is excluded from the live pre-fill — it's auto-computed per frame set
+  // (see fwhmAutoFilledForRef effect below). The saved FWHM is still kept in
+  // `defaultThresholds` so the "Load defaults" button can restore it on demand.
+  //
+  // The saved `fwhm_unit` lives inside the JSON next to the value, so loading
+  // the pair gives us an unambiguous interpretation of the saved number.
+  // Legacy migration: if the JSON has no `fwhm_unit` field, fall back to the
+  // standalone `analysis.fwhm_default_unit` setting (older saves).
   useEffect(() => {
     (async () => {
       try {
+        const unitPref = await api.invoke<string>('get_setting', {
+          key: 'analysis.fwhm_default_unit',
+          defaultValue: 'px',
+        });
+        const prefersArcsec = unitPref === 'arcsec';
+        if (prefersArcsec) setDefaultFwhmUnit('arcsec');
+
         const json = await api.invoke<string>('get_setting', {
           key: 'analysis.rejection_defaults',
           defaultValue: '',
         });
         if (json) {
-          const saved = JSON.parse(json) as RejectionThresholds;
-          const merged = { ...EMPTY_THRESHOLDS, ...saved };
+          const saved = JSON.parse(json) as Partial<RejectionThresholds>;
+          const merged: RejectionThresholds = { ...EMPTY_THRESHOLDS, ...saved };
+          // Pair the saved value with its unit. Prefer the inline field; fall
+          // back to the legacy standalone setting for older saves.
+          if (merged.fwhm && merged.fwhm !== '') {
+            merged.fwhm_unit = saved.fwhm_unit ?? (prefersArcsec ? 'arcsec' : 'px');
+          } else {
+            merged.fwhm_unit = undefined;
+          }
           setDefaultThresholds(merged);
-          setThresholds(merged);
+          setThresholds(prev => ({
+            ...prev,
+            eccentricity: merged.eccentricity,
+            frame_snr: merged.frame_snr,
+            snr_weight: merged.snr_weight,
+            trail: merged.trail,
+          }));
         }
       } catch (err) {
         console.error('Failed to load rejection defaults:', err);
+      } finally {
+        setDefaultsLoaded(true);
       }
     })();
   }, []);
@@ -175,37 +208,18 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     return null;
   }, [allFrames]);
 
-  // Compute auto FWHM threshold: median × 1.8, in current units
-  const computeAutoFwhm = useCallback((): string => {
-    if (analysisData.size === 0) return '';
-    const fwhmValues: number[] = [];
-    for (const f of allFrames) {
-      const a = analysisData.get(f.frame_id);
-      if (a) fwhmValues.push(a.median_fwhm);
+  // Apply the saved default FWHM unit once plateScale is available (one-shot).
+  // If the user later toggles units manually, we don't override them.
+  // Auto-fill is gated on this having run (see the fwhmAutoFilledForRef effect),
+  // so no value-conversion is needed here — auto-fill won't fire until useArcsec
+  // is settled.
+  useEffect(() => {
+    if (defaultUnitAppliedRef.current) return;
+    if (defaultFwhmUnit === 'arcsec' && plateScale) {
+      setUseArcsec(true);
+      defaultUnitAppliedRef.current = true;
     }
-    if (fwhmValues.length === 0) return '';
-    fwhmValues.sort((a, b) => a - b);
-    const median = fwhmValues[Math.floor(fwhmValues.length / 2)];
-    let value = median * 1.8;
-    if (useArcsec && plateScale) value *= plateScale;
-    return value.toFixed(2);
-  }, [analysisData, allFrames, useArcsec, plateScale]);
-
-  const handleClearThresholds = useCallback(() => {
-    setThresholds({ ...EMPTY_THRESHOLDS, fwhm: computeAutoFwhm() });
-  }, [computeAutoFwhm]);
-
-  const handleLoadDefaults = useCallback(() => {
-    if (defaultThresholds) setThresholds(defaultThresholds);
-  }, [defaultThresholds]);
-
-  const handleSplit = useCallback(() => {
-    if (onSplit && checkedKeys.size > 0) onSplit(checkedKeys);
-  }, [onSplit, checkedKeys]);
-
-  const handleCreateCustomSet = useCallback(() => {
-    if (onCreateCustomSet && checkedKeys.size > 0) onCreateCustomSet(checkedKeys);
-  }, [onCreateCustomSet, checkedKeys]);
+  }, [defaultFwhmUnit, plateScale]);
 
   // Frames shown in the table: filtered by checked tree items, or all if nothing checked
   const displayedFrames = useMemo(() => {
@@ -218,29 +232,116 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     return frames.filter(f => !blackholedFileIds.has(f.file_id));
   }, [checkedKeys, allFrames, framesByKey, blackholedFileIds]);
 
-  const toggleUnits = useCallback(() => {
-    setUseArcsec(prev => {
-      const next = !prev;
-      if (plateScale) {
-        setThresholds(t => {
-          const val = parseFloat(t.fwhm);
-          if (isNaN(val)) return t;
-          const converted = next ? val * plateScale : val / plateScale;
-          return { ...t, fwhm: converted.toFixed(2) };
-        });
-      }
-      return next;
-    });
-  }, [plateScale]);
+  // Auto FWHM threshold in PIXELS. Pure data transform — no UI-state dependency.
+  // Rule: median + 3 × max(MAD, 0.1 × median) over the *displayed* frames, so
+  // the threshold tracks whatever cohort the user has filtered to. The MAD floor
+  // keeps very tight clusters from collapsing the threshold onto the median
+  // (which would reject ~half the frames).
+  const autoFwhmPx = useMemo((): number | null => {
+    if (analysisData.size === 0) return null;
+    const values: number[] = [];
+    for (const f of displayedFrames) {
+      const a = analysisData.get(f.frame_id);
+      if (a) values.push(a.median_fwhm);
+    }
+    if (values.length === 0) return null;
+    values.sort((a, b) => a - b);
+    const median = values[Math.floor(values.length / 2)];
+    const deviations = values.map(v => Math.abs(v - median));
+    deviations.sort((a, b) => a - b);
+    const mad = deviations[Math.floor(deviations.length / 2)];
+    const effectiveMad = Math.max(mad, median * 0.1);
+    return median + 3 * effectiveMad;
+  }, [analysisData, displayedFrames]);
 
-  // Auto-fill FWHM rejection with median×1.8 when analysis data loads and field is empty
+  // Format a pixel value into the threshold-bar string in whatever unit is
+  // currently displayed. Keep all internal math in pixels; convert only here.
+  const pxToDisplayString = useCallback((px: number): string => {
+    const v = (useArcsec && plateScale) ? px * plateScale : px;
+    return v.toFixed(2);
+  }, [useArcsec, plateScale]);
+
+  const handleClearThresholds = useCallback(() => {
+    const fwhm = autoFwhmPx != null ? pxToDisplayString(autoFwhmPx) : '';
+    setThresholds({ ...EMPTY_THRESHOLDS, fwhm });
+  }, [autoFwhmPx, pxToDisplayString]);
+
+  // Load the saved defaults into the threshold bar, converting the FWHM value
+  // from its saved unit to the unit the threshold bar is currently displaying.
+  // The unit toggle itself is NOT flipped — the value adapts to the view, not
+  // the other way around. If a unit conversion is required but no plate scale
+  // is available, the FWHM field is left blank (we have no way to convert).
+  const handleLoadDefaults = useCallback(() => {
+    if (!defaultThresholds) return;
+    const next: RejectionThresholds = { ...defaultThresholds };
+    const savedUnit = defaultThresholds.fwhm_unit ?? 'px';
+    const savedFwhm = parseFloat(defaultThresholds.fwhm);
+    if (!isNaN(savedFwhm)) {
+      const wantArcsec = useArcsec;
+      if (savedUnit === 'arcsec' && !wantArcsec) {
+        next.fwhm = plateScale ? (savedFwhm / plateScale).toFixed(2) : '';
+      } else if (savedUnit === 'px' && wantArcsec) {
+        next.fwhm = plateScale ? (savedFwhm * plateScale).toFixed(2) : '';
+      }
+      // else: units already match — keep the saved value as-is
+    }
+    setThresholds(next);
+  }, [defaultThresholds, plateScale, useArcsec]);
+
+  const handleSplit = useCallback(() => {
+    if (onSplit && checkedKeys.size > 0) onSplit(checkedKeys);
+  }, [onSplit, checkedKeys]);
+
+  const handleCreateCustomSet = useCallback(() => {
+    if (onCreateCustomSet && checkedKeys.size > 0) onCreateCustomSet(checkedKeys);
+  }, [onCreateCustomSet, checkedKeys]);
+
+  // Toggle the px ↔ arcsec display unit, converting the current FWHM threshold
+  // by the plate scale so the threshold's physical meaning stays the same.
+  //
+  // IMPORTANT: do NOT call `setThresholds` from inside `setUseArcsec`'s updater.
+  // React StrictMode invokes state updaters twice in development to detect
+  // impure code; if `setThresholds` is queued from inside that updater, it ends
+  // up queued twice and the second run sees the *already-converted* value,
+  // dividing by plate scale a second time. (E.g. 5.85 → 3.38 → 1.95 for a
+  // plate scale of 1.7312 arcsec/px.) Calling `setThresholds` with a single
+  // pure updater outside avoids that — its updater can run twice with the
+  // same `t.fwhm` and still produce the same converted value.
+  const toggleUnits = useCallback(() => {
+    const next = !useArcsec;
+    setUseArcsec(next);
+    if (plateScale) {
+      setThresholds(t => {
+        const val = parseFloat(t.fwhm);
+        if (isNaN(val)) return t;
+        const converted = next ? val * plateScale : val / plateScale;
+        return { ...t, fwhm: converted.toFixed(2) };
+      });
+    }
+  }, [useArcsec, plateScale]);
+
+  // Auto-fill FWHM rejection from the analysis data when it first loads for this
+  // frame set. Overrides any pre-filled saved default for FWHM (FWHM depends on
+  // plate scale + atmospheric conditions, so a single saved value rarely applies
+  // cleanly). Other fields keep saved-default precedence (handled in the
+  // load-defaults effect). Per-frameSetId ref prevents re-firing after manual
+  // edits.
+  //
+  // Gating: wait until (a) the saved-defaults load has finished, and (b) if the
+  // user prefers arcsec AND the frame set has a plate scale, `useArcsec` has
+  // actually flipped to true. Together these guarantee the conversion in
+  // `pxToDisplayString` writes the value in the user's intended unit on the
+  // very first auto-fill — so the initial-load value matches the value Reset
+  // would produce.
+  const fwhmAutoFilledForRef = useRef<number | null>(null);
   useEffect(() => {
-    if (analysisData.size === 0) return;
-    setThresholds(prev => {
-      if (prev.fwhm !== '') return prev;
-      return { ...prev, fwhm: computeAutoFwhm() };
-    });
-  }, [analysisData, computeAutoFwhm]);
+    if (!defaultsLoaded) return;
+    if (autoFwhmPx == null) return;
+    if (defaultFwhmUnit === 'arcsec' && plateScale && !useArcsec) return;
+    if (fwhmAutoFilledForRef.current === frameSetId) return;
+    fwhmAutoFilledForRef.current = frameSetId;
+    setThresholds(prev => ({ ...prev, fwhm: pxToDisplayString(autoFwhmPx) }));
+  }, [defaultsLoaded, autoFwhmPx, pxToDisplayString, frameSetId, defaultFwhmUnit, plateScale, useArcsec]);
 
   // Count of frames in checked filter groups (for the action bar)
   const checkedFrameCount = useMemo(() => {
@@ -627,15 +728,31 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               <span className="text-[10px] text-content-muted leading-tight">CSV</span>
             </div>
             <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-              <button
-                onClick={() => setChartsOpen(true)}
-                disabled={analysisData.size === 0}
-                className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-lg border border-border transition-colors disabled:opacity-30 disabled:cursor-default"
-                title="Charts"
-              >
-                <LineChart size={12} />
-              </button>
-              <span className="text-[10px] text-content-muted leading-tight">Charts</span>
+              <div className="flex h-7">
+                <button
+                  onClick={() => setFrameViewMode('table')}
+                  className={`w-10 h-7 inline-flex items-center justify-center text-xs font-medium rounded-l-lg border border-r-0 transition-colors ${
+                    frameViewMode === 'table'
+                      ? 'bg-accent/20 text-accent border-accent/40'
+                      : 'bg-surface-hover hover:bg-surface-elevated text-content-secondary border-border'
+                  }`}
+                  title="Table view"
+                >
+                  <TableIcon size={12} />
+                </button>
+                <button
+                  onClick={() => setFrameViewMode('chart')}
+                  className={`w-10 h-7 inline-flex items-center justify-center text-xs font-medium rounded-r-lg border transition-colors ${
+                    frameViewMode === 'chart'
+                      ? 'bg-accent/20 text-accent border-accent/40'
+                      : 'bg-surface-hover hover:bg-surface-elevated text-content-secondary border-border'
+                  }`}
+                  title="Chart view"
+                >
+                  <LineChart size={12} />
+                </button>
+              </div>
+              <span className="text-[10px] text-content-muted leading-tight">View</span>
             </div>
           </div>
 
@@ -646,29 +763,38 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
             </div>
           )}
 
-          <div className="flex-1 min-h-0 overflow-y-auto border border-border rounded-xl">
-            <LightsAnalysisTable
-              frames={displayedFrames}
-              selectedFrameIds={selectedFrameIds}
-              onSelectionChange={setSelectedFrameIds}
-              analysisData={analysisData}
-              rejectedFrameIds={rejectedFrameIds}
-              plateScale={useArcsec ? plateScale : null}
-              hideLocateColumn={hideLocateColumn}
-            />
+          <div className="flex-1 min-h-0 overflow-hidden">
+            {frameViewMode === 'table' ? (
+              <div className="h-full overflow-y-auto border border-border rounded-xl">
+                <LightsAnalysisTable
+                  frames={displayedFrames}
+                  selectedFrameIds={selectedFrameIds}
+                  onSelectionChange={setSelectedFrameIds}
+                  analysisData={analysisData}
+                  rejectedFrameIds={rejectedFrameIds}
+                  plateScale={useArcsec ? plateScale : null}
+                  hideLocateColumn={hideLocateColumn}
+                />
+              </div>
+            ) : (
+              <LightsAnalysisChartView
+                displayedFrames={displayedFrames}
+                analysisData={analysisData}
+                selectedFrameIds={selectedFrameIds}
+                onSelectionChange={setSelectedFrameIds}
+                rejectedFrameIds={rejectedFrameIds}
+                plateScale={plateScale}
+                useArcsec={useArcsec}
+                thresholds={thresholds}
+                onAnalyze={() => handleAnalyzeAll(false)}
+                analyzing={analyzing}
+              />
+            )}
           </div>
 
           <BlackholedFramesSection frames={blackholedFrames} analysisData={analysisData} onBlink={onBlink} />
         </div>
       </div>
-
-      <AnalysisChartsModal
-        isOpen={chartsOpen}
-        onClose={() => setChartsOpen(false)}
-        displayedFrames={displayedFrames}
-        analysisData={analysisData}
-        frameSetName={frameSetName}
-      />
     </div>
   );
 }

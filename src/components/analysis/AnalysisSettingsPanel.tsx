@@ -4,6 +4,10 @@ import { api } from '../../api';
 import type { AnalysisConfig } from '../../types/analysis-config';
 import { THRESHOLD_FIELDS, EMPTY_THRESHOLDS, type RejectionThresholds } from '../calibration/RejectionThresholdBar';
 
+export type FwhmUnit = 'px' | 'arcsec';
+
+export const FWHM_UNIT_SETTING_KEY = 'analysis.fwhm_default_unit';
+
 export function AnalysisSettingsPanel() {
   const [config, setConfig] = useState<AnalysisConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -11,6 +15,7 @@ export function AnalysisSettingsPanel() {
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rejectionDefaults, setRejectionDefaults] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
+  const [fwhmUnit, setFwhmUnit] = useState<FwhmUnit>('px');
 
   useEffect(() => {
     loadConfig();
@@ -21,14 +26,30 @@ export function AnalysisSettingsPanel() {
       setLoading(true);
       const result = await api.invoke<AnalysisConfig>('get_analysis_config');
       setConfig(result);
-      // Load rejection defaults
+      // Load standalone unit-preference setting (controls which unit Analysis opens in).
+      const unit = await api.invoke<string>('get_setting', {
+        key: FWHM_UNIT_SETTING_KEY,
+        defaultValue: 'px',
+      });
+      const prefersArcsec = unit === 'arcsec';
+      // Load rejection defaults. Prefer the inline `fwhm_unit` from the saved
+      // JSON; fall back to the standalone setting for legacy saves with no
+      // inline unit.
       const json = await api.invoke<string>('get_setting', {
         key: 'analysis.rejection_defaults',
         defaultValue: '',
       });
+      let resolvedUnit: FwhmUnit = prefersArcsec ? 'arcsec' : 'px';
       if (json) {
-        setRejectionDefaults({ ...EMPTY_THRESHOLDS, ...JSON.parse(json) });
+        const saved = JSON.parse(json) as Partial<RejectionThresholds>;
+        const merged: RejectionThresholds = { ...EMPTY_THRESHOLDS, ...saved };
+        if (saved.fwhm_unit === 'arcsec' || saved.fwhm_unit === 'px') {
+          resolvedUnit = saved.fwhm_unit;
+        }
+        merged.fwhm_unit = merged.fwhm ? resolvedUnit : undefined;
+        setRejectionDefaults(merged);
       }
+      setFwhmUnit(resolvedUnit);
     } catch (err) {
       setError(String(err));
       console.error('Failed to load analysis config:', err);
@@ -43,20 +64,36 @@ export function AnalysisSettingsPanel() {
       setSaving(true);
       setError(null);
       await api.invoke('set_analysis_config', { config });
-      // Save rejection defaults
-      const hasAny = Object.values(rejectionDefaults).some(v => v !== '');
+      // Save rejection defaults. The numeric/string fields are persisted only
+      // when non-empty; `fwhm_unit` is paired with `fwhm` so the saved value
+      // can never be reinterpreted in the wrong unit later.
+      const numericKeys: (keyof RejectionThresholds)[] = ['fwhm', 'eccentricity', 'frame_snr', 'snr_weight', 'trail'];
+      const hasAny = numericKeys.some(k => {
+        const v = rejectionDefaults[k];
+        return typeof v === 'string' && v !== '';
+      });
       if (hasAny) {
-        // Only persist non-empty values
         const toSave: Partial<RejectionThresholds> = {};
-        for (const [k, v] of Object.entries(rejectionDefaults)) {
-          if (v !== '') toSave[k as keyof RejectionThresholds] = v;
+        for (const k of numericKeys) {
+          const v = rejectionDefaults[k];
+          if (typeof v === 'string' && v !== '') {
+            (toSave as Record<string, string>)[k] = v;
+          }
         }
+        if (toSave.fwhm) toSave.fwhm_unit = fwhmUnit;
         await api.invoke('set_setting', {
           key: 'analysis.rejection_defaults',
           value: JSON.stringify(toSave),
         });
       } else {
         await api.invoke('delete_setting', { key: 'analysis.rejection_defaults' });
+      }
+      // Save the standalone FWHM unit preference (controls which unit the
+      // Analysis tab opens in, independent of any saved default value).
+      if (fwhmUnit === 'arcsec') {
+        await api.invoke('set_setting', { key: FWHM_UNIT_SETTING_KEY, value: 'arcsec' });
+      } else {
+        await api.invoke('delete_setting', { key: FWHM_UNIT_SETTING_KEY });
       }
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
@@ -66,7 +103,7 @@ export function AnalysisSettingsPanel() {
     } finally {
       setSaving(false);
     }
-  }, [config, rejectionDefaults]);
+  }, [config, rejectionDefaults, fwhmUnit]);
 
   const handleReset = useCallback(async () => {
     try {
@@ -74,7 +111,9 @@ export function AnalysisSettingsPanel() {
       const result = await api.invoke<AnalysisConfig>('reset_analysis_config');
       setConfig(result);
       setRejectionDefaults(EMPTY_THRESHOLDS);
+      setFwhmUnit('px');
       await api.invoke('delete_setting', { key: 'analysis.rejection_defaults' });
+      await api.invoke('delete_setting', { key: FWHM_UNIT_SETTING_KEY });
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch (err) {
@@ -288,24 +327,64 @@ export function AnalysisSettingsPanel() {
         <p className="text-xs text-content-muted mb-3">
           Pre-fill the threshold bar on the Analysis tab. Leave a field empty to not set a default for it.
         </p>
-        <div className="grid grid-cols-3 gap-3">
-          {THRESHOLD_FIELDS.map(field => (
-            <div key={field.key}>
-              <label className="block text-xs text-content-secondary mb-1">{field.label}</label>
-              <input
-                type="number"
-                step={field.step}
-                min={field.min}
-                max={field.max}
-                value={rejectionDefaults[field.key]}
-                onChange={e => setRejectionDefaults(prev => ({ ...prev, [field.key]: e.target.value }))}
-                placeholder={field.placeholder}
-                className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
-              />
-            </div>
-          ))}
+
+        {/* FWHM unit toggle */}
+        <div className="flex items-center gap-3 mb-3">
+          <span className="text-xs text-content-secondary">FWHM unit:</span>
+          <div className="flex rounded-lg border border-border overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setFwhmUnit('px')}
+              className={`px-3 py-1 text-xs font-medium transition-colors ${
+                fwhmUnit === 'px'
+                  ? 'bg-accent/20 text-accent'
+                  : 'bg-surface-hover text-content-muted hover:text-content-secondary'
+              }`}
+            >
+              Pixels
+            </button>
+            <button
+              type="button"
+              onClick={() => setFwhmUnit('arcsec')}
+              className={`px-3 py-1 text-xs font-medium border-l border-border transition-colors ${
+                fwhmUnit === 'arcsec'
+                  ? 'bg-accent/20 text-accent'
+                  : 'bg-surface-hover text-content-muted hover:text-content-secondary'
+              }`}
+            >
+              Arcseconds
+            </button>
+          </div>
+          <span className="text-[11px] text-content-muted">
+            {fwhmUnit === 'arcsec'
+              ? 'Stored value is in arcsec; the Analysis tab opens in arcsec mode when a plate scale is available.'
+              : 'Stored value is in pixels (raw FWHM).'}
+          </span>
         </div>
-        {Object.values(rejectionDefaults).some(v => v !== '') && (
+
+        <div className="grid grid-cols-3 gap-3">
+          {THRESHOLD_FIELDS.map(rawField => {
+            const field = (rawField.key === 'fwhm' && fwhmUnit === 'arcsec')
+              ? { ...rawField, label: 'FWHM (") >', placeholder: '"' }
+              : rawField;
+            return (
+              <div key={field.key}>
+                <label className="block text-xs text-content-secondary mb-1">{field.label}</label>
+                <input
+                  type="number"
+                  step={field.step}
+                  min={field.min}
+                  max={field.max}
+                  value={rejectionDefaults[field.key]}
+                  onChange={e => setRejectionDefaults(prev => ({ ...prev, [field.key]: e.target.value }))}
+                  placeholder={field.placeholder}
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+            );
+          })}
+        </div>
+        {(['fwhm', 'eccentricity', 'frame_snr', 'snr_weight', 'trail'] as const).some(k => rejectionDefaults[k] !== '') && (
           <button
             type="button"
             onClick={() => setRejectionDefaults(EMPTY_THRESHOLDS)}

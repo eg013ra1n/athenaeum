@@ -6,10 +6,15 @@ export interface RejectionThresholds {
   frame_snr: string;
   snr_weight: string;
   trail: string;
+  /** Unit the saved `fwhm` value was entered in. Metadata only — never rendered. */
+  fwhm_unit?: 'px' | 'arcsec';
 }
 
+/** The user-editable numeric/string form fields (excludes the `fwhm_unit` metadata field). */
+export type ThresholdFieldKey = 'fwhm' | 'eccentricity' | 'frame_snr' | 'snr_weight' | 'trail';
+
 export interface ThresholdFieldDef {
-  key: keyof RejectionThresholds;
+  key: ThresholdFieldKey;
   label: string;
   placeholder: string;
   step: number;
@@ -71,7 +76,7 @@ export function RejectionThresholdBar({
   rejectActive = true,
   onToggleReject,
 }: RejectionThresholdBarProps) {
-  const handleChange = (field: keyof RejectionThresholds, value: string) => {
+  const handleChange = (field: ThresholdFieldKey, value: string) => {
     onChange({ ...thresholds, [field]: value });
   };
 
