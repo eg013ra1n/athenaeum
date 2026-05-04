@@ -6,6 +6,7 @@
 use crate::events::SseProgressEmitter;
 use crate::WebAppState;
 use athenaeum_core::archive::{db as adb, executor, planner, resume, restore, rollback, models::*};
+use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
 use athenaeum_core::services::ArchiveHandle;
 use athenaeum_core::settings::keys;
 use axum::{extract::State, http::StatusCode, Json};
@@ -269,42 +270,46 @@ pub async fn start_archive_operation(
 
     let event_tx = state.event_tx.clone();
     let ctx_for_worker = ctx.clone();
-    tokio::task::spawn_blocking(move || {
-        let emitter = SseProgressEmitter::new(event_tx);
-        let db = ctx_for_worker.db.get().expect("db");
-        let conn = db.conn();
-        match executor::run_operation(&conn, op_id, &cancel_flag, &emitter) {
-            Ok(()) => {
-                eprintln!("archive operation {} completed", op_id);
-            }
-            Err(e) => {
-                if executor::was_cancelled(&e) {
-                    let _ = adb::update_operation_status(
-                        &conn,
-                        op_id,
-                        ArchiveStatus::Cancelled,
-                        None,
-                    );
-                } else {
-                    eprintln!("archive operation {} failed: {:#}", op_id, e);
-                    let msg = format!("{:#}", e);
-                    let _ = adb::update_operation_status(
-                        &conn,
-                        op_id,
-                        ArchiveStatus::Failed,
-                        Some(&msg),
-                    );
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let emitter = SseProgressEmitter::new(event_tx);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            match executor::run_operation(&conn, op_id, &cancel_flag, &emitter) {
+                Ok(()) => {
+                    eprintln!("archive operation {} completed", op_id);
                 }
-                if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
-                    eprintln!("rollback for {} failed: {:#}", op_id, rb_err);
+                Err(e) => {
+                    if executor::was_cancelled(&e) {
+                        let _ = adb::update_operation_status(
+                            &conn,
+                            op_id,
+                            ArchiveStatus::Cancelled,
+                            None,
+                        );
+                    } else {
+                        eprintln!("archive operation {} failed: {:#}", op_id, e);
+                        let msg = format!("{:#}", e);
+                        let _ = adb::update_operation_status(
+                            &conn,
+                            op_id,
+                            ArchiveStatus::Failed,
+                            Some(&msg),
+                        );
+                    }
+                    if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
+                        eprintln!("rollback for {} failed: {:#}", op_id, rb_err);
+                    }
                 }
             }
-        }
-        ctx_for_worker
-            .active_archives
-            .lock()
-            .unwrap()
-            .remove(&op_id);
+            ctx_for_worker
+                .active_archives
+                .lock()
+                .unwrap()
+                .remove(&op_id);
+        }),
     });
 
     Ok(Json(op_id))
@@ -397,15 +402,6 @@ pub async fn resume_archive_operation(
     State(state): State<WebAppState>,
     Json(req): Json<OperationIdRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    {
-        let map = state.ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err((
-                StatusCode::CONFLICT,
-                "another archive operation already running".into(),
-            ));
-        }
-    }
     let ctx = state.ctx.clone();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     ctx.active_archives.lock().unwrap().insert(
@@ -417,17 +413,22 @@ pub async fn resume_archive_operation(
     );
     let event_tx = state.event_tx.clone();
     let op_id = req.operation_id;
-    tokio::task::spawn_blocking(move || {
-        let emitter = SseProgressEmitter::new(event_tx);
-        let db = ctx.db.get().expect("db");
-        let conn = db.conn();
-        if let Err(e) = resume::resume_operation(&conn, op_id, &cancel_flag, &emitter) {
-            eprintln!("resume {} failed: {:#}", op_id, e);
-            let msg = format!("{:#}", e);
-            let _ = adb::update_operation_status(&conn, op_id, ArchiveStatus::Failed, Some(&msg));
-            let _ = rollback::rollback_operation(&conn, op_id, &emitter);
-        }
-        ctx.active_archives.lock().unwrap().remove(&op_id);
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let emitter = SseProgressEmitter::new(event_tx);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            if let Err(e) = resume::resume_operation(&conn, op_id, &cancel_flag, &emitter) {
+                eprintln!("resume {} failed: {:#}", op_id, e);
+                let msg = format!("{:#}", e);
+                let _ = adb::update_operation_status(&conn, op_id, ArchiveStatus::Failed, Some(&msg));
+                let _ = rollback::rollback_operation(&conn, op_id, &emitter);
+            }
+            ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
+        }),
     });
     Ok(StatusCode::OK)
 }
@@ -439,13 +440,18 @@ pub async fn rollback_archive_operation(
     let ctx = state.ctx.clone();
     let event_tx = state.event_tx.clone();
     let op_id = req.operation_id;
-    tokio::task::spawn_blocking(move || {
-        let emitter = SseProgressEmitter::new(event_tx);
-        let db = ctx.db.get().expect("db");
-        let conn = db.conn();
-        if let Err(e) = rollback::rollback_operation(&conn, op_id, &emitter) {
-            eprintln!("rollback {} failed: {:#}", op_id, e);
-        }
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let emitter = SseProgressEmitter::new(event_tx);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            if let Err(e) = rollback::rollback_operation(&conn, op_id, &emitter) {
+                eprintln!("rollback {} failed: {:#}", op_id, e);
+            }
+        }),
     });
     Ok(StatusCode::OK)
 }
@@ -577,31 +583,36 @@ pub async fn start_restore_operation(
     let target_root_path = req.target_root_path.clone();
     let overwrite_existing = req.overwrite_existing;
     let keep_zip_after_restore = req.keep_zip_after_restore;
-    tokio::task::spawn_blocking(move || {
-        let emitter = SseProgressEmitter::new(event_tx);
-        let db = ctx.db.get().expect("db");
-        let conn = db.conn();
-        let outcome = match restore::run_restore(
-            &conn,
-            op_id,
-            Path::new(&target_root_path),
-            overwrite_existing,
-            keep_zip_after_restore,
-            &cancel_flag,
-            &emitter,
-        ) {
-            Ok(()) => "completed",
-            Err(e) => {
-                eprintln!("restore {} failed: {:#}", op_id, e);
-                if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
-            }
-        };
-        athenaeum_core::events::emit_event(
-            &emitter,
-            "archive-finished",
-            &serde_json::json!({ "operation_id": op_id, "outcome": outcome, "kind": "restore" }),
-        );
-        ctx.active_archives.lock().unwrap().remove(&op_id);
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let emitter = SseProgressEmitter::new(event_tx);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            let outcome = match restore::run_restore(
+                &conn,
+                op_id,
+                Path::new(&target_root_path),
+                overwrite_existing,
+                keep_zip_after_restore,
+                &cancel_flag,
+                &emitter,
+            ) {
+                Ok(()) => "completed",
+                Err(e) => {
+                    eprintln!("restore {} failed: {:#}", op_id, e);
+                    if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
+                }
+            };
+            athenaeum_core::events::emit_event(
+                &emitter,
+                "archive-finished",
+                &serde_json::json!({ "operation_id": op_id, "outcome": outcome, "kind": "restore" }),
+            );
+            ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
+        }),
     });
     Ok(StatusCode::OK)
 }

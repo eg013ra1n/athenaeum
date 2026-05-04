@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info } from 'lucide-react';
+import { revealItemInDir } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
@@ -38,6 +39,10 @@ export default function Settings() {
   const [archiveCompression, setArchiveCompressionState] = useState<ArchiveCompression>('store');
   const [archiveSaving, setArchiveSaving] = useState(false);
 
+  // Data file locations (desktop only — db + log paths reported by the backend).
+  const [dbPath, setDbPath] = useState<string>('');
+  const [logPath, setLogPath] = useState<string>('');
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -62,6 +67,10 @@ export default function Settings() {
         setArchiveCompressionState(s.compression);
       })
       .catch(console.error);
+    if (isTauri) {
+      api.invoke<string>('get_database_path').then(setDbPath).catch(console.error);
+      api.invoke<string>('get_log_path').then(setLogPath).catch(console.error);
+    }
   }, []);
 
   const handleArchiveCompressionChange = async (next: ArchiveCompression) => {
@@ -1072,6 +1081,48 @@ export default function Settings() {
           </p>
         </div>
       </div>
+
+      {/* Data file locations (desktop only) */}
+      {isTauri && (
+        <div className="mt-6 bg-surface-elevated rounded-lg p-6">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <Info size={20} />
+            Data file locations
+          </h3>
+          <p className="text-sm text-content-muted mb-4">
+            Where Athenaeum stores its catalog database and log file on disk. Click the
+            folder icon to reveal each in your file manager.
+          </p>
+          <div className="bg-surface-secondary rounded p-4 text-sm font-mono space-y-3">
+            <div className="flex items-center gap-3">
+              <span className="text-content-muted min-w-[80px]">Database:</span>
+              <span className="text-content truncate flex-1">{dbPath || '—'}</span>
+              {dbPath && (
+                <button
+                  onClick={() => revealItemInDir(dbPath)}
+                  className="text-content-muted hover:text-content transition flex-shrink-0"
+                  title="Reveal in file manager"
+                >
+                  <FolderOpen size={16} />
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="text-content-muted min-w-[80px]">Log file:</span>
+              <span className="text-content truncate flex-1">{logPath || '—'}</span>
+              {logPath && (
+                <button
+                  onClick={() => revealItemInDir(logPath)}
+                  className="text-content-muted hover:text-content transition flex-shrink-0"
+                  title="Reveal in file manager"
+                >
+                  <FolderOpen size={16} />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Database Maintenance Section */}
       <div className="mt-6 bg-surface-elevated rounded-lg p-6">

@@ -1,11 +1,17 @@
 // File route handlers — mirrors athenaeum-tauri/src/commands/files.rs
 
 use athenaeum_core::db;
+use athenaeum_core::file_op::{db as fdb, executor as fexec, models::FileOpStatus, planner as fplan};
 use athenaeum_core::models::{FileWithFrame, FrameMetadataEdits, MissingMetadataRow};
+use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
+use athenaeum_core::services::ArchiveHandle;
 use axum::{extract::State, http::StatusCode, Json};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
+use crate::events::SseProgressEmitter;
 use crate::WebAppState;
 
 // ── Response DTO ─────────────────────────────────────────────────────────────
@@ -120,14 +126,17 @@ pub async fn get_directory_contents(
 ) -> Result<Json<DirectoryContents>, (StatusCode, String)> {
     let path = Path::new(&args.path);
 
-    if !path.exists() {
-        return Err((StatusCode::NOT_FOUND, "Directory does not exist".to_string()));
-    }
-
-    // Collect subdirectories from the filesystem
+    // Use read_dir directly so we get a real ErrorKind. exists() returns
+    // false on permission flicker / transient FS state too, which would
+    // wrongly mislabel an existing directory as missing.
     let mut subdirectories = Vec::new();
-    let entries =
-        fs::read_dir(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err((StatusCode::NOT_FOUND, "Directory does not exist".to_string()));
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
 
     for entry in entries {
         let entry = entry.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -188,14 +197,14 @@ pub async fn get_camera_directory_contents(
 ) -> Result<Json<DirectoryContents>, (StatusCode, String)> {
     let path = Path::new(&args.directory_path);
 
-    if !path.exists() {
-        return Err((StatusCode::NOT_FOUND, "Directory does not exist".to_string()));
-    }
-
-    // Filter subdirectories to those relevant for this camera
     let mut subdirectories = Vec::new();
-    let entries =
-        fs::read_dir(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err((StatusCode::NOT_FOUND, "Directory does not exist".to_string()));
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
 
     for entry in entries {
         let entry = entry.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -265,6 +274,60 @@ pub struct BulkUpdateFrameMetadataArgs {
     #[serde(rename = "frameIds")]
     pub frame_ids: Vec<i64>,
     pub edits: FrameMetadataEdits,
+}
+
+#[derive(serde::Deserialize)]
+pub struct CountFrameMetadataRelationsArgs {
+    #[serde(rename = "frameIds")]
+    pub frame_ids: Vec<i64>,
+}
+
+/// POST /api/get_frame_metadata_originals
+///
+/// Re-decode the originally-scanned header values for given frames so the
+/// UI can compare against current edits and revert per field.
+pub async fn get_frame_metadata_originals(
+    State(state): State<WebAppState>,
+    Json(args): Json<CountFrameMetadataRelationsArgs>,
+) -> Result<Json<Vec<athenaeum_core::fits_parser::stored_header::FrameOriginalSnapshot>>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+    let snaps = athenaeum_core::db::get_frame_metadata_originals(&conn, &args.frame_ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(snaps))
+}
+
+/// POST /api/get_frame_memberships
+///
+/// Aggregate which framesets / calibration sets the given frames belong to.
+pub async fn get_frame_memberships(
+    State(state): State<WebAppState>,
+    Json(args): Json<CountFrameMetadataRelationsArgs>,
+) -> Result<Json<athenaeum_core::db::FrameMembershipsSummary>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+    let summary = athenaeum_core::db::get_frame_memberships_summary(&conn, &args.frame_ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(summary))
+}
+
+/// POST /api/count_frame_metadata_relations
+///
+/// Counts the calibration-set / session relations for the given frames so
+/// the metadata editor can warn the user before applying edits that will
+/// unlink them.
+pub async fn count_frame_metadata_relations(
+    State(state): State<WebAppState>,
+    Json(args): Json<CountFrameMetadataRelationsArgs>,
+) -> Result<Json<athenaeum_core::db::FrameMetadataRelations>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+    let rel = athenaeum_core::db::count_frame_metadata_relations(&conn, &args.frame_ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(rel))
 }
 
 /// POST /api/bulk_update_frame_metadata
@@ -459,4 +522,399 @@ pub async fn browse_directories(
         parent,
         directories,
     }))
+}
+
+// ============================================================================
+// Dual-pane file browser routes (Phase 1: Move + catalog search)
+// ============================================================================
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSearchHit {
+    pub file_id: i64,
+    pub path: String,
+    pub filename: String,
+    pub object: Option<String>,
+    pub filter: Option<String>,
+    pub imagetyp: Option<String>,
+    pub instrume: Option<String>,
+    pub telescop: Option<String>,
+    pub date_obs: Option<String>,
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOperationSummary {
+    pub id: i64,
+    pub kind: String,
+    pub status: String,
+    pub source_root: Option<String>,
+    pub dest_dir: Option<String>,
+    pub total_files: i64,
+    pub total_bytes: i64,
+    pub created_at: String,
+    pub started_at: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct EnqueueMoveArgs {
+    pub sources: Vec<String>,
+    #[serde(rename = "destDir")]
+    pub dest_dir: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct EnqueueDeleteArgs {
+    pub targets: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct OperationIdArgs {
+    #[serde(rename = "operationId")]
+    pub operation_id: i64,
+}
+
+#[derive(serde::Deserialize)]
+pub struct SearchCatalogArgs {
+    pub query: String,
+    pub limit: Option<u32>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct MkdirArgs {
+    pub path: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct RenamePathArgs {
+    #[serde(rename = "oldPath")]
+    pub old_path: String,
+    #[serde(rename = "newName")]
+    pub new_name: String,
+}
+
+fn path_inside_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    allowed.iter().any(|root| {
+        let rc = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        canonical.starts_with(&rc)
+    })
+}
+
+/// POST /api/enqueue_move_operation
+pub async fn enqueue_move_operation(
+    State(state): State<WebAppState>,
+    Json(args): Json<EnqueueMoveArgs>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    // Path validation against ATHENAEUM_ALLOWED_PATHS.
+    let allowed = &state.allowed_paths;
+    if !allowed.is_empty() {
+        let dest = PathBuf::from(&args.dest_dir);
+        if !path_inside_allowed(&dest, allowed) {
+            return Err((StatusCode::FORBIDDEN, format!("dest '{}' not allowed", args.dest_dir)));
+        }
+        for s in &args.sources {
+            let sp = PathBuf::from(s);
+            if !path_inside_allowed(&sp, allowed) {
+                return Err((StatusCode::FORBIDDEN, format!("source '{}' not allowed", s)));
+            }
+        }
+    }
+
+    let ctx = state.ctx.clone();
+    let db = ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+
+    let source_paths: Vec<PathBuf> = args.sources.iter().map(PathBuf::from).collect();
+    let plan = fplan::build_move_plan(&conn, source_paths, PathBuf::from(&args.dest_dir))
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{:#}", e)))?;
+    let op_id = plan.operation_id;
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut map = ctx.active_archives.lock().unwrap();
+        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
+    }
+
+    let event_tx = state.event_tx.clone();
+    let ctx_for_worker = ctx.clone();
+    let cancel_for_worker = cancel_flag.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::FileOpMove,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let emitter = SseProgressEmitter::new(event_tx);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    if fexec::was_cancelled(&e) {
+                        let _ = fdb::update_operation_status(
+                            &conn, op_id, FileOpStatus::Cancelled, None,
+                        );
+                    } else {
+                        eprintln!("file_op {} failed: {:#}", op_id, e);
+                        let msg = format!("{:#}", e);
+                        let _ = fdb::update_operation_status(
+                            &conn, op_id, FileOpStatus::Failed, Some(&msg),
+                        );
+                    }
+                }
+            }
+        }),
+    });
+
+    Ok(Json(op_id))
+}
+
+pub async fn enqueue_delete_operation(
+    State(state): State<WebAppState>,
+    Json(args): Json<EnqueueDeleteArgs>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    let allowed = &state.allowed_paths;
+    if !allowed.is_empty() {
+        for t in &args.targets {
+            let tp = PathBuf::from(t);
+            if !path_inside_allowed(&tp, allowed) {
+                return Err((StatusCode::FORBIDDEN, format!("target '{}' not allowed", t)));
+            }
+        }
+    }
+
+    let ctx = state.ctx.clone();
+    let db = ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+
+    let target_paths: Vec<PathBuf> = args.targets.iter().map(PathBuf::from).collect();
+    let plan = fplan::build_delete_plan(&conn, target_paths)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{:#}", e)))?;
+    let op_id = plan.operation_id;
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut map = ctx.active_archives.lock().unwrap();
+        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
+    }
+
+    let event_tx = state.event_tx.clone();
+    let ctx_for_worker = ctx.clone();
+    let cancel_for_worker = cancel_flag.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::FileOpDelete,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let emitter = SseProgressEmitter::new(event_tx);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    if fexec::was_cancelled(&e) {
+                        let _ = fdb::update_operation_status(
+                            &conn, op_id, FileOpStatus::Cancelled, None,
+                        );
+                    } else {
+                        eprintln!("file_op {} failed: {:#}", op_id, e);
+                        let msg = format!("{:#}", e);
+                        let _ = fdb::update_operation_status(
+                            &conn, op_id, FileOpStatus::Failed, Some(&msg),
+                        );
+                    }
+                }
+            }
+        }),
+    });
+
+    Ok(Json(op_id))
+}
+
+pub async fn cancel_file_operation(
+    State(state): State<WebAppState>,
+    Json(args): Json<OperationIdArgs>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let map = state.ctx.active_archives.lock().unwrap();
+    if let Some(handle) = map.get(&args.operation_id) {
+        handle.cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(StatusCode::OK)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("no active file operation with id {}", args.operation_id),
+        ))
+    }
+}
+
+pub async fn list_unfinished_file_operations(
+    State(state): State<WebAppState>,
+) -> Result<Json<Vec<FileOperationSummary>>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+    let ops = fdb::list_unfinished_operations(&conn)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(
+        ops.into_iter()
+            .map(|o| FileOperationSummary {
+                id: o.id,
+                kind: o.kind,
+                status: o.status,
+                source_root: o.source_root,
+                dest_dir: o.dest_dir,
+                total_files: o.total_files,
+                total_bytes: o.total_bytes,
+                created_at: o.created_at,
+                started_at: o.started_at,
+            })
+            .collect(),
+    ))
+}
+
+pub async fn search_catalog(
+    State(state): State<WebAppState>,
+    Json(args): Json<SearchCatalogArgs>,
+) -> Result<Json<Vec<CatalogSearchHit>>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+
+    let trimmed = args.query.trim();
+    if trimmed.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let limit = args.limit.unwrap_or(200).min(500) as i64;
+    let pattern = format!("%{}%", trimmed.to_lowercase());
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.id, f.path, f.filename,
+                    fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
+             FROM files f
+             LEFT JOIN frames fr ON fr.file_id = f.id
+             WHERE LOWER(f.filename) LIKE ?1
+                OR LOWER(f.path) LIKE ?1
+                OR LOWER(IFNULL(fr.object,''))    LIKE ?1
+                OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
+                OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
+                OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
+                OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1
+             ORDER BY fr.date_obs DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![pattern, limit], |row| {
+            Ok(CatalogSearchHit {
+                file_id: row.get(0)?,
+                path: row.get(1)?,
+                filename: row.get(2)?,
+                object: row.get(3)?,
+                filter: row.get(4)?,
+                imagetyp: row.get(5)?,
+                instrume: row.get(6)?,
+                telescop: row.get(7)?,
+                date_obs: row.get(8)?,
+            })
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(rows))
+}
+
+pub async fn mkdir_in_scan_root(
+    State(state): State<WebAppState>,
+    Json(args): Json<MkdirArgs>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let allowed = &state.allowed_paths;
+    let target = PathBuf::from(&args.path);
+    if !allowed.is_empty() && !path_inside_allowed(&target, allowed) {
+        return Err((StatusCode::FORBIDDEN, format!("'{}' not allowed", args.path)));
+    }
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+    let scan_roots = athenaeum_core::db::get_scan_roots(&conn)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let inside_root = scan_roots.iter().filter(|r| r.enabled).any(|r| {
+        let root = PathBuf::from(&r.path);
+        let rc = fs::canonicalize(&root).unwrap_or(root);
+        let tc = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        tc.starts_with(&rc)
+    });
+    if !inside_root {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is not inside any scan root", args.path),
+        ));
+    }
+    fs::create_dir_all(&target).map_err(|e| {
+        eprintln!("mkdir {} failed: {}", args.path, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    Ok(StatusCode::OK)
+}
+
+pub async fn rename_path(
+    State(state): State<WebAppState>,
+    Json(args): Json<RenamePathArgs>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if args.new_name.contains('/') || args.new_name.contains('\\') || args.new_name.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "new name must be a single path component".into(),
+        ));
+    }
+    let allowed = &state.allowed_paths;
+    let old = PathBuf::from(&args.old_path);
+    if !allowed.is_empty() && !path_inside_allowed(&old, allowed) {
+        return Err((StatusCode::FORBIDDEN, format!("'{}' not allowed", args.old_path)));
+    }
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
+    let conn = db.conn();
+
+    let parent = old
+        .parent()
+        .ok_or((StatusCode::BAD_REQUEST, "source has no parent dir".into()))?
+        .to_path_buf();
+    let new = parent.join(&args.new_name);
+    if new.exists() {
+        return Err((StatusCode::CONFLICT, format!("target already exists: {}", new.display())));
+    }
+    let scan_roots = athenaeum_core::db::get_scan_roots(&conn)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let inside_root = scan_roots.iter().filter(|r| r.enabled).any(|r| {
+        let root = PathBuf::from(&r.path);
+        let rc = fs::canonicalize(&root).unwrap_or(root);
+        let oc = fs::canonicalize(&old).unwrap_or_else(|_| old.clone());
+        oc.starts_with(&rc)
+    });
+    if !inside_root {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{}' is not inside any scan root", args.old_path),
+        ));
+    }
+    let is_dir = old.is_dir();
+    fs::rename(&old, &new).map_err(|e| {
+        eprintln!("rename {} → {} failed: {}", old.display(), new.display(), e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+    let old_str = old.to_string_lossy().to_string();
+    let new_str = new.to_string_lossy().to_string();
+    if is_dir {
+        let prefix_old = format!("{}/", old_str);
+        let prefix_new = format!("{}/", new_str);
+        let _ = athenaeum_core::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new);
+    } else {
+        let _ = conn.execute(
+            "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
+            rusqlite::params![&new_str, &args.new_name, &old_str],
+        );
+    }
+    Ok(StatusCode::OK)
 }

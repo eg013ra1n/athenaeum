@@ -387,6 +387,59 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // File operations - one row per dual-pane Move or Delete operation
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_operations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK(kind IN ('move','delete')),
+            status TEXT NOT NULL,
+            source_root TEXT,
+            dest_dir TEXT,
+            total_files INTEGER NOT NULL DEFAULT 0,
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            error_message TEXT
+        )",
+        [],
+    )?;
+
+    // File operation files - frozen plan: one row per file the operation will touch
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_operation_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id INTEGER NOT NULL,
+            source_path TEXT NOT NULL,
+            dest_path TEXT,
+            strategy TEXT NOT NULL,
+            catalog_file_id INTEGER,
+            expected_hash TEXT,
+            file_size_bytes INTEGER NOT NULL DEFAULT 0,
+            disposition TEXT NOT NULL DEFAULT 'planned',
+            FOREIGN KEY (operation_id) REFERENCES file_operations(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // File operation steps - audit log: one row per (file, stage) pair for resume + rollback
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_operation_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id INTEGER NOT NULL,
+            operation_file_id INTEGER,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            actual_hash TEXT,
+            error_message TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            FOREIGN KEY (operation_id) REFERENCES file_operations(id) ON DELETE CASCADE,
+            FOREIGN KEY (operation_file_id) REFERENCES file_operation_files(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -523,6 +576,22 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_archive_ops_frames_set ON archive_operations(frames_set_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_op_files_op ON file_operation_files(operation_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_op_steps_op_file ON file_operation_steps(operation_id, operation_file_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_op_steps_status ON file_operation_steps(status)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_ops_status ON file_operations(status)",
         [],
     )?;
     conn.execute(
@@ -1033,6 +1102,21 @@ mod archive_schema_tests {
         init_db(&conn).unwrap();
 
         for table in &["archive_operations", "archive_operation_files", "archive_operation_steps"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "expected table {} to exist", table);
+        }
+    }
+
+    #[test]
+    fn test_file_op_tables_created() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for table in &["file_operations", "file_operation_files", "file_operation_steps"] {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],

@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
 import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
-import { pickDirectory, revealItemInDir } from '../api/desktop';
+import { pickDirectory } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { api } from '../api';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
 import { format } from 'date-fns';
-import DirectoryTree from '../components/DirectoryTree';
+import DualPaneFileBrowser from '../components/dualpane/DualPaneFileBrowser';
 import type { ScanResult, RelinkResult, MissingFileRecord } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
@@ -81,9 +81,6 @@ export default function FileManager() {
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
 
   // Data file locations state
-  const [showDataPaths, setShowDataPaths] = useState(false);
-  const [dbPath, setDbPath] = useState<string>('');
-  const [logPath, setLogPath] = useState<string>('');
 
   const showConfirm = (title: string, message: string, onConfirm: () => void, confirmDanger = false) => {
     setConfirmDialog({ isOpen: true, title, message, onConfirm, confirmDanger });
@@ -93,12 +90,6 @@ export default function FileManager() {
     setAlertDialog({ isOpen: true, title, message, variant });
   };
 
-  // Fetch data file locations on mount (desktop only)
-  useEffect(() => {
-    if (!isTauri) return;
-    api.invoke<string>('get_database_path').then(setDbPath).catch(console.error);
-    api.invoke<string>('get_log_path').then(setLogPath).catch(console.error);
-  }, []);
 
   // Lazy load duplicates when Duplicates tab is clicked
   useEffect(() => {
@@ -264,57 +255,15 @@ export default function FileManager() {
   };
 
   return (
-    <div className="p-6">
-      <div className="mb-6">
-        <h2 className="text-3xl font-bold mb-2">File Manager</h2>
-        <p className="text-content-muted">
-          Manage monitored directories and view FITS/XISF metadata
-        </p>
-      </div>
-
-      {/* Data file locations (desktop only) */}
-      {isTauri && (
+    <div className="p-4 pt-3 h-full flex flex-col min-h-0">
       <div className="mb-4">
-        <button
-          onClick={() => setShowDataPaths(!showDataPaths)}
-          className="flex items-center gap-2 text-sm text-content-muted hover:text-content transition"
-        >
-          <Info size={14} />
-          Data file locations
-          {showDataPaths ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        </button>
-        {showDataPaths && (
-          <div className="mt-2 bg-surface-secondary rounded p-3 text-sm font-mono space-y-2">
-            <div className="flex items-center gap-2">
-              <span className="text-content-muted min-w-[80px]">Database:</span>
-              <span className="text-content truncate">{dbPath || '—'}</span>
-              {dbPath && (
-                <button
-                  onClick={() => revealItemInDir(dbPath)}
-                  className="text-content-muted hover:text-content transition flex-shrink-0"
-                  title="Reveal in file manager"
-                >
-                  <FolderOpen size={14} />
-                </button>
-              )}
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-content-muted min-w-[80px]">Log file:</span>
-              <span className="text-content truncate">{logPath || '—'}</span>
-              {logPath && (
-                <button
-                  onClick={() => revealItemInDir(logPath)}
-                  className="text-content-muted hover:text-content transition flex-shrink-0"
-                  title="Reveal in file manager"
-                >
-                  <FolderOpen size={14} />
-                </button>
-              )}
-            </div>
-          </div>
-        )}
+        <h2 className="text-2xl font-bold">
+          File Manager
+          <span className="text-sm font-normal text-content-muted ml-3">
+            Manage monitored directories and view FITS/XISF metadata
+          </span>
+        </h2>
       </div>
-      )}
 
       {/* Tab Navigation */}
       <div className="flex gap-2 mb-3 border-b border-border">
@@ -387,7 +336,7 @@ export default function FileManager() {
       {/* Tab Content */}
       {activeTab === 'directories' && (
         /* Monitored Directories Tab */
-        <div>
+        <div className="flex-1 overflow-auto min-h-0">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-xl font-semibold">Monitored Directories</h3>
             <button
@@ -691,17 +640,15 @@ export default function FileManager() {
             </p>
           </div>
         ) : (
-          <DirectoryTree
-            scanRoots={scanRoots}
-            duplicates={duplicates}
-            refreshTrigger={refreshTrigger}
-          />
+          <div className="flex-1 min-h-0">
+            <DualPaneFileBrowser scanRoots={scanRoots} />
+          </div>
         )
       )}
 
       {activeTab === 'duplicates' && (
         /* Duplicates View with Multi-View Tabs */
-        <div>
+        <div className="flex-1 overflow-auto min-h-0">
           {/* Sub-tabs for different views */}
           <div className="flex gap-2 mb-4 border-b border-border">
             <button
@@ -901,7 +848,9 @@ export default function FileManager() {
 
       {/* Missing Metadata Tab */}
       {activeTab === 'missing-metadata' && (
-        <MissingMetadataView onCountChange={setMissingMetadataCount} />
+        <div className="flex-1 overflow-auto min-h-0">
+          <MissingMetadataView onCountChange={setMissingMetadataCount} />
+        </div>
       )}
 
       {/* Confirm Dialog */}

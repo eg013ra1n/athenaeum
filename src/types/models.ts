@@ -58,6 +58,7 @@ export interface Frame {
   exptime: number | null;
   filter: string | null;
   imagetyp: ImageType | null;
+  is_master: boolean;
   gain: number | null;
   offset: number | null;
   binning: string | null;
@@ -1039,6 +1040,25 @@ export interface FrameMetadataEdits {
   imagetyp?: string | null;
   /** True when the frame type is a master variant (paired with imagetyp) */
   isMaster?: boolean | null;
+  /** Target name (FITS OBJECT) */
+  object?: string | null;
+  /** Filter name (FITS FILTER) */
+  filter?: string | null;
+  /** Telescope name (FITS TELESCOP) */
+  telescop?: string | null;
+  /** Focal length in mm (FITS FOCALLEN) */
+  focallen?: number | null;
+  /** Sensor gain (FITS GAIN), 0..1000 */
+  gain?: number | null;
+  /** Sensor offset (FITS OFFSET), >=0 */
+  offset?: number | null;
+  /** Binning string in "AxB" form. Backend also updates xbinning/ybinning. */
+  binning?: string | null;
+  /** Exposure time (FITS EXPTIME), seconds, > 0 */
+  exptime?: number | null;
+  /** CCD temperature (FITS CCD-TEMP), °C, finite. Backend serde uses
+   *  camelCase, so the wire field is `ccdTemp` — not `ccd_temp`. */
+  ccdTemp?: number | null;
 }
 
 /**

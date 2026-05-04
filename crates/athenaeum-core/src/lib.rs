@@ -27,3 +27,4 @@ pub mod catalog;
 pub mod plate_solve;
 pub mod services;
 pub mod archive;
+pub mod file_op;

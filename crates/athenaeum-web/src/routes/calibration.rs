@@ -1023,6 +1023,50 @@ pub async fn bulk_update_calibration_metadata(
         }
 
         if any_update {
+            // Mirror the calibration-set edits into the member frames so
+            // frames.* stays in sync (see the Tauri-side comment in
+            // bulk_update_calibration_metadata for the rationale).
+            let mut frame_set_clauses: Vec<&str> = Vec::new();
+            let mut frame_values: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(temp) = args.edits.ccd_temp {
+                frame_set_clauses.push("ccd_temp = ?");
+                frame_values.push(rusqlite::types::Value::Real(temp));
+            }
+            if let Some(gain) = args.edits.gain {
+                frame_set_clauses.push("gain = ?");
+                frame_values.push(rusqlite::types::Value::Real(gain));
+            }
+            if let Some(offset) = args.edits.offset {
+                frame_set_clauses.push("offset = ?");
+                frame_values.push(rusqlite::types::Value::Real(offset));
+            }
+            if let Some(ref binning) = args.edits.binning {
+                frame_set_clauses.push("binning = ?");
+                frame_values.push(rusqlite::types::Value::Text(binning.clone()));
+                if let Some((xs, ys)) = binning.split_once('x') {
+                    if let (Ok(xb), Ok(yb)) = (xs.parse::<i64>(), ys.parse::<i64>()) {
+                        frame_set_clauses.push("xbinning = ?");
+                        frame_values.push(rusqlite::types::Value::Integer(xb));
+                        frame_set_clauses.push("ybinning = ?");
+                        frame_values.push(rusqlite::types::Value::Integer(yb));
+                    }
+                }
+            }
+            if let Some(exptime) = args.edits.exptime {
+                frame_set_clauses.push("exptime = ?");
+                frame_values.push(rusqlite::types::Value::Real(exptime));
+            }
+            if !frame_set_clauses.is_empty() {
+                let sql = format!(
+                    "UPDATE frames SET {}, override = 1
+                     WHERE id IN (SELECT frame_id FROM calibration_set_frames WHERE set_id = ?)",
+                    frame_set_clauses.join(", "),
+                );
+                let mut all_values = frame_values.clone();
+                all_values.push(rusqlite::types::Value::Integer(*set_id));
+                conn.execute(&sql, rusqlite::params_from_iter(all_values.iter()))
+                    .map_err(db_err)?;
+            }
             updated_count += 1;
         }
     }

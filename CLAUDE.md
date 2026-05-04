@@ -272,6 +272,34 @@ Folder management: `list_archive_roots`, `add_archive_root`, `delete_archive_roo
 
 **Restore semantics (the safe one):** the zip is the inventory; restore makes disk match by filling gaps. For each `archive_operation_files` row: if the file already exists at `source_path`, skip (no duplicate, no overwrite); else copy from temp → target. Target is the original `source_path` when the user picked "original location" mode, or `<picked>/<path-in-zip>` when picking a scan root or custom folder. This handles copy-disposition calibrations cleanly (originals stay put) and the cross-archive move case (where archive A copied X and archive B later moved X — restoring A first puts X back, restoring B later sees it in place and skips).
 
+### Dual-Pane File Browser
+
+`FileManager → Browse Files` is a Far-Manager-style two-pane browser that owns file-system operations (Move, Delete, Rename, Mkdir), catalog search, bulk metadata editing, and the Blink launcher. Full design in `docs/superpowers/specs/2026-05-05-dual-pane-file-browser-design.md`.
+
+**Module structure:**
+
+- `crates/athenaeum-core/src/services/operation_queue.rs` — single serialized worker thread shared with the archive feature. `OperationKind { ZipArchive, FileOpMove, FileOpDelete }`. All long-running ops enqueue here; archive command sites in both Tauri and Axum routes go through it too.
+- `crates/athenaeum-core/src/file_op/` — Move/Delete pipeline (`models`, `db`, `planner`, `executor`) modeled on the existing `archive/` module. `MoveStrategy { AtomicRename, CopyVerifyDelete, Delete }` chosen by planner via `MetadataExt::dev()`. Cross-volume moves verify with xxHash before deleting source. **Move planner refuses destination collisions up front** — no silent overwrite. **Delete planner records every subdirectory** so full hierarchies clear cleanly (deepest-first rmdir).
+- `crates/athenaeum-core/src/fits_parser/stored_header.rs` — re-decodes the `fits_header.header` blob (FITS 80-char card text or XISF XML) into the canonical `FrameOriginalSnapshot` so the metadata pane can show "what the file looked like at scan time" and offer per-field revert.
+- `src/components/dualpane/` — `DualPaneFileBrowser.tsx` (shell + reducer + key handlers), `MetadataPane.tsx` (bulk edit + Memberships panel + Originals panel), `CatalogSearch.tsx`, `types.ts`.
+
+**Key Tauri commands** (mirrored on the web side in `crates/athenaeum-web/src/routes/files.rs`):
+
+- File ops: `enqueue_move_operation`, `enqueue_delete_operation`, `cancel_file_operation`, `list_unfinished_file_operations`, `mkdir_in_scan_root`, `rename_path`.
+- Search: `search_catalog` (filename / path / OBJECT / FILTER / IMAGETYP / INSTRUME / TELESCOP).
+- Metadata pane backing data: `bulk_update_frame_metadata` (extended with OBJECT/FILTER/TELESCOP/FOCALLEN/GAIN/OFFSET/BINNING/EXPTIME/CCD-TEMP, derives `is_master` from IMAGETYP, cascade-prunes empty calibration sets, recomputes `frames.override` after every save), `count_frame_metadata_relations` (pre-save unlink count), `get_frame_memberships` (frame-set + cal-set membership + reverse "used in frame set" rollup), `get_frame_metadata_originals` (the FITS-header round-trip).
+
+**Hot-sync semantics:**
+
+- Move: per-file SQL transaction updates `files.path` AND does the disk action. AtomicRename is `rename(2)`; CopyVerifyDelete is copy → xxHash verify → DB update + source delete. The path-based UPDATE in `update_files_path_by_old_path` is the primary catalog write — id-based update only fires as a fallback when the planner missed `catalog_file_id`. Survives path-encoding edge cases (macOS `/Volumes` vs `/private/Volumes`).
+- Rename of a directory: SUBSTR-based leading-prefix swap on `files.path` (`UPDATE files SET path = ?new_prefix || SUBSTR(path, LENGTH(?old_prefix) + 1) WHERE path LIKE ?old_prefix || '%'`). The naive `REPLACE(path, old, new)` was unsafe — replaced every occurrence, not just the leading prefix.
+- `bulk_update_frame_metadata` cascade: deletes `calibration_set_frames`, `calibration_set_to_frames`, `session_members` rows for the touched frames; **prunes calibration sets that lose their last member** (master sets and last-frame regular sets). FK CASCADE on `calibration_set_to_frames.calibration_set_id` cleans up consumer references when the set is deleted. Sessions / imaging_nights / frames_set rows are intentionally left in place even when empty.
+- `bulk_update_calibration_metadata` (Equipment page) propagates set-level edits to every member frame in `calibration_set_frames` with `frames.override = 1` so the scanner won't undo the change.
+
+**Override flag lifecycle:** any save sets `frames.override = 1`. The trailing `recompute_override_flag_for_frames` call re-checks each touched frame against its FITS-header originals (semantic comparison: ±1e-6 for floats, instant-aware for DATE-OBS) and clears the flag back to 0 when everything matches — so reverting all edits visually returns the row to its untouched state.
+
+**Schema additions** (`db/schema.rs::init_db`): `file_operations`, `file_operation_files`, `file_operation_steps` plus their indexes. All idempotent `CREATE TABLE IF NOT EXISTS`.
+
 ## Development Workflow
 
 1. **Adding New Tauri Commands**:

@@ -757,7 +757,7 @@ pub struct CalibrationMetadataEdits {
 /// Bulk edits for light/calibration frame metadata in the `frames` table.
 /// Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type actions.
 /// None means don't change that field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameMetadataEdits {
     pub instrume: Option<String>,
@@ -768,6 +768,25 @@ pub struct FrameMetadataEdits {
     /// type (e.g. `imagetyp = "DARK"`, `is_master = true` → master dark).
     pub imagetyp: Option<String>,
     pub is_master: Option<bool>,
+    /// Target name (FITS OBJECT). Common cleanup case for misnamed targets.
+    pub object: Option<String>,
+    /// Filter name (FITS FILTER). Common cleanup case for ASIAir mis-records.
+    pub filter: Option<String>,
+    /// Telescope name (FITS TELESCOP).
+    pub telescop: Option<String>,
+    /// Focal length in mm (FITS FOCALLEN).
+    pub focallen: Option<f64>,
+    /// Sensor gain (FITS GAIN). Typically 0-1000.
+    pub gain: Option<f64>,
+    /// Sensor offset (FITS OFFSET). Typically 0+.
+    pub offset: Option<f64>,
+    /// Binning string (e.g. "1x1", "2x2"). When set, xbinning/ybinning are
+    /// also updated to match the parsed components.
+    pub binning: Option<String>,
+    /// Exposure time in seconds (FITS EXPTIME). Must be > 0.
+    pub exptime: Option<f64>,
+    /// CCD temperature in °C (FITS CCD-TEMP). Typically -50..50.
+    pub ccd_temp: Option<f64>,
 }
 
 /// Excluded frame entry (frame excluded during auto-generation)

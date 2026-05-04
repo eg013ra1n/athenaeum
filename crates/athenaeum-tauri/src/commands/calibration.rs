@@ -2008,6 +2008,63 @@ pub async fn bulk_update_calibration_metadata(
             continue; // No fields to update
         }
 
+        // Propagate edits down to the member frames so frames.* stays in
+        // sync with the calibration_set the user just edited. Without this
+        // an edit on a master flat / dark only retunes calibration matching
+        // — frames.ccd_temp etc. would still report stale values to anything
+        // querying frames directly (catalog views, dual-pane editor, etc.).
+        // Frames are flagged override = 1 to protect them from scanner
+        // re-overwrites on the next rescan. Reset-to-original on the set
+        // restores the set columns only; the frame override stays.
+        let mut frame_set_clauses: Vec<&str> = Vec::new();
+        let mut frame_values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(temp) = edits.ccd_temp {
+            frame_set_clauses.push("ccd_temp = ?");
+            frame_values.push(rusqlite::types::Value::Real(temp));
+        }
+        if let Some(gain) = edits.gain {
+            frame_set_clauses.push("gain = ?");
+            frame_values.push(rusqlite::types::Value::Real(gain));
+        }
+        if let Some(offset) = edits.offset {
+            frame_set_clauses.push("offset = ?");
+            frame_values.push(rusqlite::types::Value::Real(offset));
+        }
+        if let Some(ref binning) = edits.binning {
+            frame_set_clauses.push("binning = ?");
+            frame_values.push(rusqlite::types::Value::Text(binning.clone()));
+            // Mirror the AxB string into xbinning / ybinning so derived
+            // queries see consistent values.
+            if let Some((xs, ys)) = binning.split_once('x') {
+                if let (Ok(xb), Ok(yb)) = (xs.parse::<i64>(), ys.parse::<i64>()) {
+                    frame_set_clauses.push("xbinning = ?");
+                    frame_values.push(rusqlite::types::Value::Integer(xb));
+                    frame_set_clauses.push("ybinning = ?");
+                    frame_values.push(rusqlite::types::Value::Integer(yb));
+                }
+            }
+        }
+        if let Some(exptime) = edits.exptime {
+            frame_set_clauses.push("exptime = ?");
+            frame_values.push(rusqlite::types::Value::Real(exptime));
+        }
+        if !frame_set_clauses.is_empty() {
+            let sql = format!(
+                "UPDATE frames SET {}, override = 1
+                 WHERE id IN (SELECT frame_id FROM calibration_set_frames WHERE set_id = ?)",
+                frame_set_clauses.join(", "),
+            );
+            let mut all_values = frame_values.clone();
+            all_values.push(rusqlite::types::Value::Integer(*set_id));
+            let n = conn
+                .execute(&sql, rusqlite::params_from_iter(all_values.iter()))
+                .map_err(|e| format!("Failed to propagate edits to frames for set {}: {}", set_id, e))?;
+            println!(
+                "📝 Propagated edits to {} member frames of set #{}",
+                n, set_id
+            );
+        }
+
         updated_count += 1;
     }
 

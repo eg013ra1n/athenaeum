@@ -1,6 +1,7 @@
 // FITS/XISF metadata parser module
 
 pub(crate) mod fits_header_reader;
+pub mod stored_header;
 
 use crate::models::{Frame, ImageType};
 use anyhow::{Context, Result};
