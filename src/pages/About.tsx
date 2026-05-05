@@ -21,9 +21,7 @@ interface Dependency {
 const frontendDeps: Dependency[] = [
   { name: 'React', url: 'https://github.com/facebook/react', license: 'MIT', copyright: 'Meta Platforms, Inc.' },
   { name: 'React Router', url: 'https://github.com/remix-run/react-router', license: 'MIT', copyright: 'Remix Software Inc.' },
-  { name: 'TanStack Table', url: 'https://github.com/TanStack/table', license: 'MIT', copyright: 'Tanner Linsley' },
   { name: 'Tauri API', url: 'https://github.com/tauri-apps/tauri', license: 'MIT OR Apache-2.0', copyright: 'Tauri Programme within The Commons Conservancy' },
-  { name: 'clsx', url: 'https://github.com/lukeed/clsx', license: 'MIT', copyright: 'Luke Edwards' },
   { name: 'date-fns', url: 'https://github.com/date-fns/date-fns', license: 'MIT', copyright: 'Sasha Koss' },
   { name: 'Lucide React', url: 'https://github.com/lucide-icons/lucide', license: 'ISC', copyright: 'Lucide Contributors' },
   { name: 'D3.js', url: 'https://github.com/d3/d3', license: 'BSD-3-Clause', copyright: 'Mike Bostock' },
@@ -222,6 +220,44 @@ export default function About() {
           </button>
         </section>
       </div>
+
+      <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-accent">Acknowledgements</h2>
+        <p className="text-content-secondary leading-relaxed">
+          The analysis flow in Athenaeum was guided by{' '}
+          <ExtLink href="https://github.com/fenriques/AstroDom">Ferrante Enriques</ExtLink>,
+          creator of <ExtLink href="https://github.com/fenriques/AstroDom">AstroDom</ExtLink>,
+          whose work shaped how light-frame quality metrics (FWHM, eccentricity, SNR) are
+          captured, scored, and surfaced for selection.
+        </p>
+        <div className="flex gap-4 pt-1">
+          <ExtLink href="https://github.com/fenriques/AstroDom">GitHub</ExtLink>
+          <ExtLink href="https://app.astrobin.com/u/fenriques">AstroBin</ExtLink>
+        </div>
+
+        <div className="pt-4 space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-content-muted">Standards &amp; Data</h3>
+          <ul className="space-y-1.5 text-content-secondary text-sm">
+            <li>
+              <ExtLink href="https://fits.gsfc.nasa.gov/fits_standard.html">FITS</ExtLink>
+              {' '}— Flexible Image Transport System; IAU FITS Working Group / NASA GSFC.
+            </li>
+            <li>
+              <ExtLink href="https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html">XISF 1.0</ExtLink>
+              {' '}— Extensible Image Serialization Format; Pleiades Astrophoto (Juan Conejero).
+            </li>
+            <li>
+              <ExtLink href="https://www.cosmos.esa.int/web/hipparcos/tycho-2">Tycho-2</ExtLink>
+              {' '}— star catalog (Høg et al., 2000); used for plate solving and sky-chart overlays.
+            </li>
+            <li>
+              <ExtLink href="https://healpix.sourceforge.io/">HEALPix</ExtLink>
+              {' '}— Hierarchical Equal Area isoLatitude Pixelation (Górski et al., 2005); used via{' '}
+              <ExtLink href="https://github.com/cds-astro/cds-healpix-rust">cdshealpix</ExtLink> for spatial indexing.
+            </li>
+          </ul>
+        </div>
+      </section>
 
       <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-5">
         <div>

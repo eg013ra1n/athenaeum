@@ -20,7 +20,6 @@ quick-xml = "0.36"
 uuid = { version = "1", features = ["v4"] }
 rustafits = { path = "../../rustafits", features = ["debug-pipeline"] }
 sha2 = "0.10"
-base64 = "0.22"
 jpeg-encode = { path = "../jpeg-encode" }
 memmap2 = "0.9"
 byteorder = "1"

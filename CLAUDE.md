@@ -9,7 +9,6 @@ Never swallow errors silently. When implementing error handling in Rust commands
 ### Testing and Debugging
 
 When debugging, test with real data files (e.g., real FITS files) early rather than spending extended time on synthetic tests. If synthetic tests pass but real-world behavior differs, switch to real data immediately.
-When there are any 
 
 ### Communication section
 
@@ -28,28 +27,49 @@ Athenaeum is a desktop application for astrophotographers to manage FITS/XISF im
 - Export templates with path resolution
 - User-configurable settings system
 
-The application uses Tauri 2.0 (Rust backend + React frontend) with SQLite for local catalog storage.
+The application uses Tauri 2.0 (Rust backend + React frontend) with SQLite for local catalog storage. A second build target ships the same app as a containerized web service (Axum + SSE) for headless / multi-user use.
+
+### Workspace layout
+
+Cargo workspace + git submodule:
+
+- `crates/athenaeum-core/` — shared library. All non-IPC logic lives here (DB, FITS parsing, calibration, scanner, archive, file_op, analysis, plate_solve, services, etc.).
+- `crates/athenaeum-tauri/` — desktop shell. `commands/` modules thinly wrap `athenaeum-core`.
+- `crates/athenaeum-web/` — Axum HTTP/SSE server for the Docker/web build. `routes/` modules mirror Tauri commands one-for-one.
+- `rustafits/` — git submodule (FITS image rendering); path dep of both `core` and `tauri`.
+- `src/` — React/TypeScript frontend. `src/api/` abstracts Tauri IPC vs. HTTP/SSE behind a single `api` object selected by the `VITE_TARGET` env var. Zero `@tauri-apps/*` imports outside `src/api/`.
+
+**Critical rule:** when adding or modifying a Tauri command, add the matching Axum route in `athenaeum-web` in the same change. The two backends must stay in sync.
 
 ## Commands
 
 ### Development
 ```bash
-npm run tauri dev          # Start development server with hot reload
-npm run build             # Build frontend only
-npm run tauri build       # Build complete desktop application
+# Desktop (Tauri)
+npm run tauri dev          # Start desktop app with hot reload
+npm run build              # Frontend-only build
+npm run tauri build        # Build complete desktop application
+
+# Web / Docker target
+npm run dev:web            # Vite frontend in web mode (VITE_TARGET=web)
+npm run build:web          # Web frontend build
+cargo run -p athenaeum-web # Run the Axum server locally
 ```
 
 ### Testing
 ```bash
-# Rust backend tests
-cd src-tauri && cargo test
+# Rust workspace tests (all crates)
+cargo test --workspace
+
+# Single crate
+cargo test -p athenaeum-core
 
 # Frontend tests (when added)
 npm test
 ```
 
 ### Database
-The SQLite database is created in the user's app data directory by Tauri. Schema initialization happens in `src-tauri/src/db/schema.rs`.
+The SQLite database is created in the user's app data directory by Tauri (or under `/data` in the Docker image, configurable via `ATHENAEUM_DB_PATH`). Schema initialization happens in `crates/athenaeum-core/src/db/schema.rs`.
 
 ## Architecture
 
@@ -57,60 +77,92 @@ This project uses a Tauri stack: Rust backend + React/TypeScript frontend. Be aw
 
 ### Frontend (React + TypeScript)
 
-- **Routing**: React Router v7 with 6 main views:
-  - `FileManager` - Directory browser with file metadata display
-  - `Objects` - Frame set library grouped by sky coordinates
-  - `ShootCalendar` - Calendar view of imaging sessions
-  - `Equipment` - Equipment and setup management
-  - `Export` - Export templates and file organization
-  - `Settings` - Application settings and configuration
-- **State Management**: React hooks + Tauri commands for backend communication
-- **Styling**: Tailwind CSS with dark theme (bg-gray-800/900, text-gray-100)
+- **Routing**: React Router v7 (see `src/App.tsx`). Routes (root `/` redirects to `/files`):
+  - `/files` → `FileManager` - Dual-pane file browser + monitored directory management
+  - `/calendar` → `ShootCalendar` - Calendar view of imaging sessions
+  - `/objects` → `Objects` - Frame set library grouped by sky coordinates
+  - `/objects/:id` → `FrameSetDetail` - Per-frame-set detail view (zip/unarchive toolbar lives here)
+  - `/excluded` → `ExcludedFrames` - Frames hidden from clustering
+  - `/skychart` → `SkyChart` - Sky-map view of cataloged objects
+  - `/equipment` → `Equipment` - Equipment, cameras, and calibration library
+  - `/export` → `Export` - Export templates and file organization
+  - `/blackhole` → `BlackHole` - Duplicate / orphan handling
+  - `/settings` → `Settings`
+  - `/about` → `About`
+- **Backend abstraction**: `src/api/` exposes a single `api` object that switches between Tauri IPC and HTTP/SSE based on `VITE_TARGET`. Always import from `src/api/`, never from `@tauri-apps/*` directly outside this layer.
+- **State Management**: React hooks + the `api` layer
+- **Styling**: Tailwind CSS, dark theme via design tokens (`bg-surface`, `text-content-muted`, `bg-accent`, …) — prefer tokens over raw `bg-gray-*` so dark/light themes both work
 - **Component Structure**:
   - `src/components/Layout.tsx` - Main app shell with sidebar navigation
-  - `src/components/DirectoryTree.tsx` - Directory browser with file listing and metadata
-  - `src/pages/*` - One page component per view
-  - `src/hooks/*` - Custom hooks for Tauri command invocation (when added)
+  - `src/components/dualpane/` - Far-Manager-style two-pane file browser (see Dual-Pane File Browser below)
+  - `src/pages/*` - One page component per route
+  - `src/api/*` - Backend abstraction (`desktop.ts`, `web.ts`, `index.ts`)
   - `src/types/models.ts` - TypeScript interfaces matching Rust models
 
 ### Backend (Rust)
 
-- **Module Organization**:
+- **`athenaeum-core` modules** (`crates/athenaeum-core/src/`, in `lib.rs` order):
   - `models.rs` - Serde-compatible data structures (File, Frame, FramesSet, etc.)
-  - `db/` - SQLite operations (`schema.rs`, `operations.rs`)
-  - `fits_parser/` - FITS/XISF metadata extraction
-  - `scanner/` - Multi-threaded directory traversal with walkdir + rayon
-  - `duplicates/` - xxHash XXH3_64 computation and duplicate detection
-  - `calibration/` - Calibration frame matching algorithms (see Calibration Matching System below)
-  - `clustering/` - Sky coordinate-based frame set clustering (seed-and-grow single-link)
   - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
+  - `fingerprint/` - File fingerprinting
+  - `calibration/` - Calibration frame matching algorithms (see Calibration Matching System below)
+  - `db/` - SQLite operations (`schema.rs`, `operations.rs`)
+  - `fits_parser/` - FITS/XISF metadata extraction (incl. `stored_header.rs` round-trip used by the metadata pane)
+  - `clustering/` - Sky-coordinate-based frame set clustering (seed-and-grow single-link)
   - `settings/` - Settings management with runtime and database persistence
+  - `sessions/`, `relinking/`, `frames_set_metadata.rs`, `frames_set_merge.rs` - frame-set/session lifecycle
+  - `events.rs`, `logging.rs` - structured events + logging plumbing
+  - `duplicates/` - xxHash XXH3_64 computation and duplicate detection
+  - `scanner/` - Multi-threaded directory traversal with walkdir + rayon
+  - `monitor/` - Directory watching (FS event loop)
+  - `auto_merge/` - Automatic cluster merging
   - `export/` - Path template resolution and file copying
+  - `rustafits_processor/` - Bridge to the `rustafits` crate (FITS image rendering)
+  - `cache/` - Image / preview cache
+  - `analysis/` - FWHM / eccentricity / star-analysis pipeline
+  - `catalog/` - Catalog read APIs used by both backends
+  - `plate_solve/` - Plate-solving pipeline
+  - `services/` - `ServiceContext` + `ProgressEmitter` trait (the abstraction that lets `core` emit progress to either Tauri events or SSE)
   - `archive/` - ZIP archive feature: planner, executor, rollback, resume, restore (see Archive Feature below)
+  - `file_op/` - Move/Delete pipeline shared with the dual-pane browser (see Dual-Pane File Browser below)
+
+- **`athenaeum-tauri` layout** (`crates/athenaeum-tauri/src/`):
   - `commands/` - **Modular Tauri commands** organized by domain (see below)
   - `commands_rustafits.rs` - Specialized FITS image rendering commands
+  - `tauri_events.rs` - Tauri-side `ProgressEmitter` impl
+  - `lib.rs` - registers all commands in `invoke_handler`
 
-- **Commands Module Structure** (Refactored 2025-11-17):
-  The Tauri commands are organized into focused modules by domain. All 68 commands are in `src-tauri/src/commands/`:
-  - `mod.rs` - Module exports, AppState definition, and re-exports
-  - `core.rs` - 2 commands: App initialization (greet, initialize_database)
-  - `scan_roots.rs` - 9 commands: Directory scanning and monitoring
-  - `files.rs` - 7 commands: File operations and browsing
-  - `settings.rs` - 5 commands: Application configuration
-  - `frame_sets.rs` - 14 commands: Frame set management and operations
-  - `calibration.rs` - 17 commands: Calibration frame matching and library management
-  - `duplicates.rs` - 8 commands: Black hole & duplicate detection
-  - `cache.rs` - 2 commands: Cache management
-  - `spatial.rs` - 4 commands: Sky coordinate queries and spatial operations
+- **`athenaeum-web` layout** (`crates/athenaeum-web/src/`):
+  - `routes/` - One module per domain (`scan_roots.rs`, `files.rs`, `frame_sets.rs`, `calibration.rs`, `archive.rs`, `analysis.rs`, `plate_solve.rs`, `export.rs`, `duplicates.rs`, `missing_files.rs`, `images.rs`, `settings.rs`, `spatial.rs`, `calendar.rs`) — registered in `routes/mod.rs`
+  - `events.rs` - SSE `ProgressEmitter` impl (use `SseProgressEmitter::new(state.event_tx.clone())`)
+
+- **Commands Module Structure**:
+  Tauri commands live in `crates/athenaeum-tauri/src/commands/` (~180 `#[tauri::command]` functions across 16 modules). Each module has a sibling route module in `crates/athenaeum-web/src/routes/` with the same name and surface.
+  - `mod.rs` - Module exports, `AppState` definition, and re-exports
+  - `core.rs` - App initialization
+  - `scan_roots.rs` - Directory scanning and monitoring
+  - `files.rs` - File operations and browsing (incl. dual-pane move/delete/rename/search/metadata)
+  - `settings.rs` - Application configuration
+  - `frame_sets.rs` - Frame set management and operations
+  - `calibration.rs` - Calibration matching and library management (largest module)
+  - `duplicates.rs` - Black hole & duplicate detection
+  - `cache.rs` - Image cache operations
+  - `spatial.rs` - Sky-coordinate queries and spatial operations
+  - `archive.rs` - ZIP archive feature (see Archive Feature below)
+  - `analysis.rs` - FWHM / eccentricity analysis queue
+  - `plate_solve.rs` - Plate-solving queue
+  - `export.rs` - Export operations
+  - `missing_files.rs` - Missing-file detection and resolution
+  - `calendar.rs` - Calendar/session queries
   - `utils.rs` - Shared helper functions (calculate_fov, angular_distance, format_bytes)
 
-  See `src-tauri/REFACTORING.md` for complete command migration map and details.
+  See `crates/athenaeum-tauri/REFACTORING.md` for the original 2025-11-17 modular-refactor map.
 
-- **Tauri Commands**: Functions marked with `#[tauri::command]` in `commands/` modules are callable from React via `invoke()`. All commands are re-exported through `commands/mod.rs` for backward compatibility.
+- **Tauri Commands**: Functions marked with `#[tauri::command]` in `commands/` modules are callable from React via the `api` layer. All commands are re-exported through `commands/mod.rs`.
 
 ### Database Schema
 
-See `src-tauri/src/db/schema.rs` for full schema. Key tables:
+See `crates/athenaeum-core/src/db/schema.rs` for full schema. Key tables:
 
 - `files` - Physical files (path, filename, size, format, modified_at)
 - `frames` - Metadata extracted from FITS/XISF with astronomical coordinates
@@ -154,7 +206,7 @@ Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, ex
 2. Database persisted settings
 3. Default values
 
-Common settings include `grouping.threshold.value` (default `3.0`) and `grouping.threshold.unit` (default `deg`, also accepts `arcmin` and `arcsec`) for frame set clustering. Internally consumed via `SettingsManager::get_grouping_threshold_deg`.
+Common settings include `grouping.threshold.value` (default `3.0`) and `grouping.threshold.unit` (default `deg`, also accepts `arcmin` and `arcsec`) for frame set clustering. Internally consumed via `SettingsManager::get_grouping_threshold_arcsec` (callers convert to whichever unit they need).
 
 **Auto-Generate Frame Sets**:
 
@@ -163,7 +215,7 @@ Common settings include `grouping.threshold.value` (default `3.0`) and `grouping
 - Reports excluded frames with reasons (missing coordinates, etc.)
 - Creates named sets with aggregated metadata (total exposure time, coordinates)
 
-**FITS Parsing**: Uses `fitsio` crate. Key FITS keywords: OBJECT, DATE-OBS, TIME-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP, GAIN, OFFSET, XBINNING, YBINNING, CCD-TEMP, SET-TEMP, FOCALLEN, RA, DEC, OBJCTRA, OBJCTDEC.
+**FITS Parsing**: Hand-rolled header reader in `crates/athenaeum-core/src/fits_parser/fits_header_reader.rs` — reads 2880-byte FITS blocks one card at a time and stops at the `END` card, so a 200 MB FITS only costs a few KB of I/O for metadata. No `fitsio` / CFITSIO dependency. (Image *rendering* — pixels, not metadata — goes through the `rustafits` submodule via `rustafits_processor/`.) Key FITS keywords extracted: OBJECT, DATE-OBS, TIME-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP, GAIN, OFFSET, XBINNING, YBINNING, CCD-TEMP, SET-TEMP, FOCALLEN, RA, DEC, OBJCTRA, OBJCTDEC.
 
 **XISF Parsing**: Must parse XML header according to XISF 1.0 spec and extract embedded FITS-like properties.
 
@@ -215,9 +267,9 @@ The calibration matching system is fully configurable via UI (Settings → Calib
 - `Ignore` - Don't check this parameter
 
 **Key Files**:
-- `src-tauri/src/calibration/config.rs` - Configuration data structures (`CalibrationMatchingConfig`, `ParameterConfig`, `MatchMode`, etc.)
-- `src-tauri/src/calibration/configurable_matcher.rs` - Config-driven matching engine (`find_calibration_sets`, `load_config`, etc.)
-- `src-tauri/src/calibration/hierarchy.rs` - Calibration hierarchy builder (uses configurable matcher)
+- `crates/athenaeum-core/src/calibration/config.rs` - Configuration data structures (`CalibrationMatchingConfig`, `ParameterConfig`, `MatchMode`, etc.)
+- `crates/athenaeum-core/src/calibration/configurable_matcher.rs` - Config-driven matching engine (`find_calibration_sets`, `load_config`, etc.)
+- `crates/athenaeum-core/src/calibration/hierarchy.rs` - Calibration hierarchy builder (uses configurable matcher)
 - `src/types/calibration-config.ts` - TypeScript interfaces
 - `src/components/calibration/` - UI components (`CalibrationMatchingConfig.tsx`, `MatchingMatrixTable.tsx`, etc.)
 
@@ -302,73 +354,82 @@ Folder management: `list_archive_roots`, `add_archive_root`, `delete_archive_roo
 
 ## Development Workflow
 
-1. **Adding New Tauri Commands**:
-   - Determine the appropriate module in `src-tauri/src/commands/` based on functionality:
-     - `core.rs` - App initialization and basic operations
-     - `scan_roots.rs` - Scanning directories for FITS files
-     - `files.rs` - File browsing, searching, previewing
+1. **Adding New Tauri Commands** (and the matching Axum route):
+   - Put the actual logic in `crates/athenaeum-core/` so both backends can call it. The Tauri/Axum layer should be a thin wrapper.
+   - Pick the right module in `crates/athenaeum-tauri/src/commands/` (and the same-named file in `crates/athenaeum-web/src/routes/`):
+     - `core.rs` - App initialization
+     - `scan_roots.rs` - Scanning directories
+     - `files.rs` - File browsing / dual-pane file ops
      - `settings.rs` - Application configuration
-     - `frame_sets.rs` - Grouping frames into sets
-     - `calibration.rs` - Calibration frame matching and library
-     - `duplicates.rs` - Duplicate detection and black hole management
-     - `cache.rs` - Image cache operations
-     - `spatial.rs` - Sky coordinate queries and spatial operations
-     - `archive.rs` - ZIP archive feature: folder management, plan/start/cancel/resume/rollback operations, list archived frame sets, list zips, restore, delete
-   - Add command function to the appropriate module with `#[tauri::command]`
-   - Ensure it's exported in `commands/mod.rs` (use `pub use module_name::*;`)
-   - Add to `invoke_handler` in `src-tauri/src/lib.rs` as `commands::command_name`
-   - Call from React with `invoke('command_name', { args })`
+     - `frame_sets.rs` - Frame set grouping
+     - `calibration.rs` - Calibration matching and library
+     - `duplicates.rs` - Duplicates / black hole
+     - `cache.rs` - Image cache
+     - `spatial.rs` - Sky-coordinate queries
+     - `archive.rs` - ZIP archive feature (plan/start/cancel/resume/rollback, list, restore, delete)
+     - `analysis.rs` - FWHM / eccentricity analysis queue
+     - `plate_solve.rs` - Plate solving
+     - `export.rs` - Export operations
+     - `missing_files.rs` - Missing-file resolution
+     - `calendar.rs` - Calendar / sessions
+   - Add the function with `#[tauri::command]`; ensure it's re-exported via `commands/mod.rs` (`pub use module_name::*;`)
+   - Register it in `invoke_handler` in `crates/athenaeum-tauri/src/lib.rs` as `commands::command_name`
+   - **Mirror it on the web side**: add the matching `pub async fn` in `crates/athenaeum-web/src/routes/<same_name>.rs` and register it in `routes/mod.rs`. Use `SseProgressEmitter::new(state.event_tx.clone())` for progress.
+   - Call from React via the `api` layer (`api.invoke('command_name', { args })`) — never import `@tauri-apps/api` outside `src/api/`
 
    **Example**:
 
    ```rust
-   // In src-tauri/src/commands/settings.rs
+   // crates/athenaeum-tauri/src/commands/settings.rs
    #[tauri::command]
    pub async fn get_my_setting(state: State<'_, AppState>) -> Result<String, String> {
-       // implementation
+       // call into athenaeum_core::settings::...
    }
 
-   // Already re-exported in commands/mod.rs via: pub use settings::*;
+   // commands/mod.rs already re-exports: pub use settings::*;
 
-   // In src-tauri/src/lib.rs, add to invoke_handler:
+   // crates/athenaeum-tauri/src/lib.rs, in invoke_handler:
    commands::get_my_setting,
+
+   // crates/athenaeum-web/src/routes/settings.rs
+   pub async fn get_my_setting(State(state): State<AppState>) -> impl IntoResponse {
+       // same call into athenaeum_core::settings::...
+   }
    ```
 
 2. **Database Schema Changes**:
-   - Update `src-tauri/src/db/schema.rs::init_db()`
-   - Handle migration if schema already exists (or delete dev database during development)
-   - Add corresponding operations in `src-tauri/src/db/operations.rs`
+   - Update `crates/athenaeum-core/src/db/schema.rs::init_db()` (idempotent `CREATE TABLE IF NOT EXISTS`)
+   - Handle migration if the table already exists in the wild; or delete the dev DB during development (path: see auto-memory `MEMORY.md` → "Database issues")
+   - Add corresponding operations in `crates/athenaeum-core/src/db/operations.rs`
 
 3. **Adding New Models**:
-   - Define in `src-tauri/src/models.rs` with Serde derive
+   - Define in `crates/athenaeum-core/src/models.rs` with Serde derive
    - Create matching TypeScript interface in `src/types/models.ts`
-   - Ensure field names and types match exactly
+   - Verify the field names match across the IPC/HTTP boundary (Rust `snake_case` ↔ TS `camelCase` via `#[serde(rename_all = "camelCase")]`)
 
 4. **UI Changes**:
-   - Pages are in `src/pages/`
-   - Shared components in `src/components/`
-   - Use Tailwind classes, dark theme (bg-gray-800/900, text-gray-100)
+   - Pages in `src/pages/`, shared components in `src/components/`
+   - Use the design tokens (`bg-surface`, `text-content-muted`, `bg-accent`, `text-error`, …) — avoid raw `bg-gray-*`
    - Icons from `lucide-react`
    - Follow React hooks best practices (useCallback, useMemo, proper dependencies)
 
 5. **Working with Settings**:
-   - Settings are managed through `SettingsManager` in `src-tauri/src/settings/`
-   - Use `get_setting` and `set_setting` Tauri commands from frontend
-   - Settings support default values and database persistence
-   - Access via `state.settings` in Rust commands
+   - `SettingsManager` lives in `crates/athenaeum-core/src/settings/`
+   - Use the `get_setting` / `set_setting` commands from the frontend (via the `api` layer)
+   - Three-tier precedence: runtime overrides > DB > defaults
+   - In Rust commands, access via `state.settings`
 
 6. **Working with Frame Sets**:
-   - Frame sets are created via `auto_generate_frame_sets` command
-   - Clustering is performed by `src-tauri/src/clustering/` module
-   - Coordinate conversion handled by `src-tauri/src/coordinates/` module
+   - Frame sets are created via the `auto_generate_frame_sets` command
+   - Clustering is performed by `crates/athenaeum-core/src/clustering/`
+   - Coordinate conversion handled by `crates/athenaeum-core/src/coordinates/`
    - Always check if frames are already in sets before adding to prevent duplicates
 
 7. **Working with Calibration Matching Config**:
-   - Configuration is managed through `src-tauri/src/calibration/config.rs`
-   - Use `get_calibration_matching_config` and `set_calibration_matching_config` Tauri commands
+   - Configuration lives in `crates/athenaeum-core/src/calibration/config.rs`
+   - Use `get_calibration_matching_config` / `set_calibration_matching_config` commands
    - Load config in Rust with `configurable_matcher::load_config(conn)`
-   - UI components are in `src/components/calibration/`
-   - TypeScript interfaces in `src/types/calibration-config.ts`
+   - UI in `src/components/calibration/`, TS interfaces in `src/types/calibration-config.ts`
 
 ## Testing Approach
 
@@ -453,11 +514,11 @@ pub async fn my_command(state: State<'_, AppState>) -> Result<f64, String> {
     let db = state_lock.as_ref().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    let threshold = state.settings
-        .get_grouping_threshold_deg(&conn)
+    let threshold_arcsec = state.settings
+        .get_grouping_threshold_arcsec(&conn)
         .map_err(|e| e.to_string())?;
 
-    Ok(threshold)
+    Ok(threshold_arcsec / 3600.0) // → degrees
 }
 ```
 
@@ -519,9 +580,15 @@ let temp_weight = config.scoring.temperature_match_weight;
 
 ## Dependencies
 
-**Frontend**: React, React Router, Tailwind, TanStack Table, Lucide Icons, date-fns
+All listed below are confirmed in `Cargo.toml` / `package.json` *and* used in source (verified 2026-05-05).
 
-**Backend**: Tauri, rusqlite, fitsio, xxhash-rust, chrono, rayon, walkdir, serde, anyhow, thiserror
+**Frontend** (`package.json`): react 19 + react-dom, react-router-dom 7, tailwindcss 3, lucide-react (icons, ~90 imports), date-fns, recharts (analysis charts), `@tauri-apps/api` + `@tauri-apps/plugin-opener` / `-dialog` / `-fs` (only imported under `src/api/desktop.ts`).
+
+**Backend — `athenaeum-core`**: rusqlite 0.32 (`bundled` + `functions` for `SIN`/`COS` scalar fns) + r2d2 (custom `ManageConnection` impl), serde / serde_json, chrono, rayon, walkdir, anyhow, xxhash-rust (`xxh3`), quick-xml (XISF parsing), uuid (v4, monitor orchestrator), sha2, memmap2, byteorder, cdshealpix, flate2, zip, reqwest (blocking, Tycho-2 fetch), tokio (`sync`/`time`/`macros`/`rt`), `rustafits` (path dep, FITS image rendering), `jpeg-encode` (path dep, kept out of the workspace so it builds with opt-level 2 + no incremental).
+
+**Backend — `athenaeum-tauri`**: athenaeum-core, tauri 2 + tauri-plugin-opener / -dialog / -fs, tokio (`full`), serde / serde_json, rusqlite, chrono, rayon, anyhow, base64 (preview JPEG → data-URI), reqwest (json, update checker), uuid, semver (update-version comparison), rustafits. The `duplicates` / `scanner` / `fits_parser` modules are re-exported from `athenaeum-core`, so this crate doesn't need its own `xxhash-rust` / `walkdir` / `quick-xml` deps.
+
+**Backend — `athenaeum-web`**: athenaeum-core, axum 0.8, tower-http (`cors`+`fs`), tokio (`full`), tokio-stream (`sync`), serde / serde_json, rusqlite (for inline `params!` in route handlers), chrono, rayon, futures.
 
 ## Reference Documentation
 
@@ -529,4 +596,4 @@ let temp_weight = config.scoring.temperature_match_weight;
 - [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html)
 - [XISF 1.0 Specification](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html)
 - [xxHash](https://xxhash.com/)
-- Commands Refactoring: `src-tauri/REFACTORING.md` - Complete documentation of the 2025-11-17 modular refactoring
+- Commands Refactoring: `crates/athenaeum-tauri/REFACTORING.md` - Original 2025-11-17 modular-refactor map
