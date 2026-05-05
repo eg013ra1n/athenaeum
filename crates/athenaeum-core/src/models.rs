@@ -787,6 +787,20 @@ pub struct FrameMetadataEdits {
     pub exptime: Option<f64>,
     /// CCD temperature in °C (FITS CCD-TEMP). Typically -50..50.
     pub ccd_temp: Option<f64>,
+    /// Right Ascension in decimal degrees [0, 360). Only set by the metadata
+    /// pane's RA/DEC revert path — there is no text input for these. The
+    /// "manual update" path for coordinates is plate-solving. When set,
+    /// `bulk_update_frame_metadata` also writes the parallel sexagesimal
+    /// `objctra` so derived consumers stay consistent with what the scanner
+    /// and plate solver produce.
+    pub ra: Option<f64>,
+    /// Declination in decimal degrees [-90, 90]. See `ra`.
+    pub dec: Option<f64>,
+    /// Image position angle in degrees (north through east). Plate solving
+    /// derives this from the CD matrix. The metadata pane lets the user
+    /// override or revert it just like any other numeric field. Range is
+    /// `[-360, 360]` to accept either sign convention.
+    pub rotation: Option<f64>,
 }
 
 /// Excluded frame entry (frame excluded during auto-generation)

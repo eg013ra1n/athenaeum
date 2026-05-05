@@ -267,6 +267,28 @@ pub async fn get_frames_with_missing_metadata(
     Ok(Json(rows))
 }
 
+/// POST /api/get_unsolved_light_frames
+///
+/// Returns LIGHT frames that have never been plate-solved. Powers the
+/// "Unsolved" tab of the missing-metadata UI — surfaces frames whose
+/// mount-recorded RA/Dec is present but never verified by a solve, which
+/// the missing-coords filter silently excludes.
+pub async fn get_unsolved_light_frames(
+    State(state): State<WebAppState>,
+) -> Result<Json<Vec<MissingMetadataRow>>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    let rows = db::get_unsolved_light_frames(&conn)
+        .map_err(|e| {
+            eprintln!("get_unsolved_light_frames route failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    Ok(Json(rows))
+}
+
 // ── Bulk frame metadata edits ────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]

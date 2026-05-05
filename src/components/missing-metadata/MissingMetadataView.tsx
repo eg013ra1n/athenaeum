@@ -14,6 +14,19 @@ import BlinkViewer from '../BlinkViewer';
 
 type ModalKind = 'camera' | 'date' | 'type' | null;
 
+/**
+ * Two source modes share this view:
+ *
+ * - `missing-metadata` (default): the existing "Missing Metadata" workflow,
+ *   backed by `get_frames_with_missing_metadata`. Filters to LIGHT frames
+ *   whose RA/Dec are zero/null AND whose OBJCTRA/OBJCTDEC are zero/null.
+ * - `unsolved`: LIGHT frames that have never been plate-solved, regardless
+ *   of whether the FITS header populated RA/Dec. Backed by
+ *   `get_unsolved_light_frames`. Surfaces the frames the missing-coords
+ *   filter would otherwise hide (e.g. mount-pointed-but-never-verified).
+ */
+type SourceMode = 'missing-metadata' | 'unsolved';
+
 interface MissingMetadataViewProps {
   /** Called with the total number of rows currently loaded, so the parent
       tab button can show a count badge. Passed `null` while loading. */
@@ -21,6 +34,7 @@ interface MissingMetadataViewProps {
 }
 
 export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCountChange }) => {
+  const [source, setSource] = useState<SourceMode>('missing-metadata');
   const [allRows, setAllRows] = useState<MissingMetadataRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -60,9 +74,12 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     try {
       setLoading(true);
       setError(null);
-      const rows = await api.invoke<MissingMetadataRow[]>('get_frames_with_missing_metadata', {
-        category: 'all',
-      });
+      const rows =
+        source === 'unsolved'
+          ? await api.invoke<MissingMetadataRow[]>('get_unsolved_light_frames')
+          : await api.invoke<MissingMetadataRow[]>('get_frames_with_missing_metadata', {
+              category: 'all',
+            });
       setAllRows(rows);
       // Preserve selection: drop IDs no longer present
       const presentIds = new Set(rows.map(r => r.frame.id).filter((id): id is number => id != null));
@@ -74,16 +91,24 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         return next;
       });
     } catch (err) {
-      console.error('Failed to load frames with missing metadata:', err);
-      setError(typeof err === 'string' ? err : 'Failed to load frames with missing metadata');
+      console.error('Failed to load frames:', err);
+      setError(typeof err === 'string' ? err : 'Failed to load frames');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [source]);
 
   useEffect(() => {
     void loadMissing();
   }, [loadMissing]);
+
+  // Reset filter chips when switching sources — chips only apply in
+  // missing-metadata mode (they describe which metadata gap to filter on),
+  // and silently restricting an unsolved-mode list to "missing coordinates"
+  // would be confusing.
+  useEffect(() => {
+    setActiveChips(new Set());
+  }, [source]);
 
   // Report the current row count up to the parent (for the tab badge).
   // While loading we clear the count so the badge doesn't show a stale number.
@@ -169,8 +194,16 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
       const frame = item.frame;
       const flags = computeMissingFlags(item);
 
-      // Plate Solve: LIGHT AND missing coordinates
-      if (frame.imagetyp === ImageType.Light && flags.coordinates) {
+      // Plate Solve eligibility differs by source mode:
+      //   - missing-metadata: LIGHT AND missing coordinates (the legacy rule —
+      //     the existing flow is only meant to seed coords on no-coord frames)
+      //   - unsolved: any LIGHT frame is eligible (the whole list is, by
+      //     definition, LIGHT frames lacking a plate_solves row, so the user
+      //     wants to (re)solve them whether or not they already have RA/Dec)
+      const plateSolveEligible =
+        frame.imagetyp === ImageType.Light &&
+        (source === 'unsolved' || flags.coordinates);
+      if (plateSolveEligible) {
         plateSolveIds.push(frameId);
       }
 
@@ -216,7 +249,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         setType: setTypeIds,
       },
     };
-  }, [allRows, selectedIds]);
+  }, [allRows, selectedIds, source]);
 
   // ── Rows for blink viewer ────────────────────────────────────────────────
   // BlinkViewer takes FileWithFrame[], not MissingMetadataRow[], so wrap
@@ -275,6 +308,40 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         ref={toolbarRef}
         className="sticky top-0 z-20 bg-surface-elevated -mx-2 -mt-2 px-2 pt-2 rounded-t-lg"
       >
+        {/* Source-mode tabs: switch between the legacy "Missing Metadata"
+            list (frames the FITS pipeline left coordinate-blank) and the
+            new "Unsolved" list (LIGHT frames that have never received a
+            plate-solve, regardless of whether the header populated RA/Dec).
+            The Unsolved tab is the user-facing escape hatch for the bug
+            where frames with valid mount-recorded coords were silently
+            excluded from the plate-solve batch queue. */}
+        <div className="flex items-center gap-1 mb-2 border-b border-border">
+          <button
+            type="button"
+            onClick={() => setSource('missing-metadata')}
+            className={`px-3 py-1.5 text-sm rounded-t -mb-px border-b-2 ${
+              source === 'missing-metadata'
+                ? 'border-accent text-content'
+                : 'border-transparent text-content-muted hover:text-content'
+            }`}
+            title="Frames whose FITS files left coordinates / object / date / camera blank"
+          >
+            Missing Metadata
+          </button>
+          <button
+            type="button"
+            onClick={() => setSource('unsolved')}
+            className={`px-3 py-1.5 text-sm rounded-t -mb-px border-b-2 ${
+              source === 'unsolved'
+                ? 'border-accent text-content'
+                : 'border-transparent text-content-muted hover:text-content'
+            }`}
+            title="LIGHT frames that have never been plate-solved (regardless of whether the FITS header populated RA/Dec)"
+          >
+            Unsolved
+          </button>
+        </div>
+
         <MissingMetadataToolbar
           activeChips={activeChips}
           onToggleChip={toggleChip}

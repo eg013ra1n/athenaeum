@@ -42,6 +42,25 @@ pub struct FrameOriginalSnapshot {
     /// DATE-OBS as it appears in the header (no timezone normalisation —
     /// the UI shows it verbatim and the user can decide what to compare).
     pub date_obs: Option<String>,
+    /// Right Ascension in decimal degrees, derived from OBJCTRA/RA in the
+    /// header. Sexagesimal OBJCTRA is parsed via `parse_ra_sexagesimal`;
+    /// fallback to numeric RA. Plate solving overrides this; the metadata
+    /// pane shows the FITS-header original next to the catalog value so the
+    /// user can revert a plate solve back to whatever the file shipped with.
+    pub ra: Option<f64>,
+    /// Declination in decimal degrees. Same precedence as `ra`: OBJCTDEC
+    /// (sexagesimal) preferred, numeric DEC as fallback.
+    pub dec: Option<f64>,
+    /// Image position angle in degrees (north through east). Derived from
+    /// the same 8-keyword priority chain as the scanner — CROTA2 → CD-matrix
+    /// → CROTA1 → POSANGLE → PA → OBJCTROT → ROTATANG → APTS_ROT — so the
+    /// snapshot value matches what the scanner stored in `frames.rotation`,
+    /// avoiding a phantom diff in the metadata pane's revert UI. Sky-frame
+    /// keywords come first; mechanical rotator angles (ROTATANG, APTS_ROT)
+    /// last because they reflect the rotator's hardware position rather
+    /// than the image's sky orientation. Plate solving overrides the
+    /// catalog value from the CD matrix.
+    pub rotation: Option<f64>,
 }
 
 /// Format-aware dispatcher: pulls the canonical FITS keys (UPPERCASE) out
@@ -90,6 +109,49 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
         .or_else(|| get("CCDTEMP").and_then(|s| s.parse::<f64>().ok()));
     let date_obs = get("DATE-OBS").or_else(|| get("DATE_OBS"));
 
+    // RA: prefer sexagesimal OBJCTRA (HH:MM:SS); fall back to numeric RA in
+    // decimal degrees. Numeric RA values from a FITS header are typically
+    // already in degrees, but we accept both ":"-separated and bare-decimal
+    // forms — `parse_ra_sexagesimal` only handles the former, so we route
+    // accordingly.
+    let ra = get("OBJCTRA")
+        .and_then(|s| crate::coordinates::parse_ra_sexagesimal(&s).ok())
+        .or_else(|| get("RA").and_then(|s| s.parse::<f64>().ok()));
+    let dec = get("OBJCTDEC")
+        .and_then(|s| crate::coordinates::parse_dec_sexagesimal(&s).ok())
+        .or_else(|| get("DEC").and_then(|s| s.parse::<f64>().ok()));
+    // Rotation: must match the scanner's keyword priority in
+    // `fits_parser/mod.rs::extract_metadata` exactly, otherwise the
+    // metadata pane shows a phantom "original differs from current" diff
+    // for any frame whose header has multiple rotation-bearing keywords.
+    //
+    // Sky-frame keywords first; mechanical-rotator-angle keywords last —
+    // ROTATANG / APTS_ROT are raw hardware positions whose mapping to the
+    // sky depends on rotator zero-offset. Real-world example: NINA writes
+    // both OBJCTROT=185 (planned sky rotation) and ROTATANG=208 (mechanical
+    // angle); the rotator was offset 23° from sky-east-of-north.
+    //
+    //   1. CROTA2 — FITS WCS standard (sky frame)
+    //   2. CD matrix — atan2(-CD1_2, CD2_2) (sky frame)
+    //   3. CROTA1 — alt WCS axis rotation (sky frame)
+    //   4. POSANGLE — sky position angle
+    //   5. PA — generic position angle (sky frame)
+    //   6. OBJCTROT — planned target rotation (NINA / PI, sky frame)
+    //   7. ROTATANG — mechanical rotator angle (instrument frame, fallback)
+    //   8. APTS_ROT — APT mechanical rotator angle (instrument frame)
+    let parse_f = |k: &str| get(k).and_then(|s| s.parse::<f64>().ok());
+    let rotation = parse_f("CROTA2")
+        .or_else(|| match (parse_f("CD1_2"), parse_f("CD2_2")) {
+            (Some(cd1_2), Some(cd2_2)) => Some((-cd1_2).atan2(cd2_2).to_degrees()),
+            _ => None,
+        })
+        .or_else(|| parse_f("CROTA1"))
+        .or_else(|| parse_f("POSANGLE"))
+        .or_else(|| parse_f("PA"))
+        .or_else(|| parse_f("OBJCTROT"))
+        .or_else(|| parse_f("ROTATANG"))
+        .or_else(|| parse_f("APTS_ROT"));
+
     FrameOriginalSnapshot {
         frame_id,
         object,
@@ -104,6 +166,9 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
         exptime,
         ccd_temp,
         date_obs,
+        ra,
+        dec,
+        rotation,
     }
 }
 
@@ -245,6 +310,85 @@ mod tests {
         assert_eq!(snap.binning.as_deref(), Some("2x2"));
         assert_eq!(snap.exptime, Some(60.0));
         assert_eq!(snap.ccd_temp, Some(-9.9));
+    }
+
+    #[test]
+    fn objctrot_beats_rotatang() {
+        // Real-world case: NINA writes both OBJCTROT (planned sky rotation)
+        // and ROTATANG (mechanical hardware angle). OBJCTROT is in sky frame
+        // and reflects user intent; ROTATANG is the raw rotator position
+        // whose mapping to sky depends on the rotator's zero offset. Sky
+        // frame wins.
+        let mut keys = HashMap::new();
+        keys.insert("OBJCTROT".into(), "185.0".into());
+        keys.insert("ROTATANG".into(), "208.089996337891".into());
+        let snap = snapshot_from_keys(42, &keys);
+        assert_eq!(
+            snap.rotation,
+            Some(185.0),
+            "OBJCTROT (sky frame) must beat ROTATANG (mechanical)"
+        );
+    }
+
+    #[test]
+    fn rotation_full_chain_priority() {
+        // Walk the chain top-down: each keyword wins over everything below it.
+        // Order: CROTA2 → CD-matrix → CROTA1 → POSANGLE → PA → OBJCTROT →
+        // ROTATANG → APTS_ROT. Sky-frame keys precede mechanical ones.
+        let mut keys = HashMap::new();
+        keys.insert("APTS_ROT".into(), "8.0".into());
+        keys.insert("ROTATANG".into(), "7.0".into());
+        keys.insert("OBJCTROT".into(), "6.0".into());
+        keys.insert("PA".into(), "5.0".into());
+        keys.insert("POSANGLE".into(), "4.0".into());
+        keys.insert("CROTA1".into(), "3.0".into());
+        keys.insert("CROTA2".into(), "1.0".into());
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, Some(1.0), "CROTA2 must win when present");
+
+        // Drop CROTA2 → CD matrix wins next (atan2-derived).
+        keys.remove("CROTA2");
+        keys.insert("CD1_2".into(), "0.0".into());
+        keys.insert("CD2_2".into(), "1.0".into());
+        let snap = snapshot_from_keys(1, &keys);
+        // atan2(-0.0, 1.0) = 0.0 rad = 0°
+        assert_eq!(snap.rotation, Some(0.0), "CD matrix must win over CROTA1+");
+
+        // Remove CD matrix → CROTA1 wins.
+        keys.remove("CD1_2");
+        keys.remove("CD2_2");
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, Some(3.0));
+
+        // ...POSANGLE...
+        keys.remove("CROTA1");
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, Some(4.0));
+
+        // ...PA (now 5th)...
+        keys.remove("POSANGLE");
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, Some(5.0));
+
+        // ...OBJCTROT (now 6th)...
+        keys.remove("PA");
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, Some(6.0));
+
+        // ...ROTATANG (now 7th, demoted from 5th — sky frame wins over hw)...
+        keys.remove("OBJCTROT");
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, Some(7.0));
+
+        // ...APTS_ROT.
+        keys.remove("ROTATANG");
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, Some(8.0));
+
+        // No rotation keys at all → None.
+        keys.clear();
+        let snap = snapshot_from_keys(1, &keys);
+        assert_eq!(snap.rotation, None);
     }
 
     #[test]

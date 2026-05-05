@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { CheckCircle2, Loader2 } from 'lucide-react';
+import { CheckCircle2, Loader2, Pencil } from 'lucide-react';
 import type { MissingMetadataRow } from '../../types/models';
 
 /** Returns the parent directory of a file path (without trailing slash). */
@@ -240,11 +240,22 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
                 </td>
                 {/* Filename — always full, never truncated */}
                 <td className="px-1.5 py-1">
-                  <span
-                    className="text-sm text-content-secondary font-mono whitespace-nowrap"
-                    title={item.file.filename}
-                  >
-                    {item.file.filename}
+                  <span className="inline-flex items-center gap-1.5">
+                    <span
+                      className="text-sm text-content-secondary font-mono whitespace-nowrap"
+                      title={item.file.filename}
+                    >
+                      {item.file.filename}
+                    </span>
+                    {item.frame.override_ === true && (
+                      <Pencil
+                        size={11}
+                        className="flex-shrink-0 text-amber-400"
+                        aria-label="Custom metadata applied"
+                      >
+                        <title>Custom metadata applied — open metadata pane (⌘I) to compare with original</title>
+                      </Pencil>
+                    )}
                   </span>
                 </td>
                 <td className="px-1.5 py-1">

@@ -55,6 +55,16 @@ export interface FrameOriginalSnapshot {
   exptime: number | null;
   ccdTemp: number | null;
   dateObs: string | null;
+  /** RA in decimal degrees, decoded from OBJCTRA (sexagesimal) or RA
+   *  (decimal) in the FITS header. The metadata pane shows it next to the
+   *  catalog value so the user can revert a plate-solved value back to
+   *  whatever the file shipped with. */
+  ra: number | null;
+  /** DEC in decimal degrees, decoded from OBJCTDEC or DEC in the header. */
+  dec: number | null;
+  /** Image position angle in degrees (north through east), from CROTA2 or
+   *  OBJCTROT in the FITS header. Plate solving overrides this. */
+  rotation: number | null;
 }
 
 /** One frame_set ("Object") the selection is part of. */

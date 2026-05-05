@@ -829,6 +829,92 @@ pub fn get_files_by_directory_for_camera(
 /// `metadata_hash`. That covers both exact-byte duplicates (content hash) and
 /// "same header/size/filename" near-duplicates (metadata hash), matching how
 /// the rest of the app treats duplicates.
+/// SELECT clause for `MissingMetadataRow` rows. Kept as a constant so
+/// `get_frames_with_missing_metadata` and `get_unsolved_light_frames` stay
+/// in lock-step on column ordering — the row-mapping closure below relies on
+/// the column indexes being identical.
+const MISSING_METADATA_SELECT: &str =
+    "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+            f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
+            fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
+            fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
+            fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+            fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
+            CASE WHEN dgf.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_duplicate";
+
+/// Map a row from a SELECT that uses `MISSING_METADATA_SELECT`.
+fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MissingMetadataRow> {
+    let file = File {
+        id: Some(row.get(0)?),
+        path: row.get(1)?,
+        filename: row.get(2)?,
+        size: row.get(3)?,
+        modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+            .unwrap()
+            .with_timezone(&Utc),
+        format: if row.get::<_, String>(5)? == "FITS" {
+            FileFormat::FITS
+        } else {
+            FileFormat::XISF
+        },
+        created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
+            .unwrap()
+            .with_timezone(&Utc),
+        metadata_hash: row.get(7)?,
+        content_hash: row.get(8)?,
+        archived_in_operation: row.get(9)?,
+        archive_zip_path: row.get(10)?,
+        archive_path_in_zip: row.get(11)?,
+    };
+
+    let frame = Frame {
+        id: Some(row.get(12)?),
+        file_id: file.id.unwrap(),
+        object: row.get(13).ok(),
+        date_obs: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| {
+            DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+        }),
+        telescop: row.get(15).ok(),
+        instrume: row.get(16).ok(),
+        exptime: row.get(17).ok(),
+        filter: row.get(18).ok(),
+        imagetyp: row.get::<_, Option<String>>(19).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+        is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
+        gain: row.get(21).ok(),
+        offset: row.get(22).ok(),
+        binning: row.get(23).ok(),
+        xbinning: row.get(24).ok(),
+        ybinning: row.get(25).ok(),
+        ccd_temp: row.get(26).ok(),
+        set_temp: row.get(27).ok(),
+        focallen: row.get(28).ok(),
+        xpixsz: row.get(29).ok(),
+        ypixsz: row.get(30).ok(),
+        naxis1: row.get(31).ok(),
+        naxis2: row.get(32).ok(),
+        ra: row.get(33).ok(),
+        dec: row.get(34).ok(),
+        sitelat: row.get(35).ok(),
+        lat_obs: row.get(36).ok(),
+        sitelong: row.get(37).ok(),
+        long_obs: row.get(38).ok(),
+        objctra: row.get(39).ok(),
+        objctdec: row.get(40).ok(),
+        override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
+        swcreate: row.get(42).ok(),
+        bayerpat: row.get(43).ok(),
+        rotation: row.get(44).ok(),
+    };
+
+    let has_duplicate: i32 = row.get(45)?;
+
+    Ok(MissingMetadataRow {
+        file,
+        frame,
+        has_duplicate: has_duplicate != 0,
+    })
+}
+
 pub fn get_frames_with_missing_metadata(
     conn: &Connection,
     category: &str,
@@ -874,96 +960,50 @@ pub fn get_frames_with_missing_metadata(
     // means the file isn't in any detected duplicate group; any match means it
     // is. Uses the `idx_dup_group_files_file` index for O(1) lookups.
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
-                f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
-                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
-                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
-                CASE WHEN dgf.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_duplicate
+        "{select}
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
          LEFT JOIN duplicate_group_files dgf ON dgf.file_id = f.id
-         WHERE {} ({})
+         WHERE {imagetyp_filter} ({missing_clause})
          GROUP BY f.id
          ORDER BY f.modified_at DESC",
-        imagetyp_filter, missing_clause
+        select = MISSING_METADATA_SELECT,
+        imagetyp_filter = imagetyp_filter,
+        missing_clause = missing_clause,
     );
 
     let mut stmt = conn.prepare(&query)?;
+    let results = stmt.query_map([], map_missing_metadata_row)?;
+    results.collect()
+}
 
-    let results = stmt.query_map([], |row| {
-        let file = File {
-            id: Some(row.get(0)?),
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            size: row.get(3)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                .unwrap()
-                .with_timezone(&Utc),
-            format: if row.get::<_, String>(5)? == "FITS" {
-                FileFormat::FITS
-            } else {
-                FileFormat::XISF
-            },
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                .unwrap()
-                .with_timezone(&Utc),
-            metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
-            archived_in_operation: row.get(9)?,
-            archive_zip_path: row.get(10)?,
-            archive_path_in_zip: row.get(11)?,
-        };
+/// LIGHT frames that have never been plate-solved.
+///
+/// Mirrors the row mapping of [`get_frames_with_missing_metadata`] but
+/// gates differently: any LIGHT frame that has no `plate_solves` row is
+/// returned, regardless of whether numeric `ra/dec` or sexagesimal
+/// `objctra/objctdec` are populated. Used by the "Unsolved" tab in the
+/// missing-metadata UI to surface frames whose mount-recorded coordinates
+/// are present but never verified — the existing missing-coords filter
+/// silently excludes those frames so they would otherwise stay in limbo.
+///
+/// `plate_solves.frame_id` has a UNIQUE constraint, so `LEFT JOIN ... WHERE
+/// ps.id IS NULL` reliably identifies "never been solved".
+pub fn get_unsolved_light_frames(conn: &Connection) -> Result<Vec<MissingMetadataRow>> {
+    let query = format!(
+        "{select}
+         FROM files f
+         INNER JOIN frames fr ON f.id = fr.file_id
+         LEFT JOIN duplicate_group_files dgf ON dgf.file_id = f.id
+         LEFT JOIN plate_solves ps ON ps.frame_id = fr.id
+         WHERE UPPER(fr.imagetyp) = 'LIGHT' AND ps.id IS NULL
+         GROUP BY f.id
+         ORDER BY f.modified_at DESC",
+        select = MISSING_METADATA_SELECT,
+    );
 
-        let frame = Frame {
-            id: Some(row.get(12)?),
-            file_id: file.id.unwrap(),
-            object: row.get(13).ok(),
-            date_obs: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-            }),
-            telescop: row.get(15).ok(),
-            instrume: row.get(16).ok(),
-            exptime: row.get(17).ok(),
-            filter: row.get(18).ok(),
-            imagetyp: row.get::<_, Option<String>>(19).ok().flatten().and_then(|s| ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
-            gain: row.get(21).ok(),
-            offset: row.get(22).ok(),
-            binning: row.get(23).ok(),
-            xbinning: row.get(24).ok(),
-            ybinning: row.get(25).ok(),
-            ccd_temp: row.get(26).ok(),
-            set_temp: row.get(27).ok(),
-            focallen: row.get(28).ok(),
-            xpixsz: row.get(29).ok(),
-            ypixsz: row.get(30).ok(),
-            naxis1: row.get(31).ok(),
-            naxis2: row.get(32).ok(),
-            ra: row.get(33).ok(),
-            dec: row.get(34).ok(),
-            sitelat: row.get(35).ok(),
-            lat_obs: row.get(36).ok(),
-            sitelong: row.get(37).ok(),
-            long_obs: row.get(38).ok(),
-            objctra: row.get(39).ok(),
-            objctdec: row.get(40).ok(),
-            override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
-            swcreate: row.get(42).ok(),
-            bayerpat: row.get(43).ok(),
-            rotation: row.get(44).ok(),
-        };
-
-        let has_duplicate: i32 = row.get(45)?;
-
-        Ok(MissingMetadataRow {
-            file,
-            frame,
-            has_duplicate: has_duplicate != 0,
-        })
-    })?;
-
+    let mut stmt = conn.prepare(&query)?;
+    let results = stmt.query_map([], map_missing_metadata_row)?;
     results.collect()
 }
 
@@ -1002,6 +1042,9 @@ pub fn bulk_update_frame_metadata(
         && edits.binning.is_none()
         && edits.exptime.is_none()
         && edits.ccd_temp.is_none()
+        && edits.ra.is_none()
+        && edits.dec.is_none()
+        && edits.rotation.is_none()
     {
         return Ok(0);
     }
@@ -1118,6 +1161,42 @@ pub fn bulk_update_frame_metadata(
         }
         set_clauses.push("ccd_temp = ?");
         values.push(Value::Real(ccd_temp));
+    }
+    // RA / DEC: write decimal degrees AND mirror sexagesimal OBJCTRA / OBJCTDEC
+    // so calibration-matching, sky-chart and clustering consumers (which read
+    // from either column) stay in sync with what the scanner and plate solver
+    // produce. The metadata pane is the only call site that supplies these
+    // today; its revert button feeds back the FITS-header decimal value.
+    if let Some(ra) = edits.ra {
+        if !ra.is_finite() || !(0.0..360.0).contains(&ra) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                format!("ra must be in [0, 360) degrees, got {}", ra).into(),
+            ));
+        }
+        set_clauses.push("ra = ?");
+        values.push(Value::Real(ra));
+        set_clauses.push("objctra = ?");
+        values.push(Value::Text(crate::coordinates::format_ra_sexagesimal(ra)));
+    }
+    if let Some(dec) = edits.dec {
+        if !dec.is_finite() || !(-90.0..=90.0).contains(&dec) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                format!("dec must be in [-90, 90] degrees, got {}", dec).into(),
+            ));
+        }
+        set_clauses.push("dec = ?");
+        values.push(Value::Real(dec));
+        set_clauses.push("objctdec = ?");
+        values.push(Value::Text(crate::coordinates::format_dec_sexagesimal(dec)));
+    }
+    if let Some(rotation) = edits.rotation {
+        if !rotation.is_finite() || !(-360.0..=360.0).contains(&rotation) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                format!("rotation must be in [-360, 360] degrees, got {}", rotation).into(),
+            ));
+        }
+        set_clauses.push("rotation = ?");
+        values.push(Value::Real(rotation));
     }
     // Always flag touched rows as override so rescans preserve the edit.
     set_clauses.push("override = 1");
@@ -2898,7 +2977,7 @@ pub fn recompute_override_flag_for_frames(
     let sql = format!(
         "SELECT fr.id, fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop,
                 fr.focallen, fr.gain, fr.offset, fr.binning, fr.exptime, fr.ccd_temp,
-                fr.date_obs, files.format, fh.header
+                fr.date_obs, fr.ra, fr.dec, files.format, fh.header
          FROM frames fr
          JOIN files ON files.id = fr.file_id
          LEFT JOIN fits_header fh ON fh.file_id = fr.file_id
@@ -2920,6 +2999,8 @@ pub fn recompute_override_flag_for_frames(
         Option<f64>,    // exptime
         Option<f64>,    // ccd_temp
         Option<String>, // date_obs
+        Option<f64>,    // ra
+        Option<f64>,    // dec
         String,         // files.format
         Option<String>, // header
     );
@@ -2943,6 +3024,8 @@ pub fn recompute_override_flag_for_frames(
                 row.get(12)?,
                 row.get(13)?,
                 row.get(14)?,
+                row.get(15)?,
+                row.get(16)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2963,6 +3046,8 @@ pub fn recompute_override_flag_for_frames(
             exptime,
             ccd_temp,
             date_obs,
+            ra,
+            dec,
             format_str,
             header,
         ) = r;
@@ -2992,7 +3077,9 @@ pub fn recompute_override_flag_for_frames(
             && opt_str_eq(&binning, &snap.binning)
             && opt_f64_eq(&exptime, &snap.exptime)
             && opt_f64_eq(&ccd_temp, &snap.ccd_temp)
-            && opt_date_eq(&date_obs, &snap.date_obs);
+            && opt_date_eq(&date_obs, &snap.date_obs)
+            && opt_f64_eq(&ra, &snap.ra)
+            && opt_f64_eq(&dec, &snap.dec);
 
         if all_match {
             conn.execute(

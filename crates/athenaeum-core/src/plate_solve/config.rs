@@ -56,6 +56,27 @@ pub struct PlateSolveConfig {
     /// shares the global rayon pool for intra-frame star detection.
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: u32,
+    /// Maximum great-circle distance (degrees) between a candidate's seed
+    /// WCS center and the FITS positional hint (RA/Dec) before the candidate
+    /// is rejected. A generous default tolerates moderate mount sync errors
+    /// while still eliminating dense-Milky-Way false positives that would
+    /// otherwise win the inlier tournament on raw count alone. Skipped when
+    /// no positional hint is available (true blind solve). Set to a value
+    /// >= 180 to disable gating entirely. Default: 10.0°.
+    #[serde(default = "default_position_hint_radius_deg")]
+    pub position_hint_radius_deg: f64,
+    /// Per-dimension tolerance for the catalog quad-index hash lookup. With
+    /// `1` (the default), each query probes the target bucket plus ±1
+    /// neighbors and accepts entries whose 5 hash dimensions are all within
+    /// ±1 bin. With `2`, it widens to ±2 — ~7× more candidates per query
+    /// at the cost of more verification work, but rescues frames whose
+    /// detection produces ratios drifted by 1-2% (typical for OSC images
+    /// whose green-only interpolation biases red/blue star centroids).
+    /// Don't go higher than 2: the false-positive rate grows fast and the
+    /// positional-prior gate is the only thing keeping noise alignments out.
+    /// Default: 1.
+    #[serde(default = "default_index_lookup_tolerance")]
+    pub index_lookup_tolerance: i32,
 }
 
 fn default_max_image_stars() -> usize { 300 }
@@ -70,6 +91,8 @@ fn default_batch_concurrency() -> u32 { 0 }
 fn default_min_inlier_ratio() -> f64 { 0.10 }
 fn default_retry_passes() -> Vec<usize> { vec![50, 150, 300, 600] }
 fn default_base_verification_tolerance_arcsec() -> f64 { 8.0 }
+fn default_position_hint_radius_deg() -> f64 { 10.0 }
+fn default_index_lookup_tolerance() -> i32 { 1 }
 
 impl Default for PlateSolveConfig {
     fn default() -> Self {
@@ -86,6 +109,8 @@ impl Default for PlateSolveConfig {
             min_inlier_ratio: default_min_inlier_ratio(),
             retry_passes: default_retry_passes(),
             base_verification_tolerance_arcsec: default_base_verification_tolerance_arcsec(),
+            position_hint_radius_deg: default_position_hint_radius_deg(),
+            index_lookup_tolerance: default_index_lookup_tolerance(),
         }
     }
 }

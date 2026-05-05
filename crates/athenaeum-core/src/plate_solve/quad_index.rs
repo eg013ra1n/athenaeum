@@ -125,17 +125,35 @@ impl QuadIndex {
         self.hash_tolerance
     }
 
-    /// Look up a hash key. Checks the target bucket and its immediate
-    /// neighbors (multi-probe tolerance). Returns up to a few matching
-    /// catalog quads.
+    /// Look up a hash key. Checks the target bucket and its `±1` neighbors
+    /// (multi-probe tolerance). Returns up to a few matching catalog quads.
+    /// Convenience wrapper for the common case where the default ±1 probe
+    /// is appropriate.
     pub fn lookup(&self, hash_key: &[i32; 5]) -> Vec<QuadLookup> {
+        self.lookup_with_tolerance(hash_key, 1)
+    }
+
+    /// Look up a hash key with explicit per-dimension tolerance. Probes the
+    /// target bucket and `±tol` neighbors, and accepts entries whose hash
+    /// dimensions are all within `±tol` of the query.
+    ///
+    /// `tol = 1` is the default and gives ~3 buckets × 3^5 ratio cells of
+    /// match space. `tol = 2` widens to 5 buckets × 5^5 cells (~7× more
+    /// candidates per query) — useful when the source detection has known
+    /// centroid noise that shifts ratios outside the tight ±1 window. The
+    /// classic case is OSC (one-shot color) frames whose green-only
+    /// interpolation produces 1-2% centroid bias on red and blue stars,
+    /// which translates to 2-4 hash bins of drift per ratio dimension.
+    /// Don't use larger than 2 — the false-positive rate grows quickly.
+    pub fn lookup_with_tolerance(&self, hash_key: &[i32; 5], tol: i32) -> Vec<QuadLookup> {
+        let tol = tol.max(0);
         let bucket = bucket_for_ratio(hash_key[0], self.hash_tolerance);
 
         let mut results = Vec::new();
 
-        // Check the target bucket and ±1 neighbors
-        let start_b = bucket.saturating_sub(1);
-        let end_b = (bucket + 1).min(NUM_BUCKETS - 1);
+        // Check the target bucket and ±tol neighbors.
+        let start_b = bucket.saturating_sub(tol as u32);
+        let end_b = (bucket + tol as u32).min(NUM_BUCKETS - 1);
 
         for b in start_b..=end_b {
             let offset = self.bucket_offsets[b as usize];
@@ -152,10 +170,10 @@ impl QuadIndex {
                 }
                 let entry = parse_entry(&self.mmap[entry_off..entry_off + ENTRY_SIZE]);
 
-                // Check all 5 hash dimensions within ±1 tolerance
+                // Check all 5 hash dimensions within ±tol tolerance
                 let mut ok = true;
                 for k in 0..5 {
-                    if (entry.hash_key[k] - hash_key[k]).abs() > 1 {
+                    if (entry.hash_key[k] - hash_key[k]).abs() > tol {
                         ok = false;
                         break;
                     }

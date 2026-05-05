@@ -6,7 +6,7 @@
 // CLAUDE.md and the file_op extension docs.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Save, Loader2, AlertTriangle, ExternalLink, RotateCcw } from 'lucide-react';
+import { Save, Loader2, AlertTriangle, ExternalLink, RotateCcw, Crosshair } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../../api';
 import type {
@@ -18,6 +18,10 @@ import type {
   FrameSetMembership,
   UsedInFrameSetMembership,
 } from './types';
+import {
+  PlateSolveBatchPanel,
+  type PlateSolveBatchPanelHandle,
+} from '../plate-solve/PlateSolveBatchPanel';
 
 interface Props {
   /** Listing of the FILE pane (the other side). */
@@ -80,6 +84,30 @@ function display(v: string): string {
   return v === VARIES ? '(varies)' : v || '(empty)';
 }
 
+/** Format decimal-degree RA as HH:MM:SS.s (sexagesimal). Mirrors
+ *  `coordinates::format_ra_sexagesimal` on the Rust side so the catalog
+ *  value and the FITS-header original are rendered in the same form. */
+function formatRaSexagesimal(deg: number): string {
+  const hours = deg / 15;
+  const h = Math.floor(hours);
+  const minutesF = (hours - h) * 60;
+  const m = Math.floor(minutesF);
+  const s = (minutesF - m) * 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s.toFixed(1).padStart(4, '0')}`;
+}
+
+/** Format decimal-degree DEC as ±DD:MM:SS.s (sexagesimal). Mirrors
+ *  `coordinates::format_dec_sexagesimal` on the Rust side. */
+function formatDecSexagesimal(deg: number): string {
+  const sign = deg < 0 ? '-' : '+';
+  const abs = Math.abs(deg);
+  const d = Math.floor(abs);
+  const minutesF = (abs - d) * 60;
+  const m = Math.floor(minutesF);
+  const s = (minutesF - m) * 60;
+  return `${sign}${String(d).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s.toFixed(1).padStart(4, '0')}`;
+}
+
 export default function MetadataPane({ otherListing, otherSelection, onSaved }: Props) {
   // Resolve selected FileWithFrame entries.
   const selectedItems = useMemo(() => {
@@ -110,6 +138,13 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       binning: commonValueStr(selectedItems.map((f) => f.frame?.binning)),
       exptime: commonValueNum(selectedItems.map((f) => f.frame?.exptime)),
       ccdTemp: commonValueNum(selectedItems.map((f) => f.frame?.ccd_temp)),
+      // Coordinates are stored in the catalog as decimal degrees. The UI
+      // renders them as sexagesimal — see formatRa/DecSexagesimal in the row
+      // path. There is no text input for these: the only way to write a new
+      // value is plate-solving (see the "Plate Solve" button below).
+      ra: commonValueNum(selectedItems.map((f) => f.frame?.ra)),
+      dec: commonValueNum(selectedItems.map((f) => f.frame?.dec)),
+      rotation: commonValueNum(selectedItems.map((f) => f.frame?.rotation)),
     };
   }, [selectedItems]);
 
@@ -128,6 +163,10 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       exptime: { enabled: false, value: common.exptime === VARIES ? '' : common.exptime },
       ccdTemp: { enabled: false, value: common.ccdTemp === VARIES ? '' : common.ccdTemp },
       dateObs: { enabled: false, value: common.dateObs === VARIES ? '' : common.dateObs },
+      // ra/dec are populated only by the ↺ revert handler — no text input.
+      ra: { enabled: false, value: '' },
+      dec: { enabled: false, value: '' },
+      rotation: { enabled: false, value: common.rotation === VARIES ? '' : common.rotation },
     }),
     [common],
   );
@@ -138,6 +177,15 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
   const [pendingRelations, setPendingRelations] = useState<FrameMetadataRelations | null>(null);
   const [memberships, setMemberships] = useState<FrameMembershipsSummary | null>(null);
   const [originals, setOriginals] = useState<FrameOriginalSnapshot[] | null>(null);
+
+  // Plate-solve goes through the global queue at usePlateSolveQueue (mounted
+  // via PlateSolveProgressProvider in Layout.tsx) — same pipeline as the
+  // missing-metadata "Plate Solve" toolbar button. The panel below the field
+  // list owns the progress bar, the per-frame solve/fail counts, the
+  // completion banner, and the cancel button. We trigger it via the
+  // imperative `start()` handle from a normal button so the layout stays
+  // tight (panel renders nothing when idle).
+  const plateSolveRef = useRef<PlateSolveBatchPanelHandle>(null);
 
   // Reset edit state ONLY when the actual selection changes — keyed by the
   // sorted frame_ids. Including `initialEdits` in the deps was a bug: that
@@ -154,8 +202,44 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
   useEffect(() => {
     setEdits(initialEditsRef.current());
     setSavedAt(null);
+    // Reset the "last common" baseline so the next sync effect doesn't
+    // think the user manually typed the post-selection initial values.
+    lastCommonRef.current = null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectionKey]);
+
+  // Sync the input values from `common` when the catalog data refreshes
+  // *without* the selection changing — e.g. after a plate-solve writes
+  // OBJECT/RA/DEC, or any other parent-driven save. Without this, the input
+  // boxes are pinned to the value `initialEdits` captured at selection time
+  // and would never reflect the new catalog state. We preserve user typing
+  // by skipping any field whose current input value diverges from the
+  // previously-observed common value (i.e. the user has changed it).
+  const lastCommonRef = useRef<typeof common | null>(null);
+  useEffect(() => {
+    const last = lastCommonRef.current;
+    lastCommonRef.current = common;
+    if (last == null) return; // first render after a selection — initialEdits already populated
+    setEdits(prev => {
+      let next = prev;
+      for (const k of Object.keys(common) as Array<keyof typeof common>) {
+        const ks = k as string;
+        const cur = prev[ks];
+        if (!cur || cur.enabled) continue;
+        const lastV = last[k] === VARIES ? '' : String(last[k] ?? '');
+        // imagetyp's edit state stores UPPERCASE+collapsed-spaces (matches
+        // the dropdown options), so compare against the same form.
+        const lastFinal = k === 'imagetyp' ? lastV.toUpperCase().replace(/\s+/g, '') : lastV;
+        if (cur.value !== lastFinal) continue; // user typed something — leave alone
+        const newV = common[k] === VARIES ? '' : String(common[k] ?? '');
+        const newFinal = k === 'imagetyp' ? newV.toUpperCase().replace(/\s+/g, '') : newV;
+        if (cur.value === newFinal) continue;
+        if (next === prev) next = { ...prev };
+        next[ks] = { ...cur, value: newFinal };
+      }
+      return next;
+    });
+  }, [common]);
 
   // Fetch memberships whenever the selection changes. Guarded against
   // out-of-order resolution via a generation counter.
@@ -280,6 +364,12 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
         offset:   { label: 'Offset',       min: 0, max: 100000 },
         exptime:  { label: 'Exposure',     positive: true },
         ccdTemp:  { label: 'CCD temp',     min: -100, max: 100 },
+        // RA/DEC are decimal degrees. Only set by the revert path — never
+        // typed in. Backend `bulk_update_frame_metadata` validates the same
+        // ranges and also writes the parallel sexagesimal OBJCTRA/OBJCTDEC.
+        ra:       { label: 'RA',           min: 0,    max: 360 },
+        dec:      { label: 'DEC',          min: -90,  max: 90 },
+        rotation: { label: 'Rotation',     min: -360, max: 360 },
       };
       if (numericFields[k]) {
         const cfg = numericFields[k];
@@ -412,6 +502,12 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     options?: string[];
     /** Snapshot key — when present a 🔄 revert button appears for overridden frames. */
     originalKey?: keyof FrameOriginalSnapshot;
+    /** RA/DEC: render as read-only sexagesimal, no input/checkbox. The only
+     *  way to write a new value is plate-solving (see button below the
+     *  field rows). The ↺ revert button still works — it pre-fills the edit
+     *  state with the FITS-header decimal value so a normal save restores
+     *  the original. */
+    coordinate?: 'ra' | 'dec';
   }> = [
     { key: 'object',   label: 'OBJECT',           maxLength: 64, originalKey: 'object' },
     { key: 'filter',   label: 'FILTER',           maxLength: 32, originalKey: 'filter' },
@@ -446,6 +542,9 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     { key: 'exptime',  label: 'EXPTIME (s)',      numeric: true, step: '0.001', min: 0.001, originalKey: 'exptime' },
     { key: 'ccdTemp',  label: 'CCD-TEMP (°C)',    numeric: true, step: '0.1',   min: -100, max: 100, originalKey: 'ccdTemp' },
     { key: 'dateObs',  label: 'DATE-OBS (ISO)',   maxLength: 32, placeholder: 'YYYY-MM-DDTHH:MM:SS', originalKey: 'dateObs' },
+    { key: 'ra',       label: 'RA (OBJCTRA)',     originalKey: 'ra',  coordinate: 'ra' },
+    { key: 'dec',      label: 'DEC (OBJCTDEC)',   originalKey: 'dec', coordinate: 'dec' },
+    { key: 'rotation', label: 'ROTATION (°)',     numeric: true, step: '0.1', min: -360, max: 360, originalKey: 'rotation' },
   ];
 
   return (
@@ -489,36 +588,102 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
             // inherently uncertain, so we treat it as "show" so the user
             // still sees the per-frame originals on hover.
             const currentStr = String(cv ?? '');
+            // For RA/DEC the underlying values are decimal degrees — show
+            // both the catalog and FITS-header values formatted as
+            // sexagesimal, and compare numerically (±1e-6) so display-level
+            // rounding doesn't fake a "differs" diff.
+            let displayCurrent = display(cv);
+            let displayOriginal = display(origVal);
+            let coordsMatch: boolean | null = null;
+            if (f.coordinate && cv !== VARIES && currentStr !== '') {
+              const n = Number(currentStr);
+              if (Number.isFinite(n)) {
+                displayCurrent = f.coordinate === 'ra'
+                  ? formatRaSexagesimal(n)
+                  : formatDecSexagesimal(n);
+              }
+            }
+            if (f.coordinate && origVal !== VARIES && origVal !== '') {
+              const n = Number(origVal);
+              if (Number.isFinite(n)) {
+                displayOriginal = f.coordinate === 'ra'
+                  ? formatRaSexagesimal(n)
+                  : formatDecSexagesimal(n);
+                if (cv !== VARIES && currentStr !== '') {
+                  const cn = Number(currentStr);
+                  if (Number.isFinite(cn)) {
+                    coordsMatch = Math.abs(cn - n) < 1e-6;
+                  }
+                }
+              }
+            }
             // For DATE-OBS the catalog has been through parse-and-reformat
             // (RFC3339 with `Z`) while the snapshot has the raw FITS string
             // (often no timezone marker). Compare them as instants instead
             // of strings so identical timestamps don't show as a diff.
             const semanticEqual =
-              f.key === 'dateObs'
-                ? sameDateInstant(currentStr, origVal)
-                : origVal === currentStr;
+              f.coordinate
+                ? coordsMatch === true
+                : f.key === 'dateObs'
+                  ? sameDateInstant(currentStr, origVal)
+                  : origVal === currentStr;
             const valuesMatch =
-              origVal !== '' &&
-              currentStr !== '' &&
               origVal !== VARIES &&
               currentStr !== VARIES &&
               semanticEqual;
+            // Show the revert affordance whenever originals have actually
+            // loaded (not just `origVal !== ''` — that was conflating "no
+            // originals fetched yet" with "FITS header had no value for this
+            // keyword", so auto-filled-from-null fields like Find Object's
+            // OBJECT couldn't be reverted back to empty).
             const showRevert =
-              anyOverridden && f.originalKey != null && origVal !== '' && !valuesMatch;
+              anyOverridden &&
+              f.originalKey != null &&
+              originals != null &&
+              origVal !== VARIES &&
+              !valuesMatch;
+            // Three-column row layout:
+            //   - Left (140px): label only.
+            //   - Middle (1fr): current value (and original when overridden).
+            //     `break-all` lets long timestamps and sexagesimal RA/DEC
+            //     wrap if the column gets squeezed instead of truncating
+            //     with an ellipsis.
+            //   - Right (320px fixed): checkbox + input + revert. Capped
+            //     width so short numeric values (gain=56, offset=30) don't
+            //     get a half-screen-wide input box, and so the middle
+            //     column always has room to display the current value.
             return (
-              <div key={f.key as string} className="grid grid-cols-[140px_140px_1fr] gap-2 items-center">
+              <div key={f.key as string} className="grid grid-cols-[140px_1fr_320px] gap-3 items-center">
                 <label className="text-xs font-mono text-content-muted">{f.label}</label>
                 <div
-                  className={`text-xs font-mono truncate ${cv === VARIES ? 'text-amber-400' : 'text-content'}`}
-                  title={display(cv) + (showRevert ? `  ·  original: ${display(origVal)}` : '')}
+                  className={`text-xs font-mono break-all min-w-0 ${cv === VARIES ? 'text-amber-400' : 'text-content/80'}`}
+                  title={displayCurrent + (showRevert ? `  ·  original: ${displayOriginal}` : '')}
                 >
-                  {display(cv)}
+                  {displayCurrent}
                   {showRevert && (
-                    <span className="ml-1 text-amber-400/70 text-[10px]" title={`Original: ${display(origVal)}`}>
-                      ↺ {display(origVal)}
+                    <span className="ml-1 text-amber-400/70 text-[10px]" title={`Original: ${displayOriginal}`}>
+                      ↺ {displayOriginal}
                     </span>
                   )}
                 </div>
+                {f.coordinate ? (
+                  // Coordinate rows: read-only. New values come from plate-
+                  // solving (button below the field list); the only direct
+                  // affordance here is the ↺ revert button when the FITS
+                  // header had a value to revert to.
+                  <div className="flex items-center gap-2 justify-end">
+                    {showRevert && f.originalKey && (
+                      <button
+                        type="button"
+                        onClick={() => revertField(f.key as string, f.originalKey!)}
+                        title={`Revert to original (${displayOriginal})`}
+                        className="p-1 rounded hover:bg-surface-hover text-amber-400 flex-shrink-0"
+                      >
+                        <RotateCcw size={12} />
+                      </button>
+                    )}
+                  </div>
+                ) : (
                 <div className="flex items-center gap-2">
                   <input
                     type="checkbox"
@@ -538,7 +703,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                           enabled: ev.target.value !== '',
                         })
                       }
-                      className="flex-1 px-2 py-1 rounded border border-border bg-surface text-content text-xs font-mono outline-none focus:border-accent"
+                      className="flex-1 min-w-0 px-2 py-1 rounded border border-border bg-surface text-content text-xs font-mono outline-none focus:border-accent"
                     >
                       <option value="">— no change —</option>
                       {f.options.map((opt) => (
@@ -566,24 +731,60 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                         f.placeholder ??
                         (cv === VARIES ? '(varies — type to set)' : '(no change)')
                       }
-                      className="flex-1 px-2 py-1 rounded border border-border bg-surface text-content text-xs font-mono outline-none focus:border-accent"
+                      className="flex-1 min-w-0 px-2 py-1 rounded border border-border bg-surface text-content text-xs font-mono outline-none focus:border-accent"
                     />
                   )}
                   {showRevert && f.originalKey && (
                     <button
                       type="button"
                       onClick={() => revertField(f.key as string, f.originalKey!)}
-                      title={`Revert to original (${display(origVal)})`}
+                      title={`Revert to original (${displayOriginal})`}
                       className="p-1 rounded hover:bg-surface-hover text-amber-400 flex-shrink-0"
                     >
                       <RotateCcw size={12} />
                     </button>
                   )}
                 </div>
+                )}
               </div>
             );
           })}
         </div>
+
+        {/* Coordinates can only be (re)written by plate-solving — there is no
+            text input for them. The button enqueues every selected frame
+            through the global plate-solve queue (PlateSolveProgressProvider).
+            The panel directly below renders progress / completion / errors,
+            and the global PlateSolveQueueIndicator picks the batch up too.
+            On completion we fire `onSaved` so this pane re-loads frame
+            values + originals. */}
+        {frameIds.length > 0 && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-surface-elevated/40 px-3 py-2">
+              <div className="text-xs text-content-muted">
+                <span className="text-content font-mono">RA / DEC</span> are written by plate solving.
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (frameIds.length === 0) return;
+                  plateSolveRef.current?.start(frameIds);
+                }}
+                disabled={saving || frameIds.length === 0}
+                title="Enqueue every selected frame on the global plate-solve queue. Progress shows here and in the sidebar queue indicator."
+                className="flex items-center gap-2 px-2.5 py-1 rounded bg-surface hover:bg-surface-hover border border-border text-content text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Crosshair size={12} />
+                Plate Solve {frameIds.length} frame{frameIds.length === 1 ? '' : 's'}
+              </button>
+            </div>
+            <PlateSolveBatchPanel
+              ref={plateSolveRef}
+              hideTriggerButtons
+              onSolveComplete={onSaved}
+            />
+          </div>
+        )}
 
         <MembershipsPanel memberships={memberships} />
       </div>

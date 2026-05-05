@@ -111,19 +111,23 @@ fn main() -> anyhow::Result<()> {
     let full_height = processed.height * DOWNSCALE;
 
     // ── Star detection (fast and precise) on FULL-RES FITS ──
+    let mut detector_size: (u32, u32) = (0, 0);
     let fast_stars = {
         let analyzer = ImageAnalyzer::new()
             .with_detection_sigma(5.0)
             .with_max_stars(500)
+            .with_saturation_fraction(1.0) // match plate-solve service.rs
             .with_thread_pool(Arc::clone(&pool));
         let r = analyzer.detect_fast(&file_path)?;
         println!("fast:    {} stars detected ({}x{})", r.stars.len(), r.width, r.height);
+        detector_size = (r.width as u32, r.height as u32);
         r.stars.into_iter().map(|s| (s.x as f64, s.y as f64, s.flux as f64)).collect::<Vec<_>>()
     };
     let precise_stars = {
         let analyzer = ImageAnalyzer::new()
             .with_detection_sigma(5.0)
             .with_max_stars(500)
+            .with_saturation_fraction(1.0) // match plate-solve service.rs
             .with_thread_pool(Arc::clone(&pool));
         let r = analyzer.analyze(&file_path)?;
         println!("precise: {} stars detected ({}x{})", r.stars.len(), r.width, r.height);
@@ -167,7 +171,7 @@ fn main() -> anyhow::Result<()> {
     // a 1200×1200 region around the brightest star. No scaling math, so
     // the only remaining source of misalignment would be a y-axis flip
     // or something equivalent — the simplest isolating test.
-    render_native_crop(&file_path, &fast_stars, &output_dir, frame_id)?;
+    render_native_crop(&file_path, &fast_stars, detector_size, &output_dir, frame_id)?;
 
     // ── Run plate solve (fast detection, default config) ──
     // For the viz bench we lower the acceptance threshold so we can always
@@ -411,68 +415,144 @@ fn render_solve_overlay(
 fn render_native_crop(
     file_path: &str,
     fast_stars: &[(f64, f64, f64)],
+    detector_size: (u32, u32),
     output_dir: &std::path::Path,
     frame_id: i64,
 ) -> anyhow::Result<()> {
     let full = ImageConverter::new().process(file_path)?;
     let w = full.width as u32;
     let h = full.height as u32;
-    println!("native crop: full image {}x{}", w, h);
+    println!("native crop: full image {}x{} (detector {}x{})",
+        w, h, detector_size.0, detector_size.1);
+
+    // OSC images go through super-pixel debayer in `ImageConverter::process()`,
+    // halving width and height (4 raw Bayer pixels → 1 RGB super-pixel). The
+    // detector, in contrast, runs green-channel interpolation that preserves
+    // native resolution. So `detect_fast` reports coordinates in the original
+    // 6248x4176 space, but the displayed `full` image is 3124x2088. We must
+    // scale detector coords by the ratio of converter-output to detector-input
+    // before drawing the reticle, otherwise reticles land at half (or beyond)
+    // their intended position.
+    //
+    // For mono frames (no Bayer), debayer is a no-op so both dimensions match
+    // 1:1 and the scale is 1.0.
+    let sx = w as f64 / detector_size.0 as f64;
+    let sy = h as f64 / detector_size.1 as f64;
+    let to_disp = |(x, y): (f64, f64)| (x * sx, y * sy);
 
     // Sort stars by flux desc and take the top 30.
     let mut sorted: Vec<(f64, f64, f64)> = fast_stars.to_vec();
     sorted.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     let top: Vec<(f64, f64)> = sorted.iter().take(30).map(|s| (s.0, s.1)).collect();
 
-    let brightest = top.first().copied().unwrap_or((w as f64 / 2.0, h as f64 / 2.0));
-    println!("brightest star @ ({:.1}, {:.1})", brightest.0, brightest.1);
+    let brightest = top.first().copied().unwrap_or((
+        detector_size.0 as f64 / 2.0,
+        detector_size.1 as f64 / 2.0,
+    ));
+    let brightest_disp = to_disp(brightest);
+    println!(
+        "brightest star @ detector=({:.1}, {:.1}) → display=({:.1}, {:.1})",
+        brightest.0, brightest.1, brightest_disp.0, brightest_disp.1
+    );
 
-    // Variant A: y as-is
+    // Variant A: y as-is (display coords = detector coords × scale).
     {
         let img = rgb_from_processed(&full)?;
         let mut img = img;
         for &(x, y) in &top {
-            draw_bigcross(&mut img, x as i32, y as i32, 20, Rgb([255, 0, 0]));
+            let (dx, dy) = to_disp((x, y));
+            draw_reticle(&mut img, dx as i32, dy as i32, Rgb([255, 0, 0]));
         }
-        let crop = crop_around(&img, brightest.0 as i32, brightest.1 as i32, 1200);
+        let crop = crop_around(&img, brightest_disp.0 as i32, brightest_disp.1 as i32, 1200);
         let path = output_dir.join(format!("{frame_id}_crop_y_asis.png"));
         crop.save(&path)?;
         println!("wrote:  {}", path.display());
     }
 
-    // Variant B: y flipped (height - 1 - y)
+    // Variant B: y flipped (h - 1 - scaled_y). The Y flip happens AFTER the
+    // detector→display scale conversion so the flip is in display coords.
+    let fy = |y: f64| h as f64 - 1.0 - y;
     {
         let img = rgb_from_processed(&full)?;
         let mut img = img;
-        let fy = |y: f64| h as f64 - 1.0 - y;
         for &(x, y) in &top {
-            draw_bigcross(&mut img, x as i32, fy(y) as i32, 20, Rgb([0, 255, 255]));
+            let (dx, dy) = to_disp((x, y));
+            draw_reticle(&mut img, dx as i32, fy(dy) as i32, Rgb([0, 255, 255]));
         }
-        let crop = crop_around(&img, brightest.0 as i32, fy(brightest.1) as i32, 1200);
+        let crop = crop_around(&img, brightest_disp.0 as i32, fy(brightest_disp.1) as i32, 1200);
         let path = output_dir.join(format!("{frame_id}_crop_y_flipped.png"));
         crop.save(&path)?;
         println!("wrote:  {}", path.display());
     }
 
+    // Variant C: tight 200×200 close-up centered on the brightest centroid
+    // in each Y convention. A real bright star is ~5-10 px wide on the
+    // converter output and unambiguously visible inside the open-center
+    // reticle if the centroid is correct.
+    {
+        let img = rgb_from_processed(&full)?;
+        let mut img = img;
+        draw_reticle(&mut img, brightest_disp.0 as i32, brightest_disp.1 as i32, Rgb([255, 0, 0]));
+        let crop = crop_around(&img, brightest_disp.0 as i32, brightest_disp.1 as i32, 200);
+        let path = output_dir.join(format!("{frame_id}_brightest_y_asis_200px.png"));
+        crop.save(&path)?;
+        println!(
+            "wrote:  {} (display ({:.1}, {:.1}))",
+            path.display(),
+            brightest_disp.0,
+            brightest_disp.1
+        );
+    }
+    {
+        let img = rgb_from_processed(&full)?;
+        let mut img = img;
+        draw_reticle(&mut img, brightest_disp.0 as i32, fy(brightest_disp.1) as i32, Rgb([0, 255, 255]));
+        let crop = crop_around(&img, brightest_disp.0 as i32, fy(brightest_disp.1) as i32, 200);
+        let path = output_dir.join(format!("{frame_id}_brightest_y_flipped_200px.png"));
+        crop.save(&path)?;
+        println!(
+            "wrote:  {} (display ({:.1}, {:.1}))",
+            path.display(),
+            brightest_disp.0,
+            fy(brightest_disp.1)
+        );
+    }
+
     Ok(())
 }
 
-fn draw_bigcross(img: &mut RgbImage, cx: i32, cy: i32, size: i32, c: Rgb<u8>) {
+/// Open-center reticle: a hollow circle around the centroid plus four outward
+/// tick marks (N/S/E/W) that stop short of the center. Leaves the inner area
+/// visually unobstructed so you can see whether a star is actually there.
+///
+/// Sized large (inner radius 25 px, outer tick 50 px) so the reticle is clearly
+/// visible in 1200x1200 native-resolution crops. Two-pixel stroke thickness
+/// keeps it visible against bright star halos.
+fn draw_reticle(img: &mut RgbImage, cx: i32, cy: i32, c: Rgb<u8>) {
+    let r_in: i32 = 25;
+    let r_tick_start: i32 = 32;
+    let r_tick_end: i32 = 50;
+
+    // Hollow circle (3-pixel-thick stroke).
+    for r in r_in..=(r_in + 2) {
+        draw_hollow_circle_mut(img, (cx, cy), r, c);
+    }
+
+    // Four outward tick marks: N, S, E, W. Each tick is 3 px thick.
     let (w, h) = (img.width() as i32, img.height() as i32);
-    for thickness in 0..=1 {
-        for k in -size..=size {
-            for t in &[thickness, -thickness] {
-                let x = cx + k;
-                let y = cy + t;
-                if (0..w).contains(&x) && (0..h).contains(&y) {
-                    img.put_pixel(x as u32, y as u32, c);
-                }
-                let x = cx + t;
-                let y = cy + k;
-                if (0..w).contains(&x) && (0..h).contains(&y) {
-                    img.put_pixel(x as u32, y as u32, c);
-                }
-            }
+    let put = |img: &mut RgbImage, x: i32, y: i32| {
+        if (0..w).contains(&x) && (0..h).contains(&y) {
+            img.put_pixel(x as u32, y as u32, c);
+        }
+    };
+    for r in r_tick_start..=r_tick_end {
+        for thick in -1..=1 {
+            // N (up), S (down)
+            put(img, cx + thick, cy - r);
+            put(img, cx + thick, cy + r);
+            // E (right), W (left)
+            put(img, cx + r, cy + thick);
+            put(img, cx - r, cy + thick);
         }
     }
 }

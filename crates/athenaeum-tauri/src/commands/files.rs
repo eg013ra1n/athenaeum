@@ -62,6 +62,23 @@ pub async fn get_frames_with_missing_metadata(
     })
 }
 
+/// LIGHT frames that have never been plate-solved. Powers the "Unsolved" tab
+/// of the missing-metadata UI — surfaces frames whose mount-recorded RA/Dec
+/// is present but never verified, which the existing missing-coords filter
+/// silently excludes.
+#[tauri::command]
+pub async fn get_unsolved_light_frames(
+    state: State<'_, AppState>,
+) -> Result<Vec<MissingMetadataRow>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_unsolved_light_frames(&conn).map_err(|e| {
+        eprintln!("get_unsolved_light_frames failed: {}", e);
+        e.to_string()
+    })
+}
+
 /// Bulk-update metadata fields (camera / date_obs / imagetyp / is_master) on
 /// a set of frames. DB-only — the FITS files on disk are NOT rewritten.
 /// Returns the number of rows updated.
