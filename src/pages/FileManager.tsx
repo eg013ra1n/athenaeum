@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { pickDirectory } from '../api/desktop';
 import { isTauri } from '../utils/platform';
@@ -6,7 +7,7 @@ import { api } from '../api';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
 import { format } from 'date-fns';
-import DualPaneFileBrowser from '../components/dualpane/DualPaneFileBrowser';
+import DualPaneFileBrowser, { type DualPaneRevealRequest } from '../components/dualpane/DualPaneFileBrowser';
 import type { ScanResult, RelinkResult, MissingFileRecord } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
@@ -26,6 +27,23 @@ export default function FileManager() {
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
+  const [browserReveal, setBrowserReveal] = useState<DualPaneRevealRequest | undefined>(undefined);
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  // External pages (e.g. Missing Metadata) can hand off a file path via
+  // `navigate('/files', { state: { reveal: { path, token } } })`. Switch to
+  // the Browse Files tab, forward the reveal request to the dual-pane
+  // browser, and clear the location state so back-navigation doesn't
+  // re-trigger the reveal.
+  useEffect(() => {
+    const state = location.state as { reveal?: DualPaneRevealRequest } | null;
+    const incoming = state?.reveal;
+    if (!incoming) return;
+    setActiveTab('browse');
+    setBrowserReveal(incoming);
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.state, location.pathname, navigate]);
   const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [missingMetadataCount, setMissingMetadataCount] = useState<number | null>(null);
@@ -641,7 +659,7 @@ export default function FileManager() {
           </div>
         ) : (
           <div className="flex-1 min-h-0">
-            <DualPaneFileBrowser scanRoots={scanRoots} />
+            <DualPaneFileBrowser scanRoots={scanRoots} reveal={browserReveal} />
           </div>
         )
       )}

@@ -6,6 +6,7 @@ import {
   Camera,
   Calendar,
   Tag,
+  Trash2,
   X,
   RefreshCw,
 } from 'lucide-react';
@@ -19,6 +20,7 @@ export interface EligibleCounts {
   setCamera: number;
   setDate: number;
   setType: number;
+  blackHole: number;
 }
 
 interface MissingMetadataToolbarProps {
@@ -37,6 +39,7 @@ interface MissingMetadataToolbarProps {
   onSetCamera: () => void;
   onSetDate: () => void;
   onSetType: () => void;
+  onBlackHole: () => void;
   onClearSelection: () => void;
 }
 
@@ -98,6 +101,7 @@ export const MissingMetadataToolbar: React.FC<MissingMetadataToolbarProps> = ({
   onSetCamera,
   onSetDate,
   onSetType,
+  onBlackHole,
   onClearSelection,
 }) => {
   return (
@@ -194,6 +198,20 @@ export const MissingMetadataToolbar: React.FC<MissingMetadataToolbarProps> = ({
         disabled={eligible.setType === 0}
         disabledTitle="No selected frames are missing a frame type"
         colorClass="bg-surface-hover border border-border text-content-secondary hover:text-content"
+      />
+
+      <span className="text-border h-7 flex items-center">|</span>
+
+      {/* Destructive action: send selected frames to the Black Hole. Reversible
+          from the Black Hole tab — soft-delete, not file-system delete. */}
+      <ActionButton
+        icon={<Trash2 size={12} />}
+        label="Black Hole"
+        subLabel={selectedCount > 0 ? `${eligible.blackHole} of ${selectedCount}` : 'Select frames'}
+        onClick={onBlackHole}
+        disabled={eligible.blackHole === 0}
+        disabledTitle="No frames selected"
+        colorClass="bg-error hover:bg-error/80 text-white"
       />
 
       <span className="text-border h-7 flex items-center">|</span>

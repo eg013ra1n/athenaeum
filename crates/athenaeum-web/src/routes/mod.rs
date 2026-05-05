@@ -63,7 +63,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_camera_directories", post(files::get_camera_directories))
         .route("/api/get_camera_directory_contents", post(files::get_camera_directory_contents))
         .route("/api/get_frames_with_missing_metadata", post(files::get_frames_with_missing_metadata))
-        .route("/api/get_unsolved_light_frames", post(files::get_unsolved_light_frames))
         .route("/api/bulk_update_frame_metadata", post(files::bulk_update_frame_metadata))
         .route("/api/count_frame_metadata_relations", post(files::count_frame_metadata_relations))
         .route("/api/get_frame_memberships", post(files::get_frame_memberships))

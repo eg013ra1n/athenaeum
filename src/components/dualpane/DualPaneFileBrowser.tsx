@@ -18,6 +18,7 @@
 
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Folder,
   File as FileIcon,
   ChevronRight,
@@ -35,8 +36,10 @@ import {
   X as XIcon,
 } from 'lucide-react';
 import { api } from '../../api';
-import type { FileWithFrame, ScanRootWithAvailability } from '../../types/models';
+import { ImageType } from '../../types/models';
+import type { FileWithFrame, Frame, ScanRootWithAvailability } from '../../types/models';
 import BlinkViewer from '../BlinkViewer';
+import { computeMissingFlags, type MissingFlags } from '../missing-metadata/MissingMetadataTable';
 import CatalogSearch from './CatalogSearch';
 import MetadataPane from './MetadataPane';
 import {
@@ -59,8 +62,20 @@ const LS_RIGHT_CWD = 'dualpane.cwd.right';
 const LS_LEFT_SORT = 'dualpane.sortDir.left';
 const LS_RIGHT_SORT = 'dualpane.sortDir.right';
 
+/** External "reveal" command — when this prop's `token` changes, the browser
+ *  navigates the LEFT pane to the file's parent directory and pre-selects the
+ *  file. Used by callers like the Missing Metadata page to jump from a row
+ *  to the file in-place. The `token` is required so back-to-back reveals of
+ *  the same path still re-fire the effect (a stable string would otherwise
+ *  be a no-op). */
+export interface DualPaneRevealRequest {
+  path: string;
+  token: number;
+}
+
 interface Props {
   scanRoots: ScanRootWithAvailability[];
+  reveal?: DualPaneRevealRequest;
 }
 
 interface State {
@@ -177,7 +192,7 @@ interface ActiveOp {
   finished?: FileOpFinishedPayload;
 }
 
-export default function DualPaneFileBrowser({ scanRoots }: Props) {
+export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
   const [state, dispatch] = useReducer(reducer, scanRoots, initialState);
   const [listings, setListings] = useState<Record<PaneId, DirectoryListing | null>>({
     left: null,
@@ -496,6 +511,29 @@ export default function DualPaneFileBrowser({ scanRoots }: Props) {
       alert(`Rename failed: ${e}`);
     }
   }, [renameState, refreshBoth, state.activePane]);
+
+  // External reveal: caller (e.g. the Missing Metadata page) hands off a file
+  // path; we navigate the LEFT pane to its parent directory and select the
+  // file. Keyed on `reveal.token` so the same path can be revealed twice in
+  // a row by bumping the token.
+  useEffect(() => {
+    if (!reveal) return;
+    const parent = getParentPath(reveal.path);
+    if (!parent) return;
+    dispatch({ type: 'set_active', pane: 'left' });
+    dispatch({ type: 'set_cwd', pane: 'left', cwd: parent });
+    // Schedule selection so the cwd-change-driven listing load finishes first;
+    // the row render then has the path available to scroll-into-view.
+    window.setTimeout(() => {
+      dispatch({
+        type: 'set_selection',
+        pane: 'left',
+        selection: new Set([reveal.path]),
+        anchor: reveal.path,
+      });
+    }, 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reveal?.token]);
 
   // Catalog search reveal: navigate the active pane to the hit's parent dir,
   // and select the file.
@@ -1231,6 +1269,31 @@ interface FileListProps {
   onSetSelection: (selection: Set<string>, anchor?: string | null) => void;
 }
 
+/** Field labels for the missing-metadata tooltip on file rows. Order matches
+ *  how the labels read aloud (Coordinates, Object, Date, Camera, Type). */
+const MISSING_LABELS: Record<keyof MissingFlags, string> = {
+  coordinates: 'Coordinates',
+  object: 'Object',
+  date: 'Date',
+  camera: 'Camera',
+  type: 'Type',
+};
+
+/** List of missing-metadata field names that apply to this frame, given its
+ *  IMAGETYP. LIGHT frames are checked against all five flags; non-LIGHT
+ *  frames (darks/flats/bias/darkflats) only against date/camera/type — the
+ *  other two are legitimately absent on calibration frames. Returns [] when
+ *  nothing is missing or no frame row exists. */
+function applicableMissing(frame: Frame | null): (keyof MissingFlags)[] {
+  if (!frame) return [];
+  const flags = computeMissingFlags(frame);
+  const isLight = frame.imagetyp === ImageType.Light;
+  const keys: (keyof MissingFlags)[] = isLight
+    ? ['coordinates', 'object', 'date', 'camera', 'type']
+    : ['date', 'camera', 'type'];
+  return keys.filter((k) => flags[k]);
+}
+
 function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onToggleSelect, onSetSelection }: FileListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the focused (anchor) row visible — fires when cursor crosses the
@@ -1327,6 +1390,7 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
       {listing.files.map((f) => {
         const isSel = selection.has(f.file.path);
         const isOverridden = f.frame?.override_ === true;
+        const missingFields = applicableMissing(f.frame);
         return (
           <button
             key={f.file.path}
@@ -1338,6 +1402,15 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
           >
             <FileIcon size={14} className={isSel ? 'text-accent' : 'text-content-muted'} />
             <span className="truncate font-mono">{f.file.filename}</span>
+            {missingFields.length > 0 && (
+              <AlertTriangle
+                size={11}
+                className="flex-shrink-0 text-warning"
+                aria-label={`Missing metadata: ${missingFields.map((k) => MISSING_LABELS[k]).join(', ')}`}
+              >
+                <title>{`Missing: ${missingFields.map((k) => MISSING_LABELS[k]).join(', ')}`}</title>
+              </AlertTriangle>
+            )}
             {isOverridden && (
               <Pencil
                 size={11}

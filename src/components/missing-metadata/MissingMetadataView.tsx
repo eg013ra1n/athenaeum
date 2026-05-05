@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../../api';
 import { ImageType } from '../../types/models';
 import type { FileWithFrame, MissingMetadataRow } from '../../types/models';
@@ -11,21 +12,10 @@ import { SetFrameTypeModal } from './modals/SetFrameTypeModal';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from '../plate-solve/PlateSolveBatchPanel';
 import { FillObjectsPanel, type FillObjectsPanelHandle } from '../plate-solve/FillObjectsPanel';
 import BlinkViewer from '../BlinkViewer';
+import { ConfirmDialog } from '../ConfirmDialog';
+import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
 
 type ModalKind = 'camera' | 'date' | 'type' | null;
-
-/**
- * Two source modes share this view:
- *
- * - `missing-metadata` (default): the existing "Missing Metadata" workflow,
- *   backed by `get_frames_with_missing_metadata`. Filters to LIGHT frames
- *   whose RA/Dec are zero/null AND whose OBJCTRA/OBJCTDEC are zero/null.
- * - `unsolved`: LIGHT frames that have never been plate-solved, regardless
- *   of whether the FITS header populated RA/Dec. Backed by
- *   `get_unsolved_light_frames`. Surfaces the frames the missing-coords
- *   filter would otherwise hide (e.g. mount-pointed-but-never-verified).
- */
-type SourceMode = 'missing-metadata' | 'unsolved';
 
 interface MissingMetadataViewProps {
   /** Called with the total number of rows currently loaded, so the parent
@@ -34,7 +24,6 @@ interface MissingMetadataViewProps {
 }
 
 export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCountChange }) => {
-  const [source, setSource] = useState<SourceMode>('missing-metadata');
   const [allRows, setAllRows] = useState<MissingMetadataRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -44,6 +33,18 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
 
   const [showBlink, setShowBlink] = useState(false);
   const [openModal, setOpenModal] = useState<ModalKind>(null);
+  const [blackHoleConfirmOpen, setBlackHoleConfirmOpen] = useState(false);
+  const bulkBlackHole = useBulkMoveToBlackHole();
+  const navigate = useNavigate();
+
+  // Hand off a clicked filename to the FileManager / dual-pane browser via
+  // react-router location state. The browser keys its reveal effect on
+  // `token`, so a fresh value is required even for re-clicks of the same path.
+  const handleRevealInBrowser = useCallback((filePath: string) => {
+    navigate('/files', {
+      state: { reveal: { path: filePath, token: Date.now() } },
+    });
+  }, [navigate]);
 
   // Imperative handles into the plate-solve and find-object panels so the
   // toolbar buttons can trigger a batch directly without the panels showing
@@ -74,12 +75,9 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     try {
       setLoading(true);
       setError(null);
-      const rows =
-        source === 'unsolved'
-          ? await api.invoke<MissingMetadataRow[]>('get_unsolved_light_frames')
-          : await api.invoke<MissingMetadataRow[]>('get_frames_with_missing_metadata', {
-              category: 'all',
-            });
+      const rows = await api.invoke<MissingMetadataRow[]>('get_frames_with_missing_metadata', {
+        category: 'all',
+      });
       setAllRows(rows);
       // Preserve selection: drop IDs no longer present
       const presentIds = new Set(rows.map(r => r.frame.id).filter((id): id is number => id != null));
@@ -96,19 +94,11 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     } finally {
       setLoading(false);
     }
-  }, [source]);
+  }, []);
 
   useEffect(() => {
     void loadMissing();
   }, [loadMissing]);
-
-  // Reset filter chips when switching sources — chips only apply in
-  // missing-metadata mode (they describe which metadata gap to filter on),
-  // and silently restricting an unsolved-mode list to "missing coordinates"
-  // would be confusing.
-  useEffect(() => {
-    setActiveChips(new Set());
-  }, [source]);
 
   // Report the current row count up to the parent (for the tab badge).
   // While loading we clear the count so the badge doesn't show a stale number.
@@ -135,7 +125,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
   const filteredRows = useMemo(() => {
     if (activeChips.size === 0) return allRows;
     return allRows.filter(item => {
-      const flags = computeMissingFlags(item);
+      const flags = computeMissingFlags(item.frame);
       for (const chip of activeChips) {
         if (!flags[chip]) return false;
       }
@@ -174,6 +164,18 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     }
   }, [filteredRows, selectedIds]);
 
+  const handleToggleGroup = useCallback((frameIds: number[], select: boolean) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (select) {
+        for (const id of frameIds) next.add(id);
+      } else {
+        for (const id of frameIds) next.delete(id);
+      }
+      return next;
+    });
+  }, []);
+
   // ── Eligibility computation ──────────────────────────────────────────────
   // Computed from the full allRows set (not filtered) for selected IDs
 
@@ -188,21 +190,19 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     const setCameraIds: number[] = [];
     const setDateIds: number[] = [];
     const setTypeIds: number[] = [];
+    // Black Hole works on file IDs, not frame IDs — bulk_move_to_black_hole
+    // identifies rows in the `files` table.
+    const blackHoleFileIds: number[] = [];
 
     for (const item of selectedRows) {
       const frameId = item.frame.id!;
       const frame = item.frame;
-      const flags = computeMissingFlags(item);
+      const flags = computeMissingFlags(item.frame);
 
-      // Plate Solve eligibility differs by source mode:
-      //   - missing-metadata: LIGHT AND missing coordinates (the legacy rule —
-      //     the existing flow is only meant to seed coords on no-coord frames)
-      //   - unsolved: any LIGHT frame is eligible (the whole list is, by
-      //     definition, LIGHT frames lacking a plate_solves row, so the user
-      //     wants to (re)solve them whether or not they already have RA/Dec)
+      // Plate Solve: LIGHT AND missing coordinates. The existing flow is only
+      // meant to seed coords on no-coord frames.
       const plateSolveEligible =
-        frame.imagetyp === ImageType.Light &&
-        (source === 'unsolved' || flags.coordinates);
+        frame.imagetyp === ImageType.Light && flags.coordinates;
       if (plateSolveEligible) {
         plateSolveIds.push(frameId);
       }
@@ -227,6 +227,9 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
 
       // Set Type: missing imagetyp (any type)
       if (flags.type) setTypeIds.push(frameId);
+
+      // Black Hole: any selected frame whose file row has an id
+      if (item.file.id != null) blackHoleFileIds.push(item.file.id);
     }
 
     const eligible: EligibleCounts = {
@@ -236,6 +239,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
       setCamera: setCameraIds.length,
       setDate: setDateIds.length,
       setType: setTypeIds.length,
+      blackHole: blackHoleFileIds.length,
     };
 
     return {
@@ -247,9 +251,10 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         setCamera: setCameraIds,
         setDate: setDateIds,
         setType: setTypeIds,
+        blackHole: blackHoleFileIds,
       },
     };
-  }, [allRows, selectedIds, source]);
+  }, [allRows, selectedIds]);
 
   // ── Rows for blink viewer ────────────────────────────────────────────────
   // BlinkViewer takes FileWithFrame[], not MissingMetadataRow[], so wrap
@@ -285,6 +290,25 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
 
   const handleBlink = () => setShowBlink(true);
 
+  const handleBlackHole = () => {
+    if (eligibleIds.blackHole.length === 0) return;
+    setBlackHoleConfirmOpen(true);
+  };
+
+  const handleConfirmBlackHole = useCallback(async () => {
+    setBlackHoleConfirmOpen(false);
+    if (eligibleIds.blackHole.length === 0) return;
+    try {
+      await bulkBlackHole.start(eligibleIds.blackHole, 'missing_metadata');
+      // Drop selection and reload — moved files won't appear in the next
+      // missing-metadata fetch.
+      setSelectedIds(new Set());
+      void loadMissing();
+    } catch {
+      // useBulkMoveToBlackHole already logs; surface as an inline error.
+    }
+  }, [bulkBlackHole, eligibleIds.blackHole, loadMissing]);
+
   // ── Reload callbacks ─────────────────────────────────────────────────────
 
   const handleSolveComplete = useCallback(() => { void loadMissing(); }, [loadMissing]);
@@ -308,40 +332,6 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         ref={toolbarRef}
         className="sticky top-0 z-20 bg-surface-elevated -mx-2 -mt-2 px-2 pt-2 rounded-t-lg"
       >
-        {/* Source-mode tabs: switch between the legacy "Missing Metadata"
-            list (frames the FITS pipeline left coordinate-blank) and the
-            new "Unsolved" list (LIGHT frames that have never received a
-            plate-solve, regardless of whether the header populated RA/Dec).
-            The Unsolved tab is the user-facing escape hatch for the bug
-            where frames with valid mount-recorded coords were silently
-            excluded from the plate-solve batch queue. */}
-        <div className="flex items-center gap-1 mb-2 border-b border-border">
-          <button
-            type="button"
-            onClick={() => setSource('missing-metadata')}
-            className={`px-3 py-1.5 text-sm rounded-t -mb-px border-b-2 ${
-              source === 'missing-metadata'
-                ? 'border-accent text-content'
-                : 'border-transparent text-content-muted hover:text-content'
-            }`}
-            title="Frames whose FITS files left coordinates / object / date / camera blank"
-          >
-            Missing Metadata
-          </button>
-          <button
-            type="button"
-            onClick={() => setSource('unsolved')}
-            className={`px-3 py-1.5 text-sm rounded-t -mb-px border-b-2 ${
-              source === 'unsolved'
-                ? 'border-accent text-content'
-                : 'border-transparent text-content-muted hover:text-content'
-            }`}
-            title="LIGHT frames that have never been plate-solved (regardless of whether the FITS header populated RA/Dec)"
-          >
-            Unsolved
-          </button>
-        </div>
-
         <MissingMetadataToolbar
           activeChips={activeChips}
           onToggleChip={toggleChip}
@@ -355,9 +345,52 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
           onSetCamera={() => setOpenModal('camera')}
           onSetDate={() => setOpenModal('date')}
           onSetType={() => setOpenModal('type')}
+          onBlackHole={handleBlackHole}
           onClearSelection={() => setSelectedIds(new Set())}
         />
       </div>
+
+      {/* Black-hole batch progress + result banner. Mirrors the
+          plate-solve / find-object panels in placement. */}
+      {bulkBlackHole.isRunning && (
+        <div className="mb-2 p-2 bg-surface rounded border border-border text-xs text-content-secondary">
+          {bulkBlackHole.progress
+            ? `Moving ${bulkBlackHole.progress.current.toLocaleString()} / ${bulkBlackHole.progress.total.toLocaleString()} to Black Hole…`
+            : 'Moving to Black Hole…'}
+        </div>
+      )}
+      {!bulkBlackHole.isRunning && bulkBlackHole.result && (bulkBlackHole.result.moved > 0 || bulkBlackHole.result.failed.length > 0) && (
+        <div
+          className={`mb-2 p-2 rounded border text-xs ${
+            bulkBlackHole.result.failed.length > 0
+              ? 'bg-warning-muted border-warning/50 text-warning'
+              : 'bg-success-muted border-success/50 text-success'
+          }`}
+        >
+          Moved {bulkBlackHole.result.moved.toLocaleString()} file{bulkBlackHole.result.moved === 1 ? '' : 's'} to Black Hole.
+          {bulkBlackHole.result.failed.length > 0
+            && ` ${bulkBlackHole.result.failed.length} failed.`}
+          <button
+            type="button"
+            onClick={() => bulkBlackHole.reset()}
+            className="ml-2 underline hover:no-underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+      {bulkBlackHole.error && !bulkBlackHole.isRunning && (
+        <div className="mb-2 p-2 rounded border border-error/50 bg-error-muted text-error text-xs">
+          Black Hole move failed: {bulkBlackHole.error}
+          <button
+            type="button"
+            onClick={() => bulkBlackHole.reset()}
+            className="ml-2 underline hover:no-underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Plate solve progress/completion panel — always mounted, driven
           imperatively by the toolbar button. Renders as an empty div when
@@ -383,6 +416,8 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         selectedIds={selectedIds}
         onToggleRow={handleToggleRow}
         onToggleAll={handleToggleAll}
+        onToggleGroup={handleToggleGroup}
+        onRevealInBrowser={handleRevealInBrowser}
         stickyHeaderTop={toolbarHeight}
       />
 
@@ -421,6 +456,16 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         eligibleFrameIds={eligibleIds.setType}
         onApplied={handleModalApplied}
         onCancel={() => setOpenModal(null)}
+      />
+
+      <ConfirmDialog
+        isOpen={blackHoleConfirmOpen}
+        title="Move to Black Hole"
+        message={`Move ${eligibleIds.blackHole.length.toLocaleString()} file${eligibleIds.blackHole.length === 1 ? '' : 's'} to the Black Hole? This is reversible — you can restore from the Black Hole tab.`}
+        confirmText="Move"
+        confirmDanger
+        onConfirm={() => { void handleConfirmBlackHole(); }}
+        onCancel={() => setBlackHoleConfirmOpen(false)}
       />
     </div>
   );

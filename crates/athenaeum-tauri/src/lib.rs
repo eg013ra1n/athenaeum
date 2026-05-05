@@ -169,7 +169,6 @@ pub fn run() {
             commands::get_files,
             commands::get_files_by_directory,
             commands::get_frames_with_missing_metadata,
-            commands::get_unsolved_light_frames,
             commands::bulk_update_frame_metadata,
             commands::count_frame_metadata_relations,
             commands::get_frame_memberships,

@@ -829,10 +829,7 @@ pub fn get_files_by_directory_for_camera(
 /// `metadata_hash`. That covers both exact-byte duplicates (content hash) and
 /// "same header/size/filename" near-duplicates (metadata hash), matching how
 /// the rest of the app treats duplicates.
-/// SELECT clause for `MissingMetadataRow` rows. Kept as a constant so
-/// `get_frames_with_missing_metadata` and `get_unsolved_light_frames` stay
-/// in lock-step on column ordering — the row-mapping closure below relies on
-/// the column indexes being identical.
+/// SELECT clause for `MissingMetadataRow` rows.
 const MISSING_METADATA_SELECT: &str =
     "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
             f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
@@ -970,36 +967,6 @@ pub fn get_frames_with_missing_metadata(
         select = MISSING_METADATA_SELECT,
         imagetyp_filter = imagetyp_filter,
         missing_clause = missing_clause,
-    );
-
-    let mut stmt = conn.prepare(&query)?;
-    let results = stmt.query_map([], map_missing_metadata_row)?;
-    results.collect()
-}
-
-/// LIGHT frames that have never been plate-solved.
-///
-/// Mirrors the row mapping of [`get_frames_with_missing_metadata`] but
-/// gates differently: any LIGHT frame that has no `plate_solves` row is
-/// returned, regardless of whether numeric `ra/dec` or sexagesimal
-/// `objctra/objctdec` are populated. Used by the "Unsolved" tab in the
-/// missing-metadata UI to surface frames whose mount-recorded coordinates
-/// are present but never verified — the existing missing-coords filter
-/// silently excludes those frames so they would otherwise stay in limbo.
-///
-/// `plate_solves.frame_id` has a UNIQUE constraint, so `LEFT JOIN ... WHERE
-/// ps.id IS NULL` reliably identifies "never been solved".
-pub fn get_unsolved_light_frames(conn: &Connection) -> Result<Vec<MissingMetadataRow>> {
-    let query = format!(
-        "{select}
-         FROM files f
-         INNER JOIN frames fr ON f.id = fr.file_id
-         LEFT JOIN duplicate_group_files dgf ON dgf.file_id = f.id
-         LEFT JOIN plate_solves ps ON ps.frame_id = fr.id
-         WHERE UPPER(fr.imagetyp) = 'LIGHT' AND ps.id IS NULL
-         GROUP BY f.id
-         ORDER BY f.modified_at DESC",
-        select = MISSING_METADATA_SELECT,
     );
 
     let mut stmt = conn.prepare(&query)?;
