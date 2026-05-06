@@ -16,10 +16,12 @@
 //   - Drag-and-drop between panes.
 //   - Virtualized list (current implementation handles a few thousand rows fine).
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Folder,
+  FolderPlus,
   File as FileIcon,
   ChevronRight,
   Home,
@@ -27,15 +29,20 @@ import {
   ArrowDownAZ,
   ArrowDownZA,
   CornerLeftUp,
+  Info,
   Loader2,
   FileText,
   Filter as FilterIcon,
+  MoveRight,
   Pencil,
+  Play,
   RefreshCw,
   Sliders,
+  Trash2,
   X as XIcon,
 } from 'lucide-react';
 import { api } from '../../api';
+import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
 import { ImageType } from '../../types/models';
 import type { FileWithFrame, Frame, ScanRootWithAvailability } from '../../types/models';
 import BlinkViewer from '../BlinkViewer';
@@ -56,6 +63,59 @@ import {
   getClampedParent,
   getParentPath,
 } from './types';
+
+/** Click-equivalent of one of the keyboard shortcuts that drive the active
+ *  pane. Visual style matches the Analysis-tab toolbar (icon-only square
+ *  button with a small label below). The `title` carries the keyboard
+ *  shortcut so hovering teaches it.
+ *
+ *  Variant maps to the same color semantics used on the Analysis tab:
+ *    neutral - bordered surface, low-emphasis (e.g. selection helpers)
+ *    accent  - blue, primary action (e.g. Move, Rename)
+ *    success - green, creates something (e.g. Mkdir)
+ *    error   - red, destructive (e.g. Delete)
+ *    cyan    - viewer / playback (e.g. Blink) */
+type ShortcutVariant = 'neutral' | 'accent' | 'success' | 'error' | 'cyan';
+
+const SHORTCUT_VARIANT_CLASSES: Record<ShortcutVariant, string> = {
+  neutral:
+    'bg-surface-hover hover:bg-surface-elevated text-content-secondary border border-border',
+  accent: 'bg-accent hover:bg-accent-hover text-white',
+  success: 'bg-success hover:brightness-90 text-white',
+  error: 'bg-error hover:brightness-90 text-white',
+  cyan: 'bg-cyan-600 hover:bg-cyan-700 text-white',
+};
+
+function ShortcutButton({
+  icon,
+  label,
+  title,
+  disabled,
+  variant = 'neutral',
+  onClick,
+}: {
+  icon: ReactNode;
+  label: string;
+  title: string;
+  disabled?: boolean;
+  variant?: ShortcutVariant;
+  onClick: () => void;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={disabled}
+        title={title}
+        className={`w-10 h-7 inline-flex items-center justify-center text-xs font-medium rounded-lg transition-colors disabled:opacity-30 disabled:cursor-default ${SHORTCUT_VARIANT_CLASSES[variant]}`}
+      >
+        {icon}
+      </button>
+      <span className="text-[10px] text-content-muted leading-tight">{label}</span>
+    </div>
+  );
+}
 
 const LS_LEFT_CWD = 'dualpane.cwd.left';
 const LS_RIGHT_CWD = 'dualpane.cwd.right';
@@ -202,7 +262,17 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
   const [errors, setErrors] = useState<Record<PaneId, string | null>>({ left: null, right: null });
   const [activeOps, setActiveOps] = useState<Record<number, ActiveOp>>({});
   const [confirmMove, setConfirmMove] = useState<{ count: number; dest: string; sources: string[] } | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<{ count: number; bytes: number; targets: string[] } | null>(null);
+  /** "Delete" in the dual-pane is the safe Black Hole move (not a permanent
+   *  delete). Black Hole works on file IDs and is files-only — selected
+   *  subdirectories are recorded here and shown as skipped in the dialog. */
+  const [confirmDelete, setConfirmDelete] = useState<{
+    count: number;
+    bytes: number;
+    targets: string[];
+    fileIds: number[];
+    skippedDirs: number;
+  } | null>(null);
+  const bulkBlackHole = useBulkMoveToBlackHole();
   const [mkdirState, setMkdirState] = useState<{ destDir: string } | null>(null);
   const [renameState, setRenameState] = useState<{ oldPath: string; oldName: string } | null>(null);
   const [blinkFrames, setBlinkFrames] = useState<FileWithFrame[] | null>(null);
@@ -411,44 +481,62 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
   }, [confirmMove, state.activePane]);
 
   // Delete handler: F8.
+  /** "Delete" in the dual-pane is the safe Black Hole move. We split the
+   *  active selection into files (resolved to catalog file IDs that
+   *  bulk_move_to_black_hole accepts) and subdirectories (which Black Hole
+   *  cannot accept — they're skipped and counted for the confirm dialog). */
   const enqueueDelete = useCallback(() => {
     const active = state.panes[state.activePane];
-    const sel = Array.from(active.selection);
-    if (sel.length === 0) return;
+    if (active.selection.size === 0) return;
     const listing = listings[state.activePane];
-    let bytes = 0;
-    if (listing) {
-      for (const f of listing.files) {
-        if (active.selection.has(f.file.path)) bytes += f.file.size;
-      }
+    if (!listing) return;
+
+    const selectedFiles = listing.files.filter((f) => active.selection.has(f.file.path));
+    const selectedDirs = listing.subdirectories.filter((s) => active.selection.has(s));
+
+    if (selectedFiles.length === 0) {
+      // User selected only directories — Black Hole holds files only, so
+      // there's nothing to do. Tell them why.
+      alert(
+        `Black Hole holds files only — selected directories cannot be moved.\n\n` +
+        `Select at least one file (deselect the ${selectedDirs.length} folder${selectedDirs.length === 1 ? '' : 's'} or pick files instead).`,
+      );
+      return;
     }
-    setConfirmDelete({ count: sel.length, bytes, targets: sel });
+
+    const fileIds = selectedFiles
+      .map((f) => f.file.id)
+      .filter((id): id is number => id != null);
+    const targets = selectedFiles.map((f) => f.file.path);
+    const bytes = selectedFiles.reduce((sum, f) => sum + f.file.size, 0);
+
+    setConfirmDelete({
+      count: selectedFiles.length,
+      bytes,
+      targets,
+      fileIds,
+      skippedDirs: selectedDirs.length,
+    });
   }, [listings, state.activePane, state.panes]);
 
   const performDelete = useCallback(async () => {
     if (!confirmDelete) return;
-    const active = state.panes[state.activePane];
-    const targets = Array.from(active.selection);
+    const { fileIds } = confirmDelete;
     setConfirmDelete(null);
+    if (fileIds.length === 0) return;
     try {
-      const opId = await api.invoke<number>('enqueue_delete_operation', { targets });
-      setActiveOps(prev => ({
-        ...prev,
-        [opId]: {
-          operationId: opId,
-          kind: 'delete',
-          current: 0,
-          total: targets.length,
-          stage: 'pending',
-          message: `Queued: delete ${targets.length} items`,
-        },
-      }));
+      await bulkBlackHole.start(fileIds, 'file_browser');
+      // Drop active-pane selection and refresh both panes — moved files no
+      // longer live at their original path and the quarantine folder may
+      // be visible in either pane.
       dispatch({ type: 'set_selection', pane: state.activePane, selection: new Set() });
-    } catch (e) {
-      console.error('enqueue_delete_operation failed:', e);
-      alert(`Delete failed to enqueue: ${e}`);
+      reloadPane('left');
+      reloadPane('right');
+    } catch {
+      // useBulkMoveToBlackHole already logs and surfaces the error; the
+      // inline banner below renders bulkBlackHole.error.
     }
-  }, [confirmDelete, state.activePane, state.panes]);
+  }, [confirmDelete, bulkBlackHole, state.activePane, reloadPane]);
 
   // Mkdir handler: F7.
   const openMkdir = useCallback(() => {
@@ -778,6 +866,124 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
     // h-full here stretches the dual-pane to the exact remaining viewport
     // height — no fragile vh calc, no leftover space below.
     <div className="flex flex-col gap-3 h-full min-h-0">
+      {/* Shortcut toolbar — clickable equivalents of the keyboard shortcuts
+          driving the active pane. Visual style matches the Analysis-tab
+          toolbar (Analysis is the canonical reference for app-wide button
+          styling). Pane-navigation shortcuts (Tab / Enter / Backspace) are
+          NOT buttons — they're keyboard-only and surfaced as notes in the
+          status bar below. Both surfaces call the same handlers, so
+          keyboard shortcuts continue to work unchanged. */}
+      <div className="flex items-start gap-2 flex-wrap">
+        {/* Selection: count-clear + invert split button — mirrors the
+            Analysis-tab pattern. Left half shows the active pane's selection
+            count and clears it on click; right half inverts the active
+            pane's selection against the visible listing. ⌘A keyboard
+            shortcut continues to do "select all" (see status bar note). */}
+        <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+          <div className="flex h-7">
+            <button
+              type="button"
+              onClick={() =>
+                dispatch({
+                  type: 'set_selection',
+                  pane: state.activePane,
+                  selection: new Set(),
+                })
+              }
+              disabled={state.panes[state.activePane].selection.size === 0}
+              className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-l-lg border border-r-0 border-border transition-colors disabled:opacity-30 disabled:cursor-default"
+              title="Clear selection"
+            >
+              {state.panes[state.activePane].selection.size}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const listing = visibleListing(state.activePane);
+                if (!listing) return;
+                const cur = state.panes[state.activePane].selection;
+                const all = [
+                  ...listing.subdirectories,
+                  ...listing.files.map((f) => f.file.path),
+                ];
+                const inverted = new Set<string>();
+                for (const p of all) {
+                  if (!cur.has(p)) inverted.add(p);
+                }
+                dispatch({
+                  type: 'set_selection',
+                  pane: state.activePane,
+                  selection: inverted,
+                });
+              }}
+              disabled={!visibleListing(state.activePane)}
+              className="w-7 h-7 inline-flex items-center justify-center text-xs font-medium bg-surface-hover hover:bg-surface-elevated text-content-secondary rounded-r-lg border border-border transition-colors disabled:opacity-30 disabled:cursor-default"
+              title="Invert selection"
+            >
+              <ArrowLeftRight size={10} />
+            </button>
+          </div>
+          <span className="text-[10px] text-content-muted leading-tight">Selection</span>
+        </div>
+
+        <span className="text-border h-7 flex items-center">|</span>
+
+        <ShortcutButton
+          variant="accent"
+          icon={<Pencil size={12} />}
+          label="Rename"
+          title="Rename selected item (F2)"
+          disabled={state.panes[state.activePane].selection.size !== 1}
+          onClick={openRename}
+        />
+        <ShortcutButton
+          variant="accent"
+          icon={<MoveRight size={12} />}
+          label="Move"
+          title="Move active selection to opposite pane's directory (F6)"
+          disabled={state.panes[state.activePane].selection.size === 0}
+          onClick={() => void enqueueMove()}
+        />
+        <ShortcutButton
+          variant="success"
+          icon={<FolderPlus size={12} />}
+          label="Mkdir"
+          title="Create new directory in active pane (F7)"
+          onClick={openMkdir}
+        />
+        <ShortcutButton
+          variant="error"
+          icon={<Trash2 size={12} />}
+          label="Delete"
+          title="Move active selection to Black Hole (F8)"
+          disabled={state.panes[state.activePane].selection.size === 0}
+          onClick={enqueueDelete}
+        />
+
+        <span className="text-border h-7 flex items-center">|</span>
+
+        <ShortcutButton
+          variant="cyan"
+          icon={<Play size={12} />}
+          label="Blink"
+          title="Open Blink viewer with active selection (Space)"
+          disabled={state.panes[state.activePane].selection.size === 0}
+          onClick={openBlink}
+        />
+        <ShortcutButton
+          variant="neutral"
+          icon={<Info size={12} />}
+          label="Meta"
+          title="Toggle metadata pane on opposite side (⌘I)"
+          onClick={() =>
+            dispatch({
+              type: 'toggle_mode',
+              pane: state.activePane === 'left' ? 'right' : 'left',
+            })
+          }
+        />
+      </div>
+
       {/* Search */}
       <CatalogSearch onReveal={onSearchReveal} />
 
@@ -844,6 +1050,50 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
         </div>
       )}
 
+      {/* Black Hole batch progress / result / error — same style as on the
+          Missing Metadata page so the feedback feels uniform across surfaces. */}
+      {bulkBlackHole.isRunning && (
+        <div className="p-2 bg-surface rounded border border-border text-xs text-content-secondary">
+          {bulkBlackHole.progress
+            ? `Moving ${bulkBlackHole.progress.current.toLocaleString()} / ${bulkBlackHole.progress.total.toLocaleString()} to Black Hole…`
+            : 'Moving to Black Hole…'}
+        </div>
+      )}
+      {!bulkBlackHole.isRunning
+        && bulkBlackHole.result
+        && (bulkBlackHole.result.moved > 0 || bulkBlackHole.result.failed.length > 0) && (
+        <div
+          className={`p-2 rounded border text-xs ${
+            bulkBlackHole.result.failed.length > 0
+              ? 'bg-warning-muted border-warning/50 text-warning'
+              : 'bg-success-muted border-success/50 text-success'
+          }`}
+        >
+          Moved {bulkBlackHole.result.moved.toLocaleString()} file
+          {bulkBlackHole.result.moved === 1 ? '' : 's'} to Black Hole.
+          {bulkBlackHole.result.failed.length > 0 && ` ${bulkBlackHole.result.failed.length} failed.`}
+          <button
+            type="button"
+            onClick={() => bulkBlackHole.reset()}
+            className="ml-2 underline hover:no-underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+      {bulkBlackHole.error && !bulkBlackHole.isRunning && (
+        <div className="p-2 rounded border border-error/50 bg-error-muted text-error text-xs">
+          Black Hole move failed: {bulkBlackHole.error}
+          <button
+            type="button"
+            onClick={() => bulkBlackHole.reset()}
+            className="ml-2 underline hover:no-underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Status bar */}
       <div className="flex items-center justify-between border-t border-border pt-2 text-xs text-content-muted">
         <div>
@@ -855,7 +1105,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
           {activePaneListing && ` · ${activePaneListing.files.length} files`}
         </div>
         <div className="font-mono">
-          Tab · ↑↓ · Enter · ⌫ Up · Space Blink · ⌘A All · Shift+click range · F2 Rename · F6 Move · F7 Mkdir · F8 Delete · ⌘I Meta
+          Tab switch · Enter open · ⌫ up · ↑↓ navigate · Shift+click range · ⌘A select all
         </div>
       </div>
 
@@ -875,21 +1125,34 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
         </Modal>
       )}
 
-      {/* Delete confirmation */}
+      {/* Move-to-Black-Hole confirmation. F8 / the toolbar Delete button no
+          longer trigger a permanent delete — files are moved to the Black
+          Hole quarantine where they can be restored from the Black Hole
+          page. Selected subdirectories (if any) are skipped. */}
       {confirmDelete && (
         <Modal
           onClose={() => setConfirmDelete(null)}
-          title={`Permanently delete ${confirmDelete.count} items?`}
+          title={`Move ${confirmDelete.count} file${confirmDelete.count === 1 ? '' : 's'} to Black Hole?`}
         >
           <ItemNameList paths={confirmDelete.targets} />
           <div className="text-sm text-content-muted mb-4">
-            {formatBytes(confirmDelete.bytes)} will be removed from disk and the catalog. This
-            cannot be undone.
+            {formatBytes(confirmDelete.bytes)} will be moved to the Black Hole quarantine.
+            They can be restored from the Black Hole page.
+            {confirmDelete.skippedDirs > 0 && (
+              <>
+                {' '}
+                <span className="text-warning">
+                  {confirmDelete.skippedDirs} selected folder
+                  {confirmDelete.skippedDirs === 1 ? ' will be' : 's will be'} skipped — Black Hole
+                  holds files only.
+                </span>
+              </>
+            )}
           </div>
           <ModalButtons
             onCancel={() => setConfirmDelete(null)}
-            primaryLabel="Delete"
-            primaryClass="bg-red-600 text-white hover:bg-red-700"
+            primaryLabel="Move to Black Hole"
+            primaryClass="bg-error text-white hover:brightness-90"
             onPrimary={performDelete}
           />
         </Modal>

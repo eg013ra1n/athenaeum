@@ -84,29 +84,18 @@ function display(v: string): string {
   return v === VARIES ? '(varies)' : v || '(empty)';
 }
 
-/** Format decimal-degree RA as HH:MM:SS.s (sexagesimal). Mirrors
- *  `coordinates::format_ra_sexagesimal` on the Rust side so the catalog
- *  value and the FITS-header original are rendered in the same form. */
-function formatRaSexagesimal(deg: number): string {
-  const hours = deg / 15;
-  const h = Math.floor(hours);
-  const minutesF = (hours - h) * 60;
-  const m = Math.floor(minutesF);
-  const s = (minutesF - m) * 60;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s.toFixed(1).padStart(4, '0')}`;
+/** True for IMAGETYP values that represent on-sky light frames (single
+ *  exposures or stacked masters). Coordinates / plate-solve only make
+ *  sense for these — calibration frames legitimately have no RA/Dec.
+ *  Match the same uppercase + space-stripping normalization used by the
+ *  imagetyp edit state, so 'Light', 'MASTERLIGHT', 'Master Light' all
+ *  compare equal. */
+function isLightLike(v: string | null | undefined): boolean {
+  if (!v) return false;
+  const norm = String(v).toUpperCase().replace(/\s+/g, '');
+  return norm === 'LIGHT' || norm === 'MASTERLIGHT';
 }
 
-/** Format decimal-degree DEC as ±DD:MM:SS.s (sexagesimal). Mirrors
- *  `coordinates::format_dec_sexagesimal` on the Rust side. */
-function formatDecSexagesimal(deg: number): string {
-  const sign = deg < 0 ? '-' : '+';
-  const abs = Math.abs(deg);
-  const d = Math.floor(abs);
-  const minutesF = (abs - d) * 60;
-  const m = Math.floor(minutesF);
-  const s = (minutesF - m) * 60;
-  return `${sign}${String(d).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s.toFixed(1).padStart(4, '0')}`;
-}
 
 export default function MetadataPane({ otherListing, otherSelection, onSaved }: Props) {
   // Resolve selected FileWithFrame entries.
@@ -144,6 +133,12 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       // value is plate-solving (see the "Plate Solve" button below).
       ra: commonValueNum(selectedItems.map((f) => f.frame?.ra)),
       dec: commonValueNum(selectedItems.map((f) => f.frame?.dec)),
+      // FITS-header sexagesimal strings, kept separate from the numeric
+      // ra/dec columns. Used to render a forensic secondary line on the
+      // RA/DEC rows when the literal header string disagrees with what the
+      // numeric (plate-solved) value would format to.
+      objctra: commonValueStr(selectedItems.map((f) => f.frame?.objctra)),
+      objctdec: commonValueStr(selectedItems.map((f) => f.frame?.objctdec)),
       rotation: commonValueNum(selectedItems.map((f) => f.frame?.rotation)),
     };
   }, [selectedItems]);
@@ -486,6 +481,20 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     );
   }
 
+  // RA / DEC and the plate-solve action only make sense for on-sky light
+  // frames. For calibration frames (Dark / Flat / Bias / DarkFlat and their
+  // masters) the coordinates are meaningless, so we hide both. If the user
+  // is in the middle of changing IMAGETYP, treat the pending value as the
+  // effective type — flipping a calibration frame to LIGHT in the edit row
+  // immediately re-exposes RA/DEC + Plate Solve.
+  const effectiveImagetypIsLight = (() => {
+    const editState = edits.imagetyp;
+    if (editState?.enabled && typeof editState.value === 'string' && editState.value !== '') {
+      return isLightLike(editState.value);
+    }
+    return selectedItems.some((it) => isLightLike(it.frame?.imagetyp ?? null));
+  })();
+
   /** Field row spec — numeric, free-text, or dropdown. `originalKey` maps
    *  the field to the matching `FrameOriginalSnapshot` field for the revert
    *  button (omit for fields the snapshot doesn't carry). */
@@ -502,12 +511,17 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     options?: string[];
     /** Snapshot key — when present a 🔄 revert button appears for overridden frames. */
     originalKey?: keyof FrameOriginalSnapshot;
-    /** RA/DEC: render as read-only sexagesimal, no input/checkbox. The only
+    /** RA/DEC: render as read-only, no input/checkbox. The only
      *  way to write a new value is plate-solving (see button below the
      *  field rows). The ↺ revert button still works — it pre-fills the edit
      *  state with the FITS-header decimal value so a normal save restores
      *  the original. */
     coordinate?: 'ra' | 'dec';
+    /** Generic read-only flag. Same render path as `coordinate` (no input,
+     *  no checkbox, just a value + optional revert) but without the numeric
+     *  comparison logic — used for the literal OBJCTRA/OBJCTDEC strings
+     *  which compare as plain strings. */
+    readOnly?: boolean;
   }> = [
     { key: 'object',   label: 'OBJECT',           maxLength: 64, originalKey: 'object' },
     { key: 'filter',   label: 'FILTER',           maxLength: 32, originalKey: 'filter' },
@@ -542,8 +556,18 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     { key: 'exptime',  label: 'EXPTIME (s)',      numeric: true, step: '0.001', min: 0.001, originalKey: 'exptime' },
     { key: 'ccdTemp',  label: 'CCD-TEMP (°C)',    numeric: true, step: '0.1',   min: -100, max: 100, originalKey: 'ccdTemp' },
     { key: 'dateObs',  label: 'DATE-OBS (ISO)',   maxLength: 32, placeholder: 'YYYY-MM-DDTHH:MM:SS', originalKey: 'dateObs' },
-    { key: 'ra',       label: 'RA (OBJCTRA)',     originalKey: 'ra',  coordinate: 'ra' },
-    { key: 'dec',      label: 'DEC (OBJCTDEC)',   originalKey: 'dec', coordinate: 'dec' },
+    ...(effectiveImagetypIsLight
+      ? [
+          { key: 'ra' as const,       label: 'RA',       originalKey: 'ra' as const,  coordinate: 'ra' as const },
+          // OBJCTRA/OBJCTDEC: read-only literal strings from the catalog.
+          // No `originalKey` because the FITS-header snapshot only stores
+          // parsed numeric ra/dec — reverting RA already re-derives OBJCTRA
+          // on save, so a separate revert here would be redundant.
+          { key: 'objctra' as const,  label: 'OBJCTRA',  readOnly: true },
+          { key: 'dec' as const,      label: 'DEC',      originalKey: 'dec' as const, coordinate: 'dec' as const },
+          { key: 'objctdec' as const, label: 'OBJCTDEC', readOnly: true },
+        ]
+      : []),
     { key: 'rotation', label: 'ROTATION (°)',     numeric: true, step: '0.1', min: -360, max: 360, originalKey: 'rotation' },
   ];
 
@@ -589,32 +613,22 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
             // still sees the per-frame originals on hover.
             const currentStr = String(cv ?? '');
             // For RA/DEC the underlying values are decimal degrees — show
-            // both the catalog and FITS-header values formatted as
-            // sexagesimal, and compare numerically (±1e-6) so display-level
-            // rounding doesn't fake a "differs" diff.
-            let displayCurrent = display(cv);
-            let displayOriginal = display(origVal);
+            // them verbatim so the user sees exactly what the catalog has.
+            // We still compute a numeric `coordsMatch` (±1e-6) so the revert
+            // marker doesn't fire on display-only rounding noise between the
+            // catalog value and the FITS-header snapshot.
+            const displayCurrent = display(cv);
+            const displayOriginal = display(origVal);
             let coordsMatch: boolean | null = null;
-            if (f.coordinate && cv !== VARIES && currentStr !== '') {
-              const n = Number(currentStr);
-              if (Number.isFinite(n)) {
-                displayCurrent = f.coordinate === 'ra'
-                  ? formatRaSexagesimal(n)
-                  : formatDecSexagesimal(n);
-              }
-            }
-            if (f.coordinate && origVal !== VARIES && origVal !== '') {
-              const n = Number(origVal);
-              if (Number.isFinite(n)) {
-                displayOriginal = f.coordinate === 'ra'
-                  ? formatRaSexagesimal(n)
-                  : formatDecSexagesimal(n);
-                if (cv !== VARIES && currentStr !== '') {
-                  const cn = Number(currentStr);
-                  if (Number.isFinite(cn)) {
-                    coordsMatch = Math.abs(cn - n) < 1e-6;
-                  }
-                }
+            if (
+              f.coordinate &&
+              cv !== VARIES && currentStr !== '' &&
+              origVal !== VARIES && origVal !== ''
+            ) {
+              const cn = Number(currentStr);
+              const on = Number(origVal);
+              if (Number.isFinite(cn) && Number.isFinite(on)) {
+                coordsMatch = Math.abs(cn - on) < 1e-6;
               }
             }
             // For DATE-OBS the catalog has been through parse-and-reformat
@@ -666,7 +680,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                     </span>
                   )}
                 </div>
-                {f.coordinate ? (
+                {(f.coordinate || f.readOnly) ? (
                   // Coordinate rows: read-only. New values come from plate-
                   // solving (button below the field list); the only direct
                   // affordance here is the ↺ revert button when the FITS
@@ -757,8 +771,9 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
             The panel directly below renders progress / completion / errors,
             and the global PlateSolveQueueIndicator picks the batch up too.
             On completion we fire `onSaved` so this pane re-loads frame
-            values + originals. */}
-        {frameIds.length > 0 && (
+            values + originals. Hidden when the selection has no light-like
+            frames — calibration frames don't need plate solving. */}
+        {frameIds.length > 0 && effectiveImagetypIsLight && (
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-surface-elevated/40 px-3 py-2">
               <div className="text-xs text-content-muted">

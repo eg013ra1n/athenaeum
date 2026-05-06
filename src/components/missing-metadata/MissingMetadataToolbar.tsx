@@ -202,17 +202,27 @@ export const MissingMetadataToolbar: React.FC<MissingMetadataToolbarProps> = ({
 
       <span className="text-border h-7 flex items-center">|</span>
 
-      {/* Destructive action: send selected frames to the Black Hole. Reversible
-          from the Black Hole tab — soft-delete, not file-system delete. */}
-      <ActionButton
-        icon={<Trash2 size={12} />}
-        label="Black Hole"
-        subLabel={selectedCount > 0 ? `${eligible.blackHole} of ${selectedCount}` : 'Select frames'}
-        onClick={onBlackHole}
-        disabled={eligible.blackHole === 0}
-        disabledTitle="No frames selected"
-        colorClass="bg-error hover:bg-error/80 text-white"
-      />
+      {/* Destructive action: send selected frames to the Black Hole. Icon-only,
+          matches the dual-pane Delete button (and Analysis-tab Blackhole) so
+          the same action looks the same everywhere. Reversible from the Black
+          Hole tab — soft-delete, not a file-system delete. */}
+      <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+        <button
+          onClick={onBlackHole}
+          disabled={eligible.blackHole === 0}
+          title={
+            eligible.blackHole === 0
+              ? 'No eligible frames in selection'
+              : `Move ${eligible.blackHole} of ${selectedCount} selected to Black Hole`
+          }
+          className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-error hover:brightness-90 text-white rounded-lg transition-colors disabled:opacity-30 disabled:cursor-default"
+        >
+          <Trash2 size={12} />
+        </button>
+        <span className="text-[10px] text-content-muted leading-tight">
+          {selectedCount > 0 ? `${eligible.blackHole} of ${selectedCount}` : 'Black Hole'}
+        </span>
+      </div>
 
       <span className="text-border h-7 flex items-center">|</span>
 
