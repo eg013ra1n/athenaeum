@@ -623,11 +623,16 @@ pub async fn list_unfinished_file_operations(
 /// Free-text catalog search across all scan roots. Returns up to `limit`
 /// hits matching by filename, OBJECT, FILTER, IMAGETYP, INSTRUME, or
 /// TELESCOP (case-insensitive substring match).
+///
+/// `instrume_filter` constrains hits to a single camera (frames.instrume
+/// equality). Used by the per-camera dual-pane file browser so a camera-
+/// scoped view's search bar can't surface frames from other cameras.
 #[tauri::command]
 pub async fn search_catalog(
     state: State<'_, AppState>,
     query: String,
     limit: Option<u32>,
+    instrume_filter: Option<String>,
 ) -> Result<Vec<CatalogSearchHit>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -639,42 +644,77 @@ pub async fn search_catalog(
     let limit = limit.unwrap_or(200).min(500) as i64;
     let pattern = format!("%{}%", trimmed.to_lowercase());
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.id, f.path, f.filename,
-                    fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
-             FROM files f
-             LEFT JOIN frames fr ON fr.file_id = f.id
-             WHERE LOWER(f.filename) LIKE ?1
-                OR LOWER(f.path) LIKE ?1
-                OR LOWER(IFNULL(fr.object,''))    LIKE ?1
-                OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
-                OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
-                OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
-                OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1
-             ORDER BY fr.date_obs DESC
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(rusqlite::params![pattern, limit], |row| {
-            Ok(CatalogSearchHit {
-                file_id: row.get(0)?,
-                path: row.get(1)?,
-                filename: row.get(2)?,
-                object: row.get(3)?,
-                filter: row.get(4)?,
-                imagetyp: row.get(5)?,
-                instrume: row.get(6)?,
-                telescop: row.get(7)?,
-                date_obs: row.get(8)?,
-            })
-        })
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.to_string())?;
+    // Two SQL branches so `instrume_filter` either pins fr.instrume or is
+    // skipped entirely (no `OR instrume IS NULL` ambiguity, no wasted bind).
+    // The Vec is bound to a local before the block returns so `stmt`
+    // outlives the iterator (rustc E0597).
+    let rows = if let Some(cam) = instrume_filter.as_deref() {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, f.path, f.filename,
+                        fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
+                 FROM files f
+                 LEFT JOIN frames fr ON fr.file_id = f.id
+                 WHERE fr.instrume = ?3
+                   AND (LOWER(f.filename) LIKE ?1
+                     OR LOWER(f.path) LIKE ?1
+                     OR LOWER(IFNULL(fr.object,''))    LIKE ?1
+                     OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
+                     OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
+                     OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
+                     OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1)
+                 ORDER BY fr.date_obs DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let hits: Vec<CatalogSearchHit> = stmt
+            .query_map(rusqlite::params![pattern, limit, cam], map_search_row)
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        hits
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, f.path, f.filename,
+                        fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
+                 FROM files f
+                 LEFT JOIN frames fr ON fr.file_id = f.id
+                 WHERE LOWER(f.filename) LIKE ?1
+                    OR LOWER(f.path) LIKE ?1
+                    OR LOWER(IFNULL(fr.object,''))    LIKE ?1
+                    OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
+                    OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
+                    OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
+                    OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1
+                 ORDER BY fr.date_obs DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let hits: Vec<CatalogSearchHit> = stmt
+            .query_map(rusqlite::params![pattern, limit], map_search_row)
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        hits
+    };
 
     Ok(rows)
+}
+
+/// Row → CatalogSearchHit mapper shared between the two SQL branches above.
+fn map_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogSearchHit> {
+    Ok(CatalogSearchHit {
+        file_id: row.get(0)?,
+        path: row.get(1)?,
+        filename: row.get(2)?,
+        object: row.get(3)?,
+        filter: row.get(4)?,
+        imagetyp: row.get(5)?,
+        instrume: row.get(6)?,
+        telescop: row.get(7)?,
+        date_obs: row.get(8)?,
+    })
 }
 
 /// Create a directory inside a scan root. Validated to refuse paths that

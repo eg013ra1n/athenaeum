@@ -115,7 +115,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
       <table className="w-full">
         <thead className="bg-surface sticky top-0">
           <tr>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
                 onClick={() => handleSort("id")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -124,7 +124,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="id" />
               </button>
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
                 onClick={() => handleSort("imagetyp")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -134,7 +134,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
               </button>
             </th>
             {showFilterColumn && (
-              <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+              <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
                 <button
                   onClick={() => handleSort("filter")}
                   className="flex items-center gap-1 hover:text-content transition-colors"
@@ -144,7 +144,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 </button>
               </th>
             )}
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
                 onClick={() => handleSort("exptime")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -153,7 +153,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="exptime" />
               </button>
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
                 onClick={() => handleSort("ccd_temp")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -162,7 +162,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="ccd_temp" />
               </button>
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
                 onClick={() => handleSort("gain")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -171,7 +171,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="gain" />
               </button>
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider hidden md:table-cell">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider hidden md:table-cell">
               <button
                 onClick={() => handleSort("offset")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -180,7 +180,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="offset" />
               </button>
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider hidden lg:table-cell">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider hidden lg:table-cell">
               <button
                 onClick={() => handleSort("binning")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -189,7 +189,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="binning" />
               </button>
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
                 onClick={() => handleSort("date_start")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -198,7 +198,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="date_start" />
               </button>
             </th>
-            <th className="px-4 py-3 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-left text-xs font-medium text-content-muted uppercase tracking-wider">
               <button
                 onClick={() => handleSort("frame_count")}
                 className="flex items-center gap-1 hover:text-content transition-colors"
@@ -207,7 +207,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                 <SortIcon field="frame_count" />
               </button>
             </th>
-            <th className="px-4 py-3 text-center text-xs font-medium text-content-muted uppercase tracking-wider">
+            <th className="px-4 py-1.5 text-center text-xs font-medium text-content-muted uppercase tracking-wider">
               Actions
             </th>
           </tr>
@@ -227,12 +227,12 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                   } hover:bg-surface-hover cursor-pointer transition-colors`}
                 >
                   {/* ID */}
-                  <td className="px-4 py-3 text-sm text-content-muted">
+                  <td className="px-4 py-1 text-sm text-content-muted">
                     {set.id ?? "—"}
                   </td>
 
                   {/* Type */}
-                  <td className="px-4 py-3">
+                  <td className="px-4 py-1">
                     <div className="flex items-center gap-1">
                       {isMasterType(set.imagetyp) && (
                         <Star size={12} className="text-warning fill-warning" />
@@ -262,18 +262,18 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
 
                   {/* Filter (for flats) */}
                   {showFilterColumn && (
-                    <td className="px-4 py-3 text-sm text-content">
+                    <td className="px-4 py-1 text-sm text-content">
                       {set.filter || "—"}
                     </td>
                   )}
 
                   {/* Exposure */}
-                  <td className="px-4 py-3 text-sm text-content">
+                  <td className="px-4 py-1 text-sm text-content">
                     {set.exptime !== null ? `${set.exptime}s` : "N/A"}
                   </td>
 
                   {/* Temperature */}
-                  <td className="px-4 py-3 text-sm">
+                  <td className="px-4 py-1 text-sm">
                     <div className="flex flex-col">
                       <span className="text-content font-medium">
                         {formatTemp(set.ccd_temp)}
@@ -285,22 +285,22 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                   </td>
 
                   {/* Gain */}
-                  <td className="px-4 py-3 text-sm text-content">
+                  <td className="px-4 py-1 text-sm text-content">
                     {set.gain !== null ? set.gain : "N/A"}
                   </td>
 
                   {/* Offset - Hidden on mobile */}
-                  <td className="px-4 py-3 text-sm text-content hidden md:table-cell">
+                  <td className="px-4 py-1 text-sm text-content hidden md:table-cell">
                     {set.offset !== null ? set.offset : "N/A"}
                   </td>
 
                   {/* Binning - Hidden on tablet */}
-                  <td className="px-4 py-3 text-sm text-content hidden lg:table-cell">
+                  <td className="px-4 py-1 text-sm text-content hidden lg:table-cell">
                     {set.binning || "N/A"}
                   </td>
 
                   {/* Date Range */}
-                  <td className="px-4 py-3 text-sm">
+                  <td className="px-4 py-1 text-sm">
                     <div className="flex flex-col">
                       <span className="text-content font-medium">
                         {set.date_display}
@@ -312,12 +312,12 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                   </td>
 
                   {/* Frame Count */}
-                  <td className="px-4 py-3 text-sm text-content font-medium">
+                  <td className="px-4 py-1 text-sm text-content font-medium">
                     {set.frame_count}
                   </td>
 
                   {/* Actions */}
-                  <td className="px-4 py-3 text-center">
+                  <td className="px-4 py-1 text-center">
                     <div className="flex items-center justify-center gap-2">
                       <button
                         onClick={(e) => handleViewFrames(set.id!, e)}
@@ -353,7 +353,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                     key={`${rowId}-expanded`}
                     className="bg-surface border-t border-border"
                   >
-                    <td colSpan={showFilterColumn ? 11 : 10} className="px-4 py-3">
+                    <td colSpan={showFilterColumn ? 11 : 10} className="px-4 py-1">
                       <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
                         <div>
                           <span className="text-content-muted">Resolution:</span>

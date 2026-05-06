@@ -578,6 +578,12 @@ pub struct OperationIdArgs {
 pub struct SearchCatalogArgs {
     pub query: String,
     pub limit: Option<u32>,
+    /// When set, restricts hits to a single camera (frames.instrume equality).
+    /// Used by the per-camera dual-pane file browser so a camera-scoped view
+    /// can't surface frames from other cameras. Mirrors the same parameter on
+    /// the Tauri side.
+    #[serde(default)]
+    pub instrume_filter: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -788,40 +794,75 @@ pub async fn search_catalog(
     }
     let limit = args.limit.unwrap_or(200).min(500) as i64;
     let pattern = format!("%{}%", trimmed.to_lowercase());
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.id, f.path, f.filename,
-                    fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
-             FROM files f
-             LEFT JOIN frames fr ON fr.file_id = f.id
-             WHERE LOWER(f.filename) LIKE ?1
-                OR LOWER(f.path) LIKE ?1
-                OR LOWER(IFNULL(fr.object,''))    LIKE ?1
-                OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
-                OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
-                OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
-                OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1
-             ORDER BY fr.date_obs DESC
-             LIMIT ?2",
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rows = stmt
-        .query_map(rusqlite::params![pattern, limit], |row| {
-            Ok(CatalogSearchHit {
-                file_id: row.get(0)?,
-                path: row.get(1)?,
-                filename: row.get(2)?,
-                object: row.get(3)?,
-                filter: row.get(4)?,
-                imagetyp: row.get(5)?,
-                instrume: row.get(6)?,
-                telescop: row.get(7)?,
-                date_obs: row.get(8)?,
-            })
+
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<CatalogSearchHit> {
+        Ok(CatalogSearchHit {
+            file_id: row.get(0)?,
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            object: row.get(3)?,
+            filter: row.get(4)?,
+            imagetyp: row.get(5)?,
+            instrume: row.get(6)?,
+            telescop: row.get(7)?,
+            date_obs: row.get(8)?,
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    };
+
+    // Two SQL branches so `instrume_filter` either pins fr.instrume or is
+    // skipped entirely. The Vec is bound to a local before the block returns
+    // so `stmt` outlives the iterator (rustc E0597).
+    let rows: Vec<CatalogSearchHit> = if let Some(cam) = args.instrume_filter.as_deref() {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, f.path, f.filename,
+                        fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
+                 FROM files f
+                 LEFT JOIN frames fr ON fr.file_id = f.id
+                 WHERE fr.instrume = ?3
+                   AND (LOWER(f.filename) LIKE ?1
+                     OR LOWER(f.path) LIKE ?1
+                     OR LOWER(IFNULL(fr.object,''))    LIKE ?1
+                     OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
+                     OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
+                     OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
+                     OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1)
+                 ORDER BY fr.date_obs DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let hits: Vec<CatalogSearchHit> = stmt
+            .query_map(rusqlite::params![pattern, limit, cam], map_row)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        hits
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.id, f.path, f.filename,
+                        fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
+                 FROM files f
+                 LEFT JOIN frames fr ON fr.file_id = f.id
+                 WHERE LOWER(f.filename) LIKE ?1
+                    OR LOWER(f.path) LIKE ?1
+                    OR LOWER(IFNULL(fr.object,''))    LIKE ?1
+                    OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
+                    OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
+                    OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
+                    OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1
+                 ORDER BY fr.date_obs DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let hits: Vec<CatalogSearchHit> = stmt
+            .query_map(rusqlite::params![pattern, limit], map_row)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        hits
+    };
+
     Ok(Json(rows))
 }
 

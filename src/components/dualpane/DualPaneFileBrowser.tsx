@@ -133,9 +133,20 @@ export interface DualPaneRevealRequest {
   token: number;
 }
 
+/** When set on the dual-pane, the LEFT pane scopes its scan roots and
+ *  directory listings to a single camera (mirrors the legacy DirectoryTree
+ *  filter used by the Equipment detail page). The RIGHT pane stays
+ *  unfiltered — it can still target any folder for Move/Mkdir/etc. The
+ *  catalog search bar is also scoped to this camera. */
+export interface DualPaneCameraFilter {
+  instrume: string;
+  cameraDirectories: string[];
+}
+
 interface Props {
   scanRoots: ScanRootWithAvailability[];
   reveal?: DualPaneRevealRequest;
+  leftCameraFilter?: DualPaneCameraFilter;
 }
 
 interface State {
@@ -225,9 +236,39 @@ function reducer(state: State, action: Action): State {
   }
 }
 
-function initialState(scanRoots: ScanRootWithAvailability[]): State {
+/** Roots whose path is an ancestor of (or equal to) any of the supplied
+ *  camera-touching directories. Mirrors the legacy DirectoryTree clamp. */
+function clampScanRootsToCamera(
+  scanRoots: ScanRootWithAvailability[],
+  cameraDirectories: string[],
+): ScanRootWithAvailability[] {
+  return scanRoots.filter((r) =>
+    cameraDirectories.some(
+      (d) =>
+        d === r.path
+        || d.startsWith(r.path + '/')
+        || d.startsWith(r.path + '\\'),
+    ),
+  );
+}
+
+function initialState(
+  scanRoots: ScanRootWithAvailability[],
+  leftCameraFilter?: DualPaneCameraFilter,
+): State {
   const defaultRoot = scanRoots[0]?.path ?? '';
-  const left = (typeof window !== 'undefined' && localStorage.getItem(LS_LEFT_CWD)) || defaultRoot;
+
+  // Left pane: when camera-filtered, anchor at the first camera-touching
+  // scan root and skip LS persistence (so a stale cwd from a different
+  // camera or a global session can't strand the pane outside its scope).
+  let left: string;
+  if (leftCameraFilter) {
+    const leftRoots = clampScanRootsToCamera(scanRoots, leftCameraFilter.cameraDirectories);
+    left = leftRoots[0]?.path ?? defaultRoot;
+  } else {
+    left = (typeof window !== 'undefined' && localStorage.getItem(LS_LEFT_CWD)) || defaultRoot;
+  }
+
   const right = (typeof window !== 'undefined' && localStorage.getItem(LS_RIGHT_CWD)) || defaultRoot;
   const leftSort: 'asc' | 'desc' =
     (typeof window !== 'undefined' && (localStorage.getItem(LS_LEFT_SORT) as 'asc' | 'desc' | null)) || 'asc';
@@ -252,8 +293,28 @@ interface ActiveOp {
   finished?: FileOpFinishedPayload;
 }
 
-export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
-  const [state, dispatch] = useReducer(reducer, scanRoots, initialState);
+export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilter }: Props) {
+  // Lazy initializer so `leftCameraFilter` flows into the first state.
+  const [state, dispatch] = useReducer(reducer, undefined, () =>
+    initialState(scanRoots, leftCameraFilter),
+  );
+
+  // Per-pane scan-root universe. The left pane is clamped to scan roots that
+  // contain camera files when leftCameraFilter is set; the right pane always
+  // sees the full list. Used everywhere a pane needs to know "what counts as
+  // a root" — Up navigation, parent clamping, recovery, breadcrumbs.
+  const leftScanRoots = useMemo<ScanRootWithAvailability[]>(
+    () =>
+      leftCameraFilter
+        ? clampScanRootsToCamera(scanRoots, leftCameraFilter.cameraDirectories)
+        : scanRoots,
+    [scanRoots, leftCameraFilter],
+  );
+  const paneScanRoots = useCallback(
+    (pane: PaneId): ScanRootWithAvailability[] =>
+      pane === 'left' ? leftScanRoots : scanRoots,
+    [leftScanRoots, scanRoots],
+  );
   const [listings, setListings] = useState<Record<PaneId, DirectoryListing | null>>({
     left: null,
     right: null,
@@ -284,12 +345,16 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
    *  rows — desyncing the breadcrumb (cwd) from the displayed contents. */
   const loadGenRef = useRef<Record<PaneId, number>>({ left: 0, right: 0 });
 
-  // Persist cwd + sortDir per pane.
+  // Persist cwd + sortDir per pane. The left cwd is NOT persisted while
+  // camera-filter mode is active — that pane's cwd is meaningful only inside
+  // the current camera scope, and reusing it for the global File Manager (or
+  // a different camera's view) would strand the pane outside its valid roots.
   useEffect(() => {
+    if (leftCameraFilter) return;
     try {
       localStorage.setItem(LS_LEFT_CWD, state.panes.left.cwd);
     } catch {}
-  }, [state.panes.left.cwd]);
+  }, [state.panes.left.cwd, leftCameraFilter]);
   useEffect(() => {
     try {
       localStorage.setItem(LS_RIGHT_CWD, state.panes.right.cwd);
@@ -324,7 +389,18 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
     setLoading(prev => ({ ...prev, [pane]: true }));
     setErrors(prev => ({ ...prev, [pane]: null }));
 
+    // The left pane in camera-filter mode routes through
+    // `get_camera_directory_contents` (same backend command DirectoryTree
+    // uses) so subdirs and files are filtered to this camera. The right
+    // pane always uses the unfiltered listing.
     const attempt = async (): Promise<DirectoryListing> => {
+      if (pane === 'left' && leftCameraFilter) {
+        return api.invoke<DirectoryListing>('get_camera_directory_contents', {
+          directoryPath: cwd,
+          instrume: leftCameraFilter.instrume,
+          cameraDirectories: leftCameraFilter.cameraDirectories,
+        });
+      }
       return api.invoke<DirectoryListing>('get_directory_contents', { directoryPath: cwd });
     };
     const isMissingMsg = (m: string) =>
@@ -351,15 +427,18 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
       const msg = String(e);
       if (isMissingMsg(msg)) {
         // Walk up to the nearest existing ancestor inside the same scan
-        // root, then fall back to any other configured scan root.
-        const rootPaths = scanRoots.map(r => r.path);
+        // root, then fall back to any other configured scan root. Use
+        // the active pane's scoped roots so a left-pane recovery in
+        // camera-filter mode lands on a camera-touching root.
+        const paneRoots = paneScanRoots(pane);
+        const rootPaths = paneRoots.map(r => r.path);
         const enclosing = findEnclosingScanRoot(cwd, rootPaths);
         let recover: string | null = getClampedParent(cwd, rootPaths);
         if (!recover && enclosing && enclosing !== cwd) {
           recover = enclosing;
         }
         if (!recover) {
-          const fallback = scanRoots.find(
+          const fallback = paneRoots.find(
             (r) => r.path !== cwd && r.path !== enclosing,
           );
           if (fallback) recover = fallback.path;
@@ -381,7 +460,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
         setLoading(prev => ({ ...prev, [pane]: false }));
       }
     }
-  }, [scanRoots]);
+  }, [scanRoots, leftCameraFilter, paneScanRoots]);
 
   /** Manual reload trigger — bound to the per-pane Refresh button. */
   const reloadPane = useCallback((pane: PaneId) => {
@@ -671,14 +750,14 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
     const listing = visibleListing(pane);
     if (!listing) return [];
     const cwd = state.panes[pane].cwd;
-    const rootPaths = scanRoots.map((r) => r.path);
+    const rootPaths = paneScanRoots(pane).map((r) => r.path);
     const parent = getClampedParent(cwd, rootPaths);
     const order: string[] = [];
     if (parent !== null) order.push(PARENT_ROW);
     for (const sub of listing.subdirectories) order.push(sub);
     for (const f of listing.files) order.push(f.file.path);
     return order;
-  }, [visibleListing, scanRoots, state.panes]);
+  }, [visibleListing, paneScanRoots, state.panes]);
 
   /** Open the blink viewer with the FITS/XISF files currently selected in the
    *  active pane (skipping folders, sidecars, etc). No-op if nothing eligible. */
@@ -698,7 +777,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
   const activatePath = useCallback((path: string) => {
     const active = state.panes[state.activePane];
     if (path === PARENT_ROW) {
-      const rootPaths = scanRoots.map((r) => r.path);
+      const rootPaths = paneScanRoots(state.activePane).map((r) => r.path);
       const parent = getClampedParent(active.cwd, rootPaths);
       if (parent) dispatch({ type: 'set_cwd', pane: state.activePane, cwd: parent });
       return;
@@ -710,7 +789,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
     if (listing && listing.subdirectories.includes(path)) {
       dispatch({ type: 'set_cwd', pane: state.activePane, cwd: path });
     }
-  }, [visibleListing, scanRoots, state.activePane, state.panes]);
+  }, [visibleListing, paneScanRoots, state.activePane, state.panes]);
 
   // True when ANY confirm/prompt dialog is open. Pane shortcuts (F-keys,
   // Tab, Cmd+I, Cmd+A, Space, Enter, arrows, Backspace) are suppressed in
@@ -834,9 +913,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
         e.preventDefault();
         openBlink();
       } else if (e.key === 'Backspace') {
-        // Backspace = navigate up one level (clamped to scan root).
+        // Backspace = navigate up one level (clamped to scan root, scoped
+        // to the active pane's universe so the left pane can't escape its
+        // camera-touching roots in filter mode).
         const active = state.panes[state.activePane];
-        const rootPaths = scanRoots.map((r) => r.path);
+        const rootPaths = paneScanRoots(state.activePane).map((r) => r.path);
         const parent = getClampedParent(active.cwd, rootPaths);
         if (parent) {
           e.preventDefault();
@@ -846,7 +927,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isModalOpen, enqueueMove, enqueueDelete, openMkdir, openRename, openBlink, state.activePane, state.panes, visibleListing, keyboardOrder, activatePath, scanRoots]);
+  }, [isModalOpen, enqueueMove, enqueueDelete, openMkdir, openRename, openBlink, state.activePane, state.panes, visibleListing, keyboardOrder, activatePath, paneScanRoots]);
 
   // Status bar metrics for the active pane.
   const activePaneListing = listings[state.activePane];
@@ -985,7 +1066,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
       </div>
 
       {/* Search */}
-      <CatalogSearch onReveal={onSearchReveal} />
+      <CatalogSearch onReveal={onSearchReveal} instrumeFilter={leftCameraFilter?.instrume} />
 
       {/* Two panes — flex-fill the remaining height; each pane scrolls on its own */}
       <div className="grid grid-cols-2 gap-3 flex-1 min-h-0">
@@ -1012,7 +1093,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal }: Props) {
           onSetSort={(sortDir) => dispatch({ type: 'set_sort', pane: 'left', sortDir })}
           onReload={() => reloadPane('left')}
           onMetaSaved={refreshBoth}
-          scanRoots={scanRoots}
+          scanRoots={leftScanRoots}
         />
         <Pane
           id="right"

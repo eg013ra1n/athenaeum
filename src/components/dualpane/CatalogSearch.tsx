@@ -13,11 +13,15 @@ import type { CatalogSearchHit } from './types';
 
 interface CatalogSearchProps {
   onReveal: (hit: CatalogSearchHit) => void;
+  /** When set, the backend search restricts hits to a single camera
+   *  (frames.instrume equality). Used by the per-camera dual-pane view
+   *  inside Equipment detail so the search bar stays in scope. */
+  instrumeFilter?: string;
 }
 
 const DEBOUNCE_MS = 250;
 
-export default function CatalogSearch({ onReveal }: CatalogSearchProps) {
+export default function CatalogSearch({ onReveal, instrumeFilter }: CatalogSearchProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<CatalogSearchHit[]>([]);
   const [loading, setLoading] = useState(false);
@@ -39,6 +43,7 @@ export default function CatalogSearch({ onReveal }: CatalogSearchProps) {
         const hits = await api.invoke<CatalogSearchHit[]>('search_catalog', {
           query: trimmed,
           limit: 100,
+          instrumeFilter,
         });
         setResults(hits);
         setOpen(true);
@@ -50,7 +55,7 @@ export default function CatalogSearch({ onReveal }: CatalogSearchProps) {
       }
     }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [query]);
+  }, [query, instrumeFilter]);
 
   // Close on outside click.
   useEffect(() => {
@@ -73,7 +78,11 @@ export default function CatalogSearch({ onReveal }: CatalogSearchProps) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onFocus={() => results.length > 0 && setOpen(true)}
-          placeholder="Search catalog (filename, OBJECT, FILTER, INSTRUME, TELESCOP)…"
+          placeholder={
+            instrumeFilter
+              ? `Search ${instrumeFilter} frames (filename, OBJECT, FILTER, TELESCOP)…`
+              : 'Search catalog (filename, OBJECT, FILTER, INSTRUME, TELESCOP)…'
+          }
           className="flex-1 bg-transparent outline-none text-sm placeholder:text-content-muted"
         />
         {query && (
