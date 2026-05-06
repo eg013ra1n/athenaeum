@@ -186,6 +186,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
         .route("/api/cancel_analysis", post(analysis::cancel_analysis))
         .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))
+        .route("/api/compute_flat_contour_plot", post(analysis::compute_flat_contour_plot))
         // Plate solving
         .route("/api/get_plate_solve_config", post(plate_solve::get_plate_solve_config))
         .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))

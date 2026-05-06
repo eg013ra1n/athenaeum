@@ -308,6 +308,7 @@ pub fn run() {
             commands::get_analysis_for_frame_set,
             commands::delete_analysis_for_frame_set,
             commands::get_frame_star_metrics,
+            commands::compute_flat_contour_plot,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,

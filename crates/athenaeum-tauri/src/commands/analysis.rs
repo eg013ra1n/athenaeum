@@ -5,6 +5,7 @@ use tauri::{Emitter, State};
 use athenaeum_core::analysis::config::{self, AnalysisConfig};
 use athenaeum_core::analysis::analyzer;
 use athenaeum_core::db::analysis as db_analysis;
+use athenaeum_core::flat_analysis::{self, FlatContourOpts};
 use athenaeum_core::models::{FrameAnalysis, StarMetric, StarMetricsResponse};
 
 use super::AppState;
@@ -377,19 +378,14 @@ pub async fn delete_analysis_for_frame_set(
         .map_err(|e| e.to_string())
 }
 
+/// Wrapper kept for call-site readability — delegates to the central
+/// orientation helper. The earlier inline implementation had the
+/// ROWORDER comparison polarity inverted (returned `true` for TOP-DOWN
+/// instead of false), which displayed N.I.N.A.-written FITS files
+/// flipped relative to PixInsight; the helper applies astronomical
+/// convention.
 fn detect_flip_vertical(path: &str) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else { return false };
-    let mut buf = [0u8; 2880 * 5];
-    let n = file.read(&mut buf).unwrap_or(0);
-    let header = String::from_utf8_lossy(&buf[..n]);
-    for i in (0..header.len()).step_by(80) {
-        let end = (i + 80).min(header.len());
-        let card = &header[i..end];
-        if card.starts_with("ROWORDER") { return card.contains("TOP-DOWN"); }
-        if card.starts_with("END") && card[3..].trim().is_empty() { break; }
-    }
-    false
+    athenaeum_core::orientation::flip_vertical_for_path(std::path::Path::new(path))
 }
 
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.
@@ -468,5 +464,75 @@ pub async fn get_frame_star_metrics(
         metrics: analysis,
         stars,
         flip_vertical,
+    })
+}
+
+// ========== Flat Contour Plot ==========
+//
+// PixInsight FlatContourPlot v1.3.1 port. Reads a flat (or master flat) at
+// `file_id`, resamples + clips + Gaussian-blurs + quantizes per the user's
+// opts, and returns the band-per-pixel buffer (as base64-LE bytes) plus
+// the per-band central values for the legend strip on the frontend.
+
+/// Wire response for `compute_flat_contour_plot`. Mirrors
+/// `flat_analysis::FlatContourResult` but base64-encodes the pixel buffer
+/// for JSON transport.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlatContourPlotResponse {
+    pub width: u32,
+    pub height: u32,
+    pub peak: f32,
+    pub mean: f32,
+    pub min: f32,
+    pub min_quantile: f32,
+    pub max_quantile: f32,
+    pub contours: u32,
+    /// Base64 (STANDARD) of the 8-bit grayscale display buffer.
+    /// Length == `width * height`. The frontend paints these directly.
+    pub pixels_b64: String,
+}
+
+#[tauri::command]
+pub async fn compute_flat_contour_plot(
+    state: State<'_, AppState>,
+    file_id: i64,
+    opts: FlatContourOpts,
+) -> Result<FlatContourPlotResponse, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    // Resolve file path under the DB lock, then drop it before the (slow)
+    // pixel work to avoid holding the connection across an await.
+    let path = {
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT path FROM files WHERE id = ?1",
+            rusqlite::params![file_id],
+            |row| row.get::<_, String>(0),
+        ).map_err(|e| format!("File not found (id={}): {}", file_id, e))?
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        flat_analysis::compute_flat_contour_plot(&path, opts)
+    }).await
+        .map_err(|e| format!("Flat contour analysis panicked: {}", e))?
+        .map_err(|e| {
+            eprintln!("compute_flat_contour_plot failed: {:#}", e);
+            format!("Flat contour analysis failed: {}", e)
+        })?;
+
+    let pixels_b64 = STANDARD.encode(&result.pixels);
+
+    Ok(FlatContourPlotResponse {
+        width: result.width,
+        height: result.height,
+        peak: result.peak,
+        mean: result.mean,
+        min: result.min,
+        min_quantile: result.min_quantile,
+        max_quantile: result.max_quantile,
+        contours: result.contours,
+        pixels_b64,
     })
 }

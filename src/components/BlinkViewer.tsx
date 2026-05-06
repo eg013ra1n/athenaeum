@@ -11,6 +11,7 @@ import type { FrameAnalysis } from "../types/models";
 import type { AnnotationSettings } from "../types/analysis-config";
 import { DEFAULT_ANNOTATION_SETTINGS } from "../types/analysis-config";
 import { ToolBar, FrameList, FrameInfoPanel } from "./blink";
+import { fetchAndComposeFlatContour, loadFlatContourOpts } from "./blink/flatContour";
 import { useBlinkCache } from "../hooks/useBlinkCache";
 import { useStarMetricsCache } from "../hooks/useStarMetricsCache";
 import { drawStarOverlay } from "./blink/StarOverlay";
@@ -52,6 +53,21 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   const [fullResMode, setFullResMode] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [loadingFullRes, setLoadingFullRes] = useState(false);
+  // Flat Contour Plot — when ON, the main canvas shows the contour plot
+  // (image + legend strip composite from the backend) instead of the FITS
+  // preview. Toggleable from the toolbar; only available on FLAT/MASTERFLAT.
+  const [contourMode, setContourMode] = useState(false);
+  /** Cache of contour-plot composite dataURLs, keyed by file_id, so
+   *  navigating between flats with the toggle on doesn't re-fetch the
+   *  same plot every time. */
+  const contourCacheRef = useRef<Map<number, string>>(new Map());
+  /** Refs that mirror reactive contour state for use inside listeners that
+   *  capture once (resize, keyboard handlers). Without these, the resize
+   *  handler renders the FITS preview after a window resize while contour
+   *  mode is active, tearing the contour off the screen. */
+  const contourModeRef = useRef(false);
+  const canShowContourRef = useRef(false);
+  const currentFileIdRef = useRef<number | null>(null);
   const fullResBlobRef = useRef<string | null>(null);
   const showAnnotationsRef = useRef(showAnnotations);
   const annotationSettingsRef = useRef(annotationSettings);
@@ -104,6 +120,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
   // Keep refs updated
   currentIndexRef.current = currentIndex;
   loadedImagesRef.current = loadedImages;
+  contourModeRef.current = contourMode;
 
   // Query backend capacity and signal ready on mount
   useEffect(() => {
@@ -333,11 +350,66 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     };
   }, []);
 
-  // Render when image loads or frame changes
+  // ── Flat Contour Plot integration ──────────────────────────────────────
+  // Derive whether the current frame is eligible for contour analysis
+  // (FLAT / MASTERFLAT). When the user navigates to a non-flat frame
+  // while contourMode is on, auto-disable it so the toolbar button reflects
+  // the now-disabled state and the canvas falls back to the FITS preview.
+  const canShowContour = (() => {
+    const t = currentFrame?.frame?.imagetyp?.toUpperCase().trim();
+    return t === 'FLAT' || t === 'MASTERFLAT';
+  })();
+  // Mirror reactive contour state into refs the resize handler reads.
+  canShowContourRef.current = canShowContour;
+  currentFileIdRef.current = currentFrame?.file?.id ?? null;
+
   useEffect(() => {
+    if (!canShowContour && contourMode) setContourMode(false);
+  }, [canShowContour, contourMode]);
+
+  // Reset zoom & pan whenever the displayed image SOURCE flips between
+  // FITS preview and contour composite. The two have very different
+  // aspect ratios (the composite is wider because of the legend strip),
+  // so a carried-over zoom/pan from the previous source produces a
+  // mis-fit (legend cut off, image overshooting) until the user resets
+  // manually. Resetting on toggle replicates "fit to view" each time.
+  useEffect(() => {
+    zoomRef.current = 1.0;
+    panRef.current = { x: 0, y: 0 };
+    setDisplayZoom(1.0);
+  }, [contourMode]);
+
+  // Render when image loads or frame changes. When contourMode is on for
+  // an eligible frame, fetch the contour composite (image + legend strip)
+  // from the backend and render IT instead of the FITS preview. Cached by
+  // file_id so toggling on/off or navigating between flats is instant.
+  useEffect(() => {
+    if (contourMode && canShowContour && currentFrame?.file?.id != null) {
+      const fileId = currentFrame.file.id;
+      const cached = contourCacheRef.current.get(fileId);
+      if (cached) {
+        renderImage(cached);
+        return;
+      }
+      let cancelled = false;
+      void (async () => {
+        try {
+          const opts = await loadFlatContourOpts();
+          const dataUrl = await fetchAndComposeFlatContour(fileId, opts);
+          if (cancelled) return;
+          contourCacheRef.current.set(fileId, dataUrl);
+          renderImage(dataUrl);
+        } catch (err) {
+          if (cancelled) return;
+          console.error('Flat contour fetch failed:', err);
+          setError(typeof err === 'string' ? err : (err as Error).message ?? String(err));
+        }
+      })();
+      return () => { cancelled = true; };
+    }
     const imageValue = loadedImages.get(currentIndex);
     if (imageValue) renderImage(imageValue);
-  }, [currentIndex, loadedImages, renderImage]);
+  }, [currentIndex, loadedImages, renderImage, contourMode, canShowContour, currentFrame]);
 
   // Re-render when annotation state changes (renderCanvas reads from refs, just needs a kick)
   useEffect(() => {
@@ -367,6 +439,21 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
       if (canvas.width !== newWidth || canvas.height !== newHeight) {
         canvas.width = newWidth;
         canvas.height = newHeight;
+        // Resize must respect contour mode: re-render the contour
+        // composite if it's active, otherwise the FITS preview.
+        // Without this branch the resize handler tears the contour off
+        // the screen and replaces it with the regular preview.
+        if (
+          contourModeRef.current
+          && canShowContourRef.current
+          && currentFileIdRef.current != null
+        ) {
+          const cached = contourCacheRef.current.get(currentFileIdRef.current);
+          if (cached) {
+            renderImage(cached);
+            return;
+          }
+        }
         const imageValue = loadedImagesRef.current.get(currentIndexRef.current);
         if (imageValue) renderImage(imageValue);
       }
@@ -923,6 +1010,12 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
         onToggleFullRes={handleToggleFullRes}
         showHelp={showHelp}
         onToggleHelp={() => setShowHelp(prev => !prev)}
+        canShowContour={canShowContour}
+        contourActive={contourMode && canShowContour}
+        onShowContourPlot={() => {
+          if (!canShowContour) return;
+          setContourMode(prev => !prev);
+        }}
         isCaching={isCaching}
         cacheProgress={cacheProgress}
         cacheStats={cacheStats}
@@ -1094,6 +1187,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
           </div>
         </div>
       )}
+
     </div>
   );
 };

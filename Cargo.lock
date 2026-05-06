@@ -317,6 +317,7 @@ version = "0.2.0-beta.9"
 dependencies = [
  "athenaeum-core",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "rayon",
@@ -4097,7 +4098,7 @@ dependencies = [
 
 [[package]]
 name = "rustafits"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

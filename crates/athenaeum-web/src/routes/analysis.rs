@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use athenaeum_core::analysis::analyzer;
 use athenaeum_core::analysis::config::{self, AnalysisConfig};
 use athenaeum_core::db::analysis as db_analysis;
+use athenaeum_core::flat_analysis::{self, FlatContourOpts};
 use athenaeum_core::models::{FrameAnalysis, StarMetric, StarMetricsResponse};
 
 use crate::events::SseEvent;
@@ -438,19 +439,11 @@ pub async fn cancel_analysis(
 
 // ── Star metrics ─────────────────────────────────────────────────────────────
 
+/// Web mirror of the Tauri-side helper — delegates to the central
+/// orientation rule in `athenaeum_core::orientation`. See the comment
+/// over the Tauri version for why this matters.
 fn detect_flip_vertical(path: &str) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else { return false };
-    let mut buf = [0u8; 2880 * 5];
-    let n = file.read(&mut buf).unwrap_or(0);
-    let header = String::from_utf8_lossy(&buf[..n]);
-    for i in (0..header.len()).step_by(80) {
-        let end = (i + 80).min(header.len());
-        let card = &header[i..end];
-        if card.starts_with("ROWORDER") { return card.contains("TOP-DOWN"); }
-        if card.starts_with("END") && card[3..].trim().is_empty() { break; }
-    }
-    false
+    athenaeum_core::orientation::flip_vertical_for_path(std::path::Path::new(path))
 }
 
 /// POST /api/get_frame_star_metrics
@@ -532,5 +525,74 @@ pub async fn get_frame_star_metrics(
         metrics: analysis,
         stars,
         flip_vertical,
+    }))
+}
+
+// ── Flat contour plot (PixInsight FlatContourPlot port) ──────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlatContourPlotArgs {
+    pub file_id: i64,
+    pub opts: FlatContourOpts,
+}
+
+/// Wire response for `compute_flat_contour_plot`. Mirrors the Tauri command's
+/// `FlatContourPlotResponse` exactly.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlatContourPlotResponse {
+    pub width: u32,
+    pub height: u32,
+    pub peak: f32,
+    pub mean: f32,
+    pub min: f32,
+    pub min_quantile: f32,
+    pub max_quantile: f32,
+    pub contours: u32,
+    pub pixels_b64: String,
+}
+
+/// POST /api/compute_flat_contour_plot
+pub async fn compute_flat_contour_plot(
+    State(state): State<WebAppState>,
+    Json(args): Json<FlatContourPlotArgs>,
+) -> Result<Json<FlatContourPlotResponse>, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let path = {
+        let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT path FROM files WHERE id = ?1",
+            rusqlite::params![args.file_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| err(format!("File not found (id={}): {}", args.file_id, e)))?
+    };
+
+    let opts = args.opts;
+    let result = tokio::task::spawn_blocking(move || {
+        flat_analysis::compute_flat_contour_plot(&path, opts)
+    })
+    .await
+    .map_err(|e| err(format!("Flat contour analysis panicked: {}", e)))?
+    .map_err(|e| {
+        eprintln!("compute_flat_contour_plot failed: {:#}", e);
+        err(format!("Flat contour analysis failed: {}", e))
+    })?;
+
+    let pixels_b64 = STANDARD.encode(&result.pixels);
+
+    Ok(Json(FlatContourPlotResponse {
+        width: result.width,
+        height: result.height,
+        peak: result.peak,
+        mean: result.mean,
+        min: result.min,
+        min_quantile: result.min_quantile,
+        max_quantile: result.max_quantile,
+        contours: result.contours,
+        pixels_b64,
     }))
 }

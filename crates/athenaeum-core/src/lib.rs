@@ -23,6 +23,8 @@ pub mod export;
 pub mod rustafits_processor;
 pub mod cache;
 pub mod analysis;
+pub mod flat_analysis;
+pub mod orientation;
 pub mod catalog;
 pub mod plate_solve;
 pub mod services;

@@ -1119,3 +1119,42 @@ export interface MergeLogEntry {
   added_count: number;
   skipped_count: number;
 }
+
+// ── Flat Contour Plot ────────────────────────────────────────────────────
+
+/** Settings for the FlatContourPlot analysis. Mirrors PixInsight's
+ *  FlatContourPlot v1.3.1 (Mike Schuster). */
+export interface FlatContourOpts {
+  /** Resampling factor in percent (1..100). 50 halves both dimensions. */
+  resolutionPct: number;
+  /** Gaussian blur sigma in pixels (0..50). */
+  sigmaPx: number;
+  /** Number of discrete grayscale bands (2..64). */
+  contours: number;
+  /** Percent of post-clip range mapped to full grayscale (1..100). */
+  gradientPct: number;
+}
+
+/** Response from `compute_flat_contour_plot`. The `pixelsB64` field is the
+ *  final 8-bit grayscale display image (length == width*height) base64-
+ *  encoded for JSON transport. The frontend paints those bytes directly
+ *  via putImageData; the legend strip is built from `minQuantile`,
+ *  `maxQuantile`, and `contours`. */
+export interface FlatContourPlot {
+  width: number;
+  height: number;
+  /** Raw-units peak of the resampled, pre-rescale image. */
+  peak: number;
+  /** Raw-units mean. */
+  mean: number;
+  /** Raw-units min. */
+  min: number;
+  /** 1st-percentile sample value (legend low edge, original flat units). */
+  minQuantile: number;
+  /** 99th-percentile sample value (legend high edge, original flat units). */
+  maxQuantile: number;
+  /** Echoed back from the request — number of bands the result uses. */
+  contours: number;
+  /** Base64-encoded 8-bit grayscale buffer. */
+  pixelsB64: string;
+}
