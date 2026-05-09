@@ -223,6 +223,7 @@ pub fn run() {
             commands::has_master_flat_library,
             commands::refresh_calibration_library_for_camera,
             commands::get_calibration_set_frames,
+            commands::get_calibration_set_consumers,
             commands::clear_image_cache,
             commands::set_scan_root_duplicates_flag,
             commands::set_scan_root_unique_camera_flag,

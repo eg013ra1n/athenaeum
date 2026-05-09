@@ -373,6 +373,22 @@ pub async fn get_calibration_set_frames(
     Ok(Json(frames))
 }
 
+/// POST /api/get_calibration_set_consumers
+///
+/// List the frame sets (objects) that ultimately consume a calibration set,
+/// including transitive consumers via the sub-cal chain.
+pub async fn get_calibration_set_consumers(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetIdArgs>,
+) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetConsumer>>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    let consumers = db::calibration_links::get_calibration_set_consumers(&conn, args.set_id)
+        .map_err(db_err)?;
+    Ok(Json(consumers))
+}
+
 // ── Calibration finder ────────────────────────────────────────────────────────
 
 /// POST /api/find_calibration_for_frame_set

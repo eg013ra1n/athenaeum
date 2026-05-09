@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ArrowLeft, RefreshCw, Package, Calendar, Filter } from "lucide-react";
 import DarkLibrary, { LibraryStats } from "./DarkLibrary";
 import MasterDarkLibrary from "./MasterDarkLibrary";
@@ -22,15 +23,37 @@ interface CalibrationScanResult {
   master_darkflat_sets_created: number;
 }
 
+type TabType = "files" | "darks" | "flats" | "master-darks" | "master-flats";
+
 interface CameraDetailProps {
   instrume: string;
   onClose: () => void;
+  /** Initial tab to open. Defaults to "files". */
+  initialTab?: TabType;
+  /** Calibration set ID to scroll to + highlight + auto-expand on first render. */
+  highlightSetId?: number | null;
 }
 
-type TabType = "files" | "darks" | "flats" | "master-darks" | "master-flats";
-
-export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
-  const [activeTab, setActiveTab] = useState<TabType>("files");
+export default function CameraDetail({ instrume, onClose, initialTab, highlightSetId }: CameraDetailProps) {
+  const [activeTab, setActiveTab] = useState<TabType>(initialTab ?? "files");
+  // Consume the highlight + initialTab once. After ~3.5s (slightly longer
+  // than the child's flash fade) we clear pendingHighlightSetId so re-mounts
+  // (e.g. switching tabs back to this one) don't re-flash the same row.
+  const [pendingHighlightSetId, setPendingHighlightSetId] = useState<number | null>(highlightSetId ?? null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    if (searchParams.has("camera") || searchParams.has("tab") || searchParams.has("highlightSet")) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("camera");
+      next.delete("tab");
+      next.delete("highlightSet");
+      setSearchParams(next, { replace: true });
+    }
+    if (pendingHighlightSetId == null) return;
+    const t = setTimeout(() => setPendingHighlightSetId(null), 3500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -297,6 +320,7 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
             isTabView={true}
             imageTypeFilter={darksFilter}
             onStatsChange={setCurrentStats}
+            highlightSetId={pendingHighlightSetId}
           />
         )}
         {activeTab === "flats" && (
@@ -305,13 +329,14 @@ export default function CameraDetail({ instrume, onClose }: CameraDetailProps) {
             isTabView={true}
             imageTypeFilter={flatsFilter}
             onStatsChange={setCurrentStats}
+            highlightSetId={pendingHighlightSetId}
           />
         )}
         {activeTab === "master-darks" && (
-          <MasterDarkLibrary instrume={instrume} isTabView={true} />
+          <MasterDarkLibrary instrume={instrume} isTabView={true} highlightSetId={pendingHighlightSetId} />
         )}
         {activeTab === "master-flats" && (
-          <MasterFlatLibrary instrume={instrume} isTabView={true} />
+          <MasterFlatLibrary instrume={instrume} isTabView={true} highlightSetId={pendingHighlightSetId} />
         )}
       </div>
 

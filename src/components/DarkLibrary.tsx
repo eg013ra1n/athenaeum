@@ -18,9 +18,11 @@ interface DarkLibraryProps {
   isTabView?: boolean;
   imageTypeFilter?: ImageType[];
   onStatsChange?: (stats: LibraryStats) => void;
+  /** Calibration set ID to highlight + auto-expand + scroll to in the table. */
+  highlightSetId?: number | null;
 }
 
-export default function DarkLibrary({ instrume, onClose, isTabView = false, imageTypeFilter, onStatsChange }: DarkLibraryProps) {
+export default function DarkLibrary({ instrume, onClose, isTabView = false, imageTypeFilter, onStatsChange, highlightSetId }: DarkLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -223,6 +225,7 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
               sets={filteredSets}
               showFilterColumn={imageTypeFilter?.length === 1 && imageTypeFilter[0] === "Flat"}
               onEditSubCalibration={handleEditSubCalibration}
+              highlightSetId={highlightSetId}
             />
           ) : (
             <div className="text-center py-12 bg-surface-elevated rounded-lg">

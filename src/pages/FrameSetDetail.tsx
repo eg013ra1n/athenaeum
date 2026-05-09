@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport } from '../types/models';
@@ -64,8 +64,52 @@ export default function FrameSetDetail() {
   const [calibrationHierarchy, setCalibrationHierarchy] = useState<CalibrationHierarchyView | null>(null);
   const [loadingCalibration, setLoadingCalibration] = useState(false);
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<FrameSetTab>('analysis');
+  // Tab state. If we arrived via a chip click in Equipment with
+  // ?tab=calibration&highlightSet=…&kind=…, start on the Calibration Coverage
+  // tab and forward the highlight request to the table view.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialTabFromUrl: FrameSetTab | undefined =
+    searchParams.get('tab') === 'calibration' ? 'calibration'
+    : searchParams.get('tab') === 'history' ? 'history'
+    : searchParams.get('tab') === 'analysis' ? 'analysis'
+    : undefined;
+  const [activeTab, setActiveTab] = useState<FrameSetTab>(initialTabFromUrl ?? 'analysis');
+
+  // Highlight signal consumed once by CalibrationTableView. Seeded from URL
+  // params on mount; cleared (along with the URL params) after consumption.
+  const highlightFromUrlSetId = (() => {
+    const v = searchParams.get('highlightSet');
+    return v != null && /^\d+$/.test(v) ? parseInt(v, 10) : null;
+  })();
+  const highlightFromUrlKind = (() => {
+    const v = searchParams.get('kind');
+    return v === 'flat' || v === 'dark' || v === 'bias' ? v : null;
+  })();
+  const [pendingHighlightCalSet, setPendingHighlightCalSet] = useState<
+    { setId: number; kind: 'flat' | 'dark' | 'bias' } | null
+  >(
+    highlightFromUrlSetId != null && highlightFromUrlKind != null
+      ? { setId: highlightFromUrlSetId, kind: highlightFromUrlKind }
+      : null
+  );
+
+  // Drop the URL params on mount so reloads / back-forward don't re-flash.
+  // The pendingHighlightCalSet state outlives the URL clear; CalibrationTable
+  // View consumes it once and clears it via onHighlightConsumed below.
+  useEffect(() => {
+    if (
+      searchParams.has('tab') ||
+      searchParams.has('highlightSet') ||
+      searchParams.has('kind')
+    ) {
+      const next = new URLSearchParams(searchParams);
+      next.delete('tab');
+      next.delete('highlightSet');
+      next.delete('kind');
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [showFindNewDialog, setShowFindNewDialog] = useState(false);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
@@ -747,6 +791,8 @@ export default function FrameSetDetail() {
               onBlink={handleBlink}
               onSplit={handleOpenSplitDialog}
               onCreateCustomSet={handleOpenCreateDialog}
+              highlightCalSet={pendingHighlightCalSet}
+              onHighlightConsumed={() => setPendingHighlightCalSet(null)}
             />
           ) : (
             <LightsAnalysisView

@@ -128,6 +128,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/has_master_flat_library", post(calibration::has_master_flat_library))
         .route("/api/refresh_calibration_library_for_camera", post(calibration::refresh_calibration_library_for_camera))
         .route("/api/get_calibration_set_frames", post(calibration::get_calibration_set_frames))
+        .route("/api/get_calibration_set_consumers", post(calibration::get_calibration_set_consumers))
         .route("/api/find_calibration_for_frame_set", post(calibration::find_calibration_for_frame_set))
         .route("/api/get_calibration_status", post(calibration::get_calibration_status))
         .route("/api/get_calibration_matching_config", post(calibration::get_calibration_matching_config))

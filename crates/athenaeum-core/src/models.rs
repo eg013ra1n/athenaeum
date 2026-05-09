@@ -876,6 +876,17 @@ pub struct StarMetricsResponse {
     pub flip_vertical: bool,
 }
 
+/// One frame set that ultimately consumes a calibration set, either directly
+/// (a Light using the set) or transitively via the sub-cal chain
+/// (e.g. Light → Dark → Bias).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSetConsumer {
+    pub frame_set_id: i64,
+    pub name: Option<String>,
+    pub date_obs_start: Option<String>,
+}
+
 /// Original calibration set metadata values (backed up before editing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationSetOriginals {

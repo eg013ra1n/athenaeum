@@ -739,6 +739,14 @@ export interface SubCalibrationDetail {
   temp_warning: boolean;
 }
 
+/** A frame set (object) that ultimately consumes a calibration set, either
+ *  directly or via the sub-cal chain. Returned by get_calibration_set_consumers. */
+export interface CalibrationSetConsumer {
+  frameSetId: number;
+  name: string | null;
+  dateObsStart: string | null;
+}
+
 /** A calibration set with the count of frames that use it */
 export interface CalibrationSetWithFrameCount {
   set: CalibrationSetDetail;

@@ -4,7 +4,7 @@ use crate::models::{
     FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning,
     CalibrationHierarchyView, CalibrationDateGroup, CalibrationCameraGroup,
     CalibrationFilterGroup, LightFrameWithCalibration, CalibrationSetWithFrameCount,
-    SubCalibrationDetail,
+    SubCalibrationDetail, CalibrationSetConsumer,
 };
 use crate::calibration::configurable_matcher::load_config;
 use crate::calibration::config::{MatchMode, CalibrationMatchingConfig};
@@ -364,6 +364,49 @@ pub fn get_calibration_statistics(conn: &Connection, frame_set_id: i64) -> Resul
 
 /// Check if a calibration link exists
 #[allow(dead_code)]
+/// Frame sets that ultimately consume the given calibration set.
+///
+/// Walks the sub-cal chain via `calibration_set_to_frames` (so a Bias used
+/// only via Darks still surfaces the Lights' frame sets), then resolves to
+/// the unique `frames_set` rows owning those Light frames. Sorted newest
+/// first by `date_obs_start`.
+pub fn get_calibration_set_consumers(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<Vec<CalibrationSetConsumer>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE consumer_chain(set_id) AS (
+             SELECT ?1
+             UNION
+             SELECT cstf.source_id
+               FROM calibration_set_to_frames cstf
+               JOIN consumer_chain cc ON cstf.calibration_set_id = cc.set_id
+              WHERE cstf.source_type = 'calibration_set'
+         )
+         SELECT fs.id, fs.name, MIN(fs.date_obs_start) AS date_obs_start
+           FROM consumer_chain cc
+           JOIN calibration_set_to_frames cstf
+                ON cstf.calibration_set_id = cc.set_id
+               AND cstf.source_type = 'frame'
+           JOIN session_members sm     ON sm.frame_id = cstf.source_id
+           JOIN sessions s             ON s.id = sm.session_id
+           JOIN imaging_nights inight  ON inight.id = s.imaging_night_id
+           JOIN frames_set fs          ON fs.id = inight.frames_set_id
+          GROUP BY fs.id, fs.name
+          ORDER BY fs.date_obs_start DESC, fs.name ASC"
+    )?;
+
+    let rows = stmt.query_map(params![set_id], |row| {
+        Ok(CalibrationSetConsumer {
+            frame_set_id: row.get(0)?,
+            name: row.get::<_, Option<String>>(1)?,
+            date_obs_start: row.get::<_, Option<String>>(2)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
 pub fn link_exists(
     conn: &Connection,
     source_id: i64,

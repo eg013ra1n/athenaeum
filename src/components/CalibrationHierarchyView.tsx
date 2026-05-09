@@ -32,6 +32,10 @@ interface CalibrationHierarchyViewProps {
   onBlink?: (frameIds: number[]) => void;
   onSplit?: (selectedFilterKeys: Set<string>) => void;
   onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
+  /** When set, scroll to + highlight the matching set in the Flat/Dark/Bias table on mount. */
+  highlightCalSet?: { setId: number; kind: 'flat' | 'dark' | 'bias' } | null;
+  /** Called once the highlight has been forwarded to the table view. */
+  onHighlightConsumed?: () => void;
 }
 
 export function CalibrationHierarchyView({
@@ -47,6 +51,8 @@ export function CalibrationHierarchyView({
   onBlink,
   onSplit,
   onCreateCustomSet,
+  highlightCalSet,
+  onHighlightConsumed,
 }: CalibrationHierarchyViewProps) {
   // Re-assign mode toggle
   const [reassignMode, setReassignMode] = useState(false);
@@ -317,6 +323,8 @@ export function CalibrationHierarchyView({
               onManualCalibration={openManualCalibrationForFrameIds}
               onBlink={onBlink}
               reassignMode={reassignMode}
+              highlightCalSet={highlightCalSet}
+              onHighlightConsumed={onHighlightConsumed}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 

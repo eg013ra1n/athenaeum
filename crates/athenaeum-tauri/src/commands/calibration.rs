@@ -186,6 +186,18 @@ pub async fn get_calibration_set_frames(
     db::get_frames_for_calibration_set(&conn, set_id).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_calibration_set_consumers(
+    state: State<'_, AppState>,
+    set_id: i64,
+) -> Result<Vec<crate::models::CalibrationSetConsumer>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::calibration_links::get_calibration_set_consumers(&conn, set_id)
+        .map_err(|e| e.to_string())
+}
+
 // ===== CALIBRATION FINDER COMMANDS =====
 
 /// Find and link calibration for all light frames in a frame set
