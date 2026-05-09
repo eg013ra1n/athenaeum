@@ -7,13 +7,16 @@ use crate::calibration::config::{
     CalibrationMatchingConfig, CalibrationTypeConfig, MatchMode, ParameterConfig,
     MasterPreference, ScoringConfig,
 };
-use crate::calibration::finder::CalibrationCandidate;
+use crate::calibration::finder::{
+    CalibrationCandidate, CandidateMatchDetails, CandidateMode, ParameterMatch,
+};
 use crate::models::{Frame, ImageType};
 use rusqlite::Connection;
 use chrono::{DateTime, Utc};
 use anyhow::Result;
 
-/// Result of checking a single parameter
+/// Result of checking a single parameter, with the per-parameter detail the
+/// manual modal needs to render "what was compared, against what threshold".
 #[derive(Debug, Clone)]
 pub struct ParameterCheckResult {
     pub matches: bool,
@@ -21,23 +24,48 @@ pub struct ParameterCheckResult {
     pub warning: bool,
     pub warning_message: Option<String>,
     pub skip_matching: bool, // If true, skip this calibration type entirely
+    pub detail: ParameterMatch,
 }
 
 impl ParameterCheckResult {
-    fn matched() -> Self {
-        Self { matches: true, warning: false, warning_message: None, skip_matching: false }
+    fn matched(detail: ParameterMatch) -> Self {
+        Self {
+            matches: true,
+            warning: false,
+            warning_message: None,
+            skip_matching: false,
+            detail: ParameterMatch { matched: true, ..detail },
+        }
     }
 
-    fn failed() -> Self {
-        Self { matches: false, warning: false, warning_message: None, skip_matching: false }
+    fn failed(detail: ParameterMatch) -> Self {
+        Self {
+            matches: false,
+            warning: false,
+            warning_message: None,
+            skip_matching: false,
+            detail: ParameterMatch { matched: false, ..detail },
+        }
     }
 
-    fn warning(msg: String) -> Self {
-        Self { matches: true, warning: true, warning_message: Some(msg), skip_matching: false }
+    fn warning(msg: String, detail: ParameterMatch) -> Self {
+        Self {
+            matches: true,
+            warning: true,
+            warning_message: Some(msg),
+            skip_matching: false,
+            detail: ParameterMatch { matched: true, warning: true, ..detail },
+        }
     }
 
-    fn skip() -> Self {
-        Self { matches: false, warning: false, warning_message: None, skip_matching: true }
+    fn skip(detail: ParameterMatch) -> Self {
+        Self {
+            matches: false,
+            warning: false,
+            warning_message: None,
+            skip_matching: true,
+            detail,
+        }
     }
 }
 
@@ -48,28 +76,34 @@ fn check_string_param(
     config: &ParameterConfig,
     param_name: &str,
 ) -> ParameterCheckResult {
+    let base_detail = ParameterMatch {
+        mode: config.mode,
+        frame_value: frame_value.clone(),
+        set_value: set_value.clone(),
+        ..Default::default()
+    };
     match config.mode {
-        MatchMode::Ignore => ParameterCheckResult::matched(),
+        MatchMode::Ignore => ParameterCheckResult::matched(base_detail),
         MatchMode::Exact => {
             // If required and frame value is None, skip matching entirely
             if config.required && frame_value.is_none() {
-                return ParameterCheckResult::skip();
+                return ParameterCheckResult::skip(base_detail);
             }
 
             match (frame_value, set_value) {
                 (Some(f), Some(s)) => {
                     if f == s {
-                        ParameterCheckResult::matched()
+                        ParameterCheckResult::matched(base_detail)
                     } else {
-                        ParameterCheckResult::failed()
+                        ParameterCheckResult::failed(base_detail)
                     }
                 }
-                (None, None) => ParameterCheckResult::matched(),
+                (None, None) => ParameterCheckResult::matched(base_detail),
                 _ => {
                     if config.required {
-                        ParameterCheckResult::skip()
+                        ParameterCheckResult::skip(base_detail)
                     } else {
-                        ParameterCheckResult::failed()
+                        ParameterCheckResult::failed(base_detail)
                     }
                 }
             }
@@ -78,11 +112,12 @@ fn check_string_param(
             // Warning mode for string params just checks if they're different
             match (frame_value, set_value) {
                 (Some(f), Some(s)) if f != s => {
-                    ParameterCheckResult::warning(format!(
-                        "{} mismatch: frame='{}' vs set='{}'", param_name, f, s
-                    ))
+                    ParameterCheckResult::warning(
+                        format!("{} mismatch: frame='{}' vs set='{}'", param_name, f, s),
+                        base_detail,
+                    )
                 }
-                _ => ParameterCheckResult::matched(),
+                _ => ParameterCheckResult::matched(base_detail),
             }
         }
     }
@@ -101,28 +136,41 @@ fn check_float_param(
     param_name: &str,
     tolerance: f64,
 ) -> ParameterCheckResult {
+    let diff = match (frame_value, set_value) {
+        (Some(f), Some(s)) => Some((f - s).abs()),
+        _ => None,
+    };
+    let base_detail = ParameterMatch {
+        mode: config.mode,
+        frame_value: frame_value.map(|v| v.to_string()),
+        set_value: set_value.map(|v| v.to_string()),
+        diff,
+        warning_threshold: config.warning_threshold,
+        matching_threshold: config.matching_threshold,
+        ..Default::default()
+    };
     match config.mode {
-        MatchMode::Ignore => ParameterCheckResult::matched(),
+        MatchMode::Ignore => ParameterCheckResult::matched(base_detail),
         MatchMode::Exact => {
             // If required and frame value is None, skip matching entirely
             if config.required && frame_value.is_none() {
-                return ParameterCheckResult::skip();
+                return ParameterCheckResult::skip(base_detail);
             }
 
             match (frame_value, set_value) {
                 (Some(f), Some(s)) => {
                     if (f - s).abs() <= tolerance {
-                        ParameterCheckResult::matched()
+                        ParameterCheckResult::matched(base_detail)
                     } else {
-                        ParameterCheckResult::failed()
+                        ParameterCheckResult::failed(base_detail)
                     }
                 }
-                (None, None) => ParameterCheckResult::matched(),
+                (None, None) => ParameterCheckResult::matched(base_detail),
                 _ => {
                     if config.required {
-                        ParameterCheckResult::skip()
+                        ParameterCheckResult::skip(base_detail)
                     } else {
-                        ParameterCheckResult::failed()
+                        ParameterCheckResult::failed(base_detail)
                     }
                 }
             }
@@ -136,24 +184,27 @@ fn check_float_param(
 
             match (frame_value, set_value) {
                 (Some(f), Some(s)) => {
-                    let diff = (f - s).abs();
+                    let abs_diff = (f - s).abs();
 
                     // First check: if outside matching threshold, REJECT
-                    if diff > matching_thresh {
-                        return ParameterCheckResult::failed();
+                    if abs_diff > matching_thresh {
+                        return ParameterCheckResult::failed(base_detail);
                     }
 
                     // Second check: if outside warning threshold, accept with WARNING
-                    if diff > warning_thresh {
-                        ParameterCheckResult::warning(format!(
-                            "{} differs by {:.1} (warning threshold: {:.1}, max: {:.1})",
-                            param_name, diff, warning_thresh, matching_thresh
-                        ))
+                    if abs_diff > warning_thresh {
+                        ParameterCheckResult::warning(
+                            format!(
+                                "{} differs by {:.1} (warning threshold: {:.1}, max: {:.1})",
+                                param_name, abs_diff, warning_thresh, matching_thresh
+                            ),
+                            base_detail,
+                        )
                     } else {
-                        ParameterCheckResult::matched()
+                        ParameterCheckResult::matched(base_detail)
                     }
                 }
-                _ => ParameterCheckResult::matched(),
+                _ => ParameterCheckResult::matched(base_detail),
             }
         }
     }
@@ -167,7 +218,12 @@ pub struct ConfigMatchResult {
     pub warnings: Vec<String>,
 }
 
-/// Check all parameters for a calibration match using the config
+/// Check all parameters for a calibration match using the config.
+///
+/// Returns `(ConfigMatchResult, CandidateMatchDetails)`. The first describes
+/// pass/fail/skip + accumulated warning strings (used by both auto-link and
+/// manual paths to gate the candidate). The second is the per-parameter
+/// breakdown used by the manual modal to render exactly what was compared.
 pub fn check_calibration_match(
     frame: &Frame,
     set_instrume: &Option<String>,
@@ -180,68 +236,51 @@ pub fn check_calibration_match(
     set_filter: &Option<String>,
     set_ccd_temp: Option<f64>,
     config: &CalibrationTypeConfig,
-) -> ConfigMatchResult {
+) -> (ConfigMatchResult, CandidateMatchDetails) {
     let mut warnings = Vec::new();
     let mut all_match = true;
+    let mut details = CandidateMatchDetails::default();
 
-    // Check instrume
-    let result = check_string_param(&frame.instrume, set_instrume, &config.instrume, "instrume");
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
+    macro_rules! apply {
+        ($field:ident, $result:expr) => {{
+            let r = $result;
+            details.$field = r.detail.clone();
+            if r.skip_matching {
+                return (
+                    ConfigMatchResult { matches: false, skip_matching: true, warnings: warnings.clone() },
+                    details,
+                );
+            }
+            if !r.matches { all_match = false; }
+            if let Some(msg) = r.warning_message { warnings.push(msg); }
+        }};
+    }
 
-    // Check binning
-    let result = check_string_param(&frame.binning, set_binning, &config.binning, "binning");
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
+    apply!(instrume, check_string_param(&frame.instrume, set_instrume, &config.instrume, "instrume"));
+    apply!(binning,  check_string_param(&frame.binning,  set_binning,  &config.binning,  "binning"));
+    apply!(gain,     check_float_param(frame.gain,       set_gain,     &config.gain,     "gain",     0.01));
+    apply!(offset,   check_float_param(frame.offset,     set_offset,   &config.offset,   "offset",   0.01));
+    apply!(telescop, check_string_param(&frame.telescop, set_telescop, &config.telescop, "telescop"));
+    apply!(exptime,  check_float_param(frame.exptime,    set_exptime,  &config.exptime,  "exptime",  0.1));
+    apply!(focallen, check_float_param(frame.focallen,   set_focallen, &config.focallen, "focallen", 1.0));
+    apply!(filter,   check_string_param(&frame.filter,   set_filter,   &config.filter,   "filter"));
+    // A4: fall back to set_temp when measured ccd_temp is missing so master
+    // frames / uncooled emergency captures still get a temperature comparison.
+    let frame_temp_effective = crate::models::effective_temp(frame.ccd_temp, frame.set_temp);
+    apply!(ccd_temp, check_float_param(frame_temp_effective, set_ccd_temp, &config.ccd_temp, "ccd_temp", 2.0));
 
-    // Check gain (tolerance: 0.01)
-    let result = check_float_param(frame.gain, set_gain, &config.gain, "gain", 0.01);
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
-
-    // Check offset (tolerance: 0.01)
-    let result = check_float_param(frame.offset, set_offset, &config.offset, "offset", 0.01);
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
-
-    // Check telescop (exact or disabled, no warning mode)
-    let result = check_string_param(&frame.telescop, set_telescop, &config.telescop, "telescop");
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
-
-    // Check exptime (supports warning mode with dual thresholds, tolerance: 0.1s)
-    let result = check_float_param(frame.exptime, set_exptime, &config.exptime, "exptime", 0.1);
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
-
-    // Check focallen (supports warning mode with dual thresholds, tolerance: 1.0mm)
-    let result = check_float_param(frame.focallen, set_focallen, &config.focallen, "focallen", 1.0);
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
-
-    // Check filter (exact or disabled, no warning mode)
-    let result = check_string_param(&frame.filter, set_filter, &config.filter, "filter");
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
-
-    // Check ccd_temp (supports warning mode with dual thresholds, tolerance: 2.0°C)
-    let result = check_float_param(frame.ccd_temp, set_ccd_temp, &config.ccd_temp, "ccd_temp", 2.0);
-    if result.skip_matching { return ConfigMatchResult { matches: false, skip_matching: true, warnings }; }
-    if !result.matches { all_match = false; }
-    if let Some(msg) = result.warning_message { warnings.push(msg); }
-
-    ConfigMatchResult { matches: all_match, skip_matching: false, warnings }
+    (
+        ConfigMatchResult { matches: all_match, skip_matching: false, warnings },
+        details,
+    )
 }
 
-/// Find calibration sets matching a source frame using configurable rules
+/// Find calibration sets matching a source frame using configurable rules.
+///
+/// Auto-link path: returns only candidates that pass the config-driven hard
+/// filter, sorted by score (and master preference). This is now a thin wrapper
+/// around `find_calibration_candidates(..., OnlyCompatible)` so auto-link and
+/// the manual modal share one engine, one scorer, one set of filter rules.
 pub fn find_calibration_sets(
     conn: &Connection,
     frame: &Frame,
@@ -249,16 +288,47 @@ pub fn find_calibration_sets(
     calibration_type: &str,
     config: &CalibrationMatchingConfig,
 ) -> Result<Vec<CalibrationCandidate>> {
-    // Get the type config for this source→calibration pair
+    find_calibration_candidates(
+        conn,
+        frame,
+        source_type,
+        calibration_type,
+        config,
+        CandidateMode::OnlyCompatible,
+    )
+}
+
+/// Unified candidate engine used by both auto-link and the manual modal.
+///
+/// Always queries both regular and master sets so the manual modal can show
+/// masters when the user toggles "Show All". Filtering and master-preference
+/// ordering happen as a post-step on the scored list.
+///
+/// Behavior in `OnlyCompatible` mode:
+/// - Drops candidates that fail any Exact / Warning parameter check.
+/// - Honors `master_preferences`:
+///   - `PreferMaster`  → masters first, then framesets.
+///   - `PreferFrameset` → framesets first, then masters.
+///   - `NoPreference`  → no grouping; both sorted together by score.
+///
+/// Behavior in `IncludeIncompatible` mode:
+/// - Returns every set of the requested type. Compatible candidates first
+///   (descending by score), then incompatible (descending by score). Master
+///   preference is applied within the compatible group only — incompatible
+///   sets keep their score-only order.
+pub fn find_calibration_candidates(
+    conn: &Connection,
+    frame: &Frame,
+    source_type: &str,
+    calibration_type: &str,
+    config: &CalibrationMatchingConfig,
+    mode: CandidateMode,
+) -> Result<Vec<CalibrationCandidate>> {
     let type_config = match config.get_type_config(source_type, calibration_type) {
         Some(tc) => tc,
-        None => {
-            // No config means this calibration type is not configured for this source
-            return Ok(Vec::new());
-        }
+        None => return Ok(Vec::new()),
     };
 
-    // Get image type for the calibration
     let imagetyp = match calibration_type {
         "flat" => ImageType::Flat,
         "dark" => ImageType::Dark,
@@ -267,7 +337,6 @@ pub fn find_calibration_sets(
         _ => return Ok(Vec::new()),
     };
 
-    // Query calibration sets - determine which image types to include
     let (imagetyp_str, master_imagetyp_str) = match calibration_type {
         "flat" => ("Flat", "MasterFlat"),
         "dark" => ("Dark", "MasterDark"),
@@ -276,34 +345,23 @@ pub fn find_calibration_sets(
         _ => return Ok(Vec::new()),
     };
 
-    // Check master preference to decide whether to include master sets
     let master_pref = config.get_master_preference(calibration_type);
-    let include_masters = matches!(master_pref, MasterPreference::PreferMaster);
 
-    let query = if include_masters {
-        // Include both regular calibration sets and master sets
-        format!(
-            "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
-                    ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
-             FROM calibration_set
-             WHERE imagetyp IN ('{}', '{}')
-             ORDER BY date_start DESC",
-            imagetyp_str, master_imagetyp_str
-        )
-    } else {
-        // Only include regular calibration sets (is_master_library = 0)
-        format!(
-            "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
-                    ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
-             FROM calibration_set
-             WHERE imagetyp = '{}' AND is_master_library = 0
-             ORDER BY date_start DESC",
-            imagetyp_str
-        )
-    };
+    // Always query both regular + master rows. Master preference is applied
+    // post-query so the manual modal can show masters in "Show All" even when
+    // the user has master preference set to NoPreference.
+    let query = format!(
+        "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
+                ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
+         FROM calibration_set
+         WHERE imagetyp IN ('{}', '{}')
+         ORDER BY date_start DESC",
+        imagetyp_str, master_imagetyp_str
+    );
 
     let mut stmt = conn.prepare(&query)?;
-    let mut candidates = Vec::new();
+    let mut compatible: Vec<CalibrationCandidate> = Vec::new();
+    let mut incompatible: Vec<CalibrationCandidate> = Vec::new();
 
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -329,61 +387,68 @@ pub fn find_calibration_sets(
         let (set_id, gain, offset, binning, instrume, exptime, focallen, filter,
              ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library) = row_result?;
 
-        // Use the average temp if available
         let set_temp = match (temp_min, temp_max) {
             (Some(min), Some(max)) => Some((min + max) / 2.0),
             _ => ccd_temp,
         };
 
-        // Check all parameters using configurable rules
-        let match_result = check_calibration_match(
-            frame,
-            &instrume,
-            &binning,
-            gain,
-            offset,
-            &telescop,
-            exptime,
-            focallen,
-            &filter,
-            set_temp,
-            type_config,
+        let (match_result, mut details) = check_calibration_match(
+            frame, &instrume, &binning, gain, offset, &telescop, exptime,
+            focallen, &filter, set_temp, type_config,
         );
 
-        // Skip entirely if required field is missing
+        // `skip_matching` fires per-candidate when an Exact+required parameter
+        // can't be compared (frame missing the value, or set missing it).
+        // Treat it the same way the original `find_calibration_sets` did:
+        // skip THIS candidate and keep iterating. Aborting the whole search
+        // breaks real-world DBs where any single malformed calibration row
+        // would otherwise hide every legitimate match.
         if match_result.skip_matching {
             continue;
         }
 
-        // Skip if parameters don't match
-        if !match_result.matches {
+        // Diffs for the engine score. These are also surfaced via details so
+        // both UIs can display them consistently.
+        let date_diff = calculate_date_diff(frame.date_obs, &date_start, &date_end);
+        // A4: same set_temp fallback as in check_calibration_match so the
+        // displayed temp_diff agrees with the hard-filter decision.
+        let frame_temp_for_score = crate::models::effective_temp(frame.ccd_temp, frame.set_temp);
+        let temp_diff = match (frame_temp_for_score, set_temp) {
+            (Some(f), Some(s)) => Some((f - s).abs()),
+            _ => None,
+        };
+        let exptime_diff = match (frame.exptime, exptime) {
+            (Some(f), Some(s)) => Some((f - s).abs()),
+            _ => None,
+        };
+        details.date_diff_days = date_diff.unwrap_or(0);
+        details.temp_diff = temp_diff;
+        details.exptime_diff = exptime_diff;
+
+        let date_warning = check_date_warning_days(date_diff, calibration_type, config);
+        let temp_warning = match_result.warnings.iter().any(|w| w.contains("ccd_temp"));
+
+        let passed_hard_filter = match_result.matches && !match_result.skip_matching;
+
+        if mode == CandidateMode::OnlyCompatible && !passed_hard_filter {
             continue;
         }
 
-        // Calculate date difference for scoring
-        let date_diff = calculate_date_diff(frame.date_obs, &date_start, &date_end);
-
-        // Calculate temperature difference for scoring
-        let temp_diff = match (frame.ccd_temp, set_temp) {
-            (Some(f_temp), Some(s_temp)) => Some((f_temp - s_temp).abs()),
-            _ => None,
+        // Score reflects "is this a real match per the user's config" — not
+        // just date/temp/exptime closeness. A wrong-camera (or wrong-filter,
+        // wrong-binning, wrong-gain, wrong-offset) candidate is honestly a
+        // zero-confidence match even if the date / temp / exptime line up,
+        // and so are warning-mode params that exceed `matching_threshold`
+        // (focal length, exptime, temp). All of those flip
+        // `passed_hard_filter = false`, so this single override zeroes the
+        // score for every kind of hard-rejection consistently.
+        let score = if passed_hard_filter {
+            score_match(date_diff, temp_diff, exptime_diff, &config.scoring)
+        } else {
+            0.0
         };
 
-        // Calculate exposure time difference for scoring
-        let exptime_diff = match (frame.exptime, exptime) {
-            (Some(f_exp), Some(s_exp)) => Some((f_exp - s_exp).abs()),
-            _ => None,
-        };
-
-        // Score the match using configurable weights and scales
-        let score = score_match(date_diff, temp_diff, exptime_diff, &config.scoring);
-
-        // Determine warnings
-        let temp_warning = !match_result.warnings.is_empty() &&
-            match_result.warnings.iter().any(|w| w.contains("ccd_temp"));
-        let date_warning = check_date_warning_days(date_diff, calibration_type, config);
-
-        candidates.push(CalibrationCandidate {
+        let candidate = CalibrationCandidate {
             set_id,
             imagetyp: imagetyp.clone(),
             match_score: score,
@@ -392,18 +457,47 @@ pub fn find_calibration_sets(
             date_warning,
             temp_warning,
             is_master: is_master_library == 1,
-        });
+            passed_hard_filter,
+            details,
+            warnings: match_result.warnings,
+        };
+
+        if passed_hard_filter {
+            compatible.push(candidate);
+        } else {
+            incompatible.push(candidate);
+        }
     }
 
-    // Sort by score (best first)
-    candidates.sort_by(|a, b| {
-        b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Score-sort each group, descending.
+    let by_score_desc = |a: &CalibrationCandidate, b: &CalibrationCandidate| {
+        b.match_score
+            .partial_cmp(&a.match_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    compatible.sort_by(by_score_desc);
+    incompatible.sort_by(by_score_desc);
 
-    // Apply master preference if configured (reuse the master_pref from above)
-    candidates = apply_master_preference(candidates, master_pref);
+    // Master preference applies inside the compatible group.
+    let mut compatible = apply_master_preference(compatible, master_pref.clone());
 
-    Ok(candidates)
+    match mode {
+        CandidateMode::OnlyCompatible => {
+            // Preserve historic auto-link semantics: when master_pref is
+            // NoPreference, callers don't expect masters mixed into auto-link
+            // results. PreferMaster / PreferFrameset already include both.
+            if master_pref == MasterPreference::NoPreference {
+                compatible.retain(|c| !c.is_master);
+            }
+            Ok(compatible)
+        }
+        CandidateMode::IncludeIncompatible => {
+            // Compatible block first (already master-preference-sorted),
+            // incompatible block second (score-only).
+            compatible.extend(incompatible);
+            Ok(compatible)
+        }
+    }
 }
 
 /// Calculate date difference in days
@@ -794,5 +888,322 @@ mod tests {
 
         // 1s dark should score higher (closer exposure match)
         assert!(score_1s > score_5s, "Closer exposure should score higher: {} vs {}", score_1s, score_5s);
+    }
+
+    // ── Engine-level tests ──────────────────────────────────────────────
+    // These exercise `find_calibration_candidates` with an in-memory SQLite
+    // DB to make sure the auto-link and manual-suggestion paths see identical
+    // scores and that the `OnlyCompatible` / `IncludeIncompatible` modes do
+    // exactly what the unification plan promises.
+
+    use crate::db::schema::init_db;
+    use rusqlite::params;
+    use rusqlite::Connection;
+
+    fn engine_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    fn insert_dark_set(
+        conn: &Connection,
+        id: i64,
+        instrume: &str,
+        binning: &str,
+        gain: f64,
+        offset: f64,
+        exptime: f64,
+        ccd_temp: f64,
+        date_start: &str,
+        is_master: i32,
+        imagetyp: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO calibration_set
+             (id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
+              binning, instrume, date, date_start, date_end, frame_count, is_master_library)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9, 10, ?10)",
+            params![
+                id, imagetyp, exptime, ccd_temp, gain, offset, binning, instrume,
+                date_start, is_master,
+            ],
+        ).unwrap();
+    }
+
+    fn light_frame_for_dark() -> Frame {
+        Frame {
+            id: Some(1),
+            file_id: 1,
+            object: None,
+            date_obs: Some(
+                chrono::DateTime::parse_from_rfc3339("2025-10-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            telescop: None,
+            instrume: Some("ASI2600MM".to_string()),
+            exptime: Some(300.0),
+            filter: Some("L".to_string()),
+            imagetyp: Some(ImageType::Light),
+            is_master: false,
+            gain: Some(56.0),
+            offset: Some(50.0),
+            binning: Some("1x1".to_string()),
+            xbinning: Some(1),
+            ybinning: Some(1),
+            ccd_temp: Some(-10.0),
+            set_temp: None,
+            focallen: Some(448.0),
+            xpixsz: None,
+            ypixsz: None,
+            naxis1: None,
+            naxis2: None,
+            ra: None,
+            dec: None,
+            sitelat: None,
+            lat_obs: None,
+            sitelong: None,
+            long_obs: None,
+            objctra: None,
+            objctdec: None,
+            override_: false,
+            swcreate: None,
+            bayerpat: None,
+            rotation: None,
+        }
+    }
+
+    #[test]
+    fn engine_only_compatible_drops_failing_candidates() {
+        let conn = engine_test_db();
+        // Match: same camera/binning/gain/offset/exptime, ~10°C
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        // Mismatch: different binning
+        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        // Mismatch: different exptime (rejected by Exact in default config)
+        insert_dark_set(&conn, 3, "ASI2600MM", "1x1", 56.0, 50.0, 60.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+
+        let compatible = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
+        ).unwrap();
+
+        let ids: Vec<i64> = compatible.iter().map(|c| c.set_id).collect();
+        assert_eq!(ids, vec![1], "OnlyCompatible should keep just the matching set");
+        assert!(compatible[0].passed_hard_filter);
+    }
+
+    #[test]
+    fn engine_include_incompatible_returns_all_with_flag() {
+        let conn = engine_test_db();
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(&conn, 3, "ASI2600MM", "1x1", 56.0, 50.0, 60.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+
+        let all = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
+        ).unwrap();
+
+        // All three rows present.
+        assert_eq!(all.len(), 3, "IncludeIncompatible should keep every row");
+
+        // Compatible (set 1) appears first; incompatible follows.
+        assert_eq!(all[0].set_id, 1);
+        assert!(all[0].passed_hard_filter);
+        assert!(!all[1].passed_hard_filter);
+        assert!(!all[2].passed_hard_filter);
+    }
+
+    #[test]
+    fn engine_same_set_scores_identical_in_both_modes() {
+        // The auto-link path's score and the manual-modal path's score must
+        // agree for any compatible candidate, otherwise the modal lies about
+        // what auto-link will pick.
+        let conn = engine_test_db();
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -8.5, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+
+        let compatible = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
+        ).unwrap();
+        let all = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
+        ).unwrap();
+
+        let auto_score = compatible
+            .iter()
+            .find(|c| c.set_id == 1)
+            .map(|c| c.match_score)
+            .expect("set 1 should be compatible");
+        let manual_score = all
+            .iter()
+            .find(|c| c.set_id == 1)
+            .map(|c| c.match_score)
+            .expect("set 1 should also appear in IncludeIncompatible");
+
+        assert!(
+            (auto_score - manual_score).abs() < 1e-12,
+            "auto vs manual score divergence: {} vs {}",
+            auto_score,
+            manual_score
+        );
+    }
+
+    #[test]
+    fn engine_include_incompatible_surfaces_cross_camera_dark() {
+        // Manual modal use case: the user's lights are for camera A, but the
+        // only Dark sets in their DB are for camera B. The manual modal needs
+        // those B-camera Darks to appear (so the user can pick or confirm) —
+        // OnlyCompatible would drop them on the instrume Exact filter.
+        let conn = engine_test_db();
+        // Wrong-camera dark: same exptime/gain/binning, different instrume.
+        insert_dark_set(&conn, 5, "OtherCamera", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+
+        // Auto-link path: must reject the cross-camera dark.
+        let auto = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
+        ).unwrap();
+        assert!(auto.is_empty(), "auto-link must NOT pick wrong-camera dark");
+
+        // Manual modal path: must surface it so the user can override.
+        let manual = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
+        ).unwrap();
+        assert_eq!(manual.len(), 1);
+        assert_eq!(manual[0].set_id, 5);
+        assert!(!manual[0].passed_hard_filter);
+        assert!(!manual[0].details.instrume.matched);
+        // Score must be zero for any hard-filter reject (camera mismatch here).
+        // High date/temp/exptime closeness must not produce misleading scores.
+        assert_eq!(manual[0].match_score, 0.0,
+            "wrong-camera dark must score 0 even with perfect date/temp/exptime");
+    }
+
+    #[test]
+    fn engine_score_zero_for_hard_filter_rejects() {
+        // Verify the score-zero rule fires for every kind of hard-filter
+        // reject: instrume / binning / gain / offset (Exact mismatch),
+        // exptime / focallen / temp (Warning mode beyond matching_threshold).
+        let conn = engine_test_db();
+
+        // Wrong binning, otherwise perfect.
+        insert_dark_set(&conn, 1, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        // Wrong gain.
+        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 999.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        // exptime way off (>5s matching_threshold).
+        insert_dark_set(&conn, 3, "ASI2600MM", "1x1", 56.0, 50.0, 60.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        // temp way off (>5°C matching_threshold).
+        insert_dark_set(&conn, 4, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -25.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        // Real match.
+        insert_dark_set(&conn, 5, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+
+        let manual = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
+        ).unwrap();
+
+        let by_id: std::collections::HashMap<i64, &CalibrationCandidate> =
+            manual.iter().map(|c| (c.set_id, c)).collect();
+
+        for &id in &[1i64, 2, 3, 4] {
+            let c = by_id.get(&id).expect("incompatible candidate must still be returned");
+            assert!(!c.passed_hard_filter, "set {} should fail hard filter", id);
+            assert_eq!(c.match_score, 0.0, "set {} score must be 0 (hard-filter reject)", id);
+        }
+        // Compatible match keeps a real score.
+        let good = by_id.get(&5).unwrap();
+        assert!(good.passed_hard_filter);
+        assert!(good.match_score > 0.5, "compatible match should score well, got {}", good.match_score);
+    }
+
+    #[test]
+    fn engine_skip_matching_does_not_abort_search() {
+        // Regression: a calibration set with NULL on a required-Exact param
+        // (e.g., gain) used to make the engine return Vec::new() and hide every
+        // valid candidate behind it. Make sure those rows are skipped, not
+        // fatal.
+        let conn = engine_test_db();
+
+        // Set 1: malformed — NULL gain. With config.gain Exact+required, the
+        // per-param check returns skip_matching for THIS row.
+        conn.execute(
+            "INSERT INTO calibration_set
+             (id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
+              binning, instrume, date, date_start, date_end, frame_count, is_master_library)
+             VALUES (1, 'Dark', 300.0, -10.0, -10.0, -10.0, NULL, 50.0, '1x1', 'ASI2600MM',
+                     '2025-09-25T00:00:00+00:00', '2025-09-25T00:00:00+00:00',
+                     '2025-09-25T00:00:00+00:00', 10, 0)",
+            params![],
+        ).unwrap();
+        // Set 2: valid match
+        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+
+        let compatible = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
+        ).unwrap();
+
+        let ids: Vec<i64> = compatible.iter().map(|c| c.set_id).collect();
+        assert_eq!(
+            ids, vec![2],
+            "skip_matching on one row must not hide other valid candidates"
+        );
+    }
+
+    #[test]
+    fn engine_no_preference_excludes_masters_for_auto_only() {
+        // OnlyCompatible + NoPreference: auto-link should not consider masters.
+        // IncludeIncompatible: masters still appear so the modal can show them.
+        use crate::calibration::config::{BehavioralOptions, ParameterConfig};
+
+        let conn = engine_test_db();
+        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 1, "MasterDark");
+
+        let frame = light_frame_for_dark();
+        let mut config = CalibrationMatchingConfig::default();
+        // Force NoPreference for darks
+        config.master_preferences.insert("dark".to_string(), MasterPreference::NoPreference);
+        // Make sure the darks→bias optional knob doesn't interfere with the test.
+        config.behavioral_options.insert(
+            "darks".to_string(),
+            BehavioralOptions {
+                use_bias_for_dark_optimization: false,
+                use_bias_if_no_darks: false,
+                fallback_chain: Vec::new(),
+            },
+        );
+        // Avoid letting filter Exact-required reject the test setup.
+        if let Some(tc) = config.lights.dark.as_mut() {
+            tc.filter = ParameterConfig::ignore();
+        }
+
+        let compatible = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
+        ).unwrap();
+        let ids: Vec<i64> = compatible.iter().map(|c| c.set_id).collect();
+        assert_eq!(ids, vec![1], "NoPreference should drop masters from auto-link results");
+
+        let all = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
+        ).unwrap();
+        let all_ids: Vec<i64> = all.iter().map(|c| c.set_id).collect();
+        assert!(all_ids.contains(&2), "IncludeIncompatible should still surface masters: got {:?}", all_ids);
     }
 }

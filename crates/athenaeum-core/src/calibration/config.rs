@@ -12,7 +12,7 @@ use std::collections::HashMap;
 pub const CONFIG_VERSION: i32 = 3;
 
 /// Match mode for parameter comparison
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchMode {
     /// Must match exactly (with small tolerance for floats)

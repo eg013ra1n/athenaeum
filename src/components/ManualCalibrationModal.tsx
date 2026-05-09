@@ -121,14 +121,20 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     }
   };
 
-  const handleApply = () => {
-    onApply(selectedFlatId, selectedDarkId, selectedBiasId);
-  };
-
   // Use backend data as source of truth for detecting changes
   const currentFlatFromBackend = lightParams?.current_flat_set_id ?? currentFlatSetId;
   const currentDarkFromBackend = lightParams?.current_dark_set_id ?? currentDarkSetId;
   const currentBiasFromBackend = lightParams?.current_bias_set_id ?? currentBiasSetId;
+
+  // Only forward values the user actually changed. Unchanged dropdowns come back
+  // as null so the parent's null-skip prevents accidental manual_assigns.
+  const handleApply = () => {
+    onApply(
+      selectedFlatId !== currentFlatFromBackend ? selectedFlatId : null,
+      selectedDarkId !== currentDarkFromBackend ? selectedDarkId : null,
+      selectedBiasId !== currentBiasFromBackend ? selectedBiasId : null,
+    );
+  };
 
   const hasChanges =
     selectedFlatId !== currentFlatFromBackend ||
@@ -205,6 +211,20 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
       return calDate < lightMid ? 'old' : 'young';
     })();
 
+    // B4: warn when a flat set spans an unusually wide time window. Sky flats
+    // shot at dusk and dawn ~10-12 hours apart can merge into a single group
+    // when the user widens `time_cluster_minutes`, hiding the fact that two
+    // physically different atmospheric conditions are being averaged. The
+    // chip surfaces this without changing scoring or selection.
+    const longSpanHours = (() => {
+      if (type !== 'flat' || !set.date_start || !set.date_end) return 0;
+      const s = new Date(set.date_start).getTime();
+      const e = new Date(set.date_end).getTime();
+      if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return 0;
+      return (e - s) / 3_600_000;
+    })();
+    const isLongSpan = longSpanHours > 6;
+
     return (
       <div
         onClick={onSelect}
@@ -251,6 +271,14 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
           )}
           {set.is_master && (
             <span className="text-[10px] px-1.5 py-px rounded bg-yellow-500/20 text-yellow-400">Master</span>
+          )}
+          {isLongSpan && (
+            <span
+              className="text-[10px] px-1.5 py-px rounded bg-warning/20 text-warning"
+              title={`This flat group spans ${longSpanHours.toFixed(1)} hours — verify it isn't merging dawn and dusk frames captured under different atmospheric conditions.`}
+            >
+              Long span ({longSpanHours.toFixed(0)}h)
+            </span>
           )}
         </div>
 

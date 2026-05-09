@@ -218,12 +218,8 @@ pub fn process_frame_set(
 
     // Process each frame
     for (index, frame) in frames.iter().enumerate() {
-        // Get manual flat selection for this frame's filter (if any)
-        let manual_flat_set_id = manual_flat_selections
-            .and_then(|selections| {
-                frame.filter.as_ref()
-                    .and_then(|filter| selections.get(filter).copied())
-            });
+        let (manual_flat_set_id, manual_dark_set_id) =
+            resolve_manual_overrides(conn, frame, manual_flat_selections);
 
         // Build calibration hierarchy for this frame
         let hierarchy = build_complete_hierarchy(
@@ -232,6 +228,7 @@ pub fn process_frame_set(
             tolerance,
             flat_pattern,
             manual_flat_set_id,
+            manual_dark_set_id,
             max_age_days,
             time_cluster_minutes,
             temp_weight,
@@ -264,6 +261,46 @@ pub fn process_frame_set(
     Ok(stats)
 }
 
+/// Resolve which Flat / Dark calibration set IDs (if any) should be treated as
+/// manual overrides for a given frame.
+///
+/// Precedence:
+/// 1. Frontend-provided `manual_flat_selections` (per-filter map) — wins for Flat.
+/// 2. DB-stored `is_manual_override = 1` row in `calibration_set_to_frames`.
+///
+/// Without this fallback, "Find Calibration" runs the auto-matcher even when a
+/// user has previously locked a calibration set for a frame, which means the
+/// sub-calibration chain (DarkFlat/Dark/Bias for Flat, Bias for Dark) ends up
+/// computed against the auto-detected parent and never against the user's pick.
+fn resolve_manual_overrides(
+    conn: &Connection,
+    frame: &Frame,
+    manual_flat_selections: Option<&std::collections::HashMap<String, i64>>,
+) -> (Option<i64>, Option<i64>) {
+    use crate::db::calibration_links::get_manual_override_set_id;
+
+    let frontend_flat = manual_flat_selections.and_then(|selections| {
+        frame
+            .filter
+            .as_ref()
+            .and_then(|filter| selections.get(filter).copied())
+    });
+
+    let frame_id = match frame.id {
+        Some(id) => id,
+        None => return (frontend_flat, None),
+    };
+
+    let manual_flat_set_id = frontend_flat
+        .or_else(|| get_manual_override_set_id(conn, frame_id, "Flat").ok().flatten());
+
+    let manual_dark_set_id = get_manual_override_set_id(conn, frame_id, "Dark")
+        .ok()
+        .flatten();
+
+    (manual_flat_set_id, manual_dark_set_id)
+}
+
 /// Process all light frames in a frame set with progress callback
 #[allow(dead_code)]
 pub fn process_frame_set_with_progress<F>(
@@ -289,12 +326,8 @@ where
 
     // Process each frame
     for (index, frame) in frames.iter().enumerate() {
-        // Get manual flat selection for this frame's filter (if any)
-        let manual_flat_set_id = manual_flat_selections
-            .and_then(|selections| {
-                frame.filter.as_ref()
-                    .and_then(|filter| selections.get(filter).copied())
-            });
+        let (manual_flat_set_id, manual_dark_set_id) =
+            resolve_manual_overrides(conn, frame, manual_flat_selections);
 
         // Build calibration hierarchy for this frame
         let hierarchy = build_complete_hierarchy(
@@ -303,6 +336,7 @@ where
             tolerance,
             flat_pattern,
             manual_flat_set_id,
+            manual_dark_set_id,
             max_age_days,
             time_cluster_minutes,
             temp_weight,

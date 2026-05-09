@@ -26,6 +26,30 @@ pub enum FileFormat {
     XISF,
 }
 
+/// Effective temperature for a frame: prefer the measured `ccd_temp`, but
+/// fall back to `set_temp` (commanded cooler temperature) when the measured
+/// reading is missing. Master frames and uncooled emergency captures often
+/// arrive with `ccd_temp = NULL` but a valid `set_temp` — without this
+/// fallback those frames would cluster into a single "no-temperature" bucket
+/// and silently mix cooled and uncooled darks. Auto-link / Manual modal both
+/// use this helper.
+pub fn effective_temp(ccd_temp: Option<f64>, set_temp: Option<f64>) -> Option<f64> {
+    ccd_temp.or(set_temp)
+}
+
+/// Heuristic: a frame is "filter-ambiguous mono" when it has no Bayer pattern
+/// (so it isn't an OSC sensor) and no FILTER keyword. Filter wheels on mono
+/// cameras normally write the slot label to FILTER; a NULL FILTER on a mono
+/// camera with a wheel is most often a driver hiccup or hand-edit, not an
+/// "I shot without any filter" intention. Auto-link can't tell which physical
+/// filter the frame came through, so the matcher logs a warning when it sees
+/// this case (used by A7). Pure-mono setups without a filter wheel will also
+/// trigger this heuristic — that's intentional, the user must confirm manually
+/// that auto-linking by NULL-filter is what they want.
+pub fn is_mono_with_ambiguous_filter(bayerpat: &Option<String>, filter: &Option<String>) -> bool {
+    bayerpat.is_none() && filter.is_none()
+}
+
 /// Represents a FITS/XISF frame with metadata
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Frame {

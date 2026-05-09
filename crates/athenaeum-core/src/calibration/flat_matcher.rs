@@ -105,8 +105,12 @@ pub fn find_flat_groups_for_light_frame(
         .ok_or_else(|| anyhow::anyhow!("Light frame missing binning"))?;
     let gain = light_frame.gain;
     let focal_length = light_frame.focallen;
-    let frame_date = light_frame.date_obs
-        .ok_or_else(|| anyhow::anyhow!("Light frame missing date_obs"))?;
+    // A3: don't hard-fail on a missing DATE-OBS. Legacy FITS, hand-edited
+    // headers, or archive→restore round-trips can leave one light without a
+    // date — that shouldn't block calibration for the rest of the frame set.
+    // When the date is unknown, search across all candidate flats (no date
+    // window) and skip date-based scoring/timing later.
+    let frame_date_opt: Option<DateTime<Utc>> = light_frame.date_obs;
 
     // Diagnostic logging
     println!("🔍 Finding flats for light frame ID {}",
@@ -116,12 +120,33 @@ pub fn find_flat_groups_for_light_frame(
     println!("  📐 binning: {}", binning);
     println!("  ⚡ gain: {:?}", gain);
     println!("  🔭 focallen: {:?}", focal_length);
-    println!("  📅 date: {}", frame_date);
+    match frame_date_opt {
+        Some(d) => println!("  📅 date: {}", d),
+        None => println!("  📅 date: <missing — searching across full date range>"),
+    }
     println!("  ⏰ max_age_days: {}", max_age_days);
 
-    // Calculate date range for search (±max_age_days from light frame)
-    let start_date = frame_date - chrono::Duration::days(max_age_days);
-    let end_date = frame_date + chrono::Duration::days(max_age_days);
+    // A7: warn when the light is "filter-ambiguous mono" — no Bayer pattern
+    // (i.e., a mono sensor) AND a missing FILTER keyword. Auto-link can't tell
+    // which physical filter the frame came through; results may include flats
+    // shot through different filters, all stored with FILTER=NULL. Logged
+    // here so it shows up in stderr / app logs; behavior is unchanged so a
+    // pure-mono single-filter setup doesn't silently regress.
+    if crate::models::is_mono_with_ambiguous_filter(&light_frame.bayerpat, &light_frame.filter) {
+        eprintln!(
+            "  ⚠️  filter-ambiguous mono frame (id={:?}): bayerpat=NULL and filter=NULL. \
+             Auto-link will match against any flat with FILTER=NULL — verify the result manually.",
+            light_frame.id
+        );
+    }
+
+    // Calculate date range for search (±max_age_days from light frame).
+    // When the light has no date_obs, omit the date filter entirely so we
+    // can still surface candidates the user may have manually linked.
+    let date_range = frame_date_opt.map(|d| (
+        d - chrono::Duration::days(max_age_days),
+        d + chrono::Duration::days(max_age_days),
+    ));
 
     // Load config to get focallen threshold
     let config = load_config(conn);
@@ -141,32 +166,43 @@ pub fn find_flat_groups_for_light_frame(
         focal_length,
         focallen_threshold,
         time_cluster_minutes,
-        Some((start_date, end_date)),
+        date_range,
     ).map_err(|e| {
         eprintln!("  ❌ detect_flat_groups failed: {}", e);
         eprintln!("  📋 Search params - instrume: {}, filter: {:?}, binning: {}, gain: {:?}, focallen: {:?}",
             instrume, filter, binning, gain, focal_length);
-        eprintln!("  📅 Date range: {} to {}", start_date, end_date);
+        match date_range {
+            Some((s, e_)) => eprintln!("  📅 Date range: {} to {}", s, e_),
+            None => eprintln!("  📅 Date range: <none — light frame missing date_obs>"),
+        }
         e
     })?;
 
     println!("  🎯 detect_flat_groups found {} groups", flat_groups.len());
 
-    // Calculate match scores for each group
+    // Calculate match scores for each group. When the light frame has no
+    // date_obs, we can't compute proximity — fall back to a neutral date
+    // score (0.5) and an explicit `FlatTiming::During` so downstream pattern
+    // selection (Automatic / LongTerm) still has something to compare.
     let mut matches: Vec<FlatGroupMatch> = flat_groups
         .into_iter()
         .map(|group| {
-            // Calculate age in days (use group's midpoint)
             let group_midpoint = group.start_time + (group.end_time - group.start_time) / 2;
-            let age_days = (frame_date - group_midpoint).num_days().abs();
-
-            // Determine timing relationship
-            let timing = if group.end_time < frame_date {
-                FlatTiming::Before
-            } else if group.start_time > frame_date {
-                FlatTiming::After
-            } else {
-                FlatTiming::During
+            let (age_days, timing, date_score) = match frame_date_opt {
+                Some(frame_date) => {
+                    let age = (frame_date - group_midpoint).num_days().abs();
+                    let timing = if group.end_time < frame_date {
+                        FlatTiming::Before
+                    } else if group.start_time > frame_date {
+                        FlatTiming::After
+                    } else {
+                        FlatTiming::During
+                    };
+                    let max_days = max_age_days as f64;
+                    let score = 1.0 - (age as f64 / max_days).min(1.0);
+                    (age, timing, score)
+                }
+                None => (0, FlatTiming::During, 0.5),
             };
 
             // Calculate temperature difference (if available)
@@ -177,11 +213,6 @@ pub fn find_flat_groups_for_light_frame(
             } else {
                 None
             };
-
-            // Calculate match score
-            // Base score from date proximity (newer = better)
-            let max_days = max_age_days as f64;
-            let date_score = 1.0 - (age_days as f64 / max_days).min(1.0);
 
             // Temperature score (if available)
             let temp_score = if let Some(diff) = temp_diff {
@@ -234,14 +265,34 @@ pub fn apply_pattern_selection(
 
     match pattern {
         FlatPattern::Automatic => {
-            // Find flat group nearest in time to the light frame
+            // Find flat group nearest in time to the light frame.
+            //
+            // B6: when two groups are equidistant, prefer FlatTiming::After
+            // deterministically — astrophotographers conventionally shoot
+            // flats AFTER the imaging session (dawn flats / panel flats once
+            // the rig is parked). The post-session flat captures the actual
+            // optical state the lights were taken under (dust drift, dewing
+            // accumulation during the session). The previous code relied on
+            // `min_by_key` returning the first encountered on ties, which
+            // depended on the input vec's score-sort order — unstable across
+            // re-runs as scores shift by tiny amounts.
             if let Some(frame_date) = light_frame_date {
+                // Composite key: (time-distance ascending, timing priority).
+                // Timing priority: During (0) < After (1) < Before (2).
+                // The `min_by_key` picks the smallest tuple, so equidistant
+                // After beats equidistant Before.
+                fn timing_priority(t: &FlatTiming) -> u8 {
+                    match t {
+                        FlatTiming::During => 0,
+                        FlatTiming::After => 1,
+                        FlatTiming::Before => 2,
+                    }
+                }
                 matches.into_iter().min_by_key(|m| {
-                    // Calculate midpoint of flat group
                     let duration = m.group.end_time - m.group.start_time;
                     let flat_midpoint = m.group.start_time + duration / 2;
-                    // Return absolute time difference in seconds
-                    (frame_date - flat_midpoint).num_seconds().abs()
+                    let abs_distance = (frame_date - flat_midpoint).num_seconds().abs();
+                    (abs_distance, timing_priority(&m.timing))
                 })
             } else {
                 // Fallback: return best scored match (first in sorted list)
@@ -280,6 +331,8 @@ mod tests {
                 start_time,
                 end_time,
                 avg_temp: Some(-10.0),
+                temp_min: Some(-10.0),
+                temp_max: Some(-10.0),
                 frame_count: 3,
                 filter: Some("L".to_string()),
                 instrume: Some("ASI2600MM".to_string()),
@@ -382,6 +435,81 @@ mod tests {
     }
 
     #[test]
+    fn is_mono_with_ambiguous_filter_heuristic() {
+        // A7: helper that drives the warning logged by find_flat_groups_*.
+        use crate::models::is_mono_with_ambiguous_filter;
+
+        // Mono (no Bayer) + no filter = ambiguous.
+        assert!(is_mono_with_ambiguous_filter(&None, &None));
+        // Mono with a real filter label = not ambiguous.
+        assert!(!is_mono_with_ambiguous_filter(&None, &Some("L".to_string())));
+        // OSC (Bayer present) with no filter = NOT ambiguous (normal).
+        assert!(!is_mono_with_ambiguous_filter(&Some("RGGB".to_string()), &None));
+        // OSC with a filter label = not ambiguous.
+        assert!(!is_mono_with_ambiguous_filter(&Some("RGGB".to_string()), &Some("L".to_string())));
+    }
+
+    #[test]
+    fn find_flat_groups_for_light_with_no_date_obs_returns_ok() {
+        // A3 regression: a light frame missing DATE-OBS used to hard-fail the
+        // entire flat search (the function returned Err and aborted the
+        // per-frame loop in process_frame_set). After A3 it must return Ok —
+        // the engine's existing handling for missing dates kicks in (no date
+        // window, neutral date scoring) so the rest of the frame set still
+        // calibrates.
+        use crate::db::schema::init_db;
+        use crate::models::{Frame, ImageType};
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let light = Frame {
+            id: Some(1),
+            file_id: 1,
+            object: None,
+            date_obs: None, // ← the case under test
+            telescop: None,
+            instrume: Some("ASI2600MM".to_string()),
+            exptime: Some(300.0),
+            filter: Some("L".to_string()),
+            imagetyp: Some(ImageType::Light),
+            is_master: false,
+            gain: Some(56.0),
+            offset: Some(50.0),
+            binning: Some("1x1".to_string()),
+            xbinning: Some(1),
+            ybinning: Some(1),
+            ccd_temp: Some(-10.0),
+            set_temp: None,
+            focallen: Some(448.0),
+            xpixsz: None,
+            ypixsz: None,
+            naxis1: None,
+            naxis2: None,
+            ra: None,
+            dec: None,
+            sitelat: None,
+            lat_obs: None,
+            sitelong: None,
+            long_obs: None,
+            objctra: None,
+            objctdec: None,
+            override_: false,
+            swcreate: None,
+            bayerpat: None,
+            rotation: None,
+        };
+
+        let result = find_flat_groups_for_light_frame(&conn, &light, 30, 30, 0.5);
+        assert!(
+            result.is_ok(),
+            "missing date_obs must NOT abort the search, got Err: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn test_automatic_selects_nearest_flat_group() {
         // Light frame taken at 20:00
         let light_date = DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z")
@@ -414,8 +542,10 @@ mod tests {
     }
 
     #[test]
-    fn test_automatic_prefers_before_when_equidistant() {
-        // Light frame taken at 20:00
+    fn test_automatic_prefers_after_when_equidistant() {
+        // B6: equidistant flats must deterministically prefer FlatTiming::After
+        // — astrophotographers shoot flats after the imaging session, so the
+        // After flat reflects the actual optical state of the night's lights.
         let light_date = DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -436,13 +566,49 @@ mod tests {
             FlatTiming::After,
         );
 
-        // When equidistant, min_by_key returns first encountered
         let matches = vec![match_a.clone(), match_b.clone()];
         let result = apply_pattern_selection(matches, &FlatPattern::Automatic, Some(light_date));
 
         assert!(result.is_some());
-        // First match in iterator should be returned when equal
-        assert_eq!(result.unwrap().timing, FlatTiming::Before);
+        assert_eq!(result.unwrap().timing, FlatTiming::After,
+            "equidistant tie must pick the post-session flat");
+    }
+
+    #[test]
+    fn test_automatic_prefers_after_independent_of_input_order() {
+        // B6 invariant: the prefer-After rule must hold regardless of the
+        // order in which the matches arrive. The previous code passed the
+        // sister test only because the input vec happened to be [Before,
+        // After] and `min_by_key` returned the first-encountered on ties.
+        // With the composite-key tie-break the Before-first input also picks
+        // After, and so does the After-first input.
+        let light_date = DateTime::parse_from_rfc3339("2025-01-15T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let match_before = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T19:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T19:00:00Z").unwrap().with_timezone(&Utc),
+            0.9,
+            FlatTiming::Before,
+        );
+        let match_after = make_match(
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            DateTime::parse_from_rfc3339("2025-01-15T21:00:00Z").unwrap().with_timezone(&Utc),
+            0.8,
+            FlatTiming::After,
+        );
+
+        // Before-first
+        let r1 = apply_pattern_selection(
+            vec![match_before.clone(), match_after.clone()],
+            &FlatPattern::Automatic, Some(light_date));
+        assert_eq!(r1.unwrap().timing, FlatTiming::After);
+
+        // After-first
+        let r2 = apply_pattern_selection(
+            vec![match_after.clone(), match_before.clone()],
+            &FlatPattern::Automatic, Some(light_date));
+        assert_eq!(r2.unwrap().timing, FlatTiming::After);
     }
 
     #[test]

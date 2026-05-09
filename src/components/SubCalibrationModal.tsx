@@ -36,9 +36,14 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
   onApply,
   onClose,
 }) => {
-  // For flat: tabs are darkflat, dark, bias
-  // For dark: tab is bias only
-  const [activeTab, setActiveTab] = useState<SubCalTabType>(sourceType === 'flat' ? 'dark' : 'bias');
+  // For flat sources, the auto-link engine uses the fallback chain
+  // DarkFlat (preferred) → Dark (fallback) → Bias (last resort) — see
+  // configurable_matcher::find_calibration_with_fallback. We mirror that order
+  // visually here so the user sees what auto-link would have picked first.
+  // Default activeTab is set after data loads (see effect below) so we land on
+  // the highest-priority tab that has at least one candidate.
+  const [activeTab, setActiveTab] = useState<SubCalTabType>(sourceType === 'flat' ? 'darkflat' : 'bias');
+  const [hasAutoSelectedTab, setHasAutoSelectedTab] = useState(false);
   const [setParams, setSetParams] = useState<CalibrationSetParameters | null>(null);
   const [darkflatSets, setDarkflatSets] = useState<CalibrationSetWithScore[]>([]);
   const [darkSets, setDarkSets] = useState<CalibrationSetWithScore[]>([]);
@@ -68,6 +73,35 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
       setSelectedBiasId(setParams.current_bias_set_id ?? null);
     }
   }, [isOpen, setParams]);
+
+  // Reset the "has auto-selected" flag when the modal closes so the next open
+  // re-runs the priority defaulting against fresh data.
+  useEffect(() => {
+    if (!isOpen) setHasAutoSelectedTab(false);
+  }, [isOpen]);
+
+  // Default to the highest-priority tab that has at least one candidate, but
+  // only once per modal open and only for flat sources (dark sources have a
+  // single Bias tab). If the user has already linked a sub-cal, prefer the tab
+  // matching that link so they land on what's currently selected.
+  useEffect(() => {
+    if (!isOpen || sourceType !== 'flat' || hasAutoSelectedTab || !setParams) return;
+    if (loading) return; // wait until data has loaded
+
+    const linkedTab: SubCalTabType | null =
+      setParams.current_darkflat_set_id ? 'darkflat' :
+      setParams.current_dark_set_id ? 'dark' :
+      setParams.current_bias_set_id ? 'bias' : null;
+
+    const firstNonEmpty: SubCalTabType | null =
+      darkflatSets.length > 0 ? 'darkflat' :
+      darkSets.length > 0 ? 'dark' :
+      biasSets.length > 0 ? 'bias' : null;
+
+    const next = linkedTab ?? firstNonEmpty;
+    if (next) setActiveTab(next);
+    setHasAutoSelectedTab(true);
+  }, [isOpen, sourceType, hasAutoSelectedTab, setParams, loading, darkflatSets.length, darkSets.length, biasSets.length]);
 
   const loadData = async () => {
     setLoading(true);
@@ -329,16 +363,38 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
   };
 
   const handleSelect = (setId: number) => {
+    // For flats, only one of DarkFlat/Dark/Bias may be set as sub-cal at a time
+    // (handleApply uses a priority chain that would otherwise let a pre-loaded
+    // higher-priority selection silently win over the user's tab change).
+    const isFlat = sourceType === 'flat';
     switch (activeTab) {
-      case 'darkflat':
-        setSelectedDarkFlatId(selectedDarkFlatId === setId ? null : setId);
+      case 'darkflat': {
+        const next = selectedDarkFlatId === setId ? null : setId;
+        setSelectedDarkFlatId(next);
+        if (isFlat && next !== null) {
+          setSelectedDarkId(null);
+          setSelectedBiasId(null);
+        }
         break;
-      case 'dark':
-        setSelectedDarkId(selectedDarkId === setId ? null : setId);
+      }
+      case 'dark': {
+        const next = selectedDarkId === setId ? null : setId;
+        setSelectedDarkId(next);
+        if (isFlat && next !== null) {
+          setSelectedDarkFlatId(null);
+          setSelectedBiasId(null);
+        }
         break;
-      case 'bias':
-        setSelectedBiasId(selectedBiasId === setId ? null : setId);
+      }
+      case 'bias': {
+        const next = selectedBiasId === setId ? null : setId;
+        setSelectedBiasId(next);
+        if (isFlat && next !== null) {
+          setSelectedDarkFlatId(null);
+          setSelectedDarkId(null);
+        }
         break;
+      }
     }
   };
 
@@ -490,6 +546,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                 <>
                   <button
                     onClick={() => setActiveTab('darkflat')}
+                    title="Auto-link prefers DarkFlat for calibrating Flats"
                     className={`px-6 py-3 font-medium text-sm transition-colors ${
                       activeTab === 'darkflat'
                         ? 'text-info border-b-2 border-info bg-surface-elevated'
@@ -497,6 +554,9 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                     }`}
                   >
                     DarkFlats
+                    <span className="ml-2 px-1.5 py-0.5 text-[10px] uppercase tracking-wide rounded bg-info-muted text-info">
+                      Preferred
+                    </span>
                     {darkflatSets.length > 0 && (
                       <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-surface-hover">
                         {darkflatSets.length}
@@ -505,6 +565,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                   </button>
                   <button
                     onClick={() => setActiveTab('dark')}
+                    title="Used when no DarkFlat is available"
                     className={`px-6 py-3 font-medium text-sm transition-colors ${
                       activeTab === 'dark'
                         ? 'text-purple border-b-2 border-purple bg-surface-elevated'
@@ -512,6 +573,9 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                     }`}
                   >
                     Darks
+                    <span className="ml-2 px-1.5 py-0.5 text-[10px] uppercase tracking-wide rounded bg-surface-hover text-content-muted">
+                      Fallback
+                    </span>
                     {darkSets.length > 0 && (
                       <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-surface-hover">
                         {darkSets.length}
@@ -522,6 +586,7 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
               )}
               <button
                 onClick={() => setActiveTab('bias')}
+                title={sourceType === 'flat' ? 'Last-resort fallback when no Dark/DarkFlat is available' : 'Bias sub-calibration for Dark frames'}
                 className={`px-6 py-3 font-medium text-sm transition-colors ${
                   activeTab === 'bias'
                     ? 'text-success border-b-2 border-success bg-surface-elevated'
@@ -529,6 +594,11 @@ export const SubCalibrationModal: React.FC<SubCalibrationModalProps> = ({
                 }`}
               >
                 Bias
+                {sourceType === 'flat' && (
+                  <span className="ml-2 px-1.5 py-0.5 text-[10px] uppercase tracking-wide rounded bg-surface-hover text-content-muted">
+                    Last resort
+                  </span>
+                )}
                 {biasSets.length > 0 && (
                   <span className="ml-2 px-1.5 py-0.5 text-xs rounded bg-surface-hover">
                     {biasSets.length}

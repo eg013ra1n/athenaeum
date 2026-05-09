@@ -1,599 +1,194 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## General rules
-When implementing plans, start with the minimal viable approach. Do NOT over-engineer or try to build/stub entire dependency trees (e.g., don't build all of Siril when only a few C files are needed). Ask for clarification if scope is unclear.
-Never swallow errors silently. When implementing error handling in Rust commands or TypeScript handlers, always log errors to console/stderr before returning. Silent error swallowing has repeatedly caused hours of debugging.
-
-### Testing and Debugging
-
-When debugging, test with real data files (e.g., real FITS files) early rather than spending extended time on synthetic tests. If synthetic tests pass but real-world behavior differs, switch to real data immediately.
-
-### Communication section
-
-When the user describes a concept (e.g., 'calibration set ID', 'filter field'), ask for clarification if there's any ambiguity rather than assuming a technical interpretation. Do not substitute domain terms (e.g., 'equipment ID' ≠ 'calibration set ID', 'filter' ≠ 'sort').
-
-### Editing Conventions
-
-For multi-file edit sessions, consolidate changes into complete passes rather than making many incremental small edits. When editing large files, be especially careful to preserve file integrity—avoid partial writes or truncation.
+Guidance for Claude Code working in the Athenaeum repo.
 
 ## Project Overview
 
-Athenaeum is a desktop application for astrophotographers to manage FITS/XISF image files. It builds a searchable metadata catalog with specialized astronomy features including:
-- Automated frame set grouping by sky coordinates
-- Directory browsing with file metadata display
-- Calibration frame management
-- Export templates with path resolution
-- User-configurable settings system
+Athenaeum is a desktop + web app for astrophotographers to manage FITS/XISF image files and their metadata catalog (frame-set clustering by sky coordinates, calibration matching, ZIP archive, plate-solving, export templates). Tauri 2 desktop shell, Axum/SSE web server, shared `athenaeum-core` library, SQLite catalog, React/TS frontend.
 
-The application uses Tauri 2.0 (Rust backend + React frontend) with SQLite for local catalog storage. A second build target ships the same app as a containerized web service (Axum + SSE) for headless / multi-user use.
-
-### Workspace layout
+## Workspace Layout
 
 Cargo workspace + git submodule:
 
-- `crates/athenaeum-core/` — shared library. All non-IPC logic lives here (DB, FITS parsing, calibration, scanner, archive, file_op, analysis, plate_solve, services, etc.).
+- `crates/athenaeum-core/` — shared library; all non-IPC logic (DB, FITS parsing, calibration, scanner, archive, file_op, analysis, plate_solve, services, …).
 - `crates/athenaeum-tauri/` — desktop shell. `commands/` modules thinly wrap `athenaeum-core`.
 - `crates/athenaeum-web/` — Axum HTTP/SSE server for the Docker/web build. `routes/` modules mirror Tauri commands one-for-one.
-- `rustafits/` — git submodule (FITS image rendering); path dep of both `core` and `tauri`.
-- `src/` — React/TypeScript frontend. `src/api/` abstracts Tauri IPC vs. HTTP/SSE behind a single `api` object selected by the `VITE_TARGET` env var. Zero `@tauri-apps/*` imports outside `src/api/`.
+- `rustafits/` — git submodule (FITS image rendering); path dep of `core` + `tauri`.
+- `src/` — React/TS frontend. `src/api/` abstracts Tauri IPC vs HTTP/SSE behind a single `api` object selected by `VITE_TARGET`.
 
-**Critical rule:** when adding or modifying a Tauri command, add the matching Axum route in `athenaeum-web` in the same change. The two backends must stay in sync.
+## Critical Rules
+
+- **Two backends in sync.** Adding/modifying a Tauri command (`crates/athenaeum-tauri/src/commands/<domain>.rs`) requires the matching Axum route (`crates/athenaeum-web/src/routes/<domain>.rs`) in the same change. Put real logic in `athenaeum-core`; the Tauri/Axum layer is a thin wrapper.
+- **No `@tauri-apps/*` imports outside `src/api/`.** Frontend always goes through the `api` object.
+- **Serde boundary: snake_case ↔ camelCase.** Use `#[serde(rename_all = "camelCase")]` and verify TS interfaces in `src/types/models.ts` match.
+- **Never swallow errors.** Always log to console/stderr before returning; silent failures have repeatedly cost hours.
+- **Minimal scope.** Don't over-engineer or build adjacent dependency trees unprompted. Ask if scope is unclear.
+- **Real data first when debugging.** Synthetic tests can mask real-world bugs — switch to a real FITS file early.
+- **Clarify domain terms.** Don't substitute (`equipment ID` ≠ `calibration set ID`, `filter` ≠ `sort`).
+- **Design tokens, not raw colors.** Use `bg-surface`, `text-content-muted`, `bg-accent`, `text-error`, … so dark/light themes both work.
+- **Multi-file edits in complete passes.** Avoid many small partial edits to large files.
+- **`anyhow::Result`** inside core; convert with `.map_err(|e| e.to_string())` at the command boundary.
 
 ## Commands
 
-### Development
 ```bash
-# Desktop (Tauri)
-npm run tauri dev          # Start desktop app with hot reload
-npm run build              # Frontend-only build
-npm run tauri build        # Build complete desktop application
+# Desktop
+npm run tauri dev          # Hot-reload desktop app
+npm run tauri build        # Full desktop build
 
-# Web / Docker target
-npm run dev:web            # Vite frontend in web mode (VITE_TARGET=web)
-npm run build:web          # Web frontend build
-cargo run -p athenaeum-web # Run the Axum server locally
-```
+# Web / Docker
+npm run dev:web            # Vite frontend, VITE_TARGET=web
+cargo run -p athenaeum-web # Axum server locally
 
-### Testing
-```bash
-# Rust workspace tests (all crates)
-cargo test --workspace
-
-# Single crate
+# Tests
+cargo test --workspace     # All Rust crates
 cargo test -p athenaeum-core
-
-# Frontend tests (when added)
-npm test
 ```
 
-### Database
-The SQLite database is created in the user's app data directory by Tauri (or under `/data` in the Docker image, configurable via `ATHENAEUM_DB_PATH`). Schema initialization happens in `crates/athenaeum-core/src/db/schema.rs`.
+DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Docker. Schema in `crates/athenaeum-core/src/db/schema.rs`.
 
-## Architecture
+## Module Map
 
-This project uses a Tauri stack: Rust backend + React/TypeScript frontend. Be aware of serialization boundaries—Rust uses snake_case, TypeScript uses camelCase. Always verify serde attributes and IPC serialization when wiring backend to frontend.
+**`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`.
 
-### Frontend (React + TypeScript)
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — ~180 functions across 16 modules. Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
-- **Routing**: React Router v7 (see `src/App.tsx`). Routes (root `/` redirects to `/files`):
-  - `/files` → `FileManager` - Dual-pane file browser + monitored directory management
-  - `/calendar` → `ShootCalendar` - Calendar view of imaging sessions
-  - `/objects` → `Objects` - Frame set library grouped by sky coordinates
-  - `/objects/:id` → `FrameSetDetail` - Per-frame-set detail view (zip/unarchive toolbar lives here)
-  - `/excluded` → `ExcludedFrames` - Frames hidden from clustering
-  - `/skychart` → `SkyChart` - Sky-map view of cataloged objects
-  - `/equipment` → `Equipment` - Equipment, cameras, and calibration library
-  - `/export` → `Export` - Export templates and file organization
-  - `/blackhole` → `BlackHole` - Duplicate / orphan handling
-  - `/settings` → `Settings`
-  - `/about` → `About`
-- **Backend abstraction**: `src/api/` exposes a single `api` object that switches between Tauri IPC and HTTP/SSE based on `VITE_TARGET`. Always import from `src/api/`, never from `@tauri-apps/*` directly outside this layer.
-- **State Management**: React hooks + the `api` layer
-- **Styling**: Tailwind CSS, dark theme via design tokens (`bg-surface`, `text-content-muted`, `bg-accent`, …) — prefer tokens over raw `bg-gray-*` so dark/light themes both work
-- **Component Structure**:
-  - `src/components/Layout.tsx` - Main app shell with sidebar navigation
-  - `src/components/dualpane/` - Far-Manager-style two-pane file browser (see Dual-Pane File Browser below)
-  - `src/pages/*` - One page component per route
-  - `src/api/*` - Backend abstraction (`desktop.ts`, `web.ts`, `index.ts`)
-  - `src/types/models.ts` - TypeScript interfaces matching Rust models
+`core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `export` `missing_files` `calendar` `utils`
 
-### Backend (Rust)
+Frontend pages live in `src/pages/`; routing in `src/App.tsx` (React Router v7, `/` → `/files`).
 
-- **`athenaeum-core` modules** (`crates/athenaeum-core/src/`, in `lib.rs` order):
-  - `models.rs` - Serde-compatible data structures (File, Frame, FramesSet, etc.)
-  - `coordinates/` - Astronomical coordinate conversions (RA/Dec string parsing, decimal degrees)
-  - `fingerprint/` - File fingerprinting
-  - `calibration/` - Calibration frame matching algorithms (see Calibration Matching System below)
-  - `db/` - SQLite operations (`schema.rs`, `operations.rs`)
-  - `fits_parser/` - FITS/XISF metadata extraction (incl. `stored_header.rs` round-trip used by the metadata pane)
-  - `clustering/` - Sky-coordinate-based frame set clustering (seed-and-grow single-link)
-  - `settings/` - Settings management with runtime and database persistence
-  - `sessions/`, `relinking/`, `frames_set_metadata.rs`, `frames_set_merge.rs` - frame-set/session lifecycle
-  - `events.rs`, `logging.rs` - structured events + logging plumbing
-  - `duplicates/` - xxHash XXH3_64 computation and duplicate detection
-  - `scanner/` - Multi-threaded directory traversal with walkdir + rayon
-  - `monitor/` - Directory watching (FS event loop)
-  - `auto_merge/` - Automatic cluster merging
-  - `export/` - Path template resolution and file copying
-  - `rustafits_processor/` - Bridge to the `rustafits` crate (FITS image rendering)
-  - `cache/` - Image / preview cache
-  - `analysis/` - FWHM / eccentricity / star-analysis pipeline
-  - `catalog/` - Catalog read APIs used by both backends
-  - `plate_solve/` - Plate-solving pipeline
-  - `services/` - `ServiceContext` + `ProgressEmitter` trait (the abstraction that lets `core` emit progress to either Tauri events or SSE)
-  - `archive/` - ZIP archive feature: planner, executor, rollback, resume, restore (see Archive Feature below)
-  - `file_op/` - Move/Delete pipeline shared with the dual-pane browser (see Dual-Pane File Browser below)
+## Adding a Tauri Command
 
-- **`athenaeum-tauri` layout** (`crates/athenaeum-tauri/src/`):
-  - `commands/` - **Modular Tauri commands** organized by domain (see below)
-  - `commands_rustafits.rs` - Specialized FITS image rendering commands
-  - `tauri_events.rs` - Tauri-side `ProgressEmitter` impl
-  - `lib.rs` - registers all commands in `invoke_handler`
-
-- **`athenaeum-web` layout** (`crates/athenaeum-web/src/`):
-  - `routes/` - One module per domain (`scan_roots.rs`, `files.rs`, `frame_sets.rs`, `calibration.rs`, `archive.rs`, `analysis.rs`, `plate_solve.rs`, `export.rs`, `duplicates.rs`, `missing_files.rs`, `images.rs`, `settings.rs`, `spatial.rs`, `calendar.rs`) — registered in `routes/mod.rs`
-  - `events.rs` - SSE `ProgressEmitter` impl (use `SseProgressEmitter::new(state.event_tx.clone())`)
-
-- **Commands Module Structure**:
-  Tauri commands live in `crates/athenaeum-tauri/src/commands/` (~180 `#[tauri::command]` functions across 16 modules). Each module has a sibling route module in `crates/athenaeum-web/src/routes/` with the same name and surface.
-  - `mod.rs` - Module exports, `AppState` definition, and re-exports
-  - `core.rs` - App initialization
-  - `scan_roots.rs` - Directory scanning and monitoring
-  - `files.rs` - File operations and browsing (incl. dual-pane move/delete/rename/search/metadata)
-  - `settings.rs` - Application configuration
-  - `frame_sets.rs` - Frame set management and operations
-  - `calibration.rs` - Calibration matching and library management (largest module)
-  - `duplicates.rs` - Black hole & duplicate detection
-  - `cache.rs` - Image cache operations
-  - `spatial.rs` - Sky-coordinate queries and spatial operations
-  - `archive.rs` - ZIP archive feature (see Archive Feature below)
-  - `analysis.rs` - FWHM / eccentricity analysis queue
-  - `plate_solve.rs` - Plate-solving queue
-  - `export.rs` - Export operations
-  - `missing_files.rs` - Missing-file detection and resolution
-  - `calendar.rs` - Calendar/session queries
-  - `utils.rs` - Shared helper functions (calculate_fov, angular_distance, format_bytes)
-
-  See `crates/athenaeum-tauri/REFACTORING.md` for the original 2025-11-17 modular-refactor map.
-
-- **Tauri Commands**: Functions marked with `#[tauri::command]` in `commands/` modules are callable from React via the `api` layer. All commands are re-exported through `commands/mod.rs`.
-
-### Database Schema
-
-See `crates/athenaeum-core/src/db/schema.rs` for full schema. Key tables:
-
-- `files` - Physical files (path, filename, size, format, modified_at)
-- `frames` - Metadata extracted from FITS/XISF with astronomical coordinates
-  - Basic: OBJECT, DATE-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP
-  - Camera: GAIN, OFFSET, XBINNING, YBINNING, CCD-TEMP, SET-TEMP
-  - Optics: FOCALLEN, XPIXSZ, PIXSZ
-  - Coordinates: RA, DEC, OBJCTRA, OBJCTDEC, SITELAT, SITELONG
-- `scan_roots` - Monitored directory paths
-- `calibration_set` + `calibration_set_frames` - Grouped calibration frames
-- `projects` - Exists but currently not used (vestigial table; frame sets are global and not scoped to projects)
-- `frames_set` - Top-level frame sets grouped by sky coordinates (NO project_id column - frame sets are global)
-- `imaging_nights` - Imaging nights/sessions within a frame set (linked via `frames_set_id`)
-- `sessions` - Groups frames by instrument within an imaging night
-- `session_members` - Junction table linking frames to sessions (the actual many-to-many between frames and sessions)
-- `tags` + `frame_tags` - User tagging system
-- `export_templates` - Saved export path templates
-- `fits_header` - Complete original FITS header storage
-- `settings` - Application configuration (key-value pairs)
-- `archive_roots` - User-configured destination folders for ZIP archives (multi-folder support; `is_default` flag picks the default destination)
-- `archive_operations` - One row per ZIP archive operation (state machine: planning → copying → verifying → zipping → zip_verifying → deleting_sources → finalizing → completed; plus cancelled / rolling_back / rolled_back / failed)
-- `archive_operation_files` - Frozen plan: one row per file the operation touches (source_path, target_zip_path, target_path_in_zip, expected_hash, disposition, frame_role)
-- `archive_operation_steps` - Audit log: one row per (file, stage) pair for resume + rollback
-- `frames_set.archived_at` + `archive_operation_id` - Set when a frame set has been ZIP-archived (separate from the legacy `is_archived` boolean — see Archive Feature lifecycle)
-- `files.archived_in_operation` + `archive_zip_path` + `archive_path_in_zip` - Set on every `files` row whose data was *moved* into a zip; copied calibrations leave the row untouched
-
-Indexes on: filename, date_obs, object, instrume, ra, dec, objctra, objctdec, exptime, filter
-
-### Key Technical Decisions
-
-**Frame Set Clustering**: Uses a seed-and-grow single-link clustering algorithm to group LIGHT frames by sky coordinates (RA/Dec). For each unassigned frame (in deterministic RA→Dec→DATE-OBS order), a new cluster is seeded; the cluster then iteratively absorbs any unassigned frame within `threshold_deg` of the cluster's current center. After each member is added, the center is recomputed as the spherical mean of all members so far — so the cluster center *moves* during growth. This is intentional: it lets dithered or mosaicked fields collapse into a single frame set, even when the dither/mosaic span exceeds the threshold. The trade-off is that long chains of frames each within `threshold_deg` of the running mean can also merge, even if the chain endpoints are farther apart than the threshold. Distance is great-circle (spherical law of cosines), so RA wraparound and high-declination compression are handled correctly. The algorithm is **not** DBSCAN — there is no min_pts, no core/border/noise distinction, and every frame ends up in some cluster (singletons allowed).
-
-**Coordinate Parsing**: Supports multiple RA/Dec formats:
-
-- Decimal degrees (e.g., `123.456`, `-45.678`)
-- HMS/DMS strings (e.g., `12h34m56.7s`, `-45d40m30s`)
-- Colon-separated (e.g., `12:34:56.7`, `-45:40:30`)
-
-**Settings System**: Three-tier precedence for configuration:
-
-1. Runtime overrides (in-memory)
-2. Database persisted settings
-3. Default values
-
-Common settings include `grouping.threshold.value` (default `3.0`) and `grouping.threshold.unit` (default `deg`, also accepts `arcmin` and `arcsec`) for frame set clustering. Internally consumed via `SettingsManager::get_grouping_threshold_arcsec` (callers convert to whichever unit they need).
-
-**Auto-Generate Frame Sets**:
-
-- Excludes frames already in any set to prevent duplicates
-- Clusters by sky coordinates with configurable threshold
-- Reports excluded frames with reasons (missing coordinates, etc.)
-- Creates named sets with aggregated metadata (total exposure time, coordinates)
-
-**FITS Parsing**: Hand-rolled header reader in `crates/athenaeum-core/src/fits_parser/fits_header_reader.rs` — reads 2880-byte FITS blocks one card at a time and stops at the `END` card, so a 200 MB FITS only costs a few KB of I/O for metadata. No `fitsio` / CFITSIO dependency. (Image *rendering* — pixels, not metadata — goes through the `rustafits` submodule via `rustafits_processor/`.) Key FITS keywords extracted: OBJECT, DATE-OBS, TIME-OBS, TELESCOP, INSTRUME, EXPTIME, FILTER, IMAGETYP, GAIN, OFFSET, XBINNING, YBINNING, CCD-TEMP, SET-TEMP, FOCALLEN, RA, DEC, OBJCTRA, OBJCTDEC.
-
-**XISF Parsing**: Must parse XML header according to XISF 1.0 spec and extract embedded FITS-like properties.
-
-**DATE-OBS Normalization**: Parse various formats (ISO 8601, separate DATE-OBS + TIME-OBS, legacy) into consistent timestamp for calendar grouping.
-
-**Duplicate Detection**: xxHash XXH3_64 computation available for identifying duplicate files (implementation in `duplicates/` module).
-
-**IMAGETYP to FRAME_FOLDER Mapping**:
-
-- LIGHT → `Lights`
-- DARK → `Calibration/Darks`
-- FLAT → `Calibration/Flats`
-- BIAS → `Calibration/Bias`
-- DARKFLAT → `Calibration/DarkFlats`
-
-**Export Path Templating**: Supports tokens like `{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`, `{TELESCOP}`, `{INSTRUME}`, `{EXPTIME}`, `{FILTER}`, `{IMAGETYP}`, `{FRAME_FOLDER}`, with fallbacks (`{OBJECT|Unknown}`) and transforms (`:slug` for slugification).
-
-**Scanner re-parse is non-destructive (UPDATE in place, not DELETE+INSERT)**: When a scanned file's `(size, modified_at)` has drifted from the catalog, the scanner re-parses and UPDATEs the existing `files`/`frames`/`fits_header` rows inside a single transaction so `files.id` and `frames.id` are preserved. This keeps junction tables (`session_members`, `calibration_set_frames`, `calibration_set_to_frames`, `frame_tags`) intact across legitimate in-place modifications (FITS edited by another tool, archive→restore round-trips, network FS clock drift). On parse failure the existing row is left untouched — better stale than missing. Implemented in `scanner::reparse_and_update_in_place` and used by both `scan_directory` and `scan_directory_parallel`.
-
-### Calibration Matching System
-
-The calibration matching system is fully configurable via UI (Settings → Calibration Matching tab). All calibration-related settings are stored in a unified `CalibrationMatchingConfig` JSON structure in the `settings` table under key `calibration.matching_config`.
-
-**Configuration Components**:
-- **Parameter Matching Rules**: Configure which parameters must match exactly, warn on threshold, or be ignored
-- **Clustering Settings**: Max age and time clustering thresholds per calibration type (flat, dark, bias, darkflat)
-- **Scoring Config**: Temperature match weight for calibration candidate scoring
-- **Warning Thresholds**: Temperature delta tolerance and date warning thresholds
-- **Master Preferences**: Prefer master frames or frame sets when both available
-
-**Source Types** (frames that need calibration):
-- **Lights** → can link to Flat, Dark, Bias
-- **Flats** → can link to DarkFlat, Dark, Bias (with fallback chain: DarkFlat → Dark → Bias)
-- **Darks** → can link to Bias (when "BIAS for Dark Optimization" is enabled)
-
-**Configurable Parameters** (8 parameters per source→calibration pair):
-- `instrume` - Camera/instrument name
-- `binning` - Binning mode (e.g., "1x1", "2x2")
-- `gain` - Sensor gain value
-- `offset` - Sensor offset value
-- `exptime` - Exposure time
-- `focallen` - Focal length
-- `filter` - Filter name (only matched for Lights→Flat)
-- `ccd_temp` - CCD temperature
-
-**Match Modes**:
-- `Exact` - Must match exactly (with small tolerance for floats)
-- `Warning` - Match but warn if threshold exceeded (e.g., temperature delta > 2°C)
-- `Ignore` - Don't check this parameter
-
-**Key Files**:
-- `crates/athenaeum-core/src/calibration/config.rs` - Configuration data structures (`CalibrationMatchingConfig`, `ParameterConfig`, `MatchMode`, etc.)
-- `crates/athenaeum-core/src/calibration/configurable_matcher.rs` - Config-driven matching engine (`find_calibration_sets`, `load_config`, etc.)
-- `crates/athenaeum-core/src/calibration/hierarchy.rs` - Calibration hierarchy builder (uses configurable matcher)
-- `src/types/calibration-config.ts` - TypeScript interfaces
-- `src/components/calibration/` - UI components (`CalibrationMatchingConfig.tsx`, `MatchingMatrixTable.tsx`, etc.)
-
-**Tauri Commands**:
-- `get_calibration_matching_config` - Load config (returns default if not set)
-- `set_calibration_matching_config` - Save config to database
-- `reset_calibration_matching_config` - Reset to defaults
-
-**Default Behavior**: The default configuration matches the original hardcoded behavior:
-- Lights→Flat: Exact match on instrume, binning, gain, offset, focallen, filter
-- Lights→Dark: Exact match on instrume, binning, gain, offset, exptime; Warning on ccd_temp (2°C threshold)
-- Lights→Bias: Exact match on instrume, binning, gain, offset; Warning on ccd_temp
-- Flats→DarkFlat/Dark: Same as Lights→Dark (no filter matching)
-- Flats→Bias: Same as Lights→Bias
-
-### Archive Feature
-
-Athenaeum can move a finished frame set's data into a `.zip` per frame type (Lights / Flats / Darks / Bias / DarkFlats) inside a user-configured archive folder, while preserving the catalog metadata. The full design and implementation plan are in `docs/superpowers/specs/2026-04-29-archive-feature-design.md` and `docs/superpowers/plans/2026-04-29-archive-feature.md`.
-
-**Three-state lifecycle for a frame set:**
-
-| State | DB columns | Toolbar button on FrameSetDetail |
-| ----- | ---------- | -------------------------------- |
-| Stage / WIP | `is_archived = 0` | **Find new images** + **Move to Archive** |
-| In Archive section, not zipped | `is_archived = 1`, `archived_at = NULL` | **Move and ZIP** |
-| Zipped | `archived_at IS NOT NULL` | **Unarchive** + folder-icon reveal-in-file-manager |
-
-The legacy `is_archived` boolean is the soft-hide flag toggled by the existing `archive_frame_set` / `unarchive_frame_set` commands (used by the Objects page tabs). The new ZIP archive feature adds `archived_at` + `archive_operation_id` on `frames_set` and treats them as a separate axis. A frame set must already be in the Archive section (`is_archived = 1`) before the planner will allow zipping — `archive::planner::build_plan` enforces this.
-
-**Module structure (`crates/athenaeum-core/src/archive/`):**
-
-- `models.rs` - `ArchiveOperation`, `ArchiveOperationFile`, `ArchiveOperationStep`, `Dispositions`, `FrameRole`, `ArchiveCompression`, `ConflictResolution` enums and structs
-- `db.rs` - CRUD for the three archive_* tables; `mark_frame_set_archived` (zip markers only), `clear_zip_markers` (rollback), `unmark_frame_set_archived` (full Unarchive — clears zip markers AND `is_archived`)
-- `path_layout.rs` - Zip filename generation (`{Object}_{Start}_{End}_{Telescope}_{Camera}_{FrameType}.zip`) and per-file path-in-zip computation (`<UniqueScanRootName>/<rel-path>/<filename>`)
-- `staging.rs` - Per-operation staging dir under `<archive_root>/.athenaeum_staging/op_<id>/`
-- `zip_writer.rs` - `build_zip` + `build_zip_with_progress` (per-entry callback for smooth progress)
-- `zip_reader.rs` - `verify_zip_contents` (entry list match)
-- `shared_calibration.rs` - `find_shared_calibration_sets` — detects when a calibration is linked to other (non-archived) frame sets, used to disable Move in the disposition dialog
-- `planner.rs` - `build_plan` (no DB writes) + `commit_plan` (writes archive_operations + archive_operation_files); validates is_archived=1 + archived_at=NULL up front; per-file frame_role priority dedup (`light > flat > darkflat > dark > bias`); collision detection on existing zip filenames
-- `executor.rs` - `run_operation` drives stages 2–7 with cooperative cancellation. Per-file progress on every stage including zip and finalize (zip uses `build_zip_with_progress`; finalize total = move_count + 2)
-- `rollback.rs` - `rollback_operation`: restores deleted sources from staging back to original, deletes partial/finished zips, clears zip markers via `clear_zip_markers` (leaves is_archived intact since the frame set was in the archive section before)
-- `resume.rs` - `find_unfinished_operations` + `resume_operation` (re-runs executor; idempotent step log skips already-Done steps)
-- `restore.rs` - **Reconcile-based restore**: extract every entry to `<archive_root>/.athenaeum_restore_temp/op_<id>/`, hash-verify, then for each file skip if already on disk at `source_path` (preserves copy-disposition calibrations and user edits) else copy to target. Catalog updates only touch restored files. Cleans temp + optionally deletes zips.
-
-**Tauri commands (`crates/athenaeum-tauri/src/commands/archive.rs`):**
-
-Folder management: `list_archive_roots`, `add_archive_root`, `delete_archive_root`, `set_default_archive_root`. Operation lifecycle: `plan_archive_operation`, `start_archive_operation`, `cancel_archive_operation`, `list_unfinished_archive_operations`, `resume_archive_operation`, `rollback_archive_operation`. Browsing: `list_archived_frame_sets`, `list_archive_zips` (returns unique zips of an operation with size/exists for the expandable section + reveal-in-file-manager). Restore: `start_restore_operation`, `get_restore_suggestions`. Cleanup: `delete_archive`. The legacy single-folder `archive.root_path` setting is auto-migrated into `archive_roots` on first read of `list_archive_roots`. Both Tauri and Axum (`crates/athenaeum-web/src/routes/archive.rs`) expose the same surface.
-
-**Multi-folder archive roots:** stored in the `archive_roots` table. `start_archive_operation` and `plan_archive_operation` accept an optional `archive_root_path`. Resolution: explicit value > only-configured-root > `is_default` row > error. The disposition dialog renders a destination dropdown when 2+ roots are configured. The File Manager → Monitored Directories tab has an Archive Folders subsection with add/delete/star-as-default and an expandable per-folder view that lists archived frame sets stored there and their zip files (each with reveal-in-file-manager).
-
-**Progress events:** unified on the `archive-progress` Tauri event channel for both archive *and* restore stages. The `archive-finished` event fires when the worker exits with `{ operation_id, outcome: "completed"|"cancelled"|"failed", kind?: "restore" }` so the `ArchiveProgress` widget auto-dismisses with the right color (green/yellow/red). Restore also emits on the legacy `archive-restore-progress` channel for compatibility.
-
-**Restore semantics (the safe one):** the zip is the inventory; restore makes disk match by filling gaps. For each `archive_operation_files` row: if the file already exists at `source_path`, skip (no duplicate, no overwrite); else copy from temp → target. Target is the original `source_path` when the user picked "original location" mode, or `<picked>/<path-in-zip>` when picking a scan root or custom folder. This handles copy-disposition calibrations cleanly (originals stay put) and the cross-archive move case (where archive A copied X and archive B later moved X — restoring A first puts X back, restoring B later sees it in place and skips).
-
-### Dual-Pane File Browser
-
-`FileManager → Browse Files` is a Far-Manager-style two-pane browser that owns file-system operations (Move, Delete, Rename, Mkdir), catalog search, bulk metadata editing, and the Blink launcher. Full design in `docs/superpowers/specs/2026-05-05-dual-pane-file-browser-design.md`.
-
-**Module structure:**
-
-- `crates/athenaeum-core/src/services/operation_queue.rs` — single serialized worker thread shared with the archive feature. `OperationKind { ZipArchive, FileOpMove, FileOpDelete }`. All long-running ops enqueue here; archive command sites in both Tauri and Axum routes go through it too.
-- `crates/athenaeum-core/src/file_op/` — Move/Delete pipeline (`models`, `db`, `planner`, `executor`) modeled on the existing `archive/` module. `MoveStrategy { AtomicRename, CopyVerifyDelete, Delete }` chosen by planner via `MetadataExt::dev()`. Cross-volume moves verify with xxHash before deleting source. **Move planner refuses destination collisions up front** — no silent overwrite. **Delete planner records every subdirectory** so full hierarchies clear cleanly (deepest-first rmdir).
-- `crates/athenaeum-core/src/fits_parser/stored_header.rs` — re-decodes the `fits_header.header` blob (FITS 80-char card text or XISF XML) into the canonical `FrameOriginalSnapshot` so the metadata pane can show "what the file looked like at scan time" and offer per-field revert.
-- `src/components/dualpane/` — `DualPaneFileBrowser.tsx` (shell + reducer + key handlers), `MetadataPane.tsx` (bulk edit + Memberships panel + Originals panel), `CatalogSearch.tsx`, `types.ts`.
-
-**Key Tauri commands** (mirrored on the web side in `crates/athenaeum-web/src/routes/files.rs`):
-
-- File ops: `enqueue_move_operation`, `enqueue_delete_operation`, `cancel_file_operation`, `list_unfinished_file_operations`, `mkdir_in_scan_root`, `rename_path`.
-- Search: `search_catalog` (filename / path / OBJECT / FILTER / IMAGETYP / INSTRUME / TELESCOP).
-- Metadata pane backing data: `bulk_update_frame_metadata` (extended with OBJECT/FILTER/TELESCOP/FOCALLEN/GAIN/OFFSET/BINNING/EXPTIME/CCD-TEMP, derives `is_master` from IMAGETYP, cascade-prunes empty calibration sets, recomputes `frames.override` after every save), `count_frame_metadata_relations` (pre-save unlink count), `get_frame_memberships` (frame-set + cal-set membership + reverse "used in frame set" rollup), `get_frame_metadata_originals` (the FITS-header round-trip).
-
-**Hot-sync semantics:**
-
-- Move: per-file SQL transaction updates `files.path` AND does the disk action. AtomicRename is `rename(2)`; CopyVerifyDelete is copy → xxHash verify → DB update + source delete. The path-based UPDATE in `update_files_path_by_old_path` is the primary catalog write — id-based update only fires as a fallback when the planner missed `catalog_file_id`. Survives path-encoding edge cases (macOS `/Volumes` vs `/private/Volumes`).
-- Rename of a directory: SUBSTR-based leading-prefix swap on `files.path` (`UPDATE files SET path = ?new_prefix || SUBSTR(path, LENGTH(?old_prefix) + 1) WHERE path LIKE ?old_prefix || '%'`). The naive `REPLACE(path, old, new)` was unsafe — replaced every occurrence, not just the leading prefix.
-- `bulk_update_frame_metadata` cascade: deletes `calibration_set_frames`, `calibration_set_to_frames`, `session_members` rows for the touched frames; **prunes calibration sets that lose their last member** (master sets and last-frame regular sets). FK CASCADE on `calibration_set_to_frames.calibration_set_id` cleans up consumer references when the set is deleted. Sessions / imaging_nights / frames_set rows are intentionally left in place even when empty.
-- `bulk_update_calibration_metadata` (Equipment page) propagates set-level edits to every member frame in `calibration_set_frames` with `frames.override = 1` so the scanner won't undo the change.
-
-**Override flag lifecycle:** any save sets `frames.override = 1`. The trailing `recompute_override_flag_for_frames` call re-checks each touched frame against its FITS-header originals (semantic comparison: ±1e-6 for floats, instant-aware for DATE-OBS) and clears the flag back to 0 when everything matches — so reverting all edits visually returns the row to its untouched state.
-
-**Schema additions** (`db/schema.rs::init_db`): `file_operations`, `file_operation_files`, `file_operation_steps` plus their indexes. All idempotent `CREATE TABLE IF NOT EXISTS`.
-
-## Development Workflow
-
-1. **Adding New Tauri Commands** (and the matching Axum route):
-   - Put the actual logic in `crates/athenaeum-core/` so both backends can call it. The Tauri/Axum layer should be a thin wrapper.
-   - Pick the right module in `crates/athenaeum-tauri/src/commands/` (and the same-named file in `crates/athenaeum-web/src/routes/`):
-     - `core.rs` - App initialization
-     - `scan_roots.rs` - Scanning directories
-     - `files.rs` - File browsing / dual-pane file ops
-     - `settings.rs` - Application configuration
-     - `frame_sets.rs` - Frame set grouping
-     - `calibration.rs` - Calibration matching and library
-     - `duplicates.rs` - Duplicates / black hole
-     - `cache.rs` - Image cache
-     - `spatial.rs` - Sky-coordinate queries
-     - `archive.rs` - ZIP archive feature (plan/start/cancel/resume/rollback, list, restore, delete)
-     - `analysis.rs` - FWHM / eccentricity analysis queue
-     - `plate_solve.rs` - Plate solving
-     - `export.rs` - Export operations
-     - `missing_files.rs` - Missing-file resolution
-     - `calendar.rs` - Calendar / sessions
-   - Add the function with `#[tauri::command]`; ensure it's re-exported via `commands/mod.rs` (`pub use module_name::*;`)
-   - Register it in `invoke_handler` in `crates/athenaeum-tauri/src/lib.rs` as `commands::command_name`
-   - **Mirror it on the web side**: add the matching `pub async fn` in `crates/athenaeum-web/src/routes/<same_name>.rs` and register it in `routes/mod.rs`. Use `SseProgressEmitter::new(state.event_tx.clone())` for progress.
-   - Call from React via the `api` layer (`api.invoke('command_name', { args })`) — never import `@tauri-apps/api` outside `src/api/`
-
-   **Example**:
-
-   ```rust
-   // crates/athenaeum-tauri/src/commands/settings.rs
-   #[tauri::command]
-   pub async fn get_my_setting(state: State<'_, AppState>) -> Result<String, String> {
-       // call into athenaeum_core::settings::...
-   }
-
-   // commands/mod.rs already re-exports: pub use settings::*;
-
-   // crates/athenaeum-tauri/src/lib.rs, in invoke_handler:
-   commands::get_my_setting,
-
-   // crates/athenaeum-web/src/routes/settings.rs
-   pub async fn get_my_setting(State(state): State<AppState>) -> impl IntoResponse {
-       // same call into athenaeum_core::settings::...
-   }
-   ```
-
-2. **Database Schema Changes**:
-   - Update `crates/athenaeum-core/src/db/schema.rs::init_db()` (idempotent `CREATE TABLE IF NOT EXISTS`)
-   - Handle migration if the table already exists in the wild; or delete the dev DB during development (path: see auto-memory `MEMORY.md` → "Database issues")
-   - Add corresponding operations in `crates/athenaeum-core/src/db/operations.rs`
-
-3. **Adding New Models**:
-   - Define in `crates/athenaeum-core/src/models.rs` with Serde derive
-   - Create matching TypeScript interface in `src/types/models.ts`
-   - Verify the field names match across the IPC/HTTP boundary (Rust `snake_case` ↔ TS `camelCase` via `#[serde(rename_all = "camelCase")]`)
-
-4. **UI Changes**:
-   - Pages in `src/pages/`, shared components in `src/components/`
-   - Use the design tokens (`bg-surface`, `text-content-muted`, `bg-accent`, `text-error`, …) — avoid raw `bg-gray-*`
-   - Icons from `lucide-react`
-   - Follow React hooks best practices (useCallback, useMemo, proper dependencies)
-
-5. **Working with Settings**:
-   - `SettingsManager` lives in `crates/athenaeum-core/src/settings/`
-   - Use the `get_setting` / `set_setting` commands from the frontend (via the `api` layer)
-   - Three-tier precedence: runtime overrides > DB > defaults
-   - In Rust commands, access via `state.settings`
-
-6. **Working with Frame Sets**:
-   - Frame sets are created via the `auto_generate_frame_sets` command
-   - Clustering is performed by `crates/athenaeum-core/src/clustering/`
-   - Coordinate conversion handled by `crates/athenaeum-core/src/coordinates/`
-   - Always check if frames are already in sets before adding to prevent duplicates
-
-7. **Working with Calibration Matching Config**:
-   - Configuration lives in `crates/athenaeum-core/src/calibration/config.rs`
-   - Use `get_calibration_matching_config` / `set_calibration_matching_config` commands
-   - Load config in Rust with `configurable_matcher::load_config(conn)`
-   - UI in `src/components/calibration/`, TS interfaces in `src/types/calibration-config.ts`
-
-## Testing Approach
-
-- **Backend**: Use `cargo test` with mock file systems and in-memory SQLite
-- **FITS Parser**: Test with real FITS files from common observatories
-- **Coordinate Parsing**: Test HMS/DMS and decimal degree conversions with edge cases
-- **Frame Set Clustering**: Test seed-and-grow algorithm with various coordinate distributions (including RA wraparound and zero-leg fallback to sexagesimal)
-- **Settings System**: Test precedence (runtime > DB > default) and persistence
-- **Export Templates**: Test token resolution with edge cases (missing values, special chars)
-- **Duplicate Detection**: Verify hash consistency (when implemented)
-- **Calibration Matching**: Test config loading, parameter matching modes, fallback chains
-
-## File Organization Conventions
-
-- Keep Rust modules focused (one responsibility per module)
-- Frontend pages should be mostly presentational, delegate logic to hooks
-- Use `anyhow::Result` for Rust error handling, convert to strings at Tauri command boundary
-- Prefix all custom hooks with `use` (e.g., `useScanRoots`)
-
-## Common Patterns
-
-**Invoking Tauri Commands from React**:
-
-```typescript
-import { invoke } from '@tauri-apps/api/core';
-
-const result = await invoke<ReturnType>('command_name', {
-  arg1: value1,
-  arg2: value2
-});
-```
-
-**Auto-Generating Frame Sets**:
-
-```typescript
-// From frontend
-const result = await invoke<AutoGenerateResult>('auto_generate_frame_sets', {
-  projectId: 1  // NOTE: projectId parameter is kept for backwards compatibility but is currently ignored
-});
-console.log(`Created ${result.sets_created} sets with ${result.frames_clustered} frames`);
-```
-
-**Note on Projects**: The `projects` table exists in the database but is not currently linked to frame sets. The `project_id` parameter in commands like `get_frames_sets` and `auto_generate_frame_sets` is accepted for backwards compatibility but is ignored in the implementation. Frame sets are currently global and not scoped to any project.
-
-**Working with Settings**:
-
-```typescript
-// Get a setting with default
-const threshold = await invoke<string>('get_setting', {
-  key: 'grouping.threshold.value',
-  defaultValue: '3.0'
-});
-
-// Set a setting
-await invoke('set_setting', {
-  key: 'grouping.threshold.value',
-  value: '15.0'
-});
-// Unit is configured separately:
-await invoke('set_setting', {
-  key: 'grouping.threshold.unit',
-  value: 'arcmin'
-});
-```
-
-**Querying Database in Rust**:
+1. Put the logic in `athenaeum-core` (so both backends call it).
+2. Add `#[tauri::command] pub async fn …` in the right `commands/<domain>.rs` (re-exported by `commands/mod.rs`).
+3. Register it in `commands::…` in `invoke_handler` in `crates/athenaeum-tauri/src/lib.rs`.
+4. Mirror it in `crates/athenaeum-web/src/routes/<same_domain>.rs` and register in `routes/mod.rs`. For progress, use `SseProgressEmitter::new(state.event_tx.clone())`.
+5. Call from React via `api.invoke('command_name', { args })` — never `@tauri-apps/api` outside `src/api/`.
 
 ```rust
-let conn = db.conn();
-let mut stmt = conn.prepare("SELECT * FROM frames WHERE object = ?1")?;
-let frames = stmt.query_map([object], |row| {
-  // map row to Frame struct
-})?;
-```
-
-**Accessing Settings in Rust Commands**:
-
-```rust
+// commands/settings.rs
 #[tauri::command]
-pub async fn my_command(state: State<'_, AppState>) -> Result<f64, String> {
-    let state_lock = state.db.lock().unwrap();
-    let db = state_lock.as_ref().ok_or("Database not initialized")?;
-    let conn = db.conn();
+pub async fn get_my_setting(state: State<'_, AppState>) -> Result<String, String> {
+    // → athenaeum_core::settings::…
+}
 
-    let threshold_arcsec = state.settings
-        .get_grouping_threshold_arcsec(&conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(threshold_arcsec / 3600.0) // → degrees
+// routes/settings.rs (mirror)
+pub async fn get_my_setting(State(state): State<AppState>) -> impl IntoResponse {
+    // same call into athenaeum_core::settings::…
 }
 ```
 
-**Parsing Coordinates**:
-```rust
-use crate::coordinates::{parse_ra_to_degrees, parse_dec_to_degrees};
+## Frontend Conventions
 
-let ra_deg = parse_ra_to_degrees("12h34m56.7s")?;
-let dec_deg = parse_dec_to_degrees("-45d40m30s")?;
-```
+- Backend access via the `api` object in `src/api/` only. Desktop-specific bits in `src/api/desktop.ts`.
+- Tailwind + design tokens (above). Icons from `lucide-react`. Charts from `recharts`.
+- Custom hooks prefixed `use…`; pages mostly presentational, logic in hooks.
+- TS interfaces in `src/types/models.ts` mirror Rust models; `src/types/calibration-config.ts` mirrors the calibration config.
 
-**Working with Calibration Matching Config**:
+## Database
 
-```typescript
-// From frontend - get current config
-const config = await invoke<CalibrationMatchingConfig>('get_calibration_matching_config');
+Schema in `crates/athenaeum-core/src/db/schema.rs::init_db()` (idempotent `CREATE TABLE IF NOT EXISTS`). For dev-reset path see auto-memory `MEMORY.md` → "Database issues".
 
-// Modify parameter matching rules
-config.lights.dark.ccd_temp.warning_threshold = 3.0;
+Key tables:
 
-// Modify clustering settings
-config.clustering.flat.max_age_days = 60;
-config.clustering.flat.time_cluster_minutes = 45;
+- `files` — physical files (path, filename, size, format, modified_at).
+- `frames` — FITS/XISF metadata + RA/Dec/coordinates/temps/optics. `frames.override` = "user has edited; scanner must not undo".
+- `fits_header` — raw header blob, used by metadata-pane revert.
+- `scan_roots` — monitored directories.
+- `frames_set` + `imaging_nights` + `sessions` + `session_members` — frame-set/session lifecycle. **Frame sets are global, not project-scoped** (the `projects` table is vestigial; `project_id` parameters are accepted but ignored).
+- `calibration_set` + `calibration_set_frames` + `calibration_set_to_frames` — grouped calibration frames + consumer links.
+- `tags` + `frame_tags`, `export_templates`, `settings`.
+- Archive: `archive_roots`, `archive_operations`, `archive_operation_files`, `archive_operation_steps`; `frames_set.archived_at` + `archive_operation_id`; `files.archived_in_operation` + `archive_zip_path` + `archive_path_in_zip`.
+- File-op: `file_operations`, `file_operation_files`, `file_operation_steps`.
 
-// Modify scoring config
-config.scoring.temperature_match_weight = 0.5;
+Indexes on `filename`, `date_obs`, `object`, `instrume`, `ra`, `dec`, `objctra`, `objctdec`, `exptime`, `filter`.
 
-// Modify warning thresholds
-config.warnings.temp_delta_celsius = 3.0;
-config.warnings.flat_date_warning_days = 60;
+**Scanner re-parse is non-destructive.** When a scanned file's `(size, modified_at)` drifts, the scanner re-parses and UPDATEs the existing `files`/`frames`/`fits_header` rows in one transaction so `files.id` and `frames.id` are preserved — junction tables stay intact across edits, archive→restore round-trips, and FS clock drift. Implemented in `scanner::reparse_and_update_in_place`.
 
-// Save changes
-await invoke('set_calibration_matching_config', { config });
+## Settings, Coordinates, FITS
 
-// Reset to defaults
-const defaultConfig = await invoke<CalibrationMatchingConfig>('reset_calibration_matching_config');
-```
+- **Settings precedence**: runtime override > DB > default. `SettingsManager` in `crates/athenaeum-core/src/settings/`. Frontend uses `get_setting` / `set_setting`; Rust commands use `state.settings`.
+- **Frame-set clustering threshold**: `grouping.threshold.value` (default `3.0`) + `grouping.threshold.unit` (default `deg`; also `arcmin`, `arcsec`). Read internally via `SettingsManager::get_grouping_threshold_arcsec`.
+- **Coordinate parsing**: `parse_ra_to_degrees` / `parse_dec_to_degrees` in `crates/athenaeum-core/src/coordinates/` accept decimal, HMS/DMS, and colon-separated formats.
+- **FITS parsing is hand-rolled** (`fits_parser/fits_header_reader.rs`) — no fitsio/CFITSIO dep; reads 2880-byte blocks until `END`. Image *rendering* (pixels) is the `rustafits` submodule via `rustafits_processor/`.
+- **XISF parsing**: XML header per XISF 1.0 spec.
+- **Frame-set clustering** (`clustering/`) is seed-and-grow single-link on RA/Dec for LIGHT frames, great-circle distance, recomputed center on each member add. Frames already in any set are excluded by `auto_generate_frame_sets`.
+- **Duplicate detection**: xxHash XXH3_64 in `duplicates/`.
+- **Export templating**: tokens like `{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`, `{TELESCOP}`, `{INSTRUME}`, `{EXPTIME}`, `{FILTER}`, `{IMAGETYP}`, `{FRAME_FOLDER}`, with fallbacks (`{OBJECT|Unknown}`) and transforms (`:slug`). `IMAGETYP → FRAME_FOLDER`: `LIGHT→Lights`, `DARK→Calibration/Darks`, `FLAT→Calibration/Flats`, `BIAS→Calibration/Bias`, `DARKFLAT→Calibration/DarkFlats`.
 
-```rust
-// In Rust - load and use config for matching
-use crate::calibration::configurable_matcher::{load_config, find_calibration_sets};
+## Calibration Matching
 
-let config = load_config(conn);
+Fully configurable via UI (Settings → Calibration Matching). Stored as a single `CalibrationMatchingConfig` JSON in `settings` under key `calibration.matching_config`.
 
-// Use parameter matching rules
-let candidates = find_calibration_sets(conn, &frame, "lights", "dark", &config)?;
+**Components**: parameter-matching rules, clustering settings (max age, time-cluster window per type), scoring weights, warning thresholds, master preferences.
 
-// Access clustering settings
-let max_age = config.clustering.get("flat")
-    .map(|c| c.max_age_days)
-    .unwrap_or(30);
+**Source → calibration links**:
 
-// Access warning thresholds
-let temp_delta = config.warnings.temp_delta_celsius;
+- Lights → Flat, Dark, Bias
+- Flats → DarkFlat, Dark, Bias (fallback chain DarkFlat → Dark → Bias)
+- Darks → Bias (when "BIAS for Dark Optimization" is on)
 
-// Access scoring config
-let temp_weight = config.scoring.temperature_match_weight;
-```
+**Per-pair parameters** (each `Exact` / `Warning` / `Ignore`): `instrume`, `binning`, `gain`, `offset`, `exptime`, `focallen`, `filter` (Lights→Flat only), `ccd_temp`. Defaults reproduce the original hardcoded behavior — see `config.rs::default_*` for the matrix.
 
-## Dependencies
+**Key files**:
 
-All listed below are confirmed in `Cargo.toml` / `package.json` *and* used in source (verified 2026-05-05).
+- `crates/athenaeum-core/src/calibration/config.rs` — `CalibrationMatchingConfig`, `ParameterConfig`, `MatchMode`.
+- `crates/athenaeum-core/src/calibration/configurable_matcher.rs` — `find_calibration_sets`, `load_config`.
+- `crates/athenaeum-core/src/calibration/hierarchy.rs` — hierarchy builder (uses configurable matcher).
+- `src/types/calibration-config.ts`, `src/components/calibration/`.
 
-**Frontend** (`package.json`): react 19 + react-dom, react-router-dom 7, tailwindcss 3, lucide-react (icons, ~90 imports), date-fns, recharts (analysis charts), `@tauri-apps/api` + `@tauri-apps/plugin-opener` / `-dialog` / `-fs` (only imported under `src/api/desktop.ts`).
+**Tauri commands**: `get_calibration_matching_config`, `set_calibration_matching_config`, `reset_calibration_matching_config`.
 
-**Backend — `athenaeum-core`**: rusqlite 0.32 (`bundled` + `functions` for `SIN`/`COS` scalar fns) + r2d2 (custom `ManageConnection` impl), serde / serde_json, chrono, rayon, walkdir, anyhow, xxhash-rust (`xxh3`), quick-xml (XISF parsing), uuid (v4, monitor orchestrator), sha2, memmap2, byteorder, cdshealpix, flate2, zip, reqwest (blocking, Tycho-2 fetch), tokio (`sync`/`time`/`macros`/`rt`), `rustafits` (path dep, FITS image rendering), `jpeg-encode` (path dep, kept out of the workspace so it builds with opt-level 2 + no incremental).
+## Archive Feature
 
-**Backend — `athenaeum-tauri`**: athenaeum-core, tauri 2 + tauri-plugin-opener / -dialog / -fs, tokio (`full`), serde / serde_json, rusqlite, chrono, rayon, anyhow, base64 (preview JPEG → data-URI), reqwest (json, update checker), uuid, semver (update-version comparison), rustafits. The `duplicates` / `scanner` / `fits_parser` modules are re-exported from `athenaeum-core`, so this crate doesn't need its own `xxhash-rust` / `walkdir` / `quick-xml` deps.
+Moves a finished frame set's data into a `.zip` per frame type (Lights / Flats / Darks / Bias / DarkFlats) inside a user-configured archive folder, preserving catalog metadata. Full design in `docs/superpowers/specs/2026-04-29-archive-feature-design.md` and plan in `docs/superpowers/plans/2026-04-29-archive-feature.md`.
 
-**Backend — `athenaeum-web`**: athenaeum-core, axum 0.8, tower-http (`cors`+`fs`), tokio (`full`), tokio-stream (`sync`), serde / serde_json, rusqlite (for inline `params!` in route handlers), chrono, rayon, futures.
+**Three-state lifecycle for a frame set:**
 
-## Reference Documentation
+| State | DB columns | Toolbar button |
+| ----- | ---------- | -------------- |
+| Stage / WIP | `is_archived = 0` | **Find new images** + **Move to Archive** |
+| In Archive section, not zipped | `is_archived = 1`, `archived_at = NULL` | **Move and ZIP** |
+| Zipped | `archived_at IS NOT NULL` | **Unarchive** + reveal-in-file-manager |
 
-- [Tauri 2.0 Docs](https://tauri.app/start/)
-- [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html)
-- [XISF 1.0 Specification](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html)
-- [xxHash](https://xxhash.com/)
-- Commands Refactoring: `crates/athenaeum-tauri/REFACTORING.md` - Original 2025-11-17 modular-refactor map
+The legacy `is_archived` boolean is the soft-hide flag (`archive_frame_set` / `unarchive_frame_set`, used by Objects-page tabs). The ZIP feature adds `archived_at` + `archive_operation_id` as a separate axis. The planner refuses to ZIP a frame set unless `is_archived = 1` AND `archived_at IS NULL`.
+
+**Module structure (`crates/athenaeum-core/src/archive/`)** — `models`, `db`, `path_layout`, `staging`, `zip_writer` (+ `build_zip_with_progress`), `zip_reader`, `shared_calibration`, `planner` (`build_plan` no DB writes / `commit_plan` writes rows), `executor` (`run_operation` drives stages 2–7 with cooperative cancellation), `rollback` (`rollback_operation` restores sources, deletes partial zips, clears zip markers), `resume` (idempotent step log skips Done), `restore` (reconcile-based: extract + hash-verify; skip if file already on disk at `source_path` else copy).
+
+**Multi-folder destinations** in `archive_roots`. `start_archive_operation` / `plan_archive_operation` accept an optional `archive_root_path`; resolution is explicit > only-root > `is_default` > error. Legacy single-folder `archive.root_path` setting auto-migrates on first read of `list_archive_roots`.
+
+**Tauri commands** (mirrored in `crates/athenaeum-web/src/routes/archive.rs`): folder management (`list_archive_roots`, `add_archive_root`, `delete_archive_root`, `set_default_archive_root`); operation lifecycle (`plan_archive_operation`, `start_archive_operation`, `cancel_archive_operation`, `list_unfinished_archive_operations`, `resume_archive_operation`, `rollback_archive_operation`); browsing (`list_archived_frame_sets`, `list_archive_zips`); restore (`start_restore_operation`, `get_restore_suggestions`); cleanup (`delete_archive`).
+
+**Progress events**: unified on `archive-progress` for both archive and restore stages; `archive-finished` fires at exit with `{ operation_id, outcome, kind? }` so the widget auto-dismisses with the right color.
+
+**Restore semantics (the safe one)**: zip is the inventory; restore makes disk match by filling gaps. For each `archive_operation_files` row, if the file already exists at `source_path` skip (no overwrite, no duplicate); else copy from temp → target. Cleanly handles copy-disposition calibrations and cross-archive-move cases.
+
+## Dual-Pane File Browser
+
+`FileManager → Browse Files` is a Far-Manager-style two-pane browser that owns file-system operations (Move, Delete, Rename, Mkdir), catalog search, bulk metadata editing, and the Blink launcher. Spec: `docs/superpowers/specs/2026-05-05-dual-pane-file-browser-design.md`.
+
+**Module structure**:
+
+- `crates/athenaeum-core/src/services/operation_queue.rs` — single serialized worker thread shared with the archive feature. `OperationKind { ZipArchive, FileOpMove, FileOpDelete }`.
+- `crates/athenaeum-core/src/file_op/` — Move/Delete pipeline (`models`, `db`, `planner`, `executor`). `MoveStrategy { AtomicRename, CopyVerifyDelete, Delete }` chosen by planner via `MetadataExt::dev()`. Cross-volume moves verify with xxHash before deleting source. Move planner refuses destination collisions up front; Delete planner records every subdirectory for deepest-first rmdir.
+- `crates/athenaeum-core/src/fits_parser/stored_header.rs` — re-decodes the `fits_header.header` blob into the canonical `FrameOriginalSnapshot` for "what the file looked like at scan time" + per-field revert.
+- `src/components/dualpane/` — `DualPaneFileBrowser.tsx`, `MetadataPane.tsx`, `CatalogSearch.tsx`, `types.ts`.
+
+**Key Tauri commands** (mirrored in `crates/athenaeum-web/src/routes/files.rs`):
+
+- File ops: `enqueue_move_operation`, `enqueue_delete_operation`, `cancel_file_operation`, `list_unfinished_file_operations`, `mkdir_in_scan_root`, `rename_path`.
+- Search: `search_catalog` (filename / path / OBJECT / FILTER / IMAGETYP / INSTRUME / TELESCOP).
+- Metadata pane: `bulk_update_frame_metadata`, `count_frame_metadata_relations`, `get_frame_memberships`, `get_frame_metadata_originals`.
+
+**Hot-sync semantics**:
+
+- **Move**: per-file SQL transaction updates `files.path` AND does the disk action. AtomicRename is `rename(2)`; CopyVerifyDelete is copy → xxHash verify → DB update + source delete. Path-based UPDATE in `update_files_path_by_old_path` is the primary catalog write (id-based update is a fallback). Survives macOS `/Volumes` vs `/private/Volumes` edge cases.
+- **Directory rename**: SUBSTR-based leading-prefix swap on `files.path` (`UPDATE files SET path = ?new_prefix || SUBSTR(path, LENGTH(?old_prefix) + 1) WHERE path LIKE ?old_prefix || '%'`). Naive `REPLACE(path, old, new)` was unsafe — replaced every occurrence.
+- **`bulk_update_frame_metadata` cascade**: deletes `calibration_set_frames`, `calibration_set_to_frames`, `session_members` rows for touched frames; **prunes calibration sets that lose their last member**. FK CASCADE on `calibration_set_to_frames.calibration_set_id` cleans consumer references. Sessions / imaging_nights / frames_set are intentionally left in place even when empty.
+- **`bulk_update_calibration_metadata`** (Equipment page) propagates set-level edits to every member frame with `frames.override = 1` so the scanner won't undo it.
+- **Override flag**: any save sets `frames.override = 1`; trailing `recompute_override_flag_for_frames` clears it back to 0 if everything matches FITS-header originals (semantic compare: ±1e-6 floats, instant-aware DATE-OBS).
+
+## Reference
+
+- [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · [XISF 1.0](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html) · [xxHash](https://xxhash.com/)
+- 2025-11-17 modular-refactor map: `crates/athenaeum-tauri/REFACTORING.md`

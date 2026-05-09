@@ -21,6 +21,15 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
     let temp_warning = if link.temp_warning { 1 } else { 0 };
     let is_manual_override = if link.is_manual_override { 1 } else { 0 };
 
+    // Reserve match_score = 1.0 as the manual-assignment marker.
+    // `manual_assign_calibration` / `manual_assign_subcalibration` both write
+    // 1.0 to flag a user pick; clamp auto-find scores to 0.999 so any UI
+    // consumer that wants to distinguish (badge "Manual" vs "Auto") can do so
+    // by score alone, while `is_manual_override` remains the authoritative flag.
+    let match_score = link.match_score.map(|s| {
+        if !link.is_manual_override && s >= 1.0 { 0.999 } else { s }
+    });
+
     // If this is an automatic assignment, check if there's a manual override we should preserve
     if !link.is_manual_override {
         let has_manual_override: i64 = conn.query_row(
@@ -55,7 +64,7 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
             link.calibration_set_id,
             &link.calibration_type,
             &matched_at,
-            link.match_score,
+            match_score,
             date_warning,
             temp_warning,
             is_manual_override
@@ -119,6 +128,35 @@ pub fn get_links_for_calibration_set(conn: &Connection, set_id: i64) -> Result<V
     })?;
 
     links.collect()
+}
+
+/// Look up the manually-overridden calibration_set_id for a frame, if any.
+///
+/// `calibration_type` is one of "Flat", "Dark", "Bias", "DarkFlat".
+/// Returns `Ok(Some(set_id))` when the frame has a row in
+/// `calibration_set_to_frames` with `is_manual_override = 1` for that type,
+/// otherwise `Ok(None)`.
+pub fn get_manual_override_set_id(
+    conn: &Connection,
+    frame_id: i64,
+    calibration_type: &str,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1
+           AND source_type = 'frame'
+           AND calibration_type = ?2
+           AND is_manual_override = 1
+         LIMIT 1",
+    )?;
+
+    let mut rows = stmt.query(params![frame_id, calibration_type])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Get sub-calibration details for a calibration set

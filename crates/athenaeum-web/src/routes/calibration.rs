@@ -745,88 +745,186 @@ pub async fn get_light_frame_parameters(
 
 /// POST /api/get_calibration_sets_for_manual_selection
 ///
-/// Get calibration sets with match scores for manual selection.
+/// Get calibration sets with match scores for manual selection. Routes through
+/// the same `find_calibration_candidates` engine that auto-link uses, so the
+/// modal's score and "compatible" decision agree with what "Find Calibration"
+/// will actually pick.
 pub async fn get_calibration_sets_for_manual_selection(
     State(state): State<WebAppState>,
     Json(args): Json<GetCalibrationSetsForManualSelectionArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetWithScore>>, (StatusCode, String)> {
+    use athenaeum_core::calibration::configurable_matcher::{find_calibration_candidates, load_config};
+    use athenaeum_core::calibration::finder::CandidateMode;
+    use athenaeum_core::calibration::manual::{load_set_with_score, synthesize_frame_for_lights};
+
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
     if args.frame_ids.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No frame IDs provided".to_string()));
     }
+    match args.calibration_type.to_lowercase().as_str() {
+        "flat" | "dark" | "bias" | "darkflat" => {}
+        _ => return Err((StatusCode::BAD_REQUEST, format!("Invalid calibration type: {}", args.calibration_type))),
+    }
 
-    let params = get_light_params_internal(&conn, &args.frame_ids)?;
-    let scored = query_and_score_calibration_sets(
-        &conn, &params, &args.calibration_type, args.show_all,
-    )?;
+    let frame = synthesize_frame_for_lights(&conn, &args.frame_ids).map_err(internal_err)?;
+    let config = load_config(&conn);
 
-    Ok(Json(scored))
+    let cal_type_key = match args.calibration_type.to_lowercase().as_str() {
+        "flat" => "Flat",
+        "dark" => "Dark",
+        "bias" => "Bias",
+        "darkflat" => "DarkFlat",
+        _ => "",
+    };
+    let current_link_set_id: Option<i64> = if !args.frame_ids.is_empty() && !cal_type_key.is_empty() {
+        let links = athenaeum_core::db::calibration_links::get_links_for_frame(&conn, args.frame_ids[0])
+            .unwrap_or_default();
+        links.iter()
+            .find(|l| l.calibration_type == cal_type_key)
+            .map(|l| l.calibration_set_id)
+    } else {
+        None
+    };
+
+    // Manual modal: always include incompatible candidates with engine's
+    // score (0 for hard-filter rejects). Always include the currently-linked
+    // set so the "Current" badge can render.
+    let candidates = find_calibration_candidates(
+        &conn, &frame, "lights", &args.calibration_type.to_lowercase(),
+        &config, CandidateMode::IncludeIncompatible,
+    ).map_err(internal_err)?;
+
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut current_seen = false;
+    for candidate in candidates {
+        let is_current = current_link_set_id == Some(candidate.set_id);
+        if is_current { current_seen = true; }
+        if !args.show_all && !is_current && candidate.match_score < 0.1 {
+            continue;
+        }
+        if let Some(swc) = load_set_with_score(&conn, &candidate).map_err(internal_err)? {
+            out.push(swc);
+        }
+    }
+    if let (false, Some(cur_id)) = (current_seen, current_link_set_id) {
+        let placeholder = athenaeum_core::calibration::finder::CalibrationCandidate {
+            set_id: cur_id,
+            imagetyp: athenaeum_core::models::ImageType::from_str(cal_type_key)
+                .unwrap_or(athenaeum_core::models::ImageType::Dark),
+            match_score: 0.0,
+            date_diff_days: 0,
+            temp_diff: None,
+            date_warning: false,
+            temp_warning: false,
+            is_master: false,
+            passed_hard_filter: false,
+            details: athenaeum_core::calibration::finder::CandidateMatchDetails::default(),
+            warnings: Vec::new(),
+        };
+        if let Some(swc) = load_set_with_score(&conn, &placeholder).map_err(internal_err)? {
+            out.push(swc);
+        }
+    }
+    Ok(Json(out))
 }
 
 /// POST /api/get_subcalibration_sets_for_manual_selection
 ///
-/// Get compatible sub-calibration sets with match scores for a calibration set.
+/// Sub-calibration candidates for a Flat or Dark set. Routes through
+/// `find_calibration_candidates` with the parent set's parameters synthesized
+/// as a frame so the engine's `flats→{darkflat,dark,bias}` and `darks→bias`
+/// configs apply.
 pub async fn get_subcalibration_sets_for_manual_selection(
     State(state): State<WebAppState>,
     Json(args): Json<GetSubcalibrationSetsArgs>,
 ) -> Result<Json<Vec<athenaeum_core::models::CalibrationSetWithScore>>, (StatusCode, String)> {
+    use athenaeum_core::calibration::configurable_matcher::{find_calibration_candidates, load_config};
+    use athenaeum_core::calibration::finder::CandidateMode;
+    use athenaeum_core::calibration::manual::{load_set_with_score, synthesize_frame_for_set};
+
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    // Check if master set — masters don't need sub-calibration
-    let is_master: bool = conn.query_row(
-        "SELECT is_master_library FROM calibration_set WHERE id = ?1",
-        [args.set_id],
-        |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
-    ).unwrap_or(false);
+    match args.calibration_type.to_lowercase().as_str() {
+        "dark" | "darkflat" | "bias" => {}
+        _ => return Err((StatusCode::BAD_REQUEST, format!("Invalid calibration type for sub-calibration: {}", args.calibration_type))),
+    }
 
+    let is_master: bool = conn
+        .query_row(
+            "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+            [args.set_id],
+            |row| Ok(row.get::<_, i32>(0).unwrap_or(0) == 1),
+        )
+        .unwrap_or(false);
     if is_master {
         return Ok(Json(Vec::new()));
     }
 
-    // Load source set params to use as reference
-    let mut stmt = conn.prepare(
-        "SELECT instrume, binning, gain, offset, exptime, filter, ccd_temp, date_start, date_end
-         FROM calibration_set WHERE id = ?1"
-    ).map_err(db_err)?;
+    let (frame, source_type) = synthesize_frame_for_set(&conn, args.set_id).map_err(internal_err)?;
+    let config = load_config(&conn);
 
-    let (instrume, binning, gain, offset, exptime, filter, ccd_temp,
-         date_start, date_end): (
-        Option<String>, Option<String>, Option<f64>, Option<f64>,
-        Option<f64>, Option<String>, Option<f64>, Option<String>, Option<String>
-    ) = stmt.query_row([args.set_id], |row| {
-        Ok((
-            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
-        ))
-    }).map_err(|e| db_err(format!("Calibration set not found: {}", e)))?;
-
-    let params = athenaeum_core::models::LightFrameParameters {
-        instrume,
-        binning,
-        gain,
-        offset,
-        filter,
-        avg_ccd_temp: ccd_temp,
-        avg_exptime: exptime,
-        exptime_range: exptime.map(|e| (e, e)),
-        frame_count: 1,
-        date_range: match (&date_start, &date_end) {
-            (Some(s), Some(e)) => Some((s.clone(), e.clone())),
-            _ => None,
-        },
-        current_flat_set_id: None,
-        current_dark_set_id: None,
-        current_bias_set_id: None,
+    let cal_type_key = match args.calibration_type.to_lowercase().as_str() {
+        "dark" => "Dark",
+        "darkflat" => "DarkFlat",
+        "bias" => "Bias",
+        _ => "",
+    };
+    let current_link_set_id: Option<i64> = if !cal_type_key.is_empty() {
+        let links = athenaeum_core::db::calibration_links::get_links_for_calibration_set(&conn, args.set_id)
+            .unwrap_or_default();
+        links.iter()
+            .find(|l| l.calibration_type == cal_type_key)
+            .map(|l| l.calibration_set_id)
+    } else {
+        None
     };
 
-    let scored = query_and_score_calibration_sets(
-        &conn, &params, &args.calibration_type, args.show_all,
-    )?;
+    // Manual sub-cal modal: same lenient policy. Score = 0 for hard-filter
+    // rejects. Always surface currently-linked set.
+    let candidates = find_calibration_candidates(
+        &conn, &frame, &source_type, &args.calibration_type.to_lowercase(),
+        &config, CandidateMode::IncludeIncompatible,
+    ).map_err(internal_err)?;
 
-    Ok(Json(scored))
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut current_seen = false;
+    for candidate in candidates {
+        let is_current = current_link_set_id == Some(candidate.set_id);
+        if is_current { current_seen = true; }
+        if !args.show_all && !is_current && candidate.match_score < 0.1 {
+            continue;
+        }
+        if let Some(swc) = load_set_with_score(&conn, &candidate).map_err(internal_err)? {
+            out.push(swc);
+        }
+    }
+    if let (false, Some(cur_id)) = (current_seen, current_link_set_id) {
+        let placeholder = athenaeum_core::calibration::finder::CalibrationCandidate {
+            set_id: cur_id,
+            imagetyp: athenaeum_core::models::ImageType::from_str(cal_type_key)
+                .unwrap_or(athenaeum_core::models::ImageType::Dark),
+            match_score: 0.0,
+            date_diff_days: 0,
+            temp_diff: None,
+            date_warning: false,
+            temp_warning: false,
+            is_master: false,
+            passed_hard_filter: false,
+            details: athenaeum_core::calibration::finder::CandidateMatchDetails::default(),
+            warnings: Vec::new(),
+        };
+        if let Some(swc) = load_set_with_score(&conn, &placeholder).map_err(internal_err)? {
+            out.push(swc);
+        }
+    }
+    Ok(Json(out))
+}
+
+fn internal_err<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
 /// POST /api/manual_assign_calibration
@@ -1262,233 +1360,6 @@ fn get_light_params_internal(
 }
 
 /// Query all calibration sets of a given type and score them against light frame params.
-fn query_and_score_calibration_sets(
-    conn: &rusqlite::Connection,
-    params: &athenaeum_core::models::LightFrameParameters,
-    calibration_type: &str,
-    show_all: bool,
-) -> Result<Vec<athenaeum_core::models::CalibrationSetWithScore>, (StatusCode, String)> {
-    use athenaeum_core::models::{CalibrationSetWithScore, ImageType};
-
-    let (regular_type, master_type) = match calibration_type.to_lowercase().as_str() {
-        "flat" => ("Flat", "MasterFlat"),
-        "dark" => ("Dark", "MasterDark"),
-        "bias" => ("Bias", "MasterBias"),
-        "darkflat" => ("DarkFlat", "MasterDarkFlat"),
-        _ => return Err((StatusCode::BAD_REQUEST, format!("Invalid calibration type: {}", calibration_type))),
-    };
-
-    let mut stmt = conn.prepare(
-        "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
-                cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
-                cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library,
-                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
-         FROM calibration_set cs
-         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
-         LEFT JOIN frames f ON f.id = csf.frame_id
-         LEFT JOIN files fi ON fi.id = f.file_id
-         WHERE cs.imagetyp IN (?1, ?2)
-         GROUP BY cs.id
-         ORDER BY cs.is_master_library ASC, cs.date_start DESC"
-    ).map_err(db_err)?;
-
-    let sets: Vec<athenaeum_core::models::CalibrationSetDetail> = stmt
-        .query_map([regular_type, master_type], |row| {
-            Ok(athenaeum_core::models::CalibrationSetDetail {
-                id: row.get(0)?,
-                imagetyp: ImageType::from_str(row.get::<_, String>(1)?.as_str())
-                    .unwrap_or(ImageType::Flat),
-                exptime: row.get(2)?,
-                ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                gain: row.get(4)?,
-                offset: row.get(5)?,
-                binning: row.get(6)?,
-                instrume: row.get(7)?,
-                filter: row.get(8)?,
-                date_start: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                date_end: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                temp_min: row.get::<_, Option<f64>>(11)?.unwrap_or(0.0),
-                temp_max: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
-                frame_count: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
-                date_display: String::new(),
-                is_master: row.get::<_, i32>(15).unwrap_or(0) == 1,
-                naxis1: row.get(16)?,
-                naxis2: row.get(17)?,
-                bayerpat: row.get(18)?,
-                swcreate: row.get(19)?,
-                xpixsz: row.get(20)?,
-                format: row.get(21)?,
-                focallen: row.get(14)?,
-            })
-        })
-        .map_err(db_err)?
-        .filter_map(|r| r.ok())
-        .map(|mut set| {
-            if set.date_start == set.date_end {
-                set.date_display = set.date_start.chars().take(10).collect();
-            } else {
-                let start: String = set.date_start.chars().take(10).collect();
-                let end: String = set.date_end.chars().take(10).collect();
-                set.date_display = format!("{} - {}", start, end);
-            }
-            set
-        })
-        .collect();
-
-    let mut scored_sets: Vec<CalibrationSetWithScore> = Vec::new();
-
-    for set in sets {
-        let match_details = calculate_match_details(params, &set, calibration_type);
-        let match_score = calculate_match_score(&match_details, calibration_type);
-
-        if !show_all && match_score < 0.1 {
-            continue;
-        }
-
-        scored_sets.push(CalibrationSetWithScore {
-            set,
-            match_score,
-            match_details,
-        });
-    }
-
-    scored_sets.sort_by(|a, b| b.match_score.partial_cmp(&a.match_score).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(scored_sets)
-}
-
-fn calculate_match_details(
-    params: &athenaeum_core::models::LightFrameParameters,
-    set: &athenaeum_core::models::CalibrationSetDetail,
-    calibration_type: &str,
-) -> athenaeum_core::models::MatchDetails {
-    let instrume_match = match (&params.instrume, &set.instrume) {
-        (Some(p), Some(s)) => p.to_lowercase() == s.to_lowercase(),
-        (None, None) => true,
-        _ => false,
-    };
-    let binning_match = match (&params.binning, &set.binning) {
-        (Some(p), Some(s)) => p == s,
-        (None, None) => true,
-        _ => false,
-    };
-    let gain_match = match (params.gain, set.gain) {
-        (Some(p), Some(s)) => (p - s).abs() < 0.01,
-        (None, None) => true,
-        _ => false,
-    };
-    let offset_match = match (params.offset, set.offset) {
-        (Some(p), Some(s)) => (p - s).abs() < 0.01,
-        (None, None) => true,
-        _ => false,
-    };
-    let exptime_match = if calibration_type.to_lowercase() == "bias" {
-        true
-    } else {
-        match (params.avg_exptime, set.exptime) {
-            (Some(p), Some(s)) => (p - s).abs() < 0.1,
-            (None, None) => true,
-            _ => false,
-        }
-    };
-    let filter_match = if calibration_type.to_lowercase() == "flat" {
-        match (&params.filter, &set.filter) {
-            (Some(p), Some(s)) => p.to_lowercase() == s.to_lowercase(),
-            (None, None) => true,
-            _ => false,
-        }
-    } else {
-        true
-    };
-    let temp_diff = match (params.avg_ccd_temp, set.ccd_temp) {
-        (Some(p), c) if c != 0.0 => Some((p - c).abs()),
-        _ => None,
-    };
-    let date_diff_days = calculate_date_diff_days(params, set);
-
-    athenaeum_core::models::MatchDetails {
-        instrume_match,
-        binning_match,
-        gain_match,
-        offset_match,
-        exptime_match,
-        filter_match,
-        temp_diff,
-        date_diff_days,
-    }
-}
-
-fn calculate_date_diff_days(
-    params: &athenaeum_core::models::LightFrameParameters,
-    set: &athenaeum_core::models::CalibrationSetDetail,
-) -> i64 {
-    use chrono::NaiveDate;
-
-    let parse_date = |s: &str| -> Option<NaiveDate> {
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-            return Some(dt.date_naive());
-        }
-        NaiveDate::parse_from_str(&s.chars().take(10).collect::<String>(), "%Y-%m-%d").ok()
-    };
-
-    let light_dates = match &params.date_range {
-        Some((start, end)) => (parse_date(start), parse_date(end)),
-        None => return 365 * 10,
-    };
-
-    let set_start = parse_date(&set.date_start);
-    let set_end = parse_date(&set.date_end);
-
-    match (light_dates, set_start, set_end) {
-        ((Some(l_start), Some(l_end)), Some(s_start), Some(s_end)) => {
-            if l_end < s_start {
-                (s_start - l_end).num_days()
-            } else if l_start > s_end {
-                (l_start - s_end).num_days()
-            } else {
-                0
-            }
-        }
-        _ => 365 * 10,
-    }
-}
-
-fn calculate_match_score(
-    details: &athenaeum_core::models::MatchDetails,
-    calibration_type: &str,
-) -> f64 {
-    let mut score: f64 = 1.0;
-    let cal_type_lower = calibration_type.to_lowercase();
-
-    if !details.instrume_match { score -= 0.5; }
-    if !details.binning_match { score -= 0.3; }
-    if !details.gain_match { score -= 0.2; }
-    if !details.offset_match { score -= 0.2; }
-
-    if (cal_type_lower == "dark" || cal_type_lower == "darkflat") && !details.exptime_match {
-        score -= 1.0;
-    }
-    if cal_type_lower == "flat" && !details.filter_match {
-        score -= 1.0;
-    }
-
-    if let Some(temp_diff) = details.temp_diff {
-        if temp_diff > 10.0 { score -= 0.15; }
-        else if temp_diff > 5.0 { score -= 0.1; }
-        else if temp_diff > 2.0 { score -= 0.05; }
-    }
-
-    if cal_type_lower == "flat" {
-        let date_score = 1.0 / (1.0 + (details.date_diff_days as f64 / 30.0));
-        score -= 0.15 * (1.0 - date_score);
-    } else {
-        if details.date_diff_days > 365 { score -= 0.15; }
-        else if details.date_diff_days > 90 { score -= 0.1; }
-        else if details.date_diff_days > 30 { score -= 0.05; }
-    }
-
-    score.max(0.0).min(1.0)
-}
-
 fn most_common_option(values: &[Option<String>]) -> Option<String> {
     let mut counts: HashMap<&String, usize> = HashMap::new();
     for v in values.iter().flatten() {
