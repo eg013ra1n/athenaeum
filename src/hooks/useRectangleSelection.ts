@@ -19,8 +19,17 @@ export interface RectangleSelectionAPI {
   /**
    * Start rectangle selection mode
    * @param onComplete - Callback with selection results
+   * @param onQueryStateChange - Optional callback that fires `true` when the
+   *   backend query starts and `false` when it completes (success OR error).
+   *   Lets the host render a loading spinner during slow queries (T2-18).
+   * @param onError - Optional callback with a user-friendly error message
+   *   when the backend query fails (T2-19). Raw value is still console-logged.
    */
-  startSelection: (onComplete: (result: SelectionResult) => void) => void;
+  startSelection: (
+    onComplete: (result: SelectionResult) => void,
+    onQueryStateChange?: (querying: boolean) => void,
+    onError?: (message: string) => void,
+  ) => void;
 
   /**
    * Cancel current selection
@@ -60,9 +69,17 @@ export function useRectangleSelection(
   const rectangleElementRef = useRef<SVGRectElement | null>(null);
   const textElementRef = useRef<SVGTextElement | null>(null);
   const callbackRef = useRef<((result: SelectionResult) => void) | null>(null);
+  const queryStateRef = useRef<((querying: boolean) => void) | null>(null);
+  const errorRef = useRef<((message: string) => void) | null>(null);
 
-  const startSelection = (onComplete: (result: SelectionResult) => void) => {
+  const startSelection = (
+    onComplete: (result: SelectionResult) => void,
+    onQueryStateChange?: (querying: boolean) => void,
+    onError?: (message: string) => void,
+  ) => {
     callbackRef.current = onComplete;
+    queryStateRef.current = onQueryStateChange ?? null;
+    errorRef.current = onError ?? null;
 
     const svg = svgOverlay.getSvg();
     if (!svg) {
@@ -217,7 +234,10 @@ export function useRectangleSelection(
 
         console.log('✅ Sky bounds:', skyBounds);
 
-        // Query backend for candidate frames in the sky bounding box
+        // Query backend for candidate frames in the sky bounding box.
+        // T2-18 — surface a loading state to the host so it can show a
+        // spinner during slow queries.
+        queryStateRef.current?.(true);
         try {
           const candidates = await api.invoke<SelectionCandidates>('query_frames_in_bounds', {
             bounds: {
@@ -257,7 +277,13 @@ export function useRectangleSelection(
           }
         } catch (err) {
           console.error('❌ Error querying frames in rectangle:', err);
+          // T2-19 — surface a friendly message to the host; raw value is
+          // already logged for support.
+          const msg = err instanceof Error ? err.message : String(err);
+          errorRef.current?.(`Couldn't query that region: ${msg}`);
         } finally {
+          // T2-18 — clear loading flag whether the query succeeded or not.
+          queryStateRef.current?.(false);
           // Always clear the rectangle visual after query completes
           svgOverlay.clear();
           rectangleElementRef.current = null;

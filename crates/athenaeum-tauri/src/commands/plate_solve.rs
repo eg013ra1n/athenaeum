@@ -643,7 +643,10 @@ pub async fn build_quad_index(
     state: State<'_, AppState>,
 ) -> Result<QuadIndexStatus, String> {
     let path = quad_index_path(&state)?;
-    let catalog_dir = path.parent().unwrap().to_path_buf();
+    let catalog_dir = path
+        .parent()
+        .ok_or_else(|| format!("Quad index path has no parent directory: {}", path.display()))?
+        .to_path_buf();
     if !catalog_dir.exists() {
         return Err(format!(
             "Tycho-2 catalog directory not found at {}. Please download the catalog first.",

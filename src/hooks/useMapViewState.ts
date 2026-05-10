@@ -86,10 +86,13 @@ export function useMapViewState(storageKey: string = 'skyatlas_view_state') {
    * Validate view state values
    */
   const validateViewState = useCallback((state: MapViewState): boolean => {
-    // Zoom should be positive and reasonable for projection.scale()
-    // projection.scale() = Bt.scale * containerWidth / 1024 * zoomFactor
-    // Stereographic base scale is 500; at 1920px wide, max x20 zoom ≈ 500*1920/1024*20 ≈ 18750
-    if (state.zoom !== null && (state.zoom <= 0 || state.zoom > 20000)) return false;
+    // Zoom should be positive. Upper bound is intentionally generous —
+    // projection.scale() = base_scale * containerWidth / 1024 * zoomFactor,
+    // so on a 4K (3840 px) display at the max d3-celestial `zoomextend` (20×)
+    // and a stereographic base scale of 500, valid scales reach ~37500.
+    // 100000 leaves headroom for ultrawide / HiDPI displays without
+    // accepting clearly bogus values from a corrupted URL.
+    if (state.zoom !== null && (state.zoom <= 0 || state.zoom > 100000)) return false;
 
     // RA should be 0-360 degrees
     if (state.ra !== null && (state.ra < 0 || state.ra > 360)) return false;

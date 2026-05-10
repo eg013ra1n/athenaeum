@@ -90,6 +90,12 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
           )
         GROUP BY COALESCE(fr.object, 'Unknown'), ROUND(fr.ra, 1), ROUND(fr.dec, 1)
         HAVING avg_ra IS NOT NULL AND avg_dec IS NOT NULL
+
+        -- Safety cap: 5000 distinct imaging locations is more than any
+        -- realistic library has (typical user: <500). Without this, a
+        -- pathological 100K+ frame catalog would ship a multi-MB JSON
+        -- payload to the frontend in one hit. T1-9.
+        LIMIT 5000
     ").map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let locations = stmt.query_map([], |row| {

@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { api } from '../api';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useNavigationType } from 'react-router-dom';
 import { ImagingLocation } from '../types/models';
 import { DrawingMode, SelectionResult } from '../types/selection';
 import { useSvgOverlay } from '../hooks/useSvgOverlay';
@@ -47,6 +47,22 @@ export default function SkyChart() {
   const autoSaveTimeoutRef = useRef<number | undefined>(undefined);
   const saveViewStateRef = useRef<((state: any, replace?: boolean) => void) | null>(null);
   const autoSaveRegistered = useRef(false);
+  // T1-3 — keep heavy callback deps in refs so addImagingMarkers identity
+  // stays stable across URL changes (saveViewState recreates on every
+  // searchParams write). Without this, the marker effect re-runs on every
+  // pan/zoom and re-registers a new Celestial callback each time, never
+  // cleaned up — progressively slowing the chart.
+  const navigateRef = useRef<((path: string) => void) | null>(null);
+  const getCanvasScalingRef = useRef<(() => any) | null>(null);
+  const updateGlobeClipRef = useRef<((svg: any, clipId: string, scaling: any) => void) | null>(null);
+  const markersRegisteredRef = useRef(false);
+  // Latest renderMarkers fn — the one-shot Celestial registration delegates
+  // to this ref so every fresh `addImagingMarkers` call (e.g. when the date
+  // filter changes) provides the new closure without registering again.
+  const renderMarkersRef = useRef<(() => void) | null>(null);
+  // T1-6 — track current selected target inside the redraw callback so we
+  // can know when its FOV gets hidden by zoom/distortion thresholds.
+  const selectedTargetRef = useRef<string>('');
   const [locations, setLocations] = useState<ImagingLocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -66,6 +82,16 @@ export default function SkyChart() {
   const [dateFrom, setDateFrom] = useState<DateParts | null>(null);
   const [dateTo, setDateTo] = useState<DateParts | null>(null);
 
+  // T1-6 — when the user has explicitly chosen a target via the dropdown
+  // and its FOV becomes hidden by the distortion / span thresholds, surface
+  // a small inline hint so the user understands why nothing is highlighted.
+  const [fovHiddenForTarget, setFovHiddenForTarget] = useState(false);
+
+  // T2-18 — true while the rectangle-selection backend query is in flight.
+  // Drives a small spinner overlay so the user knows their drag was
+  // received and is being processed.
+  const [isQueryingSelection, setIsQueryingSelection] = useState(false);
+
   // Custom hooks
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
   const coordinateTransform = useCoordinateTransform();
@@ -74,6 +100,7 @@ export default function SkyChart() {
   const { getViewState, saveViewState } = useMapViewState('skychart_view_state');
 
   const navigate = useNavigate();
+  const navigationType = useNavigationType();
 
   const starDataFile = (limit: number) => limit > 8 ? 'stars.14.json' : 'stars.8.json';
 
@@ -105,26 +132,76 @@ export default function SkyChart() {
     });
   }, [locations, dateFrom, dateTo]);
 
-  // Fetch imaging locations from backend
+  // Fetch imaging locations from backend.
+  // T1-7 — guard setState against unmount (page can be left within ms of
+  // mount; the in-flight fetch would otherwise warn / leak).
+  // T2-19 — wrap raw error string in user-friendly prefix; raw goes to
+  // console for support.
   useEffect(() => {
+    let mounted = true;
     async function loadLocations() {
       try {
         const data = await api.invoke<ImagingLocation[]>('get_imaging_locations');
+        if (!mounted) return;
         setLocations(data);
         setLoading(false);
       } catch (err) {
         console.error('Failed to load imaging locations:', err);
-        setError(err as string);
+        if (!mounted) return;
+        const msg = err instanceof Error ? err.message : String(err);
+        setError(`Couldn't load chart data: ${msg}`);
         setLoading(false);
       }
     }
     loadLocations();
+    return () => { mounted = false; };
   }, []);
 
-  // Keep saveViewState ref up to date
+  // T1-5 — clear selectedTarget if its id no longer exists in the loaded
+  // locations (e.g. user deleted a frame set in another tab).
   useEffect(() => {
-    saveViewStateRef.current = saveViewState;
-  }, [saveViewState]);
+    if (!selectedTarget) return;
+    if (!locations.some(l => String(l.id) === selectedTarget)) {
+      setSelectedTarget('');
+    }
+  }, [locations, selectedTarget]);
+
+  // T1-6 — clear the FOV-hidden hint when the user clears their target.
+  useEffect(() => {
+    if (!selectedTarget) setFovHiddenForTarget(false);
+  }, [selectedTarget]);
+
+  // Keep callback refs up to date — these are read by the marker render
+  // pipeline (which must NOT re-register on every identity change).
+  useEffect(() => { saveViewStateRef.current = saveViewState; }, [saveViewState]);
+  useEffect(() => { navigateRef.current = navigate; }, [navigate]);
+  useEffect(() => { selectedTargetRef.current = selectedTarget; }, [selectedTarget]);
+
+  // Defensive unmount cleanup: null out every callback ref the registered
+  // window.Celestial.add() callbacks read through. d3-celestial's internal
+  // fade-in / pan / zoom animations keep firing for a moment after this
+  // component unmounts (we have no way to unregister those callbacks),
+  // and they were previously calling stale React Router setSearchParams /
+  // navigate from this dead hook instance — which in v7 re-navigated the
+  // browser back to /skychart. Nulling the refs makes those leftover fires
+  // become no-ops.
+  useEffect(() => {
+    return () => {
+      saveViewStateRef.current = null;
+      navigateRef.current = null;
+      getCanvasScalingRef.current = null;
+      updateGlobeClipRef.current = null;
+      renderMarkersRef.current = null;
+      if (autoSaveTimeoutRef.current !== undefined) {
+        window.clearTimeout(autoSaveTimeoutRef.current);
+        autoSaveTimeoutRef.current = undefined;
+      }
+      if (resizeTimeoutRef.current !== undefined) {
+        window.clearTimeout(resizeTimeoutRef.current);
+        resizeTimeoutRef.current = undefined;
+      }
+    };
+  }, []);
 
   // Projection scaling helper — reads canvas buffer dimensions directly
   const getCanvasScaling = useCallback(() => {
@@ -142,6 +219,10 @@ export default function SkyChart() {
 
     return { scaleX, scaleY, offsetX: displayRect.left, offsetY: displayRect.top };
   }, []);
+
+  // Keep getCanvasScaling ref current (callback identity is stable since
+  // useCallback deps are []; the assignment is a no-op after first run).
+  useEffect(() => { getCanvasScalingRef.current = getCanvasScaling; }, [getCanvasScaling]);
 
   // Auto-save map state on pan/zoom
   useEffect(() => {
@@ -392,6 +473,39 @@ export default function SkyChart() {
     };
   }, [mapReady]);
 
+  // T1-2 — react to URL changes ONLY when the user used browser back/forward.
+  // Our own autosave writes URL params on every pan/zoom (with `replace`),
+  // and reading those back to re-apply Celestial.rotate/zoomBy mid-input
+  // fights the user's interaction (the live map pos and the saved-via-
+  // toFixed(6) URL pos differ slightly, so each replace triggers a tiny
+  // correction). `useNavigationType()` is 'POP' only for back/forward and
+  // initial mount — exactly the cases we want to restore from.
+  const lastAppliedUrlRef = useRef<string>('');
+  useEffect(() => {
+    if (!mapReady || typeof window.Celestial === 'undefined') return;
+    if (navigationType !== 'POP') return;
+    const state = getViewState();
+    if (state.zoom == null && state.ra == null && state.dec == null) return;
+
+    // Skip re-applying the same URL twice (handles React StrictMode and
+    // initial mount where the layout effect already restored the view).
+    const sig = `${state.zoom ?? ''}|${state.ra ?? ''}|${state.dec ?? ''}|${state.rotation ?? ''}`;
+    if (lastAppliedUrlRef.current === sig) return;
+    lastAppliedUrlRef.current = sig;
+
+    const projection = window.Celestial.mapProjection;
+    const currentZoom = projection?.scale?.() ?? null;
+
+    if (state.ra != null && state.dec != null) {
+      window.Celestial.rotate({ center: [state.ra, state.dec, state.rotation ?? 0] });
+    }
+    if (state.zoom != null && currentZoom != null && window.Celestial.zoomBy) {
+      const factor = state.zoom / currentZoom;
+      if (Math.abs(factor - 1) > 0.001) window.Celestial.zoomBy(factor);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getViewState, mapReady, navigationType]);
+
   // Apply star density changes at runtime.
   // Celestial.settings() returns the defaults template (wt), NOT the active
   // rendering config ($). Mutating wt and calling redraw() has no effect.
@@ -440,6 +554,8 @@ export default function SkyChart() {
       .attr('d', sphereD)
       .attr('transform', `scale(${scaling.scaleX},${scaling.scaleY})`);
   }, []);
+
+  useEffect(() => { updateGlobeClipRef.current = updateGlobeClip; }, [updateGlobeClip]);
 
   // Add imaging location markers with FOV visualization
   const addImagingMarkers = useCallback((locs: ImagingLocation[]) => {
@@ -530,17 +646,24 @@ export default function SkyChart() {
       markersGroup.selectAll('.imaging-marker').remove();
       markersGroup.selectAll('.fov-box').remove();
 
-      const scaling = getCanvasScaling();
+      const scaling = getCanvasScalingRef.current
+        ? getCanvasScalingRef.current()
+        : { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
 
       // Clip markers to globe boundary
-      updateGlobeClip(svg, 'markers-globe-clip', scaling);
+      updateGlobeClipRef.current?.(svg, 'markers-globe-clip', scaling);
       markersGroup.attr('clip-path', 'url(#markers-globe-clip)');
 
       markersGroup.selectAll('.fov-box')
         .data(data.features)
         .enter().append('g')
         .attr('class', 'fov-box')
-        .style('pointer-events', 'all')
+        // Group itself is transparent to pointer events so wheel/zoom passes
+        // through to the canvas underneath; only the inner painted shapes
+        // (the FOV rectangle and the marker icon) reactivate clicks/hover
+        // for tooltip + navigation. Without this, hovering over an FOV box
+        // froze map zoom anywhere a marker was drawn.
+        .style('pointer-events', 'none')
         .each(function(this: any, d: any) {
           const g = d3.select(this);
           const hasFov = d.properties.fovWidth && d.properties.fovHeight;
@@ -633,7 +756,24 @@ export default function SkyChart() {
             const r = parseInt(fillColor.substring(0, 2), 16);
             const g_rgb = parseInt(fillColor.substring(2, 4), 16);
             const b = parseInt(fillColor.substring(4, 6), 16);
-            const fillStyle = `rgba(${r}, ${g_rgb}, ${b}, 0.15)`;
+            // T2-15 — bumped from 0.15 → 0.28; was nearly invisible on dark sky.
+            const fillStyle = `rgba(${r}, ${g_rgb}, ${b}, 0.28)`;
+
+            // Whole-box hit area — transparent fill + thick transparent
+            // stroke. pointer-events: all means clicks/dblclicks anywhere
+            // inside or near the border register; wheel events get
+            // explicitly forwarded to the canvas (see g.on('wheel', …)
+            // below) so zoom-over-FOV still works.
+            if (d.properties.frameSetId) {
+              g.append('path')
+                .attr('class', 'fov-hit')
+                .attr('d', pathData)
+                .style('fill', 'transparent')
+                .style('stroke', 'transparent')
+                .style('stroke-width', '14px')
+                .style('pointer-events', 'all')
+                .style('cursor', 'pointer');
+            }
 
             g.append('path')
               .attr('class', 'fov-rect')
@@ -641,7 +781,36 @@ export default function SkyChart() {
               .style('fill', fillStyle)
               .style('stroke', markerColor)
               .style('stroke-width', '2px')
-              .style('cursor', d.properties.frameSetId ? 'pointer' : 'default');
+              // Visible rect doesn't need its own hit testing — the
+              // sibling .fov-hit captures clicks/dblclicks for us.
+              .style('pointer-events', 'none');
+
+            // Object-name label — hidden by default, positioned + shown by
+            // the placement pass in the redraw callback. The pill bg + text
+            // are kept in a sibling group so we can move both together with
+            // a single transform attribute. The whole label is also a
+            // click target when the box has a frame set, so users can
+            // click the readable name instead of hunting for the border.
+            const labelG = g.append('g')
+              .attr('class', 'fov-label')
+              .style('pointer-events', d.properties.frameSetId ? 'visiblePainted' : 'none')
+              .style('cursor', d.properties.frameSetId ? 'pointer' : 'default')
+              .style('display', 'none');
+            labelG.append('rect')
+              .attr('class', 'fov-label-bg')
+              .attr('rx', 3)
+              .attr('ry', 3)
+              .style('fill', 'rgba(0,0,0,0.7)')
+              .style('stroke', markerColor)
+              .style('stroke-width', '1px');
+            labelG.append('text')
+              .attr('class', 'fov-label-text')
+              .attr('text-anchor', 'middle')
+              .attr('dominant-baseline', 'middle')
+              .style('font-size', '11px')
+              .style('font-family', 'Helvetica, Arial, sans-serif')
+              .style('fill', '#ffffff')
+              .style('user-select', 'none');
 
             (this as any).__fovCorners = corners;
             (this as any).__fovWidth = fovW;
@@ -658,6 +827,7 @@ export default function SkyChart() {
                 .style('fill', markerColor)
                 .style('stroke', markerStroke)
                 .style('stroke-width', '2px')
+                .style('pointer-events', 'visiblePainted')
                 .style('cursor', d.properties.frameSetId ? 'pointer' : 'default');
             }
           }
@@ -665,28 +835,57 @@ export default function SkyChart() {
           const isVisible = window.Celestial.clip(d.geometry.coordinates);
           g.style('display', isVisible ? null : 'none');
 
-          // Click handler
-          g.on('click', function(event: any) {
-            if (event && event.stopPropagation) {
-              event.stopPropagation();
+          // Double-click handler navigates to the object detail page.
+          // (Single click is intentionally unused — avoids accidental
+          // navigation when the user is just panning / zooming over a
+          // dense cluster of FOV boxes.) Uses refs so the callback keeps
+          // working across the lifetime of the map without forcing this
+          // useCallback to re-run on every navigate identity change.
+          //
+          // We intentionally do NOT call saveViewState here. The autosave
+          // (300 ms debounce on every pan/zoom) has already persisted the
+          // current view by the time a dblclick fires, and queuing a
+          // setSearchParams() in the same tick as a navigate() causes
+          // React Router to land the URL update AFTER the navigation,
+          // effectively replacing /objects/X with /skychart?ra=…&dec=…
+          // — which presented as "jumps to the frameset and immediately
+          // back".
+          g.on('dblclick', function() {
+            if (d3 && d3.event) {
+              d3.event.stopPropagation();
+              d3.event.preventDefault();
             }
             const frameSetId = d.properties.frameSetId;
-            if (frameSetId) {
-              const projection = window.Celestial.mapProjection;
-              const currentZoom = projection && projection.scale ? projection.scale() : null;
-              const currentCenter = window.Celestial.rotate ? window.Celestial.rotate() : null;
+            if (!frameSetId) return;
+            navigateRef.current?.(`/objects/${frameSetId}`);
+          });
 
-              if (currentZoom !== null && currentCenter !== null) {
-                saveViewState({
-                  zoom: currentZoom,
-                  ra: currentCenter[0],
-                  dec: currentCenter[1],
-                  rotation: currentCenter[2] ?? 0
-                });
-              }
-
-              navigate(`/objects/${frameSetId}`);
-            }
+          // Wheel passthrough — the FOV interior now captures all pointer
+          // events so dblclick can hit anywhere, but wheel events should
+          // still zoom the chart. Re-dispatch on the underlying canvas
+          // where d3-celestial's zoom handler is bound. d3 v3 passes the
+          // bound datum to .on() callbacks (NOT the native event), so the
+          // real WheelEvent comes from `d3.event`.
+          g.on('wheel', function() {
+            const evt = d3 && d3.event as WheelEvent | undefined;
+            const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement | null;
+            if (!canvas || !evt) return;
+            evt.preventDefault();
+            evt.stopPropagation();
+            canvas.dispatchEvent(new WheelEvent('wheel', {
+              bubbles: true,
+              cancelable: true,
+              deltaX: evt.deltaX,
+              deltaY: evt.deltaY,
+              deltaZ: evt.deltaZ,
+              deltaMode: evt.deltaMode,
+              clientX: evt.clientX,
+              clientY: evt.clientY,
+              ctrlKey: evt.ctrlKey,
+              shiftKey: evt.shiftKey,
+              altKey: evt.altKey,
+              metaKey: evt.metaKey,
+            }));
           });
 
           // Tooltip
@@ -703,17 +902,30 @@ export default function SkyChart() {
                 ? `\nDates: ${d.properties.dateRange[0].split('T')[0]} to ${d.properties.dateRange[1].split('T')[0]}`
                 : '';
               const fovInfo = hasFov ? `\nFOV: ${fovW.toFixed(2)}° × ${fovH.toFixed(2)}°` : '';
-              return `${typeLabel} ${d.properties.name}\nFrames: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}${fovInfo}`;
+              const displayName = d.properties.name && d.properties.name !== 'Unknown'
+                ? d.properties.name
+                : '[No Name]';
+              return `${typeLabel} ${displayName}\nFrames: ${d.properties.frameCount}\nExposure: ${totalHours}h\nFilters: ${d.properties.filters}${cameras}${focalLengths}${dates}${fovInfo}`;
             });
         });
     };
 
+    // Latest render fn lives in a ref so the registered Celestial callback
+    // (set up exactly once below) always invokes the freshest closure.
+    renderMarkersRef.current = renderMarkers;
     renderMarkers();
 
-    // Register with Celestial for pan/zoom updates
+    // Register with Celestial for pan/zoom updates ONCE per page lifetime.
+    // Without this guard, every saveViewState identity churn would re-run
+    // the marker effect, re-call addImagingMarkers, and append another
+    // callback to Celestial's list. That registration is never cleaned up,
+    // so callbacks accumulated and the chart got progressively slower.
+    if (markersRegisteredRef.current) return;
+    markersRegisteredRef.current = true;
+
     window.Celestial.add({
       type: 'raw',
-      callback: renderMarkers,
+      callback: () => { renderMarkersRef.current?.(); },
       redraw: function() {
         const map = window.Celestial.map;
 
@@ -723,14 +935,22 @@ export default function SkyChart() {
         const markersGroup = svg.select('g.imaging-markers-layer');
         if (markersGroup.empty()) return;
 
-        const scaling = getCanvasScaling();
+        const scaling = getCanvasScalingRef.current
+          ? getCanvasScalingRef.current()
+          : { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
 
         // Update globe clip on every redraw
-        updateGlobeClip(svg, 'markers-globe-clip', scaling);
+        updateGlobeClipRef.current?.(svg, 'markers-globe-clip', scaling);
 
         const canvas = document.querySelector('#celestial-map canvas') as HTMLCanvasElement;
         const canvasWidth = canvas ? canvas.getBoundingClientRect().width : 1000;
         const canvasHeight = canvas ? canvas.getBoundingClientRect().height : 1000;
+
+        // T1-6 — tracks whether the user-selected target's FOV ends up
+        // hidden in this redraw pass.
+        const targetIdNum = selectedTargetRef.current ? Number(selectedTargetRef.current) : null;
+        let selectedTargetHidden = false;
+        let selectedTargetSeen = false;
 
         markersGroup.selectAll('.fov-box').each(function(this: any, d: any) {
           const pt = map.projection()(d.geometry.coordinates);
@@ -784,7 +1004,9 @@ export default function SkyChart() {
 
             const pathData = `M${projectedCorners[0][0]},${projectedCorners[0][1]} L${projectedCorners[1][0]},${projectedCorners[1][1]} L${projectedCorners[2][0]},${projectedCorners[2][1]} L${projectedCorners[3][0]},${projectedCorners[3][1]} Z`;
 
-            d3.select(this).select('.fov-rect')
+            // Update both the visible stroke AND the invisible wide
+            // hit-stroke that gives the rectangle a generous click target.
+            d3.select(this).selectAll('.fov-rect, .fov-hit')
               .attr('d', pathData);
 
             d3.select(this).style('display', null);
@@ -797,10 +1019,150 @@ export default function SkyChart() {
             const isVisible = pt && window.Celestial.clip(d.geometry.coordinates);
             d3.select(this).style('display', isVisible ? null : 'none');
           }
+
+          // T1-6 — note whether this is the user-selected target and
+          // whether it ended up hidden after this redraw pass.
+          if (targetIdNum != null && d.id === targetIdNum) {
+            selectedTargetSeen = true;
+            const display = d3.select(this).style('display');
+            if (display === 'none') selectedTargetHidden = true;
+          }
         });
+
+        // T1-6 — sync the React state outside the hot per-marker loop.
+        // useState's setter is a no-op when the value matches, so this
+        // doesn't trigger a re-render unless the visibility actually
+        // changed.
+        const newHidden = selectedTargetSeen && selectedTargetHidden;
+        setFovHiddenForTarget(prev => prev === newHidden ? prev : newHidden);
+
+        // ── Object-name label placement pass ──────────────────────────
+        //
+        // 1. Collect every visible FOV box, regardless of how small the
+        //    box itself is on screen — labels remain visible even when
+        //    zoomed out.
+        // 2. Dedupe by object name — multiple frame sets imaging the same
+        //    target collapse to a single label on the largest box.
+        // 3. Place labels greedily, sorted by box area descending; skip
+        //    any label that would overlap an already-placed one. This is
+        //    the actual clutter guard at low zoom: instead of all labels
+        //    fighting for the same patch of sky, the larger-area target
+        //    wins and the rest stay hidden until the user zooms in.
+        // 4. Hide labels that didn't make the cut.
+        const LABEL_FONT_SIZE = 11;
+        const LABEL_CHAR_W = 6.2;        // approx average char width at 11px Helvetica
+        const LABEL_PAD_X = 6;
+        const LABEL_PAD_Y = 3;
+        const LABEL_OFFSET_Y = 4;        // gap above the FOV box
+
+        type LabelCandidate = {
+          el: SVGGElement;
+          name: string;
+          area: number;
+          cx: number;
+          topY: number;
+          rectWidth: number;
+          rectHeight: number;
+        };
+        const candidates: LabelCandidate[] = [];
+
+        markersGroup.selectAll('.fov-box').each(function(this: any, d: any) {
+          const labelG = d3.select(this).select('g.fov-label');
+          if (labelG.empty()) return;
+
+          const display = d3.select(this).style('display');
+          if (display === 'none') {
+            labelG.style('display', 'none');
+            return;
+          }
+
+          const name = d.properties?.objectName;
+          if (!name) {
+            labelG.style('display', 'none');
+            return;
+          }
+
+          // Recompute the projected centre + span from the same corner data
+          // used to draw the rectangle (already validated above).
+          const corners = (this as any).__fovCorners as [number, number][] | undefined;
+          if (!corners) {
+            labelG.style('display', 'none');
+            return;
+          }
+          const projected: [number, number][] = [];
+          for (const c of corners) {
+            const projPt = window.Celestial.map.projection()(c);
+            if (!projPt || !isFinite(projPt[0]) || !isFinite(projPt[1])) return;
+            projected.push([projPt[0] * scaling.scaleX, projPt[1] * scaling.scaleY]);
+          }
+          const xs = projected.map(p => p[0]);
+          const ys = projected.map(p => p[1]);
+          const xSpan = Math.max(...xs) - Math.min(...xs);
+          const ySpan = Math.max(...ys) - Math.min(...ys);
+
+          const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+          const topY = Math.min(...ys);
+          const rectWidth = name.length * LABEL_CHAR_W + LABEL_PAD_X * 2;
+          const rectHeight = LABEL_FONT_SIZE + LABEL_PAD_Y * 2;
+          candidates.push({
+            el: this as SVGGElement,
+            name,
+            area: xSpan * ySpan,
+            cx,
+            topY,
+            rectWidth,
+            rectHeight,
+          });
+        });
+
+        // Dedupe by object name — keep the candidate with the largest
+        // box. So 50 NGC 7000 frame-sets stacked together render one
+        // "NGC 7000" label, not 50 overlapping copies.
+        const byName = new Map<string, LabelCandidate>();
+        for (const c of candidates) {
+          const existing = byName.get(c.name);
+          if (!existing || c.area > existing.area) byName.set(c.name, c);
+        }
+
+        // Sort largest first so important targets win the collision pass.
+        const sorted = [...byName.values()].sort((a, b) => b.area - a.area);
+        const placedRects: Array<[number, number, number, number]> = []; // x1, y1, x2, y2
+
+        const intersects = (a: [number, number, number, number], b: [number, number, number, number]) =>
+          !(a[2] < b[0] || b[2] < a[0] || a[3] < b[1] || b[3] < a[1]);
+
+        // Hide all label groups first; we'll re-show the placed ones.
+        markersGroup.selectAll('.fov-box g.fov-label').style('display', 'none');
+
+        for (const c of sorted) {
+          const x1 = c.cx - c.rectWidth / 2;
+          const y1 = c.topY - LABEL_OFFSET_Y - c.rectHeight;
+          const x2 = x1 + c.rectWidth;
+          const y2 = y1 + c.rectHeight;
+          const rect: [number, number, number, number] = [x1, y1, x2, y2];
+
+          if (placedRects.some(p => intersects(p, rect))) continue;
+          placedRects.push(rect);
+
+          const labelG = d3.select(c.el).select('g.fov-label');
+          labelG.style('display', null);
+          labelG.select('rect.fov-label-bg')
+            .attr('x', x1)
+            .attr('y', y1)
+            .attr('width', c.rectWidth)
+            .attr('height', c.rectHeight);
+          labelG.select('text.fov-label-text')
+            .attr('x', c.cx)
+            .attr('y', y1 + c.rectHeight / 2)
+            .text(c.name);
+        }
       }
     });
-  }, [navigate, getCanvasScaling, saveViewState, updateGlobeClip]);
+    // Empty deps — all dynamic dependencies (saveViewState, navigate, the
+    // callbacks above) are accessed through refs that we keep in sync via
+    // separate effects. This is the central fix for T1-3.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Add markers when locations are loaded
   useEffect(() => {
@@ -842,34 +1204,51 @@ export default function SkyChart() {
     }
   }, [locations]);
 
+  // Stabilize svgOverlay + rectangleSelection refs. Both hooks return brand-
+  // new function objects every render, and `useSvgOverlay` calls
+  // `setEnabled(...)` from inside `enable()` / `disable()` — which triggers
+  // a re-render that churns the api object identity, which cycles the
+  // effects below if they depend on the api directly. Reading through refs
+  // keeps the effects keyed on the actual semantic deps (drawingMode,
+  // mapReady) and breaks the loop that caused the "map restarts when
+  // initiating drawing" regression.
+  const svgOverlayRef = useRef(svgOverlay);
+  useEffect(() => { svgOverlayRef.current = svgOverlay; }, [svgOverlay]);
+  const rectangleSelectionRef = useRef(rectangleSelection);
+  useEffect(() => { rectangleSelectionRef.current = rectangleSelection; }, [rectangleSelection]);
+
   // Manage SVG overlay visibility based on drawing mode
   useEffect(() => {
     if (!mapReady) return;
-
-    const overlay = svgOverlay.getSvg();
+    const overlay = svgOverlayRef.current.getSvg();
     if (!overlay) return;
-
     if (drawingMode !== 'none') {
-      svgOverlay.enable();
+      svgOverlayRef.current.enable();
     } else {
-      svgOverlay.disable();
+      svgOverlayRef.current.disable();
     }
-  }, [drawingMode, mapReady, svgOverlay]);
+  }, [drawingMode, mapReady]);
 
   // Handle rectangle selection
   useEffect(() => {
     if (!mapReady || drawingMode !== 'rectangle') return;
 
-    rectangleSelection.startSelection((result) => {
-      setSelectionResult(result);
-      setShowDialog(true);
-      setDrawingMode('none');
-    });
+    rectangleSelectionRef.current.startSelection(
+      (result) => {
+        setSelectionResult(result);
+        setShowDialog(true);
+        setDrawingMode('none');
+      },
+      // T2-18 — flip the spinner overlay on/off around the backend query.
+      (querying) => setIsQueryingSelection(querying),
+      // T2-19 — surface user-friendly errors via the existing error state.
+      (message) => setError(message),
+    );
 
     return () => {
-      rectangleSelection.cancelSelection();
+      rectangleSelectionRef.current.cancelSelection();
     };
-  }, [drawingMode, mapReady, rectangleSelection]);
+  }, [drawingMode, mapReady]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -902,36 +1281,56 @@ export default function SkyChart() {
 
         {/* Right: Controls */}
         <div className="flex items-center gap-4">
+          {/* T2-10/T2-13/T2-16 — visible kbd hint, distinct active label,
+              focus ring for keyboard nav. */}
           <button
             onClick={() => setDrawingMode(prev => prev === 'rectangle' ? 'none' : 'rectangle')}
             disabled={!mapReady}
-            title="Select frames in a rectangular region (Press S)"
-            className={`px-3 py-1.5 rounded text-sm font-medium transition ${
+            title={
+              drawingMode === 'rectangle'
+                ? 'Drawing… click and drag on the map. Press Esc or S to cancel.'
+                : 'Select frames in a rectangular region (S)'
+            }
+            className={`px-3 py-1.5 rounded text-sm font-medium transition inline-flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-accent ${
               drawingMode === 'rectangle'
                 ? 'bg-accent text-white shadow-lg'
                 : 'bg-surface-hover text-content-secondary hover:bg-surface-hover'
             } ${!mapReady ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
-            Select
+            {drawingMode === 'rectangle' ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-white animate-pulse" aria-hidden />
+                Drawing…
+                <kbd className="text-[10px] font-mono px-1 py-px rounded bg-white/20">Esc</kbd>
+              </>
+            ) : (
+              <>
+                Select
+                <kbd className="text-[10px] font-mono px-1 py-px rounded bg-surface border border-border text-content-muted">S</kbd>
+              </>
+            )}
           </button>
 
           <div className="w-px h-6 bg-border" />
 
-          {/* Target centering dropdown */}
+          {/* T2-12/T2-16/T2-17 — visible label, focus ring, no-name
+              fallback in the option list. */}
+          <label htmlFor="skychart-jump-to" className="text-xs text-content-muted">Jump to:</label>
           <select
+            id="skychart-jump-to"
             value={selectedTarget}
             onChange={(e) => handleTargetCenter(e.target.value)}
             disabled={!mapReady || loading}
-            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:border-accent"
+            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
           >
-            <option value="">Center on target...</option>
+            <option value="">Select a target…</option>
             {locations
               .filter(loc => loc.objectName)
               .sort((a, b) => (a.objectName || '').localeCompare(b.objectName || ''))
               .filter((loc, i, arr) => arr.findIndex(l => l.objectName === loc.objectName) === i)
               .map(loc => (
                 <option key={loc.id} value={String(loc.id)}>
-                  {loc.objectName}
+                  {loc.objectName || '[No Name]'}
                 </option>
               ))
             }
@@ -939,6 +1338,7 @@ export default function SkyChart() {
 
           <div className="w-px h-6 bg-border" />
 
+          {/* T2-11/T2-16 — magnitude in tooltips per option, focus ring. */}
           <select
             value={starLimit}
             onChange={(e) => {
@@ -950,12 +1350,13 @@ export default function SkyChart() {
               }).catch(console.error);
             }}
             disabled={!mapReady}
-            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:border-accent"
+            title="Limiting magnitude for stars on the chart"
+            className="px-2 py-1.5 rounded text-sm bg-surface-hover text-content-secondary border border-border focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent"
           >
-            <option value="4">Stars: Few</option>
-            <option value="6">Stars: Normal</option>
-            <option value="8">Stars: Many</option>
-            <option value="14">Stars: Dense</option>
+            <option value="4" title="Stars to magnitude ~4">Stars: Few (mag 4)</option>
+            <option value="6" title="Stars to magnitude ~6">Stars: Normal (mag 6)</option>
+            <option value="8" title="Stars to magnitude ~8">Stars: Many (mag 8)</option>
+            <option value="14" title="Extended catalog ~14k stars">Stars: Dense</option>
           </select>
 
           <div className="w-px h-6 bg-border" />
@@ -989,6 +1390,22 @@ export default function SkyChart() {
                 Retry
               </button>
             </div>
+          </div>
+        )}
+        {/* T1-6 — explain why the selected target's FOV box has vanished
+            (zoom/distortion thresholds in the projection). */}
+        {fovHiddenForTarget && (
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 bg-warning-muted border border-warning/50 text-warning text-xs px-3 py-1.5 rounded shadow">
+            FOV overlay hidden at this zoom — zoom out to see it.
+          </div>
+        )}
+
+        {/* T2-18 — spinner while the backend query for a rectangle
+            selection is in flight. */}
+        {isQueryingSelection && (
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 bg-surface-elevated border border-border text-content-secondary text-xs px-3 py-1.5 rounded shadow flex items-center gap-2">
+            <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-accent" />
+            Querying selection…
           </div>
         )}
         {!loading && !error && locations.length === 0 && (

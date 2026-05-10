@@ -150,6 +150,9 @@ pub async fn get_imaging_locations(
           )
         GROUP BY COALESCE(fr.object, 'Unknown'), ROUND(fr.ra, 1), ROUND(fr.dec, 1)
         HAVING avg_ra IS NOT NULL AND avg_dec IS NOT NULL
+
+        -- Safety cap: see Tauri commands/spatial.rs for rationale (T1-9).
+        LIMIT 5000
         ",
         )
         .map_err(|e| {
