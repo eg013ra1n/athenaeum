@@ -3304,6 +3304,47 @@ pub fn get_excluded_frames(conn: &Connection) -> Result<Vec<crate::models::Exclu
     entries.collect()
 }
 
+/// Get all excluded frames with full file + frame metadata, the exclusion
+/// reason, and the duplicate-group flag — the shape the Excluded Frames page
+/// needs to drive its Missing-Metadata-style repair toolbar.
+///
+/// Reuses `MISSING_METADATA_SELECT` and `map_missing_metadata_row` so the
+/// row shape stays in lock-step with the missing-metadata view; adds two
+/// trailing columns for `reason` and `excluded_at`. Sorted newest-first by
+/// `excluded_at`.
+pub fn get_excluded_frames_with_metadata(
+    conn: &Connection,
+) -> Result<Vec<crate::models::ExcludedFrameRow>> {
+    let query = format!(
+        "{select}, ef.reason, ef.excluded_at
+         FROM excluded_frames ef
+         INNER JOIN files f ON ef.file_id = f.id
+         INNER JOIN frames fr ON fr.file_id = f.id
+         LEFT JOIN duplicate_group_files dgf ON dgf.file_id = f.id
+         GROUP BY f.id
+         ORDER BY ef.excluded_at DESC",
+        select = MISSING_METADATA_SELECT,
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map([], |row| {
+        let base = map_missing_metadata_row(row)?;
+        // Trailing two columns appended after the MISSING_METADATA_SELECT
+        // 46-column block (indices 0..=45).
+        let reason: String = row.get(46)?;
+        let excluded_at: String = row.get(47)?;
+        Ok(crate::models::ExcludedFrameRow {
+            file: base.file,
+            frame: base.frame,
+            has_duplicate: base.has_duplicate,
+            reason,
+            excluded_at,
+        })
+    })?;
+
+    rows.collect()
+}
+
 #[cfg(test)]
 mod bulk_metadata_tests {
     use super::*;

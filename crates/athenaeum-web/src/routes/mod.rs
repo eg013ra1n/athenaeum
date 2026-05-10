@@ -112,6 +112,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
         // Excluded frames
         .route("/api/get_excluded_frames", post(frame_sets::get_excluded_frames))
+        .route("/api/get_excluded_frames_with_metadata", post(frame_sets::get_excluded_frames_with_metadata))
+        .route("/api/remove_files_from_excluded", post(frame_sets::remove_files_from_excluded))
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
         .route("/api/reclassify_excluded_frames", post(frame_sets::reclassify_excluded_frames))
         // Calibration

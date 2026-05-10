@@ -139,26 +139,13 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
         </div>
       )}
 
-      {/* Cancel button in hidden-buttons mode — only shown while active */}
-      {hideTriggerButtons && isActive && (
-        <div className="flex items-center justify-end">
-          <button
-            onClick={handleCancel}
-            disabled={isCancelling}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors
-              border border-border hover:bg-surface-hover disabled:opacity-50"
-          >
-            <XCircle size={15} />
-            {isCancelling ? 'Cancelling...' : 'Cancel'}
-          </button>
-        </div>
-      )}
-
-      {/* Active progress bar */}
+      {/* Active progress bar — Cancel sits inline at the right end of the
+          top row instead of in a separate block above, so the whole widget
+          stays on one tight line. */}
       {isActive && progress && (
         <div className="rounded-lg border border-border bg-surface p-3 space-y-2">
-          <div className="flex items-center justify-between text-sm">
-            <div className="flex items-center gap-2 text-content-secondary min-w-0">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <div className="flex items-center gap-2 text-content-secondary min-w-0 flex-1">
               <Loader2 size={14} className="animate-spin flex-shrink-0 text-violet-400" />
               <span className="truncate">
                 {isCancelling
@@ -168,9 +155,20 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
                   : 'Preparing...'}
               </span>
             </div>
-            <span className="text-content-muted flex-shrink-0 ml-3">
+            <span className="text-content-muted flex-shrink-0 tabular-nums">
               {progress.current} / {progress.total}
             </span>
+            {hideTriggerButtons && (
+              <button
+                onClick={handleCancel}
+                disabled={isCancelling}
+                title={isCancelling ? 'Cancelling…' : 'Cancel batch'}
+                className="flex-shrink-0 inline-flex items-center justify-center w-6 h-6 rounded text-content-muted hover:text-error hover:bg-surface-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                aria-label="Cancel plate-solve batch"
+              >
+                <XCircle size={14} />
+              </button>
+            )}
           </div>
 
           <div className="h-1.5 w-full rounded-full bg-surface-hover overflow-hidden">

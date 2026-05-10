@@ -837,6 +837,19 @@ pub struct ExcludedFrameEntry {
     pub excluded_at: String,
 }
 
+/// Excluded frame with full file + frame metadata. Mirrors `MissingMetadataRow`
+/// so the same view shell can render both — adds the exclusion `reason` and
+/// `excluded_at` so the Excluded Frames page can surface why a row landed there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExcludedFrameRow {
+    pub file: File,
+    pub frame: Frame,
+    pub has_duplicate: bool,
+    pub reason: String,
+    pub excluded_at: String,
+}
+
 /// Frame analysis results from star detection and image quality metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameAnalysis {

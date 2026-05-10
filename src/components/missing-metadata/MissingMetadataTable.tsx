@@ -88,6 +88,12 @@ interface MissingMetadataTableProps {
       table header should stop. Used to park the header just below the
       sticky toolbar above. */
   stickyHeaderTop?: number;
+  /** Optional extra column appended after Frame Type. Used by the Excluded
+      Frames page to surface the exclusion `reason` per row. */
+  extraColumn?: {
+    header: string;
+    render: (row: MissingMetadataRow) => React.ReactNode;
+  };
 }
 
 /** A directory group: shared parent folder path + the rows that live in it. */
@@ -106,7 +112,9 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
   onToggleGroup,
   onRevealInBrowser,
   stickyHeaderTop = 0,
+  extraColumn,
 }) => {
+  const totalDataCols = 3 + (extraColumn ? 1 : 0); // File + Missing + Frame Type [+ extra]
   // Group rows by parent folder, then sort folders alphabetically and
   // filenames within each folder. Same key ordering as before, just folded
   // into a tree shape so we can render group headers.
@@ -175,9 +183,25 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
     allFrameIds.length > 0 && allFrameIds.every(id => selectedIds.has(id));
   const someSelected = allFrameIds.some(id => selectedIds.has(id));
 
+  // When an extra column is present (Excluded Frames page) we set strict
+  // column widths via `table-fixed`:
+  //   - File: 28% (honors the original sweet spot — long names truncate)
+  //   - Missing: 11rem (fits the 1-2 pills typically shown without wrapping)
+  //   - Frame Type: 6rem (fits "MasterDarkFlat" comfortably)
+  //   - Reason: no explicit width — claims everything else
+  const fileColStyle = extraColumn
+    ? { top: stickyHeaderTop, width: '28%' }
+    : { top: stickyHeaderTop };
+  const missingColStyle = extraColumn
+    ? { top: stickyHeaderTop, width: '11rem' }
+    : { top: stickyHeaderTop };
+  const typeColStyle = extraColumn
+    ? { top: stickyHeaderTop, width: '6rem' }
+    : { top: stickyHeaderTop };
+
   return (
     <div>
-      <table className="w-full" role="table">
+      <table className={`w-full ${extraColumn ? 'table-fixed' : ''}`} role="table">
         {/* Sticky is applied per-<th> (not on <thead>) because sticky thead
             is unreliable under the default border-collapse behaviour. Top is
             offset by the measured toolbar height so the header parks just
@@ -186,7 +210,7 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
           <tr>
             <th
               scope="col"
-              style={{ top: stickyHeaderTop }}
+              style={{ top: stickyHeaderTop, width: '2.5rem' }}
               className="sticky z-10 bg-surface w-10 px-1.5 py-1.5 text-center"
             >
               <input
@@ -201,25 +225,34 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
                 row instead of being repeated on every row. */}
             <th
               scope="col"
-              style={{ top: stickyHeaderTop }}
+              style={fileColStyle}
               className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
             >
               File
             </th>
             <th
               scope="col"
-              style={{ top: stickyHeaderTop }}
+              style={missingColStyle}
               className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
             >
               Missing
             </th>
             <th
               scope="col"
-              style={{ top: stickyHeaderTop }}
+              style={typeColStyle}
               className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
             >
               Frame Type
             </th>
+            {extraColumn && (
+              <th
+                scope="col"
+                style={{ top: stickyHeaderTop }}
+                className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
+              >
+                {extraColumn.header}
+              </th>
+            )}
           </tr>
         </thead>
         <tbody className="divide-y divide-border">
@@ -254,7 +287,7 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
                     />
                   </td>
                   <td
-                    colSpan={3}
+                    colSpan={totalDataCols}
                     onClick={() => toggleCollapse(group.folder)}
                     className="px-1.5 py-1 cursor-pointer select-none"
                   >
@@ -296,24 +329,29 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
                           className="rounded border-border text-accent focus:ring-accent cursor-pointer disabled:cursor-default disabled:opacity-30"
                         />
                       </td>
-                      {/* Filename — always full, never truncated. Renders as
-                          a link when `onRevealInBrowser` is wired so the user
-                          can jump straight to the file in the dual-pane
-                          browser. */}
-                      <td className="px-1.5 py-1">
-                        <span className="inline-flex items-center gap-1.5">
+                      {/* Filename — when an extra column is present the
+                          File column is constrained, so we truncate with an
+                          ellipsis and rely on the existing `title` attribute
+                          for hover-to-see-full. Without an extra column the
+                          column auto-sizes and the filename never wraps. */}
+                      <td className={`px-1.5 py-1 ${extraColumn ? 'overflow-hidden' : ''}`}>
+                        <span className="flex items-center gap-1.5 min-w-0">
                           {onRevealInBrowser ? (
                             <button
                               type="button"
                               onClick={() => onRevealInBrowser(item.file.path)}
                               title={`Open in file browser — ${item.file.filename}`}
-                              className="text-sm text-accent hover:underline font-mono whitespace-nowrap text-left"
+                              className={`text-sm text-accent hover:underline font-mono text-left min-w-0 ${
+                                extraColumn ? 'truncate' : 'whitespace-nowrap'
+                              }`}
                             >
                               {item.file.filename}
                             </button>
                           ) : (
                             <span
-                              className="text-sm text-content-secondary font-mono whitespace-nowrap"
+                              className={`text-sm text-content-secondary font-mono min-w-0 ${
+                                extraColumn ? 'truncate' : 'whitespace-nowrap'
+                              }`}
                               title={item.file.filename}
                             >
                               {item.file.filename}
@@ -348,6 +386,9 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
                           )}
                         </span>
                       </td>
+                      {extraColumn && (
+                        <td className="px-1.5 py-1">{extraColumn.render(item)}</td>
+                      )}
                     </tr>
                   );
                 })}

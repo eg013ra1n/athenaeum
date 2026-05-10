@@ -1161,6 +1161,40 @@ pub async fn get_excluded_frames(
     db::get_excluded_frames(&conn).map_err(|e| e.to_string())
 }
 
+/// Get all excluded frames with full file + frame metadata. Drives the
+/// Excluded Frames page's Missing-Metadata-style repair toolbar.
+#[tauri::command]
+pub async fn get_excluded_frames_with_metadata(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::models::ExcludedFrameRow>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::get_excluded_frames_with_metadata(&conn).map_err(|e| {
+        eprintln!("get_excluded_frames_with_metadata failed: {}", e);
+        e.to_string()
+    })
+}
+
+/// Remove the given file IDs from the `excluded_frames` table.
+///
+/// Used by the Excluded Frames page after a metadata edit: once the user
+/// has fixed the offending fields the row should leave the excluded list,
+/// even though the underlying frame may or may not satisfy the next
+/// auto-generate pass — the user has explicitly told us the metadata is
+/// now correct. Returns the number of rows actually deleted.
+#[tauri::command]
+pub async fn remove_files_from_excluded(
+    file_ids: Vec<i64>,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    db::delete_excluded_frames_by_file_ids(&conn, &file_ids)
+        .map_err(|e| format!("Failed to remove from excluded: {}", e))
+}
+
 // DTOs for frame sets
 #[derive(serde::Serialize)]
 pub struct AutoGenerateResult {

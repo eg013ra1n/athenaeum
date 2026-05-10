@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Pencil, X } from 'lucide-react';
 import { api } from '../../api';
 import { ImageType } from '../../types/models';
-import type { FileWithFrame, MissingMetadataRow } from '../../types/models';
+import type { ExcludedFrameRow, FileWithFrame, MissingMetadataRow } from '../../types/models';
 
 import { MissingMetadataToolbar, type FilterChip, type EligibleCounts } from './MissingMetadataToolbar';
 import { MissingMetadataTable, computeMissingFlags } from './MissingMetadataTable';
@@ -14,16 +15,75 @@ import { FillObjectsPanel, type FillObjectsPanelHandle } from '../plate-solve/Fi
 import BlinkViewer from '../BlinkViewer';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
+import MetadataPane from '../dualpane/MetadataPane';
+import type { DirectoryListing } from '../dualpane/types';
 
 type ModalKind = 'camera' | 'date' | 'type' | null;
+
+export type MissingMetadataMode = 'missing' | 'excluded';
 
 interface MissingMetadataViewProps {
   /** Called with the total number of rows currently loaded, so the parent
       tab button can show a count badge. Passed `null` while loading. */
   onCountChange?: (count: number | null) => void;
+  /** Data source. `'missing'` (default) = File Manager → Missing Metadata
+      tab. `'excluded'` = Objects → Excluded Frames page; fetches from the
+      `excluded_frames` table joined to file/frame metadata so the same
+      Plate-Solve / Set Camera / Set Date / Set Type / Black Hole toolset
+      applies to the excluded list. */
+  mode?: MissingMetadataMode;
+  /** Optional caller-supplied extra column appended after the Frame Type
+      column (e.g. an exclusion-reason badge in `excluded` mode). */
+  extraColumn?: { header: string; render: (row: MissingMetadataRow) => React.ReactNode };
+  /** Optional caller-supplied buttons rendered between the standard action
+      group and the selection counter in the toolbar. Either a static node or
+      a render function that receives the current selection + a refresh
+      callback so buttons can act on what's selected. */
+  extraActions?:
+    | React.ReactNode
+    | ((ctx: ExtraActionsContext) => React.ReactNode);
+  /** Called after every successful refresh of the row list (e.g. so the
+      caller can react to selection changes that came from internal edits). */
+  onAfterRefresh?: (rows: MissingMetadataRow[]) => void;
+  /** Called whenever the row selection changes, with the currently-selected
+      MissingMetadataRow objects (file + frame). Lets the parent host a
+      side panel that mirrors the selection (e.g. the MetadataPane on the
+      Excluded Frames page). */
+  onSelectionChange?: (rows: MissingMetadataRow[]) => void;
+  /** When this prop changes value the view triggers a fresh load. Used by
+      callers that need to reload after an external write. */
+  refreshNonce?: number;
+  /** When true, hide the row of filter chips in the toolbar (Coordinates /
+      Object / Date / Camera / Type). Useful for callers whose data source
+      doesn't benefit from per-flag filtering (e.g. the Excluded Frames
+      page where every row is already an exclusion). */
+  hideFilterChips?: boolean;
+  /** Caller-specific hook fired after a successful save in the side-panel
+      MetadataPane, with the file IDs that were just saved. Lets the caller
+      run page-specific cleanup (e.g. the Excluded Frames page removes
+      those file IDs from the excluded_frames table). The view then reloads
+      its data automatically. */
+  onMetadataSaved?: (savedFileIds: number[]) => void | Promise<void>;
 }
 
-export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCountChange }) => {
+export interface ExtraActionsContext {
+  selectedCount: number;
+  selectedFrameIds: number[];
+  selectedFileIds: number[];
+  refresh: () => Promise<void>;
+}
+
+export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
+  onCountChange,
+  mode = 'missing',
+  extraColumn,
+  extraActions,
+  onAfterRefresh,
+  onSelectionChange,
+  refreshNonce,
+  hideFilterChips,
+  onMetadataSaved,
+}) => {
   const [allRows, setAllRows] = useState<MissingMetadataRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +96,13 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
   const [blackHoleConfirmOpen, setBlackHoleConfirmOpen] = useState(false);
   const bulkBlackHole = useBulkMoveToBlackHole();
   const navigate = useNavigate();
+
+  // Side-panel MetadataPane toggle. When on, the table loses any caller-
+  // supplied extra column and the bulk Set X buttons (the editor covers
+  // both), and a MetadataPane appears on the right scoped to the current
+  // selection. Same component the dual-pane file browser hosts — single
+  // source of truth for bulk metadata editing.
+  const [editorOpen, setEditorOpen] = useState(false);
 
   // Hand off a clicked filename to the FileManager / dual-pane browser via
   // react-router location state. The browser keys its reveal effect on
@@ -75,9 +142,15 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     try {
       setLoading(true);
       setError(null);
-      const rows = await api.invoke<MissingMetadataRow[]>('get_frames_with_missing_metadata', {
-        category: 'all',
-      });
+      const rows = mode === 'excluded'
+        // ExcludedFrameRow extends MissingMetadataRow with `reason` /
+        // `excludedAt`; the extra fields ride along for `extraColumn` to
+        // surface but are otherwise ignored by the shared filter / selection
+        // / eligibility code below.
+        ? (await api.invoke<ExcludedFrameRow[]>('get_excluded_frames_with_metadata')) as MissingMetadataRow[]
+        : await api.invoke<MissingMetadataRow[]>('get_frames_with_missing_metadata', {
+            category: 'all',
+          });
       setAllRows(rows);
       // Preserve selection: drop IDs no longer present
       const presentIds = new Set(rows.map(r => r.frame.id).filter((id): id is number => id != null));
@@ -88,17 +161,37 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         }
         return next;
       });
+      onAfterRefresh?.(rows);
     } catch (err) {
       console.error('Failed to load frames:', err);
       setError(typeof err === 'string' ? err : 'Failed to load frames');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [mode, onAfterRefresh]);
 
   useEffect(() => {
     void loadMissing();
   }, [loadMissing]);
+
+  // External refresh trigger — bumping refreshNonce reloads the table even
+  // when nothing in the local effect deps changed.
+  useEffect(() => {
+    if (refreshNonce == null) return;
+    void loadMissing();
+    // intentionally only re-runs when the parent bumps the nonce
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshNonce]);
+
+  // Mirror the current selection to the parent so it can host selection-
+  // aware side panels (e.g. the MetadataPane).
+  useEffect(() => {
+    if (!onSelectionChange) return;
+    const selectedRows = allRows.filter(
+      r => r.frame.id != null && selectedIds.has(r.frame.id),
+    );
+    onSelectionChange(selectedRows);
+  }, [allRows, selectedIds, onSelectionChange]);
 
   // Report the current row count up to the parent (for the tab badge).
   // While loading we clear the count so the badge doesn't show a stale number.
@@ -276,6 +369,36 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
       .map(r => r.file.modified_at);
   }, [allRows, eligibleIds.setDate]);
 
+  // ── extraActions context: collect file IDs for currently-selected frames
+  // so the caller's buttons (e.g. "Treat as Flat" on the Excluded page) can
+  // act on the user's actual selection. ────────────────────────────────────
+
+  const selectedFileIds = useMemo<number[]>(() => {
+    const out: number[] = [];
+    for (const row of allRows) {
+      const fid = row.frame.id;
+      if (fid != null && selectedIds.has(fid) && row.file.id != null) {
+        out.push(row.file.id);
+      }
+    }
+    return out;
+  }, [allRows, selectedIds]);
+
+  const selectedFrameIds = useMemo<number[]>(() => Array.from(selectedIds), [selectedIds]);
+
+  const resolvedExtraActions = useMemo<React.ReactNode>(() => {
+    if (extraActions == null) return null;
+    if (typeof extraActions === 'function') {
+      return extraActions({
+        selectedCount: selectedIds.size,
+        selectedFrameIds,
+        selectedFileIds,
+        refresh: loadMissing,
+      });
+    }
+    return extraActions;
+  }, [extraActions, selectedIds.size, selectedFrameIds, selectedFileIds, loadMissing]);
+
   // ── Toolbar action handlers ──────────────────────────────────────────────
 
   const handlePlateSolve = () => {
@@ -299,7 +422,10 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     setBlackHoleConfirmOpen(false);
     if (eligibleIds.blackHole.length === 0) return;
     try {
-      await bulkBlackHole.start(eligibleIds.blackHole, 'missing_metadata');
+      await bulkBlackHole.start(
+        eligibleIds.blackHole,
+        mode === 'excluded' ? 'excluded_frames' : 'missing_metadata',
+      );
       // Drop selection and reload — moved files won't appear in the next
       // missing-metadata fetch.
       setSelectedIds(new Set());
@@ -307,7 +433,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     } catch {
       // useBulkMoveToBlackHole already logs; surface as an inline error.
     }
-  }, [bulkBlackHole, eligibleIds.blackHole, loadMissing]);
+  }, [bulkBlackHole, eligibleIds.blackHole, loadMissing, mode]);
 
   // ── Reload callbacks ─────────────────────────────────────────────────────
 
@@ -319,10 +445,51 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
     void loadMissing();
   }, [loadMissing]);
 
+  // ── Side-panel MetadataPane ──────────────────────────────────────────────
+  // Synthesize the DirectoryListing + path-based selection MetadataPane
+  // expects (it filters listing.files by selection internally, so as long
+  // as paths match it doesn't care that this isn't a real directory).
+
+  const editorListing = useMemo<DirectoryListing>(() => {
+    const selected = allRows.filter(
+      r => r.frame.id != null && selectedIds.has(r.frame.id),
+    );
+    return {
+      subdirectories: [],
+      files: selected.map(r => ({ file: r.file, frame: r.frame })),
+    };
+  }, [allRows, selectedIds]);
+
+  const editorSelection = useMemo<Set<string>>(() => {
+    return new Set(editorListing.files.map(f => f.file.path));
+  }, [editorListing]);
+
+  // After a successful save in the side-panel editor: notify the caller (so
+  // they can run page-specific cleanup, e.g. removing rows from the
+  // excluded_frames table) then reload the table.
+  const handleEditorSaved = useCallback(async () => {
+    const savedFileIds = editorListing.files
+      .map(f => f.file.id)
+      .filter((id): id is number => id != null);
+    try {
+      await onMetadataSaved?.(savedFileIds);
+    } catch (err) {
+      console.error('onMetadataSaved hook failed:', err);
+    } finally {
+      void loadMissing();
+    }
+  }, [editorListing, onMetadataSaved, loadMissing]);
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   return (
-    <div className="bg-surface-elevated rounded-lg p-2 flex flex-col">
+    <div className="h-full flex gap-2 min-h-0">
+      {/* Table column. When the editor is open it shrinks to ~60% so the
+          MetadataPane on the right can host the bulk-edit form. The
+          column owns its own scroll context (overflow-y-auto + min-h-0)
+          so the toolbar's sticky positioning anchors against this column
+          rather than the page. */}
+      <div className={`bg-surface-elevated rounded-lg p-2 flex flex-col min-w-0 min-h-0 overflow-y-auto ${editorOpen ? 'w-3/5' : 'flex-1'}`}>
       {/* Toolbar (refresh is in the toolbar itself so this view has no
           dedicated header row — the tab title already names the section).
           Wrapped in a sticky container so the controls remain on-screen while
@@ -347,6 +514,11 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
           onSetType={() => setOpenModal('type')}
           onBlackHole={handleBlackHole}
           onClearSelection={() => setSelectedIds(new Set())}
+          extraActions={resolvedExtraActions}
+          hideEditActions={editorOpen}
+          hideFilterChips={hideFilterChips}
+          onToggleEditor={() => setEditorOpen(o => !o)}
+          editorOpen={editorOpen}
         />
       </div>
 
@@ -408,7 +580,9 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         onComplete={handleFindObjectComplete}
       />
 
-      {/* Table */}
+      {/* Table — the caller-supplied extra column auto-hides when the
+          side-panel editor is open (it's redundant with the editor's
+          richer view of the same data). */}
       <MissingMetadataTable
         rows={filteredRows}
         loading={loading}
@@ -419,6 +593,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         onToggleGroup={handleToggleGroup}
         onRevealInBrowser={handleRevealInBrowser}
         stickyHeaderTop={toolbarHeight}
+        extraColumn={editorOpen ? undefined : extraColumn}
       />
 
       {/* Blink Viewer */}
@@ -467,6 +642,46 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({ onCoun
         onConfirm={() => { void handleConfirmBlackHole(); }}
         onCancel={() => setBlackHoleConfirmOpen(false)}
       />
+      </div>
+
+      {/* Right-side metadata editor. Hosts the same MetadataPane the
+          dual-pane file browser uses, so there's a single source of truth
+          for bulk metadata editing. Visible only while editorOpen. */}
+      {editorOpen && (
+        <aside className="w-2/5 min-w-0 border border-border rounded-lg bg-surface-elevated flex flex-col overflow-hidden">
+          <header className="flex items-center justify-between px-3 py-2 border-b border-border flex-shrink-0">
+            <div className="flex items-center gap-2">
+              <Pencil size={14} className="text-accent" />
+              <span className="text-sm font-medium">Metadata Editor</span>
+              <span className="text-xs text-content-muted">
+                {editorListing.files.length === 0
+                  ? '(no rows selected)'
+                  : `${editorListing.files.length} row${editorListing.files.length === 1 ? '' : 's'}`}
+              </span>
+            </div>
+            <button
+              onClick={() => setEditorOpen(false)}
+              className="text-content-muted hover:text-content transition-colors"
+              title="Close editor"
+            >
+              <X size={16} />
+            </button>
+          </header>
+          <div className="flex-1 min-h-0 overflow-auto">
+            {editorListing.files.length === 0 ? (
+              <div className="p-4 text-sm text-content-muted text-center">
+                Select one or more rows in the table to edit their metadata.
+              </div>
+            ) : (
+              <MetadataPane
+                otherListing={editorListing}
+                otherSelection={editorSelection}
+                onSaved={() => { void handleEditorSaved(); }}
+              />
+            )}
+          </div>
+        </aside>
+      )}
     </div>
   );
 };

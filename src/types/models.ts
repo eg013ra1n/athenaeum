@@ -909,6 +909,17 @@ export interface ExcludedFrameEntry {
   excluded_at: string;
 }
 
+/** Excluded frame with full file + frame metadata. Mirrors `MissingMetadataRow`
+ *  so the same view shell can render both, plus the exclusion reason and
+ *  excluded_at timestamp. Returned by get_excluded_frames_with_metadata. */
+export interface ExcludedFrameRow {
+  file: File;
+  frame: Frame;
+  hasDuplicate: boolean;
+  reason: string;
+  excludedAt: string;
+}
+
 /** Result of reclassifying excluded frames */
 export interface ReclassifyResult {
   frames_updated: number;
