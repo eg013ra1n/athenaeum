@@ -8,7 +8,6 @@ import ShootCalendar from './pages/ShootCalendar';
 import Objects from './pages/Objects';
 import FrameSetDetail from './pages/FrameSetDetail';
 import Equipment from './pages/Equipment';
-import Export from './pages/Export';
 import BlackHole from './pages/BlackHole';
 import SkyChart from './pages/SkyChart';
 import Settings from './pages/Settings';
@@ -66,7 +65,6 @@ function App() {
           <Route path="excluded" element={<ExcludedFrames />} />
           <Route path="skychart" element={<SkyChart />} />
           <Route path="equipment" element={<Equipment />} />
-          <Route path="export" element={<Export />} />
           <Route path="blackhole" element={<BlackHole />} />
           <Route path="settings" element={<Settings />} />
           <Route path="about" element={<About />} />

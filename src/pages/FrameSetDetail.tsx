@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -15,13 +15,14 @@ import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../component
 import { ArchiveDispositionDialog } from '../components/archive/ArchiveDispositionDialog';
 import { ArchiveProgress } from '../components/archive/ArchiveProgress';
 import { RestoreDialog } from '../components/archive/RestoreDialog';
+import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { revealItemInDir } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
 
-type FrameSetTab = 'calibration' | 'analysis' | 'history';
+type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -64,52 +65,67 @@ export default function FrameSetDetail() {
   const [calibrationHierarchy, setCalibrationHierarchy] = useState<CalibrationHierarchyView | null>(null);
   const [loadingCalibration, setLoadingCalibration] = useState(false);
 
-  // Tab state. If we arrived via a chip click in Equipment with
-  // ?tab=calibration&highlightSet=…&kind=…, start on the Calibration Coverage
-  // tab and forward the highlight request to the table view.
+  // Tab + highlight state. Initial values seed from URL params on first
+  // render to avoid the analysis-tab flash when arriving via a cross-page
+  // chip click. The reactive useEffect below handles in-page navigations
+  // (e.g. clicking a `#setId` in the Export tab's WarningsPanel pushes
+  // `?tab=calibration&highlightSet=…&kind=…` and we re-consume them).
   const [searchParams, setSearchParams] = useSearchParams();
   const initialTabFromUrl: FrameSetTab | undefined =
     searchParams.get('tab') === 'calibration' ? 'calibration'
     : searchParams.get('tab') === 'history' ? 'history'
     : searchParams.get('tab') === 'analysis' ? 'analysis'
+    : searchParams.get('tab') === 'export' ? 'export'
     : undefined;
   const [activeTab, setActiveTab] = useState<FrameSetTab>(initialTabFromUrl ?? 'analysis');
 
-  // Highlight signal consumed once by CalibrationTableView. Seeded from URL
-  // params on mount; cleared (along with the URL params) after consumption.
-  const highlightFromUrlSetId = (() => {
+  const initialHighlightSetId = (() => {
     const v = searchParams.get('highlightSet');
     return v != null && /^\d+$/.test(v) ? parseInt(v, 10) : null;
   })();
-  const highlightFromUrlKind = (() => {
+  const initialHighlightKind = (() => {
     const v = searchParams.get('kind');
     return v === 'flat' || v === 'dark' || v === 'bias' ? v : null;
   })();
   const [pendingHighlightCalSet, setPendingHighlightCalSet] = useState<
     { setId: number; kind: 'flat' | 'dark' | 'bias' } | null
   >(
-    highlightFromUrlSetId != null && highlightFromUrlKind != null
-      ? { setId: highlightFromUrlSetId, kind: highlightFromUrlKind }
+    initialHighlightSetId != null && initialHighlightKind != null
+      ? { setId: initialHighlightSetId, kind: initialHighlightKind }
       : null
   );
 
-  // Drop the URL params on mount so reloads / back-forward don't re-flash.
-  // The pendingHighlightCalSet state outlives the URL clear; CalibrationTable
-  // View consumes it once and clears it via onHighlightConsumed below.
+  // Watch searchParams so URL-driven jumps work BOTH on initial mount and
+  // on subsequent in-page updates (e.g. the Export tab pushing a new
+  // `?tab=calibration&highlightSet=…&kind=…`). On match, sync state and
+  // clear the params so the URL stays clean.
   useEffect(() => {
-    if (
-      searchParams.has('tab') ||
-      searchParams.has('highlightSet') ||
-      searchParams.has('kind')
-    ) {
-      const next = new URLSearchParams(searchParams);
-      next.delete('tab');
-      next.delete('highlightSet');
-      next.delete('kind');
-      setSearchParams(next, { replace: true });
+    const tabParam = searchParams.get('tab');
+    const highlightSetParam = searchParams.get('highlightSet');
+    const kindParam = searchParams.get('kind');
+
+    if (!tabParam && !highlightSetParam && !kindParam) return;
+
+    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export') {
+      setActiveTab(tabParam);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+
+    const id = highlightSetParam != null && /^\d+$/.test(highlightSetParam)
+      ? parseInt(highlightSetParam, 10)
+      : null;
+    const kind = kindParam === 'flat' || kindParam === 'dark' || kindParam === 'bias'
+      ? kindParam
+      : null;
+    if (id != null && kind != null) {
+      setPendingHighlightCalSet({ setId: id, kind });
+    }
+
+    const next = new URLSearchParams(searchParams);
+    next.delete('tab');
+    next.delete('highlightSet');
+    next.delete('kind');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   const [showFindNewDialog, setShowFindNewDialog] = useState(false);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
@@ -751,6 +767,7 @@ export default function FrameSetDetail() {
         {([
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
           { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
+          { key: 'export' as FrameSetTab, label: 'Export', icon: Layers },
           { key: 'history' as FrameSetTab, label: 'History', icon: History },
         ]).map(({ key, label, icon: Icon }) => (
           <button
@@ -778,6 +795,11 @@ export default function FrameSetDetail() {
         ) : calibrationHierarchy ? (
           activeTab === 'history' ? (
             <FrameSetHistoryTab key={historyRefreshKey} frameSetId={parseInt(id!)} />
+          ) : activeTab === 'export' ? (
+            <ExportTab
+              frameSetId={parseInt(id!)}
+              frameSetName={detail?.frames_set?.name ?? undefined}
+            />
           ) : activeTab === 'calibration' ? (
             <CalibrationHierarchyViewComponent
               data={calibrationHierarchy}
