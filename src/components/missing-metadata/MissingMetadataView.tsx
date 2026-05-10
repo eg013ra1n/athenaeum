@@ -120,22 +120,6 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
   const plateSolveRef = useRef<PlateSolveBatchPanelHandle>(null);
   const findObjectRef = useRef<FillObjectsPanelHandle>(null);
 
-  // Toolbar height is measured live so the sticky table header can be offset
-  // below it. The toolbar uses flex-wrap, so the height can change with the
-  // window width — a fixed offset would overlap or leave a gap.
-  const toolbarRef = useRef<HTMLDivElement>(null);
-  const [toolbarHeight, setToolbarHeight] = useState(0);
-
-  useEffect(() => {
-    const el = toolbarRef.current;
-    if (!el) return;
-    const update = () => setToolbarHeight(el.getBoundingClientRect().height);
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
   // ── Fetch ────────────────────────────────────────────────────────────────
 
   const loadMissing = useCallback(async () => {
@@ -485,20 +469,16 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
   return (
     <div className="h-full flex gap-2 min-h-0">
       {/* Table column. When the editor is open it shrinks to ~60% so the
-          MetadataPane on the right can host the bulk-edit form. The
-          column owns its own scroll context (overflow-y-auto + min-h-0)
-          so the toolbar's sticky positioning anchors against this column
-          rather than the page. */}
-      <div className={`bg-surface-elevated rounded-lg p-2 flex flex-col min-w-0 min-h-0 overflow-y-auto ${editorOpen ? 'w-3/5' : 'flex-1'}`}>
-      {/* Toolbar (refresh is in the toolbar itself so this view has no
-          dedicated header row — the tab title already names the section).
-          Wrapped in a sticky container so the controls remain on-screen while
-          the table scrolls. Negative margins + padding extend the background
-          over the parent's p-2 so scrolling content doesn't peek through. */}
-      <div
-        ref={toolbarRef}
-        className="sticky top-0 z-20 bg-surface-elevated -mx-2 -mt-2 px-2 pt-2 rounded-t-lg"
-      >
+          MetadataPane on the right can host the bulk-edit form. The card
+          itself does NOT scroll — only the inner table area does. This
+          way the toolbar / banners sit naturally at the top with no
+          chance of a visual gap (the previous sticky + negative-margin
+          layout could leave a slim "hole" through which table rows
+          peeked between the tab header and the toolbar). */}
+      <div className={`bg-surface-elevated rounded-lg flex flex-col min-w-0 min-h-0 overflow-hidden ${editorOpen ? 'w-3/5' : 'flex-1'}`}>
+      {/* Header section: toolbar + transient banners. Lives outside the
+          scroll container so it always hugs the top of the card. */}
+      <div className="px-2 pt-2 flex flex-col gap-2 flex-shrink-0">
         <MissingMetadataToolbar
           activeChips={activeChips}
           onToggleChip={toggleChip}
@@ -525,7 +505,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
       {/* Black-hole batch progress + result banner. Mirrors the
           plate-solve / find-object panels in placement. */}
       {bulkBlackHole.isRunning && (
-        <div className="mb-2 p-2 bg-surface rounded border border-border text-xs text-content-secondary">
+        <div className="px-2 p-2 bg-surface rounded border border-border text-xs text-content-secondary mx-2">
           {bulkBlackHole.progress
             ? `Moving ${bulkBlackHole.progress.current.toLocaleString()} / ${bulkBlackHole.progress.total.toLocaleString()} to Black Hole…`
             : 'Moving to Black Hole…'}
@@ -533,7 +513,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
       )}
       {!bulkBlackHole.isRunning && bulkBlackHole.result && (bulkBlackHole.result.moved > 0 || bulkBlackHole.result.failed.length > 0) && (
         <div
-          className={`mb-2 p-2 rounded border text-xs ${
+          className={`mx-2 p-2 rounded border text-xs ${
             bulkBlackHole.result.failed.length > 0
               ? 'bg-warning-muted border-warning/50 text-warning'
               : 'bg-success-muted border-success/50 text-success'
@@ -552,7 +532,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
         </div>
       )}
       {bulkBlackHole.error && !bulkBlackHole.isRunning && (
-        <div className="mb-2 p-2 rounded border border-error/50 bg-error-muted text-error text-xs">
+        <div className="mx-2 p-2 rounded border border-error/50 bg-error-muted text-error text-xs">
           Black Hole move failed: {bulkBlackHole.error}
           <button
             type="button"
@@ -567,34 +547,43 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
       {/* Plate solve progress/completion panel — always mounted, driven
           imperatively by the toolbar button. Renders as an empty div when
           idle (no active batch, no completion banner). */}
-      <PlateSolveBatchPanel
-        ref={plateSolveRef}
-        hideTriggerButtons
-        onSolveComplete={handleSolveComplete}
-      />
+      <div className="px-2">
+        <PlateSolveBatchPanel
+          ref={plateSolveRef}
+          hideTriggerButtons
+          onSolveComplete={handleSolveComplete}
+        />
+      </div>
 
       {/* Find object progress/completion panel — same pattern */}
-      <FillObjectsPanel
-        ref={findObjectRef}
-        hideTriggerButtons
-        onComplete={handleFindObjectComplete}
-      />
+      <div className="px-2">
+        <FillObjectsPanel
+          ref={findObjectRef}
+          hideTriggerButtons
+          onComplete={handleFindObjectComplete}
+        />
+      </div>
 
-      {/* Table — the caller-supplied extra column auto-hides when the
-          side-panel editor is open (it's redundant with the editor's
-          richer view of the same data). */}
-      <MissingMetadataTable
-        rows={filteredRows}
-        loading={loading}
-        error={error}
-        selectedIds={selectedIds}
-        onToggleRow={handleToggleRow}
-        onToggleAll={handleToggleAll}
-        onToggleGroup={handleToggleGroup}
-        onRevealInBrowser={handleRevealInBrowser}
-        stickyHeaderTop={toolbarHeight}
-        extraColumn={editorOpen ? undefined : extraColumn}
-      />
+      {/* Scroll area: only the table scrolls. The table's own sticky <th>
+          headers stick to top:0 of THIS container — no toolbar-height
+          measurement needed. NB: no top padding here. A `pt-*` would let
+          rows scroll up into the gap above the sticky headers (same class
+          of bug we just fixed for the toolbar). The table's <thead>
+          provides its own visual top edge. */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-2 pb-2">
+        <MissingMetadataTable
+          rows={filteredRows}
+          loading={loading}
+          error={error}
+          selectedIds={selectedIds}
+          onToggleRow={handleToggleRow}
+          onToggleAll={handleToggleAll}
+          onToggleGroup={handleToggleGroup}
+          onRevealInBrowser={handleRevealInBrowser}
+          stickyHeaderTop={0}
+          extraColumn={editorOpen ? undefined : extraColumn}
+        />
+      </div>
 
       {/* Blink Viewer */}
       {showBlink && blinkRows.length > 0 && (

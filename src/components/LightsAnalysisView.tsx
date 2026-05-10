@@ -21,8 +21,8 @@ interface LightsAnalysisViewProps {
   blackholedFileIds: Set<number>;
   onRefresh?: () => void;
   onBlink?: (frameIds: number[]) => void;
-  onSplit?: (selectedFilterKeys: Set<string>) => void;
-  onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
+  onSplit?: (frameIds: number[]) => void;
+  onCreateCustomSet?: (frameIds: number[]) => void;
   /** When true, hide the "Locate" column in the table — used when the frame
    *  set is ZIP-archived and source files are no longer on disk. */
   hideLocateColumn?: boolean;
@@ -288,13 +288,26 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     setThresholds(next);
   }, [defaultThresholds, plateScale, useArcsec]);
 
+  // Resolve checked tree keys to concrete frame IDs using the active-view framesByKey,
+  // so callers don't need to know the by-night vs by-camera key shape.
+  const collectCheckedFrameIds = useCallback((): number[] => {
+    const ids: number[] = [];
+    for (const key of checkedKeys) {
+      const frames = framesByKey.get(key);
+      if (frames) ids.push(...frames.map(f => f.frame_id));
+    }
+    return ids;
+  }, [checkedKeys, framesByKey]);
+
   const handleSplit = useCallback(() => {
-    if (onSplit && checkedKeys.size > 0) onSplit(checkedKeys);
-  }, [onSplit, checkedKeys]);
+    if (!onSplit || checkedKeys.size === 0) return;
+    onSplit(collectCheckedFrameIds());
+  }, [onSplit, checkedKeys, collectCheckedFrameIds]);
 
   const handleCreateCustomSet = useCallback(() => {
-    if (onCreateCustomSet && checkedKeys.size > 0) onCreateCustomSet(checkedKeys);
-  }, [onCreateCustomSet, checkedKeys]);
+    if (!onCreateCustomSet || checkedKeys.size === 0) return;
+    onCreateCustomSet(collectCheckedFrameIds());
+  }, [onCreateCustomSet, checkedKeys, collectCheckedFrameIds]);
 
   // Toggle the px ↔ arcsec display unit, converting the current FWHM threshold
   // by the plate scale so the threshold's physical meaning stays the same.

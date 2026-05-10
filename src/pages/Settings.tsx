@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info } from 'lucide-react';
 import { revealItemInDir } from '../api/desktop';
@@ -63,8 +64,37 @@ export default function Settings() {
   const [rescanningContentHash, setRescanningContentHash] = useState(false);
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<'general' | 'calibration' | 'analysis' | 'plate_solving'>('general');
+  // Tab state — initial value comes from `?tab=…` so deep-links (e.g. the
+  // "Open Plate-Solve Settings" CTA on the index-missing modal) land on the
+  // right tab without an extra click.
+  const [searchParams, setSearchParams] = useSearchParams();
+  type SettingsTab = 'general' | 'calibration' | 'analysis' | 'plate_solving';
+  const tabFromUrl = (searchParams.get('tab') ?? '') as SettingsTab | '';
+  const validTabs: readonly SettingsTab[] = ['general', 'calibration', 'analysis', 'plate_solving'];
+  const initialTab: SettingsTab = validTabs.includes(tabFromUrl as SettingsTab)
+    ? (tabFromUrl as SettingsTab)
+    : 'general';
+  const [activeTab, _setActiveTab] = useState<SettingsTab>(initialTab);
+  const setActiveTab = (tab: SettingsTab) => {
+    _setActiveTab(tab);
+    // Reflect in the URL so a refresh keeps the tab and back/forward navigation
+    // stays in sync. `replace` so we don't pollute the history stack on every click.
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      next.set('tab', tab);
+      return next;
+    }, { replace: true });
+  };
+
+  // If the URL `?tab=` changes while Settings is already mounted (e.g. the
+  // plate-solve modal navigates here from another page), follow it. Otherwise
+  // the user lands on Settings but on the wrong tab.
+  useEffect(() => {
+    if (validTabs.includes(tabFromUrl as SettingsTab) && tabFromUrl !== activeTab) {
+      _setActiveTab(tabFromUrl as SettingsTab);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabFromUrl]);
 
   useEffect(() => {
     loadSettings();

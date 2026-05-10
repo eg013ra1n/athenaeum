@@ -3,6 +3,7 @@ import { api } from '../api';
 import type {
   PlateSolveProgressEvent,
   PlateSolveCompleteEvent,
+  QuadIndexStatus,
 } from '../types/plate-solve';
 
 export type FrameSolveStatus =
@@ -34,7 +35,16 @@ export interface ActivePlateSolveBatch {
   isComplete: boolean;
   isCancelling: boolean;
   summary: PlateSolveSummary | null;
+  /** Set when the backend rejects the whole batch (e.g. quad index missing) so the
+   *  per-batch banner can explain the failure instead of just showing "0/N solved". */
+  errorMessage: string | null;
 }
+
+/** Reason the queue refused to invoke the backend. `index_missing` triggers the
+ *  dedicated "Build the index from Settings" modal; `unknown` is a generic fallback. */
+export type PlateSolvePrecheckError =
+  | { kind: 'index_missing'; message: string }
+  | { kind: 'unknown'; message: string };
 
 let nextBatchId = 1;
 
@@ -43,13 +53,38 @@ export function usePlateSolveQueue() {
   const [activeBatches, setActiveBatches] = useState<Map<number, ActivePlateSolveBatch>>(
     new Map(),
   );
+  const [precheckError, setPrecheckError] = useState<PlateSolvePrecheckError | null>(null);
   const processingRef = useRef(false);
   const queueRef = useRef(queue);
   queueRef.current = queue;
 
+  // Once we've confirmed the quad index is built, skip the precheck for
+  // subsequent batches in the same session — the file-existence check is
+  // cheap but pointless to repeat once we know it's there.
+  const quadIndexVerifiedRef = useRef(false);
+
   // Backend only runs one plate-solve batch at a time (cancel handle key = 0),
   // so every incoming progress event belongs to the currently-running batch.
   const currentBatchIdRef = useRef<number | null>(null);
+
+  /** Mark a batch as completed-with-failure and stash the reason so the panel
+   *  banner can show *why* every frame failed. */
+  const failBatch = useCallback((batchId: number, frameCount: number, message: string) => {
+    setActiveBatches(prev => {
+      const updated = new Map(prev);
+      const entry = updated.get(batchId);
+      if (entry) {
+        updated.set(batchId, {
+          ...entry,
+          isComplete: true,
+          isCancelling: false,
+          summary: { solved: 0, failed: frameCount, total: frameCount, total_time_ms: 0 },
+          errorMessage: message,
+        });
+      }
+      return updated;
+    });
+  }, []);
 
   const runNext = useCallback(async () => {
     if (processingRef.current) return;
@@ -73,29 +108,56 @@ export function usePlateSolveQueue() {
       return updated;
     });
 
+    // Precheck: bail out before invoking the backend if the quad index isn't
+    // built yet. The backend would reject with the same error string, but
+    // detecting it here lets us show a dedicated modal that links to the
+    // build-it-from-Settings UI instead of just an inline error.
+    if (!quadIndexVerifiedRef.current) {
+      try {
+        const status = await api.invoke<QuadIndexStatus>('get_quad_index_status');
+        if (!status.built) {
+          const message =
+            'Plate-solve indexes have not been built yet. Open Settings → Plate Solving to download the Tycho-2 catalog and build the quad index.';
+          failBatch(next.batchId, next.frameIds.length, message);
+          setPrecheckError({ kind: 'index_missing', message });
+          processingRef.current = false;
+          currentBatchIdRef.current = null;
+          setQueue(q => q.slice(1));
+          return;
+        }
+        quadIndexVerifiedRef.current = true;
+      } catch (err) {
+        // Status call itself failed — surface generically and skip the batch.
+        const message = `Could not verify plate-solve index status: ${String(err)}`;
+        console.error('Plate solve precheck failed:', err);
+        failBatch(next.batchId, next.frameIds.length, message);
+        setPrecheckError({ kind: 'unknown', message });
+        processingRef.current = false;
+        currentBatchIdRef.current = null;
+        setQueue(q => q.slice(1));
+        return;
+      }
+    }
+
     try {
       await api.invoke<void>('plate_solve_batch', { frameIds: next.frameIds });
     } catch (err) {
       console.error(`Plate solve batch ${next.batchId} failed:`, err);
-      setActiveBatches(prev => {
-        const updated = new Map(prev);
-        const entry = updated.get(next.batchId);
-        if (entry) {
-          updated.set(next.batchId, {
-            ...entry,
-            isComplete: true,
-            isCancelling: false,
-            summary: { solved: 0, failed: entry.frameIds.length, total: entry.frameIds.length, total_time_ms: 0 },
-          });
-        }
-        return updated;
-      });
+      const message = String(err);
+      // Some failures only show up once the backend tries to load the index
+      // (e.g. file disappeared between the precheck and the call). Re-trigger
+      // the index-missing modal in that case so the user gets the right CTA.
+      if (/quad index/i.test(message) && /not found|missing/i.test(message)) {
+        quadIndexVerifiedRef.current = false;
+        setPrecheckError({ kind: 'index_missing', message });
+      }
+      failBatch(next.batchId, next.frameIds.length, message);
     }
 
     processingRef.current = false;
     currentBatchIdRef.current = null;
     setQueue(q => q.slice(1));
-  }, []);
+  }, [failBatch]);
 
   // Kick the processor whenever the queue has pending items.
   useEffect(() => {
@@ -198,6 +260,7 @@ export function usePlateSolveQueue() {
           isComplete: false,
           isCancelling: false,
           summary: null,
+          errorMessage: null,
         });
         return updated;
       });
@@ -253,6 +316,8 @@ export function usePlateSolveQueue() {
     });
   }, []);
 
+  const dismissPrecheckError = useCallback(() => setPrecheckError(null), []);
+
   const getFrameStatus = useCallback(
     (frameId: number): FrameSolveStatus | null => {
       for (const batch of activeBatches.values()) {
@@ -274,11 +339,13 @@ export function usePlateSolveQueue() {
     cancelBatch,
     cancelAll,
     dismissCompleted,
+    dismissPrecheckError,
     // state
     activeBatches,
     currentBatch,
     queueLength,
     hasActiveBatches,
+    precheckError,
     // helpers
     getFrameStatus,
   };

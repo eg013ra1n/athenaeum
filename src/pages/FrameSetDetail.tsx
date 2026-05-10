@@ -259,8 +259,9 @@ export default function FrameSetDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail?.frames_set?.id]);
 
-  // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
-  const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
+  // Frame IDs collected from the active tree view (resolved by the child to handle
+  // both by-night and by-camera key shapes).
+  const [selectedFrameIds, setSelectedFrameIds] = useState<number[]>([]);
 
   // Analysis data for SNR display in tree
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
@@ -387,26 +388,6 @@ export default function FrameSetDetail() {
     return parseFloat(hours) >= 1 ? `${hours}h` : `${minutes}m`;
   };
 
-  // Get frame IDs from selected filter keys (must match key format in buildCameraFilterTree)
-  const getFrameIdsFromFilterKeys = useCallback((filterKeys: Set<string>): number[] => {
-    if (!calibrationHierarchy) return [];
-
-    const frameIds: number[] = [];
-    for (const dateGroup of calibrationHierarchy.date_groups) {
-      for (const cameraGroup of dateGroup.camera_groups) {
-        for (const filterGroup of cameraGroup.filter_groups) {
-          const filterName = filterGroup.filter ?? 'No Filter';
-          const exptime = filterGroup.exptime;
-          const fullKey = `${dateGroup.date}::${cameraGroup.instrume}::${filterName}::${exptime ?? 'any'}`;
-          if (filterKeys.has(fullKey)) {
-            frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
-          }
-        }
-      }
-    }
-    return frameIds;
-  }, [calibrationHierarchy]);
-
   // Handle blink from LightsAnalysisView - load full frame data
   const handleBlink = useCallback(async (frameIds: number[]) => {
     if (frameIds.length === 0) {
@@ -438,10 +419,10 @@ export default function FrameSetDetail() {
   }, []);
 
   // Handle split from CalibrationHierarchyView
-  const handleOpenSplitDialog = useCallback((filterKeys: Set<string>) => {
-    if (!id || filterKeys.size === 0) return;
+  const handleOpenSplitDialog = useCallback((frameIds: number[]) => {
+    if (!id || frameIds.length === 0) return;
 
-    setSelectedFilterKeys(filterKeys);
+    setSelectedFrameIds(frameIds);
 
     // Pre-fill split name
     const originalName = detail?.frames_set?.name || 'Untitled';
@@ -450,10 +431,10 @@ export default function FrameSetDetail() {
   }, [id, detail]);
 
   // Handle create custom set from CalibrationHierarchyView
-  const handleOpenCreateDialog = useCallback((filterKeys: Set<string>) => {
-    if (filterKeys.size === 0) return;
+  const handleOpenCreateDialog = useCallback((frameIds: number[]) => {
+    if (frameIds.length === 0) return;
 
-    setSelectedFilterKeys(filterKeys);
+    setSelectedFrameIds(frameIds);
     setShowCreateDialog(true);
   }, []);
 
@@ -463,14 +444,8 @@ export default function FrameSetDetail() {
       return;
     }
 
-    if (selectedFilterKeys.size === 0) {
+    if (selectedFrameIds.length === 0) {
       showAlert('No Selection', 'Please select at least one filter group', 'warning');
-      return;
-    }
-
-    const frameIds = getFrameIdsFromFilterKeys(selectedFilterKeys);
-    if (frameIds.length === 0) {
-      showAlert('No Frames', 'No frames found in selected filter groups', 'warning');
       return;
     }
 
@@ -479,14 +454,14 @@ export default function FrameSetDetail() {
       // Use existing command that creates frame set from frame IDs
       await api.invoke('create_frame_set_from_selection', {
         name: customSetName.trim(),
-        frame_ids: frameIds,
+        frame_ids: selectedFrameIds,
         description: null,
       });
 
       // Success - silent update
       setShowCreateDialog(false);
       setCustomSetName('');
-      setSelectedFilterKeys(new Set());
+      setSelectedFrameIds([]);
       navigate('/objects');
     } catch (err) {
       showAlert('Creation Failed', 'Failed to create custom set: ' + String(err), 'error');
@@ -501,14 +476,8 @@ export default function FrameSetDetail() {
       return;
     }
 
-    if (selectedFilterKeys.size === 0) {
+    if (selectedFrameIds.length === 0) {
       showAlert('No Selection', 'Please select at least one filter group', 'warning');
-      return;
-    }
-
-    const frameIds = getFrameIdsFromFilterKeys(selectedFilterKeys);
-    if (frameIds.length === 0) {
-      showAlert('No Frames', 'No frames found in selected filter groups', 'warning');
       return;
     }
 
@@ -517,13 +486,13 @@ export default function FrameSetDetail() {
       // Use existing split_frame_set with Frames selection type
       await api.invoke('split_frame_set', {
         sourceSetId: parseInt(id),
-        selection: { type: 'frames', ids: frameIds },
+        selection: { type: 'frames', ids: selectedFrameIds },
         newName: splitName.trim(),
       });
 
       setShowSplitDialog(false);
       setSplitName('');
-      setSelectedFilterKeys(new Set());
+      setSelectedFrameIds([]);
 
       // Reload to show updated data
       await loadData();
@@ -863,7 +832,7 @@ export default function FrameSetDetail() {
             </div>
 
             <div className="mb-6 text-sm text-content-muted">
-              {selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be included in the new set
+              {selectedFrameIds.length} frame{selectedFrameIds.length !== 1 ? 's' : ''} will be included in the new set
             </div>
 
             <div className="flex gap-3 justify-end">
@@ -912,7 +881,7 @@ export default function FrameSetDetail() {
             </div>
 
             <div className="mb-6 text-sm text-content-muted space-y-2">
-              <p>{selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be split into the new set</p>
+              <p>{selectedFrameIds.length} frame{selectedFrameIds.length !== 1 ? 's' : ''} will be split into the new set</p>
               <p className="text-warning">
                 The selected frames will be removed from "{detail?.frames_set?.name || 'this set'}" and moved to the new set.
               </p>

@@ -52,6 +52,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
   const progress = myBatch?.progress ?? null;
   const currentFrameId = myBatch?.currentFrameId ?? null;
   const completedSummary = myBatch?.isComplete ? myBatch.summary : null;
+  const completedError = myBatch?.isComplete ? myBatch.errorMessage : null;
   const frameStatuses = myBatch?.frameStatuses ?? new Map();
 
   const startBatch = (ids: number[]) => {
@@ -201,25 +202,43 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
       {completedSummary && !isActive && (
         <div
           className={`p-3 rounded-lg border flex items-start gap-2 ${
-            completedSummary.failed === 0
+            completedError
+              ? 'bg-error-muted border-error/50'
+              : completedSummary.failed === 0
               ? 'bg-success-muted border-success/50'
               : 'bg-warning-muted border-warning/50'
           }`}
         >
-          {completedSummary.failed === 0 ? (
+          {completedError ? (
+            <AlertCircle size={16} className="text-error flex-shrink-0 mt-0.5" />
+          ) : completedSummary.failed === 0 ? (
             <CheckCircle size={16} className="text-success flex-shrink-0 mt-0.5" />
           ) : (
             <AlertCircle size={16} className="text-warning flex-shrink-0 mt-0.5" />
           )}
           <div className="flex-1 text-sm">
-            <p className={`font-medium ${completedSummary.failed === 0 ? 'text-success' : 'text-warning'}`}>
-              Batch solve complete
+            <p
+              className={`font-medium ${
+                completedError
+                  ? 'text-error'
+                  : completedSummary.failed === 0
+                  ? 'text-success'
+                  : 'text-warning'
+              }`}
+            >
+              {completedError ? 'Plate solve could not start' : 'Batch solve complete'}
             </p>
-            <p className="text-content-muted text-xs mt-0.5">
-              {completedSummary.solved} solved, {completedSummary.failed} failed out of{' '}
-              {completedSummary.total} frames &mdash;{' '}
-              {(completedSummary.total_time_ms / 1000).toFixed(1)}s total
-            </p>
+            {completedError ? (
+              <p className="text-content-muted text-xs mt-0.5 break-words">
+                {completedError}
+              </p>
+            ) : (
+              <p className="text-content-muted text-xs mt-0.5">
+                {completedSummary.solved} solved, {completedSummary.failed} failed out of{' '}
+                {completedSummary.total} frames &mdash;{' '}
+                {(completedSummary.total_time_ms / 1000).toFixed(1)}s total
+              </p>
+            )}
           </div>
           <button
             onClick={handleDismiss}

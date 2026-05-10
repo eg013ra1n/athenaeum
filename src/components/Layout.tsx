@@ -10,6 +10,7 @@ import { AnalysisProgressProvider } from '../contexts/AnalysisProgressContext';
 import { AnalysisQueueIndicator } from './AnalysisQueueIndicator';
 import { PlateSolveProgressProvider } from '../contexts/PlateSolveProgressContext';
 import { PlateSolveQueueIndicator } from './PlateSolveQueueIndicator';
+import { PlateSolveIndexMissingModal } from './plate-solve';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { NotificationBell } from './NotificationBell';
 import { ToastStack } from './Toast';
@@ -104,6 +105,7 @@ export default function Layout() {
           {/* Global progress indicators */}
           <ScanProgressIndicator />
           <ExportProgressIndicator />
+          <PlateSolveIndexMissingModal />
           <ToastStack />
         </div>
         </PlateSolveProgressProvider>
