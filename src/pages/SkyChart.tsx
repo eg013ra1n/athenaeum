@@ -9,7 +9,7 @@ import { useD3MouseEvents } from '../hooks/useD3MouseEvents';
 import { useRectangleSelection } from '../hooks/useRectangleSelection';
 import { useMapViewState } from '../hooks/useMapViewState';
 import { SelectionDialog } from '../components/SelectionDialog';
-import { DateRangeFilter, DateParts, toISODate } from '../components/DateRangeFilter';
+import { DateRangeFilter, DateParts, toISODateRange } from '../components/DateRangeFilter';
 import '../styles/celestial-overrides.css';
 
 // Declare global Celestial and d3 from d3-celestial
@@ -92,6 +92,12 @@ export default function SkyChart() {
   // received and is being processed.
   const [isQueryingSelection, setIsQueryingSelection] = useState(false);
 
+  // Brief inline banner shown when a rectangle selection returns zero
+  // frames — instead of opening the dialog with "0 frames found", which
+  // is noise. Auto-dismisses; the toast pattern matches T1-6 / T2-18.
+  const [emptySelectionHint, setEmptySelectionHint] = useState(false);
+  const emptySelectionTimerRef = useRef<number | undefined>(undefined);
+
   // Custom hooks
   const svgOverlay = useSvgOverlay({ containerId: 'celestial-map' });
   const coordinateTransform = useCoordinateTransform();
@@ -116,10 +122,12 @@ export default function SkyChart() {
       .finally(() => setStarLimitLoaded(true));
   }, []);
 
-  // Filter locations by date range
+  // Filter locations by date range. Uses the partial-aware helper so the
+  // user can enter just a year (→ whole year), or a year + month (→ whole
+  // month, leap-year-aware), as well as the existing full DD/MM/YYYY.
   const filteredLocations = useMemo(() => {
-    const fromISO = toISODate(dateFrom);
-    const toISO = toISODate(dateTo);
+    const fromISO = toISODateRange(dateFrom, 'start');
+    const toISO = toISODateRange(dateTo, 'end');
 
     return locations.filter(loc => {
       const locStartDate = loc.dateRange[0]?.split('T')[0];
@@ -199,6 +207,10 @@ export default function SkyChart() {
       if (resizeTimeoutRef.current !== undefined) {
         window.clearTimeout(resizeTimeoutRef.current);
         resizeTimeoutRef.current = undefined;
+      }
+      if (emptySelectionTimerRef.current !== undefined) {
+        window.clearTimeout(emptySelectionTimerRef.current);
+        emptySelectionTimerRef.current = undefined;
       }
     };
   }, []);
@@ -1235,9 +1247,23 @@ export default function SkyChart() {
 
     rectangleSelectionRef.current.startSelection(
       (result) => {
+        setDrawingMode('none');
+        // Skip the dialog entirely when the selection caught no frames.
+        // Show a brief "no frames in selection" toast instead so the
+        // user gets feedback that their drag was processed.
+        if (result.count === 0) {
+          if (emptySelectionTimerRef.current !== undefined) {
+            window.clearTimeout(emptySelectionTimerRef.current);
+          }
+          setEmptySelectionHint(true);
+          emptySelectionTimerRef.current = window.setTimeout(() => {
+            setEmptySelectionHint(false);
+            emptySelectionTimerRef.current = undefined;
+          }, 2500);
+          return;
+        }
         setSelectionResult(result);
         setShowDialog(true);
-        setDrawingMode('none');
       },
       // T2-18 — flip the spinner overlay on/off around the backend query.
       (querying) => setIsQueryingSelection(querying),
@@ -1301,12 +1327,16 @@ export default function SkyChart() {
               <>
                 <span className="w-2 h-2 rounded-full bg-white animate-pulse" aria-hidden />
                 Drawing…
-                <kbd className="text-[10px] font-mono px-1 py-px rounded bg-white/20">Esc</kbd>
+                <kbd className="ml-0.5 inline-flex items-center justify-center h-[18px] min-w-[26px] px-1.5 rounded-md bg-white/20 text-white text-[10px] font-sans font-semibold leading-none tracking-wide">
+                  Esc
+                </kbd>
               </>
             ) : (
               <>
                 Select
-                <kbd className="text-[10px] font-mono px-1 py-px rounded bg-surface border border-border text-content-muted">S</kbd>
+                <kbd className="ml-0.5 inline-flex items-center justify-center h-[18px] min-w-[18px] px-1 rounded-md bg-content/10 text-content-muted text-[10px] font-sans font-semibold leading-none tracking-wide">
+                  S
+                </kbd>
               </>
             )}
           </button>
@@ -1406,6 +1436,16 @@ export default function SkyChart() {
           <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 bg-surface-elevated border border-border text-content-secondary text-xs px-3 py-1.5 rounded shadow flex items-center gap-2">
             <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-accent" />
             Querying selection…
+          </div>
+        )}
+
+        {/* Brief feedback when a selection didn't catch any frames —
+            the dialog is suppressed in that case to avoid noise, but
+            the user still gets confirmation that the drag was
+            processed. */}
+        {emptySelectionHint && (
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 bg-surface-elevated border border-border text-content-secondary text-xs px-3 py-1.5 rounded shadow">
+            No frames in this region.
           </div>
         )}
         {!loading && !error && locations.length === 0 && (
