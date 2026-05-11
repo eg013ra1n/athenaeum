@@ -360,6 +360,7 @@ notify:discord:
   needs:
     - job: release
       artifacts: false
+  allow_failure: true
   script:
     - .gitlab/ci/scripts/notify_discord.sh
 
@@ -372,5 +373,6 @@ notify:telegram:
   needs:
     - job: release
       artifacts: false
+  allow_failure: true
   script:
     - .gitlab/ci/scripts/notify_telegram.sh
