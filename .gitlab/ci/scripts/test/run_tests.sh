@@ -168,5 +168,83 @@ out=$(
 assert_contains "fallback body when notes missing" "is out" "$out"
 
 echo
+echo "-- notify_telegram.sh --"
+
+# Skip cleanly when TELEGRAM_BOT_TOKEN is empty (chat id alone isn't enough).
+out=$(
+  TELEGRAM_BOT_TOKEN="" \
+  TELEGRAM_CHAT_ID="123" \
+  CI_COMMIT_TAG="v0.2.0-beta.10" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_telegram.sh" 2>&1
+)
+assert_contains "skip when bot token unset" "Skipping Telegram" "$out"
+
+# Skip cleanly when TELEGRAM_CHAT_ID is empty.
+out=$(
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="" \
+  CI_COMMIT_TAG="v0.2.0-beta.10" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_telegram.sh" 2>&1
+)
+assert_contains "skip when chat id unset" "Skipping Telegram" "$out"
+
+# Dry-run for stable tag.
+out=$(
+  DRY_RUN=1 \
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="@athenaeum_releases" \
+  CI_COMMIT_TAG="v0.2.0" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_telegram.sh"
+)
+assert_contains "dry-run prints chat id" "@athenaeum_releases" "$out"
+assert_contains "dry-run uses HTML parse mode" "HTML" "$out"
+assert_contains "dry-run wraps title in bold" "<b>Athenaeum v0.2.0 released</b>" "$out"
+assert_contains "dry-run converts inline code in body" "<code>inline code</code>" "$out"
+assert_contains "dry-run includes release URL" "https://gitlab.com/eg013ra1n/athenaeum/-/releases/v0.2.0" "$out"
+assert_not_contains "stable title omits beta marker" "(beta)" "$out"
+
+# Beta tag.
+out=$(
+  DRY_RUN=1 \
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="@athenaeum_releases" \
+  CI_COMMIT_TAG="v0.2.0-beta.10" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_telegram.sh"
+)
+assert_contains "beta title labels beta" "<b>Athenaeum v0.2.0-beta.10 (beta) released</b>" "$out"
+
+# Long input gets truncated AND HTML-converted.
+out=$(
+  DRY_RUN=1 \
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="@athenaeum_releases" \
+  CI_COMMIT_TAG="v0.2.0-beta.10" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/long.md" \
+  "$HELPERS_DIR/notify_telegram.sh"
+)
+assert_contains "long telegram body has truncation tail" "Full notes: https://gitlab.com/eg013ra1n/athenaeum/-/releases/v0.2.0-beta.10" "$out"
+
+# Missing RELEASE_NOTES.md falls back to a one-liner.
+out=$(
+  DRY_RUN=1 \
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="@athenaeum_releases" \
+  CI_COMMIT_TAG="v0.2.0" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="/nonexistent/RELEASE_NOTES.md" \
+  "$HELPERS_DIR/notify_telegram.sh"
+)
+assert_contains "fallback body when notes missing" "is out" "$out"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
