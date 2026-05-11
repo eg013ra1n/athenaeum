@@ -23,6 +23,9 @@ NOTES_PATH="${RELEASE_NOTES_PATH:-RELEASE_NOTES.md}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RELEASE_URL="${CI_PROJECT_URL}/-/releases/${CI_COMMIT_TAG}"
 
+RESP_TMP=$(mktemp -t discord_response.XXXXXX)
+trap 'rm -f "$RESP_TMP"' EXIT
+
 if echo "$CI_COMMIT_TAG" | grep -q '\-beta'; then
   TITLE="Athenaeum ${CI_COMMIT_TAG} (beta) released"
   COLOR=15976499  # #f39c12 amber
@@ -58,20 +61,25 @@ payload = {
 }
 print(json.dumps(payload))
 '
-)
+) || {
+  echo "WARNING: Failed to build Discord JSON payload. Pipeline continues."
+  exit 0
+}
 
 if [ "${DRY_RUN:-}" = "1" ]; then
   echo "$PAYLOAD"
   exit 0
 fi
 
+# Use --data @- (stdin) rather than --data "$PAYLOAD" so the embed body
+# isn't visible to other jobs via ps(1) on shared runners.
 http_code=$(
-  curl --silent --show-error --max-time 30 \
-    --output /tmp/discord_response.txt \
+  printf '%s' "$PAYLOAD" | curl --silent --show-error --max-time 30 \
+    --output "$RESP_TMP" \
     --write-out '%{http_code}' \
     --request POST \
     --header 'Content-Type: application/json' \
-    --data "$PAYLOAD" \
+    --data @- \
     "$DISCORD_WEBHOOK_URL" \
     || echo "000"
 )
@@ -81,6 +89,6 @@ if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
 else
   echo "WARNING: Discord notification failed (HTTP $http_code). Pipeline continues."
   echo "Response body:"
-  cat /tmp/discord_response.txt 2>/dev/null || true
+  cat "$RESP_TMP" 2>/dev/null || true
 fi
 exit 0
