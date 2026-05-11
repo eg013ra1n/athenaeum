@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bash test runner for CI notification helper scripts.
 # Usage: .gitlab/ci/scripts/test/run_tests.sh
-# Exits 0 on success, 1 on first failure.
+# Exits 0 if all assertions pass, non-zero if any failed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -42,6 +42,7 @@ assert_not_contains() {
   if printf '%s' "$haystack" | grep -qF "$needle"; then
     echo "  FAIL: $label"
     echo "    needle present: $needle"
+    echo "    in: $haystack"
     FAIL=$((FAIL + 1))
   else
     echo "  ok: $label"
