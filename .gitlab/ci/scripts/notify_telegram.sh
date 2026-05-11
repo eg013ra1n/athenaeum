@@ -31,53 +31,24 @@ else
   TITLE="Athenaeum ${CI_COMMIT_TAG} released"
 fi
 
-# Pipeline: raw markdown -> Telegram HTML -> truncate.
-# Order matters: convert first, THEN truncate, so we never split a tag in half.
-# We pass the body through truncate_release_notes.sh (limit 3900), then do a
-# second tighter pass below: Telegram's hard cap is 4096 bytes and the bold
-# title + "Release page" anchor we add eats ~140 bytes, so the body alone has
-# to fit in ~3950. The truncate helper's "Full notes: …" tail can push past
-# that, so we re-cap with a slightly smaller limit while preserving the tail.
+# Body budget: 4096 (Telegram cap) − ~184 bytes for the bold title and
+# the two-link footer = ~3912. We pass LIMIT=3700 to the truncator for
+# comfortable headroom; HTML conversion can grow byte counts unpredictably.
+#
+# Pipeline: raw markdown → Telegram HTML → byte-truncate at LIMIT=3700.
+# Convert first, THEN truncate, so the cut never lands inside an HTML tag.
 if [ -s "$NOTES_PATH" ]; then
   BODY=$(
     "$SCRIPT_DIR/md_to_telegram_html.sh" < "$NOTES_PATH" \
-      | RELEASE_URL="$RELEASE_URL" "$SCRIPT_DIR/truncate_release_notes.sh"
+      | LIMIT=3700 RELEASE_URL="$RELEASE_URL" "$SCRIPT_DIR/truncate_release_notes.sh"
   )
 else
   BODY="Athenaeum ${CI_COMMIT_TAG} is out — see the release page for details."
 fi
 
-FOOTER=$(printf '<a href="%s">Release page</a>' "$RELEASE_URL")
-HEADER=$(printf '<b>%s</b>' "$TITLE")
-TELEGRAM_LIMIT=4096
-SEP_BYTES=4  # two "\n\n" separators between header/body/footer
-header_bytes=$(printf '%s' "$HEADER" | wc -c | tr -d ' ')
-footer_bytes=$(printf '%s' "$FOOTER" | wc -c | tr -d ' ')
-body_budget=$((TELEGRAM_LIMIT - header_bytes - footer_bytes - SEP_BYTES))
-body_bytes=$(printf '%s' "$BODY" | wc -c | tr -d ' ')
-if [ "$body_bytes" -gt "$body_budget" ]; then
-  # Body overshot — preserve the trailing "Full notes: <URL>" line if present
-  # (the truncate helper adds it when it cuts), then byte-cap the prefix to
-  # the remaining budget. Decoding via Python with errors=ignore drops any
-  # partial codepoint left at the head -c boundary.
-  TAIL_LINE=$(printf '%s' "$BODY" | grep -E '^Full notes: ' | tail -n 1 || true)
-  if [ -n "$TAIL_LINE" ]; then
-    tail_with_seps=$(printf '\n\n%s\n' "$TAIL_LINE")
-    tail_bytes=$(printf '%s' "$tail_with_seps" | wc -c | tr -d ' ')
-    prefix_budget=$((body_budget - tail_bytes))
-    PREFIX=$(printf '%s' "$BODY" | head -c "$prefix_budget" \
-      | python3 -c 'import sys; sys.stdout.write(sys.stdin.buffer.read().decode("utf-8", errors="ignore"))')
-    BODY=$(printf '%s%s' "$PREFIX" "$tail_with_seps")
-  else
-    BODY=$(printf '%s' "$BODY" | head -c "$body_budget" \
-      | python3 -c 'import sys; sys.stdout.write(sys.stdin.buffer.read().decode("utf-8", errors="ignore"))')
-  fi
-fi
-
-# Title is bold; body is HTML-formatted; trailing line is an HTML anchor to
-# the release page (which itself links to artfrom.space downloads). Anchors
-# keep the rendered message short while still embedding the URL we assert on.
-TEXT=$(printf '%s\n\n%s\n\n%s' "$HEADER" "$BODY" "$FOOTER")
+# Bold title + body + one-line footer with both links.
+FOOTER="<a href=\"https://artfrom.space/releases/download/\">Download</a> · <a href=\"${RELEASE_URL}\">Release page</a>"
+TEXT=$(printf '<b>%s</b>\n\n%s\n\n%s' "$TITLE" "$BODY" "$FOOTER")
 
 PAYLOAD=$(
   CHAT_ID="$TELEGRAM_CHAT_ID" \

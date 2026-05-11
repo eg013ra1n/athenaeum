@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Truncate stdin to <= 3900 bytes and append a "Full notes" tail line if cut.
+# Truncate stdin to <= LIMIT bytes (default 3900) and append a "Full notes"
+# tail line if cut. Callers needing a tighter budget (e.g. when wrapping the
+# output in extra envelope text) can pass LIMIT=N.
 # RELEASE_URL must be set in the environment — that's where the tail link points.
 # Output: stdout. The total output is guaranteed <= 4096 bytes (the Discord embed
 # description and Telegram message limit), assuming RELEASE_URL is < ~150 bytes.
@@ -7,7 +9,7 @@ set -euo pipefail
 
 : "${RELEASE_URL:?RELEASE_URL must be set}"
 
-LIMIT=3900
+LIMIT="${LIMIT:-3900}"
 input=$(cat)
 # Byte count, not character count: head -c below is byte-based, so we must
 # compare like-for-like. ${#input} would count UTF-8 code points and let
