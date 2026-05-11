@@ -107,13 +107,15 @@ python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'
   "chat_id": "${TELEGRAM_CHAT_ID}",
   "parse_mode": "HTML",
   "disable_web_page_preview": false,
-  "text": "<b>Athenaeum vX.Y.Z released</b>\n\n<truncated body as HTML-ish text>\n\nDownload: https://artfrom.space/releases/download/\nRelease page: https://gitlab.com/.../releases/vX.Y.Z"
+  "text": "<b>Athenaeum vX.Y.Z released</b>\n\n<truncated body as HTML-ish text>\n\n<a href=\"https://artfrom.space/releases/download/\">Download</a> · <a href=\"https://gitlab.com/.../releases/vX.Y.Z\">Release page</a>"
 }
 ```
 
 We use HTML parse mode rather than MarkdownV2. HTML is far less footgunny — Telegram's MarkdownV2 requires escaping a long list of punctuation (underscore, asterisk, brackets, parens, tilde, backtick, greater-than, hash, plus, minus, equals, pipe, braces, dot, exclamation) everywhere outside code spans, and RELEASE_NOTES.md is full of those characters (dotted version numbers, parens around clarifications, dashes in lists). HTML mode only requires escaping three characters (ampersand, less-than, greater-than) and supports a small fixed tag set: bold, italic, underline, strikethrough, anchor, code, pre.
 
-**Markdown → HTML conversion** is a tiny inline `sed` pass — release notes are skim-read in chat, so we don't need a full markdown engine:
+**Footer with two anchor links on one line.** `Download · Release page` keeps the message dense (worst-case ~130 bytes) and uses real anchor tags so Telegram renders blue clickable text rather than relying on auto-link detection. Anchors also avoid Telegram's link-preview card, which would otherwise fire for the first URL and visually dwarf the message.
+
+**Markdown → HTML conversion** is extracted to `.gitlab/ci/scripts/md_to_telegram_html.sh` (testable in isolation by the bash test runner) — release notes are skim-read in chat, so we don't need a full markdown engine. Conversions, in order:
 
 1. Escape ampersand → `&amp;`, less-than → `&lt;`, greater-than → `&gt;` first.
 2. Strip leading `#`, `##`, `###` heading markers, or wrap the heading text in a bold tag.
@@ -122,7 +124,7 @@ We use HTML parse mode rather than MarkdownV2. HTML is far less footgunny — Te
 5. Leave `[text](url)` as an anchor tag with `href="url"`.
 6. List markers (`-` or `*` at line start) stay as plain lines — Telegram doesn't render bullets natively.
 
-The conversion lives inline in the job's script as a single `sed -E` chain. If it grows past ~5 lines, we extract to `.gitlab/ci/scripts/md_to_telegram_html.sh` (do not pre-extract — keep it inline until it actually misbehaves).
+**Body byte budget.** The bold title (~50 B worst case) + two-line spacing (~4 B) + two-anchor footer (~130 B for a 70 B release URL) ≈ 184 B of envelope. We pass `LIMIT=3700` to `truncate_release_notes.sh` (vs. its 3900 default used by Discord, which has no envelope of its own), leaving ~212 B of comfortable headroom under Telegram's 4096-byte cap. HTML conversion can inflate byte counts unpredictably — that headroom is deliberate.
 
 ## Failure Handling
 
@@ -165,6 +167,8 @@ Added by the user in **GitLab → Settings → CI/CD → Variables**, all `Maske
 | `TELEGRAM_CHAT_ID` | Numeric chat id, or `@channelusername` for public channels. The bot must be a member (and admin, for channels). |
 
 The Telegram bot used here is intentionally a **separate bot** from the `telegram:configure` Claude-Code-side bot — different purpose, different audience, and re-using the user-pairing bot would surface release announcements in the wrong DM.
+
+**Known trade-off — bot token in curl URL.** The Telegram Bot API embeds the token in the URL path (`/bot<TOKEN>/sendMessage`), and `curl` receives the URL as a positional argument. On a shared GitLab runner, other concurrent jobs could in principle read it from `/proc/<pid>/cmdline`. Mitigations in place: the variable is `Masked` (kept out of job logs) and `Protected` (only injected into protected-tag pipelines). For a single-channel release-announcement bot whose only capability is posting to the configured chat, this is an acceptable risk. If the same token is ever reused for a higher-privilege bot, switch to `curl --config <tempfile>` so the URL stays out of argv.
 
 A short bootstrap note for the user lives at the top of `.gitlab-ci.yml` as a comment block above the two new jobs, pointing at this spec.
 

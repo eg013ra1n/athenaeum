@@ -61,24 +61,25 @@ echo "-- truncate_release_notes.sh --"
 out=$(RELEASE_URL="https://example.com/release" "$HELPERS_DIR/truncate_release_notes.sh" < "$FIXTURES_DIR/short.md")
 assert_contains "short input keeps body" "small" "$out"
 assert_not_contains "short input has no truncation tail" "Full notes" "$out"
-short_len=${#out}
+# Bytes, not chars — the truncator's budget is byte-based (matches Discord/Telegram caps).
+short_len=$(printf '%s' "$out" | wc -c | tr -d ' ')
 if [ "$short_len" -lt 4096 ]; then
-  echo "  ok: short output fits in 4096 chars (actual: $short_len)"
+  echo "  ok: short output fits in 4096 bytes (actual: $short_len)"
   PASS=$((PASS + 1))
 else
-  echo "  FAIL: short output exceeded 4096 chars (actual: $short_len)"
+  echo "  FAIL: short output exceeded 4096 bytes (actual: $short_len)"
   FAIL=$((FAIL + 1))
 fi
 
 # Long input is truncated and gets the tail.
 out=$(RELEASE_URL="https://example.com/release" "$HELPERS_DIR/truncate_release_notes.sh" < "$FIXTURES_DIR/long.md")
 assert_contains "long input gets truncation tail" "Full notes: https://example.com/release" "$out"
-long_len=${#out}
+long_len=$(printf '%s' "$out" | wc -c | tr -d ' ')
 if [ "$long_len" -le 4096 ]; then
-  echo "  ok: long output fits in 4096 chars (actual: $long_len)"
+  echo "  ok: long output fits in 4096 bytes (actual: $long_len)"
   PASS=$((PASS + 1))
 else
-  echo "  FAIL: long output exceeded 4096 chars (actual: $long_len)"
+  echo "  FAIL: long output exceeded 4096 bytes (actual: $long_len)"
   FAIL=$((FAIL + 1))
 fi
 
