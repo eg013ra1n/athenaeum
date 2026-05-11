@@ -117,5 +117,56 @@ assert_contains "dash list item kept"     "- list item one" "$out"
 assert_contains "asterisk list item kept" "* list item three" "$out"
 
 echo
+echo "-- notify_discord.sh --"
+
+# Skip cleanly when DISCORD_WEBHOOK_URL is empty.
+out=$(
+  DISCORD_WEBHOOK_URL="" \
+  CI_COMMIT_TAG="v0.2.0-beta.10" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_discord.sh" 2>&1
+)
+assert_contains "skip when webhook unset" "Skipping Discord" "$out"
+
+# Dry-run for stable tag prints a JSON payload with the expected shape.
+out=$(
+  DRY_RUN=1 \
+  DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/dummy" \
+  CI_COMMIT_TAG="v0.2.0" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_discord.sh"
+)
+assert_contains "dry-run prints title" "Athenaeum v0.2.0 released" "$out"
+assert_contains "dry-run prints stable color" "3066993" "$out"
+assert_contains "dry-run prints release URL" "https://gitlab.com/eg013ra1n/athenaeum/-/releases/v0.2.0" "$out"
+assert_contains "dry-run includes download field" "artfrom.space/releases/download" "$out"
+assert_not_contains "stable title omits beta marker" "(beta)" "$out"
+
+# Beta tag uses the beta colour and labels the title.
+out=$(
+  DRY_RUN=1 \
+  DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/dummy" \
+  CI_COMMIT_TAG="v0.2.0-beta.10" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_discord.sh"
+)
+assert_contains "beta title labels beta" "Athenaeum v0.2.0-beta.10 (beta) released" "$out"
+assert_contains "beta uses amber color" "15976499" "$out"
+
+# Missing RELEASE_NOTES.md falls back to a one-liner (does not fail).
+out=$(
+  DRY_RUN=1 \
+  DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/dummy" \
+  CI_COMMIT_TAG="v0.2.0" \
+  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_PATH="/nonexistent/RELEASE_NOTES.md" \
+  "$HELPERS_DIR/notify_discord.sh"
+)
+assert_contains "fallback body when notes missing" "is out" "$out"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]
