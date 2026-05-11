@@ -26,7 +26,9 @@ assert_eq() {
 
 assert_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF "$needle"; then
+  # `--` so a needle starting with "-" (e.g. a markdown list marker) isn't
+  # parsed as a grep option on BSD/macOS.
+  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
     echo "  ok: $label"
     PASS=$((PASS + 1))
   else
@@ -39,7 +41,7 @@ assert_contains() {
 
 assert_not_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if printf '%s' "$haystack" | grep -qF "$needle"; then
+  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
     echo "  FAIL: $label"
     echo "    needle present: $needle"
     echo "    in: $haystack"
@@ -79,6 +81,40 @@ else
   echo "  FAIL: long output exceeded 4096 chars (actual: $long_len)"
   FAIL=$((FAIL + 1))
 fi
+
+echo
+echo "-- md_to_telegram_html.sh --"
+
+out=$("$HELPERS_DIR/md_to_telegram_html.sh" < "$FIXTURES_DIR/markdown_features.md")
+
+# HTML escaping happens BEFORE other conversions, so a literal "<" in input
+# becomes "&lt;" in output. A "<b>" produced by us is also fine — the escaping
+# only runs on the original input characters, not on tags we add.
+assert_contains "escape ampersand" "10 &amp; 10" "$out"
+assert_contains "escape less-than"   "5 &lt; 10"  "$out"
+assert_contains "escape greater-than" "10 &gt; 5"  "$out"
+
+# **bold** -> <b>bold</b>
+assert_contains "bold conversion"   "<b>bold</b>"   "$out"
+
+# *italic* -> <i>italic</i>
+assert_contains "italic conversion" "<i>italic</i>" "$out"
+
+# `inline code` -> <code>inline code</code>
+assert_contains "code conversion"   "<code>inline code</code>" "$out"
+
+# [link](url) -> <a href="url">link</a>
+assert_contains "link conversion"   '<a href="https://example.com">link</a>' "$out"
+
+# Headings become bold lines, with NO leading "# " hash chars.
+assert_contains "heading 1 -> bold" "<b>Heading One</b>"   "$out"
+assert_contains "heading 2 -> bold" "<b>Heading Two</b>"   "$out"
+assert_contains "heading 3 -> bold" "<b>Heading Three</b>" "$out"
+assert_not_contains "no leading hashes remain" "# Heading" "$out"
+
+# List markers stay as plain dashes/asterisks at line start.
+assert_contains "dash list item kept"     "- list item one" "$out"
+assert_contains "asterisk list item kept" "* list item three" "$out"
 
 echo
 echo "Passed: $PASS  Failed: $FAIL"
