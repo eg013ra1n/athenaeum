@@ -51,7 +51,28 @@ assert_not_contains() {
 }
 
 echo "== CI notification helper tests =="
-echo "(no tests registered yet)"
+
+echo
+echo "-- truncate_release_notes.sh --"
+
+# Short input passes through unchanged (no tail).
+out=$(RELEASE_URL="https://example.com/release" "$HELPERS_DIR/truncate_release_notes.sh" < "$FIXTURES_DIR/short.md")
+assert_contains "short input keeps body" "small" "$out"
+assert_not_contains "short input has no truncation tail" "Full notes" "$out"
+short_len=${#out}
+[ "$short_len" -lt 4096 ] || { echo "  FAIL: short output exceeded 4096 chars"; FAIL=$((FAIL + 1)); }
+
+# Long input is truncated and gets the tail.
+out=$(RELEASE_URL="https://example.com/release" "$HELPERS_DIR/truncate_release_notes.sh" < "$FIXTURES_DIR/long.md")
+assert_contains "long input gets truncation tail" "Full notes: https://example.com/release" "$out"
+long_len=${#out}
+if [ "$long_len" -le 4096 ]; then
+  echo "  ok: long output fits in 4096 chars (actual: $long_len)"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: long output exceeded 4096 chars (actual: $long_len)"
+  FAIL=$((FAIL + 1))
+fi
 
 echo
 echo "Passed: $PASS  Failed: $FAIL"
