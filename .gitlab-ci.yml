@@ -336,3 +336,41 @@ publish_version:
   after_script:
     - ssh-agent -k 2>/dev/null || true
 
+# --- Chat Notifications (only on tags) ---
+# After the GitLab Release exists, post the contents of RELEASE_NOTES.md to
+# Discord and Telegram. Both are siblings under `needs: [release]` so a failure
+# in one platform does not prevent the other from posting.
+#
+# Required CI/CD variables (Settings -> CI/CD -> Variables; Masked, Protected):
+#   - DISCORD_WEBHOOK_URL  (full webhook URL)
+#   - TELEGRAM_BOT_TOKEN   (BotFather token, e.g. 1234567:ABC-DEF...)
+#   - TELEGRAM_CHAT_ID     (numeric chat id, or @channelusername)
+# Each job skips cleanly with a log message if its required variables are unset,
+# so the first pipeline after merging this change does not go red while you
+# add the secrets.
+#
+# Spec: docs/superpowers/specs/2026-05-11-release-notes-chat-notifications-design.md
+
+notify:discord:
+  stage: release
+  tags:
+    - linux
+  only:
+    - tags
+  needs:
+    - job: release
+      artifacts: false
+  script:
+    - .gitlab/ci/scripts/notify_discord.sh
+
+notify:telegram:
+  stage: release
+  tags:
+    - linux
+  only:
+    - tags
+  needs:
+    - job: release
+      artifacts: false
+  script:
+    - .gitlab/ci/scripts/notify_telegram.sh
