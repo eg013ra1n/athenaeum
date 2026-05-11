@@ -60,7 +60,13 @@ out=$(RELEASE_URL="https://example.com/release" "$HELPERS_DIR/truncate_release_n
 assert_contains "short input keeps body" "small" "$out"
 assert_not_contains "short input has no truncation tail" "Full notes" "$out"
 short_len=${#out}
-[ "$short_len" -lt 4096 ] || { echo "  FAIL: short output exceeded 4096 chars"; FAIL=$((FAIL + 1)); }
+if [ "$short_len" -lt 4096 ]; then
+  echo "  ok: short output fits in 4096 chars (actual: $short_len)"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: short output exceeded 4096 chars (actual: $short_len)"
+  FAIL=$((FAIL + 1))
+fi
 
 # Long input is truncated and gets the tail.
 out=$(RELEASE_URL="https://example.com/release" "$HELPERS_DIR/truncate_release_notes.sh" < "$FIXTURES_DIR/long.md")
