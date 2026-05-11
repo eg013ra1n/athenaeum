@@ -19,10 +19,12 @@ if [ "$input_bytes" -le "$LIMIT" ]; then
   exit 0
 fi
 
-# Truncate at LIMIT bytes. head -c is byte-based, which is what we want
-# for a Discord/Telegram code-point limit (LIMIT bytes ≤ LIMIT code points
-# in UTF-8). The iconv -c pass drops a partial codepoint that head may have
+# Truncate at LIMIT bytes. head is byte-based — for a Discord/Telegram
+# code-point limit, LIMIT bytes is ≤ LIMIT code points in UTF-8. The Python
+# decode-with-errors=ignore drops any partial codepoint that head may have
 # left at the cut, so downstream JSON serialisation can't choke on invalid
-# UTF-8 bytes from a mid-em-dash split.
-head -c "$LIMIT" <<< "$input" | iconv -f utf-8 -t utf-8 -c
+# UTF-8 bytes from a mid-em-dash split. Python (rather than iconv) because
+# BSD iconv on macOS returns exit 1 on partial-codepoint-at-EOF even with
+# -c, which would trip set -e here; the project targets both Linux and macOS.
+head -c "$LIMIT" <<< "$input" | python3 -c 'import sys; sys.stdout.write(sys.stdin.buffer.read().decode("utf-8", errors="ignore"))'
 printf '\n\n…\n\nFull notes: %s\n' "$RELEASE_URL"
