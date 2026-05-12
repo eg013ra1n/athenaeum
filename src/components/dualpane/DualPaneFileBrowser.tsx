@@ -29,6 +29,7 @@ import {
   ArrowDownAZ,
   ArrowDownZA,
   CornerLeftUp,
+  ExternalLink,
   Info,
   Loader2,
   FileText,
@@ -42,6 +43,8 @@ import {
   X as XIcon,
 } from 'lucide-react';
 import { api } from '../../api';
+import { revealItemInDir } from '../../api/desktop';
+import { isTauri } from '../../utils/platform';
 import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
 import { ImageType } from '../../types/models';
 import type { FileWithFrame, Frame, ScanRootWithAvailability } from '../../types/models';
@@ -645,6 +648,25 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     }
   }, [mkdirState, refreshBoth]);
 
+  // Reveal-in-OS handler: F3. Targets the cursor row first (matches Far
+  // Manager / Total Commander semantics), then any single selection, then
+  // falls back to the active pane's cwd so F3 always does something useful.
+  // No-op on web (revealItemInDir gracefully degrades there).
+  const revealInOs = useCallback(() => {
+    const active = state.panes[state.activePane];
+    let target: string | null = null;
+    if (active.anchor && active.anchor !== PARENT_ROW) {
+      target = active.anchor;
+    } else if (active.selection.size >= 1) {
+      target = active.selection.values().next().value ?? null;
+    }
+    if (!target) target = active.cwd;
+    if (!target) return;
+    void revealItemInDir(target).catch((e) => {
+      console.error('revealItemInDir failed:', e);
+    });
+  }, [state.activePane, state.panes]);
+
   // Rename handler: F2.
   const openRename = useCallback(() => {
     const active = state.panes[state.activePane];
@@ -850,6 +872,9 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       } else if (e.key === 'F7') {
         e.preventDefault();
         openMkdir();
+      } else if (e.key === 'F3' && isTauri) {
+        e.preventDefault();
+        revealInOs();
       } else if (e.key === 'F2') {
         e.preventDefault();
         openRename();
@@ -927,7 +952,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isModalOpen, enqueueMove, enqueueDelete, openMkdir, openRename, openBlink, state.activePane, state.panes, visibleListing, keyboardOrder, activatePath, paneScanRoots]);
+  }, [isModalOpen, enqueueMove, enqueueDelete, openMkdir, openRename, revealInOs, openBlink, state.activePane, state.panes, visibleListing, keyboardOrder, activatePath, paneScanRoots]);
 
   // Status bar metrics for the active pane.
   const activePaneListing = listings[state.activePane];
@@ -1017,6 +1042,15 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           disabled={state.panes[state.activePane].selection.size !== 1}
           onClick={openRename}
         />
+        {isTauri && (
+          <ShortcutButton
+            variant="neutral"
+            icon={<ExternalLink size={12} />}
+            label="Reveal"
+            title="Reveal cursor row (or current folder) in system file manager (F3)"
+            onClick={revealInOs}
+          />
+        )}
         <ShortcutButton
           variant="accent"
           icon={<MoveRight size={12} />}
