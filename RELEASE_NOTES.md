@@ -12,7 +12,7 @@ The first stable release since v0.1.0 — nine months of beta work landing toget
 - **Interactive sky chart** — FOV indicators, clickable footprints with labels, kbd-chip overlay, partial-date filter
 - **Equipment + Calibration Coverage** — two-way set-ID navigation between chips, camera-filtered dual-pane file browser per hardware row, pre/post-calibration states with consumer chips
 - **Duplicates rule chain** — configurable ordered picker (Master root / Path contains / Oldest mtime / Shortest path), live per-rule coverage counts, opt-in byte-by-byte deep verify before any destructive operation
-- **Web / Docker build** — Axum HTTP/SSE server with full feature parity with the desktop app via shared `athenaeum-core`. Ship as `ghcr.io/eg013ra1n/athenaeum:0.2.0`
+- **Web / Docker build** — Axum HTTP/SSE server with full feature parity with the desktop app via shared `athenaeum-core`. Ship as `vsharifov/athenaeum:0.2.0`
 - **Release notifications** — Discord and Telegram posts on tag push
 
 ## Changes
