@@ -222,6 +222,17 @@ export default function About() {
       </div>
 
       <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-accent">Community</h2>
+        <p className="text-content-secondary leading-relaxed">
+          Join the conversation, share images, ask questions, and follow updates.
+        </p>
+        <div className="flex gap-4">
+          <ExtLink href="https://discord.gg/kfpjaQuc">Discord</ExtLink>
+          <ExtLink href="https://t.me/athenaeum_astro">Telegram</ExtLink>
+        </div>
+      </section>
+
+      <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-3">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-accent">Acknowledgements</h2>
         <p className="text-content-secondary leading-relaxed">
           The analysis flow in Athenaeum was guided by{' '}
