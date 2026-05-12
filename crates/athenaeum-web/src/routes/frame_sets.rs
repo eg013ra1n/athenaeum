@@ -1069,6 +1069,39 @@ pub async fn get_excluded_frames(
     Ok(Json(entries))
 }
 
+/// Get all excluded frames with full file + frame metadata. Drives the
+/// Excluded Frames page's Missing-Metadata-style repair toolbar.
+pub async fn get_excluded_frames_with_metadata(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<Vec<athenaeum_core::models::ExcludedFrameRow>>, (StatusCode, String)> {
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+
+    let rows = athenaeum_core::db::get_excluded_frames_with_metadata(&conn).map_err(db_err)?;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveFromExcludedArgs {
+    pub file_ids: Vec<i64>,
+}
+
+/// Remove the given file IDs from the `excluded_frames` table. Returns the
+/// number of rows actually deleted.
+pub async fn remove_files_from_excluded(
+    State(state): State<WebAppState>,
+    Json(args): Json<RemoveFromExcludedArgs>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db_ref.conn();
+
+    let deleted = athenaeum_core::db::delete_excluded_frames_by_file_ids(&conn, &args.file_ids)
+        .map_err(db_err)?;
+    Ok(Json(deleted))
+}
+
 /// Get count of excluded frames (lightweight check).
 pub async fn get_excluded_frames_count(
     State(state): State<WebAppState>,

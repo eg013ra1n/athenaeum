@@ -3,7 +3,7 @@
  * Shows selected frames and provides options to create frame sets
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 import { X, Check, AlertCircle } from 'lucide-react';
 import { SelectionResult } from '../types/selection';
@@ -33,6 +33,11 @@ export function SelectionDialog({
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
 
+  // T1-4 — track the success-auto-close timer so we can clear it on
+  // unmount, on manual close, or when a new selection arrives mid-flight.
+  const successCloseTimerRef = useRef<number | undefined>(undefined);
+  const inputRef = useRef<HTMLInputElement>(null);
+
   // Reset dialog state when opened with new selection data
   useEffect(() => {
     if (isOpen && result) {
@@ -40,8 +45,42 @@ export function SelectionDialog({
       setError(null);
       setSuccess(false);
       setIsCreating(false);
+      // New selection → cancel any stale success-close timer left over
+      // from a previous successful create.
+      if (successCloseTimerRef.current !== undefined) {
+        window.clearTimeout(successCloseTimerRef.current);
+        successCloseTimerRef.current = undefined;
+      }
     }
   }, [isOpen, result]);
+
+  // Clear timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (successCloseTimerRef.current !== undefined) {
+        window.clearTimeout(successCloseTimerRef.current);
+      }
+    };
+  }, []);
+
+  // T2-14 — auto-focus the name input when the dialog opens, and close on
+  // Escape so keyboard-only users have a way out.
+  useEffect(() => {
+    if (!isOpen || success) return;
+    inputRef.current?.focus();
+  }, [isOpen, success]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isCreating) {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, isCreating, onClose]);
 
   const handleCreateFrameSet = async () => {
     if (!frameSetName.trim() || !result) {
@@ -71,8 +110,14 @@ export function SelectionDialog({
       setSuccess(true);
       setFrameSetName('');
 
-      // Clear success message after 2 seconds and close
-      setTimeout(() => {
+      // Clear success message after 2 seconds and close. Capture the timer
+      // id so we can cancel it on unmount, manual close, or when a new
+      // selection opens (T1-4).
+      if (successCloseTimerRef.current !== undefined) {
+        window.clearTimeout(successCloseTimerRef.current);
+      }
+      successCloseTimerRef.current = window.setTimeout(() => {
+        successCloseTimerRef.current = undefined;
         onClose();
       }, 2000);
 
@@ -81,7 +126,8 @@ export function SelectionDialog({
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error('Failed to create frame set:', errorMsg, err);
-      setError(errorMsg || 'Failed to create frame set');
+      // T2-19 — surface a friendly prefix; raw value already in console.
+      setError(`Couldn't create the frame set: ${errorMsg || 'Unknown error'}`);
     } finally {
       setIsCreating(false);
     }
@@ -138,14 +184,21 @@ export function SelectionDialog({
                   Create Frame Set
                 </label>
                 <input
+                  ref={inputRef}
                   type="text"
                   value={frameSetName}
                   onChange={(e) => {
                     setFrameSetName(e.target.value);
                     setError(null);
                   }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !isCreating && frameSetName.trim()) {
+                      e.preventDefault();
+                      void handleCreateFrameSet();
+                    }
+                  }}
                   placeholder="e.g., M31 Imaging Session"
-                  className="w-full px-3 py-2 bg-surface-hover border border-border rounded text-content placeholder-content-muted focus:outline-none focus:border-accent transition"
+                  className="w-full px-3 py-2 bg-surface-hover border border-border rounded text-content placeholder-content-muted focus:outline-none focus:ring-2 focus:ring-accent focus:border-accent transition"
                 />
               </div>
 

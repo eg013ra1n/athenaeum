@@ -137,6 +137,7 @@ async fn main() {
         quad_index: Arc::new(std::sync::RwLock::new(None)),
         dso_catalog: Arc::new(std::sync::RwLock::new(None)),
         image_pool: Arc::new(image_pool),
+        operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
     });
 
     // SSE broadcast channel

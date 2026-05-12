@@ -10,6 +10,7 @@ import {
   Star,
   ScanEye,
   Info,
+  Mountain,
 } from "lucide-react";
 import type { ToolBarProps } from "./types";
 
@@ -36,6 +37,9 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
   onToggleFullRes,
   showHelp,
   onToggleHelp,
+  canShowContour,
+  contourActive,
+  onShowContourPlot,
   isCaching,
   cacheProgress,
   cacheStats,
@@ -112,6 +116,29 @@ export const ToolBar: React.FC<ToolBarProps> = memo(function ToolBar({
           title={fullResMode ? "Switch to preview resolution" : "Switch to full resolution"}
         >
           {loadingFullRes ? <Loader2 size={20} className="animate-spin" /> : <ScanEye size={20} />}
+        </button>
+
+        {/* Flat contour plot — toggle. Only enabled for FLAT / MASTERFLAT
+            frames. When active, the main canvas shows the contour plot
+            (PixInsight FlatContourPlot v1.3.1 port) instead of the FITS
+            preview. Settings live in Settings → General → Flat Contour Plot. */}
+        <button
+          onClick={onShowContourPlot}
+          disabled={!canShowContour}
+          className={`p-2 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+            contourActive
+              ? "bg-accent text-surface"
+              : "bg-surface-elevated text-content hover:bg-surface-hover"
+          }`}
+          title={
+            canShowContour
+              ? contourActive
+                ? "Hide flat contour plot"
+                : "Show flat contour plot — gradient & vignetting analysis"
+              : "Flat contour plot (FLAT / MASTERFLAT only)"
+          }
+        >
+          <Mountain size={20} />
         </button>
       </div>
 

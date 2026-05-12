@@ -58,6 +58,7 @@ export interface Frame {
   exptime: number | null;
   filter: string | null;
   imagetyp: ImageType | null;
+  is_master: boolean;
   gain: number | null;
   offset: number | null;
   binning: string | null;
@@ -738,6 +739,14 @@ export interface SubCalibrationDetail {
   temp_warning: boolean;
 }
 
+/** A frame set (object) that ultimately consumes a calibration set, either
+ *  directly or via the sub-cal chain. Returned by get_calibration_set_consumers. */
+export interface CalibrationSetConsumer {
+  frameSetId: number;
+  name: string | null;
+  dateObsStart: string | null;
+}
+
 /** A calibration set with the count of frames that use it */
 export interface CalibrationSetWithFrameCount {
   set: CalibrationSetDetail;
@@ -900,6 +909,17 @@ export interface ExcludedFrameEntry {
   excluded_at: string;
 }
 
+/** Excluded frame with full file + frame metadata. Mirrors `MissingMetadataRow`
+ *  so the same view shell can render both, plus the exclusion reason and
+ *  excluded_at timestamp. Returned by get_excluded_frames_with_metadata. */
+export interface ExcludedFrameRow {
+  file: File;
+  frame: Frame;
+  hasDuplicate: boolean;
+  reason: string;
+  excludedAt: string;
+}
+
 /** Result of reclassifying excluded frames */
 export interface ReclassifyResult {
   frames_updated: number;
@@ -1039,6 +1059,25 @@ export interface FrameMetadataEdits {
   imagetyp?: string | null;
   /** True when the frame type is a master variant (paired with imagetyp) */
   isMaster?: boolean | null;
+  /** Target name (FITS OBJECT) */
+  object?: string | null;
+  /** Filter name (FITS FILTER) */
+  filter?: string | null;
+  /** Telescope name (FITS TELESCOP) */
+  telescop?: string | null;
+  /** Focal length in mm (FITS FOCALLEN) */
+  focallen?: number | null;
+  /** Sensor gain (FITS GAIN), 0..1000 */
+  gain?: number | null;
+  /** Sensor offset (FITS OFFSET), >=0 */
+  offset?: number | null;
+  /** Binning string in "AxB" form. Backend also updates xbinning/ybinning. */
+  binning?: string | null;
+  /** Exposure time (FITS EXPTIME), seconds, > 0 */
+  exptime?: number | null;
+  /** CCD temperature (FITS CCD-TEMP), °C, finite. Backend serde uses
+   *  camelCase, so the wire field is `ccdTemp` — not `ccd_temp`. */
+  ccdTemp?: number | null;
 }
 
 /**
@@ -1098,4 +1137,43 @@ export interface MergeLogEntry {
   frames_skipped: SkippedFrame[];
   added_count: number;
   skipped_count: number;
+}
+
+// ── Flat Contour Plot ────────────────────────────────────────────────────
+
+/** Settings for the FlatContourPlot analysis. Mirrors PixInsight's
+ *  FlatContourPlot v1.3.1 (Mike Schuster). */
+export interface FlatContourOpts {
+  /** Resampling factor in percent (1..100). 50 halves both dimensions. */
+  resolutionPct: number;
+  /** Gaussian blur sigma in pixels (0..50). */
+  sigmaPx: number;
+  /** Number of discrete grayscale bands (2..64). */
+  contours: number;
+  /** Percent of post-clip range mapped to full grayscale (1..100). */
+  gradientPct: number;
+}
+
+/** Response from `compute_flat_contour_plot`. The `pixelsB64` field is the
+ *  final 8-bit grayscale display image (length == width*height) base64-
+ *  encoded for JSON transport. The frontend paints those bytes directly
+ *  via putImageData; the legend strip is built from `minQuantile`,
+ *  `maxQuantile`, and `contours`. */
+export interface FlatContourPlot {
+  width: number;
+  height: number;
+  /** Raw-units peak of the resampled, pre-rescale image. */
+  peak: number;
+  /** Raw-units mean. */
+  mean: number;
+  /** Raw-units min. */
+  min: number;
+  /** 1st-percentile sample value (legend low edge, original flat units). */
+  minQuantile: number;
+  /** 99th-percentile sample value (legend high edge, original flat units). */
+  maxQuantile: number;
+  /** Echoed back from the request — number of bands the result uses. */
+  contours: number;
+  /** Base64-encoded 8-bit grayscale buffer. */
+  pixelsB64: string;
 }

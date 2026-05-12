@@ -11,9 +11,11 @@ interface MasterFlatLibraryProps {
   instrume: string;
   onClose?: () => void;
   isTabView?: boolean;
+  /** Calibration set ID to highlight + auto-expand + scroll to in the table. */
+  highlightSetId?: number | null;
 }
 
-export default function MasterFlatLibrary({ instrume, onClose, isTabView = false }: MasterFlatLibraryProps) {
+export default function MasterFlatLibrary({ instrume, onClose, isTabView = false, highlightSetId }: MasterFlatLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -270,7 +272,7 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
 
           {/* Table */}
           {filteredSets.length > 0 ? (
-            <CalibrationSetTable sets={filteredSets} customMetadataSetIds={customMetadataSetIds} />
+            <CalibrationSetTable sets={filteredSets} customMetadataSetIds={customMetadataSetIds} highlightSetId={highlightSetId} />
           ) : (
             <div className="text-center py-12 bg-surface-elevated rounded-lg">
               <p className="text-content-muted mb-4">

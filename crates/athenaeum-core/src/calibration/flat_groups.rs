@@ -27,6 +27,14 @@ pub struct FlatGroup {
     /// Average CCD temperature across all frames (if available)
     pub avg_temp: Option<f64>,
 
+    /// Coldest CCD temperature observed in the group (if any frame has temp).
+    /// Persisted as `calibration_set.temp_min` so the matcher / UI can see the
+    /// real range, not the synthetic average.
+    pub temp_min: Option<f64>,
+
+    /// Warmest CCD temperature observed in the group.
+    pub temp_max: Option<f64>,
+
     /// Number of frames in group
     pub frame_count: usize,
 
@@ -366,15 +374,19 @@ fn create_flat_group(
         .and_then(|f| f.date_obs)
         .unwrap_or_else(Utc::now);
 
-    // Calculate average temperature (if available)
+    // Calculate average temperature (if available) and the actual range.
+    // A4: prefer measured ccd_temp; fall back to commanded set_temp.
     let temps: Vec<f64> = frames.iter()
-        .filter_map(|f| f.ccd_temp)
+        .filter_map(|f| crate::models::effective_temp(f.ccd_temp, f.set_temp))
         .collect();
 
-    let avg_temp = if !temps.is_empty() {
-        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    let (avg_temp, temp_min, temp_max) = if !temps.is_empty() {
+        let avg = temps.iter().sum::<f64>() / temps.len() as f64;
+        let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (Some(avg), Some(min), Some(max))
     } else {
-        None
+        (None, None, None)
     };
 
     // Extract offset and exptime from first frame (should be same for all frames in group)
@@ -390,6 +402,8 @@ fn create_flat_group(
         start_time,
         end_time,
         avg_temp,
+        temp_min,
+        temp_max,
         frame_count,
         filter: filter.map(String::from),
         instrume: instrume_opt,
@@ -455,9 +469,11 @@ pub fn create_flat_calibration_set(
     let date_end = flat_group.end_time.to_rfc3339();
     let frame_count = flat_group.frame_ids.len() as i64;
 
-    // For flat groups, temp_min and temp_max are the same as avg_temp
-    let temp_min = flat_group.avg_temp;
-    let temp_max = flat_group.avg_temp;
+    // Persist the actual cold/warm range from the cluster so the matcher and
+    // UI see real temperature spread, not the synthetic average. Fall back to
+    // avg_temp for legacy single-temperature groups.
+    let temp_min = flat_group.temp_min.or(flat_group.avg_temp);
+    let temp_max = flat_group.temp_max.or(flat_group.avg_temp);
 
     println!("    📝 Creating new flat calibration set:");
     println!("       date={}, filter={:?}, gain={:?}, offset={:?}, exptime={:?}, binning={:?}, instrume={:?}",

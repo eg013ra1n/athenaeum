@@ -6,17 +6,22 @@ import {
   Calendar,
   FileX,
   Settings,
+  ExternalLink,
 } from 'lucide-react';
 import type { DetailedWarning, WarningType, WarningSeverity } from '../../types/export';
 
 interface WarningsPanelProps {
   warnings: DetailedWarning[];
+  /** When provided, the calibration-set ID badge on each warning becomes a
+   *  clickable link that jumps the caller wherever it wants (typically the
+   *  Calibration Coverage tab with the set highlighted). */
+  onSetClick?: (setId: number) => void;
 }
 
 /**
  * Panel displaying detailed warnings with full context
  */
-export function WarningsPanel({ warnings }: WarningsPanelProps) {
+export function WarningsPanel({ warnings, onSetClick }: WarningsPanelProps) {
   if (warnings.length === 0) {
     return null;
   }
@@ -40,13 +45,13 @@ export function WarningsPanel({ warnings }: WarningsPanelProps) {
       {/* Warnings list */}
       <div className="p-4 space-y-4">
         {errors.length > 0 && (
-          <WarningGroup warnings={errors} />
+          <WarningGroup warnings={errors} onSetClick={onSetClick} />
         )}
         {warns.length > 0 && (
-          <WarningGroup warnings={warns} />
+          <WarningGroup warnings={warns} onSetClick={onSetClick} />
         )}
         {infos.length > 0 && (
-          <WarningGroup warnings={infos} />
+          <WarningGroup warnings={infos} onSetClick={onSetClick} />
         )}
       </div>
     </div>
@@ -55,13 +60,14 @@ export function WarningsPanel({ warnings }: WarningsPanelProps) {
 
 interface WarningGroupProps {
   warnings: DetailedWarning[];
+  onSetClick?: (setId: number) => void;
 }
 
-function WarningGroup({ warnings }: WarningGroupProps) {
+function WarningGroup({ warnings, onSetClick }: WarningGroupProps) {
   return (
     <div className="space-y-3">
       {warnings.map((warning, index) => (
-        <WarningCard key={index} warning={warning} />
+        <WarningCard key={index} warning={warning} onSetClick={onSetClick} />
       ))}
     </div>
   );
@@ -69,9 +75,10 @@ function WarningGroup({ warnings }: WarningGroupProps) {
 
 interface WarningCardProps {
   warning: DetailedWarning;
+  onSetClick?: (setId: number) => void;
 }
 
-function WarningCard({ warning }: WarningCardProps) {
+function WarningCard({ warning, onSetClick }: WarningCardProps) {
   const SeverityIcon = getSeverityIcon(warning.severity);
   const TypeIcon = getTypeIcon(warning.warningType);
   const severityColor = getSeverityColor(warning.severity);
@@ -86,15 +93,43 @@ function WarningCard({ warning }: WarningCardProps) {
 
         {/* Content */}
         <div className="flex-1 min-w-0">
-          {/* Title with type icon */}
-          <div className="flex items-center gap-2 mb-1">
+          {/* Title with type icon. If the title text contains the warning's
+              own `#<setId>` token, render that token as an inline clickable
+              link instead of duplicating it as a trailing chip. Falls back
+              to a trailing chip when the setId isn't surfaced in the
+              title (e.g. generic warnings). */}
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
             <TypeIcon size={14} className="text-content-muted" />
-            <span className="font-medium text-content">{warning.title}</span>
+            <span className="font-medium text-content">
+              {renderTitleWithInlineSetLink(warning.title, warning.setId, onSetClick)}
+            </span>
             {warning.filter && (
               <span className="text-xs px-1.5 py-0.5 bg-surface-elevated rounded text-content-muted">
                 {warning.filter}
               </span>
             )}
+            {warning.setId != null
+              && !titleMentionsSetId(warning.title, warning.setId)
+              && (
+                onSetClick ? (
+                  <button
+                    type="button"
+                    onClick={() => onSetClick(warning.setId!)}
+                    title={`Open calibration set #${warning.setId} in Calibration Coverage`}
+                    className="inline-flex items-center gap-0.5 text-xs font-mono px-1.5 py-0.5 rounded bg-accent/10 text-accent border border-accent/30 hover:bg-accent/20 hover:underline transition-colors cursor-pointer"
+                  >
+                    #{warning.setId}
+                    <ExternalLink size={10} className="opacity-70" />
+                  </button>
+                ) : (
+                  <span
+                    className="text-xs font-mono px-1.5 py-0.5 rounded bg-surface-elevated text-content-muted"
+                    title={`Calibration set #${warning.setId}`}
+                  >
+                    #{warning.setId}
+                  </span>
+                )
+              )}
           </div>
 
           {/* Description */}
@@ -133,6 +168,61 @@ function WarningCard({ warning }: WarningCardProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** True when the warning title contains the literal `#<setId>` token. We use
+ *  word-boundary matching so `#11` doesn't match `#119` etc. */
+function titleMentionsSetId(title: string, setId: number): boolean {
+  const re = new RegExp(`#${setId}\\b`);
+  return re.test(title);
+}
+
+/** If the title has a `#<setId>` token, replace that token with an inline
+ *  clickable button that jumps to the Calibration Coverage tab. Everything
+ *  else in the title renders verbatim. */
+function renderTitleWithInlineSetLink(
+  title: string,
+  setId: number | null,
+  onSetClick: ((setId: number) => void) | undefined,
+): React.ReactNode {
+  if (setId == null) return title;
+  const re = new RegExp(`#${setId}\\b`);
+  const match = re.exec(title);
+  if (!match) return title;
+
+  const before = title.slice(0, match.index);
+  const tokenLen = match[0].length;
+  const after = title.slice(match.index + tokenLen);
+
+  if (!onSetClick) {
+    // No handler — render the token as a non-interactive monospace badge so
+    // it still stands out as a reference, just not clickable.
+    return (
+      <>
+        {before}
+        <span className="font-mono text-accent" title={`Calibration set #${setId}`}>
+          #{setId}
+        </span>
+        {after}
+      </>
+    );
+  }
+
+  return (
+    <>
+      {before}
+      <button
+        type="button"
+        onClick={() => onSetClick(setId)}
+        title={`Open calibration set #${setId} in Calibration Coverage`}
+        className="inline-flex items-center gap-0.5 align-baseline font-mono text-accent hover:underline cursor-pointer"
+      >
+        #{setId}
+        <ExternalLink size={10} className="opacity-70" />
+      </button>
+      {after}
+    </>
   );
 }
 

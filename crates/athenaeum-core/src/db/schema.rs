@@ -387,6 +387,59 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // File operations - one row per dual-pane Move or Delete operation
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_operations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK(kind IN ('move','delete')),
+            status TEXT NOT NULL,
+            source_root TEXT,
+            dest_dir TEXT,
+            total_files INTEGER NOT NULL DEFAULT 0,
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            error_message TEXT
+        )",
+        [],
+    )?;
+
+    // File operation files - frozen plan: one row per file the operation will touch
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_operation_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id INTEGER NOT NULL,
+            source_path TEXT NOT NULL,
+            dest_path TEXT,
+            strategy TEXT NOT NULL,
+            catalog_file_id INTEGER,
+            expected_hash TEXT,
+            file_size_bytes INTEGER NOT NULL DEFAULT 0,
+            disposition TEXT NOT NULL DEFAULT 'planned',
+            FOREIGN KEY (operation_id) REFERENCES file_operations(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // File operation steps - audit log: one row per (file, stage) pair for resume + rollback
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_operation_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id INTEGER NOT NULL,
+            operation_file_id INTEGER,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            actual_hash TEXT,
+            error_message TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            FOREIGN KEY (operation_id) REFERENCES file_operations(id) ON DELETE CASCADE,
+            FOREIGN KEY (operation_file_id) REFERENCES file_operation_files(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // Create indexes for common queries
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)",
@@ -526,11 +579,92 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_op_files_op ON file_operation_files(operation_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_op_steps_op_file ON file_operation_steps(operation_id, operation_file_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_op_steps_status ON file_operation_steps(status)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_ops_status ON file_operations(status)",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_folder_sim_percent ON folder_similarity(similarity_percent DESC)",
         [],
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_members_frame ON session_members(frame_id)",
+        [],
+    )?;
+
+    // A5: keep `calibration_set_to_frames.source_id` consistent. The
+    // `calibration_set_id` column has a FK with ON DELETE CASCADE, but
+    // `source_id` does not — when a calibration_set is deleted, any sub-cal
+    // links where `source_type = 'calibration_set' AND source_id = OLD.id`
+    // would be left dangling, silently losing the user's hierarchy. Install
+    // a trigger that prunes them on parent delete, and run a one-shot sweep
+    // to clean any orphans that already exist in older databases.
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS calibration_set_subcal_cleanup
+         AFTER DELETE ON calibration_set
+         FOR EACH ROW
+         BEGIN
+            DELETE FROM calibration_set_to_frames
+             WHERE source_type = 'calibration_set'
+               AND source_id = OLD.id;
+         END",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM calibration_set_to_frames
+         WHERE source_type = 'calibration_set'
+           AND source_id NOT IN (SELECT id FROM calibration_set)",
+        [],
+    )?;
+
+    // B2: prune empty `calibration_set` rows automatically. The
+    // `calibration_set_frames` junction table CASCADE-deletes rows when
+    // either side is removed (e.g., a frame is deleted from `frames` or the
+    // parent set itself is deleted). But a parent that loses its last
+    // member through frame deletion is never cleaned up — the
+    // `bulk_update_frame_metadata` cascade in `db/operations.rs` does it in
+    // application code, but other deletion paths (raw frame delete from
+    // file_op cleanup, archive operations, etc.) leave empty parent rows.
+    // This trigger handles every path uniformly. Master library sets
+    // (is_master_library = 1) are exempt: a master is intrinsically a
+    // single-frame set and may legitimately have its sole member removed
+    // via re-import without the parent row being garbage.
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS calibration_set_empty_prune
+         AFTER DELETE ON calibration_set_frames
+         FOR EACH ROW
+         WHEN NOT EXISTS (
+            SELECT 1 FROM calibration_set_frames
+             WHERE set_id = OLD.set_id
+         )
+           AND EXISTS (
+            SELECT 1 FROM calibration_set
+             WHERE id = OLD.set_id
+               AND COALESCE(is_master_library, 0) = 0
+         )
+         BEGIN
+            DELETE FROM calibration_set WHERE id = OLD.set_id;
+         END",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM calibration_set
+         WHERE COALESCE(is_master_library, 0) = 0
+           AND NOT EXISTS (
+            SELECT 1 FROM calibration_set_frames
+             WHERE set_id = calibration_set.id
+         )",
         [],
     )?;
 
@@ -1043,6 +1177,21 @@ mod archive_schema_tests {
     }
 
     #[test]
+    fn test_file_op_tables_created() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for table in &["file_operations", "file_operation_files", "file_operation_steps"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "expected table {} to exist", table);
+        }
+    }
+
+    #[test]
     fn test_archive_columns_added() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -1066,5 +1215,200 @@ mod archive_schema_tests {
             ).unwrap();
             assert_eq!(count, 1, "expected files.{} to exist", col);
         }
+    }
+
+    fn insert_dummy_calibration_set(conn: &Connection, id: i64, imagetyp: &str) {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (?1, ?2, '2025-01-01')",
+            rusqlite::params![id, imagetyp],
+        ).unwrap();
+    }
+
+    fn insert_subcal_link(conn: &Connection, source_id: i64, target_id: i64, calibration_type: &str) {
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (?1, 'calibration_set', ?2, ?3, '2025-01-01T00:00:00Z')",
+            rusqlite::params![source_id, target_id, calibration_type],
+        ).unwrap();
+    }
+
+    #[test]
+    fn deleting_calibration_set_prunes_subcal_links_via_trigger() {
+        // A5 regression: deleting a parent calibration_set must remove every
+        // sub-calibration link whose source_id pointed at that set, otherwise
+        // the user's manually-assigned hierarchy silently disappears.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        insert_dummy_calibration_set(&conn, 100, "Flat");
+        insert_dummy_calibration_set(&conn, 200, "Dark");
+        insert_subcal_link(&conn, 100, 200, "Dark");
+
+        // Sanity: the link exists.
+        let before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_to_frames WHERE source_id=100 AND source_type='calibration_set'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(before, 1, "sub-cal link should be present before delete");
+
+        conn.execute("DELETE FROM calibration_set WHERE id = 100", []).unwrap();
+
+        let after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_to_frames WHERE source_id=100 AND source_type='calibration_set'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(after, 0, "trigger must have removed the orphaned sub-cal link");
+    }
+
+    fn insert_dummy_frame(conn: &Connection, id: i64) {
+        // Minimal frame row for the calibration_set_frames junction.
+        // FKs are enforced — populate every NOT NULL column on `files`.
+        let file_id: i64 = id + 100_000;
+        conn.execute(
+            "INSERT OR IGNORE INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2025-01-01T00:00:00Z', 'FITS')",
+            rusqlite::params![
+                file_id,
+                format!("/test/dummy_{}.fits", id),
+                format!("dummy_{}.fits", id),
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id) VALUES (?1, ?2)",
+            rusqlite::params![id, file_id],
+        ).unwrap();
+    }
+
+    #[test]
+    fn deleting_last_member_frame_prunes_empty_calibration_set() {
+        // B2 regression: when a calibration_set's last member frame is
+        // deleted, the parent set must be removed too. The CASCADE on
+        // calibration_set_frames takes care of the junction row; the new
+        // trigger handles the parent.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // calibration_set requires `imagetyp` + `date`; nothing else is FK-bound.
+        insert_dummy_calibration_set(&conn, 500, "Dark");
+        insert_dummy_frame(&conn, 7000);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, 7000)",
+            [],
+        ).unwrap();
+
+        // Sanity: the set is present.
+        let before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 500",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(before, 1);
+
+        // Deleting the lone member triggers the prune.
+        conn.execute(
+            "DELETE FROM calibration_set_frames WHERE set_id = 500 AND frame_id = 7000",
+            [],
+        ).unwrap();
+
+        let after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 500",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(after, 0, "trigger must prune empty parent set");
+    }
+
+    #[test]
+    fn pruning_does_not_touch_master_library_sets() {
+        // Master library sets are intrinsically single-frame. If their member
+        // is removed (e.g., during re-import), the parent shouldn't be
+        // garbage-collected — the trigger explicitly skips is_master_library=1.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (501, 'MasterDark', '2025-01-01', 1)",
+            [],
+        ).unwrap();
+        insert_dummy_frame(&conn, 7001);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (501, 7001)",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "DELETE FROM calibration_set_frames WHERE set_id = 501",
+            [],
+        ).unwrap();
+
+        let still_there: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 501",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(still_there, 1, "master library sets must survive losing their member");
+    }
+
+    #[test]
+    fn startup_sweep_prunes_existing_empty_calibration_sets() {
+        // B2 startup migration: any empty non-master sets that pre-date the
+        // trigger should be cleaned at next init_db.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert an empty non-master set bypassing the trigger by simply not
+        // adding any membership rows.
+        insert_dummy_calibration_set(&conn, 502, "Bias");
+
+        let before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 502",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(before, 1);
+
+        // Re-run init_db to fire the sweep.
+        init_db(&conn).unwrap();
+
+        let after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 502",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(after, 0, "startup sweep should remove the empty set");
+    }
+
+    #[test]
+    fn startup_orphan_sweep_cleans_existing_dangling_subcal_links() {
+        // A5 startup migration: if an older DB already has orphan rows (e.g.,
+        // from a delete that happened before the trigger existed), running
+        // init_db should remove them.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Manually insert an orphan: a sub-cal link where source_id has no
+        // matching calibration_set row.
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (999, 'calibration_set', 200, 'Bias', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap_err();
+        // The line above fails because calibration_set_id=200 doesn't exist
+        // (FK CASCADE requires it). Set up a valid target first.
+        insert_dummy_calibration_set(&conn, 200, "Bias");
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (999, 'calibration_set', 200, 'Bias', '2025-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        let orphans_before: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_to_frames
+             WHERE source_type='calibration_set'
+               AND source_id NOT IN (SELECT id FROM calibration_set)",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(orphans_before, 1, "test set up an orphan to be cleaned");
+
+        // Re-run init_db (idempotent) to trigger the sweep.
+        init_db(&conn).unwrap();
+
+        let orphans_after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_to_frames
+             WHERE source_type='calibration_set'
+               AND source_id NOT IN (SELECT id FROM calibration_set)",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(orphans_after, 0, "init_db should have swept orphans away");
     }
 }

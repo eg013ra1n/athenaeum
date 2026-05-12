@@ -52,6 +52,7 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
   const progress = myBatch?.progress ?? null;
   const currentFrameId = myBatch?.currentFrameId ?? null;
   const completedSummary = myBatch?.isComplete ? myBatch.summary : null;
+  const completedError = myBatch?.isComplete ? myBatch.errorMessage : null;
   const frameStatuses = myBatch?.frameStatuses ?? new Map();
 
   const startBatch = (ids: number[]) => {
@@ -139,26 +140,13 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
         </div>
       )}
 
-      {/* Cancel button in hidden-buttons mode — only shown while active */}
-      {hideTriggerButtons && isActive && (
-        <div className="flex items-center justify-end">
-          <button
-            onClick={handleCancel}
-            disabled={isCancelling}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors
-              border border-border hover:bg-surface-hover disabled:opacity-50"
-          >
-            <XCircle size={15} />
-            {isCancelling ? 'Cancelling...' : 'Cancel'}
-          </button>
-        </div>
-      )}
-
-      {/* Active progress bar */}
+      {/* Active progress bar — Cancel sits inline at the right end of the
+          top row instead of in a separate block above, so the whole widget
+          stays on one tight line. */}
       {isActive && progress && (
         <div className="rounded-lg border border-border bg-surface p-3 space-y-2">
-          <div className="flex items-center justify-between text-sm">
-            <div className="flex items-center gap-2 text-content-secondary min-w-0">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <div className="flex items-center gap-2 text-content-secondary min-w-0 flex-1">
               <Loader2 size={14} className="animate-spin flex-shrink-0 text-violet-400" />
               <span className="truncate">
                 {isCancelling
@@ -168,9 +156,20 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
                   : 'Preparing...'}
               </span>
             </div>
-            <span className="text-content-muted flex-shrink-0 ml-3">
+            <span className="text-content-muted flex-shrink-0 tabular-nums">
               {progress.current} / {progress.total}
             </span>
+            {hideTriggerButtons && (
+              <button
+                onClick={handleCancel}
+                disabled={isCancelling}
+                title={isCancelling ? 'Cancelling…' : 'Cancel batch'}
+                className="flex-shrink-0 inline-flex items-center justify-center w-6 h-6 rounded text-content-muted hover:text-error hover:bg-surface-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                aria-label="Cancel plate-solve batch"
+              >
+                <XCircle size={14} />
+              </button>
+            )}
           </div>
 
           <div className="h-1.5 w-full rounded-full bg-surface-hover overflow-hidden">
@@ -203,25 +202,43 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
       {completedSummary && !isActive && (
         <div
           className={`p-3 rounded-lg border flex items-start gap-2 ${
-            completedSummary.failed === 0
+            completedError
+              ? 'bg-error-muted border-error/50'
+              : completedSummary.failed === 0
               ? 'bg-success-muted border-success/50'
               : 'bg-warning-muted border-warning/50'
           }`}
         >
-          {completedSummary.failed === 0 ? (
+          {completedError ? (
+            <AlertCircle size={16} className="text-error flex-shrink-0 mt-0.5" />
+          ) : completedSummary.failed === 0 ? (
             <CheckCircle size={16} className="text-success flex-shrink-0 mt-0.5" />
           ) : (
             <AlertCircle size={16} className="text-warning flex-shrink-0 mt-0.5" />
           )}
           <div className="flex-1 text-sm">
-            <p className={`font-medium ${completedSummary.failed === 0 ? 'text-success' : 'text-warning'}`}>
-              Batch solve complete
+            <p
+              className={`font-medium ${
+                completedError
+                  ? 'text-error'
+                  : completedSummary.failed === 0
+                  ? 'text-success'
+                  : 'text-warning'
+              }`}
+            >
+              {completedError ? 'Plate solve could not start' : 'Batch solve complete'}
             </p>
-            <p className="text-content-muted text-xs mt-0.5">
-              {completedSummary.solved} solved, {completedSummary.failed} failed out of{' '}
-              {completedSummary.total} frames &mdash;{' '}
-              {(completedSummary.total_time_ms / 1000).toFixed(1)}s total
-            </p>
+            {completedError ? (
+              <p className="text-content-muted text-xs mt-0.5 break-words">
+                {completedError}
+              </p>
+            ) : (
+              <p className="text-content-muted text-xs mt-0.5">
+                {completedSummary.solved} solved, {completedSummary.failed} failed out of{' '}
+                {completedSummary.total} frames &mdash;{' '}
+                {(completedSummary.total_time_ms / 1000).toFixed(1)}s total
+              </p>
+            )}
           </div>
           <button
             onClick={handleDismiss}

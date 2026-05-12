@@ -123,6 +123,27 @@ fn main() -> anyhow::Result<()> {
                 ..base.clone()
             },
         ),
+        (
+            "wide-hash (probe ±2)",
+            PlateSolveConfig { index_lookup_tolerance: 2, ..base.clone() },
+        ),
+        (
+            "wide-hash + precise",
+            PlateSolveConfig {
+                index_lookup_tolerance: 2,
+                use_fast_detection: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "wide-hash + precise + many-stars (1200)",
+            PlateSolveConfig {
+                index_lookup_tolerance: 2,
+                use_fast_detection: false,
+                retry_passes: vec![100, 300, 600, 1200],
+                ..base.clone()
+            },
+        ),
     ];
 
     let mut rows: Vec<Row> = Vec::new();

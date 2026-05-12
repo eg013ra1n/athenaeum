@@ -10,7 +10,7 @@ import {
   CheckCheck,
   ArrowLeftRight,
 } from "lucide-react";
-import { revealItemInDir } from "../../api/desktop";
+import { useNavigate } from "react-router-dom";
 import type { FrameListProps, SortField } from "./types";
 
 function formatTime(dateStr: string | null | undefined): string {
@@ -64,6 +64,8 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
   onClearSelection,
   onInvertSelection,
 }) {
+  const navigate = useNavigate();
+
   // Compute sorted display order (array of original indices)
   const sortedIndices = useMemo(() => {
     const indices = frames.map((_, i) => i);
@@ -214,9 +216,14 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                     <Loader2 className="animate-spin flex-shrink-0 ml-auto" size={11} />
                   )}
                   <button
-                    onClick={(e) => { e.stopPropagation(); revealItemInDir(frame.file.path); }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigate('/files', {
+                        state: { reveal: { path: frame.file.path, token: Date.now() } },
+                      });
+                    }}
                     className={`ml-auto p-1 rounded transition-colors flex-shrink-0 ${isCurrent ? 'text-surface/60 hover:text-surface' : 'text-content-muted hover:text-content hover:bg-surface-hover'}`}
-                    title="Reveal in file explorer"
+                    title="Locate in file browser"
                   >
                     <FolderOpen size={12} />
                   </button>

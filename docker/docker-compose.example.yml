@@ -11,9 +11,9 @@
 
 services:
   athenaeum:
-    image: ghcr.io/eg013ra1n/athenaeum:latest
+    image: vsharifov/athenaeum:latest
     # For beta builds, use:
-    # image: ghcr.io/eg013ra1n/athenaeum:beta
+    # image: vsharifov/athenaeum:beta
     ports:
       - "3000:3000"
     volumes:

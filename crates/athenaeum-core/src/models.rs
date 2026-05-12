@@ -26,6 +26,30 @@ pub enum FileFormat {
     XISF,
 }
 
+/// Effective temperature for a frame: prefer the measured `ccd_temp`, but
+/// fall back to `set_temp` (commanded cooler temperature) when the measured
+/// reading is missing. Master frames and uncooled emergency captures often
+/// arrive with `ccd_temp = NULL` but a valid `set_temp` — without this
+/// fallback those frames would cluster into a single "no-temperature" bucket
+/// and silently mix cooled and uncooled darks. Auto-link / Manual modal both
+/// use this helper.
+pub fn effective_temp(ccd_temp: Option<f64>, set_temp: Option<f64>) -> Option<f64> {
+    ccd_temp.or(set_temp)
+}
+
+/// Heuristic: a frame is "filter-ambiguous mono" when it has no Bayer pattern
+/// (so it isn't an OSC sensor) and no FILTER keyword. Filter wheels on mono
+/// cameras normally write the slot label to FILTER; a NULL FILTER on a mono
+/// camera with a wheel is most often a driver hiccup or hand-edit, not an
+/// "I shot without any filter" intention. Auto-link can't tell which physical
+/// filter the frame came through, so the matcher logs a warning when it sees
+/// this case (used by A7). Pure-mono setups without a filter wheel will also
+/// trigger this heuristic — that's intentional, the user must confirm manually
+/// that auto-linking by NULL-filter is what they want.
+pub fn is_mono_with_ambiguous_filter(bayerpat: &Option<String>, filter: &Option<String>) -> bool {
+    bayerpat.is_none() && filter.is_none()
+}
+
 /// Represents a FITS/XISF frame with metadata
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Frame {
@@ -757,7 +781,7 @@ pub struct CalibrationMetadataEdits {
 /// Bulk edits for light/calibration frame metadata in the `frames` table.
 /// Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type actions.
 /// None means don't change that field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameMetadataEdits {
     pub instrume: Option<String>,
@@ -768,6 +792,39 @@ pub struct FrameMetadataEdits {
     /// type (e.g. `imagetyp = "DARK"`, `is_master = true` → master dark).
     pub imagetyp: Option<String>,
     pub is_master: Option<bool>,
+    /// Target name (FITS OBJECT). Common cleanup case for misnamed targets.
+    pub object: Option<String>,
+    /// Filter name (FITS FILTER). Common cleanup case for ASIAir mis-records.
+    pub filter: Option<String>,
+    /// Telescope name (FITS TELESCOP).
+    pub telescop: Option<String>,
+    /// Focal length in mm (FITS FOCALLEN).
+    pub focallen: Option<f64>,
+    /// Sensor gain (FITS GAIN). Typically 0-1000.
+    pub gain: Option<f64>,
+    /// Sensor offset (FITS OFFSET). Typically 0+.
+    pub offset: Option<f64>,
+    /// Binning string (e.g. "1x1", "2x2"). When set, xbinning/ybinning are
+    /// also updated to match the parsed components.
+    pub binning: Option<String>,
+    /// Exposure time in seconds (FITS EXPTIME). Must be > 0.
+    pub exptime: Option<f64>,
+    /// CCD temperature in °C (FITS CCD-TEMP). Typically -50..50.
+    pub ccd_temp: Option<f64>,
+    /// Right Ascension in decimal degrees [0, 360). Only set by the metadata
+    /// pane's RA/DEC revert path — there is no text input for these. The
+    /// "manual update" path for coordinates is plate-solving. When set,
+    /// `bulk_update_frame_metadata` also writes the parallel sexagesimal
+    /// `objctra` so derived consumers stay consistent with what the scanner
+    /// and plate solver produce.
+    pub ra: Option<f64>,
+    /// Declination in decimal degrees [-90, 90]. See `ra`.
+    pub dec: Option<f64>,
+    /// Image position angle in degrees (north through east). Plate solving
+    /// derives this from the CD matrix. The metadata pane lets the user
+    /// override or revert it just like any other numeric field. Range is
+    /// `[-360, 360]` to accept either sign convention.
+    pub rotation: Option<f64>,
 }
 
 /// Excluded frame entry (frame excluded during auto-generation)
@@ -776,6 +833,19 @@ pub struct ExcludedFrameEntry {
     pub file_id: i64,
     pub path: String,
     pub filename: String,
+    pub reason: String,
+    pub excluded_at: String,
+}
+
+/// Excluded frame with full file + frame metadata. Mirrors `MissingMetadataRow`
+/// so the same view shell can render both — adds the exclusion `reason` and
+/// `excluded_at` so the Excluded Frames page can surface why a row landed there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExcludedFrameRow {
+    pub file: File,
+    pub frame: Frame,
+    pub has_duplicate: bool,
     pub reason: String,
     pub excluded_at: String,
 }
@@ -841,6 +911,17 @@ pub struct StarMetricsResponse {
     /// When true, star Y coordinates must be flipped: y_display = image_height - 1 - y
     /// and theta must be negated. Mirrors rustafits annotate.rs compute_annotations().
     pub flip_vertical: bool,
+}
+
+/// One frame set that ultimately consumes a calibration set, either directly
+/// (a Light using the set) or transitively via the sub-cal chain
+/// (e.g. Light → Dark → Bias).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSetConsumer {
+    pub frame_set_id: i64,
+    pub name: Option<String>,
+    pub date_obs_start: Option<String>,
 }
 
 /// Original calibration set metadata values (backed up before editing)

@@ -378,17 +378,32 @@ mod tests {
             "expected M 42 designation in {obj}"
         );
 
-        // Frame 2 untouched
+        // Frame 1 should now carry the override marker so the dual-pane
+        // editor's revert UI lights up and the file-row marker renders.
+        let override_flag: i64 = conn
+            .query_row("SELECT override FROM frames WHERE id = 1", [], |r| r.get(0))
+            .expect("read frame 1 override");
+        assert_eq!(override_flag, 1, "auto-fill must set override = 1");
+
+        // Frame 2 untouched (no coords → no auto-fill, no override change).
         let obj2: Option<String> = conn
             .query_row("SELECT object FROM frames WHERE id = 2", [], |r| r.get(0))
             .expect("read frame 2");
         assert!(obj2.is_none());
+        let override_flag_2: i64 = conn
+            .query_row("SELECT override FROM frames WHERE id = 2", [], |r| r.get(0))
+            .expect("read frame 2 override");
+        assert_eq!(override_flag_2, 0, "untouched frames must keep override = 0");
 
-        // Frame 3 untouched
+        // Frame 3 untouched.
         let obj3: Option<String> = conn
             .query_row("SELECT object FROM frames WHERE id = 3", [], |r| r.get(0))
             .unwrap();
         assert_eq!(obj3.as_deref(), Some("MyField"));
+        let override_flag_3: i64 = conn
+            .query_row("SELECT override FROM frames WHERE id = 3", [], |r| r.get(0))
+            .expect("read frame 3 override");
+        assert_eq!(override_flag_3, 0, "already-labelled frames must keep override = 0");
 
         // Terminal events count matches summary
         let terminals = events_seen.lock().unwrap();

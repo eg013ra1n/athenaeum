@@ -181,15 +181,15 @@ pub fn update_frame_from_solve(
     let objctdec = format_dec_sexagesimal(dec_deg);
 
     conn.execute(
-        "UPDATE frames SET ra = ?1, dec = ?2, rotation = ?3, objctra = ?4, objctdec = ?5
-         WHERE id = ?6",
+        "UPDATE frames SET ra = ?1, dec = ?2, rotation = ?3, objctra = ?4, objctdec = ?5,
+         override = 1 WHERE id = ?6",
         rusqlite::params![ra_deg, dec_deg, rotation_deg, objctra, objctdec, frame_id],
     )
     .context("Failed to update frame coordinates")?;
 
     if let Some(fl) = derived_focallen_mm {
         conn.execute(
-            "UPDATE frames SET focallen = ?1 WHERE id = ?2 AND focallen IS NULL",
+            "UPDATE frames SET focallen = ?1, override = 1 WHERE id = ?2 AND focallen IS NULL",
             rusqlite::params![fl, frame_id],
         )
         .context("Failed to update derived focal length")?;
@@ -200,6 +200,10 @@ pub fn update_frame_from_solve(
 
 /// Set `frame.object` to `designation` if (and only if) it is currently NULL
 /// or empty. Used to auto-label plate-solve results with the nearest DSO.
+///
+/// Sets `override = 1` so the row carries the same "manually edited" marker
+/// the dual-pane editor uses — making the auto-fill visible in the file
+/// browser and reachable through the existing revert UI in MetadataPane.
 pub fn update_frame_object_if_missing(
     conn: &Connection,
     frame_id: i64,
@@ -207,7 +211,8 @@ pub fn update_frame_object_if_missing(
 ) -> Result<bool> {
     let changed = conn
         .execute(
-            "UPDATE frames SET object = ?1 WHERE id = ?2 AND (object IS NULL OR object = '')",
+            "UPDATE frames SET object = ?1, override = 1
+             WHERE id = ?2 AND (object IS NULL OR object = '')",
             rusqlite::params![designation, frame_id],
         )
         .context("Failed to update frame object")?;

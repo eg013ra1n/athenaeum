@@ -262,7 +262,6 @@ name = "athenaeum-core"
 version = "0.2.0-beta.9"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "byteorder",
  "cdshealpix",
  "chrono",
@@ -296,8 +295,6 @@ dependencies = [
  "athenaeum-core",
  "base64 0.22.1",
  "chrono",
- "futures",
- "quick-xml 0.36.2",
  "rayon",
  "reqwest",
  "rusqlite",
@@ -312,8 +309,6 @@ dependencies = [
  "tauri-plugin-opener",
  "tokio",
  "uuid",
- "walkdir",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -322,6 +317,7 @@ version = "0.2.0-beta.9"
 dependencies = [
  "athenaeum-core",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "rayon",
@@ -4102,7 +4098,7 @@ dependencies = [
 
 [[package]]
 name = "rustafits"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

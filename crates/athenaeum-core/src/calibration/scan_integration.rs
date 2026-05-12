@@ -48,6 +48,9 @@ struct CalibrationFrameData {
     exptime: Option<f64>,
     focallen: Option<f64>,
     ccd_temp: Option<f64>,
+    /// Commanded cooler set-point. Used as fallback when ccd_temp is NULL
+    /// (master frames, uncooled emergency captures) — see A4.
+    set_temp: Option<f64>,
     date_obs: Option<DateTime<Utc>>,
 }
 
@@ -237,7 +240,7 @@ fn query_frame_data(conn: &Connection, frame_ids: &[i64]) -> Result<Vec<Calibrat
 
     let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
     let query = format!(
-        "SELECT id, instrume, filter, binning, gain, offset, exptime, focallen, ccd_temp, date_obs
+        "SELECT id, instrume, filter, binning, gain, offset, exptime, focallen, ccd_temp, set_temp, date_obs
          FROM frames
          WHERE id IN ({})",
         placeholders.join(",")
@@ -254,7 +257,7 @@ fn query_frame_data(conn: &Connection, frame_ids: &[i64]) -> Result<Vec<Calibrat
     let mut rows = stmt.raw_query();
 
     while let Some(row) = rows.next()? {
-        let date_obs_str: Option<String> = row.get(9)?;
+        let date_obs_str: Option<String> = row.get(10)?;
         let date_obs = date_obs_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
@@ -268,6 +271,7 @@ fn query_frame_data(conn: &Connection, frame_ids: &[i64]) -> Result<Vec<Calibrat
             exptime: row.get(6)?,
             focallen: row.get(7)?,
             ccd_temp: row.get(8)?,
+            set_temp: row.get(9)?,
             date_obs,
         });
     }
@@ -525,11 +529,18 @@ fn create_flat_group_from_cluster(_key: &FlatGroupKey, frames: &[CalibrationFram
         .max()
         .unwrap_or_else(Utc::now);
 
-    let temps: Vec<f64> = frames.iter().filter_map(|f| f.ccd_temp).collect();
-    let avg_temp = if !temps.is_empty() {
-        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    // A4: prefer ccd_temp, fall back to set_temp so master frames don't
+    // collapse into a single no-temperature bucket.
+    let temps: Vec<f64> = frames.iter()
+        .filter_map(|f| crate::models::effective_temp(f.ccd_temp, f.set_temp))
+        .collect();
+    let (avg_temp, temp_min, temp_max) = if !temps.is_empty() {
+        let avg = temps.iter().sum::<f64>() / temps.len() as f64;
+        let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (Some(avg), Some(min), Some(max))
     } else {
-        None
+        (None, None, None)
     };
 
     // Get values from first frame to preserve Option<T> (NULL) semantics
@@ -547,6 +558,8 @@ fn create_flat_group_from_cluster(_key: &FlatGroupKey, frames: &[CalibrationFram
         start_time,
         end_time,
         avg_temp,
+        temp_min,
+        temp_max,
         frame_count,
         filter,
         instrume,
@@ -573,11 +586,18 @@ fn create_dark_group_from_cluster(_key: &DarkGroupKey, frames: &[CalibrationFram
         .max()
         .unwrap_or_else(Utc::now);
 
-    let temps: Vec<f64> = frames.iter().filter_map(|f| f.ccd_temp).collect();
-    let avg_temp = if !temps.is_empty() {
-        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    // A4: prefer ccd_temp, fall back to set_temp so master frames don't
+    // collapse into a single no-temperature bucket.
+    let temps: Vec<f64> = frames.iter()
+        .filter_map(|f| crate::models::effective_temp(f.ccd_temp, f.set_temp))
+        .collect();
+    let (avg_temp, temp_min, temp_max) = if !temps.is_empty() {
+        let avg = temps.iter().sum::<f64>() / temps.len() as f64;
+        let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (Some(avg), Some(min), Some(max))
     } else {
-        None
+        (None, None, None)
     };
 
     // Get values from first frame to preserve Option<T> (NULL) semantics
@@ -593,6 +613,8 @@ fn create_dark_group_from_cluster(_key: &DarkGroupKey, frames: &[CalibrationFram
         start_time,
         end_time,
         avg_temp,
+        temp_min,
+        temp_max,
         frame_count,
         instrume,
         binning,
@@ -618,11 +640,18 @@ fn create_bias_group_from_cluster(_key: &BiasGroupKey, frames: &[CalibrationFram
         .max()
         .unwrap_or_else(Utc::now);
 
-    let temps: Vec<f64> = frames.iter().filter_map(|f| f.ccd_temp).collect();
-    let avg_temp = if !temps.is_empty() {
-        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    // A4: prefer ccd_temp, fall back to set_temp so master frames don't
+    // collapse into a single no-temperature bucket.
+    let temps: Vec<f64> = frames.iter()
+        .filter_map(|f| crate::models::effective_temp(f.ccd_temp, f.set_temp))
+        .collect();
+    let (avg_temp, temp_min, temp_max) = if !temps.is_empty() {
+        let avg = temps.iter().sum::<f64>() / temps.len() as f64;
+        let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (Some(avg), Some(min), Some(max))
     } else {
-        None
+        (None, None, None)
     };
 
     // Get values from first frame to preserve Option<T> (NULL) semantics
@@ -637,6 +666,8 @@ fn create_bias_group_from_cluster(_key: &BiasGroupKey, frames: &[CalibrationFram
         start_time,
         end_time,
         avg_temp,
+        temp_min,
+        temp_max,
         frame_count,
         instrume,
         binning,
@@ -782,6 +813,10 @@ fn create_dark_calibration_set_with_type(
     let date_end = dark_group.end_time.to_rfc3339();
     let frame_count = dark_group.frame_ids.len() as i64;
 
+    // Use the real cold/warm range; fall back to avg_temp for groups that
+    // pre-date the per-frame range tracking.
+    let temp_min = dark_group.temp_min.or(dark_group.avg_temp);
+    let temp_max = dark_group.temp_max.or(dark_group.avg_temp);
     conn.execute(
         "INSERT INTO calibration_set
          (imagetyp, exptime, filter, ccd_temp, gain, offset, binning, instrume, date,
@@ -798,8 +833,8 @@ fn create_dark_calibration_set_with_type(
             date,
             date_start,
             date_end,
-            dark_group.avg_temp,
-            dark_group.avg_temp,
+            temp_min,
+            temp_max,
             frame_count,
             dark_group.focal_length,
         ],

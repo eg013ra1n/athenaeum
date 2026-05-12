@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
-import { Files, Calendar, Target, Focus, Camera, Layers, Settings, Trash2, Info, ChevronsLeft, ChevronsRight } from 'lucide-react';
+import { Files, Calendar, Target, Focus, Camera, Settings, Trash2, Info, ChevronsLeft, ChevronsRight } from 'lucide-react';
 import { ArchiveResumeBanner } from './archive/ArchiveResumeBanner';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
@@ -10,6 +10,7 @@ import { AnalysisProgressProvider } from '../contexts/AnalysisProgressContext';
 import { AnalysisQueueIndicator } from './AnalysisQueueIndicator';
 import { PlateSolveProgressProvider } from '../contexts/PlateSolveProgressContext';
 import { PlateSolveQueueIndicator } from './PlateSolveQueueIndicator';
+import { PlateSolveIndexMissingModal } from './plate-solve';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { NotificationBell } from './NotificationBell';
 import { ToastStack } from './Toast';
@@ -30,7 +31,6 @@ export default function Layout() {
     { to: '/equipment', icon: Camera, label: 'Equipment' },
     { to: '/skychart', icon: Focus, label: 'Sky Chart' },
     { to: '/calendar', icon: Calendar, label: 'Shoot Calendar' },
-    { to: '/export', icon: Layers, label: 'Export' },
     { to: '/blackhole', icon: Trash2, label: 'Black Hole' },
     { to: '/settings', icon: Settings, label: 'Settings' },
     { to: '/about', icon: Info, label: 'About' },
@@ -105,6 +105,7 @@ export default function Layout() {
           {/* Global progress indicators */}
           <ScanProgressIndicator />
           <ExportProgressIndicator />
+          <PlateSolveIndexMissingModal />
           <ToastStack />
         </div>
         </PlateSolveProgressProvider>

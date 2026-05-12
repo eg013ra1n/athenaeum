@@ -1,46 +1,19 @@
-import { Loader2 } from 'lucide-react';
-import { useExportSummary } from '../../hooks/useExportData';
 import { EquipmentHeader } from './EquipmentHeader';
 import { FilterGroupCard } from './FilterGroupCard';
 import { FolderStructurePreview } from './FolderStructurePreview';
-import type { DetailedWarning } from '../../types/export';
+import type { DetailedWarning, ExportSummary as ExportSummaryType } from '../../types/export';
 
 interface ExportSummaryProps {
-  frameSetId: number;
+  /** Pre-loaded summary. The caller fetches via `useExportSummary` and
+   *  handles its own loading / error states — this lets the same summary
+   *  drive both ExportSummary and WarningsPanel without two fetches. */
+  summary: ExportSummaryType;
 }
 
 /**
  * Main export summary container that orchestrates all summary components
  */
-export function ExportSummary({ frameSetId }: ExportSummaryProps) {
-  const { summary, loading, error } = useExportSummary(frameSetId);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-8 h-8 animate-spin text-accent" />
-        <span className="ml-3 text-content-muted">Loading export summary...</span>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="p-4 bg-error/10 border border-error/30 rounded-lg">
-        <h3 className="font-medium text-error mb-1">Failed to load export summary</h3>
-        <p className="text-sm text-content-muted">{error}</p>
-      </div>
-    );
-  }
-
-  if (!summary) {
-    return (
-      <div className="p-4 text-center text-content-muted">
-        No export data available
-      </div>
-    );
-  }
-
+export function ExportSummary({ summary }: ExportSummaryProps) {
   // Filter warnings to only include actionable ones (exclude missing calibration - already shown in UI)
   const getWarningsForFilter = (filterName: string | null): DetailedWarning[] => {
     const name = filterName || 'Unfiltered';

@@ -4,7 +4,7 @@ use crate::models::{
     FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning,
     CalibrationHierarchyView, CalibrationDateGroup, CalibrationCameraGroup,
     CalibrationFilterGroup, LightFrameWithCalibration, CalibrationSetWithFrameCount,
-    SubCalibrationDetail,
+    SubCalibrationDetail, CalibrationSetConsumer,
 };
 use crate::calibration::configurable_matcher::load_config;
 use crate::calibration::config::{MatchMode, CalibrationMatchingConfig};
@@ -20,6 +20,15 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
     let date_warning = if link.date_warning { 1 } else { 0 };
     let temp_warning = if link.temp_warning { 1 } else { 0 };
     let is_manual_override = if link.is_manual_override { 1 } else { 0 };
+
+    // Reserve match_score = 1.0 as the manual-assignment marker.
+    // `manual_assign_calibration` / `manual_assign_subcalibration` both write
+    // 1.0 to flag a user pick; clamp auto-find scores to 0.999 so any UI
+    // consumer that wants to distinguish (badge "Manual" vs "Auto") can do so
+    // by score alone, while `is_manual_override` remains the authoritative flag.
+    let match_score = link.match_score.map(|s| {
+        if !link.is_manual_override && s >= 1.0 { 0.999 } else { s }
+    });
 
     // If this is an automatic assignment, check if there's a manual override we should preserve
     if !link.is_manual_override {
@@ -55,7 +64,7 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
             link.calibration_set_id,
             &link.calibration_type,
             &matched_at,
-            link.match_score,
+            match_score,
             date_warning,
             temp_warning,
             is_manual_override
@@ -119,6 +128,35 @@ pub fn get_links_for_calibration_set(conn: &Connection, set_id: i64) -> Result<V
     })?;
 
     links.collect()
+}
+
+/// Look up the manually-overridden calibration_set_id for a frame, if any.
+///
+/// `calibration_type` is one of "Flat", "Dark", "Bias", "DarkFlat".
+/// Returns `Ok(Some(set_id))` when the frame has a row in
+/// `calibration_set_to_frames` with `is_manual_override = 1` for that type,
+/// otherwise `Ok(None)`.
+pub fn get_manual_override_set_id(
+    conn: &Connection,
+    frame_id: i64,
+    calibration_type: &str,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT calibration_set_id
+         FROM calibration_set_to_frames
+         WHERE source_id = ?1
+           AND source_type = 'frame'
+           AND calibration_type = ?2
+           AND is_manual_override = 1
+         LIMIT 1",
+    )?;
+
+    let mut rows = stmt.query(params![frame_id, calibration_type])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Get sub-calibration details for a calibration set
@@ -364,6 +402,49 @@ pub fn get_calibration_statistics(conn: &Connection, frame_set_id: i64) -> Resul
 
 /// Check if a calibration link exists
 #[allow(dead_code)]
+/// Frame sets that ultimately consume the given calibration set.
+///
+/// Walks the sub-cal chain via `calibration_set_to_frames` (so a Bias used
+/// only via Darks still surfaces the Lights' frame sets), then resolves to
+/// the unique `frames_set` rows owning those Light frames. Sorted newest
+/// first by `date_obs_start`.
+pub fn get_calibration_set_consumers(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<Vec<CalibrationSetConsumer>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE consumer_chain(set_id) AS (
+             SELECT ?1
+             UNION
+             SELECT cstf.source_id
+               FROM calibration_set_to_frames cstf
+               JOIN consumer_chain cc ON cstf.calibration_set_id = cc.set_id
+              WHERE cstf.source_type = 'calibration_set'
+         )
+         SELECT fs.id, fs.name, MIN(fs.date_obs_start) AS date_obs_start
+           FROM consumer_chain cc
+           JOIN calibration_set_to_frames cstf
+                ON cstf.calibration_set_id = cc.set_id
+               AND cstf.source_type = 'frame'
+           JOIN session_members sm     ON sm.frame_id = cstf.source_id
+           JOIN sessions s             ON s.id = sm.session_id
+           JOIN imaging_nights inight  ON inight.id = s.imaging_night_id
+           JOIN frames_set fs          ON fs.id = inight.frames_set_id
+          GROUP BY fs.id, fs.name
+          ORDER BY fs.date_obs_start DESC, fs.name ASC"
+    )?;
+
+    let rows = stmt.query_map(params![set_id], |row| {
+        Ok(CalibrationSetConsumer {
+            frame_set_id: row.get(0)?,
+            name: row.get::<_, Option<String>>(1)?,
+            date_obs_start: row.get::<_, Option<String>>(2)?,
+        })
+    })?;
+
+    rows.collect()
+}
+
 pub fn link_exists(
     conn: &Connection,
     source_id: i64,

@@ -2,6 +2,7 @@
 
 use super::AppState;
 use athenaeum_core::archive::{db as adb, executor, planner, resume, restore, rollback, models::*};
+use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
 use athenaeum_core::services::ArchiveHandle;
 use athenaeum_core::settings::keys;
 use rusqlite::{params, Connection};
@@ -224,13 +225,6 @@ pub async fn start_archive_operation(
     conflict_resolution: ConflictResolution,
     archive_root_path: Option<String>,
 ) -> Result<i64, String> {
-    // One-at-a-time enforcement.
-    {
-        let map = state.ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err("another archive operation is already in progress".into());
-        }
-    }
     let ctx = state.ctx.clone();
     let db = ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -243,56 +237,59 @@ pub async fn start_archive_operation(
     let op_id = planner::commit_plan(&conn, &plan, conflict_resolution)
         .map_err(|e| format!("{:#}", e))?;
 
-    // Register the cancel flag.
+    // Register the cancel flag so cancel_archive_operation can find it.
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
         let mut map = ctx.active_archives.lock().unwrap();
         map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
     }
 
-    // Spawn worker. DB connection is obtained inside the thread (connections are not Send).
+    // Enqueue. Single global worker (shared with file ops) drives execution
+    // serially. DB connection is obtained inside the closure since rusqlite
+    // connections are not Send across thread boundaries.
     let ctx_for_worker = ctx.clone();
     let app_for_emitter = app.clone();
-    std::thread::spawn(move || {
-        let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
-        let db = ctx_for_worker.db.get().expect("db");
-        let conn = db.conn();
-        let result = executor::run_operation(&conn, op_id, &cancel_flag, &emitter);
-        let outcome = match result {
-            Ok(()) => {
-                eprintln!("archive operation {} completed", op_id);
-                "completed"
-            }
-            Err(e) => {
-                let outcome = if executor::was_cancelled(&e) {
-                    let _ = adb::update_operation_status(
-                        &conn, op_id, ArchiveStatus::Cancelled, None,
-                    );
-                    "cancelled"
-                } else {
-                    eprintln!("archive operation {} failed: {:#}", op_id, e);
-                    let msg = format!("{:#}", e);
-                    let _ = adb::update_operation_status(
-                        &conn, op_id, ArchiveStatus::Failed, Some(&msg),
-                    );
-                    "failed"
-                };
-                // Auto-rollback on cancel or failure.
-                if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
-                    eprintln!("rollback for {} failed: {:#}", op_id, rb_err);
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            let result = executor::run_operation(&conn, op_id, &cancel_flag, &emitter);
+            let outcome = match result {
+                Ok(()) => {
+                    eprintln!("archive operation {} completed", op_id);
+                    "completed"
                 }
-                outcome
-            }
-        };
-        // Tell the UI the operation is over so the progress widget can dismiss.
-        athenaeum_core::events::emit_event(
-            &emitter,
-            "archive-finished",
-            &serde_json::json!({ "operation_id": op_id, "outcome": outcome }),
-        );
-        // Remove from active map regardless of outcome.
-        let mut map = ctx_for_worker.active_archives.lock().unwrap();
-        map.remove(&op_id);
+                Err(e) => {
+                    let outcome = if executor::was_cancelled(&e) {
+                        let _ = adb::update_operation_status(
+                            &conn, op_id, ArchiveStatus::Cancelled, None,
+                        );
+                        "cancelled"
+                    } else {
+                        eprintln!("archive operation {} failed: {:#}", op_id, e);
+                        let msg = format!("{:#}", e);
+                        let _ = adb::update_operation_status(
+                            &conn, op_id, ArchiveStatus::Failed, Some(&msg),
+                        );
+                        "failed"
+                    };
+                    if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
+                        eprintln!("rollback for {} failed: {:#}", op_id, rb_err);
+                    }
+                    outcome
+                }
+            };
+            athenaeum_core::events::emit_event(
+                &emitter,
+                "archive-finished",
+                &serde_json::json!({ "operation_id": op_id, "outcome": outcome }),
+            );
+            let mut map = ctx_for_worker.active_archives.lock().unwrap();
+            map.remove(&op_id);
+        }),
     });
 
     Ok(op_id)
@@ -326,12 +323,6 @@ pub async fn resume_archive_operation(
     state: State<'_, AppState>,
     operation_id: i64,
 ) -> Result<(), String> {
-    {
-        let map = state.ctx.active_archives.lock().unwrap();
-        if !map.is_empty() {
-            return Err("another archive operation is already in progress".into());
-        }
-    }
     let ctx = state.ctx.clone();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     ctx.active_archives.lock().unwrap().insert(operation_id, ArchiveHandle {
@@ -339,17 +330,22 @@ pub async fn resume_archive_operation(
     });
 
     let app_for_emitter = app.clone();
-    std::thread::spawn(move || {
-        let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
-        let db = ctx.db.get().expect("db");
-        let conn = db.conn();
-        if let Err(e) = resume::resume_operation(&conn, operation_id, &cancel_flag, &emitter) {
-            eprintln!("resume {} failed: {:#}", operation_id, e);
-            let msg = format!("{:#}", e);
-            let _ = adb::update_operation_status(&conn, operation_id, ArchiveStatus::Failed, Some(&msg));
-            let _ = rollback::rollback_operation(&conn, operation_id, &emitter);
-        }
-        ctx.active_archives.lock().unwrap().remove(&operation_id);
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id,
+        run: Box::new(move || {
+            let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            if let Err(e) = resume::resume_operation(&conn, operation_id, &cancel_flag, &emitter) {
+                eprintln!("resume {} failed: {:#}", operation_id, e);
+                let msg = format!("{:#}", e);
+                let _ = adb::update_operation_status(&conn, operation_id, ArchiveStatus::Failed, Some(&msg));
+                let _ = rollback::rollback_operation(&conn, operation_id, &emitter);
+            }
+            ctx_for_worker.active_archives.lock().unwrap().remove(&operation_id);
+        }),
     });
 
     Ok(())
@@ -418,13 +414,18 @@ pub async fn rollback_archive_operation(
 ) -> Result<(), String> {
     let ctx = state.ctx.clone();
     let app_for_emitter = app.clone();
-    std::thread::spawn(move || {
-        let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
-        let db = ctx.db.get().expect("db");
-        let conn = db.conn();
-        if let Err(e) = rollback::rollback_operation(&conn, operation_id, &emitter) {
-            eprintln!("rollback {} failed: {:#}", operation_id, e);
-        }
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id,
+        run: Box::new(move || {
+            let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            if let Err(e) = rollback::rollback_operation(&conn, operation_id, &emitter) {
+                eprintln!("rollback {} failed: {:#}", operation_id, e);
+            }
+        }),
     });
     Ok(())
 }
@@ -545,27 +546,31 @@ pub async fn start_restore_operation(
         operation_id, cancel_flag: cancel_flag.clone(),
     });
     let app_for_emitter = app.clone();
-    std::thread::spawn(move || {
-        let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
-        let db = ctx.db.get().expect("db");
-        let conn = db.conn();
-        let outcome = match restore::run_restore(
-            &conn, operation_id, Path::new(&target_root_path),
-            overwrite_existing, keep_zip_after_restore, &cancel_flag, &emitter,
-        ) {
-            Ok(()) => "completed",
-            Err(e) => {
-                eprintln!("restore {} failed: {:#}", operation_id, e);
-                if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
-            }
-        };
-        // Tell the UI the restore is over so the progress widget can dismiss.
-        athenaeum_core::events::emit_event(
-            &emitter,
-            "archive-finished",
-            &serde_json::json!({ "operation_id": operation_id, "outcome": outcome, "kind": "restore" }),
-        );
-        ctx.active_archives.lock().unwrap().remove(&operation_id);
+    let ctx_for_worker = ctx.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id,
+        run: Box::new(move || {
+            let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
+            let db = ctx_for_worker.db.get().expect("db");
+            let conn = db.conn();
+            let outcome = match restore::run_restore(
+                &conn, operation_id, Path::new(&target_root_path),
+                overwrite_existing, keep_zip_after_restore, &cancel_flag, &emitter,
+            ) {
+                Ok(()) => "completed",
+                Err(e) => {
+                    eprintln!("restore {} failed: {:#}", operation_id, e);
+                    if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
+                }
+            };
+            athenaeum_core::events::emit_event(
+                &emitter,
+                "archive-finished",
+                &serde_json::json!({ "operation_id": operation_id, "outcome": outcome, "kind": "restore" }),
+            );
+            ctx_for_worker.active_archives.lock().unwrap().remove(&operation_id);
+        }),
     });
     Ok(())
 }

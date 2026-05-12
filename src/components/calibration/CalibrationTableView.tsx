@@ -1,5 +1,7 @@
 // src/components/calibration/CalibrationTableView.tsx
-import { useState, useMemo, useRef, useCallback } from 'react';
+import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { ExternalLink } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   CalibrationFilterGroup,
@@ -10,6 +12,13 @@ import type {
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
 import { ReassignFramePanel } from './ReassignFramePanel';
 
+type CalSetKind = 'Flat' | 'Dark' | 'Bias';
+
+function tabForCalSet(kind: CalSetKind, isMaster: boolean): 'flats' | 'darks' | 'master-flats' | 'master-darks' {
+  if (kind === 'Flat') return isMaster ? 'master-flats' : 'flats';
+  return isMaster ? 'master-darks' : 'darks';
+}
+
 interface CalibrationTableViewProps {
   data: CalibrationHierarchyViewData;
   allFrames: EnrichedLightFrame[];
@@ -18,6 +27,10 @@ interface CalibrationTableViewProps {
   onManualCalibration?: (frameIds: number[]) => void;
   onBlink?: (frameIds: number[]) => void;
   reassignMode?: boolean;
+  /** When set, scroll to + highlight the matching set in the Flat/Dark/Bias table on mount. */
+  highlightCalSet?: { setId: number; kind: 'flat' | 'dark' | 'bias' } | null;
+  /** Called once the highlight has been forwarded to the in-page handlers. */
+  onHighlightConsumed?: () => void;
 }
 
 // ── Section colors (per spec) ──────────────────────────────────────────────
@@ -586,21 +599,26 @@ function SetIdBadge({
   color,
   onClick,
   isMaster,
+  linkLike,
+  title,
 }: {
   id: number;
   color: string;
   onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void;
   isMaster?: boolean;
+  linkLike?: boolean;
+  title?: string;
 }) {
   return (
     <button
       onClick={onClick}
-      className="font-mono text-xs font-bold rounded px-1 py-px transition-colors hover:brightness-110"
+      className={`font-mono text-xs font-bold rounded px-1 py-px transition-colors hover:brightness-110 inline-flex items-center gap-0.5 ${linkLike ? 'cursor-pointer hover:underline' : ''}`}
       style={{ color, backgroundColor: color + '1a' }}
-      title={`Set #${id}`}
+      title={title ?? `Set #${id}`}
     >
-      #{id}
+      <span>#{id}</span>
       {isMaster && <MasterBadge />}
+      {linkLike && <ExternalLink size={10} className="opacity-70" />}
     </button>
   );
 }
@@ -758,6 +776,7 @@ function FlatsTable({
   onRowClick,
   onSubCalClick,
   onLightsClick,
+  onJumpToEquipment,
   compact,
 }: {
   rows: FlatRow[];
@@ -765,6 +784,7 @@ function FlatsTable({
   onRowClick: (row: FlatRow) => void;
   onSubCalClick: (id: number, type: 'Dark' | 'DarkFlat' | 'Bias') => void;
   onLightsClick: (ids: number[]) => void;
+  onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
 }) {
   const [sortField, setSortField] = useState<FlatSortField | null>('sortDate');
@@ -824,7 +844,18 @@ function FlatsTable({
                 style={{ height: 28 }}
               >
                 <td className="px-1.5 py-1 text-sm">
-                  <SetIdBadge id={row.setId} color={SECTION_COLORS.flats} isMaster={row.isMaster} />
+                  <SetIdBadge
+                    id={row.setId}
+                    color={SECTION_COLORS.flats}
+                    isMaster={row.isMaster}
+                    linkLike={row.camera != null}
+                    title={row.camera != null ? `Open #${row.setId} in Equipment` : `Set #${row.setId}`}
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (row.camera == null) return;
+                      onJumpToEquipment({ camera: row.camera, setId: row.setId, kind: 'Flat', isMaster: row.isMaster });
+                    }}
+                  />
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary">
                   {row.filter ?? <span className="text-content-muted italic">—</span>}
@@ -882,6 +913,7 @@ function DarksTable({
   onRowClick,
   onBiasClick,
   onLightsClick,
+  onJumpToEquipment,
   compact,
 }: {
   rows: DarkRow[];
@@ -889,6 +921,7 @@ function DarksTable({
   onRowClick: (row: DarkRow) => void;
   onBiasClick: (id: number) => void;
   onLightsClick: (ids: number[]) => void;
+  onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
 }) {
   const [sortField, setSortField] = useState<DarkSortField | null>('sortDate');
@@ -946,7 +979,18 @@ function DarksTable({
                 style={{ height: 28 }}
               >
                 <td className="px-1.5 py-1 text-sm">
-                  <SetIdBadge id={row.setId} color={SECTION_COLORS.darks} isMaster={row.isMaster} />
+                  <SetIdBadge
+                    id={row.setId}
+                    color={SECTION_COLORS.darks}
+                    isMaster={row.isMaster}
+                    linkLike={row.camera != null}
+                    title={row.camera != null ? `Open #${row.setId} in Equipment` : `Set #${row.setId}`}
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (row.camera == null) return;
+                      onJumpToEquipment({ camera: row.camera, setId: row.setId, kind: 'Dark', isMaster: row.isMaster });
+                    }}
+                  />
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary">
                   {row.exptime != null ? `${row.exptime}s` : '—'}
@@ -999,12 +1043,14 @@ function BiasTable({
   highlightedSetIds,
   onRowClick,
   onLightsClick,
+  onJumpToEquipment,
   compact,
 }: {
   rows: BiasRow[];
   highlightedSetIds: Set<number>;
   onRowClick: (row: BiasRow) => void;
   onLightsClick: (ids: number[]) => void;
+  onJumpToEquipment: (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => void;
   compact?: boolean;
 }) {
   const [sortField, setSortField] = useState<BiasSortField | null>('sortDate');
@@ -1059,7 +1105,18 @@ function BiasTable({
                 style={{ height: 28 }}
               >
                 <td className="px-1.5 py-1 text-sm">
-                  <SetIdBadge id={row.setId} color={SECTION_COLORS.bias} isMaster={row.isMaster} />
+                  <SetIdBadge
+                    id={row.setId}
+                    color={SECTION_COLORS.bias}
+                    isMaster={row.isMaster}
+                    linkLike={row.camera != null}
+                    title={row.camera != null ? `Open #${row.setId} in Equipment` : `Set #${row.setId}`}
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (row.camera == null) return;
+                      onJumpToEquipment({ camera: row.camera, setId: row.setId, kind: 'Bias', isMaster: row.isMaster });
+                    }}
+                  />
                 </td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary tabular-nums">{row.frameCount}</td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary whitespace-nowrap">{row.dateRange}</td>
@@ -1100,7 +1157,27 @@ export function CalibrationTableView({
   onManualCalibration,
   onBlink,
   reassignMode = false,
+  highlightCalSet,
+  onHighlightConsumed,
 }: CalibrationTableViewProps) {
+  const navigate = useNavigate();
+
+  // Cross-page jump: open the matching camera + tab on the Equipment page,
+  // with the row scrolled into view, highlighted, and auto-expanded.
+  const handleJumpToEquipment = useCallback(
+    (row: { camera: string | null; setId: number; kind: CalSetKind; isMaster: boolean }) => {
+      if (row.camera == null) return;
+      const tab = tabForCalSet(row.kind, row.isMaster);
+      const params = new URLSearchParams({
+        camera: row.camera,
+        tab,
+        highlightSet: String(row.setId),
+      });
+      navigate(`/equipment?${params.toString()}`);
+    },
+    [navigate]
+  );
+
   // Selected light row for reassign mode
   const [selectedLightRow, setSelectedLightRow] = useState<LightRow | null>(null);
 
@@ -1256,6 +1333,28 @@ export function CalibrationTableView({
     setHighlightedFlatIds(new Set());
   }, [highlightedBiasIds, darkRows, clearHighlights]);
 
+  // Cross-page jump from Equipment chip → highlight + scroll to the originating
+  // calibration set in the matching table. Fires once per highlightCalSet
+  // change, after derived rows are ready, then signals the parent to clear.
+  useEffect(() => {
+    if (!highlightCalSet) return;
+    const { setId, kind } = highlightCalSet;
+    const exists =
+      kind === 'flat' ? flatRows.some(r => r.setId === setId) :
+      kind === 'dark' ? darkRows.some(r => r.setId === setId) :
+      biasRows.some(r => r.setId === setId);
+    if (!exists) return;
+    if (kind === 'flat') {
+      handleFlatClick(setId);
+    } else if (kind === 'dark') {
+      handleDarkClick(setId);
+    } else {
+      handleBiasClick(setId);
+    }
+    onHighlightConsumed?.();
+    // intentionally only re-runs when highlightCalSet (or the derived rows) change
+  }, [highlightCalSet, flatRows, darkRows, biasRows, handleFlatClick, handleDarkClick, handleBiasClick, onHighlightConsumed]);
+
   // Highlight light rows by frame IDs (from "Lights" count click in cal tables)
   const handleLightsByFrameIds = useCallback((frameIds: number[]) => {
     const idSet = new Set(frameIds);
@@ -1354,19 +1453,19 @@ export function CalibrationTableView({
             {flatRows.length > 0 && (
               <div ref={flatsSectionRef}>
                 <SectionHeader title="Flats" count={flatRows.length} color={SECTION_COLORS.flats} />
-                <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} compact={reassignMode} />
+                <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} />
               </div>
             )}
             {darkRows.length > 0 && (
               <div ref={darksSectionRef} className="border-t border-border/30">
                 <SectionHeader title="Darks" count={darkRows.length} color={SECTION_COLORS.darks} />
-                <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} compact={reassignMode} />
+                <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} />
               </div>
             )}
             {biasRows.length > 0 && (
               <div ref={biasSectionRef} className="border-t border-border/30">
                 <SectionHeader title="Bias" count={biasRows.length} color={SECTION_COLORS.bias} />
-                <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} compact={reassignMode} />
+                <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} />
               </div>
             )}
           </div>
@@ -1389,9 +1488,9 @@ export function CalibrationTableView({
               ))}
             </div>
             <div className="flex-1 overflow-y-auto" ref={bottomTab === 'flats' ? flatsSectionRef : bottomTab === 'darks' ? darksSectionRef : biasSectionRef}>
-              {bottomTab === 'flats' && <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} compact={reassignMode} />}
-              {bottomTab === 'darks' && <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} compact={reassignMode} />}
-              {bottomTab === 'bias' && <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} compact={reassignMode} />}
+              {bottomTab === 'flats' && <FlatsTable rows={flatRows} highlightedSetIds={highlightedFlatIds} onRowClick={handleFlatRowClick} onSubCalClick={handleSubCalClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} />}
+              {bottomTab === 'darks' && <DarksTable rows={darkRows} highlightedSetIds={highlightedDarkIds} onRowClick={handleDarkRowClick} onBiasClick={handleBiasClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} />}
+              {bottomTab === 'bias' && <BiasTable rows={biasRows} highlightedSetIds={highlightedBiasIds} onRowClick={handleBiasRowClick} onLightsClick={handleLightsByFrameIds} onJumpToEquipment={handleJumpToEquipment} compact={reassignMode} />}
             </div>
           </>
         )}

@@ -205,13 +205,56 @@ export function DateRangeFilter({
   );
 }
 
-// Helper to convert DateParts to ISO date string for comparison
+// Helper to convert DateParts to ISO date string for comparison.
+// Strict — returns null unless ALL three fields are filled.
 export function toISODate(d: DateParts | null): string | null {
   if (!d || !d.year || !d.month || !d.day) return null;
   const year = d.year.padStart(4, '0');
   const month = d.month.padStart(2, '0');
   const day = d.day.padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+/** Convert DateParts into the appropriate boundary date for a range query.
+ *  Supports partial inputs:
+ *
+ *    side='start' (the "from" end of a range)
+ *      year only      → YYYY-01-01      (Jan 1 of that year)
+ *      year + month   → YYYY-MM-01      (first day of that month)
+ *      year + mo + d  → YYYY-MM-DD      (exact day)
+ *
+ *    side='end' (the "to" end of a range)
+ *      year only      → YYYY-12-31      (Dec 31 of that year)
+ *      year + month   → YYYY-MM-{last}  (last day of that month, leap-aware)
+ *      year + mo + d  → YYYY-MM-DD      (exact day)
+ *
+ *  Anything missing the year returns null (the lower-priority parts can't
+ *  be interpreted without it). Day-without-month also returns null.
+ */
+export function toISODateRange(d: DateParts | null, side: 'start' | 'end'): string | null {
+  if (!d || !d.year) return null;
+  const yearNum = parseInt(d.year, 10);
+  if (!Number.isFinite(yearNum)) return null;
+  const y = String(yearNum).padStart(4, '0');
+
+  if (!d.month) {
+    // Day-without-month is meaningless; ignore d.day if month is missing.
+    return side === 'start' ? `${y}-01-01` : `${y}-12-31`;
+  }
+  const monthNum = parseInt(d.month, 10);
+  if (!Number.isFinite(monthNum) || monthNum < 1 || monthNum > 12) return null;
+  const m = String(monthNum).padStart(2, '0');
+
+  if (!d.day) {
+    if (side === 'start') return `${y}-${m}-01`;
+    // Last day of month: pass day=0 of NEXT month (1-indexed) to get the
+    // last day of the requested month. Handles leap years naturally.
+    const lastDay = new Date(yearNum, monthNum, 0).getDate();
+    return `${y}-${m}-${String(lastDay).padStart(2, '0')}`;
+  }
+  const dayNum = parseInt(d.day, 10);
+  if (!Number.isFinite(dayNum) || dayNum < 1 || dayNum > 31) return null;
+  return `${y}-${m}-${String(dayNum).padStart(2, '0')}`;
 }
 
 // Helper to convert ISO date string to DateParts

@@ -105,9 +105,25 @@ pub fn solve_frame_with_hints(
         .max(500);
 
     let t0 = Instant::now();
+    // Disable the saturation-fraction reject: the analyzer's default 0.95
+    // (peak > 62258 of 65535 → "saturated, drop") is appropriate for FWHM /
+    // PSF measurement where a clipped flat top biases the fit, but it's
+    // counterproductive for plate-solving. The brightest stars in the field
+    // are exactly the ones most likely to be in the catalog (Tycho-2 caps
+    // at V≈11.5 — anything brighter than that saturates a 180s OSC exposure
+    // first), and they're indispensable for quad construction. Saturation
+    // shifts centroids by ~1-2 px which is fine: quad ratios are scale-
+    // invariant (a 1 px shift on a 200 px edge changes a ratio by 0.5%) and
+    // the verification gate is 4 px wide.
+    //
+    // Without this, OSC frames whose brightest stars saturate the green
+    // channel after green-interpolation lose all their hash-matchable bright
+    // stars, leaving only mid-faint stars whose quad ratios don't match
+    // catalog quads built from bright catalog stars.
     let mut analyzer = ImageAnalyzer::new()
         .with_detection_sigma(5.0)
-        .with_max_stars(max_detection_cap);
+        .with_max_stars(max_detection_cap)
+        .with_saturation_fraction(1.0);
     if let Some(pool) = thread_pool {
         analyzer = analyzer.with_thread_pool(pool);
     }
@@ -203,6 +219,7 @@ pub fn solve_frame_with_hints(
             image_size,
             image_center,
             expected_scale_arcsec,
+            hints,
             catalog,
             index,
             config,
@@ -277,10 +294,40 @@ pub fn solve_frame_with_hints(
         let (best_ra, best_dec) = result
             .wcs
             .pixel_to_sky(image_center.0, image_center.1);
-        let hint = if best_expected_in_fov > 2000 {
-            " — dense field; consider rebuilding the quad index with a higher magnitude limit"
-        } else {
-            ""
+        // Hint depends on what we know about the failure mode. The previous
+        // implementation always said "consider rebuilding the quad index with
+        // a higher magnitude limit" whenever `best_expected_in_fov > 2000`,
+        // which fires precisely on dense-region false positives — sending
+        // users to spend 30 minutes rebuilding the index for a no-op (Tycho-2
+        // saturates at V≈11.5, so raising `index_mag_limit` does nothing).
+        let hint = match (hints.ra, hints.dec) {
+            (Some(hra), Some(hdec)) => {
+                let dist = angular_distance_deg(best_ra, best_dec, hra, hdec);
+                if dist > 5.0 {
+                    format!(
+                        " — best candidate is {:.0}° from FITS pointing (RA={:.2} Dec={:.2}); \
+                         this is almost certainly a noise alignment in a dense region. \
+                         Likely cause: the FITS header RA/Dec is wrong (mount sync error), \
+                         or the positional-prior gate (config.position_hint_radius_deg, \
+                         currently {:.1}°) is too loose. Rebuilding the quad index will NOT help.",
+                        dist, hra, hdec, config.position_hint_radius_deg
+                    )
+                } else {
+                    format!(
+                        " — best candidate is within {:.1}° of FITS pointing; this is a real \
+                         near-miss. Likely cause: centroid noise (try use_fast_detection=false), \
+                         pixel scale hint is wrong, or quad geometry is degenerate. \
+                         Rebuilding the quad index will NOT help.",
+                        dist
+                    )
+                }
+            }
+            _ => format!(
+                " — true blind solve (no FITS positional hint). Try use_fast_detection=false \
+                 for sharper centroids, or set valid RA/DEC (or OBJCTRA/OBJCTDEC) in the FITS \
+                 header. Rebuilding the quad index does NOT help on Tycho-2 (catalog saturates \
+                 at V≈11.5)."
+            ),
         };
         return Err(anyhow::anyhow!(
             "[{}] verification failed: best candidate has {} inliers at RA={:.2} Dec={:.2} (required {}, density {} detected / {} catalog in FOV){}",
@@ -484,6 +531,7 @@ fn try_solve_pass(
     image_size: (u32, u32),
     image_center: (f64, f64),
     expected_scale_arcsec: Option<f64>,
+    hints: &SolveHints,
     catalog: &CatalogEngine,
     index: &QuadIndex,
     config: &PlateSolveConfig,
@@ -498,15 +546,21 @@ fn try_solve_pass(
         };
     }
 
-    // Hash lookup → candidates.
+    // Hash lookup → candidates. The lookup tolerance is configurable; the
+    // default ±1 keeps hash false-positive noise low for sharp mono frames,
+    // and bumping to ±2 rescues OSC frames whose centroid bias drifts the
+    // image-quad ratios just outside the ±1 window. The positional-prior
+    // gate downstream filters out the extra noise from the wider probe, so
+    // raising this knob is safe when a hint is present.
     let tolerance = index.hash_tolerance();
+    let lookup_tol = config.index_lookup_tolerance;
     let mut candidates: Vec<Candidate> = Vec::new();
     for iq in &image_quads {
         let ratios = [
             iq.ratios[0], iq.ratios[1], iq.ratios[2], iq.ratios[3], iq.ratios[4],
         ];
         let hash_key = hash_key_from_ratios(&ratios, tolerance);
-        for hit in index.lookup(&hash_key) {
+        for hit in index.lookup_with_tolerance(&hash_key, lookup_tol) {
             candidates.push(Candidate {
                 image_quad: iq.clone(),
                 catalog: hit,
@@ -565,6 +619,16 @@ fn try_solve_pass(
     // when the current seed's FOV is entirely inside the cached cone.
     let mut cone_cache: Option<ConeCache> = None;
 
+    // Verbose diagnostic mode (env-gated): print every candidate's seed-WCS
+    // sky position + distance from the FITS hint, so we can tell whether the
+    // candidate set lands near the truth (hash matches but verification fails)
+    // or far from it (hash mismatch — image quads have no catalog counterpart).
+    // Useful when a frame fails with all-pass "best 0 inliers" and we need to
+    // know whether to investigate hash tolerance or verification tolerance.
+    let verbose_candidates = std::env::var("ATHENAEUM_PLATESOLVE_VERBOSE").is_ok();
+    let mut hint_distance_histogram: [usize; 6] = [0; 6]; // <2°, <5°, <10°, <30°, <90°, ≥90°
+    let mut surviving_seeds = 0usize;
+
     for cand in &candidates_filtered {
         let approx_center = catalog_centroid(&cand.catalog);
 
@@ -590,6 +654,38 @@ fn try_solve_pass(
         }
 
         let (seed_ra, seed_dec) = seed_wcs.pixel_to_sky(image_center.0, image_center.1);
+        surviving_seeds += 1;
+
+        // Positional-prior gate: when the FITS header gives an approximate
+        // pointing, reject any candidate whose seed-WCS center is far from it.
+        // This eliminates dense-Milky-Way false positives that win on raw
+        // inlier count alone (random alignments in a star-rich region beating
+        // a correct candidate elsewhere). Default radius is generous (10°) to
+        // tolerate mount sync slop. Set `position_hint_radius_deg >= 180.0`
+        // in the config to disable. Skipped silently when no hint is set
+        // (true blind solve).
+        if let (Some(hra), Some(hdec)) = (hints.ra, hints.dec) {
+            let dist = angular_distance_deg(seed_ra, seed_dec, hra, hdec);
+            // Bucket the distance for the end-of-pass histogram.
+            let bucket = if dist < 2.0 { 0 }
+                else if dist < 5.0 { 1 }
+                else if dist < 10.0 { 2 }
+                else if dist < 30.0 { 3 }
+                else if dist < 90.0 { 4 }
+                else { 5 };
+            hint_distance_histogram[bucket] += 1;
+            if verbose_candidates {
+                let scale = seed_wcs.pixel_scale_arcsec();
+                eprintln!(
+                    "plate_solve [{}]:   candidate seed RA={:.2} Dec={:.2} scale={:.2}\"/px → {:.1}° from hint",
+                    filename, seed_ra, seed_dec, scale, dist
+                );
+            }
+            if config.position_hint_radius_deg < 180.0 && dist > config.position_hint_radius_deg {
+                continue;
+            }
+        }
+
         let seed_scale = seed_wcs.pixel_scale_arcsec();
         let image_fov_deg = (image_size.0 as f64).max(image_size.1 as f64) * seed_scale / 3600.0;
         let cone_radius = image_fov_deg * 0.7;
@@ -761,6 +857,31 @@ fn try_solve_pass(
                 break;
             }
         }
+    }
+
+    // End-of-pass diagnostic: histogram of how far candidate seed-WCS centers
+    // landed from the FITS hint. Only printed when a hint was set AND we have
+    // candidates to bucket. Helps disambiguate failure modes:
+    //   - Most candidates in <2° / <5° → the candidate set is healthy; if the
+    //     pass also has best 0 inliers, the bottleneck is verification
+    //     (centroid quality, scale prior, or quad-permutation choice).
+    //   - Most candidates in ≥30° → the hash matching is producing wrong-
+    //     orientation seeds; the gate is correctly rejecting them but no
+    //     real candidate is being produced. Look at hash tolerance,
+    //     centroid noise, or the source detection itself.
+    if hints.ra.is_some() && hints.dec.is_some() && surviving_seeds > 0 {
+        eprintln!(
+            "plate_solve [{}]:   seed-distance histogram (of {} candidates that produced a seed-WCS): \
+             <2°={} <5°={} <10°={} <30°={} <90°={} ≥90°={}",
+            filename,
+            surviving_seeds,
+            hint_distance_histogram[0],
+            hint_distance_histogram[1],
+            hint_distance_histogram[2],
+            hint_distance_histogram[3],
+            hint_distance_histogram[4],
+            hint_distance_histogram[5],
+        );
     }
 
     outcome
@@ -1044,8 +1165,25 @@ const PERMUTATIONS_4: [[usize; 4]; 24] = [
 ];
 
 /// Try all 24 permutations of catalog-to-image pairing for a candidate.
-/// Returns the permutation with the smallest fitting residual, or None if
-/// no permutation produces a valid fit.
+/// Returns the chosen pairing along with its 4-point fit residual, or None
+/// if no permutation produces a valid fit.
+///
+/// **Tiered tiebreak.** The fitting residual alone is unreliable on near-
+/// symmetric (rhombus / near-square) quads — multiple permutations give
+/// near-zero residuals just from geometric symmetry, and the lowest-by-
+/// residual one is essentially random. To break those ties we add a
+/// rank-consistency check: distance-from-centroid is a rotation/reflection
+/// invariant of the quad, so the image-side ranking by distance from image
+/// centroid must agree with the catalog-side ranking by distance from
+/// catalog centroid in the correct permutation.
+///
+/// Algorithm:
+///   1. Score every permutation by 4-point squared residual.
+///   2. Filter to the perms within `2 * min_residual + tiny_floor` — this
+///      keeps clear winners (single best by residual) intact while gathering
+///      all near-ties when the quad is symmetric.
+///   3. Among the filtered set, pick the highest rank-consistency (agreement
+///      count out of 6 ordered pairs). Break ties by lowest residual.
 fn best_permutation_fit(
     image_quad: &Quad,
     catalog: &QuadLookup,
@@ -1066,9 +1204,38 @@ fn best_permutation_fit(
         (catalog.stars_ra[3] as f64, catalog.stars_dec[3] as f64),
     ];
 
-    let mut best: Option<(Vec<((f64, f64), (f64, f64))>, f64)> = None;
+    // Pre-compute per-star distances from each side's centroid. These are
+    // rotation/reflection invariants — in the correct permutation, the
+    // image-side ordering by `img_dist` must match the catalog-side ordering
+    // by `cat_dist`. Image-side units are pixels^2, catalog-side units are
+    // tangent-plane radians^2; we only compare orderings, never absolute
+    // values, so the unit mismatch doesn't matter.
+    let img_centroid_x = (img_stars[0].0 + img_stars[1].0 + img_stars[2].0 + img_stars[3].0) / 4.0;
+    let img_centroid_y = (img_stars[0].1 + img_stars[1].1 + img_stars[2].1 + img_stars[3].1) / 4.0;
+    let img_dist: [f64; 4] = [0, 1, 2, 3].map(|k| {
+        let dx = img_stars[k].0 - img_centroid_x;
+        let dy = img_stars[k].1 - img_centroid_y;
+        dx * dx + dy * dy
+    });
+    let cat_xy: [(f64, f64); 4] = [0, 1, 2, 3].map(|k| {
+        GnomonicProjection::sky_to_tangent(
+            cat_stars[k].0,
+            cat_stars[k].1,
+            approx_center.0,
+            approx_center.1,
+        )
+    });
+    let cat_centroid_x = (cat_xy[0].0 + cat_xy[1].0 + cat_xy[2].0 + cat_xy[3].0) / 4.0;
+    let cat_centroid_y = (cat_xy[0].1 + cat_xy[1].1 + cat_xy[2].1 + cat_xy[3].1) / 4.0;
+    let cat_dist: [f64; 4] = [0, 1, 2, 3].map(|k| {
+        let dx = cat_xy[k].0 - cat_centroid_x;
+        let dy = cat_xy[k].1 - cat_centroid_y;
+        dx * dx + dy * dy
+    });
 
-    for perm in &PERMUTATIONS_4 {
+    // Pass 1: compute residual for every viable permutation.
+    let mut scored: Vec<(usize, Vec<((f64, f64), (f64, f64))>, f64)> = Vec::with_capacity(24);
+    for (idx, perm) in PERMUTATIONS_4.iter().enumerate() {
         let pairs: Vec<((f64, f64), (f64, f64))> = (0..4)
             .map(|k| (img_stars[k], cat_stars[perm[k]]))
             .collect();
@@ -1078,9 +1245,6 @@ fn best_permutation_fit(
             continue;
         };
 
-        // Compute fitting residual — the lower, the better this permutation
-        // fits the data. Points that are geometrically consistent give near-
-        // zero residual; incorrect permutations have large residuals.
         let mut residual = 0.0;
         for ((px, py), (ra, dec)) in &pairs {
             let (xi_rad, eta_rad) =
@@ -1092,13 +1256,67 @@ fn best_permutation_fit(
             residual += (pred_xi - xi_rad).powi(2) + (pred_eta - eta_rad).powi(2);
         }
 
-        match &best {
-            None => best = Some((pairs, residual)),
-            Some((_, best_res)) if residual < *best_res => best = Some((pairs, residual)),
-            _ => {}
+        scored.push((idx, pairs, residual));
+    }
+    if scored.is_empty() {
+        return None;
+    }
+
+    // Pass 2: tiered tiebreak. Pick min residual, build a near-tie cohort.
+    let min_residual = scored.iter().map(|(_, _, r)| *r).fold(f64::INFINITY, f64::min);
+    // The cohort threshold is intentionally generous: 2× min residual plus a
+    // tiny absolute floor so that machine-zero ties (near-perfect symmetric
+    // fits) all collapse into the cohort. Without the absolute floor, two
+    // residuals of 1e-30 and 3e-30 would not be considered tied even though
+    // they are functionally identical noise.
+    let cohort_threshold = (min_residual * 2.0).max(min_residual + 1e-20);
+
+    // Among the cohort, pick the perm that maximizes rank-consistency between
+    // image-side and catalog-side distance-from-centroid orderings. This
+    // breaks the symmetry of near-rhombus quads — wrong-orientation perms
+    // have low rank-consistency (random ~3/6) while the correct perm has
+    // high (5/6 or 6/6).
+    let mut best: Option<(Vec<((f64, f64), (f64, f64))>, f64, i32)> = None;
+    for (idx, pairs, residual) in scored {
+        if residual > cohort_threshold {
+            continue;
+        }
+        let perm = &PERMUTATIONS_4[idx];
+        let agreement = rank_agreement(&img_dist, &cat_dist, perm);
+
+        let take = match &best {
+            None => true,
+            Some((_, best_res, best_agree)) => {
+                agreement > *best_agree
+                    || (agreement == *best_agree && residual < *best_res)
+            }
+        };
+        if take {
+            best = Some((pairs, residual, agreement));
         }
     }
-    best
+    best.map(|(pairs, residual, _)| (pairs, residual))
+}
+
+/// Count, out of the 6 ordered pairs of quad-star indices, how many agree
+/// between the image-side and catalog-side distance-from-centroid orderings
+/// under permutation `perm`. Returns a value in [0, 6].
+///
+/// The correct catalog→image pairing produces 6/6 agreement on a non-
+/// degenerate quad. Wrong rotations/reflections of a near-symmetric quad
+/// typically score 2-4. Random permutations average 3.
+fn rank_agreement(img_dist: &[f64; 4], cat_dist: &[f64; 4], perm: &[usize; 4]) -> i32 {
+    let mut agreement = 0;
+    for k1 in 0..4 {
+        for k2 in (k1 + 1)..4 {
+            let img_order = img_dist[k1] < img_dist[k2];
+            let cat_order = cat_dist[perm[k1]] < cat_dist[perm[k2]];
+            if img_order == cat_order {
+                agreement += 1;
+            }
+        }
+    }
+    agreement
 }
 
 /// A similarity transform: pixel → tangent plane (in radians).
@@ -1308,5 +1526,88 @@ mod tests {
         // 90° apart at equator.
         let d = angular_distance_deg(0.0, 0.0, 90.0, 0.0);
         assert!((d - 90.0).abs() < 1e-6, "expected 90°, got {d}");
+    }
+
+    #[test]
+    fn rank_agreement_identity_perm_on_matching_orderings_is_six() {
+        // img and cat both have distances 1, 2, 3, 4 in the same order — the
+        // identity permutation should give all 6 pair-orderings agreeing.
+        let img = [1.0, 2.0, 3.0, 4.0];
+        let cat = [10.0, 20.0, 30.0, 40.0]; // monotonic, matching img
+        assert_eq!(rank_agreement(&img, &cat, &[0, 1, 2, 3]), 6);
+    }
+
+    #[test]
+    fn rank_agreement_reversed_perm_on_matching_orderings_is_zero() {
+        // Reversing the catalog mapping should disagree on every pair-ordering.
+        let img = [1.0, 2.0, 3.0, 4.0];
+        let cat = [10.0, 20.0, 30.0, 40.0];
+        assert_eq!(rank_agreement(&img, &cat, &[3, 2, 1, 0]), 0);
+    }
+
+    #[test]
+    fn rank_agreement_random_perm_around_three() {
+        // A perm that swaps two adjacent elements should disagree on 1 pair
+        // ordering and agree on 5. Concretely, perm [1, 0, 2, 3] swaps img
+        // ranks 0 and 1 — only the (0, 1) pair-ordering flips.
+        let img = [1.0, 2.0, 3.0, 4.0];
+        let cat = [10.0, 20.0, 30.0, 40.0];
+        assert_eq!(rank_agreement(&img, &cat, &[1, 0, 2, 3]), 5);
+    }
+
+    #[test]
+    fn best_permutation_fit_picks_correct_perm_on_symmetric_quad() {
+        // A nearly-square 4-star quad in the image with a known mapping to a
+        // catalog quad. The image has a specific brightness/distance pattern
+        // (one star displaced slightly inward toward centroid) and the catalog
+        // mirrors that pattern. The correct permutation is the identity.
+        // Wrong permutations will produce small residuals from the symmetry,
+        // so the rank-agreement tiebreak should pick the identity.
+        use astroimage::platesolving::Quad;
+        // Image quad: 4 stars near corners of a 100-px square, with star 0
+        // pushed slightly inward (closer to centroid than the others).
+        let positions: Vec<(f64, f64)> = vec![
+            (3010.0, 2010.0), // index 0: slightly inside top-left corner
+            (3100.0, 2000.0), // index 1: top-right corner
+            (3000.0, 2100.0), // index 2: bottom-left corner
+            (3100.0, 2100.0), // index 3: bottom-right corner
+        ];
+        let image_quad = Quad {
+            star_indices: [0, 1, 2, 3],
+            ratios: [0.0; 5], // unused by best_permutation_fit
+            center: (3050.0, 2050.0),
+            longest_dist: 100.0 * 2f64.sqrt(),
+        };
+        // Catalog quad: same configuration projected to RA/Dec near (10°, 20°).
+        // 100 px ≈ 100 * 2"/3600 ≈ 0.0556°. We mimic the image by placing
+        // catalog star 0 slightly inside the corresponding corner.
+        let cat = QuadLookup {
+            hash_key: [0; 5],
+            longest_dist_deg: 0.0556 * 2f64.sqrt() as f32,
+            stars_ra: [10.0028, 10.0556, 10.0000, 10.0556], // mirrors x-displacement
+            stars_dec: [20.0028, 20.0000, 20.0556, 20.0556],
+        };
+        let approx_center = catalog_centroid(&cat);
+        let image_center = (3050.0, 2050.0);
+
+        let result = best_permutation_fit(
+            &image_quad,
+            &cat,
+            &positions,
+            approx_center,
+            image_center,
+        );
+        let (pairs, _residual) = result.expect("must produce a fit");
+        // Identity perm: pairs[k].1 should be (cat_ra[k], cat_dec[k]).
+        for k in 0..4 {
+            let (cat_ra_paired, cat_dec_paired) = pairs[k].1;
+            assert!(
+                (cat_ra_paired - cat.stars_ra[k] as f64).abs() < 1e-9
+                    && (cat_dec_paired - cat.stars_dec[k] as f64).abs() < 1e-9,
+                "expected identity perm, but pair {k} catalog side is ({cat_ra_paired}, {cat_dec_paired}) \
+                 not ({}, {})",
+                cat.stars_ra[k], cat.stars_dec[k],
+            );
+        }
     }
 }

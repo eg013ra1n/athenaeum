@@ -5,6 +5,7 @@ pub mod config;
 pub mod configurable_matcher;
 pub mod finder;
 pub mod hierarchy;
+pub mod manual;
 pub mod processor;
 pub mod flat_groups;
 pub mod flat_matcher;

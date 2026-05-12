@@ -3,6 +3,8 @@
 //! The `ServiceContext` holds all shared state. Each backend creates one at
 //! startup and passes it (or references to it) into service functions.
 
+pub mod operation_queue;
+
 use crate::cache::MemoryImageCache;
 use crate::db::Database;
 use crate::plate_solve::dso_lookup::DsoCatalog;
@@ -62,4 +64,7 @@ pub struct ServiceContext {
     /// results (e.g. "M 42", "NGC 7000"). Parsed on first use, then cached.
     pub dso_catalog: Arc<RwLock<Option<Arc<DsoCatalog>>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
+    /// Single serialized worker queue shared by ZIP archive + file ops.
+    /// Created at startup; lives for the process lifetime.
+    pub operation_queue: operation_queue::OperationQueue,
 }

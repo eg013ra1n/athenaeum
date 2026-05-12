@@ -287,6 +287,7 @@ pub fn find_calibration_for_dark_set(
 /// * `tolerance` - Tolerance settings for calibration matching
 /// * `flat_pattern` - Optional flat pattern preference (e.g., "automatic", "long_term", "manual")
 /// * `manual_flat_set_id` - Optional manually selected flat set ID for this specific frame
+/// * `manual_dark_set_id` - Optional manually selected dark set ID for this specific frame
 /// * `max_age_days` - Maximum age of flats to consider (from settings)
 /// * `time_cluster_minutes` - Time threshold for grouping flats (from settings)
 /// * `temp_weight` - Weight for temperature matching (from settings)
@@ -296,6 +297,7 @@ pub fn build_complete_hierarchy(
     tolerance: &CalibrationTolerance,
     flat_pattern: Option<&str>,
     manual_flat_set_id: Option<i64>,
+    manual_dark_set_id: Option<i64>,
     max_age_days: i64,
     time_cluster_minutes: i64,
     temp_weight: f64,
@@ -506,31 +508,30 @@ pub fn build_complete_hierarchy(
         missing_calibration.push("Flat".to_string());
     }
 
-    // Find Dark sets for the light frame using configurable matcher
+    // Find Dark sets for the light frame.
+    // If a manual override is provided, use it directly and skip auto-detect /
+    // warning generation. Otherwise run the configurable auto-matcher.
     let config = load_config(conn);
-    let mut ranked_darks = find_dark_for_light(conn, light_frame, &config)?;
 
-    // Try to create Dark on-demand if not found
-    if ranked_darks.is_empty() {
-        println!("  🔍 No existing Dark sets found for Light frame, attempting on-demand creation...");
-
-        if let Some(created_dark_id) = try_create_dark_for_frame(conn, light_frame)? {
-            println!("  ✅ Created Dark set {} for Light frame", created_dark_id);
-
-            // Re-query using configurable matcher
-            ranked_darks = find_dark_for_light(conn, light_frame, &config)?;
-        }
-    }
-
-    if ranked_darks.is_empty() {
-        missing_calibration.push("Dark".to_string());
+    let dark_set_id_to_use: Option<i64> = if let Some(set_id) = manual_dark_set_id {
+        Some(set_id)
     } else {
-        // Take the best dark match
-        if let Some(best_dark) = ranked_darks.first() {
-            let dark_set = get_calibration_set_by_id(conn, best_dark.set_id)?;
+        let mut ranked_darks = find_dark_for_light(conn, light_frame, &config)?;
 
-            // Add warnings for the dark (only if enabled in config)
-            // Use config directly for consistency with UI
+        // Try to create Dark on-demand if not found
+        if ranked_darks.is_empty() {
+            println!("  🔍 No existing Dark sets found for Light frame, attempting on-demand creation...");
+
+            if let Some(created_dark_id) = try_create_dark_for_frame(conn, light_frame)? {
+                println!("  ✅ Created Dark set {} for Light frame", created_dark_id);
+
+                // Re-query using configurable matcher
+                ranked_darks = find_dark_for_light(conn, light_frame, &config)?;
+            }
+        }
+
+        if let Some(best_dark) = ranked_darks.first() {
+            // Add warnings for the auto-picked dark (only if enabled in config)
             let dark_date_threshold = config.warnings.dark_date_warning_days;
             if best_dark.date_warning && is_date_warning_enabled(dark_date_threshold) {
                 warnings.push(CalibrationWarning {
@@ -556,48 +557,52 @@ pub fn build_complete_hierarchy(
                     set_id: best_dark.set_id,
                 });
             }
+            Some(best_dark.set_id)
+        } else {
+            None
+        }
+    };
 
-            // Find sub-calibration for Dark (Bias) if enabled in config
-            let dark_sub_calibration = if let Some(opts) = config.get_behavioral_options("darks") {
-                if opts.use_bias_for_dark_optimization {
-                    if let Some(set_id) = dark_set.id {
-                        match find_calibration_for_dark_set(conn, set_id, tolerance) {
-                            Ok(candidates) => {
-                                // Convert best candidate to CalibrationLink
-                                if let Some(best_bias) = candidates.first() {
-                                    vec![CalibrationLink {
-                                        id: None,
-                                        source_id: set_id,
-                                        source_type: "calibration_set".to_string(),
-                                        calibration_set_id: best_bias.set_id,
-                                        calibration_type: "Bias".to_string(),
-                                        matched_at: Utc::now().to_rfc3339(),
-                                        match_score: Some(best_bias.match_score),
-                                        date_warning: best_bias.date_warning,
-                                        temp_warning: best_bias.temp_warning,
-                                        is_manual_override: false,
-                                    }]
-                                } else {
-                                    Vec::new()
-                                }
-                            }
-                            Err(_) => Vec::new()
+    if let Some(set_id) = dark_set_id_to_use {
+        let dark_set = get_calibration_set_by_id(conn, set_id)?;
+
+        // Find sub-calibration for Dark (Bias) if enabled in config
+        let dark_sub_calibration = if let Some(opts) = config.get_behavioral_options("darks") {
+            if opts.use_bias_for_dark_optimization {
+                match find_calibration_for_dark_set(conn, set_id, tolerance) {
+                    Ok(candidates) => {
+                        if let Some(best_bias) = candidates.first() {
+                            vec![CalibrationLink {
+                                id: None,
+                                source_id: set_id,
+                                source_type: "calibration_set".to_string(),
+                                calibration_set_id: best_bias.set_id,
+                                calibration_type: "Bias".to_string(),
+                                matched_at: Utc::now().to_rfc3339(),
+                                match_score: Some(best_bias.match_score),
+                                date_warning: best_bias.date_warning,
+                                temp_warning: best_bias.temp_warning,
+                                is_manual_override: false,
+                            }]
+                        } else {
+                            Vec::new()
                         }
-                    } else {
-                        Vec::new()
                     }
-                } else {
-                    Vec::new()
+                    Err(_) => Vec::new(),
                 }
             } else {
                 Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
 
-            dark_sets_with_links.push(CalibrationSetWithLinks {
-                set: dark_set,
-                sub_calibration: dark_sub_calibration,
-            });
-        }
+        dark_sets_with_links.push(CalibrationSetWithLinks {
+            set: dark_set,
+            sub_calibration: dark_sub_calibration,
+        });
+    } else {
+        missing_calibration.push("Dark".to_string());
     }
 
     Ok(CalibrationHierarchy {
@@ -740,6 +745,8 @@ fn try_create_dark_for_frame(
 
     // Detect dark groups
     // Note: focal_length is NOT used for Dark matching - Darks are sensor-only calibrations
+    let dark_temp_threshold = config.clustering.get("dark")
+        .map(|c| c.temp_threshold_celsius);
     let dark_groups = detect_dark_groups(
         conn,
         instrume,
@@ -750,6 +757,7 @@ fn try_create_dark_for_frame(
         None, // focal_length not relevant for Dark calibration
         time_cluster_minutes,
         Some((start_date, end_date)),
+        dark_temp_threshold,
     )?;
 
     if dark_groups.is_empty() {
@@ -819,6 +827,8 @@ fn try_create_bias_for_frame(
 
     // Detect bias groups
     // Note: focal_length is NOT used for Bias matching - Bias frames are sensor-only calibrations
+    let bias_temp_threshold = config.clustering.get("bias")
+        .map(|c| c.temp_threshold_celsius);
     let bias_groups = detect_bias_groups(
         conn,
         instrume,
@@ -828,6 +838,7 @@ fn try_create_bias_for_frame(
         None, // focal_length not relevant for Bias calibration
         time_cluster_minutes,
         Some((start_date, end_date)),
+        bias_temp_threshold,
     )?;
 
     if bias_groups.is_empty() {

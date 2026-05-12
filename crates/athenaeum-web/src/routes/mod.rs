@@ -64,9 +64,20 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_camera_directory_contents", post(files::get_camera_directory_contents))
         .route("/api/get_frames_with_missing_metadata", post(files::get_frames_with_missing_metadata))
         .route("/api/bulk_update_frame_metadata", post(files::bulk_update_frame_metadata))
+        .route("/api/count_frame_metadata_relations", post(files::count_frame_metadata_relations))
+        .route("/api/get_frame_memberships", post(files::get_frame_memberships))
+        .route("/api/get_frame_metadata_originals", post(files::get_frame_metadata_originals))
         .route("/api/get_distinct_instrumes", post(files::get_distinct_instrumes))
         .route("/api/get_files_with_frames_by_ids", post(files::get_files_with_frames_by_ids))
         .route("/api/browse_directories", post(files::browse_directories))
+        // Dual-pane file browser
+        .route("/api/enqueue_move_operation", post(files::enqueue_move_operation))
+        .route("/api/enqueue_delete_operation", post(files::enqueue_delete_operation))
+        .route("/api/cancel_file_operation", post(files::cancel_file_operation))
+        .route("/api/list_unfinished_file_operations", post(files::list_unfinished_file_operations))
+        .route("/api/search_catalog", post(files::search_catalog))
+        .route("/api/mkdir_in_scan_root", post(files::mkdir_in_scan_root))
+        .route("/api/rename_path", post(files::rename_path))
         // Settings
         .route("/api/get_setting", post(settings::get_setting))
         .route("/api/set_setting", post(settings::set_setting))
@@ -101,6 +112,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
         // Excluded frames
         .route("/api/get_excluded_frames", post(frame_sets::get_excluded_frames))
+        .route("/api/get_excluded_frames_with_metadata", post(frame_sets::get_excluded_frames_with_metadata))
+        .route("/api/remove_files_from_excluded", post(frame_sets::remove_files_from_excluded))
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
         .route("/api/reclassify_excluded_frames", post(frame_sets::reclassify_excluded_frames))
         // Calibration
@@ -117,6 +130,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/has_master_flat_library", post(calibration::has_master_flat_library))
         .route("/api/refresh_calibration_library_for_camera", post(calibration::refresh_calibration_library_for_camera))
         .route("/api/get_calibration_set_frames", post(calibration::get_calibration_set_frames))
+        .route("/api/get_calibration_set_consumers", post(calibration::get_calibration_set_consumers))
         .route("/api/find_calibration_for_frame_set", post(calibration::find_calibration_for_frame_set))
         .route("/api/get_calibration_status", post(calibration::get_calibration_status))
         .route("/api/get_calibration_matching_config", post(calibration::get_calibration_matching_config))
@@ -175,6 +189,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
         .route("/api/cancel_analysis", post(analysis::cancel_analysis))
         .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))
+        .route("/api/compute_flat_contour_plot", post(analysis::compute_flat_contour_plot))
         // Plate solving
         .route("/api/get_plate_solve_config", post(plate_solve::get_plate_solve_config))
         .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))

@@ -27,6 +27,15 @@ pub struct DarkGroup {
     /// Average CCD temperature across all frames (if available)
     pub avg_temp: Option<f64>,
 
+    /// Coldest CCD temperature observed in the group (if any frame has temp).
+    /// Persisted as `calibration_set.temp_min` so the matcher / UI can see the
+    /// real range, not the synthetic average. Stored as `Option<f64>` to keep
+    /// "no-temp" groups distinct from "single-temperature" groups.
+    pub temp_min: Option<f64>,
+
+    /// Warmest CCD temperature observed in the group.
+    pub temp_max: Option<f64>,
+
     /// Number of frames in group
     pub frame_count: usize,
 
@@ -63,6 +72,12 @@ pub struct BiasGroup {
 
     /// Average CCD temperature across all frames (if available)
     pub avg_temp: Option<f64>,
+
+    /// Coldest CCD temperature observed in the group. See `DarkGroup::temp_min`.
+    pub temp_min: Option<f64>,
+
+    /// Warmest CCD temperature observed in the group.
+    pub temp_max: Option<f64>,
 
     /// Number of frames in group
     pub frame_count: usize,
@@ -109,6 +124,7 @@ pub fn detect_dark_groups(
     _focal_length: Option<f64>, // Not used for Dark matching (sensor-only calibration)
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    temp_threshold: Option<f64>,
 ) -> Result<Vec<DarkGroup>> {
     // Gain and offset are REQUIRED for Dark matching - return empty if not provided
     let gain_val = match gain {
@@ -171,7 +187,7 @@ pub fn detect_dark_groups(
 
     println!("    📊 SQL query found {} dark frames", frames.len());
 
-    // Cluster frames by time proximity
+    // Cluster frames by time proximity, with optional temperature-drift split.
     let groups = cluster_dark_frames_by_time(
         frames,
         time_cluster_minutes,
@@ -181,6 +197,7 @@ pub fn detect_dark_groups(
         offset,
         exptime,
         None, // focal_length not used for Dark
+        temp_threshold,
     );
 
     println!("    🗂️  Clustered into {} dark groups", groups.len());
@@ -212,6 +229,7 @@ pub fn detect_bias_groups(
     _focal_length: Option<f64>, // Not used for Bias matching (sensor-only calibration)
     time_cluster_minutes: i64,
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    temp_threshold: Option<f64>,
 ) -> Result<Vec<BiasGroup>> {
     // Gain and offset are REQUIRED for Bias matching - return empty if not provided
     let gain_val = match gain {
@@ -267,7 +285,7 @@ pub fn detect_bias_groups(
 
     println!("    📊 SQL query found {} bias frames", frames.len());
 
-    // Cluster frames by time proximity
+    // Cluster frames by time proximity, with optional temperature-drift split.
     let groups = cluster_bias_frames_by_time(
         frames,
         time_cluster_minutes,
@@ -276,6 +294,7 @@ pub fn detect_bias_groups(
         gain,
         offset,
         None, // focal_length not used for Bias
+        temp_threshold,
     );
 
     println!("    🗂️  Clustered into {} bias groups", groups.len());
@@ -505,68 +524,107 @@ fn cluster_dark_frames_by_time(
     offset: Option<f64>,
     exptime: Option<f64>,
     focal_length: Option<f64>,
+    temp_threshold: Option<f64>,
 ) -> Vec<DarkGroup> {
     if frames.is_empty() {
         return Vec::new();
     }
 
     let threshold_seconds = time_cluster_minutes * 60;
-    let mut groups = Vec::new();
+    let mut time_clusters: Vec<Vec<Frame>> = Vec::new();
     let mut current_group: Vec<Frame> = Vec::new();
 
     for frame in frames {
         if current_group.is_empty() {
-            // Start first group
             current_group.push(frame);
         } else {
-            // Check time gap from last frame in current group
             let last_frame = current_group.last().unwrap();
-
             if let (Some(last_date), Some(curr_date)) = (&last_frame.date_obs, &frame.date_obs) {
                 let gap_seconds = (*curr_date - *last_date).num_seconds();
-
                 if gap_seconds <= threshold_seconds {
-                    // Within threshold - add to current group
                     current_group.push(frame);
                 } else {
-                    // Gap too large - close current group and start new one
-                    if !current_group.is_empty() {
-                        groups.push(create_dark_group(
-                            current_group,
-                            instrume,
-                            binning,
-                            gain,
-                            offset,
-                            exptime,
-                            focal_length,
-                        ));
-                    }
+                    time_clusters.push(std::mem::take(&mut current_group));
                     current_group = vec![frame];
                 }
             } else {
-                // Missing date - add to current group anyway
+                // Missing date — keep with current cluster (preserves legacy behavior)
                 current_group.push(frame);
             }
         }
     }
-
-    // Don't forget last group
     if !current_group.is_empty() {
-        groups.push(create_dark_group(
-            current_group,
-            instrume,
-            binning,
-            gain,
-            offset,
-            exptime,
-            focal_length,
-        ));
+        time_clusters.push(current_group);
+    }
+
+    // Sub-cluster each time-cluster by temperature drift. A 90-frame dark
+    // sequence drifting -10 → -8.5°C is one continuous time cluster but the
+    // ccd_temp range exceeds the user's threshold, so it must be split into
+    // two distinct dark sets — otherwise the master averages dark current at
+    // a temperature that was never measured. When `temp_threshold` is None
+    // (existing test paths), no drift split happens.
+    let mut groups = Vec::new();
+    for time_cluster in time_clusters {
+        for sub in split_by_temp_drift(time_cluster, temp_threshold) {
+            if !sub.is_empty() {
+                groups.push(create_dark_group(
+                    sub, instrume, binning, gain, offset, exptime, focal_length,
+                ));
+            }
+        }
     }
 
     // Sort groups by start_time (newest first)
     groups.sort_by(|a, b| b.start_time.cmp(&a.start_time));
-
     groups
+}
+
+/// Splits a time-clustered batch of frames into sub-clusters whose ccd_temp
+/// range never exceeds `threshold`. Frames without a `ccd_temp` reading stay
+/// with the current sub-cluster (so a single missing reading doesn't
+/// fracture an otherwise-coherent group). When `threshold` is None, returns
+/// the input as a single sub-cluster — the historic no-drift-check behavior.
+fn split_by_temp_drift(frames: Vec<Frame>, threshold: Option<f64>) -> Vec<Vec<Frame>> {
+    let threshold = match threshold {
+        Some(t) if t > 0.0 => t,
+        _ => return if frames.is_empty() { Vec::new() } else { vec![frames] },
+    };
+    let mut result: Vec<Vec<Frame>> = Vec::new();
+    let mut current: Vec<Frame> = Vec::new();
+    let mut cur_min: Option<f64> = None;
+    let mut cur_max: Option<f64> = None;
+
+    for frame in frames {
+        // A4: use the measured ccd_temp if available, else fall back to the
+        // commanded set_temp. Without this, master frames (ccd_temp NULL,
+        // set_temp populated) bypass the drift check entirely.
+        match crate::models::effective_temp(frame.ccd_temp, frame.set_temp) {
+            Some(t) => {
+                let new_min = cur_min.map_or(t, |m| m.min(t));
+                let new_max = cur_max.map_or(t, |m| m.max(t));
+                if !current.is_empty() && (new_max - new_min) > threshold {
+                    // Adding this frame would push the cluster over threshold —
+                    // split here and start a fresh sub-cluster from this frame.
+                    result.push(std::mem::take(&mut current));
+                    cur_min = Some(t);
+                    cur_max = Some(t);
+                } else {
+                    cur_min = Some(new_min);
+                    cur_max = Some(new_max);
+                }
+                current.push(frame);
+            }
+            None => {
+                // No reading — keep with current sub-cluster (don't disrupt
+                // grouping over a single dropped temperature record).
+                current.push(frame);
+            }
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
 }
 
 /// Clusters bias frames into groups based on time proximity
@@ -578,65 +636,53 @@ fn cluster_bias_frames_by_time(
     gain: Option<f64>,
     offset: Option<f64>,
     focal_length: Option<f64>,
+    temp_threshold: Option<f64>,
 ) -> Vec<BiasGroup> {
     if frames.is_empty() {
         return Vec::new();
     }
 
     let threshold_seconds = time_cluster_minutes * 60;
-    let mut groups = Vec::new();
+    let mut time_clusters: Vec<Vec<Frame>> = Vec::new();
     let mut current_group: Vec<Frame> = Vec::new();
 
     for frame in frames {
         if current_group.is_empty() {
-            // Start first group
             current_group.push(frame);
         } else {
-            // Check time gap from last frame in current group
             let last_frame = current_group.last().unwrap();
-
             if let (Some(last_date), Some(curr_date)) = (&last_frame.date_obs, &frame.date_obs) {
                 let gap_seconds = (*curr_date - *last_date).num_seconds();
-
                 if gap_seconds <= threshold_seconds {
-                    // Within threshold - add to current group
                     current_group.push(frame);
                 } else {
-                    // Gap too large - close current group and start new one
-                    if !current_group.is_empty() {
-                        groups.push(create_bias_group(
-                            current_group,
-                            instrume,
-                            binning,
-                            gain,
-                            offset,
-                            focal_length,
-                        ));
-                    }
+                    time_clusters.push(std::mem::take(&mut current_group));
                     current_group = vec![frame];
                 }
             } else {
-                // Missing date - add to current group anyway
                 current_group.push(frame);
             }
         }
     }
-
-    // Don't forget last group
     if !current_group.is_empty() {
-        groups.push(create_bias_group(
-            current_group,
-            instrume,
-            binning,
-            gain,
-            offset,
-            focal_length,
-        ));
+        time_clusters.push(current_group);
+    }
+
+    // Bias drift is usually small but the same threshold-based split applies
+    // — see `cluster_dark_frames_by_time` for the full rationale.
+    let mut groups = Vec::new();
+    for time_cluster in time_clusters {
+        for sub in split_by_temp_drift(time_cluster, temp_threshold) {
+            if !sub.is_empty() {
+                groups.push(create_bias_group(
+                    sub, instrume, binning, gain, offset, focal_length,
+                ));
+            }
+        }
     }
 
     // Sort groups by start_time (newest first)
     groups.sort_by(|a, b| b.start_time.cmp(&a.start_time));
-
     groups
 }
 
@@ -662,15 +708,21 @@ fn create_dark_group(
         .and_then(|f| f.date_obs)
         .unwrap_or_else(Utc::now);
 
-    // Calculate average temperature (if available)
+    // Calculate average temperature (if available) and the actual range.
+    // A4: prefer measured ccd_temp but fall back to set_temp (commanded
+    // cooler value) so master frames / uncooled emergency captures don't all
+    // collapse into one no-temperature bucket.
     let temps: Vec<f64> = frames.iter()
-        .filter_map(|f| f.ccd_temp)
+        .filter_map(|f| crate::models::effective_temp(f.ccd_temp, f.set_temp))
         .collect();
 
-    let avg_temp = if !temps.is_empty() {
-        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    let (avg_temp, temp_min, temp_max) = if !temps.is_empty() {
+        let avg = temps.iter().sum::<f64>() / temps.len() as f64;
+        let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (Some(avg), Some(min), Some(max))
     } else {
-        None
+        (None, None, None)
     };
 
     // Convert empty strings to None for proper NULL handling
@@ -682,6 +734,8 @@ fn create_dark_group(
         start_time,
         end_time,
         avg_temp,
+        temp_min,
+        temp_max,
         frame_count,
         instrume: instrume_opt,
         binning: binning_opt,
@@ -713,15 +767,21 @@ fn create_bias_group(
         .and_then(|f| f.date_obs)
         .unwrap_or_else(Utc::now);
 
-    // Calculate average temperature (if available)
+    // Calculate average temperature (if available) and the actual range.
+    // A4: prefer measured ccd_temp but fall back to set_temp (commanded
+    // cooler value) so master frames / uncooled emergency captures don't all
+    // collapse into one no-temperature bucket.
     let temps: Vec<f64> = frames.iter()
-        .filter_map(|f| f.ccd_temp)
+        .filter_map(|f| crate::models::effective_temp(f.ccd_temp, f.set_temp))
         .collect();
 
-    let avg_temp = if !temps.is_empty() {
-        Some(temps.iter().sum::<f64>() / temps.len() as f64)
+    let (avg_temp, temp_min, temp_max) = if !temps.is_empty() {
+        let avg = temps.iter().sum::<f64>() / temps.len() as f64;
+        let min = temps.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = temps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (Some(avg), Some(min), Some(max))
     } else {
-        None
+        (None, None, None)
     };
 
     // Convert empty strings to None for proper NULL handling
@@ -733,6 +793,8 @@ fn create_bias_group(
         start_time,
         end_time,
         avg_temp,
+        temp_min,
+        temp_max,
         frame_count,
         instrume: instrume_opt,
         binning: binning_opt,
@@ -791,9 +853,11 @@ pub fn create_dark_calibration_set(
     let date_end = dark_group.end_time.to_rfc3339();
     let frame_count = dark_group.frame_ids.len() as i64;
 
-    // For dark groups, temp_min and temp_max are the same as avg_temp
-    let temp_min = dark_group.avg_temp;
-    let temp_max = dark_group.avg_temp;
+    // Persist the actual coldest/warmest CCD temperature observed across the
+    // group. Falling back to avg_temp keeps existing rows readable when only
+    // an average is known (e.g., legacy data without per-frame temps).
+    let temp_min = dark_group.temp_min.or(dark_group.avg_temp);
+    let temp_max = dark_group.temp_max.or(dark_group.avg_temp);
 
     println!("    📝 Creating new dark calibration set:");
     println!("       date={}, exptime={:?}, gain={:?}, offset={:?}, binning={:?}, instrume={:?}",
@@ -891,9 +955,10 @@ pub fn create_bias_calibration_set(
     let date_end = bias_group.end_time.to_rfc3339();
     let frame_count = bias_group.frame_ids.len() as i64;
 
-    // For bias groups, temp_min and temp_max are the same as avg_temp
-    let temp_min = bias_group.avg_temp;
-    let temp_max = bias_group.avg_temp;
+    // Persist the actual coldest/warmest CCD temperature observed across the
+    // group; fall back to avg_temp for legacy single-temperature groups.
+    let temp_min = bias_group.temp_min.or(bias_group.avg_temp);
+    let temp_max = bias_group.temp_max.or(bias_group.avg_temp);
 
     println!("    📝 Creating new bias calibration set:");
     println!("       date={}, gain={:?}, offset={:?}, binning={:?}, instrume={:?}",
@@ -1176,6 +1241,7 @@ mod tests {
             None,
             Some(300.0),
             None,
+            None,
         );
         assert_eq!(groups.len(), 0);
     }
@@ -1190,7 +1256,177 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(groups.len(), 0);
+    }
+
+    fn make_dark_frame(id: i64, date_offset_seconds: i64, ccd_temp: Option<f64>) -> Frame {
+        Frame {
+            id: Some(id),
+            file_id: id,
+            object: None,
+            date_obs: Some(
+                chrono::DateTime::parse_from_rfc3339("2025-09-25T00:00:00+00:00").unwrap().with_timezone(&Utc)
+                    + chrono::Duration::seconds(date_offset_seconds),
+            ),
+            telescop: None,
+            instrume: Some("TestCamera".to_string()),
+            exptime: Some(300.0),
+            filter: None,
+            imagetyp: Some(crate::models::ImageType::Dark),
+            is_master: false,
+            gain: Some(56.0),
+            offset: Some(50.0),
+            binning: Some("1x1".to_string()),
+            xbinning: Some(1),
+            ybinning: Some(1),
+            ccd_temp,
+            set_temp: None,
+            focallen: None,
+            xpixsz: None,
+            ypixsz: None,
+            naxis1: None,
+            naxis2: None,
+            ra: None,
+            dec: None,
+            sitelat: None,
+            lat_obs: None,
+            sitelong: None,
+            long_obs: None,
+            objctra: None,
+            objctdec: None,
+            override_: false,
+            swcreate: None,
+            bayerpat: None,
+            rotation: None,
+        }
+    }
+
+    #[test]
+    fn dark_group_records_real_temp_range_not_just_avg() {
+        // A2 regression: when a dark sequence drifts, the resulting set must
+        // record the actual coldest and warmest frame, not the synthetic avg.
+        // Frames at -10.0, -9.5, -8.5 → avg ≈ -9.33, min = -10.0, max = -8.5.
+        let frames = vec![
+            make_dark_frame(1, 0, Some(-10.0)),
+            make_dark_frame(2, 60, Some(-9.5)),
+            make_dark_frame(3, 120, Some(-8.5)),
+        ];
+        let groups = cluster_dark_frames_by_time(
+            frames, 30, "TestCamera", "1x1", Some(56.0), Some(50.0), Some(300.0), None, None,
+        );
+        assert_eq!(groups.len(), 1, "frames within time threshold should cluster together");
+        let g = &groups[0];
+
+        let avg = g.avg_temp.expect("avg_temp populated");
+        assert!((avg - (-9.333333_f64)).abs() < 1e-3, "avg_temp = {}", avg);
+        assert_eq!(g.temp_min, Some(-10.0), "temp_min must be the coldest frame");
+        assert_eq!(g.temp_max, Some(-8.5), "temp_max must be the warmest frame");
+    }
+
+    #[test]
+    fn dark_clustering_splits_on_temperature_drift() {
+        // A1 regression: a long sequence within the time window but drifting
+        // beyond the temperature threshold should split into separate groups.
+        // Threshold = 2°C. Frames at -10.0, -10.5, -11.0, -11.5, -12.0, -12.5
+        // → range -10.0 to -12.5 (2.5°C span) → split at the point where the
+        // cluster's range exceeds 2°C.
+        let frames = vec![
+            make_dark_frame(1, 0,   Some(-10.0)),
+            make_dark_frame(2, 60,  Some(-10.5)),
+            make_dark_frame(3, 120, Some(-11.0)),
+            make_dark_frame(4, 180, Some(-11.5)),
+            make_dark_frame(5, 240, Some(-12.0)),
+            make_dark_frame(6, 300, Some(-12.5)),
+        ];
+        let groups = cluster_dark_frames_by_time(
+            frames, 30, "TestCamera", "1x1", Some(56.0), Some(50.0), Some(300.0), None,
+            Some(2.0),
+        );
+        assert!(
+            groups.len() >= 2,
+            "drift across 2.5°C with 2°C threshold must split, got {} groups",
+            groups.len()
+        );
+        for g in &groups {
+            let span = g.temp_max.unwrap() - g.temp_min.unwrap();
+            assert!(span <= 2.0 + 1e-9, "sub-cluster span {} exceeds threshold", span);
+        }
+    }
+
+    fn make_dark_frame_with_set_temp(id: i64, date_offset_seconds: i64, ccd_temp: Option<f64>, set_temp: Option<f64>) -> Frame {
+        let mut f = make_dark_frame(id, date_offset_seconds, ccd_temp);
+        f.set_temp = set_temp;
+        f
+    }
+
+    #[test]
+    fn dark_group_uses_set_temp_when_ccd_temp_missing() {
+        // A4 regression: a master dark / uncooled frame with ccd_temp=NULL but
+        // set_temp populated must contribute a temperature to the group rather
+        // than collapsing into a "no-temperature" bucket.
+        let frames = vec![
+            make_dark_frame_with_set_temp(1, 0,   None, Some(-10.0)),
+            make_dark_frame_with_set_temp(2, 60,  None, Some(-10.0)),
+            make_dark_frame_with_set_temp(3, 120, None, Some(-10.0)),
+        ];
+        let groups = cluster_dark_frames_by_time(
+            frames, 30, "TestCamera", "1x1", Some(56.0), Some(50.0), Some(300.0), None, None,
+        );
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.avg_temp, Some(-10.0), "set_temp must be used when ccd_temp is NULL");
+        assert_eq!(g.temp_min, Some(-10.0));
+        assert_eq!(g.temp_max, Some(-10.0));
+    }
+
+    #[test]
+    fn dark_drift_split_uses_set_temp_when_ccd_temp_missing() {
+        // A4 + A1: drift split must also see set_temp when ccd_temp is absent,
+        // otherwise master frames slip past the drift check entirely.
+        let frames = vec![
+            make_dark_frame_with_set_temp(1, 0,   None, Some(-10.0)),
+            make_dark_frame_with_set_temp(2, 60,  None, Some(-13.0)),
+        ];
+        let groups = cluster_dark_frames_by_time(
+            frames, 30, "TestCamera", "1x1", Some(56.0), Some(50.0), Some(300.0), None,
+            Some(2.0),
+        );
+        assert!(
+            groups.len() >= 2,
+            "set_temp drift of 3°C with 2°C threshold must split, got {} groups",
+            groups.len()
+        );
+    }
+
+    #[test]
+    fn dark_clustering_no_threshold_keeps_legacy_behavior() {
+        // When temp_threshold is None, the function must behave exactly like
+        // the pre-A1 version — no drift split.
+        let frames = vec![
+            make_dark_frame(1, 0,   Some(-10.0)),
+            make_dark_frame(2, 60,  Some(-12.5)),
+        ];
+        let groups = cluster_dark_frames_by_time(
+            frames, 30, "TestCamera", "1x1", Some(56.0), Some(50.0), Some(300.0), None, None,
+        );
+        assert_eq!(groups.len(), 1, "None threshold preserves single-cluster behavior");
+    }
+
+    #[test]
+    fn dark_group_with_no_temps_keeps_range_as_none() {
+        let frames = vec![
+            make_dark_frame(1, 0, None),
+            make_dark_frame(2, 60, None),
+        ];
+        let groups = cluster_dark_frames_by_time(
+            frames, 30, "TestCamera", "1x1", Some(56.0), Some(50.0), Some(300.0), None, None,
+        );
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert!(g.avg_temp.is_none());
+        assert!(g.temp_min.is_none());
+        assert!(g.temp_max.is_none());
     }
 }

@@ -1,6 +1,7 @@
 // FITS/XISF metadata parser module
 
 pub(crate) mod fits_header_reader;
+pub mod stored_header;
 
 use crate::models::{Frame, ImageType};
 use anyhow::{Context, Result};
@@ -305,15 +306,19 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
         }
     });
 
-    // Image rotation / position angle — fallback priority chain:
-    // 1. CROTA2    — FITS WCS standard (direct rotation in degrees, N through E)
-    // 2. CD matrix — atan2(-CD1_2, CD2_2)
-    // 3. CROTA1    — FITS WCS alt axis rotation
-    // 4. POSANGLE  — Mount control / plate-solve software
-    // 5. ROTATANG  — Sequence Generator Pro (SGP) / PixInsight
-    // 6. PA        — Generic position angle abbreviation
-    // 7. OBJCTROT  — Object rotation (some capture software)
-    // 8. APTS_ROT  — Astro Photography Tool (APT)
+    // Image rotation / position angle — fallback priority chain.
+    // Sky-frame keywords first; mechanical-rotator-angle keywords last.
+    // See the matching XISF-path comment below for the full reasoning and
+    // the 2026-05 demotion of ROTATANG. Both paths must stay in lock-step.
+    //
+    // 1. CROTA2    — FITS WCS standard (sky frame)
+    // 2. CD matrix — atan2(-CD1_2, CD2_2) (sky frame)
+    // 3. CROTA1    — FITS WCS alt-axis rotation (sky frame)
+    // 4. POSANGLE  — Sky position angle (sky frame)
+    // 5. PA        — Generic position angle (sky frame)
+    // 6. OBJCTROT  — Planned target rotation (NINA/PixInsight, sky frame)
+    // 7. ROTATANG  — Mechanical rotator angle (instrument frame, fallback)
+    // 8. APTS_ROT  — APT mechanical rotator angle (instrument frame, fallback)
     let rotation = header.get_f64("CROTA2")
         .or_else(|| {
             match (header.get_f64("CD1_2"), header.get_f64("CD2_2")) {
@@ -323,9 +328,9 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
         })
         .or_else(|| header.get_f64("CROTA1"))
         .or_else(|| header.get_f64("POSANGLE"))
-        .or_else(|| header.get_f64("ROTATANG"))
         .or_else(|| header.get_f64("PA"))
         .or_else(|| header.get_f64("OBJCTROT"))
+        .or_else(|| header.get_f64("ROTATANG"))
         .or_else(|| header.get_f64("APTS_ROT"));
 
     // Observatory location
@@ -617,15 +622,32 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         }
     });
 
-    // Image rotation / position angle — fallback priority chain:
-    // 1. CROTA2    — FITS WCS standard (direct rotation in degrees, N through E)
-    // 2. CD matrix — atan2(-CD1_2, CD2_2)
-    // 3. CROTA1    — FITS WCS alt axis rotation
-    // 4. POSANGLE  — Mount control / plate-solve software
-    // 5. ROTATANG  — Sequence Generator Pro (SGP) / PixInsight
-    // 6. PA        — Generic position angle abbreviation
-    // 7. OBJCTROT  — Object rotation (some capture software)
-    // 8. APTS_ROT  — Astro Photography Tool (APT)
+    // Image rotation / position angle — fallback priority chain.
+    //
+    // Sky-frame keywords (the rotation of the image on the sky, east of
+    // north) come first. Mechanical-frame keywords (the raw rotator hardware
+    // angle, which depends on the rotator's zero offset and only loosely
+    // maps to sky orientation) come last. The 1-3 entries are post-solve
+    // and authoritative; 4-6 are pre-solve sky-frame estimates from the
+    // acquisition software; 7-8 are mechanical fallbacks of last resort.
+    //
+    // 1. CROTA2    — FITS WCS standard (sky frame, direct rotation N→E)
+    // 2. CD matrix — atan2(-CD1_2, CD2_2) (sky frame, derived from WCS)
+    // 3. CROTA1    — FITS WCS alt-axis rotation (sky frame)
+    // 4. POSANGLE  — Mount/plate-solve software, sky position angle
+    // 5. PA        — Generic position angle (sky frame, east of north)
+    // 6. OBJCTROT  — Planned target rotation (NINA/PixInsight, sky frame)
+    // 7. ROTATANG  — Mechanical rotator angle (instrument frame; only
+    //                a meaningful sky angle when the rotator is zeroed
+    //                to true sky east-of-north, which is rarely true).
+    //                Demoted in 2026-05 — was 5th, but produced wrong
+    //                rotations for users with rotator offsets, e.g. a
+    //                NINA rig with OBJCTROT=185 / ROTATANG=208 (a 23°
+    //                offset). The actual sky rotation from the WCS solve
+    //                was 355°, matching neither pre-solve number — but
+    //                OBJCTROT is at least in sky semantics and lets the
+    //                user reason about framing.
+    // 8. APTS_ROT  — APT mechanical rotator angle (same caveats as ROTATANG).
     let rotation = fits_keywords.get("CROTA2")
         .and_then(|s| s.parse::<f64>().ok())
         .or_else(|| {
@@ -639,9 +661,9 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         })
         .or_else(|| fits_keywords.get("CROTA1").and_then(|s| s.parse::<f64>().ok()))
         .or_else(|| fits_keywords.get("POSANGLE").and_then(|s| s.parse::<f64>().ok()))
-        .or_else(|| fits_keywords.get("ROTATANG").and_then(|s| s.parse::<f64>().ok()))
         .or_else(|| fits_keywords.get("PA").and_then(|s| s.parse::<f64>().ok()))
         .or_else(|| fits_keywords.get("OBJCTROT").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| fits_keywords.get("ROTATANG").and_then(|s| s.parse::<f64>().ok()))
         .or_else(|| fits_keywords.get("APTS_ROT").and_then(|s| s.parse::<f64>().ok()));
 
     // Observatory location

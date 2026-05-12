@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -15,13 +15,14 @@ import { buildCameraFilterTree, buildMergedCameraFilterTree } from '../component
 import { ArchiveDispositionDialog } from '../components/archive/ArchiveDispositionDialog';
 import { ArchiveProgress } from '../components/archive/ArchiveProgress';
 import { RestoreDialog } from '../components/archive/RestoreDialog';
+import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { revealItemInDir } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
 
-type FrameSetTab = 'calibration' | 'analysis' | 'history';
+type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -64,8 +65,67 @@ export default function FrameSetDetail() {
   const [calibrationHierarchy, setCalibrationHierarchy] = useState<CalibrationHierarchyView | null>(null);
   const [loadingCalibration, setLoadingCalibration] = useState(false);
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<FrameSetTab>('analysis');
+  // Tab + highlight state. Initial values seed from URL params on first
+  // render to avoid the analysis-tab flash when arriving via a cross-page
+  // chip click. The reactive useEffect below handles in-page navigations
+  // (e.g. clicking a `#setId` in the Export tab's WarningsPanel pushes
+  // `?tab=calibration&highlightSet=…&kind=…` and we re-consume them).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialTabFromUrl: FrameSetTab | undefined =
+    searchParams.get('tab') === 'calibration' ? 'calibration'
+    : searchParams.get('tab') === 'history' ? 'history'
+    : searchParams.get('tab') === 'analysis' ? 'analysis'
+    : searchParams.get('tab') === 'export' ? 'export'
+    : undefined;
+  const [activeTab, setActiveTab] = useState<FrameSetTab>(initialTabFromUrl ?? 'analysis');
+
+  const initialHighlightSetId = (() => {
+    const v = searchParams.get('highlightSet');
+    return v != null && /^\d+$/.test(v) ? parseInt(v, 10) : null;
+  })();
+  const initialHighlightKind = (() => {
+    const v = searchParams.get('kind');
+    return v === 'flat' || v === 'dark' || v === 'bias' ? v : null;
+  })();
+  const [pendingHighlightCalSet, setPendingHighlightCalSet] = useState<
+    { setId: number; kind: 'flat' | 'dark' | 'bias' } | null
+  >(
+    initialHighlightSetId != null && initialHighlightKind != null
+      ? { setId: initialHighlightSetId, kind: initialHighlightKind }
+      : null
+  );
+
+  // Watch searchParams so URL-driven jumps work BOTH on initial mount and
+  // on subsequent in-page updates (e.g. the Export tab pushing a new
+  // `?tab=calibration&highlightSet=…&kind=…`). On match, sync state and
+  // clear the params so the URL stays clean.
+  useEffect(() => {
+    const tabParam = searchParams.get('tab');
+    const highlightSetParam = searchParams.get('highlightSet');
+    const kindParam = searchParams.get('kind');
+
+    if (!tabParam && !highlightSetParam && !kindParam) return;
+
+    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export') {
+      setActiveTab(tabParam);
+    }
+
+    const id = highlightSetParam != null && /^\d+$/.test(highlightSetParam)
+      ? parseInt(highlightSetParam, 10)
+      : null;
+    const kind = kindParam === 'flat' || kindParam === 'dark' || kindParam === 'bias'
+      ? kindParam
+      : null;
+    if (id != null && kind != null) {
+      setPendingHighlightCalSet({ setId: id, kind });
+    }
+
+    const next = new URLSearchParams(searchParams);
+    next.delete('tab');
+    next.delete('highlightSet');
+    next.delete('kind');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   const [showFindNewDialog, setShowFindNewDialog] = useState(false);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [findNewBusy, setFindNewBusy] = useState(false);
@@ -199,8 +259,9 @@ export default function FrameSetDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail?.frames_set?.id]);
 
-  // Selected filter keys from CalibrationHierarchyView (format: "dateKey:cameraKey:filterKey")
-  const [selectedFilterKeys, setSelectedFilterKeys] = useState<Set<string>>(new Set());
+  // Frame IDs collected from the active tree view (resolved by the child to handle
+  // both by-night and by-camera key shapes).
+  const [selectedFrameIds, setSelectedFrameIds] = useState<number[]>([]);
 
   // Analysis data for SNR display in tree
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
@@ -327,26 +388,6 @@ export default function FrameSetDetail() {
     return parseFloat(hours) >= 1 ? `${hours}h` : `${minutes}m`;
   };
 
-  // Get frame IDs from selected filter keys (must match key format in buildCameraFilterTree)
-  const getFrameIdsFromFilterKeys = useCallback((filterKeys: Set<string>): number[] => {
-    if (!calibrationHierarchy) return [];
-
-    const frameIds: number[] = [];
-    for (const dateGroup of calibrationHierarchy.date_groups) {
-      for (const cameraGroup of dateGroup.camera_groups) {
-        for (const filterGroup of cameraGroup.filter_groups) {
-          const filterName = filterGroup.filter ?? 'No Filter';
-          const exptime = filterGroup.exptime;
-          const fullKey = `${dateGroup.date}::${cameraGroup.instrume}::${filterName}::${exptime ?? 'any'}`;
-          if (filterKeys.has(fullKey)) {
-            frameIds.push(...filterGroup.light_frames.map(f => f.frame_id));
-          }
-        }
-      }
-    }
-    return frameIds;
-  }, [calibrationHierarchy]);
-
   // Handle blink from LightsAnalysisView - load full frame data
   const handleBlink = useCallback(async (frameIds: number[]) => {
     if (frameIds.length === 0) {
@@ -378,10 +419,10 @@ export default function FrameSetDetail() {
   }, []);
 
   // Handle split from CalibrationHierarchyView
-  const handleOpenSplitDialog = useCallback((filterKeys: Set<string>) => {
-    if (!id || filterKeys.size === 0) return;
+  const handleOpenSplitDialog = useCallback((frameIds: number[]) => {
+    if (!id || frameIds.length === 0) return;
 
-    setSelectedFilterKeys(filterKeys);
+    setSelectedFrameIds(frameIds);
 
     // Pre-fill split name
     const originalName = detail?.frames_set?.name || 'Untitled';
@@ -390,10 +431,10 @@ export default function FrameSetDetail() {
   }, [id, detail]);
 
   // Handle create custom set from CalibrationHierarchyView
-  const handleOpenCreateDialog = useCallback((filterKeys: Set<string>) => {
-    if (filterKeys.size === 0) return;
+  const handleOpenCreateDialog = useCallback((frameIds: number[]) => {
+    if (frameIds.length === 0) return;
 
-    setSelectedFilterKeys(filterKeys);
+    setSelectedFrameIds(frameIds);
     setShowCreateDialog(true);
   }, []);
 
@@ -403,14 +444,8 @@ export default function FrameSetDetail() {
       return;
     }
 
-    if (selectedFilterKeys.size === 0) {
+    if (selectedFrameIds.length === 0) {
       showAlert('No Selection', 'Please select at least one filter group', 'warning');
-      return;
-    }
-
-    const frameIds = getFrameIdsFromFilterKeys(selectedFilterKeys);
-    if (frameIds.length === 0) {
-      showAlert('No Frames', 'No frames found in selected filter groups', 'warning');
       return;
     }
 
@@ -419,14 +454,14 @@ export default function FrameSetDetail() {
       // Use existing command that creates frame set from frame IDs
       await api.invoke('create_frame_set_from_selection', {
         name: customSetName.trim(),
-        frame_ids: frameIds,
+        frame_ids: selectedFrameIds,
         description: null,
       });
 
       // Success - silent update
       setShowCreateDialog(false);
       setCustomSetName('');
-      setSelectedFilterKeys(new Set());
+      setSelectedFrameIds([]);
       navigate('/objects');
     } catch (err) {
       showAlert('Creation Failed', 'Failed to create custom set: ' + String(err), 'error');
@@ -441,14 +476,8 @@ export default function FrameSetDetail() {
       return;
     }
 
-    if (selectedFilterKeys.size === 0) {
+    if (selectedFrameIds.length === 0) {
       showAlert('No Selection', 'Please select at least one filter group', 'warning');
-      return;
-    }
-
-    const frameIds = getFrameIdsFromFilterKeys(selectedFilterKeys);
-    if (frameIds.length === 0) {
-      showAlert('No Frames', 'No frames found in selected filter groups', 'warning');
       return;
     }
 
@@ -457,13 +486,13 @@ export default function FrameSetDetail() {
       // Use existing split_frame_set with Frames selection type
       await api.invoke('split_frame_set', {
         sourceSetId: parseInt(id),
-        selection: { type: 'frames', ids: frameIds },
+        selection: { type: 'frames', ids: selectedFrameIds },
         newName: splitName.trim(),
       });
 
       setShowSplitDialog(false);
       setSplitName('');
-      setSelectedFilterKeys(new Set());
+      setSelectedFrameIds([]);
 
       // Reload to show updated data
       await loadData();
@@ -707,6 +736,7 @@ export default function FrameSetDetail() {
         {([
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
           { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
+          { key: 'export' as FrameSetTab, label: 'Export', icon: Layers },
           { key: 'history' as FrameSetTab, label: 'History', icon: History },
         ]).map(({ key, label, icon: Icon }) => (
           <button
@@ -734,6 +764,11 @@ export default function FrameSetDetail() {
         ) : calibrationHierarchy ? (
           activeTab === 'history' ? (
             <FrameSetHistoryTab key={historyRefreshKey} frameSetId={parseInt(id!)} />
+          ) : activeTab === 'export' ? (
+            <ExportTab
+              frameSetId={parseInt(id!)}
+              frameSetName={detail?.frames_set?.name ?? undefined}
+            />
           ) : activeTab === 'calibration' ? (
             <CalibrationHierarchyViewComponent
               data={calibrationHierarchy}
@@ -747,6 +782,8 @@ export default function FrameSetDetail() {
               onBlink={handleBlink}
               onSplit={handleOpenSplitDialog}
               onCreateCustomSet={handleOpenCreateDialog}
+              highlightCalSet={pendingHighlightCalSet}
+              onHighlightConsumed={() => setPendingHighlightCalSet(null)}
             />
           ) : (
             <LightsAnalysisView
@@ -795,7 +832,7 @@ export default function FrameSetDetail() {
             </div>
 
             <div className="mb-6 text-sm text-content-muted">
-              {selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be included in the new set
+              {selectedFrameIds.length} frame{selectedFrameIds.length !== 1 ? 's' : ''} will be included in the new set
             </div>
 
             <div className="flex gap-3 justify-end">
@@ -844,7 +881,7 @@ export default function FrameSetDetail() {
             </div>
 
             <div className="mb-6 text-sm text-content-muted space-y-2">
-              <p>{selectedFilterKeys.size} filter group{selectedFilterKeys.size !== 1 ? 's' : ''} ({getFrameIdsFromFilterKeys(selectedFilterKeys).length} frames) will be split into the new set</p>
+              <p>{selectedFrameIds.length} frame{selectedFrameIds.length !== 1 ? 's' : ''} will be split into the new set</p>
               <p className="text-warning">
                 The selected frames will be removed from "{detail?.frames_set?.name || 'this set'}" and moved to the new set.
               </p>

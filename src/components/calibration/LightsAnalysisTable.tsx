@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback } from 'react';
 import { FolderOpen, AlertTriangle, CheckCircle, MapPin } from 'lucide-react';
-import { revealItemInDir } from '../../api/desktop';
+import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
 type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
@@ -103,6 +103,7 @@ export function LightsAnalysisTable({
   plateScale,
   hideLocateColumn,
 }: LightsAnalysisTableProps) {
+  const navigate = useNavigate();
   const [sortField, setSortField] = useState<SortField | null>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
 
@@ -115,14 +116,12 @@ export function LightsAnalysisTable({
     }
   };
 
-  const handleReveal = useCallback(async (e: React.MouseEvent, path: string) => {
+  const handleReveal = useCallback((e: React.MouseEvent, path: string) => {
     e.stopPropagation();
-    try {
-      await revealItemInDir(path);
-    } catch (err) {
-      console.error('Failed to reveal:', err);
-    }
-  }, []);
+    navigate('/files', {
+      state: { reveal: { path, token: Date.now() } },
+    });
+  }, [navigate]);
 
   const toggleFrame = useCallback((frameId: number) => {
     const next = new Set(selectedFrameIds);
@@ -434,7 +433,7 @@ export function LightsAnalysisTable({
                     <button
                       onClick={e => handleReveal(e, frame.file_path)}
                       className="inline-flex items-center p-1 text-content-muted hover:text-content bg-surface-hover hover:bg-surface-hover rounded transition-colors"
-                      title="Reveal in file explorer"
+                      title="Locate in file browser"
                     >
                       <FolderOpen size={14} />
                     </button>

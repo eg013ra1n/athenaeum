@@ -1,18 +1,45 @@
 import { useState, useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api } from '../api';
 import { CameraStats } from "../types/models";
 import CameraCard from "../components/CameraCard";
 import CameraDetail from "../components/CameraDetail";
+
+const CAMERA_DETAIL_TABS = ["files", "darks", "flats", "master-darks", "master-flats"] as const;
+type CameraDetailTab = typeof CAMERA_DETAIL_TABS[number];
 
 export default function Equipment() {
   const [cameras, setCameras] = useState<CameraStats[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedCamera, setSelectedCamera] = useState<string | null>(null);
+  const [searchParams] = useSearchParams();
+
+  // Cross-page jump from Calibration Coverage: ?camera=…&tab=…&highlightSet=…
+  // Auto-select the matching camera once cameras have loaded; CameraDetail
+  // consumes initialTab + highlightSetId once and clears the URL params.
+  const requestedCamera = searchParams.get("camera");
+  const requestedTabParam = searchParams.get("tab");
+  const requestedTab: CameraDetailTab | undefined =
+    requestedTabParam && (CAMERA_DETAIL_TABS as readonly string[]).includes(requestedTabParam)
+      ? (requestedTabParam as CameraDetailTab)
+      : undefined;
+  const requestedHighlightSetParam = searchParams.get("highlightSet");
+  const requestedHighlightSet =
+    requestedHighlightSetParam != null && /^\d+$/.test(requestedHighlightSetParam)
+      ? parseInt(requestedHighlightSetParam, 10)
+      : null;
 
   useEffect(() => {
     loadCameras();
   }, []);
+
+  useEffect(() => {
+    if (!requestedCamera || cameras.length === 0) return;
+    if (cameras.some(c => c.instrume === requestedCamera)) {
+      setSelectedCamera(requestedCamera);
+    }
+  }, [cameras, requestedCamera]);
 
   const loadCameras = async () => {
     try {
@@ -35,12 +62,18 @@ export default function Equipment() {
     setSelectedCamera(null);
   };
 
-  // Render camera detail view with tabs
+  // Render camera detail view with tabs. Keying by selectedCamera means a
+  // camera switch remounts (so init state re-applies), but a same-camera
+  // re-render (e.g. CameraDetail clearing URL params after consuming them)
+  // does NOT remount — otherwise initialTab would reset to "files".
   if (selectedCamera) {
     return (
       <CameraDetail
+        key={selectedCamera}
         instrume={selectedCamera}
         onClose={handleCloseCamera}
+        initialTab={selectedCamera === requestedCamera ? requestedTab : undefined}
+        highlightSetId={selectedCamera === requestedCamera ? requestedHighlightSet : null}
       />
     );
   }

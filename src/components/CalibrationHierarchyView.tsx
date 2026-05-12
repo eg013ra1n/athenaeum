@@ -30,8 +30,12 @@ interface CalibrationHierarchyViewProps {
   onCalibrationComplete?: () => void;
   onRefresh?: () => void;
   onBlink?: (frameIds: number[]) => void;
-  onSplit?: (selectedFilterKeys: Set<string>) => void;
-  onCreateCustomSet?: (selectedFilterKeys: Set<string>) => void;
+  onSplit?: (frameIds: number[]) => void;
+  onCreateCustomSet?: (frameIds: number[]) => void;
+  /** When set, scroll to + highlight the matching set in the Flat/Dark/Bias table on mount. */
+  highlightCalSet?: { setId: number; kind: 'flat' | 'dark' | 'bias' } | null;
+  /** Called once the highlight has been forwarded to the table view. */
+  onHighlightConsumed?: () => void;
 }
 
 export function CalibrationHierarchyView({
@@ -47,6 +51,8 @@ export function CalibrationHierarchyView({
   onBlink,
   onSplit,
   onCreateCustomSet,
+  highlightCalSet,
+  onHighlightConsumed,
 }: CalibrationHierarchyViewProps) {
   // Re-assign mode toggle
   const [reassignMode, setReassignMode] = useState(false);
@@ -128,15 +134,26 @@ export function CalibrationHierarchyView({
     setCheckedKeys(keys);
   }, []);
 
-  // Split with checked filter keys
-  const handleSplit = useCallback(() => {
-    if (onSplit && checkedKeys.size > 0) onSplit(checkedKeys);
-  }, [onSplit, checkedKeys]);
+  // Resolve checked tree keys to concrete frame IDs using the active-view framesByKey,
+  // so callers don't need to know the by-night vs by-camera key shape.
+  const collectCheckedFrameIds = useCallback((): number[] => {
+    const ids: number[] = [];
+    for (const key of checkedKeys) {
+      const frames = framesByKey.get(key);
+      if (frames) ids.push(...frames.map(f => f.frame_id));
+    }
+    return ids;
+  }, [checkedKeys, framesByKey]);
 
-  // Create custom set with checked filter keys
+  const handleSplit = useCallback(() => {
+    if (!onSplit || checkedKeys.size === 0) return;
+    onSplit(collectCheckedFrameIds());
+  }, [onSplit, checkedKeys, collectCheckedFrameIds]);
+
   const handleCreateCustomSet = useCallback(() => {
-    if (onCreateCustomSet && checkedKeys.size > 0) onCreateCustomSet(checkedKeys);
-  }, [onCreateCustomSet, checkedKeys]);
+    if (!onCreateCustomSet || checkedKeys.size === 0) return;
+    onCreateCustomSet(collectCheckedFrameIds());
+  }, [onCreateCustomSet, checkedKeys, collectCheckedFrameIds]);
 
   // Open manual calibration modal for specific frame IDs
   const openManualCalibrationForFrameIds = useCallback((frameIds: number[]) => {
@@ -317,6 +334,8 @@ export function CalibrationHierarchyView({
               onManualCalibration={openManualCalibrationForFrameIds}
               onBlink={onBlink}
               reassignMode={reassignMode}
+              highlightCalSet={highlightCalSet}
+              onHighlightConsumed={onHighlightConsumed}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 

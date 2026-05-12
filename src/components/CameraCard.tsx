@@ -65,13 +65,15 @@ export default function CameraCard({ camera, onOpenCamera }: CameraCardProps) {
         </div>
       </div>
 
-      {/* View Calibration Button */}
+      {/* View Library Button — accent-ghost (border + 10% tint) so it reads
+          as the card's primary action without shouting. Matches the muted
+          Nord palette used throughout the app for secondary primaries. */}
       <button
         onClick={() => onOpenCamera(camera.instrume)}
-        className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-md transition-colors text-sm font-medium"
+        className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-md border border-accent/40 bg-accent/10 text-accent hover:bg-accent/20 transition-colors text-sm font-medium"
       >
         <Database size={16} />
-        View  Library
+        View Library
       </button>
     </div>
   );

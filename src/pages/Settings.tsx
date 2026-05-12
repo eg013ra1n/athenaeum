@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info } from 'lucide-react';
+import { revealItemInDir } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
@@ -34,9 +36,20 @@ export default function Settings() {
   const [autoMergeOnButtonClick, setAutoMergeOnButtonClick] = useState(false);
   const [autoMergeOnMonitorDetect, setAutoMergeOnMonitorDetect] = useState(false);
 
+  // Flat Contour Plot defaults — drive the per-frame contour rendering in
+  // Blink. Values match PixInsight FlatContourPlot v1.3.1 defaults.
+  const [flatContourResolution, setFlatContourResolution] = useState('50');
+  const [flatContourSigma, setFlatContourSigma] = useState('1.0');
+  const [flatContourCount, setFlatContourCount] = useState('15');
+  const [flatContourGradient, setFlatContourGradient] = useState('50');
+
   // Archive compression preference (folder list lives in File Manager now)
   const [archiveCompression, setArchiveCompressionState] = useState<ArchiveCompression>('store');
   const [archiveSaving, setArchiveSaving] = useState(false);
+
+  // Data file locations (desktop only — db + log paths reported by the backend).
+  const [dbPath, setDbPath] = useState<string>('');
+  const [logPath, setLogPath] = useState<string>('');
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -51,8 +64,37 @@ export default function Settings() {
   const [rescanningContentHash, setRescanningContentHash] = useState(false);
   const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<'general' | 'calibration' | 'analysis' | 'plate_solving'>('general');
+  // Tab state — initial value comes from `?tab=…` so deep-links (e.g. the
+  // "Open Plate-Solve Settings" CTA on the index-missing modal) land on the
+  // right tab without an extra click.
+  const [searchParams, setSearchParams] = useSearchParams();
+  type SettingsTab = 'general' | 'calibration' | 'analysis' | 'plate_solving';
+  const tabFromUrl = (searchParams.get('tab') ?? '') as SettingsTab | '';
+  const validTabs: readonly SettingsTab[] = ['general', 'calibration', 'analysis', 'plate_solving'];
+  const initialTab: SettingsTab = validTabs.includes(tabFromUrl as SettingsTab)
+    ? (tabFromUrl as SettingsTab)
+    : 'general';
+  const [activeTab, _setActiveTab] = useState<SettingsTab>(initialTab);
+  const setActiveTab = (tab: SettingsTab) => {
+    _setActiveTab(tab);
+    // Reflect in the URL so a refresh keeps the tab and back/forward navigation
+    // stays in sync. `replace` so we don't pollute the history stack on every click.
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      next.set('tab', tab);
+      return next;
+    }, { replace: true });
+  };
+
+  // If the URL `?tab=` changes while Settings is already mounted (e.g. the
+  // plate-solve modal navigates here from another page), follow it. Otherwise
+  // the user lands on Settings but on the wrong tab.
+  useEffect(() => {
+    if (validTabs.includes(tabFromUrl as SettingsTab) && tabFromUrl !== activeTab) {
+      _setActiveTab(tabFromUrl as SettingsTab);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabFromUrl]);
 
   useEffect(() => {
     loadSettings();
@@ -62,6 +104,10 @@ export default function Settings() {
         setArchiveCompressionState(s.compression);
       })
       .catch(console.error);
+    if (isTauri) {
+      api.invoke<string>('get_database_path').then(setDbPath).catch(console.error);
+      api.invoke<string>('get_log_path').then(setLogPath).catch(console.error);
+    }
   }, []);
 
   const handleArchiveCompressionChange = async (next: ArchiveCompression) => {
@@ -138,6 +184,28 @@ export default function Settings() {
           defaultValue: 'false',
         }),
       ]);
+
+      // Flat-contour defaults — loaded in a separate batch to keep the
+      // primary Promise.all destructuring readable. Reads inherit the same
+      // get_setting fallback contract as the other settings here.
+      const [fcRes, fcSig, fcCnt, fcGrad] = await Promise.all([
+        api.invoke<string>('get_setting', {
+          key: 'flat_contour.resolution_pct', defaultValue: '50',
+        }),
+        api.invoke<string>('get_setting', {
+          key: 'flat_contour.sigma_px', defaultValue: '1.0',
+        }),
+        api.invoke<string>('get_setting', {
+          key: 'flat_contour.contours', defaultValue: '15',
+        }),
+        api.invoke<string>('get_setting', {
+          key: 'flat_contour.gradient_pct', defaultValue: '50',
+        }),
+      ]);
+      setFlatContourResolution(fcRes);
+      setFlatContourSigma(fcSig);
+      setFlatContourCount(fcCnt);
+      setFlatContourGradient(fcGrad);
 
       setThresholdValue(value);
       setThresholdUnit(unit as ThresholdUnit);
@@ -323,6 +391,22 @@ export default function Settings() {
         api.invoke('set_setting', {
           key: 'monitoring.enabled_global',
           value: monitoringEnabledGlobal ? 'true' : 'false',
+        }),
+        api.invoke('set_setting', {
+          key: 'flat_contour.resolution_pct',
+          value: flatContourResolution,
+        }),
+        api.invoke('set_setting', {
+          key: 'flat_contour.sigma_px',
+          value: flatContourSigma,
+        }),
+        api.invoke('set_setting', {
+          key: 'flat_contour.contours',
+          value: flatContourCount,
+        }),
+        api.invoke('set_setting', {
+          key: 'flat_contour.gradient_pct',
+          value: flatContourGradient,
         }),
         api.invoke('set_setting', {
           key: 'auto_merge.on_button_click',
@@ -616,6 +700,85 @@ export default function Settings() {
                 between frames, they will be grouped into separate imaging nights. Typical night
                 sessions can span midnight (e.g., 19:00 Day 1 → 03:00 Day 2 = one night). Default
                 is 6 hours.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Flat Contour Plot</h3>
+          <p className="text-xs text-content-muted mb-4">
+            Defaults for the per-flat contour plot rendered in Blink (toolbar
+            mountain icon). Values match PixInsight's <span className="font-mono">FlatContourPlot</span> v1.3.1
+            so the visual matches that script at default settings.
+          </p>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Resolution (%)
+              </label>
+              <input
+                type="number"
+                value={flatContourResolution}
+                onChange={(e) => setFlatContourResolution(e.target.value)}
+                step="1"
+                min="5"
+                max="100"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-1">
+                Resampling factor. Lower = faster, less detail. PI default: 50.
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Sigma (px)
+              </label>
+              <input
+                type="number"
+                value={flatContourSigma}
+                onChange={(e) => setFlatContourSigma(e.target.value)}
+                step="0.1"
+                min="0"
+                max="10"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-1">
+                Gaussian noise-reduction sigma. PI default: 1.0.
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Contours
+              </label>
+              <input
+                type="number"
+                value={flatContourCount}
+                onChange={(e) => setFlatContourCount(e.target.value)}
+                step="1"
+                min="4"
+                max="20"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-1">
+                Number of discrete bands. PI default: 15.
+              </p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-content-secondary mb-2">
+                Gradient (%)
+              </label>
+              <input
+                type="number"
+                value={flatContourGradient}
+                onChange={(e) => setFlatContourGradient(e.target.value)}
+                step="1"
+                min="0"
+                max="200"
+                className="w-full bg-surface-hover border border-border rounded-lg px-4 py-2 text-content focus:outline-none focus:border-accent"
+              />
+              <p className="text-xs text-content-muted mt-1">
+                Boundary-emphasis strength. Higher darkens band edges more. PI default: 50.
               </p>
             </div>
           </div>
@@ -1072,6 +1235,48 @@ export default function Settings() {
           </p>
         </div>
       </div>
+
+      {/* Data file locations (desktop only) */}
+      {isTauri && (
+        <div className="mt-6 bg-surface-elevated rounded-lg p-6">
+          <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <Info size={20} />
+            Data file locations
+          </h3>
+          <p className="text-sm text-content-muted mb-4">
+            Where Athenaeum stores its catalog database and log file on disk. Click the
+            folder icon to reveal each in your file manager.
+          </p>
+          <div className="bg-surface-secondary rounded p-4 text-sm font-mono space-y-3">
+            <div className="flex items-center gap-3">
+              <span className="text-content-muted min-w-[80px]">Database:</span>
+              <span className="text-content truncate flex-1">{dbPath || '—'}</span>
+              {dbPath && (
+                <button
+                  onClick={() => revealItemInDir(dbPath)}
+                  className="text-content-muted hover:text-content transition flex-shrink-0"
+                  title="Reveal in file manager"
+                >
+                  <FolderOpen size={16} />
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="text-content-muted min-w-[80px]">Log file:</span>
+              <span className="text-content truncate flex-1">{logPath || '—'}</span>
+              {logPath && (
+                <button
+                  onClick={() => revealItemInDir(logPath)}
+                  className="text-content-muted hover:text-content transition flex-shrink-0"
+                  title="Reveal in file manager"
+                >
+                  <FolderOpen size={16} />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Database Maintenance Section */}
       <div className="mt-6 bg-surface-elevated rounded-lg p-6">
