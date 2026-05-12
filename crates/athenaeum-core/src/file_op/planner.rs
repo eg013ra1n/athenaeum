@@ -24,7 +24,6 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -418,7 +417,9 @@ fn is_inside_any(p: &Path, roots: &[PathBuf]) -> bool {
     })
 }
 
+#[cfg(unix)]
 fn device_id_for(p: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
     // Walk up to the nearest existing ancestor (planner may be asked about a
     // dest that doesn't yet exist as a sub-tree). For our planner we already
     // require dest_dir to exist; this is defensive.
@@ -432,6 +433,38 @@ fn device_id_for(p: &Path) -> Result<u64> {
             },
         }
     }
+}
+
+#[cfg(windows)]
+fn device_id_for(p: &Path) -> Result<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    // Windows doesn't expose st_dev on stable. Use the volume root (drive
+    // letter or UNC \\server\share prefix) of the canonical path as a stable
+    // "device key" — same drive → same u64, different drive → different u64,
+    // which is all the planner needs to pick AtomicRename vs CopyVerifyDelete.
+    let mut cur: &Path = p;
+    let canonical = loop {
+        if let Ok(c) = fs::canonicalize(cur) {
+            break c;
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => {
+                return Err(anyhow!(
+                    "could not canonicalize {} or any ancestor",
+                    p.display()
+                ))
+            }
+        }
+    };
+    let root = canonical
+        .components()
+        .next()
+        .ok_or_else(|| anyhow!("no root component for {}", p.display()))?;
+    let mut hasher = DefaultHasher::new();
+    root.as_os_str().hash(&mut hasher);
+    Ok(hasher.finish())
 }
 
 fn common_root(paths: &[PathBuf]) -> Option<PathBuf> {
