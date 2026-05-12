@@ -124,7 +124,7 @@ echo "-- notify_discord.sh --"
 out=$(
   DISCORD_WEBHOOK_URL="" \
   CI_COMMIT_TAG="v0.2.0-beta.10" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
   "$HELPERS_DIR/notify_discord.sh" 2>&1
 )
@@ -135,13 +135,13 @@ out=$(
   DRY_RUN=1 \
   DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/dummy" \
   CI_COMMIT_TAG="v0.2.0" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
   "$HELPERS_DIR/notify_discord.sh"
 )
 assert_contains "dry-run prints title" "Athenaeum v0.2.0 released" "$out"
 assert_contains "dry-run prints stable color" "3066993" "$out"
-assert_contains "dry-run prints release URL" "https://gitlab.com/eg013ra1n/athenaeum/-/releases/v0.2.0" "$out"
+assert_contains "dry-run prints release URL" "https://example.com/blog/v0.2.0/" "$out"
 assert_contains "dry-run includes download field" "artfrom.space/releases/download" "$out"
 assert_not_contains "stable title omits beta marker" "(beta)" "$out"
 
@@ -150,7 +150,7 @@ out=$(
   DRY_RUN=1 \
   DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/dummy" \
   CI_COMMIT_TAG="v0.2.0-beta.10" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
   "$HELPERS_DIR/notify_discord.sh"
 )
@@ -162,7 +162,7 @@ out=$(
   DRY_RUN=1 \
   DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/dummy" \
   CI_COMMIT_TAG="v0.2.0" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="/nonexistent/RELEASE_NOTES.md" \
   "$HELPERS_DIR/notify_discord.sh"
 )
@@ -176,7 +176,7 @@ out=$(
   TELEGRAM_BOT_TOKEN="" \
   TELEGRAM_CHAT_ID="123" \
   CI_COMMIT_TAG="v0.2.0-beta.10" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
   "$HELPERS_DIR/notify_telegram.sh" 2>&1
 )
@@ -187,7 +187,7 @@ out=$(
   TELEGRAM_BOT_TOKEN="dummy:token" \
   TELEGRAM_CHAT_ID="" \
   CI_COMMIT_TAG="v0.2.0-beta.10" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
   "$HELPERS_DIR/notify_telegram.sh" 2>&1
 )
@@ -199,7 +199,7 @@ out=$(
   TELEGRAM_BOT_TOKEN="dummy:token" \
   TELEGRAM_CHAT_ID="@athenaeum_releases" \
   CI_COMMIT_TAG="v0.2.0" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
   "$HELPERS_DIR/notify_telegram.sh"
 )
@@ -207,7 +207,7 @@ assert_contains "dry-run prints chat id" "@athenaeum_releases" "$out"
 assert_contains "dry-run uses HTML parse mode" "HTML" "$out"
 assert_contains "dry-run wraps title in bold" "<b>Athenaeum v0.2.0 released</b>" "$out"
 assert_contains "dry-run converts inline code in body" "<code>inline code</code>" "$out"
-assert_contains "dry-run includes release URL" "https://gitlab.com/eg013ra1n/athenaeum/-/releases/v0.2.0" "$out"
+assert_contains "dry-run includes release URL" "https://example.com/blog/v0.2.0/" "$out"
 assert_not_contains "stable title omits beta marker" "(beta)" "$out"
 
 # Beta tag.
@@ -216,7 +216,7 @@ out=$(
   TELEGRAM_BOT_TOKEN="dummy:token" \
   TELEGRAM_CHAT_ID="@athenaeum_releases" \
   CI_COMMIT_TAG="v0.2.0-beta.10" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
   "$HELPERS_DIR/notify_telegram.sh"
 )
@@ -228,11 +228,11 @@ out=$(
   TELEGRAM_BOT_TOKEN="dummy:token" \
   TELEGRAM_CHAT_ID="@athenaeum_releases" \
   CI_COMMIT_TAG="v0.2.0-beta.10" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="$FIXTURES_DIR/long.md" \
   "$HELPERS_DIR/notify_telegram.sh"
 )
-assert_contains "long telegram body has truncation tail" "Full notes: https://gitlab.com/eg013ra1n/athenaeum/-/releases/v0.2.0-beta.10" "$out"
+assert_contains "long telegram body has truncation tail" "Full notes: https://example.com/blog/v0.2.0-beta.10/" "$out"
 
 # Missing RELEASE_NOTES.md falls back to a one-liner.
 out=$(
@@ -240,7 +240,7 @@ out=$(
   TELEGRAM_BOT_TOKEN="dummy:token" \
   TELEGRAM_CHAT_ID="@athenaeum_releases" \
   CI_COMMIT_TAG="v0.2.0" \
-  CI_PROJECT_URL="https://gitlab.com/eg013ra1n/athenaeum" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
   RELEASE_NOTES_PATH="/nonexistent/RELEASE_NOTES.md" \
   "$HELPERS_DIR/notify_telegram.sh"
 )

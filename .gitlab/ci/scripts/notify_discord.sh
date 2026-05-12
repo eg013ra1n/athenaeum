@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Post the contents of RELEASE_NOTES.md to a Discord channel via webhook.
-# Required env: DISCORD_WEBHOOK_URL, CI_COMMIT_TAG, CI_PROJECT_URL.
-# Optional env: RELEASE_NOTES_PATH (default: RELEASE_NOTES.md), DRY_RUN=1.
+# Required env: DISCORD_WEBHOOK_URL, CI_COMMIT_TAG.
+# Optional env: RELEASE_NOTES_PATH (default: RELEASE_NOTES.md), DRY_RUN=1,
+#               RELEASE_NOTES_BASE_URL (default: https://artfrom.space/blog).
 #
 # Behaviour:
 #   - DISCORD_WEBHOOK_URL empty -> log + exit 0 (so the first pipeline after
@@ -17,11 +18,13 @@ if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
 fi
 
 : "${CI_COMMIT_TAG:?CI_COMMIT_TAG must be set}"
-: "${CI_PROJECT_URL:?CI_PROJECT_URL must be set}"
 
 NOTES_PATH="${RELEASE_NOTES_PATH:-RELEASE_NOTES.md}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RELEASE_URL="${CI_PROJECT_URL}/-/releases/${CI_COMMIT_TAG}"
+# Public release-notes URL on the docs site (artfrom.space/blog/v0.2.0/, etc.)
+# instead of CI_PROJECT_URL which leaks the local GitLab host to public chats.
+RELEASE_NOTES_BASE_URL="${RELEASE_NOTES_BASE_URL:-https://artfrom.space/blog}"
+RELEASE_URL="${RELEASE_NOTES_BASE_URL}/${CI_COMMIT_TAG}/"
 
 RESP_TMP=$(mktemp -t discord_response.XXXXXX)
 trap 'rm -f "$RESP_TMP"' EXIT
