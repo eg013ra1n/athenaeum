@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Bell, AlertCircle } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { useNotifications } from '../contexts/NotificationContext';
 
 /**
@@ -10,6 +11,7 @@ import { useNotifications } from '../contexts/NotificationContext';
 export function NotificationBell({ collapsed }: { collapsed: boolean }) {
   const { notifications, unreadCount, markAllRead, clearNotifications } =
     useNotifications();
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -75,8 +77,8 @@ export function NotificationBell({ collapsed }: { collapsed: boolean }) {
               </p>
             ) : (
               <ul className="divide-y divide-border">
-                {notifications.map((n) => (
-                  <li key={n.id} className="px-4 py-3">
+                {notifications.map((n) => {
+                  const body = (
                     <div className="flex items-start gap-2">
                       {n.hasErrors && (
                         <AlertCircle size={14} className="mt-0.5 shrink-0 text-amber-500" />
@@ -91,8 +93,26 @@ export function NotificationBell({ collapsed }: { collapsed: boolean }) {
                         </p>
                       </div>
                     </div>
-                  </li>
-                ))}
+                  );
+                  return (
+                    <li key={n.id}>
+                      {n.link ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigate(n.link!);
+                            setOpen(false);
+                          }}
+                          className="w-full px-4 py-3 text-left transition-colors hover:bg-surface-hover"
+                        >
+                          {body}
+                        </button>
+                      ) : (
+                        <div className="px-4 py-3">{body}</div>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </div>

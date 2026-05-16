@@ -30,6 +30,7 @@ export default function Settings() {
   const [useContentHash, setUseContentHash] = useState(false);
   const [contentHashRescanned, setContentHashRescanned] = useState(false);
   const [checkBeta, setCheckBeta] = useState(false);
+  const [autoCheck, setAutoCheck] = useState(true);
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
   const [monitoringIntervalMinutes, setMonitoringIntervalMinutes] = useState('10');
   const [monitoringEnabledGlobal, setMonitoringEnabledGlobal] = useState(true);
@@ -129,7 +130,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned, checkBetaVal
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned, checkBetaVal, autoCheckVal
       ] = await Promise.all([
         api.invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -183,6 +184,10 @@ export default function Settings() {
           key: 'updates.check_beta',
           defaultValue: 'false',
         }),
+        api.invoke<string>('get_setting', {
+          key: 'updates.auto_check',
+          defaultValue: 'true',
+        }),
       ]);
 
       // Flat-contour defaults — loaded in a separate batch to keep the
@@ -220,6 +225,7 @@ export default function Settings() {
       setUseContentHash(contentHash.toLowerCase() === 'true');
       setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
       setCheckBeta(checkBetaVal.toLowerCase() === 'true');
+      setAutoCheck(autoCheckVal.toLowerCase() === 'true');
 
       // Load monitoring settings
       try {
@@ -379,6 +385,10 @@ export default function Settings() {
         api.invoke('set_setting', {
           key: 'updates.check_beta',
           value: checkBeta ? 'true' : 'false',
+        }),
+        api.invoke('set_setting', {
+          key: 'updates.auto_check',
+          value: autoCheck ? 'true' : 'false',
         }),
         api.invoke('set_setting', {
           key: 'blink.annotation_config',
@@ -622,6 +632,22 @@ export default function Settings() {
         <div>
           <h3 className="text-lg font-semibold mb-4">Updates</h3>
           <div className="space-y-4">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoCheck}
+                onChange={(e) => setAutoCheck(e.target.checked)}
+                className="w-5 h-5 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent focus:ring-offset-0"
+              />
+              <div>
+                <span className="block text-sm font-medium text-content-secondary">
+                  Automatically check for updates on startup
+                </span>
+                <span className="block text-xs text-content-muted mt-1">
+                  When enabled, Athenaeum checks for a newer version each time it starts and shows a notification if one is available. Disable to only check manually via the button on the About page.
+                </span>
+              </div>
+            </label>
             <label className="flex items-center gap-3 cursor-pointer">
               <input
                 type="checkbox"

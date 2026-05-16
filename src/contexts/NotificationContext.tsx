@@ -35,7 +35,9 @@ export interface AutoMergeCompleteEvent {
 export interface Toast {
   id: string;
   message: string;
-  tone: 'info' | 'warning';
+  tone: 'info' | 'warning' | 'success';
+  /** Optional in-app route; when set the toast is clickable and navigates. */
+  link?: string;
 }
 
 /** Persisted entry shown in the notification bell dropdown. */
@@ -49,6 +51,8 @@ export interface Notification {
   unread: boolean;
   /** `true` when the scan emitted errors. */
   hasErrors: boolean;
+  /** Optional in-app route; when set the entry is clickable and navigates. */
+  link?: string;
 }
 
 interface NotificationContextValue {
@@ -58,6 +62,14 @@ interface NotificationContextValue {
   dismissToast: (id: string) => void;
   markAllRead: () => void;
   clearNotifications: () => void;
+  /** Raise a toast + persistent bell entry from non-event code. */
+  notify: (input: {
+    title: string;
+    detail: string;
+    tone?: 'info' | 'warning' | 'success';
+    hasErrors?: boolean;
+    link?: string;
+  }) => void;
 }
 
 const NotificationContext = createContext<NotificationContextValue | null>(null);
@@ -73,6 +85,39 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  const notify = useCallback(
+    (input: {
+      title: string;
+      detail: string;
+      tone?: 'info' | 'warning' | 'success';
+      hasErrors?: boolean;
+      link?: string;
+    }) => {
+      const id = `notify-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const notification: Notification = {
+        id,
+        title: input.title,
+        detail: input.detail,
+        occurredAt: new Date().toISOString(),
+        unread: true,
+        hasErrors: input.hasErrors ?? false,
+        link: input.link,
+      };
+      setNotifications((prev) => [notification, ...prev].slice(0, MAX_HISTORY));
+
+      const toastId = `toast-${id}`;
+      const toast: Toast = {
+        id: toastId,
+        message: input.title,
+        tone: input.tone ?? (input.hasErrors ? 'warning' : 'info'),
+        link: input.link,
+      };
+      setToasts((prev) => [...prev, toast]);
+      setTimeout(() => dismissToast(toastId), TOAST_TIMEOUT_MS);
+    },
+    [dismissToast],
+  );
 
   const addEvent = useCallback(
     (event: MonitorDetectedEvent) => {
@@ -195,6 +240,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
         dismissToast,
         markAllRead,
         clearNotifications,
+        notify,
       }}
     >
       {children}

@@ -5,6 +5,15 @@ export interface BlackholeChangedEvent {
   action: 'blackholed' | 'restored';
 }
 
+// Result of the `check_for_updates` command. Fields are snake_case to match
+// the Rust command's serialization (see athenaeum-tauri commands::core).
+export interface UpdateInfo {
+  current_version: string;
+  latest_version: string;
+  is_update_available: boolean;
+  download_url: string;
+}
+
 export enum FileFormat {
   FITS = "FITS",
   XISF = "XISF",

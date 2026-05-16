@@ -1,15 +1,9 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { api } from '../api';
 import { openUrl } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { RefreshCw, Download, CheckCircle2, AlertCircle, Info, ExternalLink } from 'lucide-react';
-
-interface UpdateInfo {
-  current_version: string;
-  latest_version: string;
-  is_update_available: boolean;
-  download_url: string;
-}
+import type { UpdateInfo } from '../types/models';
 
 interface Dependency {
   name: string;
@@ -64,6 +58,13 @@ function UpdateSection() {
       setChecking(false);
     }
   };
+
+  // Auto-populate on mount so arriving here (e.g. from the update
+  // notification) shows the result + Download button without a manual click.
+  useEffect(() => {
+    handleCheck();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <section className="rounded-lg bg-surface-elevated/60 p-6 space-y-4">
