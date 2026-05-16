@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, Sliders, RefreshCw, Filter, LayoutGrid, Table2, RotateCw, FileX, Archive } from 'lucide-react';
+import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, RotateCcw, Filter, LayoutGrid, Table2, RotateCw, FileX, Archive } from 'lucide-react';
 import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import {
@@ -15,14 +15,16 @@ import {
 } from '../components/ObjectsFilterPanel';
 import { ObjectsTableView } from '../components/ObjectsTableView';
 import type { ObjectsTab } from '../components/ObjectsTableView';
+import { ToolbarContainer, ToolbarGroup, ToolbarButton, ToolbarDivider } from '../components/Toolbar';
+import { useNotifications } from '../contexts/NotificationContext';
 
 export default function Objects() {
   const navigate = useNavigate();
+  const { notify } = useNotifications();
   const [frameSets, setFrameSets] = useState<FramesSetWithCount[]>([]);
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [generateResult, setGenerateResult] = useState<AutoGenerateResult | null>(null);
   const [editingSetId, setEditingSetId] = useState<number | null>(null);
   const [editingName, setEditingName] = useState<string>('');
   const [draggedSetId, setDraggedSetId] = useState<number | null>(null);
@@ -49,8 +51,8 @@ export default function Objects() {
   const [showAutoGenerateConfirm, setShowAutoGenerateConfirm] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ id: number; name: string | null } | null>(null);
-  const [showThresholdPanel, setShowThresholdPanel] = useState(false);
   const [customThreshold, setCustomThreshold] = useState<string>('');
+  const [thresholdUnit, setThresholdUnit] = useState<'deg' | 'arcmin' | 'arcsec'>('deg');
   const [defaultThreshold, setDefaultThreshold] = useState<number>(3.0);
   const [deletingAutoSets, setDeletingAutoSets] = useState(false);
   const [showDeleteAutoSetsConfirm, setShowDeleteAutoSetsConfirm] = useState(false);
@@ -119,10 +121,12 @@ export default function Objects() {
       const value = parseFloat(valueStr);
       if (isNaN(value)) {
         setDefaultThreshold(3.0);
+        setCustomThreshold('3.00');
+        setThresholdUnit('deg');
         return;
       }
 
-      // Convert to degrees based on unit
+      // Convert stored value to degrees for internal defaultThreshold reference
       let thresholdDeg = value;
       switch (unit) {
         case 'arcsec':
@@ -136,12 +140,73 @@ export default function Objects() {
           break;
       }
 
+      const resolvedUnit: 'deg' | 'arcmin' | 'arcsec' =
+        unit === 'arcmin' || unit === 'arcsec' ? unit : 'deg';
+
       setDefaultThreshold(thresholdDeg);
-      setCustomThreshold(thresholdDeg.toFixed(2));
+      // Display value in the unit stored in settings
+      setCustomThreshold(value.toFixed(resolvedUnit === 'deg' ? 2 : 1));
+      setThresholdUnit(resolvedUnit);
     } catch (err) {
       console.error('Failed to load threshold settings:', err);
       setDefaultThreshold(3.0);
       setCustomThreshold('3.00');
+      setThresholdUnit('deg');
+    }
+  };
+
+  const handleThresholdUnitChange = async (newUnit: 'deg' | 'arcmin' | 'arcsec') => {
+    // Convert current display value to degrees, then to the new unit
+    const currentValueDeg = (() => {
+      const v = parseFloat(customThreshold);
+      if (isNaN(v)) return defaultThreshold;
+      switch (thresholdUnit) {
+        case 'arcsec': return v / 3600;
+        case 'arcmin': return v / 60;
+        default: return v;
+      }
+    })();
+
+    let newValue: number;
+    switch (newUnit) {
+      case 'arcsec': newValue = currentValueDeg * 3600; break;
+      case 'arcmin': newValue = currentValueDeg * 60; break;
+      default: newValue = currentValueDeg;
+    }
+
+    setThresholdUnit(newUnit);
+    setCustomThreshold(newValue.toFixed(newUnit === 'deg' ? 2 : 1));
+
+    try {
+      await api.invoke('set_setting', { key: 'grouping.threshold.value', value: String(newValue) });
+      await api.invoke('set_setting', { key: 'grouping.threshold.unit', value: newUnit });
+    } catch (err) {
+      console.error('Failed to save threshold unit:', err);
+    }
+  };
+
+  const handleThresholdValueChange = async (raw: string) => {
+    setCustomThreshold(raw);
+    const v = parseFloat(raw);
+    if (isNaN(v) || v < 0) return;
+    try {
+      await api.invoke('set_setting', { key: 'grouping.threshold.value', value: String(v) });
+      await api.invoke('set_setting', { key: 'grouping.threshold.unit', value: thresholdUnit });
+    } catch (err) {
+      console.error('Failed to save threshold value:', err);
+    }
+  };
+
+  const handleResetThreshold = async () => {
+    // Reset to 3 degrees (the hardcoded default)
+    setCustomThreshold('3.00');
+    setThresholdUnit('deg');
+    setDefaultThreshold(3.0);
+    try {
+      await api.invoke('set_setting', { key: 'grouping.threshold.value', value: '3.0' });
+      await api.invoke('set_setting', { key: 'grouping.threshold.unit', value: 'deg' });
+    } catch (err) {
+      console.error('Failed to reset threshold:', err);
     }
   };
 
@@ -235,17 +300,26 @@ export default function Objects() {
     try {
       setGenerating(true);
       setError(null);
-      setGenerateResult(null);
       setSuggestedMerges([]);
 
       // Store current frame sets before auto-generate
       const setsBeforeGenerate = frameSets;
 
-      // Prepare threshold parameter - only pass if different from default
+      // Resolve customThreshold (displayed in thresholdUnit) to degrees
+      const parsedDisplay = parseFloat(customThreshold);
+      let resolvedDeg: number = defaultThreshold;
+      if (!isNaN(parsedDisplay) && parsedDisplay > 0) {
+        switch (thresholdUnit) {
+          case 'arcsec': resolvedDeg = parsedDisplay / 3600; break;
+          case 'arcmin': resolvedDeg = parsedDisplay / 60; break;
+          default: resolvedDeg = parsedDisplay;
+        }
+      }
+
+      // Only pass threshold if different from the persisted default
       let thresholdDeg: number | null = null;
-      const parsed = parseFloat(customThreshold);
-      if (!isNaN(parsed) && parsed > 0 && Math.abs(parsed - defaultThreshold) > 0.001) {
-        thresholdDeg = parsed;
+      if (!isNaN(resolvedDeg) && resolvedDeg > 0 && Math.abs(resolvedDeg - defaultThreshold) > 0.001) {
+        thresholdDeg = resolvedDeg;
       }
 
       const result = await api.invoke<AutoGenerateResult>('auto_generate_frame_sets', {
@@ -253,7 +327,20 @@ export default function Objects() {
         thresholdDeg,
       });
 
-      setGenerateResult(result);
+      // Notify via the notification system
+      const detailParts: string[] = [];
+      if (result.frames_already_in_sets > 0) detailParts.push(`${result.frames_already_in_sets} already in sets`);
+      if (result.frames_excluded > 0) detailParts.push(`${result.frames_excluded} excluded`);
+      const detail = detailParts.length > 0 ? detailParts.join(', ') : 'No changes';
+
+      notify({
+        title: `Frame sets generated — ${result.sets_created} set${result.sets_created === 1 ? '' : 's'}, ${result.frames_clustered} frames`,
+        detail,
+        kind: 'merge',
+        tone: result.sets_created > 0 ? 'success' : 'info',
+        hasErrors: false,
+        link: result.frames_excluded > 0 ? '/excluded' : undefined,
+      });
 
       // Refresh excluded count (always, even if no sets created)
       loadExcludedCount();
@@ -660,40 +747,17 @@ export default function Objects() {
               Objects Library
               <span className="text-sm font-normal text-content-muted ml-3">Frame sets grouped by sky coordinates</span>
             </h2>
+          </div>
+          <div className="flex items-center gap-3">
             {excludedCount > 0 && (
               <button
                 onClick={() => navigate('/excluded')}
-                className="mt-1 flex items-center gap-1.5 text-sm text-warning hover:text-warning/80 transition-colors"
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-surface-hover hover:brightness-110 text-warning transition-colors"
+                title="View excluded frames"
               >
-                <FileX size={14} />
-                {excludedCount} excluded frame{excludedCount !== 1 ? 's' : ''}
+                <FileX size={18} />
+                {excludedCount} excluded
               </button>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            {/* Stage-only toolbar buttons */}
-            {activeTab === 'stage' && (
-              <>
-                <button
-                  onClick={handleAutoGenerate}
-                  disabled={generating}
-                  className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-surface rounded-lg transition-colors"
-                >
-                  <Sparkles size={18} />
-                  {generating ? 'Generating...' : 'Auto-Generate Sets'}
-                </button>
-                <button
-                  onClick={() => setShowThresholdPanel(prev => !prev)}
-                  className={`flex items-center justify-center py-2 px-2 rounded-lg transition-colors ${
-                    showThresholdPanel
-                      ? 'bg-accent hover:bg-accent-hover text-surface'
-                      : 'bg-surface-hover hover:bg-surface-hover text-content-muted'
-                  }`}
-                  title="Grouping threshold settings"
-                >
-                  <Sliders size={18} />
-                </button>
-              </>
             )}
             {/* Merge mode — available in Stage and WIP */}
             {(activeTab === 'stage' || activeTab === 'wip') && (
@@ -789,56 +853,65 @@ export default function Objects() {
           ))}
         </div>
 
-        {/* Threshold Settings Panel */}
-        {activeTab === 'stage' && showThresholdPanel && (
-          <div className="mt-4 p-4 bg-surface-elevated border border-border rounded-lg">
-            {/* Header with buttons */}
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center gap-2">
-                <label className="text-sm font-medium text-content-secondary">
-                  Grouping Threshold
-                </label>
-                <button
-                  onClick={() => setCustomThreshold(defaultThreshold.toFixed(2))}
-                  className="p-1 text-content-muted hover:text-content transition-colors"
-                  title="Reset to default"
+        {/* Stage toolbar — always visible when on the Stage tab */}
+        {activeTab === 'stage' && (
+          <div className="mt-3">
+            <ToolbarContainer>
+              <ToolbarGroup label="Threshold">
+                <input
+                  type="number"
+                  value={customThreshold}
+                  onChange={(e) => handleThresholdValueChange(e.target.value)}
+                  step="0.1"
+                  min="0"
+                  className="h-7 w-20 text-xs bg-surface-hover border border-border rounded-lg px-2 text-content focus:outline-none focus:ring-2 focus:ring-accent"
+                />
+              </ToolbarGroup>
+              <ToolbarGroup label="Unit">
+                <select
+                  value={thresholdUnit}
+                  onChange={(e) => handleThresholdUnitChange(e.target.value as 'deg' | 'arcmin' | 'arcsec')}
+                  className="h-7 text-xs bg-surface-hover border border-border rounded-lg px-2 text-content focus:outline-none focus:ring-2 focus:ring-accent"
                 >
-                  <RefreshCw size={14} />
-                </button>
-              </div>
-              {frameSets.filter(fs => !fs.frames_set.is_custom).length > 0 && (
-                <button
+                  <option value="deg">degrees</option>
+                  <option value="arcmin">arcmin</option>
+                  <option value="arcsec">arcsec</option>
+                </select>
+              </ToolbarGroup>
+              <ToolbarGroup label="Reset">
+                <ToolbarButton
+                  variant="default"
+                  icon={RotateCcw}
+                  onClick={handleResetThreshold}
+                  title="Reset to default (3°)"
+                />
+              </ToolbarGroup>
+              <ToolbarDivider />
+              <ToolbarGroup label="Generate">
+                <ToolbarButton
+                  variant="primary"
+                  icon={Sparkles}
+                  onClick={handleAutoGenerate}
+                  disabled={generating}
+                >
+                  {generating ? 'Generating…' : 'Generate'}
+                </ToolbarButton>
+              </ToolbarGroup>
+              <ToolbarGroup label="Delete Auto">
+                <ToolbarButton
+                  variant="danger"
+                  icon={Trash2}
                   onClick={handleDeleteAutoGenerated}
-                  disabled={deletingAutoSets}
-                  className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white text-xs rounded transition-colors"
-                  title={`Delete ${frameSets.filter(fs => !fs.frames_set.is_custom).length} auto-generated set${frameSets.filter(fs => !fs.frames_set.is_custom).length !== 1 ? 's' : ''}`}
+                  disabled={
+                    deletingAutoSets ||
+                    frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length === 0
+                  }
+                  title={`Delete ${frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length} auto-generated sets`}
                 >
-                  <Trash2 size={14} />
-                  {deletingAutoSets ? 'Deleting...' : `Delete ${frameSets.filter(fs => !fs.frames_set.is_custom).length} Auto-Generated`}
-                </button>
-              )}
-            </div>
-
-            {/* Input field */}
-            <div className="flex items-center gap-3">
-              <input
-                type="number"
-                value={customThreshold}
-                onChange={(e) => setCustomThreshold(e.target.value)}
-                step="0.1"
-                min="0"
-                className="w-32 px-3 py-2 bg-surface-hover border border-border rounded text-sm text-content focus:outline-none focus:ring-2 focus:ring-accent"
-              />
-              <span className="text-sm text-content-muted">degrees</span>
-            </div>
-
-            {/* Conversion helper */}
-            <p className="mt-2 text-xs text-content-muted">
-              {!isNaN(parseFloat(customThreshold))
-                ? `${parseFloat(customThreshold).toFixed(2)}° = ${(parseFloat(customThreshold) * 60).toFixed(1)} arcmin`
-                : `${defaultThreshold.toFixed(2)}° = ${(defaultThreshold * 60).toFixed(1)} arcmin`
-              }
-            </p>
+                  Delete Auto
+                </ToolbarButton>
+              </ToolbarGroup>
+            </ToolbarContainer>
           </div>
         )}
 
@@ -896,41 +969,6 @@ export default function Objects() {
             <p className="font-medium text-error">Error</p>
             <p className="text-sm text-error/80">{String(error)}</p>
           </div>
-        </div>
-      )}
-
-      {generateResult && (
-        <div className="mb-4 p-4 bg-success-muted border border-success/50 rounded-lg">
-          <div className="flex items-start justify-between mb-2">
-            <p className="font-medium text-success">Generation Complete</p>
-            <button
-              onClick={() => setGenerateResult(null)}
-              className="p-1 text-success hover:brightness-110 transition-colors"
-              title="Dismiss"
-            >
-              <X size={18} />
-            </button>
-          </div>
-          <div className="text-sm text-success/80 space-y-1">
-            <p>Sets created: {generateResult.sets_created}</p>
-            <p>Frames clustered: {generateResult.frames_clustered}</p>
-            {generateResult.frames_already_in_sets > 0 && (
-              <p>Frames already in sets (skipped): {generateResult.frames_already_in_sets}</p>
-            )}
-            {generateResult.frames_excluded > 0 && (
-              <p>Frames excluded: {generateResult.frames_excluded}</p>
-            )}
-          </div>
-          {generateResult.frames_excluded > 0 && (
-            <div className="mt-3">
-              <button
-                onClick={() => navigate('/excluded')}
-                className="text-sm text-success hover:text-success/80 underline cursor-pointer"
-              >
-                View {generateResult.frames_excluded} excluded frames
-              </button>
-            </div>
-          )}
         </div>
       )}
 
