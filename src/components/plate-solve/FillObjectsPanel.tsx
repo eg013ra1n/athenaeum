@@ -9,6 +9,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { api } from '../../api';
+import { useNotifications } from '../../contexts/NotificationContext';
 import type {
   AutofindProgressEvent,
   AutofindCompleteEvent,
@@ -86,6 +87,7 @@ export const FillObjectsPanel = forwardRef<FillObjectsPanelHandle, FillObjectsPa
 }, ref) {
   const [isActive, setIsActive] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const { notify } = useNotifications();
   const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
   const [currentFrameId, setCurrentFrameId] = useState<number | null>(null);
   const [totals, setTotals] = useState<RunningTotals>(EMPTY_TOTALS);
@@ -102,13 +104,15 @@ export const FillObjectsPanel = forwardRef<FillObjectsPanelHandle, FillObjectsPa
 
   // Subscribe once to the two event names.
   useEffect(() => {
+    let cancelled = false;
     let unlistenProgress: (() => void) | null = null;
     let unlistenComplete: (() => void) | null = null;
 
-    (async () => {
-      unlistenProgress = await api.listen<AutofindProgressEvent>(
+    api
+      .listen<AutofindProgressEvent>(
         'autofind-objects-progress',
         (payload) => {
+          if (cancelled) return;
           setCurrentFrameId(payload.frame_id);
           setProgress({ current: payload.current, total: payload.total });
 
@@ -158,22 +162,38 @@ export const FillObjectsPanel = forwardRef<FillObjectsPanelHandle, FillObjectsPa
             return next;
           });
         },
-      );
+      )
+      .then((fn) => { if (cancelled) fn(); else unlistenProgress = fn; })
+      .catch((err) => console.error('[FillObjectsPanel] listen failed:', err));
 
-      unlistenComplete = await api.listen<AutofindCompleteEvent>(
+    api
+      .listen<AutofindCompleteEvent>(
         'autofind-objects-complete',
         (payload) => {
+          if (cancelled) return;
           setCompleted(payload);
           setIsActive(false);
           setIsCancelling(false);
           isActiveRef.current = false;
           setCurrentFrameId(null);
           onComplete?.();
+
+          notify({
+            title: payload.cancelled
+              ? 'Object autofind cancelled'
+              : `Object autofind — ${payload.labeled} labeled`,
+            detail: `${payload.no_match} no match, ${payload.already_labeled} already labeled${payload.errors ? `, ${payload.errors} error${payload.errors === 1 ? '' : 's'}` : ''}`,
+            kind: 'autofind',
+            hasErrors: payload.errors > 0,
+            tone: payload.errors > 0 ? 'warning' : payload.cancelled ? 'info' : 'success',
+          });
         },
-      );
-    })();
+      )
+      .then((fn) => { if (cancelled) fn(); else unlistenComplete = fn; })
+      .catch((err) => console.error('[FillObjectsPanel] listen failed:', err));
 
     return () => {
+      cancelled = true;
       unlistenProgress?.();
       unlistenComplete?.();
     };

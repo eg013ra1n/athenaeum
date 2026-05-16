@@ -43,6 +43,7 @@ import {
   X as XIcon,
 } from 'lucide-react';
 import { api } from '../../api';
+import { useNotifications } from '../../contexts/NotificationContext';
 import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
@@ -297,6 +298,7 @@ interface ActiveOp {
 }
 
 export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilter }: Props) {
+  const { notify } = useNotifications();
   // Lazy initializer so `leftCameraFilter` flows into the first state.
   const [state, dispatch] = useReducer(reducer, undefined, () =>
     initialState(scanRoots, leftCameraFilter),
@@ -482,9 +484,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
 
   // Subscribe to file-op progress + finished events.
   useEffect(() => {
+    let cancelled = false;
     let unlistenProgress: (() => void) | null = null;
     let unlistenFinished: (() => void) | null = null;
     api.listen<FileOpProgressPayload>('file-op-progress', (p) => {
+      if (cancelled) return;
       setActiveOps(prev => ({
         ...prev,
         [p.operationId]: {
@@ -497,9 +501,12 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           finished: prev[p.operationId]?.finished,
         },
       }));
-    }).then(fn => { unlistenProgress = fn; });
+    })
+      .then(fn => { if (cancelled) fn(); else unlistenProgress = fn; })
+      .catch(err => console.error('[DualPaneFileBrowser] listen failed:', err));
 
     api.listen<FileOpFinishedPayload>('file-op-finished', (p) => {
+      if (cancelled) return;
       setActiveOps(prev => {
         const existing = prev[p.operation_id];
         if (!existing) return prev;
@@ -507,6 +514,19 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       });
       // Refresh both panes — the listing may have changed.
       refreshBoth();
+      notify({
+        title: `File ${p.kind} ${p.outcome}`,
+        detail: `Operation #${p.operation_id}`,
+        kind: 'fileop',
+        hasErrors: p.outcome === 'failed',
+        tone:
+          p.outcome === 'failed'
+            ? 'warning'
+            : p.outcome === 'cancelled'
+              ? 'info'
+              : 'success',
+        dedupeKey: `file-op-finished-${p.operation_id}`,
+      });
       // Auto-dismiss after a brief delay.
       window.setTimeout(() => {
         setActiveOps(prev => {
@@ -515,9 +535,12 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           return next;
         });
       }, 1500);
-    }).then(fn => { unlistenFinished = fn; });
+    })
+      .then(fn => { if (cancelled) fn(); else unlistenFinished = fn; })
+      .catch(err => console.error('[DualPaneFileBrowser] listen failed:', err));
 
     return () => {
+      cancelled = true;
       unlistenProgress?.();
       unlistenFinished?.();
     };

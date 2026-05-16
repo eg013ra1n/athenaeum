@@ -33,6 +33,7 @@ export function useAutoUpdateCheck() {
             title: `Update available: v${info.latest_version}`,
             detail: `You have v${info.current_version}. Click to view and download on the About page.`,
             tone: 'success',
+            kind: 'update',
             link: '/about',
           });
         }

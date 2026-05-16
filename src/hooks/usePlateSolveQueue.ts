@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../api';
+import { useNotifications } from '../contexts/NotificationContext';
 import type {
   PlateSolveProgressEvent,
   PlateSolveCompleteEvent,
@@ -50,6 +51,7 @@ let nextBatchId = 1;
 
 export function usePlateSolveQueue() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
+  const { notify } = useNotifications();
   const [activeBatches, setActiveBatches] = useState<Map<number, ActivePlateSolveBatch>>(
     new Map(),
   );
@@ -168,13 +170,15 @@ export function usePlateSolveQueue() {
 
   // Listen for backend progress + complete events once on mount.
   useEffect(() => {
+    let cancelled = false;
     let unlistenProgress: (() => void) | null = null;
     let unlistenComplete: (() => void) | null = null;
 
-    (async () => {
-      unlistenProgress = await api.listen<PlateSolveProgressEvent>(
+    api
+      .listen<PlateSolveProgressEvent>(
         'plate-solve-progress',
         (payload) => {
+          if (cancelled) return;
           const batchId = currentBatchIdRef.current;
           if (batchId == null) return;
 
@@ -206,11 +210,15 @@ export function usePlateSolveQueue() {
             return updated;
           });
         },
-      );
+      )
+      .then((fn) => { if (cancelled) fn(); else unlistenProgress = fn; })
+      .catch((err) => console.error('[usePlateSolveQueue] listen failed:', err));
 
-      unlistenComplete = await api.listen<PlateSolveCompleteEvent>(
+    api
+      .listen<PlateSolveCompleteEvent>(
         'plate-solve-complete',
         (payload) => {
+          if (cancelled) return;
           const batchId = currentBatchIdRef.current;
           if (batchId == null) return;
           setActiveBatches(prev => {
@@ -230,11 +238,23 @@ export function usePlateSolveQueue() {
             });
             return updated;
           });
+
+          notify({
+            title: `Plate-solve finished — ${payload.solved}/${payload.total} solved`,
+            detail: payload.failed
+              ? `${payload.failed} failed`
+              : 'All frames solved',
+            kind: 'platesolve',
+            hasErrors: payload.failed > 0,
+            tone: payload.failed > 0 ? 'warning' : 'success',
+          });
         },
-      );
-    })();
+      )
+      .then((fn) => { if (cancelled) fn(); else unlistenComplete = fn; })
+      .catch((err) => console.error('[usePlateSolveQueue] listen failed:', err));
 
     return () => {
+      cancelled = true;
       unlistenProgress?.();
       unlistenComplete?.();
     };

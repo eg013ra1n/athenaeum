@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../../api';
 import { cancelArchiveOperation } from '../../api/archive';
 import type { ArchiveProgressEvent } from '../../types/archive';
+import { useNotifications } from '../../contexts/NotificationContext';
 
 interface Props {
   operationId: number;
@@ -23,21 +24,44 @@ const RESTORE_STAGES = new Set(['extract', 'verify', 'update_catalog', 'cleanup'
 export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
   const [progress, setProgress] = useState<ArchiveProgressEvent | null>(null);
   const [finished, setFinished] = useState<FinishedEvent | null>(null);
+  const { notify } = useNotifications();
 
   useEffect(() => {
+    let cancelled = false;
     let unlistenProgress: (() => void) | null = null;
     let unlistenFinished: (() => void) | null = null;
     api.listen<ArchiveProgressEvent>('archive-progress', (payload) => {
+      if (cancelled) return;
       if (payload.operation_id === operationId) setProgress(payload);
-    }).then(fn => { unlistenProgress = fn; });
+    })
+      .then(fn => { if (cancelled) fn(); else unlistenProgress = fn; })
+      .catch(err => console.error('[ArchiveProgress] listen failed:', err));
     api.listen<FinishedEvent>('archive-finished', (payload) => {
+      if (cancelled) return;
       if (payload.operation_id !== operationId) return;
       setFinished(payload);
       onFinished?.(payload.outcome);
+      const verb = payload.kind === 'restore' ? 'Restore' : 'Archive';
+      notify({
+        title: `${verb} ${payload.outcome}`,
+        detail: `Operation #${payload.operation_id}`,
+        kind: 'archive',
+        hasErrors: payload.outcome === 'failed',
+        tone:
+          payload.outcome === 'failed'
+            ? 'warning'
+            : payload.outcome === 'cancelled'
+              ? 'info'
+              : 'success',
+        dedupeKey: `archive-finished-${payload.operation_id}`,
+      });
       // Brief pause so the user sees the final state, then dismiss.
       window.setTimeout(() => { onClose?.(); }, 1500);
-    }).then(fn => { unlistenFinished = fn; });
+    })
+      .then(fn => { if (cancelled) fn(); else unlistenFinished = fn; })
+      .catch(err => console.error('[ArchiveProgress] listen failed:', err));
     return () => {
+      cancelled = true;
       unlistenProgress?.();
       unlistenFinished?.();
     };

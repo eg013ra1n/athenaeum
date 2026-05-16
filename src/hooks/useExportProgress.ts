@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
 import { api, type UnlistenFn } from '../api';
 import type { ExportProgressEvent, ExportCompleteEvent, ExportResult } from '../types/export';
+import { useNotifications } from '../contexts/NotificationContext';
 
 export interface ActiveExport {
   frameSetId: number;
@@ -13,14 +14,17 @@ export interface ActiveExport {
 
 export function useExportProgress() {
   const [activeExports, setActiveExports] = useState<Map<number, ActiveExport>>(new Map());
+  const { notify } = useNotifications();
 
   // Listen for progress/complete events
   useEffect(() => {
-    let progressUnlisten: UnlistenFn;
-    let completeUnlisten: UnlistenFn;
+    let cancelled = false;
+    let progressUnlisten: UnlistenFn | undefined;
+    let completeUnlisten: UnlistenFn | undefined;
 
-    const setupListeners = async () => {
-      progressUnlisten = await api.listen<ExportProgressEvent>('export-progress', (payload) => {
+    api
+      .listen<ExportProgressEvent>('export-progress', (payload) => {
+        if (cancelled) return;
         const { frameSetId } = payload;
         setActiveExports((prev) => {
           const updated = new Map(prev);
@@ -33,9 +37,13 @@ export function useExportProgress() {
           }
           return updated;
         });
-      });
+      })
+      .then((fn) => { if (cancelled) fn(); else progressUnlisten = fn; })
+      .catch((err) => console.error('[useExportProgress] listen failed:', err));
 
-      completeUnlisten = await api.listen<ExportCompleteEvent>('export-complete', (payload) => {
+    api
+      .listen<ExportCompleteEvent>('export-complete', (payload) => {
+        if (cancelled) return;
         const { frameSetId } = payload;
         setActiveExports((prev) => {
           const updated = new Map(prev);
@@ -58,14 +66,28 @@ export function useExportProgress() {
           }
           return updated;
         });
-      });
-    };
 
-    setupListeners();
+        const exportWarnings = payload.warnings?.length ?? 0;
+        const exportFailed = !payload.success || !!payload.error;
+        notify({
+          title: exportFailed
+            ? 'Export failed'
+            : `Export complete — ${payload.filesOrganized} files`,
+          detail: payload.error
+            ? String(payload.error)
+            : `${payload.outputDir}${exportWarnings ? ` · ${exportWarnings} warning${exportWarnings === 1 ? '' : 's'}` : ''}`,
+          kind: 'export',
+          hasErrors: exportFailed,
+          tone: exportFailed || exportWarnings > 0 ? 'warning' : 'success',
+        });
+      })
+      .then((fn) => { if (cancelled) fn(); else completeUnlisten = fn; })
+      .catch((err) => console.error('[useExportProgress] listen failed:', err));
 
     return () => {
-      if (progressUnlisten) progressUnlisten();
-      if (completeUnlisten) completeUnlisten();
+      cancelled = true;
+      progressUnlisten?.();
+      completeUnlisten?.();
     };
   }, []);
 

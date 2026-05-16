@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ChevronRight, History, Loader2, Zap, Mouse } from 'lucide-react';
 import { api } from '../api';
 import type { MergeLogEntry } from '../types/models';
+import { formatTimestamp } from '../utils/dateFormatting';
 
 interface Props {
   frameSetId: number;
@@ -165,11 +166,4 @@ function readableReason(reason: string): string {
     default:
       return reason;
   }
-}
-
-function formatTimestamp(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const pad = (n: number) => n.toString().padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }

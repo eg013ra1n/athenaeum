@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../api';
 import type { AnalysisProgressEvent, AnalysisCompleteEvent, AnalyzeFrameSetResult } from '../types/models';
+import { useNotifications } from '../contexts/NotificationContext';
 
 export interface QueueItem {
   frameSetId: number;
@@ -20,6 +21,7 @@ export interface ActiveAnalysis {
 export function useAnalysisProgress() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [activeAnalyses, setActiveAnalyses] = useState<Map<number, ActiveAnalysis>>(new Map());
+  const { notify } = useNotifications();
   const processingRef = useRef(false);
   const queueRef = useRef(queue);
   queueRef.current = queue;
@@ -78,11 +80,13 @@ export function useAnalysisProgress() {
 
   // Listen for progress and completion events (once on mount)
   useEffect(() => {
+    let cancelled = false;
     let unlistenProgress: (() => void) | null = null;
     let unlistenComplete: (() => void) | null = null;
 
-    (async () => {
-      unlistenProgress = await api.listen<AnalysisProgressEvent>('analysis-progress', (payload) => {
+    api
+      .listen<AnalysisProgressEvent>('analysis-progress', (payload) => {
+        if (cancelled) return;
         setActiveAnalyses(prev => {
           const entry = prev.get(payload.frame_set_id);
           if (!entry) return prev;
@@ -90,9 +94,13 @@ export function useAnalysisProgress() {
           updated.set(payload.frame_set_id, { ...entry, progress: payload });
           return updated;
         });
-      });
+      })
+      .then((fn) => { if (cancelled) fn(); else unlistenProgress = fn; })
+      .catch((err) => console.error('[useAnalysisProgress] listen failed:', err));
 
-      unlistenComplete = await api.listen<AnalysisCompleteEvent>('analysis-complete', (payload) => {
+    api
+      .listen<AnalysisCompleteEvent>('analysis-complete', (payload) => {
+        if (cancelled) return;
         setActiveAnalyses(prev => {
           const entry = prev.get(payload.frame_set_id);
           if (!entry) return prev;
@@ -111,10 +119,23 @@ export function useAnalysisProgress() {
           });
           return updated;
         });
-      });
-    })();
+
+        const failed = payload.failed ?? 0;
+        notify({
+          title: payload.cancelled
+            ? 'Analysis cancelled'
+            : `Analysis finished — ${payload.analyzed} analyzed`,
+          detail: `${payload.skipped} skipped${failed ? `, ${failed} failed` : ''}`,
+          kind: 'analysis',
+          hasErrors: failed > 0,
+          tone: failed > 0 ? 'warning' : payload.cancelled ? 'info' : 'success',
+        });
+      })
+      .then((fn) => { if (cancelled) fn(); else unlistenComplete = fn; })
+      .catch((err) => console.error('[useAnalysisProgress] listen failed:', err));
 
     return () => {
+      cancelled = true;
       unlistenProgress?.();
       unlistenComplete?.();
     };

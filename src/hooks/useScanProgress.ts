@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
 import { api, type UnlistenFn } from '../api';
 import type { ScanProgressEvent, ScanCompleteEvent, ScanResult, OrphanedFile } from '../types/models';
+import { useNotifications } from '../contexts/NotificationContext';
 
 // Extended result that includes missing files info
 export interface RescanResult extends ScanResult {
@@ -20,14 +21,17 @@ export interface ActiveScan {
 
 export function useScanProgress() {
   const [activeScans, setActiveScans] = useState<Map<number, ActiveScan>>(new Map());
+  const { notify } = useNotifications();
 
   // Listen for progress events
   useEffect(() => {
-    let progressUnlisten: UnlistenFn;
-    let completeUnlisten: UnlistenFn;
+    let cancelled = false;
+    let progressUnlisten: UnlistenFn | undefined;
+    let completeUnlisten: UnlistenFn | undefined;
 
-    const setupListeners = async () => {
-      progressUnlisten = await api.listen<ScanProgressEvent>('scan-progress', (payload) => {
+    api
+      .listen<ScanProgressEvent>('scan-progress', (payload) => {
+        if (cancelled) return;
         const { root_id } = payload;
         setActiveScans((prev) => {
           const updated = new Map(prev);
@@ -40,9 +44,13 @@ export function useScanProgress() {
           }
           return updated;
         });
-      });
+      })
+      .then((fn) => { if (cancelled) fn(); else progressUnlisten = fn; })
+      .catch((err) => console.error('[useScanProgress] listen failed:', err));
 
-      completeUnlisten = await api.listen<ScanCompleteEvent>('scan-complete', (payload) => {
+    api
+      .listen<ScanCompleteEvent>('scan-complete', (payload) => {
+        if (cancelled) return;
         const { root_id } = payload;
         setActiveScans((prev) => {
           const updated = new Map(prev);
@@ -72,14 +80,35 @@ export function useScanProgress() {
           }
           return updated;
         });
-      });
-    };
 
-    setupListeners();
+        const scanErrs = payload.errors?.length ?? 0;
+        const nothingNew =
+          !payload.cancelled && scanErrs === 0 && payload.files_processed === 0;
+        notify({
+          title: payload.cancelled
+            ? 'Scan cancelled'
+            : nothingNew
+              ? 'No new files found'
+              : `Scan finished — ${payload.files_processed} new or updated`,
+          detail: nothingNew
+            ? `Already up to date — ${payload.files_found} files`
+            : `${payload.files_found} on disk, ${payload.files_skipped} unchanged${scanErrs ? `, ${scanErrs} error${scanErrs === 1 ? '' : 's'}` : ''}`,
+          kind: 'scan',
+          hasErrors: scanErrs > 0,
+          tone: scanErrs > 0
+            ? 'warning'
+            : payload.cancelled || nothingNew
+              ? 'info'
+              : 'success',
+        });
+      })
+      .then((fn) => { if (cancelled) fn(); else completeUnlisten = fn; })
+      .catch((err) => console.error('[useScanProgress] listen failed:', err));
 
     return () => {
-      if (progressUnlisten) progressUnlisten();
-      if (completeUnlisten) completeUnlisten();
+      cancelled = true;
+      progressUnlisten?.();
+      completeUnlisten?.();
     };
   }, []);
 

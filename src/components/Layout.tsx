@@ -14,6 +14,7 @@ import { PlateSolveIndexMissingModal } from './plate-solve';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { NotificationBell } from './NotificationBell';
 import { ToastStack } from './Toast';
+import { NotificationPanel } from './NotificationPanel';
 import { AutoUpdateCheck } from './AutoUpdateCheck';
 import Logo from '../assets/athenaeum.png';
 
@@ -108,6 +109,7 @@ export default function Layout() {
           <ExportProgressIndicator />
           <PlateSolveIndexMissingModal />
           <ToastStack />
+          <NotificationPanel />
           <AutoUpdateCheck />
         </div>
         </PlateSolveProgressProvider>
