@@ -15,7 +15,7 @@ import {
 } from '../components/ObjectsFilterPanel';
 import { ObjectsTableView } from '../components/ObjectsTableView';
 import type { ObjectsTab } from '../components/ObjectsTableView';
-import { ToolbarContainer, ToolbarGroup, ToolbarButton, ToolbarDivider } from '../components/Toolbar';
+import { ToolbarContainer, ToolbarButton, ToolbarDivider, ToolbarInfo } from '../components/Toolbar';
 import { useNotifications } from '../contexts/NotificationContext';
 
 export default function Objects() {
@@ -740,90 +740,89 @@ export default function Objects() {
 
   return (
     <div className="p-4 pt-3">
-      <div className="mb-4">
-        <div className="flex items-center justify-between mb-2">
-          <div>
-            <h2 className="text-2xl font-bold">
-              Objects Library
-              <span className="text-sm font-normal text-content-muted ml-3">Frame sets grouped by sky coordinates</span>
-            </h2>
-          </div>
-          <div className="flex items-center gap-3">
-            {excludedCount > 0 && (
-              <button
-                onClick={() => navigate('/excluded')}
-                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-surface-hover hover:brightness-110 text-warning transition-colors"
-                title="View excluded frames"
-              >
-                <FileX size={18} />
-                {excludedCount} excluded
-              </button>
-            )}
-            {/* Merge mode — available in Stage and WIP */}
-            {(activeTab === 'stage' || activeTab === 'wip') && (
-              <>
-                <button
-                  onClick={() => setIsMergeMode(prev => !prev)}
-                  className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
-                    isMergeMode
-                      ? 'bg-success hover:brightness-90 text-surface'
-                      : 'bg-surface-hover hover:bg-surface-hover text-content-secondary'
-                  }`}
-                  title={`${isMergeMode ? 'Exit' : 'Enter'} Merge Mode (M)`}
-                >
-                  <Grip size={18} />
-                  {isMergeMode ? 'Exit Merge Mode' : 'Merge Mode'}
-                </button>
-                <div className="h-6 w-px bg-border" />
-              </>
-            )}
-            {/* Common toolbar buttons (all tabs) */}
-            <div className="flex items-center bg-surface-hover rounded-lg p-1">
-              <button
-                onClick={() => handleViewModeChange('cards')}
-                className={`p-1.5 rounded transition-colors ${
-                  viewMode === 'cards'
-                    ? 'bg-accent text-surface'
-                    : 'text-content-muted hover:text-content'
-                }`}
-                title="Card view"
-              >
-                <LayoutGrid size={18} />
-              </button>
-              <button
-                onClick={() => handleViewModeChange('table')}
-                className={`p-1.5 rounded transition-colors ${
-                  viewMode === 'table'
-                    ? 'bg-accent text-surface'
-                    : 'text-content-muted hover:text-content'
-                }`}
-                title="Table view"
-              >
-                <Table2 size={18} />
-              </button>
-            </div>
+      {/* Title block + compact action buttons (kept ~h2 height so the tab
+          row still aligns with the File Manager tab strip) */}
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-2xl font-bold">
+          Objects Library
+          <span className="text-sm font-normal text-content-muted ml-3">Frame sets grouped by sky coordinates</span>
+        </h2>
+        <div className="flex items-center gap-2">
+          {excludedCount > 0 && (
             <button
-              onClick={() => setShowFilterPanel(prev => !prev)}
-              className={`relative flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
-                showFilterPanel || activeFilterCount > 0
-                  ? 'bg-accent hover:bg-accent-hover text-surface'
-                  : 'bg-surface-hover hover:bg-surface-hover text-content-secondary'
-              }`}
-              title="Filter frame sets"
+              onClick={() => navigate('/excluded')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg bg-surface-hover hover:brightness-110 text-warning transition-colors"
+              title="View excluded frames"
             >
-              <Filter size={18} />
-              Filter
-              {activeFilterCount > 0 && (
-                <span className="absolute -top-1 -right-1 bg-orange text-surface text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
-                  {activeFilterCount}
-                </span>
-              )}
+              <FileX size={15} />
+              {excludedCount} excluded
+            </button>
+          )}
+          {/* Merge mode — available in Stage and WIP */}
+          {(activeTab === 'stage' || activeTab === 'wip') && (
+            <>
+              <button
+                onClick={() => setIsMergeMode(prev => !prev)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                  isMergeMode
+                    ? 'bg-success hover:brightness-90 text-surface'
+                    : 'bg-surface-hover hover:bg-surface-hover text-content-secondary'
+                }`}
+                title={`${isMergeMode ? 'Exit' : 'Enter'} Merge Mode (M)`}
+              >
+                <Grip size={15} />
+                {isMergeMode ? 'Exit Merge Mode' : 'Merge Mode'}
+              </button>
+              <div className="h-5 w-px bg-border" />
+            </>
+          )}
+          {/* View mode toggle (all tabs) */}
+          <div className="flex items-center bg-surface-hover rounded-lg p-0.5">
+            <button
+              onClick={() => handleViewModeChange('cards')}
+              className={`p-1 rounded transition-colors ${
+                viewMode === 'cards'
+                  ? 'bg-accent text-surface'
+                  : 'text-content-muted hover:text-content'
+              }`}
+              title="Card view"
+            >
+              <LayoutGrid size={16} />
+            </button>
+            <button
+              onClick={() => handleViewModeChange('table')}
+              className={`p-1 rounded transition-colors ${
+                viewMode === 'table'
+                  ? 'bg-accent text-surface'
+                  : 'text-content-muted hover:text-content'
+              }`}
+              title="Table view"
+            >
+              <Table2 size={16} />
             </button>
           </div>
+          <button
+            onClick={() => setShowFilterPanel(prev => !prev)}
+            className={`relative flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+              showFilterPanel || activeFilterCount > 0
+                ? 'bg-accent hover:bg-accent-hover text-surface'
+                : 'bg-surface-hover hover:bg-surface-hover text-content-secondary'
+            }`}
+            title="Filter frame sets"
+          >
+            <Filter size={15} />
+            Filter
+            {activeFilterCount > 0 && (
+              <span className="absolute -top-1 -right-1 bg-orange text-surface text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                {activeFilterCount}
+              </span>
+            )}
+          </button>
         </div>
+      </div>
 
-        {/* Tab bar */}
-        <div className="flex items-center gap-1 border-b border-border mt-4">
+      {/* Tab bar — tabs only; sized + positioned to match File Manager */}
+      <div className="flex gap-2 mb-3 border-b border-border">
           {([
             { key: 'stage' as ObjectsTab, label: 'Stage', icon: Sparkles },
             { key: 'wip' as ObjectsTab, label: 'Work In Progress', icon: Star },
@@ -832,96 +831,106 @@ export default function Objects() {
             <button
               key={key}
               onClick={() => { setActiveTab(key); if (key === 'archive') setIsMergeMode(false); }}
-              className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
+              className={`px-4 py-2 transition relative ${
                 activeTab === key
-                  ? 'border-accent text-accent'
-                  : 'border-transparent text-content-muted hover:text-content hover:border-border'
+                  ? 'text-accent border-b-2 border-accent'
+                  : 'text-content-muted hover:text-content'
               }`}
             >
-              <Icon size={16} />
-              {label}
-              {tabCounts[key] > 0 && (
-                <span className={`text-xs px-1.5 py-0.5 rounded-full ${
-                  activeTab === key
-                    ? 'bg-accent/20 text-accent'
-                    : 'bg-surface-hover text-content-muted'
-                }`}>
-                  {tabCounts[key]}
-                </span>
-              )}
+              <div className="flex items-center gap-2">
+                <Icon size={16} />
+                {label}
+                {tabCounts[key] > 0 && (
+                  <span className={`text-xs px-1.5 py-0.5 rounded-full ${
+                    activeTab === key
+                      ? 'bg-accent/20 text-accent'
+                      : 'bg-surface-hover text-content-muted'
+                  }`}>
+                    {tabCounts[key]}
+                  </span>
+                )}
+              </div>
             </button>
           ))}
-        </div>
+      </div>
 
-        {/* Stage toolbar — always visible when on the Stage tab */}
-        {activeTab === 'stage' && (
-          <div className="mt-3">
-            <ToolbarContainer>
-              <ToolbarGroup label="Threshold">
-                <input
-                  type="number"
-                  value={customThreshold}
-                  onChange={(e) => handleThresholdValueChange(e.target.value)}
-                  step="0.1"
-                  min="0"
-                  className="h-7 w-20 text-xs bg-surface-hover border border-border rounded-lg px-2 text-content focus:outline-none focus:ring-2 focus:ring-accent"
-                />
-              </ToolbarGroup>
-              <ToolbarGroup label="Unit">
-                <select
-                  value={thresholdUnit}
-                  onChange={(e) => handleThresholdUnitChange(e.target.value as 'deg' | 'arcmin' | 'arcsec')}
-                  className="h-7 text-xs bg-surface-hover border border-border rounded-lg px-2 text-content focus:outline-none focus:ring-2 focus:ring-accent"
-                >
-                  <option value="deg">degrees</option>
-                  <option value="arcmin">arcmin</option>
-                  <option value="arcsec">arcsec</option>
-                </select>
-              </ToolbarGroup>
-              <ToolbarGroup label="Reset">
+      {/* Stage toolbar — always visible when on the Stage tab */}
+      {activeTab === 'stage' && (
+        <div className="mt-3 mb-2">
+          <ToolbarContainer>
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              <span className="text-xs text-content-muted">Threshold</span>
+              <input
+                type="number"
+                value={customThreshold}
+                onChange={(e) => handleThresholdValueChange(e.target.value)}
+                step="0.1"
+                min="0"
+                className="h-7 w-20 text-xs bg-surface-hover border border-border rounded-lg px-2 text-content focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+            </div>
+            <select
+              value={thresholdUnit}
+              onChange={(e) => handleThresholdUnitChange(e.target.value as 'deg' | 'arcmin' | 'arcsec')}
+              title="Threshold unit"
+              className="h-7 text-xs bg-surface-hover border border-border rounded-lg px-2 text-content focus:outline-none focus:ring-2 focus:ring-accent"
+            >
+              <option value="deg">degrees</option>
+              <option value="arcmin">arcmin</option>
+              <option value="arcsec">arcsec</option>
+            </select>
+            <ToolbarButton
+              variant="default"
+              icon={RotateCcw}
+              onClick={handleResetThreshold}
+              title="Reset to default (3°)"
+            />
+            <ToolbarDivider />
+            <ToolbarButton
+              variant="primary"
+              icon={Sparkles}
+              onClick={handleAutoGenerate}
+              disabled={generating}
+            >
+              {generating ? 'Generating…' : 'Auto Generate'}
+            </ToolbarButton>
+            <ToolbarButton
+              variant="danger"
+              icon={RotateCcw}
+              onClick={handleDeleteAutoGenerated}
+              disabled={
+                deletingAutoSets ||
+                frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length === 0
+              }
+              title={`Purge ${frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length} auto-generated sets (custom sets are kept)`}
+            >
+              Purge Auto
+            </ToolbarButton>
+            {isMergeMode && (
+              <>
+                <ToolbarDivider />
+                <ToolbarInfo icon={Grip}>
+                  Merge Mode — drag and drop frame sets to merge them
+                </ToolbarInfo>
                 <ToolbarButton
                   variant="default"
-                  icon={RotateCcw}
-                  onClick={handleResetThreshold}
-                  title="Reset to default (3°)"
-                />
-              </ToolbarGroup>
-              <ToolbarDivider />
-              <ToolbarGroup label="Generate">
-                <ToolbarButton
-                  variant="primary"
-                  icon={Sparkles}
-                  onClick={handleAutoGenerate}
-                  disabled={generating}
+                  onClick={() => setIsMergeMode(false)}
+                  title="Exit Merge Mode (M)"
                 >
-                  {generating ? 'Generating…' : 'Generate'}
+                  Exit (M)
                 </ToolbarButton>
-              </ToolbarGroup>
-              <ToolbarGroup label="Delete Auto">
-                <ToolbarButton
-                  variant="danger"
-                  icon={Trash2}
-                  onClick={handleDeleteAutoGenerated}
-                  disabled={
-                    deletingAutoSets ||
-                    frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length === 0
-                  }
-                  title={`Delete ${frameSets.filter(fs => !fs.frames_set.is_custom && !fs.frames_set.is_archived).length} auto-generated sets`}
-                >
-                  Delete Auto
-                </ToolbarButton>
-              </ToolbarGroup>
-            </ToolbarContainer>
-          </div>
-        )}
+              </>
+            )}
+          </ToolbarContainer>
+        </div>
+      )}
 
-        {/* Filter Panel */}
-        <ObjectsFilterPanel
-          filters={filters}
-          onChange={setFilters}
-          isOpen={showFilterPanel}
-        />
-      </div>
+      {/* Filter Panel */}
+      <ObjectsFilterPanel
+        filters={filters}
+        onChange={setFilters}
+        isOpen={showFilterPanel}
+      />
 
       {/* Results Summary */}
       {activeFilterCount > 0 && (
@@ -930,25 +939,20 @@ export default function Objects() {
         </div>
       )}
 
-      {(activeTab === 'stage' || activeTab === 'wip') && isMergeMode && (
-        <div className="mb-4 p-3 bg-success-muted border border-success/50 rounded-lg flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Grip className="text-success" size={20} />
-            <div>
-              <p className="font-medium text-success">Merge Mode Active</p>
-              <p className="text-sm text-success/80">
-                {activeTab === 'wip'
-                  ? 'Drag Stage sets onto WIP sets to merge new data'
-                  : 'Drag and drop frame sets to merge them'}
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={() => setIsMergeMode(false)}
-            className="text-success hover:brightness-110 text-sm underline"
-          >
-            Exit (M)
-          </button>
+      {activeTab === 'wip' && isMergeMode && (
+        <div className="mb-4">
+          <ToolbarContainer>
+            <ToolbarInfo icon={Grip}>
+              Merge Mode — drag Stage sets onto WIP sets to merge new data
+            </ToolbarInfo>
+            <ToolbarButton
+              variant="default"
+              onClick={() => setIsMergeMode(false)}
+              title="Exit Merge Mode (M)"
+            >
+              Exit (M)
+            </ToolbarButton>
+          </ToolbarContainer>
         </div>
       )}
 
@@ -1334,14 +1338,14 @@ export default function Objects() {
         confirmDanger={true}
       />
 
-      {/* Delete Auto-Generated Sets Confirmation Dialog */}
+      {/* Purge Auto-Generated Sets Confirmation Dialog */}
       <ConfirmDialog
         isOpen={showDeleteAutoSetsConfirm}
-        title="Delete All Auto-Generated Sets?"
-        message={`This will delete all ${frameSets.filter(fs => !fs.frames_set.is_custom).length} auto-generated frame sets.\n\nCustom sets will be preserved. The frames themselves will not be deleted.`}
+        title="Purge Auto-Generated Sets?"
+        message={`This will purge all ${frameSets.filter(fs => !fs.frames_set.is_custom).length} auto-generated frame sets.\n\nCustom sets and the underlying frames are kept — only the auto-generated groupings are removed.`}
         onConfirm={confirmDeleteAutoGenerated}
         onCancel={() => setShowDeleteAutoSetsConfirm(false)}
-        confirmText="Delete All Auto-Generated"
+        confirmText="Purge Auto-Generated"
         confirmDanger={true}
       />
 

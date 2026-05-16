@@ -211,7 +211,7 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
             <th
               scope="col"
               style={{ top: stickyHeaderTop, width: '2.5rem' }}
-              className="sticky z-10 bg-surface w-10 px-1.5 py-1.5 text-center"
+              className="sticky z-10 bg-surface-hover w-10 px-1.5 py-1.5 text-center"
             >
               <input
                 type="checkbox"
@@ -226,21 +226,21 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
             <th
               scope="col"
               style={fileColStyle}
-              className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
+              className="sticky z-10 bg-surface-hover px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
             >
               File
             </th>
             <th
               scope="col"
               style={missingColStyle}
-              className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
+              className="sticky z-10 bg-surface-hover px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
             >
               Missing
             </th>
             <th
               scope="col"
               style={typeColStyle}
-              className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
+              className="sticky z-10 bg-surface-hover px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
             >
               Frame Type
             </th>
@@ -248,7 +248,7 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
               <th
                 scope="col"
                 style={{ top: stickyHeaderTop }}
-                className="sticky z-10 bg-surface px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
+                className="sticky z-10 bg-surface-hover px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary"
               >
                 {extraColumn.header}
               </th>
@@ -271,7 +271,7 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
               <React.Fragment key={group.folder}>
                 {/* Group header row — checkbox toggles select-all-in-group;
                     the rest of the row toggles expand/collapse. */}
-                <tr className="bg-surface border-t border-border">
+                <tr className="bg-accent/15 border-t border-border">
                   <td className="w-10 px-1.5 py-1 text-center">
                     <input
                       type="checkbox"
@@ -298,7 +298,7 @@ export const MissingMetadataTable: React.FC<MissingMetadataTableProps> = ({
                         <ChevronDown size={14} className="flex-shrink-0 text-content-muted" />
                       )}
                       <span
-                        className="text-xs text-content-secondary font-mono break-all"
+                        className="text-xs text-content font-medium font-mono break-all"
                         title={group.folder}
                       >
                         {group.folder}

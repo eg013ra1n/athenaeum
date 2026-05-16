@@ -94,3 +94,21 @@ export function ToolbarButton({
 export function ToolbarDivider() {
   return <span className="text-border h-7 flex items-center">|</span>;
 }
+
+// ---------------------------------------------------------------------------
+// ToolbarInfo — non-interactive status chip (info tone), toolbar height
+// ---------------------------------------------------------------------------
+
+interface ToolbarInfoProps {
+  icon?: LucideIcon;
+  children: ReactNode;
+}
+
+export function ToolbarInfo({ icon: Icon, children }: ToolbarInfoProps) {
+  return (
+    <div className="h-7 inline-flex items-center gap-1.5 px-3 text-xs font-medium rounded-lg bg-info-muted border border-info/50 text-info">
+      {Icon && <Icon size={12} />}
+      {children}
+    </div>
+  );
+}

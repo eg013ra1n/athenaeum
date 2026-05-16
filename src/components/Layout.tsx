@@ -49,7 +49,7 @@ export default function Layout() {
           <aside
             className={`${collapsed ? 'w-16' : 'w-64'} bg-surface-elevated border-r border-border transition-all duration-200 overflow-hidden flex flex-col shrink-0`}
           >
-            <div className={`p-4 border-b border-border flex items-center ${collapsed ? 'justify-center' : 'gap-3'}`}>
+            <div className={`p-4 flex items-center ${collapsed ? 'justify-center' : 'gap-3'}`}>
               <img src={Logo} alt="Athenaeum" className="w-12 h-auto shrink-0" />
               {!collapsed && (
                 <div>
