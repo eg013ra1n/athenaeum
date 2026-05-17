@@ -252,7 +252,7 @@ fn blind_solve_end_to_end() {
                 "INSERT OR REPLACE INTO frames (id, file_id) VALUES (?1, 1)",
                 [frame_id],
             );
-            service::store_result(&conn, frame_id, &solve, Some(&dso_cat))
+            service::store_result(&conn, frame_id, &solve, Some(&dso_cat), &config)
                 .expect("store_result");
             let object: Option<String> = conn
                 .query_row(
@@ -368,7 +368,7 @@ fn blind_solve_fast_path() {
         "INSERT OR REPLACE INTO frames (id, file_id) VALUES (?1, 1)",
         [frame_id],
     );
-    service::store_result(&conn, frame_id, &solve, Some(&dso_cat))
+    service::store_result(&conn, frame_id, &solve, Some(&dso_cat), &config)
         .expect("store_result with DSO");
     let _ = storage::get_plate_solve(&conn, frame_id).expect("plate solve row written");
 }

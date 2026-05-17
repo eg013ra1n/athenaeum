@@ -345,7 +345,39 @@ pub fn store_result(
     frame_id: i64,
     result: &SolveResult,
     dso_catalog: Option<&DsoCatalog>,
+    config: &PlateSolveConfig,
 ) -> Result<()> {
+    // Defense-in-depth against catalog corruption: never write a solve's
+    // WCS / focal length back (with override=1) unless it clears the strict
+    // confidence bar — applied here REGARDLESS of acceptance stage, so a
+    // false positive that slipped through the gate-exempt hinted path (e.g.
+    // because a wrong/corrupt header made it look hinted) cannot overwrite
+    // frame metadata. inlier_ratio is the rig-independent discriminator
+    // (real solves >= ~0.08, noise alignments <= ~0.001); sparse fields are
+    // exempted inside blind_gate_ok exactly as during acceptance.
+    if config.blind_gate_enabled {
+        let m = BlindGateMetrics {
+            inliers: result.matched_stars,
+            expected_in_fov: result.expected_catalog_stars_in_fov,
+            rms_px: result.rms_residual_px,
+            adaptive_tol_px: adaptive_tol_px(
+                result.pixel_scale_arcsec,
+                config.base_verification_tolerance_arcsec,
+            ),
+            inlier_ratio: result.inlier_ratio,
+            recovered_scale_arcsec: result.pixel_scale_arcsec,
+            header_scale_arcsec: None,
+        };
+        if !blind_gate_ok(GateStage::ScaleCleared, &m, config) {
+            eprintln!(
+                "plate_solve: refusing to persist low-confidence solve for frame {frame_id} \
+                 (inliers={} ratio={:.5} scale={:.3}\"/px) — WCS/focal length NOT written back",
+                result.matched_stars, result.inlier_ratio, result.pixel_scale_arcsec
+            );
+            return Ok(());
+        }
+    }
+
     let record = PlateSolveRecord {
         id: None,
         frame_id,
@@ -1844,6 +1876,93 @@ mod tests {
         assert_eq!(required_inliers(80, 500, 0.10, 6), 16); // mid-density: round(80*0.20)
         // Detected < 30 forces the sparse-floor branch even if catalog is large.
         assert_eq!(required_inliers(1000, 25, 0.10, 6), 6);
+    }
+
+    fn mk_result(
+        matched: usize,
+        expected: usize,
+        ratio: f64,
+        scale: f64,
+        rms: f64,
+    ) -> SolveResult {
+        SolveResult {
+            wcs: WcsSolution {
+                crpix: (0.0, 0.0),
+                crval: (123.45, 67.89),
+                cd: [[1e-4, 0.0], [0.0, 1e-4]],
+                sip_forward: None,
+                sip_reverse: None,
+            },
+            matched_stars: matched,
+            total_detected: 600,
+            rms_residual_px: rms,
+            rms_residual_arcsec: rms * scale,
+            pixel_scale_arcsec: scale,
+            field_rotation_deg: 0.0,
+            solve_time_ms: 0,
+            catalog_used: "tycho2".into(),
+            algorithm_used: "blind_index".into(),
+            derived_focallen_mm: None,
+            focallen_corrected: false,
+            expected_catalog_stars_in_fov: expected,
+            inlier_ratio: ratio,
+        }
+    }
+
+    #[test]
+    fn store_result_refuses_low_confidence_writeback() {
+        // Defense-in-depth: a low-confidence (false-positive) solve must
+        // never write WCS/focal length back or create a plate_solves row,
+        // regardless of how acceptance classified it — this is what
+        // corrupted the catalog during the gate-less calibration run.
+        use crate::db::schema::init_db;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let cfg = PlateSolveConfig::default();
+        for (fid, name) in [(1, "a.fits"), (2, "b.fits")] {
+            conn.execute(
+                "INSERT INTO files (id,path,filename,size,modified_at,format,created_at)
+                 VALUES (?1,?2,?3,0,'2025-01-01','FITS','2025-01-01')",
+                rusqlite::params![fid, format!("/x/{name}"), name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id,file_id) VALUES (?1,?2)",
+                [fid, fid],
+            )
+            .unwrap();
+        }
+
+        // High-confidence (real-solve shape) — must persist.
+        store_result(&conn, 1, &mk_result(120, 800, 0.15, 1.5, 1.0), None, &cfg)
+            .unwrap();
+        let ps1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plate_solves WHERE frame_id=1", [], |r| r.get(0))
+            .unwrap();
+        let (ra1, ovr1): (Option<f64>, i64) = conn
+            .query_row("SELECT ra,override FROM frames WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ps1, 1, "high-confidence solve must persist");
+        assert!(ra1.is_some() && ovr1 == 1, "must write WCS + override");
+
+        // Low-confidence false-positive shape — must be refused.
+        store_result(&conn, 2, &mk_result(90, 150_000, 0.0006, 22.0, 2.8), None, &cfg)
+            .unwrap();
+        let ps2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plate_solves WHERE frame_id=2", [], |r| r.get(0))
+            .unwrap();
+        let (ra2, ovr2): (Option<f64>, i64) = conn
+            .query_row("SELECT ra,override FROM frames WHERE id=2", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ps2, 0, "low-confidence solve must NOT create a plate_solves row");
+        assert!(
+            ra2.is_none() && ovr2 == 0,
+            "low-confidence solve must NOT mutate the frame"
+        );
     }
 
     #[test]

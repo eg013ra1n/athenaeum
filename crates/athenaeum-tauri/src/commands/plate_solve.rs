@@ -144,7 +144,7 @@ pub async fn plate_solve_frame(
     )
     .map_err(|e| e.to_string())?;
 
-    service::store_result(&conn, frame_id, &result, dso.as_deref())
+    service::store_result(&conn, frame_id, &result, dso.as_deref(), &ps_config)
         .map_err(|e| e.to_string())?;
 
     storage::get_plate_solve(&conn, frame_id)
@@ -363,7 +363,7 @@ pub async fn plate_solve_batch(
             match r {
                 WorkResult::Solved { frame_id, result } => {
                     if let Err(e) =
-                        service::store_result(&conn, *frame_id, result, dso.as_deref())
+                        service::store_result(&conn, *frame_id, result, dso.as_deref(), ps_config.as_ref())
                     {
                         eprintln!(
                             "plate_solve: failed to store result for frame {frame_id}: {e}"
