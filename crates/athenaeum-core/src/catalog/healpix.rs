@@ -24,6 +24,20 @@ pub fn sky_to_pixel(ra_deg: f64, dec_deg: f64) -> u64 {
 /// `radius_deg`: cone radius in degrees.
 /// Returns a sorted, deduplicated list of pixel IDs.
 pub fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64> {
+    // `cdshealpix::cone_coverage_approx` asserts on its inputs: a non-finite
+    // or out-of-domain centre/radius panics. The plate-solve verifier can
+    // hand us a degenerate seed WCS (huge/NaN implied pixel scale → absurd
+    // cone radius) when solving without a scale hint; treat any such input
+    // as "no pixels" so the candidate simply fails verification instead of
+    // crashing the whole batch.
+    if !ra_deg.is_finite() || !dec_deg.is_finite() || !radius_deg.is_finite() || radius_deg <= 0.0
+    {
+        return Vec::new();
+    }
+    // A real catalog cone is at most a few degrees; clamp well inside
+    // cdshealpix's valid domain (< π) as a final safety net.
+    let radius_deg = radius_deg.min(90.0);
+
     let lon_rad = ra_deg.to_radians();
     let lat_rad = dec_deg.to_radians();
     let radius_rad = radius_deg.to_radians();
@@ -119,6 +133,32 @@ mod tests {
     fn cone_search_near_pole() {
         let pixels = cone_search_pixels(0.0, 89.0, 2.0);
         assert!(!pixels.is_empty());
+    }
+
+    #[test]
+    fn cone_search_invalid_radius_returns_empty_no_panic() {
+        // Regression: a degenerate plate-solve seed WCS (no scale hint in
+        // the blind-scale fallback) can produce a non-finite or absurd cone
+        // radius. cdshealpix's cone_coverage_approx asserts and panics on
+        // such input — which used to abort the entire plate-solve batch.
+        // These must return empty rather than panic.
+        assert!(cone_search_pixels(180.0, 45.0, f64::NAN).is_empty());
+        assert!(cone_search_pixels(180.0, 45.0, f64::INFINITY).is_empty());
+        assert!(cone_search_pixels(180.0, 45.0, -1.0).is_empty());
+        assert!(cone_search_pixels(180.0, 45.0, 0.0).is_empty());
+        assert!(cone_search_pixels(f64::NAN, 45.0, 2.0).is_empty());
+        assert!(cone_search_pixels(180.0, f64::NAN, 2.0).is_empty());
+    }
+
+    #[test]
+    fn cone_search_huge_radius_clamped_no_panic() {
+        // An absurdly large (but finite) radius is clamped instead of
+        // panicking inside cdshealpix; still returns a valid pixel set.
+        let pixels = cone_search_pixels(180.0, 45.0, 1.0e9);
+        assert!(!pixels.is_empty());
+        for &p in &pixels {
+            assert!(p < n_pixels());
+        }
     }
 
     #[test]

@@ -265,21 +265,46 @@ pub async fn plate_solve_batch(
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| file_path.clone());
-                            match service::solve_frame_with_hints(
-                                &frame,
-                                &file_path,
-                                &hints,
-                                catalog_arc.as_ref(),
-                                index_arc.as_ref(),
-                                ps_config_arc.as_ref(),
-                                Some(Arc::clone(&pool)),
-                            ) {
-                                Ok(result) => WorkResult::Solved { frame_id, result },
-                                Err(e) => {
+                            // Isolate per-frame panics: a single degenerate
+                            // frame (e.g. a solver assertion deep in the
+                            // candidate verifier) must not propagate out of
+                            // the scoped thread and abort the whole batch,
+                            // discarding every other frame's result. Convert
+                            // a panic into a normal per-frame failure — same
+                            // pattern as operation_queue / scanner. The
+                            // global panic hook still logs the full backtrace.
+                            let solve = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                service::solve_frame_with_hints(
+                                    &frame,
+                                    &file_path,
+                                    &hints,
+                                    catalog_arc.as_ref(),
+                                    index_arc.as_ref(),
+                                    ps_config_arc.as_ref(),
+                                    Some(Arc::clone(&pool)),
+                                )
+                            }));
+                            match solve {
+                                Ok(Ok(result)) => WorkResult::Solved { frame_id, result },
+                                Ok(Err(e)) => {
                                     eprintln!(
                                         "plate_solve: solve failed for {filename} (frame {frame_id}): {e}"
                                     );
                                     WorkResult::Failed { frame_id, error: e.to_string() }
+                                }
+                                Err(panic) => {
+                                    let msg = panic
+                                        .downcast_ref::<&str>()
+                                        .map(|s| s.to_string())
+                                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                                        .unwrap_or_else(|| "unknown panic".to_string());
+                                    eprintln!(
+                                        "plate_solve: solve PANICKED for {filename} (frame {frame_id}): {msg}"
+                                    );
+                                    WorkResult::Failed {
+                                        frame_id,
+                                        error: format!("solver panicked: {msg}"),
+                                    }
                                 }
                             }
                         }

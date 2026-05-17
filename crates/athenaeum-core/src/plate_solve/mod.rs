@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dso_lookup;
+pub mod gate_audit;
 pub mod hints;
 pub mod index_builder;
 pub mod object_fill;

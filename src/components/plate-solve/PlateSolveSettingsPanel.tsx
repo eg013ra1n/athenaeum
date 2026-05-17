@@ -22,6 +22,7 @@ const DEFAULT_CONFIG: PlateSolveConfig = {
   min_inlier_ratio: 0.10,
   retry_passes: [50, 150, 300, 600],
   base_verification_tolerance_arcsec: 8.0,
+  fallback_to_blind_scale: true,
 };
 
 // Static metadata for catalogs that are not dynamically fetched.
@@ -689,6 +690,35 @@ export function PlateSolveSettingsPanel() {
               more frames; looser values risk labelling unrelated fields with
               distant objects. Default 0.5°.
             </p>
+          </div>
+
+          {/* Blind-solve fallback */}
+          <div className="sm:col-span-2">
+            <label className="flex items-start gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={config.fallback_to_blind_scale ?? true}
+                onChange={(e) =>
+                  setField('fallback_to_blind_scale', e.target.checked)
+                }
+                className="mt-0.5 h-4 w-4 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent"
+              />
+              <span>
+                <span className="block text-sm font-medium text-content-secondary">
+                  Fall back to a blind solve when the focal-length hint fails
+                  (recommended)
+                </span>
+                <span className="mt-1 block text-xs text-content-muted">
+                  When a solve using the FITS FOCALLEN fails, retry with the
+                  scale hint cleared, then a full blind solve (scale and
+                  position prior cleared). A wrong FOCALLEN &mdash; focal
+                  reducer, wrong rig profile, or binning mismatch &mdash;
+                  otherwise filters out every correct candidate and a
+                  solvable frame fails permanently. On success the corrected
+                  focal length is written back to the frame. Default: on.
+                </span>
+              </span>
+            </label>
           </div>
         </div>
       </section>

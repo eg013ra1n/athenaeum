@@ -77,6 +77,49 @@ pub struct PlateSolveConfig {
     /// Default: 1.
     #[serde(default = "default_index_lookup_tolerance")]
     pub index_lookup_tolerance: i32,
+    /// When a focal-length-hinted solve fails, automatically escalate through
+    /// less-constrained retries before giving up: (2) clear the pixel-scale
+    /// hint but keep the positional prior, then (3) a full blind solve with
+    /// both the scale hint and the positional prior cleared. A wrong FITS
+    /// `FOCALLEN` (focal reducer not accounted for, wrong rig profile, binning
+    /// mismatch) otherwise filters out every correct candidate and the solve
+    /// fails permanently even though a blind solve would succeed. On success
+    /// after the scale hint was cleared the corrected focal length is written
+    /// back to the frame. Default: true.
+    #[serde(default = "default_fallback_to_blind_scale")]
+    pub fallback_to_blind_scale: bool,
+    /// Apply the stricter acceptance gate on the blind / full-blind path
+    /// (scale hint cleared and/or position prior disabled). The hinted
+    /// stage-1 path is never affected. Default: true.
+    #[serde(default = "default_blind_gate_enabled")]
+    pub blind_gate_enabled: bool,
+    /// RMS-residual ceiling on the blind path, as a multiple of the
+    /// per-frame adaptive pixel tolerance. Reject if
+    /// rms_residual_px > mult * adaptive_tol_px. Loose backstop (rms was
+    /// non-discriminating in calibration). Default: 2.5.
+    #[serde(default = "default_blind_rms_max_px_mult")]
+    pub blind_rms_max_px_mult: f64,
+    /// Minimum inlier_ratio on the blind path, applied only to dense fields
+    /// (expected_in_fov > 100); sparse fields keep the absolute floor. This
+    /// is the primary false-positive discriminator. Default: 0.04.
+    #[serde(default = "default_blind_min_inlier_ratio")]
+    pub blind_min_inlier_ratio: f64,
+    /// Absolute minimum inliers on the blind path (>= min_matched_stars).
+    /// Weak backstop only. Default: 12.
+    #[serde(default = "default_blind_inlier_floor")]
+    pub blind_inlier_floor: usize,
+    /// Recovered pixel scale must be within [min,max] arcsec/px on the
+    /// blind path (nonphysical-rig guard). Default: 0.05 .. 60.0.
+    #[serde(default = "default_blind_scale_sanity_min")]
+    pub blind_scale_sanity_min: f64,
+    #[serde(default = "default_blind_scale_sanity_max")]
+    pub blind_scale_sanity_max: f64,
+    /// If the header gave a pixel scale, the recovered scale must be within
+    /// this factor of it. Deliberately generous so a legitimately very-wrong
+    /// header FOCALLEN (the whole point of the blind fallback) is not
+    /// rejected. Default: 8.0.
+    #[serde(default = "default_blind_scale_header_tol")]
+    pub blind_scale_header_tol: f64,
 }
 
 fn default_max_image_stars() -> usize { 300 }
@@ -93,6 +136,14 @@ fn default_retry_passes() -> Vec<usize> { vec![50, 150, 300, 600] }
 fn default_base_verification_tolerance_arcsec() -> f64 { 8.0 }
 fn default_position_hint_radius_deg() -> f64 { 10.0 }
 fn default_index_lookup_tolerance() -> i32 { 1 }
+fn default_fallback_to_blind_scale() -> bool { true }
+fn default_blind_gate_enabled() -> bool { true }
+fn default_blind_rms_max_px_mult() -> f64 { 2.5 }
+fn default_blind_min_inlier_ratio() -> f64 { 0.04 }
+fn default_blind_inlier_floor() -> usize { 12 }
+fn default_blind_scale_sanity_min() -> f64 { 0.05 }
+fn default_blind_scale_sanity_max() -> f64 { 60.0 }
+fn default_blind_scale_header_tol() -> f64 { 8.0 }
 
 impl Default for PlateSolveConfig {
     fn default() -> Self {
@@ -111,6 +162,14 @@ impl Default for PlateSolveConfig {
             base_verification_tolerance_arcsec: default_base_verification_tolerance_arcsec(),
             position_hint_radius_deg: default_position_hint_radius_deg(),
             index_lookup_tolerance: default_index_lookup_tolerance(),
+            fallback_to_blind_scale: default_fallback_to_blind_scale(),
+            blind_gate_enabled: default_blind_gate_enabled(),
+            blind_rms_max_px_mult: default_blind_rms_max_px_mult(),
+            blind_min_inlier_ratio: default_blind_min_inlier_ratio(),
+            blind_inlier_floor: default_blind_inlier_floor(),
+            blind_scale_sanity_min: default_blind_scale_sanity_min(),
+            blind_scale_sanity_max: default_blind_scale_sanity_max(),
+            blind_scale_header_tol: default_blind_scale_header_tol(),
         }
     }
 }
@@ -137,4 +196,19 @@ pub fn save_config(conn: &Connection, config: &PlateSolveConfig) -> Result<()> {
         rusqlite::params![SETTINGS_KEY, json],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_json_loads_with_blind_gate_defaults() {
+        let old = r#"{"max_image_stars":300,"min_matched_stars":6}"#;
+        let cfg: PlateSolveConfig = serde_json::from_str(old).unwrap();
+        assert!(cfg.blind_gate_enabled);
+        assert_eq!(cfg.blind_min_inlier_ratio, 0.04);
+        assert!(cfg.blind_inlier_floor >= cfg.min_matched_stars);
+        assert_eq!(cfg.blind_scale_header_tol, 8.0);
+    }
 }

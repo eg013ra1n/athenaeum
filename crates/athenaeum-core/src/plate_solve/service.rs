@@ -25,6 +25,7 @@ use astroimage::ImageAnalyzer;
 use crate::catalog::CatalogEngine;
 use crate::models::Frame;
 use crate::plate_solve::config::PlateSolveConfig;
+use crate::plate_solve::gate_audit::{self, GateStage};
 use crate::plate_solve::hints::{extract_hints, observation_epoch};
 use crate::plate_solve::quad_index::{hash_key_from_ratios, QuadIndex, QuadLookup};
 use crate::plate_solve::dso_lookup::DsoCatalog;
@@ -46,6 +47,10 @@ pub struct SolveResult {
     pub catalog_used: String,
     pub algorithm_used: String,
     pub derived_focallen_mm: Option<f64>,
+    /// True when `derived_focallen_mm` overrides a wrong header FOCALLEN
+    /// (the solve only succeeded after the scale hint was cleared). Drives
+    /// the unconditional focal-length write-back in `store_result`.
+    pub focallen_corrected: bool,
     /// Number of catalog stars inside the solved FOV (from the verification
     /// cone search). Drives the density-aware acceptance gate.
     pub expected_catalog_stars_in_fov: usize,
@@ -181,178 +186,137 @@ pub fn solve_frame_with_hints(
         config.use_fast_detection,
     );
 
-    // 2. Progressive retry: try with smaller star counts first (fast path
-    // for sparse/bright fields), escalate to more stars only if acceptance
-    // fails. Each pass builds its own quads from a subset of the brightest
-    // stars and runs the full hash-lookup → scale-filter → verify loop.
+    // 2. Progressive retry + escalating fallback. Star detection (the slow
+    // step) ran once above; the constraint-only retry loop lives in
+    // `run_retry_passes` so it can be re-invoked with progressively looser
+    // hints while reusing the same detected stars.
     let obs_epoch = observation_epoch(frame);
-    let expected_scale_arcsec = hints.pixel_scale_arcsec;
-    if let Some(s) = expected_scale_arcsec {
-        eprintln!(
-            "plate_solve [{}]: expected pixel scale from header: {:.3}\"/px",
-            filename, s
-        );
-    }
-
-    // If the config's retry_passes is empty or all values are 0, fall back
-    // to a single pass at the legacy max_image_stars value.
-    let passes: Vec<usize> = if config.retry_passes.iter().any(|n| *n > 0) {
-        config.retry_passes.iter().copied().filter(|n| *n > 0).collect()
-    } else {
-        vec![config.max_image_stars]
-    };
-
-    // Compute positions once; every retry pass reads the same data.
+    // Positions computed once; every retry pass across every stage reads the
+    // same data.
     let image_positions: Vec<(f64, f64)> =
         image_stars.iter().map(|s| (s.x, s.y)).collect();
 
-    let mut best_result: Option<SolveResult> = None;
-    let mut best_inliers: usize = 0;
-    let mut best_expected_in_fov: usize = 0;
+    // Three-stage escalating fallback. Stage 1 is the historical behavior
+    // (scale + position hints). When it fails and the user hasn't disabled
+    // the fallback, escalate: stage 2 drops the pixel-scale hint (a wrong
+    // FITS FOCALLEN — focal reducer, wrong rig profile, binning mismatch —
+    // otherwise filters out every correct candidate), stage 3 additionally
+    // drops the positional prior (bad mount sync). Star detection already
+    // ran once above; each stage just re-runs the cheap quad/verify loop.
+    let has_scale_hint = hints.pixel_scale_arcsec.is_some();
+    // True once a stage that cleared the scale hint produces the winning
+    // result — the header FOCALLEN is then known-wrong and gets corrected.
+    let mut scale_corrected = false;
 
-    for (pass_idx, pass_size) in passes.iter().copied().enumerate() {
-        let outcome = try_solve_pass(
-            &image_stars,
-            &image_positions,
-            pass_size,
-            &filename,
-            image_size,
-            image_center,
-            expected_scale_arcsec,
-            hints,
-            catalog,
-            index,
-            config,
-            obs_epoch,
-        );
-
-        eprintln!(
-            "plate_solve [{}]: pass {}/{} stars={} → {} quads, {} candidates, best {} inliers",
-            filename,
-            pass_idx + 1,
-            passes.len(),
-            pass_size,
-            outcome.image_quads_built,
-            outcome.total_candidates,
-            outcome.best_inliers
-        );
-
-        // Acceptance check on THIS pass's own best — uses its own expected
-        // FOV density, not the carried-over best. This prevents a weaker
-        // pass from being over-credited (a high-ratio 8-of-10 match should
-        // be accepted, even if a later pass finds a 25-of-500 dense-field
-        // match with more raw inliers but worse ratio).
-        if let Some(ref candidate) = outcome.best {
-            let required_this = required_inliers(
-                outcome.best_expected_in_fov,
-                image_stars.len(),
-                config.min_inlier_ratio,
-                config.min_matched_stars,
-            );
-            if outcome.best_inliers >= required_this {
-                best_inliers = outcome.best_inliers;
-                best_expected_in_fov = outcome.best_expected_in_fov;
-                best_result = Some(candidate.clone());
-                eprintln!(
-                    "plate_solve [{}]: pass {} accepted — {} inliers ≥ {} required (FOV density {})",
-                    filename,
-                    pass_idx + 1,
-                    best_inliers,
-                    required_this,
-                    best_expected_in_fov
-                );
-                break;
-            }
-        }
-
-        // Didn't meet density threshold on this pass. Track it as a fallback
-        // only if it has more inliers than the running best — the final gate
-        // will still reject it if no pass qualifies.
-        if outcome.best_inliers > best_inliers {
-            best_inliers = outcome.best_inliers;
-            best_expected_in_fov = outcome.best_expected_in_fov;
-            best_result = outcome.best;
-        }
-    }
-
-    let Some(mut result) = best_result else {
-        return Err(anyhow::anyhow!(
-            "[{}] no candidate passed verification across {} pass(es)",
-            filename,
-            passes.len()
-        ));
-    };
-
-    // Final density-aware acceptance gate.
-    let required = required_inliers(
-        best_expected_in_fov,
-        image_stars.len(),
-        config.min_inlier_ratio,
-        config.min_matched_stars,
+    // Stage 1 — hinted (scale + position).
+    let mut solved = run_retry_passes(
+        &image_stars,
+        &image_positions,
+        image_size,
+        image_center,
+        hints.pixel_scale_arcsec,
+        false,
+        hints,
+        catalog,
+        index,
+        config,
+        obs_epoch,
+        &filename,
     );
-    if best_inliers < required {
-        let (best_ra, best_dec) = result
-            .wcs
-            .pixel_to_sky(image_center.0, image_center.1);
-        // Hint depends on what we know about the failure mode. The previous
-        // implementation always said "consider rebuilding the quad index with
-        // a higher magnitude limit" whenever `best_expected_in_fov > 2000`,
-        // which fires precisely on dense-region false positives — sending
-        // users to spend 30 minutes rebuilding the index for a no-op (Tycho-2
-        // saturates at V≈11.5, so raising `index_mag_limit` does nothing).
-        let hint = match (hints.ra, hints.dec) {
-            (Some(hra), Some(hdec)) => {
-                let dist = angular_distance_deg(best_ra, best_dec, hra, hdec);
-                if dist > 5.0 {
-                    format!(
-                        " — best candidate is {:.0}° from FITS pointing (RA={:.2} Dec={:.2}); \
-                         this is almost certainly a noise alignment in a dense region. \
-                         Likely cause: the FITS header RA/Dec is wrong (mount sync error), \
-                         or the positional-prior gate (config.position_hint_radius_deg, \
-                         currently {:.1}°) is too loose. Rebuilding the quad index will NOT help.",
-                        dist, hra, hdec, config.position_hint_radius_deg
-                    )
-                } else {
-                    format!(
-                        " — best candidate is within {:.1}° of FITS pointing; this is a real \
-                         near-miss. Likely cause: centroid noise (try use_fast_detection=false), \
-                         pixel scale hint is wrong, or quad geometry is degenerate. \
-                         Rebuilding the quad index will NOT help.",
-                        dist
-                    )
-                }
+
+    if solved.is_err() && config.fallback_to_blind_scale {
+        // Stage 2 — clear the pixel-scale hint, keep the positional prior.
+        // Only meaningful when stage 1 actually had a scale hint to drop.
+        if has_scale_hint {
+            let e1 = solved.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+            eprintln!(
+                "plate_solve [{}]: hinted solve failed ({}); retrying blind \
+                 (scale hint cleared, position prior kept)",
+                filename, e1
+            );
+            solved = run_retry_passes(
+                &image_stars,
+                &image_positions,
+                image_size,
+                image_center,
+                None,
+                false,
+                hints,
+                catalog,
+                index,
+                config,
+                obs_epoch,
+                &filename,
+            );
+            if solved.is_ok() {
+                scale_corrected = true;
             }
-            _ => format!(
-                " — true blind solve (no FITS positional hint). Try use_fast_detection=false \
-                 for sharper centroids, or set valid RA/DEC (or OBJCTRA/OBJCTDEC) in the FITS \
-                 header. Rebuilding the quad index does NOT help on Tycho-2 (catalog saturates \
-                 at V≈11.5)."
-            ),
-        };
-        return Err(anyhow::anyhow!(
-            "[{}] verification failed: best candidate has {} inliers at RA={:.2} Dec={:.2} (required {}, density {} detected / {} catalog in FOV){}",
-            filename,
-            best_inliers,
-            best_ra,
-            best_dec,
-            required,
-            image_stars.len(),
-            best_expected_in_fov,
-            hint
-        ));
+        }
+
+        // Stage 3 — full blind: also drop the positional prior.
+        if solved.is_err() {
+            let prev = solved.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+            eprintln!(
+                "plate_solve [{}]: retrying full blind \
+                 (scale + position prior cleared) [prev: {}]",
+                filename, prev
+            );
+            solved = run_retry_passes(
+                &image_stars,
+                &image_positions,
+                image_size,
+                image_center,
+                None,
+                true,
+                hints,
+                catalog,
+                index,
+                config,
+                obs_epoch,
+                &filename,
+            );
+            if solved.is_ok() {
+                // Only a correction worth writing back if there was a (wrong)
+                // FOCALLEN-derived scale hint to begin with.
+                scale_corrected = has_scale_hint;
+            }
+        }
     }
+
+    // First stage to succeed wins; if all failed, surface the last (most
+    // permissive) attempt's error — neither hint was the limiting factor.
+    let (mut result, _best_inliers, _best_expected_in_fov) = solved?;
 
     let pixel_scale = result.pixel_scale_arcsec;
 
-    // 10. Build final SolveResult
-    let derived_fl = if frame.focallen.is_none() {
-        frame.xpixsz.map(|xpixsz| {
-            let pix_mm = xpixsz / 1000.0;
-            206265.0 * pix_mm / pixel_scale
+    // 10. Derived focal length. Normally only filled when the header lacks
+    // FOCALLEN. But when the solve only succeeded after the (FOCALLEN-
+    // derived) scale hint was cleared, the header value is proven wrong, so
+    // we recompute and overwrite it. Inverts hints.rs's pixel-scale formula
+    // exactly (atan, binning-aware) so a re-solve of the corrected frame
+    // round-trips to the same scale.
+    let derived_fl = if (frame.focallen.is_none() || scale_corrected) && pixel_scale > 0.0 {
+        frame.xpixsz.and_then(|xpixsz| {
+            if xpixsz <= 0.0 {
+                return None;
+            }
+            let pixel_size_mm = xpixsz / 1000.0;
+            let binning = frame.xbinning.unwrap_or(1).max(1) as f64;
+            let effective_pixel_mm = pixel_size_mm * binning;
+            let scale_tan = (pixel_scale / 3600.0).to_radians().tan();
+            if scale_tan > 0.0 {
+                Some(effective_pixel_mm / scale_tan)
+            } else {
+                None
+            }
         })
     } else {
         None
     };
+    // Only a write-back *correction* when the header had a (wrong) value we
+    // are overriding — scale_corrected implies a FOCALLEN-derived hint, so
+    // frame.focallen was necessarily Some.
+    result.focallen_corrected = scale_corrected && derived_fl.is_some();
 
     let total_ms = total_start.elapsed().as_millis() as u64;
     let (solved_ra, solved_dec) = result.wcs.pixel_to_sky(image_center.0, image_center.1);
@@ -419,6 +383,7 @@ pub fn store_result(
         result.wcs.crval.1,
         result.field_rotation_deg,
         result.derived_focallen_mm,
+        result.focallen_corrected,
     )?;
 
     // Optional: look up the nearest named DSO and set frame.object if empty.
@@ -447,6 +412,255 @@ pub fn store_result(
 struct Candidate {
     image_quad: Quad,
     catalog: QuadLookup,
+}
+
+/// Run the progressive-retry pass loop and the density-aware acceptance
+/// gate for one constraint configuration, then return the accepted result
+/// (plus its inlier count and FOV density) or an `Err` describing the
+/// failure mode.
+///
+/// Star detection is the caller's job — this function is constraint-only,
+/// so the caller can re-invoke it with progressively looser hints while
+/// reusing the same detected stars. `expected_scale_arcsec = None` disables
+/// the ±5 % candidate scale filter (blind-on-scale); `disable_position_gate`
+/// suppresses the positional-prior gate (full blind).
+#[allow(clippy::too_many_arguments)]
+fn run_retry_passes(
+    image_stars: &[ImageStar],
+    image_positions: &[(f64, f64)],
+    image_size: (u32, u32),
+    image_center: (f64, f64),
+    expected_scale_arcsec: Option<f64>,
+    disable_position_gate: bool,
+    hints: &SolveHints,
+    catalog: &CatalogEngine,
+    index: &QuadIndex,
+    config: &PlateSolveConfig,
+    obs_epoch: f64,
+    filename: &str,
+) -> Result<(SolveResult, usize, usize)> {
+    if let Some(s) = expected_scale_arcsec {
+        eprintln!(
+            "plate_solve [{}]: expected pixel scale from header: {:.3}\"/px",
+            filename, s
+        );
+    }
+
+    // If the config's retry_passes is empty or all values are 0, fall back
+    // to a single pass at the legacy max_image_stars value.
+    let passes: Vec<usize> = if config.retry_passes.iter().any(|n| *n > 0) {
+        config.retry_passes.iter().copied().filter(|n| *n > 0).collect()
+    } else {
+        vec![config.max_image_stars]
+    };
+
+    let mut best_result: Option<SolveResult> = None;
+    let mut best_inliers: usize = 0;
+    let mut best_expected_in_fov: usize = 0;
+
+    for (pass_idx, pass_size) in passes.iter().copied().enumerate() {
+        let outcome = try_solve_pass(
+            image_stars,
+            image_positions,
+            pass_size,
+            filename,
+            image_size,
+            image_center,
+            expected_scale_arcsec,
+            hints,
+            catalog,
+            index,
+            config,
+            obs_epoch,
+            disable_position_gate,
+        );
+
+        eprintln!(
+            "plate_solve [{}]: pass {}/{} stars={} → {} quads, {} candidates, best {} inliers",
+            filename,
+            pass_idx + 1,
+            passes.len(),
+            pass_size,
+            outcome.image_quads_built,
+            outcome.total_candidates,
+            outcome.best_inliers
+        );
+
+        // Acceptance check on THIS pass's own best — uses its own expected
+        // FOV density, not the carried-over best. This prevents a weaker
+        // pass from being over-credited (a high-ratio 8-of-10 match should
+        // be accepted, even if a later pass finds a 25-of-500 dense-field
+        // match with more raw inliers but worse ratio).
+        if let Some(ref candidate) = outcome.best {
+            let required_this = required_inliers(
+                outcome.best_expected_in_fov,
+                image_stars.len(),
+                config.min_inlier_ratio,
+                config.min_matched_stars,
+            );
+            let stage =
+                GateStage::from_params(expected_scale_arcsec, disable_position_gate);
+            let gate_m = make_gate_metrics(
+                outcome.best_inliers,
+                outcome.best_expected_in_fov,
+                candidate.rms_residual_px,
+                candidate.pixel_scale_arcsec,
+                candidate.inlier_ratio,
+                hints.pixel_scale_arcsec,
+                config.base_verification_tolerance_arcsec,
+            );
+            let accept = outcome.best_inliers >= required_this
+                && blind_gate_ok(stage, &gate_m, config);
+            if gate_audit::enabled() {
+                let (sra, sdec) =
+                    candidate.wcs.pixel_to_sky(image_center.0, image_center.1);
+                gate_audit::record_event(
+                    filename,
+                    stage,
+                    pass_idx,
+                    accept,
+                    outcome.best_inliers,
+                    outcome.best_expected_in_fov,
+                    image_stars.len(),
+                    candidate.inlier_ratio,
+                    candidate.rms_residual_px,
+                    candidate.rms_residual_arcsec,
+                    candidate.pixel_scale_arcsec,
+                    hints.pixel_scale_arcsec,
+                    sra,
+                    sdec,
+                    hints.ra,
+                    hints.dec,
+                    required_this,
+                );
+            }
+            if accept {
+                best_inliers = outcome.best_inliers;
+                best_expected_in_fov = outcome.best_expected_in_fov;
+                best_result = Some(candidate.clone());
+                eprintln!(
+                    "plate_solve [{}]: pass {} accepted — {} inliers ≥ {} required (FOV density {})",
+                    filename,
+                    pass_idx + 1,
+                    best_inliers,
+                    required_this,
+                    best_expected_in_fov
+                );
+                break;
+            }
+        }
+
+        // Didn't meet density threshold on this pass. Track it as a fallback
+        // only if it has more inliers than the running best — the final gate
+        // will still reject it if no pass qualifies.
+        if outcome.best_inliers > best_inliers {
+            best_inliers = outcome.best_inliers;
+            best_expected_in_fov = outcome.best_expected_in_fov;
+            best_result = outcome.best;
+        }
+    }
+
+    let Some(result) = best_result else {
+        return Err(anyhow::anyhow!(
+            "[{}] no candidate passed verification across {} pass(es)",
+            filename,
+            passes.len()
+        ));
+    };
+
+    // Final density-aware acceptance gate.
+    let required = required_inliers(
+        best_expected_in_fov,
+        image_stars.len(),
+        config.min_inlier_ratio,
+        config.min_matched_stars,
+    );
+    let stage = GateStage::from_params(expected_scale_arcsec, disable_position_gate);
+    let gate_m = make_gate_metrics(
+        best_inliers,
+        best_expected_in_fov,
+        result.rms_residual_px,
+        result.pixel_scale_arcsec,
+        result.inlier_ratio,
+        hints.pixel_scale_arcsec,
+        config.base_verification_tolerance_arcsec,
+    );
+    let accept = best_inliers >= required && blind_gate_ok(stage, &gate_m, config);
+    if gate_audit::enabled() {
+        let (sra, sdec) = result.wcs.pixel_to_sky(image_center.0, image_center.1);
+        gate_audit::record_event(
+            filename,
+            stage,
+            usize::MAX, // sentinel: final gate, not a pass
+            accept,
+            best_inliers,
+            best_expected_in_fov,
+            image_stars.len(),
+            result.inlier_ratio,
+            result.rms_residual_px,
+            result.rms_residual_arcsec,
+            result.pixel_scale_arcsec,
+            hints.pixel_scale_arcsec,
+            sra,
+            sdec,
+            hints.ra,
+            hints.dec,
+            required,
+        );
+    }
+    if !accept {
+        let (best_ra, best_dec) = result
+            .wcs
+            .pixel_to_sky(image_center.0, image_center.1);
+        // Hint depends on what we know about the failure mode. The previous
+        // implementation always said "consider rebuilding the quad index with
+        // a higher magnitude limit" whenever `best_expected_in_fov > 2000`,
+        // which fires precisely on dense-region false positives — sending
+        // users to spend 30 minutes rebuilding the index for a no-op (Tycho-2
+        // saturates at V≈11.5, so raising `index_mag_limit` does nothing).
+        let hint = match (hints.ra, hints.dec) {
+            (Some(hra), Some(hdec)) => {
+                let dist = angular_distance_deg(best_ra, best_dec, hra, hdec);
+                if dist > 5.0 {
+                    format!(
+                        " — best candidate is {:.0}° from FITS pointing (RA={:.2} Dec={:.2}); \
+                         this is almost certainly a noise alignment in a dense region. \
+                         Likely cause: the FITS header RA/Dec is wrong (mount sync error), \
+                         or the positional-prior gate (config.position_hint_radius_deg, \
+                         currently {:.1}°) is too loose. Rebuilding the quad index will NOT help.",
+                        dist, hra, hdec, config.position_hint_radius_deg
+                    )
+                } else {
+                    format!(
+                        " — best candidate is within {:.1}° of FITS pointing; this is a real \
+                         near-miss. Likely cause: centroid noise (try use_fast_detection=false), \
+                         pixel scale hint is wrong, or quad geometry is degenerate. \
+                         Rebuilding the quad index will NOT help.",
+                        dist
+                    )
+                }
+            }
+            _ => format!(
+                " — true blind solve (no FITS positional hint). Try use_fast_detection=false \
+                 for sharper centroids, or set valid RA/DEC (or OBJCTRA/OBJCTDEC) in the FITS \
+                 header. Rebuilding the quad index does NOT help on Tycho-2 (catalog saturates \
+                 at V≈11.5)."
+            ),
+        };
+        return Err(anyhow::anyhow!(
+            "[{}] verification failed: best candidate has {} inliers at RA={:.2} Dec={:.2} (required {}, density {} detected / {} catalog in FOV){}",
+            filename,
+            best_inliers,
+            best_ra,
+            best_dec,
+            required,
+            image_stars.len(),
+            best_expected_in_fov,
+            hint
+        ));
+    }
+
+    Ok((result, best_inliers, best_expected_in_fov))
 }
 
 /// Outcome of one retry pass — the best result produced, plus diagnostics
@@ -487,6 +701,92 @@ fn required_inliers(
         ((effective as f64 * min_ratio).round() as usize).max(20)
     };
     target.max(floor)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BlindGateMetrics {
+    pub inliers: usize,
+    pub expected_in_fov: usize,
+    pub rms_px: f64,
+    pub adaptive_tol_px: f64,
+    pub inlier_ratio: f64,
+    pub recovered_scale_arcsec: f64,
+    pub header_scale_arcsec: Option<f64>,
+}
+
+/// Extra acceptance gate applied ONLY on the blind path (scale cleared
+/// and/or position prior disabled). The hinted stage-1 path is never
+/// affected, so well-working hinted solves do not regress. Calibrated from
+/// a real-library audit: `inlier_ratio` is the primary discriminator
+/// (real solves >= ~0.08, false positives <= ~0.001); rms and absolute
+/// inlier count do not separate, so those are loose backstops.
+pub(crate) fn blind_gate_ok(
+    stage: GateStage,
+    m: &BlindGateMetrics,
+    cfg: &PlateSolveConfig,
+) -> bool {
+    if stage == GateStage::Hinted || !cfg.blind_gate_enabled {
+        return true;
+    }
+    // Geometric fit must be tight (scale-relative ceiling; loose backstop).
+    if !m.rms_px.is_finite()
+        || m.rms_px > cfg.blind_rms_max_px_mult * m.adaptive_tol_px
+    {
+        return false;
+    }
+    // Absolute inlier floor (weak backstop).
+    if m.inliers < cfg.blind_inlier_floor {
+        return false;
+    }
+    // Dense-field confidence ratio — the primary false-positive gate.
+    // Sparse fields (<=100 expected) are exempt: too few stars to trust a
+    // ratio there, and the noise alignments occur in dense regions.
+    if m.expected_in_fov > 100 && m.inlier_ratio < cfg.blind_min_inlier_ratio {
+        return false;
+    }
+    // Recovered scale must be physically plausible.
+    if !(cfg.blind_scale_sanity_min..=cfg.blind_scale_sanity_max)
+        .contains(&m.recovered_scale_arcsec)
+    {
+        return false;
+    }
+    // ...and not wildly off the header scale when the header had one
+    // (generous: a legitimately very-wrong FOCALLEN is the whole point of
+    // the blind fallback, so this is only a coarse backstop).
+    if let Some(hs) = m.header_scale_arcsec {
+        if hs > 0.0 {
+            let r = m.recovered_scale_arcsec / hs;
+            if r < 1.0 / cfg.blind_scale_header_tol || r > cfg.blind_scale_header_tol {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Build the blind-gate inputs from the few per-candidate scalars. Single
+/// construction site so the per-pass and final-gate callers cannot drift
+/// (mirrors the gate_audit::record_event extraction). Cheap — field copies
+/// plus one `adaptive_tol_px` division; built unconditionally even on the
+/// hinted path (where `blind_gate_ok` early-returns true), which is fine.
+fn make_gate_metrics(
+    inliers: usize,
+    expected_in_fov: usize,
+    rms_px: f64,
+    pixel_scale_arcsec: f64,
+    inlier_ratio: f64,
+    header_scale_arcsec: Option<f64>,
+    base_tol_arcsec: f64,
+) -> BlindGateMetrics {
+    BlindGateMetrics {
+        inliers,
+        expected_in_fov,
+        rms_px,
+        adaptive_tol_px: adaptive_tol_px(pixel_scale_arcsec, base_tol_arcsec),
+        inlier_ratio,
+        recovered_scale_arcsec: pixel_scale_arcsec,
+        header_scale_arcsec,
+    }
 }
 
 /// Convert an arcsecond-scale base tolerance to a per-frame pixel tolerance,
@@ -536,6 +836,7 @@ fn try_solve_pass(
     index: &QuadIndex,
     config: &PlateSolveConfig,
     obs_epoch: f64,
+    disable_position_gate: bool,
 ) -> PassOutcome {
     // Build quads from the brightest `pass_size` stars.
     let image_quads = build_quads(image_positions, pass_size);
@@ -663,32 +964,43 @@ fn try_solve_pass(
         // a correct candidate elsewhere). Default radius is generous (10°) to
         // tolerate mount sync slop. Set `position_hint_radius_deg >= 180.0`
         // in the config to disable. Skipped silently when no hint is set
-        // (true blind solve).
-        if let (Some(hra), Some(hdec)) = (hints.ra, hints.dec) {
-            let dist = angular_distance_deg(seed_ra, seed_dec, hra, hdec);
-            // Bucket the distance for the end-of-pass histogram.
-            let bucket = if dist < 2.0 { 0 }
-                else if dist < 5.0 { 1 }
-                else if dist < 10.0 { 2 }
-                else if dist < 30.0 { 3 }
-                else if dist < 90.0 { 4 }
-                else { 5 };
-            hint_distance_histogram[bucket] += 1;
-            if verbose_candidates {
-                let scale = seed_wcs.pixel_scale_arcsec();
-                eprintln!(
-                    "plate_solve [{}]:   candidate seed RA={:.2} Dec={:.2} scale={:.2}\"/px → {:.1}° from hint",
-                    filename, seed_ra, seed_dec, scale, dist
-                );
-            }
-            if config.position_hint_radius_deg < 180.0 && dist > config.position_hint_radius_deg {
-                continue;
+        // (true blind solve) or when `disable_position_gate` is set (the
+        // full-blind fallback stage — the caller has already established that
+        // the FITS pointing is untrustworthy).
+        if !disable_position_gate {
+            if let (Some(hra), Some(hdec)) = (hints.ra, hints.dec) {
+                let dist = angular_distance_deg(seed_ra, seed_dec, hra, hdec);
+                // Bucket the distance for the end-of-pass histogram.
+                let bucket = if dist < 2.0 { 0 }
+                    else if dist < 5.0 { 1 }
+                    else if dist < 10.0 { 2 }
+                    else if dist < 30.0 { 3 }
+                    else if dist < 90.0 { 4 }
+                    else { 5 };
+                hint_distance_histogram[bucket] += 1;
+                if verbose_candidates {
+                    let scale = seed_wcs.pixel_scale_arcsec();
+                    eprintln!(
+                        "plate_solve [{}]:   candidate seed RA={:.2} Dec={:.2} scale={:.2}\"/px → {:.1}° from hint",
+                        filename, seed_ra, seed_dec, scale, dist
+                    );
+                }
+                if config.position_hint_radius_deg < 180.0 && dist > config.position_hint_radius_deg {
+                    continue;
+                }
             }
         }
 
         let seed_scale = seed_wcs.pixel_scale_arcsec();
         let image_fov_deg = (image_size.0 as f64).max(image_size.1 as f64) * seed_scale / 3600.0;
         let cone_radius = image_fov_deg * 0.7;
+        // A degenerate similarity fit (more common without the scale hint in
+        // the blind-scale fallback) can yield a non-finite or absurd seed
+        // scale → bogus cone radius. Skip the candidate rather than feed an
+        // out-of-domain radius to the catalog cone search.
+        if !cone_radius.is_finite() || cone_radius <= 0.0 || cone_radius > 90.0 {
+            continue;
+        }
 
         // Cache hit when the current seed's FOV fits entirely inside the
         // cached cone — `distance + fov_radius ≤ cache_radius` with
@@ -837,6 +1149,7 @@ fn try_solve_pass(
                 catalog_used: "tycho2".to_string(),
                 algorithm_used: "blind_index".to_string(),
                 derived_focallen_mm: None,
+                focallen_corrected: false,
                 expected_catalog_stars_in_fov: verify_stars.len(),
                 inlier_ratio: ratio,
             });
@@ -1204,6 +1517,30 @@ fn best_permutation_fit(
         (catalog.stars_ra[3] as f64, catalog.stars_dec[3] as f64),
     ];
 
+    // Guard the gnomonic projection below. `GnomonicProjection::sky_to_tangent`
+    // asserts `cos_c > 0` and panics ("opposite hemisphere from tangent
+    // point"). A degenerate candidate quad (hash collision; or `approx_center`
+    // landing far away when the catalog quad straddles the RA=0/360 wrap) can
+    // put a star ≥90° from the centre. Such candidates are garbage anyway —
+    // skip them (the caller already does `else { continue }`) instead of
+    // crashing. Same hemisphere check the projection uses, with a small
+    // margin so near-limb points (xi/eta → ±∞) are skipped too.
+    if !approx_center.0.is_finite() || !approx_center.1.is_finite() {
+        return None;
+    }
+    let (ra0, dec0) = (approx_center.0.to_radians(), approx_center.1.to_radians());
+    let (sin_d0, cos_d0) = (dec0.sin(), dec0.cos());
+    for &(ra, dec) in &cat_stars {
+        if !ra.is_finite() || !dec.is_finite() {
+            return None;
+        }
+        let (rr, dr) = (ra.to_radians(), dec.to_radians());
+        let cos_c = sin_d0 * dr.sin() + cos_d0 * dr.cos() * (rr - ra0).cos();
+        if !(cos_c > 1e-6) {
+            return None;
+        }
+    }
+
     // Pre-compute per-star distances from each side's centroid. These are
     // rotation/reflection invariants — in the correct permutation, the
     // image-side ordering by `img_dist` must match the catalog-side ordering
@@ -1463,6 +1800,11 @@ mod tests {
     const DET: usize = 100_000;
 
     #[test]
+    fn gate_audit_disabled_is_zero_behaviour_change() {
+        assert!(!crate::plate_solve::gate_audit::enabled());
+    }
+
+    #[test]
     fn required_inliers_sparse_fields_use_absolute_floor() {
         // ≤30 catalog stars in FOV → fixed 6 (or floor if higher).
         assert_eq!(required_inliers(0, DET, 0.10, 6), 6);
@@ -1502,6 +1844,72 @@ mod tests {
         assert_eq!(required_inliers(80, 500, 0.10, 6), 16); // mid-density: round(80*0.20)
         // Detected < 30 forces the sparse-floor branch even if catalog is large.
         assert_eq!(required_inliers(1000, 25, 0.10, 6), 6);
+    }
+
+    #[test]
+    fn blind_gate_table() {
+        let cfg = PlateSolveConfig {
+            blind_rms_max_px_mult: 2.5,
+            blind_min_inlier_ratio: 0.04,
+            blind_inlier_floor: 12,
+            blind_scale_sanity_min: 0.05,
+            blind_scale_sanity_max: 60.0,
+            blind_scale_header_tol: 8.0,
+            blind_gate_enabled: true,
+            ..PlateSolveConfig::default()
+        };
+        let base = BlindGateMetrics {
+            inliers: 40,
+            expected_in_fov: 800,
+            rms_px: 1.2,
+            adaptive_tol_px: 6.0,
+            inlier_ratio: 0.30,
+            recovered_scale_arcsec: 1.8,
+            header_scale_arcsec: Some(1.9),
+        };
+        // Hinted stage is never gated.
+        assert!(blind_gate_ok(GateStage::Hinted, &base, &cfg));
+        // Good full-blind passes.
+        assert!(blind_gate_ok(GateStage::FullBlind, &base, &cfg));
+        // Loose RMS on blind path rejected.
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { rms_px: 20.0, ..base.clone() }, &cfg));
+        // Low ratio on a DENSE field rejected (the calibrated primary gate).
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { inlier_ratio: 0.001, ..base.clone() }, &cfg));
+        // Sparse field (expected<=100) NOT punished by the ratio rule — stage is irrelevant here.
+        assert!(blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { expected_in_fov: 40, inlier_ratio: 0.001,
+                inliers: 14, ..base.clone() }, &cfg));
+        // Too few inliers rejected.
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { inliers: 8, ..base.clone() }, &cfg));
+        // Absurd recovered scale rejected.
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { recovered_scale_arcsec: 0.001, ..base.clone() }, &cfg));
+        // Recovered scale wildly off header scale rejected (ratio ~10 > tol 8).
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { recovered_scale_arcsec: 20.0,
+                header_scale_arcsec: Some(1.9), ..base.clone() }, &cfg));
+        // Non-finite RMS is never a real solve (guards the is_finite branch;
+        // degenerate blind solves can produce NaN/inf).
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { rms_px: f64::NAN, ..base.clone() }, &cfg));
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { rms_px: f64::INFINITY, ..base.clone() }, &cfg));
+        // No header scale: the header-tol guard is skipped entirely, so a
+        // recovered scale that WOULD fail the ratio-to-header check still
+        // passes when header_scale_arcsec is None.
+        assert!(blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { header_scale_arcsec: None, recovered_scale_arcsec: 20.0,
+                ..base.clone() }, &cfg));
+        // Scale-sanity MAX bound (the existing table only covered the min side).
+        assert!(!blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { recovered_scale_arcsec: 100.0, ..base.clone() }, &cfg));
+        // Gate can be disabled by config.
+        let off = PlateSolveConfig { blind_gate_enabled: false, ..cfg.clone() };
+        assert!(blind_gate_ok(GateStage::FullBlind,
+            &BlindGateMetrics { rms_px: 99.0, ..base }, &off));
     }
 
     #[test]
@@ -1609,5 +2017,39 @@ mod tests {
                 cat.stars_ra[k], cat.stars_dec[k],
             );
         }
+    }
+
+    #[test]
+    fn best_permutation_fit_skips_opposite_hemisphere_quad() {
+        // Regression: without the scale/position pre-filters (blind-scale
+        // fallback), a degenerate candidate catalog "quad" whose stars
+        // straddle the RA=0/360 wrap makes the naive `catalog_centroid`
+        // land ~180° away. Projecting those stars about that centre hits
+        // `GnomonicProjection::sky_to_tangent`'s `assert!(cos_c > 0)` and
+        // used to panic the whole plate-solve batch. It must now skip the
+        // candidate (return None) without panicking.
+        use astroimage::platesolving::Quad;
+        let positions: Vec<(f64, f64)> =
+            vec![(10.0, 10.0), (90.0, 10.0), (10.0, 90.0), (90.0, 90.0)];
+        let image_quad = Quad {
+            star_indices: [0, 1, 2, 3],
+            ratios: [0.0; 5],
+            center: (50.0, 50.0),
+            longest_dist: 80.0 * 2f64.sqrt(),
+        };
+        // Stars near RA 0 and RA 360 → naive mean RA = 180° (opposite side).
+        let cat = QuadLookup {
+            hash_key: [0; 5],
+            longest_dist_deg: 0.2,
+            stars_ra: [0.1, 0.2, 359.8, 359.9],
+            stars_dec: [0.0, 0.0, 0.0, 0.0],
+        };
+        let approx_center = catalog_centroid(&cat);
+        let result =
+            best_permutation_fit(&image_quad, &cat, &positions, approx_center, (50.0, 50.0));
+        assert!(
+            result.is_none(),
+            "opposite-hemisphere candidate must be skipped, not panic"
+        );
     }
 }

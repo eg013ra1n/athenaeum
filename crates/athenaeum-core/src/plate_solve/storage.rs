@@ -168,7 +168,11 @@ pub fn delete_plate_solve(conn: &Connection, frame_id: i64) -> Result<()> {
 /// - `objctra`: sexagesimal "HH:MM:SS.s" via format_ra_sexagesimal()
 /// - `objctdec`: sexagesimal "+DD:MM:SS.s" via format_dec_sexagesimal()
 /// - `rotation`: decimal degrees (f64), N through E
-/// - `focallen`: only written if frame had NULL (derived from plate solve)
+/// - `focallen`: written when the frame had NULL (derived from plate solve);
+///   also overwrites an existing value when `focallen_is_correction` is true
+///   (the solve only succeeded after the wrong header FOCALLEN was discarded).
+///   `override = 1` keeps the scanner's non-destructive re-parse from
+///   reverting it to the bad header value.
 pub fn update_frame_from_solve(
     conn: &Connection,
     frame_id: i64,
@@ -176,6 +180,7 @@ pub fn update_frame_from_solve(
     dec_deg: f64,
     rotation_deg: f64,
     derived_focallen_mm: Option<f64>,
+    focallen_is_correction: bool,
 ) -> Result<()> {
     let objctra = format_ra_sexagesimal(ra_deg);
     let objctdec = format_dec_sexagesimal(dec_deg);
@@ -188,11 +193,15 @@ pub fn update_frame_from_solve(
     .context("Failed to update frame coordinates")?;
 
     if let Some(fl) = derived_focallen_mm {
-        conn.execute(
-            "UPDATE frames SET focallen = ?1, override = 1 WHERE id = ?2 AND focallen IS NULL",
-            rusqlite::params![fl, frame_id],
-        )
-        .context("Failed to update derived focal length")?;
+        // Default: fill only when missing. Correction: overwrite the wrong
+        // header value too (the blind solve proved it wrong).
+        let sql = if focallen_is_correction {
+            "UPDATE frames SET focallen = ?1, override = 1 WHERE id = ?2"
+        } else {
+            "UPDATE frames SET focallen = ?1, override = 1 WHERE id = ?2 AND focallen IS NULL"
+        };
+        conn.execute(sql, rusqlite::params![fl, frame_id])
+            .context("Failed to update derived focal length")?;
     }
 
     Ok(())

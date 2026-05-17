@@ -23,6 +23,10 @@ export interface PlateSolveConfig {
    * tolerance = base_arcsec / pixel_scale_arcsec, clamped [4, 20] px.
    * Default: 8.0. */
   base_verification_tolerance_arcsec?: number;
+  /** When a focal-length-hinted solve fails, escalate through a
+   * scale-cleared then a full-blind retry before giving up, and write the
+   * corrected focal length back on success. Default: true. */
+  fallback_to_blind_scale?: boolean;
 }
 
 // QuadIndexStatus fields are camelCase: the Rust struct uses #[serde(rename_all = "camelCase")].
