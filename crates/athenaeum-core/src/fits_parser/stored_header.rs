@@ -66,10 +66,55 @@ pub struct FrameOriginalSnapshot {
 /// Format-aware dispatcher: pulls the canonical FITS keys (UPPERCASE) out
 /// of the stored blob into a HashMap.
 pub fn parse_stored_header_keys(format: FileFormat, header_text: &str) -> HashMap<String, String> {
-    match format {
+    let primary = match format {
         FileFormat::FITS => parse_fits_card_text(header_text),
         FileFormat::XISF => parse_xisf_xml_text(header_text),
+    };
+    if !primary.is_empty() {
+        return primary;
     }
+    // Some capture tools (notably ASIAIR) persist the header as a plain
+    // "KEY = value" text dump rather than 80-col FITS cards or XISF XML, so
+    // the format-specific parser yields nothing. Fall back to a line parser
+    // so "revert to original" / metadata snapshots still work.
+    parse_keyword_eq_text(header_text)
+}
+
+/// Parse a plain "KEY = value" header dump (one keyword per line, banner /
+/// separator / COMMENT / HISTORY / blank lines skipped). Quoted strings have
+/// their quotes stripped; an unquoted value's trailing " / comment" is
+/// dropped. Keys are upper-cased to match the other parsers.
+fn parse_keyword_eq_text(text: &str) -> HashMap<String, String> {
+    let mut result: HashMap<String, String> = HashMap::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let key = k.trim().to_uppercase();
+        if key.is_empty()
+            || key.contains(' ')
+            || key == "END"
+            || key == "COMMENT"
+            || key == "HISTORY"
+        {
+            continue;
+        }
+        let v = v.trim();
+        let value = if let Some(s) = v.strip_prefix('\'') {
+            match s.find('\'') {
+                Some(end) => s[..end].trim_end().to_string(),
+                None => continue,
+            }
+        } else {
+            // Drop a FITS-style trailing comment (" / ...") without breaking
+            // space-separated values like "2 41 04.824".
+            v.split(" / ").next().unwrap_or("").trim().to_string()
+        };
+        if value.is_empty() {
+            continue;
+        }
+        result.entry(key).or_insert(value);
+    }
+    result
 }
 
 /// Map a parsed-keyword HashMap onto the canonical snapshot fields.
@@ -294,6 +339,29 @@ mod tests {
         assert_eq!(keys.get("CCD-TEMP"), Some(&"-10.0".to_string()));
         assert_eq!(keys.get("XBINNING"), Some(&"1".to_string()));
         assert_eq!(keys.get("YBINNING"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn parses_asiair_xisf_keyword_dump() {
+        // ASIAIR persists the XISF header as a plain "KEY = value" text dump
+        // (not XISF XML, not 80-col FITS cards). parse_xisf_xml_text returns
+        // empty for this; the dispatcher must fall back to the line parser.
+        let dump = "XISF FITS Keywords:\n==================\n\nSIMPLE = T\nBITPIX = 16\nNAXIS = 2\nCOMMENT = \nFOCALLEN = 140.616\nXPIXSZ = 2.4\nOBJCTRA = 2 41 04.824\nOBJCTDEC = +62 56 44.95\nCROTA2 = 4.383973760472021\nCREATOR = ZWO ASIAIR\n";
+        // XML parser must yield nothing for this format.
+        assert!(parse_xisf_xml_text(dump).is_empty());
+        // Dispatcher must recover the keys via the fallback.
+        let keys = parse_stored_header_keys(FileFormat::XISF, dump);
+        assert_eq!(keys.get("FOCALLEN"), Some(&"140.616".to_string()));
+        assert_eq!(keys.get("OBJCTRA"), Some(&"2 41 04.824".to_string()));
+        assert_eq!(keys.get("OBJCTDEC"), Some(&"+62 56 44.95".to_string()));
+        // And the snapshot must materialise the originals.
+        let snap = snapshot_from_keys(7, &keys);
+        assert_eq!(snap.focallen, Some(140.616));
+        let ra = snap.ra.expect("ra");
+        let dec = snap.dec.expect("dec");
+        assert!((ra - 40.2701).abs() < 0.01, "ra={ra}");
+        assert!((dec - 62.9458).abs() < 0.01, "dec={dec}");
+        assert!(snap.rotation.map(|r| (r - 4.384).abs() < 0.01).unwrap_or(false));
     }
 
     #[test]
