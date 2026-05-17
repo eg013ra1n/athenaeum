@@ -1056,9 +1056,11 @@ pub fn get_calibration_hierarchy_for_frame_set(
             f.objctra,
             f.objctdec,
             f.ra,
-            f.dec
+            f.dec,
+            ps.frame_id IS NOT NULL AS plate_solved
          FROM frames f
          JOIN files fi ON f.file_id = fi.id
+         LEFT JOIN plate_solves ps ON ps.frame_id = f.id
          JOIN session_members sm ON f.id = sm.frame_id
          JOIN sessions s ON s.id = sm.session_id
          JOIN imaging_nights n ON n.id = s.imaging_night_id
@@ -1090,6 +1092,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
         objctdec: Option<String>,
         ra: Option<f64>,
         dec: Option<f64>,
+        plate_solved: bool,
     }
 
     let frames: Vec<RawFrame> = stmt
@@ -1117,6 +1120,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
                 objctdec: row.get(19)?,
                 ra: row.get(20)?,
                 dec: row.get(21)?,
+                plate_solved: row.get(22)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -1290,6 +1294,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
                             objctdec: raw_frame.objctdec.clone(),
                             ra: raw_frame.ra,
                             dec: raw_frame.dec,
+                            plate_solved: raw_frame.plate_solved,
                             calibration_status: status,
                         });
                     }

@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback } from 'react';
-import { FolderOpen, AlertTriangle, CheckCircle, MapPin } from 'lucide-react';
+import { FolderOpen, AlertTriangle, CheckCircle, MapPin, Crosshair } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
@@ -410,21 +410,29 @@ export function LightsAnalysisTable({
                   </td>
                 )}
                 <td className="w-16 px-1.5 py-1 text-center">
-                  {frame.ra != null && frame.dec != null ? (
-                    <span
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-success/15 text-success border border-success/40"
-                      title={`RA ${frame.ra.toFixed(4)}, Dec ${frame.dec.toFixed(4)}`}
-                    >
-                      <CheckCircle size={11} />
-                      WCS
-                    </span>
-                  ) : (
+                  {frame.ra == null || frame.dec == null ? (
                     <span
                       className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-warning/15 text-warning border border-warning/40"
                       title="No WCS coordinates"
                     >
                       <MapPin size={11} />
                       No WCS
+                    </span>
+                  ) : frame.plate_solved ? (
+                    <span
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-accent/15 text-accent border border-accent/40"
+                      title={`Plate-solved by Athenaeum — RA ${frame.ra.toFixed(4)}, Dec ${frame.dec.toFixed(4)}`}
+                    >
+                      <Crosshair size={11} />
+                      Athenaeum
+                    </span>
+                  ) : (
+                    <span
+                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-success/15 text-success border border-success/40"
+                      title={`WCS from FITS header — RA ${frame.ra.toFixed(4)}, Dec ${frame.dec.toFixed(4)}`}
+                    >
+                      <CheckCircle size={11} />
+                      Original
                     </span>
                   )}
                 </td>

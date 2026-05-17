@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight } from 'lucide-react';
+import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -11,6 +11,7 @@ import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/Ligh
 import { RejectionThresholdBar, RejectionThresholds, EMPTY_THRESHOLDS } from './calibration/RejectionThresholdBar';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
+import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
 
@@ -28,7 +29,7 @@ interface LightsAnalysisViewProps {
   hideLocateColumn?: boolean;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh: _onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');
 
@@ -67,6 +68,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
   const [csvExportedMsg, setCsvExportedMsg] = useState<string | null>(null);
   const csvTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const plateSolveRef = useRef<PlateSolveBatchPanelHandle>(null);
   const [frameViewMode, setFrameViewMode] = useState<'table' | 'chart'>('table');
   const [useArcsec, setUseArcsec] = useState(false);
   const [defaultFwhmUnit, setDefaultFwhmUnit] = useState<'px' | 'arcsec'>('px');
@@ -711,6 +713,24 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               </button>
               <span className="text-[10px] text-content-muted leading-tight">Blackhole</span>
             </div>
+            <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+              <button
+                onClick={() => {
+                  if (selectedFrameIds.size === 0) return;
+                  plateSolveRef.current?.start([...selectedFrameIds]);
+                }}
+                disabled={!hasSelection}
+                className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-accent hover:bg-accent-hover text-white rounded-lg transition-colors disabled:opacity-30 disabled:cursor-default"
+                title={
+                  hasSelection
+                    ? `Plate solve ${selectedFrameIds.size} selected frame${selectedFrameIds.size === 1 ? '' : 's'} (updates WCS)`
+                    : 'Select frames to plate solve'
+                }
+              >
+                <Crosshair size={12} />
+              </button>
+              <span className="text-[10px] text-content-muted leading-tight">Plate Solve</span>
+            </div>
 
             <span className="text-border h-7 flex items-center">|</span>
 
@@ -768,6 +788,12 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               <span className="text-[10px] text-content-muted leading-tight">View</span>
             </div>
           </div>
+
+          <PlateSolveBatchPanel
+            ref={plateSolveRef}
+            hideTriggerButtons
+            onSolveComplete={() => onRefresh?.()}
+          />
 
           {csvExportedMsg && (
             <div className="inline-flex items-center gap-1 text-xs text-green-400 flex-shrink-0">

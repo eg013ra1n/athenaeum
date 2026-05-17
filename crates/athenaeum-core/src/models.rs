@@ -710,6 +710,10 @@ pub struct LightFrameWithCalibration {
     pub objctdec: Option<String>,
     pub ra: Option<f64>,
     pub dec: Option<f64>,
+    /// True when a `plate_solves` row exists for this frame, i.e. the WCS
+    /// was computed by Athenaeum's plate solver (vs. read from the FITS
+    /// header). Drives the Original/Athenaeum WCS badge.
+    pub plate_solved: bool,
     pub calibration_status: FrameCalibrationStatus,
 }
 

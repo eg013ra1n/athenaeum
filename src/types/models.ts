@@ -853,6 +853,9 @@ export interface LightFrameWithCalibration {
   objctdec: string | null;
   ra: number | null;
   dec: number | null;
+  /** True when a plate_solves row exists for this frame (WCS computed by
+   * Athenaeum's plate solver, not read from the FITS header). */
+  plate_solved: boolean;
   calibration_status: FrameCalibrationStatus;
 }
 
