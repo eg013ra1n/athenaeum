@@ -592,6 +592,113 @@ pub fn store_result(
     Ok(())
 }
 
+/// Star-detection front-end shared with the ASTAP-port backend.
+///
+/// This is the exact detection logic used by the legacy path above
+/// (`ImageAnalyzer` with the saturation reject disabled, fast or precise
+/// per config, the ≥20 floor, and the SNR-reranked twin used by the SNR
+/// rescue). The legacy `solve_frame_with_hints` body is intentionally left
+/// inline and byte-identical (the #1 project rule: legacy stays unchanged
+/// until the astap path is bench-proven — see plan); this helper is the
+/// astap path's single source for the same behaviour. The brief duplication
+/// is removed when the legacy cascade is deleted (plan Task 9).
+///
+/// Returns `(stars, (width,height), snr_reranked_twin)`. `snr_twin` is
+/// `Some` only on the fast path (it feeds the additive SNR rescue).
+pub(crate) fn detect_image_stars(
+    file_path: &str,
+    filename: &str,
+    config: &PlateSolveConfig,
+    thread_pool: Option<Arc<rayon::ThreadPool>>,
+) -> Result<(Vec<ImageStar>, (u32, u32), Option<Vec<ImageStar>>)> {
+    let max_detection_cap = config
+        .retry_passes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(config.max_image_stars)
+        .max(500);
+
+    let t0 = Instant::now();
+    let mut analyzer = ImageAnalyzer::new()
+        .with_detection_sigma(5.0)
+        .with_max_stars(max_detection_cap)
+        .with_saturation_fraction(1.0);
+    if let Some(pool) = thread_pool {
+        analyzer = analyzer.with_thread_pool(pool);
+    }
+
+    let (image_stars, image_size, snr_first): (
+        Vec<ImageStar>,
+        (u32, u32),
+        Option<Vec<ImageStar>>,
+    ) = if config.use_fast_detection {
+        let r = analyzer
+            .detect_fast(file_path)
+            .with_context(|| format!("star detection failed for {file_path}"))?;
+        if r.stars.len() < 20 {
+            return Err(anyhow::anyhow!(
+                "only {} stars detected (need >= 20)",
+                r.stars.len()
+            ));
+        }
+        let stars: Vec<ImageStar> = r
+            .stars
+            .iter()
+            .map(|s| ImageStar {
+                x: s.x as f64,
+                y: s.y as f64,
+                flux: s.flux as f64,
+            })
+            .collect();
+        let mut pk: Vec<&_> = r.stars.iter().collect();
+        pk.sort_by(|a, b| {
+            b.snr.partial_cmp(&a.snr).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let snr_first: Vec<ImageStar> = pk
+            .iter()
+            .map(|s| ImageStar {
+                x: s.x as f64,
+                y: s.y as f64,
+                flux: s.flux as f64,
+            })
+            .collect();
+        (stars, (r.width as u32, r.height as u32), Some(snr_first))
+    } else {
+        let analysis = analyzer
+            .analyze(file_path)
+            .with_context(|| format!("star detection failed for {file_path}"))?;
+        if analysis.stars.len() < 20 {
+            return Err(anyhow::anyhow!(
+                "only {} stars detected (need >= 20)",
+                analysis.stars.len()
+            ));
+        }
+        let stars: Vec<ImageStar> = analysis
+            .stars
+            .iter()
+            .map(|s| ImageStar {
+                x: s.x as f64,
+                y: s.y as f64,
+                flux: s.flux as f64,
+            })
+            .collect();
+        (stars, (analysis.width as u32, analysis.height as u32), None)
+    };
+
+    eprintln!(
+        "plate_solve [{}]: star detection {}ms ({} stars, {}x{}, fast={})",
+        filename,
+        t0.elapsed().as_millis(),
+        image_stars.len(),
+        image_size.0,
+        image_size.1,
+        config.use_fast_detection,
+    );
+
+    Ok((image_stars, image_size, snr_first))
+}
+
 // ────────── helpers ──────────
 
 #[derive(Clone, Debug)]
@@ -965,7 +1072,7 @@ struct PassOutcome {
 /// Milky Way field with 3 500 catalog stars but only 600 detected image
 /// stars should be gated against ~600, not 3 500. This prevents the gate
 /// from demanding more inliers than the detector can possibly produce.
-fn required_inliers(
+pub(crate) fn required_inliers(
     expected_in_fov: usize,
     detected_count: usize,
     min_ratio: f64,
@@ -1050,7 +1157,7 @@ pub(crate) fn blind_gate_ok(
 /// (mirrors the gate_audit::record_event extraction). Cheap — field copies
 /// plus one `adaptive_tol_px` division; built unconditionally even on the
 /// hinted path (where `blind_gate_ok` early-returns true), which is fine.
-fn make_gate_metrics(
+pub(crate) fn make_gate_metrics(
     inliers: usize,
     expected_in_fov: usize,
     rms_px: f64,
@@ -1074,7 +1181,7 @@ fn make_gate_metrics(
 /// clamped to [4, 20] px. Tight FOVs get smaller pixel tolerances (fewer
 /// false matches); wide-field frames get larger ones (slightly defocused
 /// stars still count). Used in place of the old fixed `verification_tolerance_px`.
-fn adaptive_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 {
+pub(crate) fn adaptive_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 {
     if pixel_scale_arcsec.abs() < 1e-6 {
         return 10.0;
     }
@@ -1082,7 +1189,7 @@ fn adaptive_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 {
 }
 
 /// Great-circle angular distance between two sky positions, in degrees.
-fn angular_distance_deg(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
+pub(crate) fn angular_distance_deg(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
     let dec1r = dec1.to_radians();
     let dec2r = dec2.to_radians();
     let delta_ra = (ra2 - ra1).to_radians();
@@ -1498,7 +1605,7 @@ fn try_solve_pass(
 
 /// Check whether a WCS's derived pixel scale is physically plausible and
 /// (if we have a header hint) agrees with the expected scale.
-fn scale_is_plausible(
+pub(crate) fn scale_is_plausible(
     wcs: &WcsSolution,
     expected_scale_arcsec: Option<f64>,
     scale_tolerance: f64,
@@ -1520,7 +1627,7 @@ fn scale_is_plausible(
 /// and count how many fall within `tolerance_px`. Also collects the
 /// matched `((image_px, image_py), (catalog_ra, catalog_dec))` pairs so a
 /// caller can refit the transform over the full inlier set.
-fn count_inliers(
+pub(crate) fn count_inliers(
     wcs: &WcsSolution,
     verify_stars: &[CatalogStar],
     image_stars: &[ImageStar],
@@ -1574,7 +1681,7 @@ fn count_inliers(
 ///     t = w̄ - c * z̄
 /// Then map (c_re, c_im) into the 6-param `Similarity` struct via the
 /// similarity constraint a = d = c_re, b = -c_im, c = c_im.
-fn fit_similarity_4param(
+pub(crate) fn fit_similarity_4param(
     pairs: &[((f64, f64), (f64, f64))],
     tangent_center: (f64, f64),
     image_center: (f64, f64),
@@ -1653,7 +1760,7 @@ fn fit_similarity_4param(
 /// Keeps the best-seen WCS (by tight inlier count) across iterations so
 /// a late bad iteration can't regress a good intermediate result.
 #[allow(clippy::too_many_arguments)]
-fn translation_refit(
+pub(crate) fn translation_refit(
     seed_wcs: &WcsSolution,
     seed_pairs: &[((f64, f64), (f64, f64))],
     verify_stars: &[CatalogStar],
@@ -1954,15 +2061,15 @@ fn rank_agreement(img_dist: &[f64; 4], cat_dist: &[f64; 4], perm: &[usize; 4]) -
 
 /// A similarity transform: pixel → tangent plane (in radians).
 #[derive(Clone, Debug)]
-struct Similarity {
-    // tangent_xi  = a * (px - cx) + b * (py - cy)
-    // tangent_eta = c * (px - cx) + d * (py - cy)
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
-    tx: f64,
-    ty: f64,
+pub(crate) struct Similarity {
+    // tangent_xi  = a * (px - cx) + b * (py - cy) + tx
+    // tangent_eta = c * (px - cx) + d * (py - cy) + ty
+    pub(crate) a: f64,
+    pub(crate) b: f64,
+    pub(crate) c: f64,
+    pub(crate) d: f64,
+    pub(crate) tx: f64,
+    pub(crate) ty: f64,
 }
 
 /// Fit a 6-parameter affine (call it "similarity" in spirit) from quad center
@@ -2055,7 +2162,7 @@ fn replace_col(m: &[[f64; 3]; 3], col: usize, v: &[f64; 3]) -> [[f64; 3]; 3] {
 }
 
 /// Convert a fitted similarity (pixel → tangent-plane-radians) to a WcsSolution.
-fn similarity_to_wcs(
+pub(crate) fn similarity_to_wcs(
     sim: &Similarity,
     image_center: (f64, f64),
     tangent_center: (f64, f64),
