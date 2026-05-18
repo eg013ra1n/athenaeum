@@ -104,7 +104,13 @@ export interface CatalogStatusInfo {
 }
 
 export interface CatalogDownloadProgress {
-  phase: "downloading" | "converting" | "complete" | "error";
+  phase:
+    | "downloading"
+    | "verifying"
+    | "extracting"
+    | "converting"
+    | "complete"
+    | "error";
   current: number;
   total: number;
   percent: number;

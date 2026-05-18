@@ -77,7 +77,7 @@ export function PlateSolveSettingsPanel() {
   const [catalogs, setCatalogs] = useState<CatalogStatusInfo[]>([]);
   const [catalogsLoading, setCatalogsLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
-  const [downloadKind, setDownloadKind] = useState<'tycho2' | 'gaia' | null>(null);
+  const [downloadKind, setDownloadKind] = useState<'tycho2' | 'gaia' | 'gaia-prebuilt' | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<CatalogDownloadProgress | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloadStartedAt, setDownloadStartedAt] = useState<number | null>(null);
@@ -178,7 +178,7 @@ export function PlateSolveSettingsPanel() {
   // backend command differs. Both emit the same `catalog-download-progress`
   // event; `downloadKind` scopes the progress UI to the active card.
   const runCatalogDownload = useCallback(
-    async (kind: 'tycho2' | 'gaia') => {
+    async (kind: 'tycho2' | 'gaia' | 'gaia-prebuilt') => {
       setDownloadKind(kind);
       setDownloading(true);
       setDownloadError(null);
@@ -211,7 +211,13 @@ export function PlateSolveSettingsPanel() {
             unlisten?.();
           }
         });
-        await api.invoke(kind === 'tycho2' ? 'download_tycho2_catalog' : 'download_gaia_dr3_catalog');
+        await api.invoke(
+          kind === 'tycho2'
+            ? 'download_tycho2_catalog'
+            : kind === 'gaia-prebuilt'
+              ? 'download_gaia_dr3_prebuilt_catalog'
+              : 'download_gaia_dr3_catalog',
+        );
         // The invoke resolves only once the whole command finished OK. If we
         // never saw a terminal 'complete'/'error' event (e.g. the catalog
         // was already installed → backend returns immediately with no
@@ -245,6 +251,10 @@ export function PlateSolveSettingsPanel() {
   );
   const handleDownloadGaia = useCallback(
     () => runCatalogDownload('gaia'),
+    [runCatalogDownload],
+  );
+  const handleDownloadGaiaPrebuilt = useCallback(
+    () => runCatalogDownload('gaia-prebuilt'),
     [runCatalogDownload],
   );
 
@@ -426,23 +436,33 @@ export function PlateSolveSettingsPanel() {
 
               {!gaiaInstalled && (
                 <div className="space-y-2">
-                  {downloadError && downloadKind === 'gaia' && (
-                    <p className="text-xs text-red-400">{downloadError}</p>
-                  )}
-                  {downloading && downloadKind === 'gaia' ? (
+                  {downloadError &&
+                    (downloadKind === 'gaia' || downloadKind === 'gaia-prebuilt') && (
+                      <p className="text-xs text-red-400">{downloadError}</p>
+                    )}
+                  {downloading &&
+                  (downloadKind === 'gaia' || downloadKind === 'gaia-prebuilt') ? (
                     <div className="space-y-1.5">
                       <div className="flex items-center gap-2 text-xs text-content-muted">
                         <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-violet-500 flex-shrink-0" />
                         <span>
                           {!downloadProgress
-                            ? 'Starting — contacting ESA Gaia archive (the first tiles can take a few minutes)…'
+                            ? downloadKind === 'gaia-prebuilt'
+                              ? 'Starting — connecting to the prebuilt catalog server…'
+                              : 'Starting — contacting ESA Gaia archive (the first tiles can take a few minutes)…'
                             : downloadProgress.phase === 'downloading'
-                              ? `Downloading tiles · ${downloadProgress.current}/${downloadProgress.total}`
-                              : downloadProgress.phase === 'converting'
-                                ? 'Converting stars to catalog format…'
-                                : downloadProgress.phase === 'complete'
-                                  ? 'Finishing…'
-                                  : 'Working…'}
+                              ? downloadKind === 'gaia-prebuilt'
+                                ? `Downloading archive · ${(downloadProgress.current / 1048576).toFixed(0)} / ${(downloadProgress.total / 1048576).toFixed(0)} MB`
+                                : `Downloading tiles · ${downloadProgress.current}/${downloadProgress.total}`
+                              : downloadProgress.phase === 'verifying'
+                                ? 'Verifying download integrity…'
+                                : downloadProgress.phase === 'extracting'
+                                  ? `Extracting · ${downloadProgress.current}/${downloadProgress.total}`
+                                  : downloadProgress.phase === 'converting'
+                                    ? 'Converting stars to catalog format…'
+                                    : downloadProgress.phase === 'complete'
+                                      ? 'Finishing…'
+                                      : 'Working…'}
                         </span>
                       </div>
                       <div className="w-full h-1.5 bg-surface-hover rounded-full overflow-hidden">
@@ -463,20 +483,29 @@ export function PlateSolveSettingsPanel() {
                       </p>
                     </div>
                   ) : (
-                    <div className="flex items-start gap-3">
+                    <div className="space-y-2">
+                      <div className="flex items-start gap-3">
+                        <button
+                          onClick={handleDownloadGaiaPrebuilt}
+                          disabled={downloading}
+                          className="flex items-center gap-2 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 rounded-lg text-xs font-medium transition-colors text-white"
+                        >
+                          <Download size={13} />
+                          Download Gaia DR3 (prebuilt)
+                        </button>
+                        <p className="text-xs text-content-muted leading-relaxed pt-0.5">
+                          Recommended · ~4 GB single download, resumable. Deep catalog
+                          needed for long-focal-length / headerless fields Tycho-2 cannot
+                          solve.
+                        </p>
+                      </div>
                       <button
                         onClick={handleDownloadGaia}
                         disabled={downloading}
-                        className="flex items-center gap-2 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 rounded-lg text-xs font-medium transition-colors text-white"
+                        className="text-xs text-content-muted hover:text-content underline disabled:opacity-50"
                       >
-                        <Download size={13} />
-                        Download Gaia DR3 Catalog
+                        Advanced: build from the ESA archive instead (~hours, heavy)
                       </button>
-                      <p className="text-xs text-content-muted leading-relaxed pt-0.5">
-                        ~4 GB, several hours (resumable — safe to close and resume). Deep
-                        catalog needed for long-focal-length / headerless fields Tycho-2
-                        cannot solve.
-                      </p>
                     </div>
                   )}
                 </div>
