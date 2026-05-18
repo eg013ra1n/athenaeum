@@ -20,6 +20,7 @@
 //!  - `refine`        — second full-image solve → WCS
 
 pub mod fov_ladder;
+pub mod sky_search;
 
 use std::sync::Arc;
 
