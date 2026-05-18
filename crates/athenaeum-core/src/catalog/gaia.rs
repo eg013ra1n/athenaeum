@@ -19,10 +19,11 @@
 //! Tycho-2 with no solver changes.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// ESA Gaia archive TAP async endpoint.
 pub const GAIA_TAP_ASYNC: &str = "https://gea.esac.esa.int/tap-server/tap/async";
@@ -67,8 +68,100 @@ pub fn tile_source_id_range(tile: u64) -> (u64, u64) {
     (lo, hi)
 }
 
+/// Build the ADQL for one level-3 tile: server-side magnitude cut + the
+/// 5 columns we store, constrained to the tile's `source_id` range (which
+/// is the spatial partition — `source_id BETWEEN` is primary-key indexed,
+/// so this is the fast form).
+pub fn tile_adql(tile: u64) -> String {
+    let (lo, hi) = tile_source_id_range(tile);
+    format!(
+        "SELECT ra,dec,phot_g_mean_mag,pmra,pmdec FROM gaiadr3.gaia_source \
+         WHERE phot_g_mean_mag < {} AND source_id BETWEEN {lo} AND {hi}",
+        GAIA_MAG_LIMIT as u32
+    )
+}
+
+/// Poll cadence and a generous safety cap so a stuck job can never spin
+/// forever (ESA anon async job timeout is 90 min).
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_POLLS: u32 = 90 * 60 / 5;
+
+/// A blocking HTTP client configured for ESA TAP (long timeout, polite UA).
+pub fn tap_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .user_agent("athenaeum-catalog-ingest (astrophotography catalog builder)")
+        .build()
+        .context("build TAP HTTP client")
+}
+
+/// Submit an async ADQL job (`PHASE=RUN`) and return the job resource URL.
+/// ESA responds 303 → the job resource; reqwest follows it, so the final
+/// response URL is the job URL.
+pub fn submit_tap_job(client: &reqwest::blocking::Client, adql: &str) -> Result<String> {
+    let resp = client
+        .post(GAIA_TAP_ASYNC)
+        .form(&[
+            ("REQUEST", "doQuery"),
+            ("LANG", "ADQL"),
+            ("FORMAT", "csv"),
+            ("PHASE", "RUN"),
+            ("QUERY", adql),
+        ])
+        .send()
+        .context("submit TAP job")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("TAP submit returned HTTP {}", resp.status());
+    }
+    let job_url = resp.url().as_str().trim_end_matches('/').to_string();
+    if !job_url.contains("/async/") {
+        anyhow::bail!("unexpected TAP job URL: {job_url}");
+    }
+    Ok(job_url)
+}
+
+/// Poll `{job}/phase` until terminal. Ok(()) on `COMPLETED`; Err on
+/// `ERROR`/`ABORTED`, on the safety cap, or on cancel.
+pub fn poll_job(
+    client: &reqwest::blocking::Client,
+    job_url: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<()> {
+    for _ in 0..MAX_POLLS {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        let phase = client
+            .get(format!("{job_url}/phase"))
+            .send()
+            .context("poll TAP phase")?
+            .text()
+            .context("read TAP phase")?;
+        match phase.trim() {
+            "COMPLETED" => return Ok(()),
+            "ERROR" | "ABORTED" => {
+                anyhow::bail!("TAP job {job_url} ended in phase {}", phase.trim())
+            }
+            _ => std::thread::sleep(POLL_INTERVAL),
+        }
+    }
+    anyhow::bail!("TAP job {job_url} did not complete within the poll cap")
+}
+
+/// Fetch the completed job's CSV result body.
+pub fn fetch_job_csv(client: &reqwest::blocking::Client, job_url: &str) -> Result<String> {
+    let resp = client
+        .get(format!("{job_url}/results/result"))
+        .send()
+        .context("fetch TAP result")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("TAP result returned HTTP {}", resp.status());
+    }
+    resp.text().context("read TAP result body")
+}
+
 /// Placeholder so the module is usable before later tasks land; real
-/// pipeline is `download_gaia_dr3` / `setup_gaia_dr3_catalog` (Tasks 2–5).
+/// pipeline is `download_gaia_dr3` / `setup_gaia_dr3_catalog` (Tasks 3–5).
 pub fn setup_gaia_dr3_catalog(
     _app_data_dir: &Path,
     _cancel_flag: Arc<AtomicBool>,
@@ -103,6 +196,25 @@ mod tests {
         assert_eq!(last_hi + 1, GAIA_TILE_COUNT * SOURCE_ID_TILE_SPAN);
         // …and stay within the u64 source_id space (768·2^53 ≈ 6.9e18 < 2^63).
         assert!(GAIA_TILE_COUNT * SOURCE_ID_TILE_SPAN < (1u64 << 63));
+    }
+
+    #[test]
+    fn adql_is_well_formed() {
+        let q0 = tile_adql(0);
+        assert!(q0.contains("FROM gaiadr3.gaia_source"));
+        assert!(q0.contains("phot_g_mean_mag < 16"));
+        assert!(
+            q0.contains("source_id BETWEEN 0 AND 9007199254740991"),
+            "tile 0 range wrong: {q0}"
+        );
+        // Tile 1's lower bound is exactly 2^53.
+        let q1 = tile_adql(1);
+        assert!(
+            q1.contains("BETWEEN 9007199254740992 AND "),
+            "tile 1 lower bound wrong: {q1}"
+        );
+        // Only the 5 stored columns are projected.
+        assert!(q0.starts_with("SELECT ra,dec,phot_g_mean_mag,pmra,pmdec FROM"));
     }
 
     #[test]
