@@ -30,8 +30,8 @@ const GAIA_CATALOG_META: CatalogStatusInfo = {
   name: 'Gaia DR3',
   installed: false,
   epoch: 2016,
-  star_count_approx: 1811709771,
-  mag_limit: 21.0,
+  star_count_approx: 300_000_000,
+  mag_limit: 16.0,
 };
 
 const TYCHO2_FALLBACK_META: CatalogStatusInfo = {
@@ -67,6 +67,7 @@ export function PlateSolveSettingsPanel() {
   const [catalogs, setCatalogs] = useState<CatalogStatusInfo[]>([]);
   const [catalogsLoading, setCatalogsLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
+  const [downloadKind, setDownloadKind] = useState<'tycho2' | 'gaia' | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<CatalogDownloadProgress | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
@@ -153,43 +154,62 @@ export function PlateSolveSettingsPanel() {
     }
   };
 
-  const handleDownloadTycho2 = useCallback(async () => {
-    setDownloading(true);
-    setDownloadError(null);
-    setDownloadProgress(null);
+  // Shared download driver for both catalogs — identical flow, only the
+  // backend command differs. Both emit the same `catalog-download-progress`
+  // event; `downloadKind` scopes the progress UI to the active card.
+  const runCatalogDownload = useCallback(
+    async (kind: 'tycho2' | 'gaia') => {
+      setDownloadKind(kind);
+      setDownloading(true);
+      setDownloadError(null);
+      setDownloadProgress(null);
 
-    // Track whether the operation ended via a phase event so we know
-    // whether to clean up the listener ourselves.
-    let resolvedViaEvent = false;
-    let unlisten: (() => void) | null = null;
-    try {
-      unlisten = await api.listen<CatalogDownloadProgress>('catalog-download-progress', (payload) => {
-        setDownloadProgress(payload);
-        if (payload.phase === 'complete') {
-          resolvedViaEvent = true;
-          setDownloading(false);
-          setDownloadProgress(null);
-          unlisten?.();
-          loadCatalogStatus();
-        } else if (payload.phase === 'error') {
-          resolvedViaEvent = true;
-          setDownloading(false);
-          setDownloadProgress(null);
-          setDownloadError('Download failed. Please check your connection and try again.');
+      // Track whether the operation ended via a phase event so we know
+      // whether to clean up the listener ourselves.
+      let resolvedViaEvent = false;
+      let unlisten: (() => void) | null = null;
+      try {
+        unlisten = await api.listen<CatalogDownloadProgress>('catalog-download-progress', (payload) => {
+          setDownloadProgress(payload);
+          if (payload.phase === 'complete') {
+            resolvedViaEvent = true;
+            setDownloading(false);
+            setDownloadProgress(null);
+            setDownloadKind(null);
+            unlisten?.();
+            loadCatalogStatus();
+          } else if (payload.phase === 'error') {
+            resolvedViaEvent = true;
+            setDownloading(false);
+            setDownloadProgress(null);
+            setDownloadKind(null);
+            setDownloadError('Download failed. Please check your connection and try again.');
+            unlisten?.();
+          }
+        });
+        await api.invoke(kind === 'tycho2' ? 'download_tycho2_catalog' : 'download_gaia_dr3_catalog');
+      } catch (err) {
+        console.error(`Failed to start ${kind} download:`, err);
+        setDownloadError(String(err));
+        setDownloading(false);
+        setDownloadProgress(null);
+        setDownloadKind(null);
+        if (!resolvedViaEvent) {
           unlisten?.();
         }
-      });
-      await api.invoke('download_tycho2_catalog');
-    } catch (err) {
-      console.error('Failed to start Tycho-2 download:', err);
-      setDownloadError(String(err));
-      setDownloading(false);
-      setDownloadProgress(null);
-      if (!resolvedViaEvent) {
-        unlisten?.();
       }
-    }
-  }, []);
+    },
+    [],
+  );
+
+  const handleDownloadTycho2 = useCallback(
+    () => runCatalogDownload('tycho2'),
+    [runCatalogDownload],
+  );
+  const handleDownloadGaia = useCallback(
+    () => runCatalogDownload('gaia'),
+    [runCatalogDownload],
+  );
 
   const handleBuildQuadIndex = useCallback(async () => {
     setBuildingIndex(true);
@@ -243,6 +263,8 @@ export function PlateSolveSettingsPanel() {
 
   const tycho2 = catalogs.find((c) => c.name === 'Tycho-2') ?? TYCHO2_FALLBACK_META;
   const tycho2Installed = tycho2.installed;
+  const gaia = catalogs.find((c) => c.name === 'Gaia DR3') ?? GAIA_CATALOG_META;
+  const gaiaInstalled = gaia.installed;
 
   return (
     <div className="space-y-6">
@@ -306,7 +328,7 @@ export function PlateSolveSettingsPanel() {
                   {downloadError && (
                     <p className="text-xs text-red-400">{downloadError}</p>
                   )}
-                  {downloading && downloadProgress ? (
+                  {downloading && downloadKind === 'tycho2' && downloadProgress ? (
                     <div className="space-y-1.5">
                       <p className="text-xs text-content-muted">
                         {downloadProgress.phase === 'downloading'
@@ -342,20 +364,72 @@ export function PlateSolveSettingsPanel() {
               )}
             </div>
 
-            {/* Gaia DR3 — static "not installed" entry */}
-            <div className="flex items-center justify-between rounded-lg border border-border bg-surface px-4 py-3">
-              <div className="flex items-center gap-3">
-                <Package size={18} className="text-content-muted" />
-                <div>
-                  <p className="font-medium text-sm">{GAIA_CATALOG_META.name}</p>
-                  <p className="text-xs text-content-muted">
-                    Epoch {GAIA_CATALOG_META.epoch} &middot; {formatStarCount(GAIA_CATALOG_META.star_count_approx)} stars &middot; mag &le;{GAIA_CATALOG_META.mag_limit}
-                  </p>
+            {/* Gaia DR3 — deep catalog; functional download */}
+            <div className="rounded-lg border border-border bg-surface px-4 py-3 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <Package size={18} className={gaiaInstalled ? 'text-accent' : 'text-content-muted'} />
+                  <div>
+                    <p className="font-medium text-sm">{gaia.name}</p>
+                    <p className="text-xs text-content-muted">
+                      Epoch {gaia.epoch} &middot; {formatStarCount(gaia.star_count_approx)} stars &middot; mag &le;{gaia.mag_limit}
+                    </p>
+                  </div>
                 </div>
+                {gaiaInstalled ? (
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-success/20 text-success border border-success/30">
+                    Installed
+                  </span>
+                ) : (
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-surface-hover text-content-muted border border-border">
+                    Not installed
+                  </span>
+                )}
               </div>
-              <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-surface-hover text-content-muted border border-border">
-                Not installed
-              </span>
+
+              {!gaiaInstalled && (
+                <div className="space-y-2">
+                  {downloadError && downloadKind === 'gaia' && (
+                    <p className="text-xs text-red-400">{downloadError}</p>
+                  )}
+                  {downloading && downloadKind === 'gaia' && downloadProgress ? (
+                    <div className="space-y-1.5">
+                      <p className="text-xs text-content-muted">
+                        {downloadProgress.phase === 'downloading'
+                          ? `Downloading tile ${downloadProgress.current}/${downloadProgress.total}`
+                          : downloadProgress.phase === 'converting'
+                            ? 'Converting stars...'
+                            : 'Working...'}
+                      </p>
+                      <div className="w-full h-1.5 bg-surface-hover rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-violet-500 rounded-full transition-all duration-300"
+                          style={{ width: `${downloadProgress.percent}%` }}
+                        />
+                      </div>
+                      <p className="text-xs text-content-muted text-right">
+                        {downloadProgress.percent.toFixed(0)}%
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="flex items-start gap-3">
+                      <button
+                        onClick={handleDownloadGaia}
+                        disabled={downloading}
+                        className="flex items-center gap-2 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 rounded-lg text-xs font-medium transition-colors text-white"
+                      >
+                        <Download size={13} />
+                        Download Gaia DR3 Catalog
+                      </button>
+                      <p className="text-xs text-content-muted leading-relaxed pt-0.5">
+                        ~4 GB, several hours (resumable — safe to close and resume). Deep
+                        catalog needed for long-focal-length / headerless fields Tycho-2
+                        cannot solve.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         )}
