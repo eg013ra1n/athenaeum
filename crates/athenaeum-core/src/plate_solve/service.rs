@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use astroimage::platesolving::{
-    build_quads, CatalogStar, GnomonicProjection, ImageStar, Quad, SolveHints, WcsSolution,
+    build_quads_multi, CatalogStar, GnomonicProjection, ImageStar, Quad, SolveHints, WcsSolution,
 };
 use astroimage::ImageAnalyzer;
 
@@ -32,6 +32,25 @@ use crate::plate_solve::dso_lookup::DsoCatalog;
 use crate::plate_solve::storage::{
     insert_plate_solve, update_frame_from_solve, update_frame_object_if_missing, PlateSolveRecord,
 };
+
+/// Minimum stars for a depth-matched pass to be worth running (a quad needs
+/// 4; below ~this the field is effectively unsolvable anyway).
+const QUAD_MIN_STARS: usize = 4;
+
+/// When a hinted-stage candidate lands within this radius of the user's
+/// stated target (OBJCTRA/OBJCTDEC), the field position is independently
+/// corroborated, so the absolute inlier-count requirement is relaxed to
+/// [`POS_CORROBORATED_MIN_INLIERS`]. Far tighter than the 10° positional
+/// prior — these solves land within ~0.1°.
+const POS_CORROBORATION_RADIUS_DEG: f64 = 1.0;
+
+/// ASTAP-class minimum inliers for a position+scale-corroborated solve.
+/// ASTAP accepts on ≥3 matched quads + transform sanity; astrometry.net
+/// treats a position prior as decisive. 8 geometrically-consistent inliers
+/// at the exact stated target with a ±5%-matched scale and tight RMS is
+/// unambiguously a true solve (sparse long-FL narrowband fields physically
+/// contain fewer than the density-based requirement of ~20).
+const POS_CORROBORATED_MIN_INLIERS: usize = 8;
 
 /// Result of a single frame plate solve.
 #[derive(Clone, Debug)]
@@ -134,9 +153,13 @@ pub fn solve_frame_with_hints(
     }
 
     let (image_stars, image_size) = if config.use_fast_detection {
+        // Adaptive multi-level detector (falling-threshold ladder with
+        // occupancy mask + per-tile deep pass): pulls usable, well-centroided
+        // stars out of nebulosity/galaxy-swamped, long-focal-length fields
+        // where a single global threshold under-detects.
         let r = analyzer
             .detect_fast(file_path)
-            .with_context(|| format!("fast star detection failed for {file_path}"))?;
+            .with_context(|| format!("star detection failed for {file_path}"))?;
         if r.stars.len() < 20 {
             return Err(anyhow::anyhow!(
                 "only {} stars detected (need >= 20)",
@@ -204,87 +227,122 @@ pub fn solve_frame_with_hints(
     // drops the positional prior (bad mount sync). Star detection already
     // ran once above; each stage just re-runs the cheap quad/verify loop.
     let has_scale_hint = hints.pixel_scale_arcsec.is_some();
-    // True once a stage that cleared the scale hint produces the winning
-    // result — the header FOCALLEN is then known-wrong and gets corrected.
-    let mut scale_corrected = false;
 
-    // Stage 1 — hinted (scale + position).
-    let mut solved = run_retry_passes(
-        &image_stars,
-        &image_positions,
-        image_size,
-        image_center,
-        hints.pixel_scale_arcsec,
-        false,
-        hints,
-        catalog,
-        index,
-        config,
-        obs_epoch,
-        &filename,
-    );
-
-    if solved.is_err() && config.fallback_to_blind_scale {
-        // Stage 2 — clear the pixel-scale hint, keep the positional prior.
-        // Only meaningful when stage 1 actually had a scale hint to drop.
-        if has_scale_hint {
-            let e1 = solved.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-            eprintln!(
-                "plate_solve [{}]: hinted solve failed ({}); retrying blind \
-                 (scale hint cleared, position prior kept)",
-                filename, e1
-            );
-            solved = run_retry_passes(
-                &image_stars,
-                &image_positions,
-                image_size,
-                image_center,
-                None,
-                false,
-                hints,
-                catalog,
-                index,
-                config,
-                obs_epoch,
-                &filename,
-            );
-            if solved.is_ok() {
-                scale_corrected = true;
+    // The 3-stage escalation as a closure, so it can be re-run on a
+    // stellarity-filtered star list (extended-object rescue below).
+    let solve_cascade = |stars: &[ImageStar],
+                         positions: &[(f64, f64)]|
+     -> (anyhow::Result<(SolveResult, usize, usize)>, bool) {
+        let mut sc = false;
+        // Stage 1 — hinted (scale + position).
+        let mut solved = run_retry_passes(
+            stars, positions, image_size, image_center,
+            hints.pixel_scale_arcsec, false, hints, catalog, index, config,
+            obs_epoch, &filename,
+        );
+        if solved.is_err() && config.fallback_to_blind_scale {
+            // Stage 2 — clear the pixel-scale hint, keep the positional prior.
+            if has_scale_hint {
+                let e1 = solved.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+                eprintln!(
+                    "plate_solve [{}]: hinted solve failed ({}); retrying blind \
+                     (scale hint cleared, position prior kept)",
+                    filename, e1
+                );
+                solved = run_retry_passes(
+                    stars, positions, image_size, image_center, None, false,
+                    hints, catalog, index, config, obs_epoch, &filename,
+                );
+                if solved.is_ok() {
+                    sc = true;
+                }
+            }
+            // Stage 3 — full blind: also drop the positional prior.
+            if solved.is_err() {
+                let prev = solved.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+                eprintln!(
+                    "plate_solve [{}]: retrying full blind \
+                     (scale + position prior cleared) [prev: {}]",
+                    filename, prev
+                );
+                solved = run_retry_passes(
+                    stars, positions, image_size, image_center, None, true,
+                    hints, catalog, index, config, obs_epoch, &filename,
+                );
+                if solved.is_ok() {
+                    sc = has_scale_hint;
+                }
             }
         }
+        (solved, sc)
+    };
 
-        // Stage 3 — full blind: also drop the positional prior.
-        if solved.is_err() {
-            let prev = solved.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
-            eprintln!(
-                "plate_solve [{}]: retrying full blind \
-                 (scale + position prior cleared) [prev: {}]",
-                filename, prev
-            );
-            solved = run_retry_passes(
-                &image_stars,
-                &image_positions,
-                image_size,
-                image_center,
-                None,
-                true,
-                hints,
-                catalog,
-                index,
-                config,
-                obs_epoch,
-                &filename,
-            );
-            if solved.is_ok() {
-                // Only a correction worth writing back if there was a (wrong)
-                // FOCALLEN-derived scale hint to begin with.
-                scale_corrected = has_scale_hint;
+    // `scale_corrected` is true once a stage that cleared the scale hint
+    // produced the winning result — the header FOCALLEN is then known-wrong
+    // and gets corrected on writeback.
+    let (mut solved, mut scale_corrected) = solve_cascade(&image_stars, &image_positions);
+
+    // Extended-object rescue: `detect_fast` returns flux only (no shape), so
+    // on frames with a bright nebula/galaxy the brightest detections — which
+    // feed quad building — are non-stellar structure, not stars, and no
+    // correct quad ever forms (ASTAP-oracle bench: galaxy/nebula frames had
+    // only ~40% of the top-50 detections be real stars vs ~88% on solvable
+    // starfields). If everything failed and we used the fast path, re-detect
+    // with the full analyzer and keep only compact, round, well-detected
+    // sources, then re-run the cascade. Fast-solving frames never reach here,
+    // so their speed/behaviour is unchanged.
+    if solved.is_err() && config.use_fast_detection {
+        if let Ok(an) = analyzer.analyze(file_path) {
+            let mut fwhms: Vec<f64> = an
+                .stars
+                .iter()
+                .map(|s| s.fwhm as f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .collect();
+            if fwhms.len() >= 20 {
+                fwhms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = fwhms[fwhms.len() / 2];
+                let (lo, hi) = (med * 0.4, med * 2.5);
+                let clean: Vec<ImageStar> = an
+                    .stars
+                    .iter()
+                    .filter(|s| {
+                        let f = s.fwhm as f64;
+                        s.eccentricity < 0.7
+                            && f.is_finite()
+                            && f >= lo
+                            && f <= hi
+                            && s.snr >= 5.0
+                    })
+                    .map(|s| ImageStar {
+                        x: s.x as f64,
+                        y: s.y as f64,
+                        flux: s.flux as f64,
+                    })
+                    .collect();
+                eprintln!(
+                    "plate_solve [{}]: extended-object rescue — stellarity filter \
+                     {} → {} stars (ecc<0.7, fwhm∈[{:.1},{:.1}], snr≥5); re-solving",
+                    filename,
+                    an.stars.len(),
+                    clean.len(),
+                    lo,
+                    hi
+                );
+                if clean.len() >= 20 {
+                    let pos2: Vec<(f64, f64)> = clean.iter().map(|s| (s.x, s.y)).collect();
+                    let (s2, sc2) = solve_cascade(&clean, &pos2);
+                    if s2.is_ok() {
+                        solved = s2;
+                        scale_corrected = sc2;
+                    }
+                }
             }
         }
     }
 
     // First stage to succeed wins; if all failed, surface the last (most
-    // permissive) attempt's error — neither hint was the limiting factor.
+    // permissive) attempt's error.
     let (mut result, _best_inliers, _best_expected_in_fov) = solved?;
 
     let pixel_scale = result.pixel_scale_arcsec;
@@ -480,11 +538,55 @@ fn run_retry_passes(
 
     // If the config's retry_passes is empty or all values are 0, fall back
     // to a single pass at the legacy max_image_stars value.
-    let passes: Vec<usize> = if config.retry_passes.iter().any(|n| *n > 0) {
+    let mut passes: Vec<usize> = if config.retry_passes.iter().any(|n| *n > 0) {
         config.retry_passes.iter().copied().filter(|n| *n > 0).collect()
     } else {
         vec![config.max_image_stars]
     };
+
+    // ASTAP-style catalog-depth matching. The fixed [50,150,300,600] ladder
+    // takes the brightest-by-flux detections; at long focal length a 300 s
+    // sub detects far fainter than the Tycho-2 quad index goes (V≤~11.5), so
+    // the brightest-50 quad pool is dominated by faint stars with NO catalog
+    // counterpart and a correct quad hash never forms — even though the field
+    // has plenty of usable Tycho-2 stars. ASTAP caps the image star count to
+    // what the catalog actually contains in this FOV. When we have a pointing
+    // and a scale hint, count the catalog stars in the FOV at the index's
+    // magnitude depth and prepend passes sized to that (and 2×, for detection
+    // incompleteness), so the brightest-N image stars correspond to the same
+    // physical stars the catalog quad index was built from. Only active with
+    // a scale hint (stage 1) → blind/scale-cleared stages are unchanged, and
+    // dense wide fields just see two extra small early passes.
+    if let (Some(scale), Some(ra), Some(dec)) =
+        (expected_scale_arcsec, hints.ra, hints.dec)
+    {
+        let (w, h) = (image_size.0 as f64, image_size.1 as f64);
+        let fov_diag_deg = (w * w + h * h).sqrt() * scale / 3600.0;
+        if fov_diag_deg.is_finite() && fov_diag_deg > 0.0 && fov_diag_deg < 90.0 {
+            let radius = (0.55 * fov_diag_deg).min(89.0);
+            let n_cat = catalog
+                .cone_search(ra, dec, radius, config.index_mag_limit, obs_epoch)
+                .map(|(s, _)| s.len())
+                .unwrap_or(0);
+            if n_cat >= QUAD_MIN_STARS {
+                let avail = image_stars.len();
+                let mut matched: Vec<usize> = [n_cat, n_cat.saturating_mul(2)]
+                    .into_iter()
+                    .map(|n| n.clamp(QUAD_MIN_STARS, avail.max(QUAD_MIN_STARS)))
+                    .filter(|&n| !passes.contains(&n))
+                    .collect();
+                matched.dedup();
+                eprintln!(
+                    "plate_solve [{}]: catalog-depth match — {} Tycho-2 stars \
+                     in {:.2}° FOV (mag≤{:.1}); prepending depth-matched \
+                     passes {:?}",
+                    filename, n_cat, fov_diag_deg, config.index_mag_limit, matched
+                );
+                matched.extend(std::mem::take(&mut passes));
+                passes = matched;
+            }
+        }
+    }
 
     let mut best_result: Option<SolveResult> = None;
     let mut best_inliers: usize = 0;
@@ -532,6 +634,37 @@ fn run_retry_passes(
             );
             let stage =
                 GateStage::from_params(expected_scale_arcsec, disable_position_gate);
+
+            // Position-corroborated relaxation. The per-candidate path has
+            // already required: a hash match, a verifying seed WCS, scale
+            // within ±5% of the header, and a tight per-candidate RMS. If, on
+            // the Hinted stage, the resulting field centre also lands within
+            // ~1° of the user's stated target, the position is independently
+            // corroborated and the density-based absolute inlier floor (which
+            // assumes ~20 matchable catalog stars) is wrong for sparse
+            // long-focal-length narrowband fields — they simply do not
+            // contain that many Tycho-2 stars. Relax the *count* only (ASTAP /
+            // astrometry.net behaviour); blind stages keep the full gate.
+            let (cand_ra, cand_dec) =
+                candidate.wcs.pixel_to_sky(image_center.0, image_center.1);
+            let required_eff = if stage == GateStage::Hinted {
+                match (hints.ra, hints.dec) {
+                    (Some(hra), Some(hdec))
+                        if angular_distance_deg(cand_ra, cand_dec, hra, hdec)
+                            <= POS_CORROBORATION_RADIUS_DEG =>
+                    {
+                        required_this.min(
+                            config
+                                .min_matched_stars
+                                .max(POS_CORROBORATED_MIN_INLIERS),
+                        )
+                    }
+                    _ => required_this,
+                }
+            } else {
+                required_this
+            };
+
             let gate_m = make_gate_metrics(
                 outcome.best_inliers,
                 outcome.best_expected_in_fov,
@@ -541,11 +674,9 @@ fn run_retry_passes(
                 hints.pixel_scale_arcsec,
                 config.base_verification_tolerance_arcsec,
             );
-            let accept = outcome.best_inliers >= required_this
+            let accept = outcome.best_inliers >= required_eff
                 && blind_gate_ok(stage, &gate_m, config);
             if gate_audit::enabled() {
-                let (sra, sdec) =
-                    candidate.wcs.pixel_to_sky(image_center.0, image_center.1);
                 gate_audit::record_event(
                     filename,
                     stage,
@@ -559,11 +690,11 @@ fn run_retry_passes(
                     candidate.rms_residual_arcsec,
                     candidate.pixel_scale_arcsec,
                     hints.pixel_scale_arcsec,
-                    sra,
-                    sdec,
+                    cand_ra,
+                    cand_dec,
                     hints.ra,
                     hints.dec,
-                    required_this,
+                    required_eff,
                 );
             }
             if accept {
@@ -571,12 +702,14 @@ fn run_retry_passes(
                 best_expected_in_fov = outcome.best_expected_in_fov;
                 best_result = Some(candidate.clone());
                 eprintln!(
-                    "plate_solve [{}]: pass {} accepted — {} inliers ≥ {} required (FOV density {})",
+                    "plate_solve [{}]: pass {} accepted — {} inliers ≥ {} required \
+                     (FOV density {}, {} required by density)",
                     filename,
                     pass_idx + 1,
                     best_inliers,
-                    required_this,
-                    best_expected_in_fov
+                    required_eff,
+                    best_expected_in_fov,
+                    required_this
                 );
                 break;
             }
@@ -600,14 +733,36 @@ fn run_retry_passes(
         ));
     };
 
-    // Final density-aware acceptance gate.
-    let required = required_inliers(
+    // Final density-aware acceptance gate. Mirrors the per-pass gate,
+    // including the position-corroborated relaxation: a Hinted-stage result
+    // that lands within ~1° of the user's stated target (with scale already
+    // ±5%-filtered and a tight per-candidate RMS) is a true solve even with
+    // few inliers — sparse long-focal-length narrowband fields physically
+    // contain fewer than the density-based ~20. Without applying the same
+    // relaxation here, the per-pass acceptance is silently overridden and
+    // the solve is rejected as a "near-miss".
+    let required_density = required_inliers(
         best_expected_in_fov,
         image_stars.len(),
         config.min_inlier_ratio,
         config.min_matched_stars,
     );
     let stage = GateStage::from_params(expected_scale_arcsec, disable_position_gate);
+    let (best_ra, best_dec) = result.wcs.pixel_to_sky(image_center.0, image_center.1);
+    let required = if stage == GateStage::Hinted {
+        match (hints.ra, hints.dec) {
+            (Some(hra), Some(hdec))
+                if angular_distance_deg(best_ra, best_dec, hra, hdec)
+                    <= POS_CORROBORATION_RADIUS_DEG =>
+            {
+                required_density
+                    .min(config.min_matched_stars.max(POS_CORROBORATED_MIN_INLIERS))
+            }
+            _ => required_density,
+        }
+    } else {
+        required_density
+    };
     let gate_m = make_gate_metrics(
         best_inliers,
         best_expected_in_fov,
@@ -619,7 +774,6 @@ fn run_retry_passes(
     );
     let accept = best_inliers >= required && blind_gate_ok(stage, &gate_m, config);
     if gate_audit::enabled() {
-        let (sra, sdec) = result.wcs.pixel_to_sky(image_center.0, image_center.1);
         gate_audit::record_event(
             filename,
             stage,
@@ -633,17 +787,14 @@ fn run_retry_passes(
             result.rms_residual_arcsec,
             result.pixel_scale_arcsec,
             hints.pixel_scale_arcsec,
-            sra,
-            sdec,
+            best_ra,
+            best_dec,
             hints.ra,
             hints.dec,
             required,
         );
     }
     if !accept {
-        let (best_ra, best_dec) = result
-            .wcs
-            .pixel_to_sky(image_center.0, image_center.1);
         // Hint depends on what we know about the failure mode. The previous
         // implementation always said "consider rebuilding the quad index with
         // a higher magnitude limit" whenever `best_expected_in_fov > 2000`,
@@ -870,8 +1021,21 @@ fn try_solve_pass(
     obs_epoch: f64,
     disable_position_gate: bool,
 ) -> PassOutcome {
-    // Build quads from the brightest `pass_size` stars.
-    let image_quads = build_quads(image_positions, pass_size);
+    // Build quads from the brightest `pass_size` stars. Group size follows
+    // ASTAP's `find_many_quads` ladder: when only a handful of (catalog-depth)
+    // stars are usable — exactly the long-focal-length / small-FOV case — one
+    // quad per star almost never produces a correct asterism, so densify to
+    // C(6,4)=15 quads/star (≤29 stars) or C(5,4)=5 (≤59). Dense wide fields
+    // keep the classic 1 quad/star (group 4) and are unaffected.
+    let effective_stars = image_positions.len().min(pass_size);
+    let group_size = if effective_stars <= 29 {
+        6
+    } else if effective_stars <= 59 {
+        5
+    } else {
+        4
+    };
+    let image_quads = build_quads_multi(image_positions, pass_size, group_size);
     if image_quads.len() < 10 {
         return PassOutcome {
             image_quads_built: image_quads.len(),

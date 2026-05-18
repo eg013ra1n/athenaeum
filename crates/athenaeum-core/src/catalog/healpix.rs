@@ -39,12 +39,44 @@ pub fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64
     let radius_deg = radius_deg.min(90.0);
 
     let lon_rad = ra_deg.to_radians();
-    let lat_rad = dec_deg.to_radians();
-    let radius_rad = radius_deg.to_radians();
 
-    let bmoc = nested::cone_coverage_approx(HEALPIX_DEPTH, lon_rad, lat_rad, radius_rad);
+    // cdshealpix 0.7.3 has a floating-point edge bug in
+    // `largest_center_to_vertex_distance_with_radius` (lib.rs:547/577):
+    // for certain cones whose centre latitude ± radius straddles the HEALPix
+    // region boundary at ±arcsin(2/3) (~41.81°) it asserts and panics —
+    // including on perfectly ordinary few-degree catalog cones (e.g. a real
+    // M 31 field at Dec ≈ 41.71°). An unguarded panic here aborts the entire
+    // plate-solve batch (every frame, not just this one). It is a knife-edge
+    // numeric condition, so nudging the radius by a hair clears it while
+    // still covering the field; try a few nudges, then fall back to "no
+    // pixels" (candidate fails verification) rather than crash the batch —
+    // the same contract as the non-finite/zero-radius guard above.
+    let try_cover = |r_deg: f64| -> Option<Vec<u64>> {
+        let lat_rad = dec_deg.to_radians();
+        let radius_rad = r_deg.to_radians();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            nested::cone_coverage_approx(HEALPIX_DEPTH, lon_rad, lat_rad, radius_rad)
+        }))
+        .ok()
+        .map(|bmoc| bmoc.flat_iter().collect())
+    };
 
-    let mut pixels: Vec<u64> = bmoc.flat_iter().collect();
+    // First the requested radius; then tiny over/under nudges (still covers
+    // the field, just shifts off the cdshealpix knife-edge).
+    let pixels: Option<Vec<u64>> = try_cover(radius_deg)
+        .or_else(|| try_cover(radius_deg * 1.0001))
+        .or_else(|| try_cover(radius_deg * 0.9999))
+        .or_else(|| try_cover(radius_deg * 1.01))
+        .or_else(|| try_cover(radius_deg * 0.99));
+
+    let Some(mut pixels) = pixels else {
+        eprintln!(
+            "catalog::cone_search_pixels: cdshealpix panicked at every nudged \
+             radius for ra={ra_deg:.6} dec={dec_deg:.6} radius_deg={radius_deg:.6}; \
+             returning empty cone (candidate will fail verification, not crash)"
+        );
+        return Vec::new();
+    };
     pixels.sort_unstable();
     pixels.dedup();
     pixels
@@ -148,6 +180,48 @@ mod tests {
         assert!(cone_search_pixels(180.0, 45.0, 0.0).is_empty());
         assert!(cone_search_pixels(f64::NAN, 45.0, 2.0).is_empty());
         assert!(cone_search_pixels(180.0, f64::NAN, 2.0).is_empty());
+    }
+
+    #[test]
+    fn cone_search_is_total_across_sky_and_radius() {
+        // Regression: cdshealpix 0.7.3's
+        // `largest_center_to_vertex_distance_with_radius` (lib.rs:547/577)
+        // asserts and panics for certain cones whose centre latitude ± radius
+        // straddles the HEALPix region boundary at ±arcsin(2/3) (~41.81°) —
+        // including ordinary few-degree catalog cones. The plate-solve
+        // verifier reaches `cone_search` (service.rs) with arbitrary
+        // degenerate seed positions/radii from the blind-scale fallback, and
+        // an unguarded panic there aborts the *entire* batch (every frame).
+        // `cone_search_pixels` must be TOTAL: never panic for any finite
+        // input — return a (possibly empty) pixel set instead. This sweeps
+        // the boundary band, both hemispheres, the poles, and large radii;
+        // any cdshealpix assertion must be caught internally so this test
+        // simply completes without unwinding.
+        let lat_of_square_cell_deg = (2.0_f64 / 3.0).asin().to_degrees(); // ~41.81
+        let mut dec = -89.0_f64;
+        while dec <= 89.0 {
+            for &r in &[0.05_f64, 0.5, 1.0, 2.5, 4.25, 7.3, 15.0, 45.0, 90.0] {
+                for &ra in &[0.327_f64, 90.013, 180.5, 269.91] {
+                    // Must return without panicking (guard recovers any
+                    // cdshealpix internal assertion).
+                    let v = cone_search_pixels(ra, dec, r);
+                    for &p in &v {
+                        assert!(p < n_pixels(), "pixel {p} out of range");
+                    }
+                }
+            }
+            dec += 0.137; // off-grid step to hit irregular float landings
+        }
+        // Explicitly hammer right at both region boundaries with radii that
+        // make the cone straddle them.
+        for sign in [1.0_f64, -1.0] {
+            let base = sign * lat_of_square_cell_deg;
+            for d in [-0.3_f64, -0.05, -0.001, 0.0, 0.001, 0.05, 0.3] {
+                for &r in &[0.5_f64, 1.0, 2.0, 4.0, 8.0] {
+                    let _ = cone_search_pixels(123.456, base + d, r);
+                }
+            }
+        }
     }
 
     #[test]

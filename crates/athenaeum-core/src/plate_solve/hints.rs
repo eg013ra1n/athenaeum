@@ -53,18 +53,26 @@ pub fn extract_hints(frame: &Frame, conn: Option<&Connection>) -> SolveHints {
         }
     }
 
-    // Compute pixel scale and FOV from optics
+    // Compute pixel scale and FOV from optics.
+    //
+    // FITS `XPIXSZ` is the **effective** pixel pitch of a pixel in the *saved*
+    // image: every mainstream capture program (ASIAIR, N.I.N.A., SharpCap,
+    // ZWO/ASCOM, and what ASTAP itself assumes) already folds binning into
+    // XPIXSZ, with XBINNING kept purely informational. Multiplying XPIXSZ by
+    // XBINNING double-counts binning. Empirically (ASTAP-oracle bench): a ZWO
+    // ASI294MM bin-2 frame reports XPIXSZ=4.63 with NAXIS1=4144 — already the
+    // 4.63 µm/px of the 4144-px image; ×2 yields 1.91"/px vs the true
+    // 0.955"/px, breaking the scale hint at long focal length. So use XPIXSZ
+    // directly, exactly as ASTAP does (scale ≈ 206.265·XPIXSZµm / FOCALLENmm).
     if let (Some(focallen), Some(xpixsz)) = (frame.focallen, frame.xpixsz) {
         if focallen > 0.0 && xpixsz > 0.0 {
             let pixel_size_mm = xpixsz / 1000.0;
-            let binning = frame.xbinning.unwrap_or(1).max(1) as f64;
-            let effective_pixel_mm = pixel_size_mm * binning;
-            let arcsec_per_px = (effective_pixel_mm / focallen).atan().to_degrees() * 3600.0;
+            let arcsec_per_px = (pixel_size_mm / focallen).atan().to_degrees() * 3600.0;
             hints.pixel_scale_arcsec = Some(arcsec_per_px);
 
             if let Some(naxis1) = frame.naxis1 {
                 // FOV = 2 * atan(sensor_size / (2 * focal_length))
-                let sensor_mm = naxis1 as f64 * effective_pixel_mm;
+                let sensor_mm = naxis1 as f64 * pixel_size_mm;
                 let fov_deg = 2.0 * (sensor_mm / (2.0 * focallen)).atan().to_degrees();
                 hints.fov_deg = Some(fov_deg);
             }
