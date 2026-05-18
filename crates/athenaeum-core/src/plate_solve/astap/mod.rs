@@ -19,6 +19,7 @@
 //!  - `trial`         — per-cell project→quad→match→fit→verify
 //!  - `refine`        — second full-image solve → WCS
 
+pub mod catalog_source;
 pub mod fov_ladder;
 pub mod sky_search;
 
