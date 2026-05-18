@@ -852,15 +852,24 @@ pub async fn download_gaia_dr3_catalog(
             cancel_flag,
             &|progress| {
                 let event = match progress {
+                    athenaeum_core::catalog::gaia::GaiaProgress::Started {
+                        total_tiles,
+                        already_done,
+                    } => CatalogDownloadProgress {
+                        phase: "downloading".into(),
+                        current: already_done as usize,
+                        total: total_tiles as usize,
+                        percent: already_done as f64 / total_tiles as f64 * 100.0,
+                    },
                     athenaeum_core::catalog::gaia::GaiaProgress::Querying {
-                        tile,
+                        completed,
                         total_tiles,
                         ..
                     } => CatalogDownloadProgress {
                         phase: "downloading".into(),
-                        current: tile as usize,
+                        current: completed as usize,
                         total: total_tiles as usize,
-                        percent: tile as f64 / total_tiles as f64 * 100.0,
+                        percent: completed as f64 / total_tiles as f64 * 100.0,
                     },
                     athenaeum_core::catalog::gaia::GaiaProgress::Converting {
                         stars_processed,

@@ -54,9 +54,19 @@ pub const GAIA_CONCURRENCY: usize = 3;
 /// Progress callback for the query and conversion phases (mirrors
 /// [`super::tycho2::Tycho2Progress`]).
 pub enum GaiaProgress {
-    /// One TAP tile finished: `tile` of `total_tiles`, `stars` parsed from it.
+    /// Emitted immediately when the run begins (before the first slow TAP
+    /// round-trip) so the UI has instant feedback. `already_done` is the
+    /// resume point (tiles already in the manifest).
+    Started {
+        total_tiles: u64,
+        already_done: u64,
+    },
+    /// One TAP tile finished. `completed` is the cumulative resume-aware
+    /// count (monotonic — tiles finish out of order under concurrency, so
+    /// drive progress bars off this, not `tile`).
     Querying {
         tile: u64,
+        completed: u64,
         total_tiles: u64,
         stars: usize,
     },
@@ -307,10 +317,18 @@ pub fn download_gaia_dr3(
     // disk side (binner + manifest) so there is no file contention and the
     // progress callback need not be `Send`. Bounded channel = backpressure
     // (≈one tile of stars per slot, so memory stays small).
+    // Immediate feedback before the first (slow) TAP round-trip.
+    let already_done = done.len() as u64;
+    progress(GaiaProgress::Started {
+        total_tiles: GAIA_TILE_COUNT,
+        already_done,
+    });
+
     let next = Arc::new(AtomicU64::new(0));
     let first_err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
     let (tx, rx) = mpsc::sync_channel::<(u64, Vec<StarRecord>)>(GAIA_CONCURRENCY);
     let mut written = 0usize;
+    let mut completed = already_done;
 
     std::thread::scope(|s| {
         for _ in 0..GAIA_CONCURRENCY {
@@ -381,8 +399,10 @@ pub fn download_gaia_dr3(
                 continue;
             }
             written += recs.len();
+            completed += 1;
             progress(GaiaProgress::Querying {
                 tile,
+                completed,
                 total_tiles: GAIA_TILE_COUNT,
                 stars: recs.len(),
             });

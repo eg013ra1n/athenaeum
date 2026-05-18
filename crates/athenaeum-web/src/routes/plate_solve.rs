@@ -750,8 +750,10 @@ pub async fn download_gaia_dr3_catalog(
             cancel_flag,
             &|progress| {
                 let (phase, current, total) = match progress {
-                    athenaeum_core::catalog::gaia::GaiaProgress::Querying { tile, total_tiles, .. } =>
-                        ("downloading", tile as usize, total_tiles as usize),
+                    athenaeum_core::catalog::gaia::GaiaProgress::Started { total_tiles, already_done } =>
+                        ("downloading", already_done as usize, total_tiles as usize),
+                    athenaeum_core::catalog::gaia::GaiaProgress::Querying { completed, total_tiles, .. } =>
+                        ("downloading", completed as usize, total_tiles as usize),
                     athenaeum_core::catalog::gaia::GaiaProgress::Converting { stars_processed, total_stars } =>
                         ("converting", stars_processed, total_stars),
                     athenaeum_core::catalog::gaia::GaiaProgress::Complete { total_stars } =>

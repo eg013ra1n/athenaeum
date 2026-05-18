@@ -42,20 +42,26 @@ fn main() -> anyhow::Result<()> {
     let start = Instant::now();
 
     let result = setup_gaia_dr3_catalog(&app_data_dir, cancel, &|p| match p {
+        GaiaProgress::Started {
+            total_tiles,
+            already_done,
+        } => println!(
+            "  started: {already_done}/{total_tiles} tiles already done (resumed); contacting ESA…"
+        ),
         GaiaProgress::Querying {
             tile,
+            completed,
             total_tiles,
             stars,
         } => {
-            let done = tile + 1;
             let elapsed = start.elapsed().as_secs_f64();
-            let eta = if done > 0 {
-                elapsed / done as f64 * (total_tiles - done) as f64
+            let eta = if completed > 0 {
+                elapsed / completed as f64 * (total_tiles - completed) as f64
             } else {
                 0.0
             };
             println!(
-                "  tile {done:>3}/{total_tiles}  (+{stars} stars)  elapsed {:.0}m  ETA ~{:.0}m",
+                "  tile {tile} done · {completed:>3}/{total_tiles}  (+{stars} stars)  elapsed {:.0}m  ETA ~{:.0}m",
                 elapsed / 60.0,
                 eta / 60.0
             );

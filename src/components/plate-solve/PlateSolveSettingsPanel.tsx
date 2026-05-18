@@ -49,6 +49,16 @@ function formatStarCount(n: number): string {
   return String(n);
 }
 
+function formatElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${String(sec).padStart(2, '0')}s`;
+  return `${sec}s`;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
   if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
@@ -70,6 +80,8 @@ export function PlateSolveSettingsPanel() {
   const [downloadKind, setDownloadKind] = useState<'tycho2' | 'gaia' | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<CatalogDownloadProgress | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloadStartedAt, setDownloadStartedAt] = useState<number | null>(null);
+  const [nowTs, setNowTs] = useState<number>(() => Date.now());
 
   // Quad index state
   const [quadIndexStatus, setQuadIndexStatus] = useState<QuadIndexStatus | null>(null);
@@ -83,6 +95,14 @@ export function PlateSolveSettingsPanel() {
     loadCatalogStatus();
     loadQuadIndexStatus();
   }, []);
+
+  // Tick once a second while a catalog download is active so the elapsed
+  // timer keeps moving even during the long first-tile wait (liveness).
+  useEffect(() => {
+    if (!downloading) return;
+    const id = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [downloading]);
 
   const loadConfig = async () => {
     try {
@@ -163,6 +183,8 @@ export function PlateSolveSettingsPanel() {
       setDownloading(true);
       setDownloadError(null);
       setDownloadProgress(null);
+      setDownloadStartedAt(Date.now());
+      setNowTs(Date.now());
 
       // Track whether the operation ended via a phase event so we know
       // whether to clean up the listener ourselves.
@@ -176,6 +198,7 @@ export function PlateSolveSettingsPanel() {
             setDownloading(false);
             setDownloadProgress(null);
             setDownloadKind(null);
+            setDownloadStartedAt(null);
             unlisten?.();
             loadCatalogStatus();
           } else if (payload.phase === 'error') {
@@ -183,17 +206,31 @@ export function PlateSolveSettingsPanel() {
             setDownloading(false);
             setDownloadProgress(null);
             setDownloadKind(null);
+            setDownloadStartedAt(null);
             setDownloadError('Download failed. Please check your connection and try again.');
             unlisten?.();
           }
         });
         await api.invoke(kind === 'tycho2' ? 'download_tycho2_catalog' : 'download_gaia_dr3_catalog');
+        // The invoke resolves only once the whole command finished OK. If we
+        // never saw a terminal 'complete'/'error' event (e.g. the catalog
+        // was already installed → backend returns immediately with no
+        // progress), resolve the UI here so the spinner can't hang forever.
+        if (!resolvedViaEvent) {
+          setDownloading(false);
+          setDownloadProgress(null);
+          setDownloadKind(null);
+          setDownloadStartedAt(null);
+          unlisten?.();
+          loadCatalogStatus();
+        }
       } catch (err) {
         console.error(`Failed to start ${kind} download:`, err);
         setDownloadError(String(err));
         setDownloading(false);
         setDownloadProgress(null);
         setDownloadKind(null);
+        setDownloadStartedAt(null);
         if (!resolvedViaEvent) {
           unlisten?.();
         }
@@ -392,23 +429,37 @@ export function PlateSolveSettingsPanel() {
                   {downloadError && downloadKind === 'gaia' && (
                     <p className="text-xs text-red-400">{downloadError}</p>
                   )}
-                  {downloading && downloadKind === 'gaia' && downloadProgress ? (
+                  {downloading && downloadKind === 'gaia' ? (
                     <div className="space-y-1.5">
-                      <p className="text-xs text-content-muted">
-                        {downloadProgress.phase === 'downloading'
-                          ? `Downloading tile ${downloadProgress.current}/${downloadProgress.total}`
-                          : downloadProgress.phase === 'converting'
-                            ? 'Converting stars...'
-                            : 'Working...'}
-                      </p>
+                      <div className="flex items-center gap-2 text-xs text-content-muted">
+                        <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-violet-500 flex-shrink-0" />
+                        <span>
+                          {!downloadProgress
+                            ? 'Starting — contacting ESA Gaia archive (the first tiles can take a few minutes)…'
+                            : downloadProgress.phase === 'downloading'
+                              ? `Downloading tiles · ${downloadProgress.current}/${downloadProgress.total}`
+                              : downloadProgress.phase === 'converting'
+                                ? 'Converting stars to catalog format…'
+                                : downloadProgress.phase === 'complete'
+                                  ? 'Finishing…'
+                                  : 'Working…'}
+                        </span>
+                      </div>
                       <div className="w-full h-1.5 bg-surface-hover rounded-full overflow-hidden">
                         <div
                           className="h-full bg-violet-500 rounded-full transition-all duration-300"
-                          style={{ width: `${downloadProgress.percent}%` }}
+                          style={{
+                            width: downloadProgress ? `${downloadProgress.percent}%` : '4%',
+                          }}
                         />
                       </div>
-                      <p className="text-xs text-content-muted text-right">
-                        {downloadProgress.percent.toFixed(0)}%
+                      <p className="text-xs text-content-muted flex justify-between">
+                        <span>
+                          {downloadStartedAt != null
+                            ? `elapsed ${formatElapsed(nowTs - downloadStartedAt)} · resumable — safe to leave running`
+                            : 'resumable — safe to leave running'}
+                        </span>
+                        {downloadProgress && <span>{downloadProgress.percent.toFixed(0)}%</span>}
                       </p>
                     </div>
                   ) : (
