@@ -22,6 +22,7 @@
 pub mod catalog_source;
 pub mod fov_ladder;
 pub mod sky_search;
+pub mod trial;
 
 use std::sync::Arc;
 
