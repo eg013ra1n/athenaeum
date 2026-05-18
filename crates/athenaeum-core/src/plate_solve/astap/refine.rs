@@ -84,7 +84,12 @@ pub(crate) fn refine_trial(
     let image_fov_deg =
         (image_size.0 as f64).max(image_size.1 as f64) * seed_scale / 3600.0;
     let cone_radius = image_fov_deg * 0.7;
-    if !cone_radius.is_finite() || cone_radius <= 0.0 || cone_radius > 90.0 {
+    // Reject ≥90° too: a catalog star at exactly 90° separation gives
+    // cos_c == 0 in `sky_to_tangent`, which would trip its `cos_c > 0`
+    // assert during `count_inliers` and panic the batch worker. Physically
+    // unreachable (needs a ~128° image) but the guard must be provably
+    // panic-safe, not merely unreachable.
+    if !cone_radius.is_finite() || cone_radius <= 0.0 || cone_radius >= 90.0 {
         return None;
     }
 
