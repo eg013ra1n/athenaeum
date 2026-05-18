@@ -516,6 +516,39 @@ mod tests {
     }
 
     #[test]
+    fn gaia_pm_convention_matches_tycho2_path() {
+        use astroimage::platesolving::ProperMotionCorrector;
+
+        // parse_gaia_csv_row must store Gaia μα* (cos δ included) verbatim in
+        // mas/yr — the SAME representation the Tycho-2 path and cone_search's
+        // ProperMotionCorrector expect. Realistic PM (StarRecord stores pmra
+        // as i16 ×0.01 mas/yr → ±327.67 clamp; only a handful of very-high-PM
+        // stars clamp, irrelevant for plate solving).
+        let s = parse_gaia_csv_row("0.0,60.0,10.0,300.0,-50.0").expect("row");
+        assert!(
+            (s.pmra_mas_yr() - 300.0).abs() < 0.01 && (s.pmdec_mas_yr() + 50.0).abs() < 0.01,
+            "Gaia pmra/pmdec must be stored as-is in mas/yr (no cos δ / scale applied at parse), got ({}, {})",
+            s.pmra_mas_yr(),
+            s.pmdec_mas_yr()
+        );
+
+        // Assumption-free guarantee: a Gaia-parsed record fed to the shared
+        // corrector is bit-identical to the canonical StarRecord path with
+        // the same numbers — so the Gaia route introduces zero PM distortion
+        // / cos δ double-count relative to the Tycho-2 route.
+        let direct = StarRecord::from_values(0.0, 60.0, 10.0, 300.0, -50.0);
+        let g = ProperMotionCorrector::propagate(
+            s.ra as f64, s.dec as f64, s.pmra_mas_yr(), s.pmdec_mas_yr(), 2016.0, 2116.0,
+        );
+        let d = ProperMotionCorrector::propagate(
+            direct.ra as f64, direct.dec as f64, direct.pmra_mas_yr(), direct.pmdec_mas_yr(), 2016.0, 2116.0,
+        );
+        assert_eq!(g, d, "Gaia path must match the canonical StarRecord path exactly");
+        // Sanity: nonzero pmra moves RA over 100 yr.
+        assert!((g.0 - 0.0).abs() > 1e-9, "nonzero pmra must shift RA");
+    }
+
+    #[test]
     fn level3_has_768_pixels() {
         // Nested HEALPix: 12 · 4^level.
         assert_eq!(12 * 4u64.pow(GAIA_HEALPIX_LEVEL), GAIA_TILE_COUNT);
