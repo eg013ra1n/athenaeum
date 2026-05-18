@@ -1,3 +1,4 @@
+pub mod astap;
 pub mod config;
 pub mod dso_lookup;
 pub mod gate_audit;

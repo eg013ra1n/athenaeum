@@ -120,6 +120,11 @@ pub struct PlateSolveConfig {
     /// rejected. Default: 8.0.
     #[serde(default = "default_blind_scale_header_tol")]
     pub blind_scale_header_tol: f64,
+    /// Solver backend: `"legacy"` (prebuilt-index retry cascade) or
+    /// `"astap"` (per-trial gnomonic ASTAP port). Default `"legacy"` until
+    /// the astap path is bench-proven; flipping this is the cutover switch.
+    #[serde(default = "default_solver_backend")]
+    pub solver_backend: String,
 }
 
 fn default_max_image_stars() -> usize { 300 }
@@ -144,6 +149,7 @@ fn default_blind_inlier_floor() -> usize { 12 }
 fn default_blind_scale_sanity_min() -> f64 { 0.05 }
 fn default_blind_scale_sanity_max() -> f64 { 60.0 }
 fn default_blind_scale_header_tol() -> f64 { 8.0 }
+fn default_solver_backend() -> String { "legacy".to_string() }
 
 impl Default for PlateSolveConfig {
     fn default() -> Self {
@@ -170,6 +176,7 @@ impl Default for PlateSolveConfig {
             blind_scale_sanity_min: default_blind_scale_sanity_min(),
             blind_scale_sanity_max: default_blind_scale_sanity_max(),
             blind_scale_header_tol: default_blind_scale_header_tol(),
+            solver_backend: default_solver_backend(),
         }
     }
 }

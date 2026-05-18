@@ -117,6 +117,15 @@ pub fn solve_frame_with_hints(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| file_path.to_string());
 
+    // Backend dispatch. The ASTAP-port solver owns its entire pipeline; the
+    // legacy path below is byte-identical while solver_backend == "legacy"
+    // (the default until the astap path is bench-proven — see plan).
+    if config.solver_backend.eq_ignore_ascii_case("astap") {
+        return crate::plate_solve::astap::solve(
+            frame, file_path, hints, catalog, index, config, thread_pool,
+        );
+    }
+
     // 1. Star detection — fast (no PSF fit) or precise depending on config.
     // Cap at max(retry_passes) or 500 so the later retry passes have enough
     // stars to work with.
