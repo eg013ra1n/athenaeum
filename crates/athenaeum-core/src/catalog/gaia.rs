@@ -111,45 +111,82 @@ const MAX_POLLS: u32 = 90 * 60 / 5;
 pub fn tap_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
+        .connect_timeout(Duration::from_secs(30))
+        // ESA closes idle keep-alive connections between our polls; reusing a
+        // pooled-but-dead socket yields "connection closed before message
+        // completed". Disable connection reuse — every request gets a fresh
+        // connection. (Retries below cover the rest.)
+        .pool_max_idle_per_host(0)
         .user_agent("athenaeum-catalog-ingest (astrophotography catalog builder)")
         .build()
         .context("build TAP HTTP client")
+}
+
+/// Retry a network op through transient failures (connection drops,
+/// time-outs, 5xx) with exponential backoff. The TAP ops we wrap are all
+/// safe to repeat (idempotent GETs; a re-submitted query just abandons a
+/// duplicate job which ESA purges). A hard error (e.g. ADQL 400) simply
+/// surfaces after the attempts with its real body intact.
+fn with_retry<T>(what: &str, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+    const MAX: u32 = 6;
+    let mut delay = Duration::from_secs(2);
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                eprintln!(
+                    "gaia: {what} attempt {attempt}/{MAX} failed ({e:#}); \
+                     retrying in {}s",
+                    delay.as_secs()
+                );
+                last = Some(e);
+                if attempt < MAX {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    }
+    Err(last
+        .unwrap()
+        .context(format!("{what} failed after {MAX} attempts")))
 }
 
 /// Submit an async ADQL job (`PHASE=RUN`) and return the job resource URL.
 /// ESA responds 303 → the job resource; reqwest follows it, so the final
 /// response URL is the job URL.
 pub fn submit_tap_job(client: &reqwest::blocking::Client, adql: &str) -> Result<String> {
-    let resp = client
-        .post(GAIA_TAP_ASYNC)
-        .form(&[
-            ("REQUEST", "doQuery"),
-            ("LANG", "ADQL"),
-            ("FORMAT", "csv"),
-            ("PHASE", "RUN"),
-            ("QUERY", adql),
-        ])
-        .send()
-        .context("submit TAP job")?;
-    let status = resp.status();
-    let final_url = resp.url().as_str().trim_end_matches('/').to_string();
-    if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!(
-            "TAP submit HTTP {status} (final url {final_url}): {}",
-            body.chars().take(900).collect::<String>()
-        );
-    }
-    if !final_url.contains("/async/") {
-        // Redirect not followed / unexpected landing → include the body so
-        // we can see what ESA actually returned.
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!(
-            "unexpected TAP job URL {final_url} (HTTP {status}): {}",
-            body.chars().take(900).collect::<String>()
-        );
-    }
-    Ok(final_url)
+    with_retry("TAP submit", || {
+        let resp = client
+            .post(GAIA_TAP_ASYNC)
+            .form(&[
+                ("REQUEST", "doQuery"),
+                ("LANG", "ADQL"),
+                ("FORMAT", "csv"),
+                ("PHASE", "RUN"),
+                ("QUERY", adql),
+            ])
+            .send()
+            .context("submit TAP job")?;
+        let status = resp.status();
+        let final_url = resp.url().as_str().trim_end_matches('/').to_string();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!(
+                "TAP submit HTTP {status} (final url {final_url}): {}",
+                body.chars().take(900).collect::<String>()
+            );
+        }
+        if !final_url.contains("/async/") {
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!(
+                "unexpected TAP job URL {final_url} (HTTP {status}): {}",
+                body.chars().take(900).collect::<String>()
+            );
+        }
+        Ok(final_url)
+    })
 }
 
 /// Poll `{job}/phase` until terminal. Ok(()) on `COMPLETED`; Err on
@@ -163,12 +200,14 @@ pub fn poll_job(
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("cancelled");
         }
-        let phase = client
-            .get(format!("{job_url}/phase"))
-            .send()
-            .context("poll TAP phase")?
-            .text()
-            .context("read TAP phase")?;
+        let phase = with_retry("poll TAP phase", || {
+            client
+                .get(format!("{job_url}/phase"))
+                .send()
+                .context("poll TAP phase")?
+                .text()
+                .context("read TAP phase")
+        })?;
         match phase.trim() {
             "COMPLETED" => return Ok(()),
             "ERROR" | "ABORTED" => {
@@ -202,19 +241,21 @@ pub fn poll_job(
 
 /// Fetch the completed job's CSV result body.
 pub fn fetch_job_csv(client: &reqwest::blocking::Client, job_url: &str) -> Result<String> {
-    let resp = client
-        .get(format!("{job_url}/results/result"))
-        .send()
-        .context("fetch TAP result")?;
-    let status = resp.status();
-    let body = resp.text().context("read TAP result body")?;
-    if !status.is_success() {
-        anyhow::bail!(
-            "TAP result HTTP {status}: {}",
-            body.chars().take(900).collect::<String>()
-        );
-    }
-    Ok(body)
+    with_retry("fetch TAP result", || {
+        let resp = client
+            .get(format!("{job_url}/results/result"))
+            .send()
+            .context("fetch TAP result")?;
+        let status = resp.status();
+        let body = resp.text().context("read TAP result body")?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "TAP result HTTP {status}: {}",
+                body.chars().take(900).collect::<String>()
+            );
+        }
+        Ok(body)
+    })
 }
 
 /// Parse one TAP CSV line (`ra,dec,phot_g_mean_mag,pmra,pmdec`) into a
