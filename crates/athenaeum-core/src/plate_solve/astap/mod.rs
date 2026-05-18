@@ -19,6 +19,8 @@
 //!  - `trial`         — per-cell project→quad→match→fit→verify
 //!  - `refine`        — second full-image solve → WCS
 
+pub mod fov_ladder;
+
 use std::sync::Arc;
 
 use anyhow::Result;
