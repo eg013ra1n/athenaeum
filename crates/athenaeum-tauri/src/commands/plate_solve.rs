@@ -831,6 +831,78 @@ pub async fn download_tycho2_catalog(
     Ok(result.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+pub async fn download_gaia_dr3_catalog(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let db_path = db.path().to_path_buf();
+    let app_data_dir = db_path
+        .parent()
+        .ok_or("Cannot determine app data directory")?
+        .to_path_buf();
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let app_clone = app.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        athenaeum_core::catalog::gaia::setup_gaia_dr3_catalog(
+            &app_data_dir,
+            cancel_flag,
+            &|progress| {
+                let event = match progress {
+                    athenaeum_core::catalog::gaia::GaiaProgress::Querying {
+                        tile,
+                        total_tiles,
+                        ..
+                    } => CatalogDownloadProgress {
+                        phase: "downloading".into(),
+                        current: tile as usize,
+                        total: total_tiles as usize,
+                        percent: tile as f64 / total_tiles as f64 * 100.0,
+                    },
+                    athenaeum_core::catalog::gaia::GaiaProgress::Converting {
+                        stars_processed,
+                        total_stars,
+                    } => CatalogDownloadProgress {
+                        phase: "converting".into(),
+                        current: stars_processed,
+                        total: total_stars,
+                        percent: if total_stars > 0 {
+                            stars_processed as f64 / total_stars as f64 * 100.0
+                        } else {
+                            0.0
+                        },
+                    },
+                    athenaeum_core::catalog::gaia::GaiaProgress::Complete { total_stars } => {
+                        CatalogDownloadProgress {
+                            phase: "complete".into(),
+                            current: total_stars,
+                            total: total_stars,
+                            percent: 100.0,
+                        }
+                    }
+                    athenaeum_core::catalog::gaia::GaiaProgress::Error(ref _msg) => {
+                        CatalogDownloadProgress {
+                            phase: "error".into(),
+                            current: 0,
+                            total: 0,
+                            percent: 0.0,
+                        }
+                    }
+                };
+                let _ = app_clone.emit("catalog-download-progress", event);
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("Download task failed: {e}"))?
+    .map_err(|e| format!("Gaia DR3 setup failed: {e}"))?;
+
+    Ok(result.to_string_lossy().to_string())
+}
+
 // ========== Helpers ==========
 
 fn build_catalog_engine(state: &AppState) -> Result<CatalogEngine, String> {
