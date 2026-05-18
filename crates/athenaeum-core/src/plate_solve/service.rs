@@ -234,11 +234,11 @@ pub fn solve_frame_with_hints(
                          positions: &[(f64, f64)]|
      -> (anyhow::Result<(SolveResult, usize, usize)>, bool) {
         let mut sc = false;
-        // Stage 1 — hinted (scale + position).
+        // Stage 1 — hinted (scale + position). Tight 5% scale filter.
         let mut solved = run_retry_passes(
             stars, positions, image_size, image_center,
             hints.pixel_scale_arcsec, false, hints, catalog, index, config,
-            obs_epoch, &filename,
+            obs_epoch, &filename, 0.05,
         );
         if solved.is_err() && config.fallback_to_blind_scale {
             // Stage 2 — clear the pixel-scale hint, keep the positional prior.
@@ -251,13 +251,47 @@ pub fn solve_frame_with_hints(
                 );
                 solved = run_retry_passes(
                     stars, positions, image_size, image_center, None, false,
-                    hints, catalog, index, config, obs_epoch, &filename,
+                    hints, catalog, index, config, obs_epoch, &filename, 0.05,
                 );
                 if solved.is_ok() {
                     sc = true;
                 }
             }
-            // Stage 3 — full blind: also drop the positional prior.
+            // Stage 3a — ASTAP-style blind FOV/scale ladder. With no scale
+            // hint at all (headerless frame) a scaleless solve is swamped by
+            // false high-inlier matches at absurd scales, so instead sweep
+            // FOV coarse→fine, largest first, ÷1.5 per rung (9.5°→~0.37°).
+            // Each rung feeds a candidate pixel scale to the proven hinted
+            // machinery; the all-sky position search is implicit in the
+            // global Tycho-2 quad index, so no positional spiral is needed.
+            // The scale filter is widened to ~0.30 so the true scale falls
+            // within tolerance of the nearest rung while absurd-scale hash
+            // collisions are still rejected. First accepted rung wins.
+            // Frames that *had* a FOCALLEN keep only the scaleless fallback
+            // below (the wide band adds false-positive risk and they do not
+            // reach here in practice).
+            if solved.is_err() && hints.pixel_scale_arcsec.is_none() {
+                let long_px = image_size.0.max(image_size.1) as f64;
+                let mut fov = 9.5_f64;
+                while fov >= 0.37 && solved.is_err() {
+                    let scale = fov * 3600.0 / long_px;
+                    eprintln!(
+                        "plate_solve [{}]: blind FOV ladder — FOV {:.2}° (≈{:.2}\"/px)",
+                        filename, fov, scale
+                    );
+                    solved = run_retry_passes(
+                        stars, positions, image_size, image_center,
+                        Some(scale), true, hints, catalog, index, config,
+                        obs_epoch, &filename, 0.30,
+                    );
+                    fov /= 1.5;
+                }
+                if solved.is_ok() {
+                    // Scale was recovered from no prior → write it back.
+                    sc = true;
+                }
+            }
+            // Stage 3b — scaleless full blind: also drop the positional prior.
             if solved.is_err() {
                 let prev = solved.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
                 eprintln!(
@@ -267,7 +301,7 @@ pub fn solve_frame_with_hints(
                 );
                 solved = run_retry_passes(
                     stars, positions, image_size, image_center, None, true,
-                    hints, catalog, index, config, obs_epoch, &filename,
+                    hints, catalog, index, config, obs_epoch, &filename, 0.05,
                 );
                 if solved.is_ok() {
                     sc = has_scale_hint;
@@ -528,6 +562,7 @@ fn run_retry_passes(
     config: &PlateSolveConfig,
     obs_epoch: f64,
     filename: &str,
+    scale_filter_tol: f64,
 ) -> Result<(SolveResult, usize, usize)> {
     if let Some(s) = expected_scale_arcsec {
         eprintln!(
@@ -607,6 +642,7 @@ fn run_retry_passes(
             config,
             obs_epoch,
             disable_position_gate,
+            scale_filter_tol,
         );
 
         eprintln!(
@@ -1020,6 +1056,7 @@ fn try_solve_pass(
     config: &PlateSolveConfig,
     obs_epoch: f64,
     disable_position_gate: bool,
+    scale_filter_tol: f64,
 ) -> PassOutcome {
     // Build quads from the brightest `pass_size` stars. Group size follows
     // ASTAP's `find_many_quads` ladder: when only a handful of (catalog-depth)
@@ -1074,15 +1111,16 @@ fn try_solve_pass(
     }
 
     // Scale tolerances — intentionally split:
-    //   - `filter_scale_tolerance` = 0.05  tightens the initial candidate
-    //     filter when we have a FOCALLEN+XPIXSZ hint. Real camera/scope
-    //     pairs report pixel scale to <1% accuracy, so a 5% band keeps
-    //     every real candidate while cutting the hash-collision noise
-    //     roughly in half (matters with deeper indexes).
+    //   - `filter_scale_tolerance` (caller-supplied) tightens the initial
+    //     candidate filter against the expected scale. 0.05 for a real
+    //     FOCALLEN+XPIXSZ hint (camera/scope pairs report scale to <1%);
+    //     widened (~0.30) for the blind FOV ladder so the true scale falls
+    //     within tolerance of the nearest ÷1.5 rung while absurd-scale hash
+    //     collisions are still rejected.
     //   - `scale_tolerance` = 0.10 stays generous for the downstream
     //     refit/WCS sanity checks so a fit that drifts slightly during
     //     convergence isn't prematurely rejected.
-    let filter_scale_tolerance = 0.05;
+    let filter_scale_tolerance = scale_filter_tol;
     let scale_tolerance = 0.1;
     let candidates_filtered: Vec<&Candidate> = if let Some(expected) = expected_scale_arcsec {
         candidates
