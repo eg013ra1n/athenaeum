@@ -776,6 +776,47 @@ pub async fn download_gaia_dr3_catalog(
     Ok(Json(result.to_string_lossy().to_string()))
 }
 
+pub async fn download_gaia_dr3_prebuilt_catalog(
+    State(state): State<WebAppState>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+    let db_path = db.path().to_path_buf();
+    let app_data_dir = db_path.parent()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?
+        .to_path_buf();
+
+    let event_tx = state.event_tx.clone();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    let result = tokio::task::spawn_blocking(move || {
+        athenaeum_core::catalog::gaia_prebuilt::download_gaia_dr3_prebuilt(
+            &app_data_dir,
+            cancel_flag,
+            &|progress| {
+                use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
+                let (phase, current, total) = match progress {
+                    P::Downloading { received, total } =>
+                        ("downloading", received as usize, total as usize),
+                    P::Verifying => ("verifying", 0, 0),
+                    P::Extracting { done, total } => ("extracting", done, total),
+                    P::Complete { files } => ("complete", files, files),
+                    P::Error(_) => ("error", 0, 0),
+                };
+                let _ = event_tx.send(SseEvent {
+                    event_name: "catalog-download-progress".into(),
+                    data: serde_json::json!({ "phase": phase, "current": current, "total": total,
+                        "percent": if total > 0 { current as f64 / total as f64 * 100.0 } else { 0.0 } }),
+                });
+            },
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {e}")))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Prebuilt download failed: {e:#}")))?;
+
+    Ok(Json(result.to_string_lossy().to_string()))
+}
+
 fn build_catalog_engine(state: &WebAppState) -> Result<CatalogEngine, (StatusCode, String)> {
     let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
     let conn = db.conn();

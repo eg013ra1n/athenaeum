@@ -325,6 +325,7 @@ pub fn run() {
             commands::get_catalog_status,
             commands::download_tycho2_catalog,
             commands::download_gaia_dr3_catalog,
+            commands::download_gaia_dr3_prebuilt_catalog,
             commands::get_quad_index_status,
             commands::build_quad_index,
             commands_rustafits::read_fits_image_rustafits,

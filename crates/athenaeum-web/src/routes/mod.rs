@@ -203,6 +203,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
         .route("/api/download_tycho2_catalog", post(plate_solve::download_tycho2_catalog))
         .route("/api/download_gaia_dr3_catalog", post(plate_solve::download_gaia_dr3_catalog))
+        .route("/api/download_gaia_dr3_prebuilt_catalog", post(plate_solve::download_gaia_dr3_prebuilt_catalog))
         .route("/api/get_quad_index_status", post(plate_solve::get_quad_index_status))
         .route("/api/build_quad_index", post(plate_solve::build_quad_index))
         // Archive feature

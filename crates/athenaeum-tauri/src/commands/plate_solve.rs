@@ -912,6 +912,78 @@ pub async fn download_gaia_dr3_catalog(
     Ok(result.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+pub async fn download_gaia_dr3_prebuilt_catalog(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let db_path = db.path().to_path_buf();
+    let app_data_dir = db_path
+        .parent()
+        .ok_or("Cannot determine app data directory")?
+        .to_path_buf();
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let app_clone = app.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        athenaeum_core::catalog::gaia_prebuilt::download_gaia_dr3_prebuilt(
+            &app_data_dir,
+            cancel_flag,
+            &|progress| {
+                use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
+                let event = match progress {
+                    P::Downloading { received, total } => CatalogDownloadProgress {
+                        phase: "downloading".into(),
+                        current: received as usize,
+                        total: total as usize,
+                        percent: if total > 0 {
+                            received as f64 / total as f64 * 100.0
+                        } else {
+                            0.0
+                        },
+                    },
+                    P::Verifying => CatalogDownloadProgress {
+                        phase: "verifying".into(),
+                        current: 0,
+                        total: 0,
+                        percent: 0.0,
+                    },
+                    P::Extracting { done, total } => CatalogDownloadProgress {
+                        phase: "extracting".into(),
+                        current: done,
+                        total,
+                        percent: if total > 0 {
+                            done as f64 / total as f64 * 100.0
+                        } else {
+                            0.0
+                        },
+                    },
+                    P::Complete { files } => CatalogDownloadProgress {
+                        phase: "complete".into(),
+                        current: files,
+                        total: files,
+                        percent: 100.0,
+                    },
+                    P::Error(ref _msg) => CatalogDownloadProgress {
+                        phase: "error".into(),
+                        current: 0,
+                        total: 0,
+                        percent: 0.0,
+                    },
+                };
+                let _ = app_clone.emit("catalog-download-progress", event);
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("Download task failed: {e}"))?
+    .map_err(|e| format!("Gaia DR3 prebuilt download failed: {e:#}"))?;
+
+    Ok(result.to_string_lossy().to_string())
+}
+
 // ========== Helpers ==========
 
 fn build_catalog_engine(state: &AppState) -> Result<CatalogEngine, String> {
