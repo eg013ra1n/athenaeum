@@ -18,6 +18,9 @@
 //! auto-discovers it and `cone_search` prefers it (epoch 2016.0) over
 //! Tycho-2 with no solver changes.
 
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,7 +28,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::binary_format::StarRecord;
+use super::binary_format::{self, StarRecord};
+use super::healpix;
 
 /// ESA Gaia archive TAP async endpoint.
 pub const GAIA_TAP_ASYNC: &str = "https://gea.esac.esa.int/tap-server/tap/async";
@@ -187,6 +191,87 @@ pub fn parse_gaia_csv_row(row: &str) -> Option<StarRecord> {
     Some(StarRecord::from_values(ra as f32, dec as f32, g, pmra, pmdec))
 }
 
+/// RAM-safe streaming binner: the full G≤16 catalog (~300 M records ≈
+/// 4.2 GB) cannot be held in memory like Tycho-2's 2.5 M, so we never
+/// collect it. Each TAP tile (~390 k records ≈ 5.5 MB — bounded) is grouped
+/// by depth-6 HEALPix pixel and **appended** to per-pixel scratch files
+/// (`scratch/p_NNNNNN.raw`). [`HealpixBinner::finalize`] then makes one pass
+/// per pixel: read it back, and write the final `healpix_NNNNNN.bin` via the
+/// shared [`binary_format::write_records`] (same pixel assignment + same
+/// mag-sort + same serialization as [`super::write_catalog_to_healpix`], so
+/// the output is byte-identical — asserted in tests).
+pub struct HealpixBinner {
+    scratch_dir: PathBuf,
+}
+
+impl HealpixBinner {
+    pub fn open(scratch_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(scratch_dir)
+            .with_context(|| format!("create scratch dir {}", scratch_dir.display()))?;
+        Ok(Self {
+            scratch_dir: scratch_dir.to_path_buf(),
+        })
+    }
+
+    /// Append one tile's records to their per-pixel scratch files. Only this
+    /// tile is held in memory; scratch files are opened/closed per pixel
+    /// (~64 depth-6 pixels per level-3 tile → cheap, no fd exhaustion).
+    pub fn push_tile(&self, records: &[StarRecord]) -> Result<()> {
+        let mut by_pixel: HashMap<u64, Vec<&StarRecord>> = HashMap::new();
+        for r in records {
+            let pixel = healpix::sky_to_pixel(r.ra as f64, r.dec as f64);
+            by_pixel.entry(pixel).or_default().push(r);
+        }
+        for (pixel, recs) in by_pixel {
+            let path = self.scratch_dir.join(format!("p_{:06}.raw", pixel));
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("append scratch {}", path.display()))?;
+            let mut w = BufWriter::new(f);
+            for r in recs {
+                r.write_to(&mut w)?;
+            }
+            w.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Read every pixel scratch file, mag-sort + serialize it into
+    /// `out_dir/healpix_NNNNNN.bin` (via the shared writer), delete the
+    /// scratch, and return the total record count.
+    pub fn finalize(self, out_dir: &Path) -> Result<usize> {
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("create catalog dir {}", out_dir.display()))?;
+        let mut total = 0usize;
+        for entry in std::fs::read_dir(&self.scratch_dir)? {
+            let path = entry?.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let Some(pixel_str) = name.strip_prefix("p_").and_then(|s| s.strip_suffix(".raw"))
+            else {
+                continue;
+            };
+            let pixel: u64 = pixel_str.parse().context("parse scratch pixel id")?;
+
+            let mut records: Vec<StarRecord> = Vec::new();
+            let f = std::fs::File::open(&path)?;
+            let mut r = BufReader::new(f);
+            while let Ok(rec) = StarRecord::read_from(&mut r) {
+                records.push(rec);
+            }
+            total += records.len();
+
+            let out = out_dir.join(format!("healpix_{:06}.bin", pixel));
+            let mut w = BufWriter::new(std::fs::File::create(&out)?);
+            binary_format::write_records(&mut w, &mut records)?;
+            w.flush()?;
+            std::fs::remove_file(&path)?;
+        }
+        Ok(total)
+    }
+}
+
 /// Placeholder so the module is usable before later tasks land; real
 /// pipeline is `download_gaia_dr3` / `setup_gaia_dr3_catalog` (Tasks 4–5).
 pub fn setup_gaia_dr3_catalog(
@@ -263,6 +348,61 @@ mod tests {
         // Short/garbage rows → None.
         assert!(parse_gaia_csv_row("1.0,2.0").is_none());
         assert!(parse_gaia_csv_row("").is_none());
+    }
+
+    #[test]
+    fn binner_roundtrips_and_sorts_byte_identical_to_write_catalog() {
+        use crate::catalog::write_catalog_to_healpix;
+        use tempfile::TempDir;
+
+        // ~10 stars spanning several depth-6 pixels, magnitudes deliberately
+        // out of order so the per-pixel mag sort is exercised.
+        let recs: Vec<StarRecord> = vec![
+            StarRecord::from_values(10.0, 10.0, 12.5, 1.0, -2.0),
+            StarRecord::from_values(10.05, 10.02, 8.1, 0.0, 0.0),
+            StarRecord::from_values(10.02, 9.98, 15.9, -3.0, 4.0),
+            StarRecord::from_values(200.0, -40.0, 9.7, 5.0, 5.0),
+            StarRecord::from_values(200.1, -40.1, 6.3, 0.0, 0.0),
+            StarRecord::from_values(200.2, -39.9, 14.2, 2.0, -1.0),
+            StarRecord::from_values(300.0, 70.0, 11.0, 0.0, 0.0),
+            StarRecord::from_values(300.3, 70.2, 7.4, -1.0, 1.0),
+            StarRecord::from_values(45.0, -5.0, 13.3, 0.0, 0.0),
+            StarRecord::from_values(45.0, -5.0, 10.0, 0.0, 0.0),
+        ];
+
+        let scratch = TempDir::new().unwrap();
+        let out_binner = TempDir::new().unwrap();
+        let binner = HealpixBinner::open(scratch.path()).unwrap();
+        // Two push_tile calls → exercises cross-tile append into the same
+        // pixel scratch file.
+        binner.push_tile(&recs[..5]).unwrap();
+        binner.push_tile(&recs[5..]).unwrap();
+        let total = binner.finalize(out_binner.path()).unwrap();
+        assert_eq!(total, recs.len());
+
+        let out_ref = TempDir::new().unwrap();
+        write_catalog_to_healpix(&recs, out_ref.path()).unwrap();
+
+        // Same set of pixel files, each byte-identical.
+        let names = |d: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let bn = names(out_binner.path());
+        let rn = names(out_ref.path());
+        assert!(!bn.is_empty() && bn.len() >= 3, "expected multiple pixels: {bn:?}");
+        assert_eq!(bn, rn, "pixel file sets differ");
+        for n in &bn {
+            let a = std::fs::read(out_binner.path().join(n)).unwrap();
+            let b = std::fs::read(out_ref.path().join(n)).unwrap();
+            assert_eq!(a, b, "pixel file {n} not byte-identical to write_catalog_to_healpix");
+        }
+        // Scratch fully consumed.
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
     }
 
     #[test]
