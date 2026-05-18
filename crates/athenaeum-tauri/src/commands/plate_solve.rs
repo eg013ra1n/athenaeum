@@ -907,7 +907,7 @@ pub async fn download_gaia_dr3_catalog(
     })
     .await
     .map_err(|e| format!("Download task failed: {e}"))?
-    .map_err(|e| format!("Gaia DR3 setup failed: {e}"))?;
+    .map_err(|e| format!("Gaia DR3 setup failed: {e:#}"))?;
 
     Ok(result.to_string_lossy().to_string())
 }

@@ -727,7 +727,7 @@ pub async fn download_tycho2_catalog(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Setup failed: {e}")))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Setup failed: {e:#}")))?;
 
     Ok(Json(result.to_string_lossy().to_string()))
 }
@@ -771,7 +771,7 @@ pub async fn download_gaia_dr3_catalog(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Setup failed: {e}")))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Setup failed: {e:#}")))?;
 
     Ok(Json(result.to_string_lossy().to_string()))
 }

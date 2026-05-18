@@ -131,14 +131,25 @@ pub fn submit_tap_job(client: &reqwest::blocking::Client, adql: &str) -> Result<
         ])
         .send()
         .context("submit TAP job")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("TAP submit returned HTTP {}", resp.status());
+    let status = resp.status();
+    let final_url = resp.url().as_str().trim_end_matches('/').to_string();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!(
+            "TAP submit HTTP {status} (final url {final_url}): {}",
+            body.chars().take(900).collect::<String>()
+        );
     }
-    let job_url = resp.url().as_str().trim_end_matches('/').to_string();
-    if !job_url.contains("/async/") {
-        anyhow::bail!("unexpected TAP job URL: {job_url}");
+    if !final_url.contains("/async/") {
+        // Redirect not followed / unexpected landing → include the body so
+        // we can see what ESA actually returned.
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!(
+            "unexpected TAP job URL {final_url} (HTTP {status}): {}",
+            body.chars().take(900).collect::<String>()
+        );
     }
-    Ok(job_url)
+    Ok(final_url)
 }
 
 /// Poll `{job}/phase` until terminal. Ok(()) on `COMPLETED`; Err on
@@ -161,9 +172,29 @@ pub fn poll_job(
         match phase.trim() {
             "COMPLETED" => return Ok(()),
             "ERROR" | "ABORTED" => {
-                anyhow::bail!("TAP job {job_url} ended in phase {}", phase.trim())
+                // The UWS error document carries the real reason (ADQL
+                // error, timeout, quota, …).
+                let detail = client
+                    .get(format!("{job_url}/error"))
+                    .send()
+                    .and_then(|r| r.text())
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "TAP job {job_url} ended in {} — {}",
+                    phase.trim(),
+                    detail.chars().take(900).collect::<String>()
+                );
             }
-            _ => std::thread::sleep(POLL_INTERVAL),
+            "PENDING" | "QUEUED" | "EXECUTING" | "SUSPENDED" | "HELD" | "UNKNOWN" => {
+                std::thread::sleep(POLL_INTERVAL)
+            }
+            // Anything else means the phase endpoint didn't return a UWS
+            // phase (e.g. an HTML 404 → wrong job URL). Don't spin for 90
+            // min on garbage — surface it.
+            other => anyhow::bail!(
+                "TAP {job_url}/phase returned non-UWS text: {}",
+                other.chars().take(400).collect::<String>()
+            ),
         }
     }
     anyhow::bail!("TAP job {job_url} did not complete within the poll cap")
@@ -175,10 +206,15 @@ pub fn fetch_job_csv(client: &reqwest::blocking::Client, job_url: &str) -> Resul
         .get(format!("{job_url}/results/result"))
         .send()
         .context("fetch TAP result")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("TAP result returned HTTP {}", resp.status());
+    let status = resp.status();
+    let body = resp.text().context("read TAP result body")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "TAP result HTTP {status}: {}",
+            body.chars().take(900).collect::<String>()
+        );
     }
-    resp.text().context("read TAP result body")
+    Ok(body)
 }
 
 /// Parse one TAP CSV line (`ra,dec,phot_g_mean_mag,pmra,pmdec`) into a
