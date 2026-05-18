@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -45,6 +45,11 @@ pub const GAIA_TILE_COUNT: u64 = 768;
 
 /// `source_id` span per level-3 tile: `2^35 · 4^(12−3)` = `2^53`.
 pub const SOURCE_ID_TILE_SPAN: u64 = 1 << 53;
+
+/// Concurrent in-flight TAP jobs. ESA publishes no hard scripted limit but
+/// asks users to be considerate; 3 is the documented fair-use ceiling and
+/// gives a ~3× speedup over serial without abusing the service.
+pub const GAIA_CONCURRENCY: usize = 3;
 
 /// Progress callback for the query and conversion phases (mirrors
 /// [`super::tycho2::Tycho2Progress`]).
@@ -295,39 +300,97 @@ pub fn download_gaia_dr3(
     let done = read_done_manifest(&manifest_path);
     let binner = HealpixBinner::open(&scratch_dir.join("bins"))?;
     let client = tap_client()?;
+
+    // `GAIA_CONCURRENCY` producer threads each pull tiles from a shared
+    // counter and do the slow network round-trip (submit → poll → fetch →
+    // parse) in parallel; a single consumer (this thread) serializes the
+    // disk side (binner + manifest) so there is no file contention and the
+    // progress callback need not be `Send`. Bounded channel = backpressure
+    // (≈one tile of stars per slot, so memory stays small).
+    let next = Arc::new(AtomicU64::new(0));
+    let first_err: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+    let (tx, rx) = mpsc::sync_channel::<(u64, Vec<StarRecord>)>(GAIA_CONCURRENCY);
     let mut written = 0usize;
 
-    for tile in 0..GAIA_TILE_COUNT {
-        if cancel_flag.load(Ordering::Relaxed) {
-            anyhow::bail!("cancelled");
+    std::thread::scope(|s| {
+        for _ in 0..GAIA_CONCURRENCY {
+            let tx = tx.clone();
+            let (next, first_err, cancel_flag) =
+                (Arc::clone(&next), Arc::clone(&first_err), Arc::clone(&cancel_flag));
+            let (client, done) = (&client, &done);
+            s.spawn(move || loop {
+                let tile = next.fetch_add(1, Ordering::Relaxed);
+                if tile >= GAIA_TILE_COUNT || cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                if done.contains(&tile) {
+                    continue;
+                }
+                let fetch = (|| -> Result<Vec<StarRecord>> {
+                    let job = submit_tap_job(client, &tile_adql(tile))?;
+                    poll_job(client, &job, &cancel_flag)?;
+                    let csv = fetch_job_csv(client, &job)?;
+                    Ok(csv.lines().filter_map(parse_gaia_csv_row).collect())
+                })();
+                match fetch {
+                    Ok(recs) => {
+                        if tx.send((tile, recs)).is_err() {
+                            break; // consumer gone
+                        }
+                    }
+                    Err(e) => {
+                        let mut slot = first_err.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e.context(format!("tile {tile}")));
+                        }
+                        cancel_flag.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
         }
-        if done.contains(&tile) {
-            continue;
+        // Drop our own sender so the channel closes once every producer ends.
+        drop(tx);
+
+        // Consumer: serialize disk writes + checkpoint + progress.
+        while let Ok((tile, recs)) = rx.recv() {
+            if let Err(e) = binner.push_tile(&recs) {
+                let mut slot = first_err.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(e.context(format!("binner push tile {tile}")));
+                }
+                cancel_flag.store(true, Ordering::Relaxed);
+                continue;
+            }
+            let checkpoint = (|| -> Result<()> {
+                let mut mf = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&manifest_path)
+                    .context("open done.manifest")?;
+                writeln!(mf, "{tile}")?;
+                mf.flush()?;
+                Ok(())
+            })();
+            if let Err(e) = checkpoint {
+                let mut slot = first_err.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(e.context(format!("checkpoint tile {tile}")));
+                }
+                cancel_flag.store(true, Ordering::Relaxed);
+                continue;
+            }
+            written += recs.len();
+            progress(GaiaProgress::Querying {
+                tile,
+                total_tiles: GAIA_TILE_COUNT,
+                stars: recs.len(),
+            });
         }
+    });
 
-        let job = submit_tap_job(&client, &tile_adql(tile))?;
-        poll_job(&client, &job, &cancel_flag)?;
-        let csv = fetch_job_csv(&client, &job)?;
-
-        let recs: Vec<StarRecord> =
-            csv.lines().filter_map(parse_gaia_csv_row).collect();
-        binner.push_tile(&recs)?;
-
-        // Checkpoint AFTER the tile's data is safely on disk.
-        let mut mf = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&manifest_path)
-            .context("open done.manifest")?;
-        writeln!(mf, "{tile}")?;
-        mf.flush()?;
-
-        written += recs.len();
-        progress(GaiaProgress::Querying {
-            tile,
-            total_tiles: GAIA_TILE_COUNT,
-            stars: recs.len(),
-        });
+    if let Some(e) = first_err.lock().unwrap().take() {
+        return Err(e);
     }
     Ok(written)
 }
