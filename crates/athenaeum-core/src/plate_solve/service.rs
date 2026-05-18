@@ -152,7 +152,11 @@ pub fn solve_frame_with_hints(
         analyzer = analyzer.with_thread_pool(pool);
     }
 
-    let (image_stars, image_size) = if config.use_fast_detection {
+    let (image_stars, image_size, snr_first): (
+        Vec<ImageStar>,
+        (u32, u32),
+        Option<Vec<ImageStar>>,
+    ) = if config.use_fast_detection {
         // Adaptive multi-level detector (falling-threshold ladder with
         // occupancy mask + per-tile deep pass): pulls usable, well-centroided
         // stars out of nebulosity/galaxy-swamped, long-focal-length fields
@@ -175,7 +179,27 @@ pub fn solve_frame_with_hints(
                 flux: s.flux as f64,
             })
             .collect();
-        (stars, (r.width as u32, r.height as u32))
+        // Same stars, re-ranked by aperture SNR. A bright galaxy/nebula
+        // injects extended knots with huge flux but low SNR (flux spread
+        // over a large aperture: `flux / sqrt(flux + π r² σ²)`); they top
+        // the flux ranking and poison the quad pool, while real point
+        // sources have high SNR. SNR-ranking (ASTAP `get_brightest_stars`)
+        // demotes the structure. Used only by the additive SNR rescue
+        // (after the normal flux-ordered cascade fails) so frames that
+        // solve normally are never reordered.
+        let mut pk: Vec<&_> = r.stars.iter().collect();
+        pk.sort_by(|a, b| {
+            b.snr.partial_cmp(&a.snr).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let snr_first: Vec<ImageStar> = pk
+            .iter()
+            .map(|s| ImageStar {
+                x: s.x as f64,
+                y: s.y as f64,
+                flux: s.flux as f64,
+            })
+            .collect();
+        (stars, (r.width as u32, r.height as u32), Some(snr_first))
     } else {
         let analysis = analyzer
             .analyze(file_path)
@@ -195,7 +219,7 @@ pub fn solve_frame_with_hints(
                 flux: s.flux as f64,
             })
             .collect();
-        (stars, (analysis.width as u32, analysis.height as u32))
+        (stars, (analysis.width as u32, analysis.height as u32), None)
     };
 
     let image_center = (image_size.0 as f64 / 2.0, image_size.1 as f64 / 2.0);
@@ -315,6 +339,35 @@ pub fn solve_frame_with_hints(
     // produced the winning result — the header FOCALLEN is then known-wrong
     // and gets corrected on writeback.
     let (mut solved, mut scale_corrected) = solve_cascade(&image_stars, &image_positions);
+
+    // SNR-ordered rescue (cheap; tried before the analyze() rescue). A
+    // bright galaxy/nebula injects extended knots with huge FLUX but low
+    // aperture SNR; they top the flux-ranked quad pool and stop a correct
+    // quad forming (visually confirmed on M51 — the brightest-by-flux
+    // detections sat on the galaxy core/spiral). Re-run the cascade with
+    // the SAME detections re-ranked by SNR: compact point sources lead,
+    // extended structure sinks. Purely additive — runs only after the
+    // normal flux-ordered cascade has failed, so frames that solve normally
+    // (incl. NGC 2024, which a global SNR re-rank regressed) are never
+    // reordered.
+    if solved.is_err() {
+        if let Some(pk) = snr_first.as_ref() {
+            if pk.len() >= 20 {
+                let pos: Vec<(f64, f64)> = pk.iter().map(|s| (s.x, s.y)).collect();
+                eprintln!(
+                    "plate_solve [{}]: SNR-ordered rescue — re-solving with {} \
+                     SNR-ranked stars",
+                    filename,
+                    pk.len()
+                );
+                let (s2, sc2) = solve_cascade(pk, &pos);
+                if s2.is_ok() {
+                    solved = s2;
+                    scale_corrected = sc2;
+                }
+            }
+        }
+    }
 
     // Extended-object rescue: `detect_fast` returns flux only (no shape), so
     // on frames with a bright nebula/galaxy the brightest detections — which

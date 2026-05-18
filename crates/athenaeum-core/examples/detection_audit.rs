@@ -110,20 +110,84 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Annotated render so the stars can be eyeballed against the image.
-    let processed = ImageConverter::new()
-        .with_downscale(DOWNSCALE)
-        .process(&fits)?;
-    let mut canvas = rgb_from_processed(&processed)?;
-    let full_h = processed.height * DOWNSCALE;
-    for s in &r.stars {
-        let cx = (s.x as f64 / DOWNSCALE as f64) as i32;
-        let cy = (to_display_y(s.y as f64, full_h) / DOWNSCALE as f64) as i32;
-        if cx >= -6 && cy >= -6 {
-            draw_hollow_circle_mut(&mut canvas, (cx, cy), 5, Rgb([80, 255, 80]));
+    // Two artefacts so circle-on-star coincidence is unambiguous:
+    //   <out>          downscaled overview (bold double-ring markers)
+    //   <out>.crop.png  FULL-RESOLUTION 1400×1000 window centred on the
+    //                    brightest detections (star-rich), markers at full res
+    // The detector reports y in raw file-row order. `ImageConverter::process`
+    // flips the display only when `flip_vertical` is set (ROWORDER != TOP-DOWN);
+    // flip the overlay ONLY then, else detections mirror and correct detection
+    // looks wrong.
+    let green = Rgb([60, 255, 60]);
+    let mark = |img: &mut RgbImage, cx: i32, cy: i32, r: i32| {
+        if cx >= -r && cy >= -r {
+            draw_hollow_circle_mut(img, (cx, cy), r, green);
+            draw_hollow_circle_mut(img, (cx, cy), r + 2, green);
         }
+    };
+
+    // Overview (downscale OVERVIEW_DS).
+    const OVERVIEW_DS: usize = 3;
+    let pv = ImageConverter::new()
+        .with_downscale(OVERVIEW_DS)
+        .process(&fits)?;
+    println!("flip_vertical:   {}", pv.flip_vertical);
+    let full_h_ov = pv.height * OVERVIEW_DS;
+    let mut ov = rgb_from_processed(&pv)?;
+    for s in &r.stars {
+        let cx = (s.x as f64 / OVERVIEW_DS as f64) as i32;
+        let yy = if pv.flip_vertical {
+            to_display_y(s.y as f64, full_h_ov)
+        } else {
+            s.y as f64
+        };
+        mark(&mut ov, cx, (yy / OVERVIEW_DS as f64) as i32, 7);
     }
-    canvas.save(&out)?;
-    println!("annotated image: {}", out.display());
+    ov.save(&out)?;
+    println!("annotated overview: {}", out.display());
+
+    // Full-resolution crop around the brightest-25 detection centroid.
+    let nb = r.stars.len().min(25);
+    if nb > 0 {
+        let mcx = r.stars.iter().take(nb).map(|s| s.x as f64).sum::<f64>() / nb as f64;
+        let mcy = r.stars.iter().take(nb).map(|s| s.y as f64).sum::<f64>() / nb as f64;
+        let pf = ImageConverter::new().with_downscale(1).process(&fits)?;
+        let (fw, fh) = (pf.width, pf.height);
+        let (cw, ch) = (1400i64.min(fw as i64), 1000i64.min(fh as i64));
+        let x0 = ((mcx as i64) - cw / 2).clamp(0, fw as i64 - cw).max(0);
+        let dy_full = if pf.flip_vertical {
+            (fh as f64) - 1.0 - mcy
+        } else {
+            mcy
+        };
+        let y0 = ((dy_full as i64) - ch / 2).clamp(0, fh as i64 - ch).max(0);
+        let mut full = rgb_from_processed(&pf)?;
+        for s in &r.stars {
+            let yy = if pf.flip_vertical {
+                (fh as f64) - 1.0 - s.y as f64
+            } else {
+                s.y as f64
+            };
+            mark(&mut full, s.x as i32, yy as i32, 16);
+        }
+        let crop = image::imageops::crop_imm(
+            &full,
+            x0 as u32,
+            y0 as u32,
+            cw as u32,
+            ch as u32,
+        )
+        .to_image();
+        let cp = out.with_extension("crop.png");
+        crop.save(&cp)?;
+        println!(
+            "full-res crop:      {} (window {}x{} at {},{})",
+            cp.display(),
+            cw,
+            ch,
+            x0,
+            y0
+        );
+    }
     Ok(())
 }
