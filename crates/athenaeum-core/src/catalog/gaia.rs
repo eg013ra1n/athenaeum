@@ -272,14 +272,96 @@ impl HealpixBinner {
     }
 }
 
-/// Placeholder so the module is usable before later tasks land; real
-/// pipeline is `download_gaia_dr3` / `setup_gaia_dr3_catalog` (Tasks 4–5).
+/// Read the set of already-completed tile ids from `done.manifest`.
+fn read_done_manifest(path: &Path) -> std::collections::HashSet<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.lines().filter_map(|l| l.trim().parse::<u64>().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Extract all 768 level-3 tiles via TAP into `scratch_dir/bins` (per-pixel
+/// raw scratch), checkpointing each completed tile in
+/// `scratch_dir/done.manifest`. Resumable: a re-run skips manifested tiles.
+/// Returns the number of star records written this run (not cumulative
+/// across resumes — `finalize` reports the true total).
+pub fn download_gaia_dr3(
+    scratch_dir: &Path,
+    cancel_flag: Arc<AtomicBool>,
+    progress: &dyn Fn(GaiaProgress),
+) -> Result<usize> {
+    std::fs::create_dir_all(scratch_dir)?;
+    let manifest_path = scratch_dir.join("done.manifest");
+    let done = read_done_manifest(&manifest_path);
+    let binner = HealpixBinner::open(&scratch_dir.join("bins"))?;
+    let client = tap_client()?;
+    let mut written = 0usize;
+
+    for tile in 0..GAIA_TILE_COUNT {
+        if cancel_flag.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        if done.contains(&tile) {
+            continue;
+        }
+
+        let job = submit_tap_job(&client, &tile_adql(tile))?;
+        poll_job(&client, &job, &cancel_flag)?;
+        let csv = fetch_job_csv(&client, &job)?;
+
+        let recs: Vec<StarRecord> =
+            csv.lines().filter_map(parse_gaia_csv_row).collect();
+        binner.push_tile(&recs)?;
+
+        // Checkpoint AFTER the tile's data is safely on disk.
+        let mut mf = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&manifest_path)
+            .context("open done.manifest")?;
+        writeln!(mf, "{tile}")?;
+        mf.flush()?;
+
+        written += recs.len();
+        progress(GaiaProgress::Querying {
+            tile,
+            total_tiles: GAIA_TILE_COUNT,
+            stars: recs.len(),
+        });
+    }
+    Ok(written)
+}
+
+/// Full Gaia DR3 (G≤16) catalog setup. Idempotent (skips if
+/// `catalogs/gaia_dr3/` already populated, mirroring
+/// [`super::tycho2::setup_tycho2_catalog`]); resumable via the tile
+/// manifest. Returns the catalog directory, auto-discovered by
+/// [`crate::catalog::CatalogEngine::with_catalog_dir`].
 pub fn setup_gaia_dr3_catalog(
-    _app_data_dir: &Path,
-    _cancel_flag: Arc<AtomicBool>,
-    _progress: &dyn Fn(GaiaProgress),
+    app_data_dir: &Path,
+    cancel_flag: Arc<AtomicBool>,
+    progress: &dyn Fn(GaiaProgress),
 ) -> Result<PathBuf> {
-    anyhow::bail!("gaia_dr3 ingest not yet implemented (plan Tasks 2–5)")
+    let catalog_dir = app_data_dir.join("catalogs").join("gaia_dr3");
+    if catalog_dir.exists() {
+        let file_count = std::fs::read_dir(&catalog_dir)?.count();
+        if file_count > 100 {
+            eprintln!("gaia: catalog already exists with {file_count} files");
+            return Ok(catalog_dir);
+        }
+    }
+
+    let scratch_dir = app_data_dir.join("gaia_dr3_raw");
+    let written = download_gaia_dr3(&scratch_dir, cancel_flag, progress)?;
+    progress(GaiaProgress::Converting {
+        stars_processed: 0,
+        total_stars: written,
+    });
+
+    let binner = HealpixBinner::open(&scratch_dir.join("bins"))?;
+    let total = binner.finalize(&catalog_dir)?;
+    progress(GaiaProgress::Complete { total_stars: total });
+    Ok(catalog_dir)
 }
 
 #[cfg(test)]
@@ -403,6 +485,34 @@ mod tests {
         }
         // Scratch fully consumed.
         assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn setup_is_idempotent_when_catalog_present() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let cat = tmp.path().join("catalogs").join("gaia_dr3");
+        std::fs::create_dir_all(&cat).unwrap();
+        // >100 files → setup must return immediately, no network touched.
+        for i in 0..101 {
+            std::fs::write(cat.join(format!("healpix_{i:06}.bin")), b"x").unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let got = setup_gaia_dr3_catalog(tmp.path(), cancel, &|_| {}).unwrap();
+        assert_eq!(got, cat);
+    }
+
+    #[test]
+    fn done_manifest_parsing_round_trips() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let mf = tmp.path().join("done.manifest");
+        std::fs::write(&mf, "0\n5\n767\n\n  12 \n").unwrap();
+        let set = read_done_manifest(&mf);
+        assert!(set.contains(&0) && set.contains(&5) && set.contains(&767) && set.contains(&12));
+        assert_eq!(set.len(), 4);
+        // Missing file → empty set (fresh run).
+        assert!(read_done_manifest(&tmp.path().join("nope")).is_empty());
     }
 
     #[test]
