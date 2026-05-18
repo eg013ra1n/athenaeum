@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use super::binary_format::StarRecord;
+
 /// ESA Gaia archive TAP async endpoint.
 pub const GAIA_TAP_ASYNC: &str = "https://gea.esac.esa.int/tap-server/tap/async";
 
@@ -160,8 +162,33 @@ pub fn fetch_job_csv(client: &reqwest::blocking::Client, job_url: &str) -> Resul
     resp.text().context("read TAP result body")
 }
 
+/// Parse one TAP CSV line (`ra,dec,phot_g_mean_mag,pmra,pmdec`) into a
+/// [`StarRecord`]. Returns `None` for the header and malformed/short rows.
+///
+/// Gaia 2-parameter astrometric solutions have empty `pmra`/`pmdec`; those
+/// stars are still useful for matching, so a missing PM is treated as 0.
+/// `ra`/`dec`/`phot_g_mean_mag` must be present (the server-side
+/// `phot_g_mean_mag < 16` filter already excludes null-G rows). `pmra` is
+/// Gaia μα\* (cos δ included) — stored as-is; this matches the Tycho-2 path
+/// and `cone_search`'s proper-motion expectation (asserted in Task 7).
+pub fn parse_gaia_csv_row(row: &str) -> Option<StarRecord> {
+    let mut f = row.split(',');
+    let ra: f64 = f.next()?.trim().parse().ok()?;
+    let dec: f64 = f.next()?.trim().parse().ok()?;
+    let g: f32 = f.next()?.trim().parse().ok()?;
+    let pmra: f64 = match f.next()?.trim() {
+        "" => 0.0,
+        s => s.parse().ok()?,
+    };
+    let pmdec: f64 = match f.next()?.trim() {
+        "" => 0.0,
+        s => s.parse().ok()?,
+    };
+    Some(StarRecord::from_values(ra as f32, dec as f32, g, pmra, pmdec))
+}
+
 /// Placeholder so the module is usable before later tasks land; real
-/// pipeline is `download_gaia_dr3` / `setup_gaia_dr3_catalog` (Tasks 3–5).
+/// pipeline is `download_gaia_dr3` / `setup_gaia_dr3_catalog` (Tasks 4–5).
 pub fn setup_gaia_dr3_catalog(
     _app_data_dir: &Path,
     _cancel_flag: Arc<AtomicBool>,
@@ -215,6 +242,27 @@ mod tests {
         );
         // Only the 5 stored columns are projected.
         assert!(q0.starts_with("SELECT ra,dec,phot_g_mean_mag,pmra,pmdec FROM"));
+    }
+
+    #[test]
+    fn parse_row_and_header() {
+        // Header → None.
+        assert!(parse_gaia_csv_row("ra,dec,phot_g_mean_mag,pmra,pmdec").is_none());
+        // Full row.
+        let s = parse_gaia_csv_row("86.682,0.042,14.231,12.5,-7.25").expect("row");
+        assert!((s.ra - 86.682).abs() < 1e-3);
+        assert!((s.dec - 0.042).abs() < 1e-3);
+        assert!((s.mag() - 14.231).abs() < 1e-3);
+        assert!((s.pmra_mas_yr() - 12.5).abs() < 0.01);
+        assert!((s.pmdec_mas_yr() - (-7.25)).abs() < 0.01);
+        // Null PM (2-parameter solution) → PM 0, still Some.
+        let s2 = parse_gaia_csv_row("10.0,20.0,15.9,,").expect("null-pm row");
+        assert_eq!(s2.pmra_mas_yr(), 0.0);
+        assert_eq!(s2.pmdec_mas_yr(), 0.0);
+        assert!((s2.mag() - 15.9).abs() < 1e-3);
+        // Short/garbage rows → None.
+        assert!(parse_gaia_csv_row("1.0,2.0").is_none());
+        assert!(parse_gaia_csv_row("").is_none());
     }
 
     #[test]
