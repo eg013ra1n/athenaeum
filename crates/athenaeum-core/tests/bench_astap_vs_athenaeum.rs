@@ -254,7 +254,13 @@ struct Ath {
 fn solve_athenaeum(path: &Path, frame: &Frame, cat: &CatalogEngine, idx: &QuadIndex) -> Ath {
     let conn = Connection::open_in_memory().expect("mem db");
     init_db(&conn).expect("init schema");
-    let cfg = PlateSolveConfig::default();
+    let mut cfg = PlateSolveConfig::default();
+    // T7 A/B knob: BENCH_SOLVER_BACKEND=astap exercises the ASTAP-port
+    // backend against the same corpus/oracle without a production cutover
+    // (default keeps the committed legacy baseline).
+    if let Ok(b) = std::env::var("BENCH_SOLVER_BACKEND") {
+        cfg.solver_backend = b;
+    }
     match service::solve_frame(frame, path.to_str().unwrap(), &conn, cat, idx, &cfg, None) {
         Ok(s) => Ath {
             solved: true,
@@ -413,6 +419,450 @@ fn diagnose(path: &Path, frame: &Frame, astap: &Astap, cat: &CatalogEngine, labe
             s.peak as f64 / (s.flux as f64).max(1e-6),
             if near_cat(s.x as f64, s.y as f64) { "STAR" } else { "junk" }
         );
+    }
+}
+
+/// Centroid-bias probe for M78 vs the Flame (NGC 2024) control pair.
+///
+/// Tests the hypothesis: our detector's centroids are biased on M78's steep
+/// reflection-nebula gradients (global background, no per-star annulus like
+/// ASTAP's HFD) → matched quads but wrong absolute positions → 0 inliers.
+/// Method: align detections to the catalog at ASTAP's KNOWN centre+scale
+/// (only rotation/parity/translation brute-forced), then look at matched
+/// positional residuals split by SNR (low SNR ≈ nebula-embedded). If M78
+/// shows large residuals concentrated in low-SNR / bright quad-pool stars
+/// while the Flame is tight → centroid-on-gradient bias confirmed.
+/// M78 GROUND-TRUTH residual probe. ASTAP solves M78 locally in 3.3 s
+/// (proving it IS solvable; the bug is ours). Using ASTAP's exact solved
+/// WCS for M78, reproject the catalog to pixels and measure how far our
+/// detected stars — especially the brightest-by-flux quad pool — sit from
+/// the true catalog positions. Small residuals ⇒ detections are fine, the
+/// bug is in our solver/matching. Large/systematic ⇒ centroid bias.
+#[test]
+#[ignore = "dev diagnostic; needs the M78 frame + catalog"]
+fn m78_groundtruth_residuals() {
+    use astroimage::platesolving::WcsSolution;
+    let dir = env_or("BENCH_DIR", DEF_DIR);
+    let path = std::path::PathBuf::from(&dir)
+        .join("2024-01-13_20-27-32_L_-10.00_120.00s_0081.fits");
+    let frame = load_frame(&path).expect("load M78");
+
+    // ASTAP's solved WCS for M78 (astap -f m78 -r 20 -fov 0 -wcs, 3.3 s).
+    // CRPIX is FITS 1-based → 0-based for array/detection coords.
+    let wcs = WcsSolution {
+        crpix: (2072.5 - 1.0, 1411.5 - 1.0),
+        crval: (86.681973819866826, 0.042483541842011370),
+        cd: [
+            [-4.7165954328681712e-5, -2.6222404043238338e-4],
+            [2.6196290398406243e-4, -4.666360322280e-5],
+        ],
+        sip_forward: None,
+        sip_reverse: None,
+    };
+    let fits_w = (2.0 * 2072.5) as usize; // ≈4145
+    let fits_h = (2.0 * 1411.5) as usize; // ≈2823
+
+    // Also report the PRIMARY solver path's completeness (detect_fast).
+    {
+        let fd = ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(600)
+            .with_saturation_fraction(1.0)
+            .detect_fast(path.to_str().unwrap())
+            .expect("detect_fast");
+        let fsx = fits_w as f64 / fd.width as f64;
+        let fsy = fits_h as f64 / fd.height as f64;
+        let cat2 = CatalogEngine::with_catalog_dir(Path::new(CATALOG_DIR));
+        let ep2 = observation_epoch(&frame);
+        if let Ok((cs, _)) = cat2.cone_search(86.681973819866826, 0.042483541842011370, 0.8, 12.0, ep2) {
+            let cpx: Vec<(f64, f64)> = cs
+                .iter()
+                .filter_map(|c| {
+                    let (px, py) = wcs.sky_to_pixel(c.ra, c.dec);
+                    (px >= 0.0 && px < fits_w as f64 && py >= 0.0 && py < fits_h as f64)
+                        .then_some((px, py))
+                })
+                .collect();
+            let dpx: Vec<(f64, f64)> =
+                fd.stars.iter().map(|s| (s.x as f64 * fsx, s.y as f64 * fsy)).collect();
+            let comp = cpx
+                .iter()
+                .filter(|&&(cx, cy)| {
+                    dpx.iter().any(|&(x, y)| (x - cx).powi(2) + (y - cy).powi(2) <= 9.0)
+                })
+                .count();
+            println!(
+                "\n== M78 detect_fast (PRIMARY path) ==  {} det, {} bright(≤12) cat → completeness {}/{} ({:.0}%)",
+                fd.stars.len(),
+                cpx.len(),
+                comp,
+                cpx.len(),
+                100.0 * comp as f64 / cpx.len().max(1) as f64
+            );
+        }
+    }
+
+    let an = ImageAnalyzer::new()
+        .with_detection_sigma(5.0)
+        .with_max_stars(600)
+        .with_saturation_fraction(1.0)
+        .analyze(path.to_str().unwrap())
+        .expect("analyze");
+    // The detector may bin internally → rescale detection coords to the
+    // FITS pixel grid the ASTAP WCS is defined on.
+    let sx = fits_w as f64 / an.width as f64;
+    let sy = fits_h as f64 / an.height as f64;
+
+    let epoch = observation_epoch(&frame);
+    let cat = CatalogEngine::with_catalog_dir(Path::new(CATALOG_DIR));
+    let (cat_stars, cat_name) = cat
+        .cone_search(wcs.crval.0, wcs.crval.1, 0.8, 16.0, epoch)
+        .expect("cone");
+
+    // True catalog pixel positions (in-frame only), brightest first.
+    let mut catpx: Vec<(f64, f64, f32)> = cat_stars
+        .iter()
+        .filter_map(|c| {
+            let (px, py) = wcs.sky_to_pixel(c.ra, c.dec);
+            if px >= 0.0 && px < fits_w as f64 && py >= 0.0 && py < fits_h as f64 {
+                Some((px, py, c.mag))
+            } else {
+                None
+            }
+        })
+        .collect();
+    catpx.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+
+    // Detection coords rescaled to FITS grid; try identity vs y-flip
+    // (ROWORDER/orientation convention) and keep whichever aligns better.
+    let nearest = |x: f64, y: f64| -> f64 {
+        let mut best = f64::MAX;
+        for &(cx, cy, _) in &catpx {
+            let d = (x - cx).powi(2) + (y - cy).powi(2);
+            if d < best {
+                best = d;
+            }
+        }
+        best.sqrt()
+    };
+    for flip in [false, true] {
+        let map = |s: &astroimage::analysis::StarMetrics| -> (f64, f64) {
+            let x = s.x as f64 * sx;
+            let y0 = s.y as f64 * sy;
+            (x, if flip { fits_h as f64 - 1.0 - y0 } else { y0 })
+        };
+        // Completeness: bright catalog stars (mag≤12) with a detection ≤3px.
+        let bright: Vec<&(f64, f64, f32)> =
+            catpx.iter().filter(|c| c.2 <= 12.0).collect();
+        let dets: Vec<(f64, f64)> = an.stars.iter().map(&map).collect();
+        let near_det = |cx: f64, cy: f64| {
+            dets.iter()
+                .any(|&(x, y)| (x - cx).powi(2) + (y - cy).powi(2) <= 9.0)
+        };
+        let comp = bright.iter().filter(|c| near_det(c.0, c.1)).count();
+
+        // Brightest-20 detections by FLUX (the actual quad pool) → residual
+        // to nearest true catalog position.
+        let mut byflux: Vec<&_> = an.stars.iter().collect();
+        byflux.sort_by(|a, b| b.flux.partial_cmp(&a.flux).unwrap());
+        let qp: Vec<f64> = byflux
+            .iter()
+            .take(20)
+            .map(|s| {
+                let (x, y) = map(s);
+                nearest(x, y)
+            })
+            .collect();
+        let qp_ok = qp.iter().filter(|&&r| r < 3.0).count();
+        let qp_mean = qp.iter().sum::<f64>() / qp.len().max(1) as f64;
+
+        // Residual vs SNR (low SNR ≈ on nebulosity), matched ≤8px.
+        let snr_med = {
+            let mut v: Vec<f64> = an.stars.iter().map(|s| s.snr as f64).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (mut lo, mut hi) = (Vec::new(), Vec::new());
+        for s in &an.stars {
+            let (x, y) = map(s);
+            let r = nearest(x, y);
+            if r < 8.0 {
+                if (s.snr as f64) < snr_med {
+                    lo.push(r);
+                } else {
+                    hi.push(r);
+                }
+            }
+        }
+        let mean = |v: &[f64]| {
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v.iter().sum::<f64>() / v.len() as f64
+            }
+        };
+        println!(
+            "\n== M78 ground-truth (flip={flip}) ==  catalog={cat_name}, {} det, {} in-frame cat",
+            an.stars.len(),
+            catpx.len()
+        );
+        println!(
+            "  bright(≤12mag) completeness: {}/{} have a detection ≤3px ({:.0}%)",
+            comp,
+            bright.len(),
+            100.0 * comp as f64 / bright.len().max(1) as f64
+        );
+        println!(
+            "  brightest-20 quad pool: {qp_ok}/20 within 3px of a true star; mean residual {:.2}px",
+            qp_mean
+        );
+        println!(
+            "  residual mean: low-SNR(nebula) {:.2}px (n={})  high-SNR {:.2}px (n={})",
+            mean(&lo),
+            lo.len(),
+            mean(&hi),
+            hi.len()
+        );
+    }
+}
+
+#[test]
+#[ignore = "dev diagnostic; needs the corpus + catalog"]
+fn centroid_bias_probe_m78_vs_flame() {
+    use astroimage::platesolving::GnomonicProjection;
+    let dir = env_or("BENCH_DIR", DEF_DIR);
+    let cat = CatalogEngine::with_catalog_dir(Path::new(CATALOG_DIR));
+    const TOL: f64 = 3.0; // px match tolerance at known scale
+
+    for (label, fname) in [
+        ("M78   (reflection nebula, FAILS)", "2024-01-13_20-27-32_L_-10.00_120.00s_0081.fits"),
+        ("Flame (NGC 2024, SOLVES)", "2024-09-08_04-30-13_L_-9.90_180.00s_0008.fits"),
+    ] {
+        let path = std::path::PathBuf::from(&dir).join(fname);
+        let frame = match load_frame(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("\n== {label} ==  load failed: {e}");
+                continue;
+            }
+        };
+        let truth = cached_astap_truth(&path).expect("astap truth");
+        let an = ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(600)
+            .with_saturation_fraction(1.0)
+            .analyze(path.to_str().unwrap())
+            .expect("analyze");
+        let (w, h, scale) = (an.width as f64, an.height as f64, truth.scale);
+        let fov = w.max(h) * scale / 3600.0;
+        let epoch = observation_epoch(&frame);
+        let (cat_stars, _) = cat
+            .cone_search(truth.ra, truth.dec, fov * 0.6, 16.0, epoch)
+            .expect("cone");
+
+        // Catalog → ideal pixels about (ra,dec), scale pinned (unknown:
+        // rotation, parity, translation).
+        let mut catpx: Vec<(f64, f64, f32)> = cat_stars
+            .iter()
+            .map(|c| {
+                let (xi, eta) =
+                    GnomonicProjection::sky_to_tangent(c.ra, c.dec, truth.ra, truth.dec);
+                (
+                    xi.to_degrees() * 3600.0 / scale,
+                    eta.to_degrees() * 3600.0 / scale,
+                    c.mag,
+                )
+            })
+            .collect();
+        catpx.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        catpx.truncate(400); // brightest 400 catalog
+        let mut det: Vec<(f64, f64, f64)> = an
+            .stars
+            .iter()
+            .map(|s| (s.x as f64, s.y as f64, s.snr as f64))
+            .collect();
+        // brightest-by-SNR detections for the search
+        det.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        let det_b: Vec<(f64, f64, f64)> = det.iter().take(80).cloned().collect();
+
+        // Brute-force rotation×parity; translation by Hough vote.
+        let mut best = (0usize, 0.0f64, 0.0f64, 1.0f64, (0.0, 0.0)); // matches,rms,theta,parity,t
+        for ti in 0..180 {
+            let theta = (ti as f64) * 2.0 * std::f64::consts::PI / 180.0;
+            let (st, ct) = theta.sin_cos();
+            for &par in &[1.0f64, -1.0] {
+                let rot: Vec<(f64, f64, f32)> = catpx
+                    .iter()
+                    .map(|&(x, y, m)| (ct * x - st * (par * y), st * x + ct * (par * y), m))
+                    .collect();
+                // Hough vote translation (5px bins) using brightest 60 each.
+                use std::collections::HashMap;
+                let mut votes: HashMap<(i64, i64), u32> = HashMap::new();
+                for d in det_b.iter().take(60) {
+                    for r in rot.iter().take(120) {
+                        let (ox, oy) = (d.0 - r.0, d.1 - r.1);
+                        *votes
+                            .entry(((ox / 5.0).round() as i64, (oy / 5.0).round() as i64))
+                            .or_insert(0) += 1;
+                    }
+                }
+                let Some((&(bx, by), _)) = votes.iter().max_by_key(|(_, &v)| v) else {
+                    continue;
+                };
+                let t = (bx as f64 * 5.0, by as f64 * 5.0);
+                // count matches det_b → nearest rotated+translated catalog
+                let mut m = 0usize;
+                let mut sse = 0.0;
+                for d in &det_b {
+                    let mut bd = f64::MAX;
+                    for r in &rot {
+                        let dx = d.0 - (r.0 + t.0);
+                        let dy = d.1 - (r.1 + t.1);
+                        let dd = dx * dx + dy * dy;
+                        if dd < bd {
+                            bd = dd;
+                        }
+                    }
+                    if bd.sqrt() < TOL {
+                        m += 1;
+                        sse += bd;
+                    }
+                }
+                if m > best.0 {
+                    let rms = if m > 0 { (sse / m as f64).sqrt() } else { 0.0 };
+                    best = (m, rms, theta, par, t);
+                }
+            }
+        }
+
+        let (m, rms, theta, par, t) = best;
+        // Re-measure residuals over ALL detections at the best alignment, and
+        // split by SNR (low SNR ≈ on nebulosity) + brightest-20 quad pool.
+        let (st, ct) = theta.sin_cos();
+        let rot: Vec<(f64, f64)> = catpx
+            .iter()
+            .map(|&(x, y, _)| {
+                (ct * x - st * (par * y) + t.0, st * x + ct * (par * y) + t.1)
+            })
+            .collect();
+        let mut res_lo = Vec::new();
+        let mut res_hi = Vec::new();
+        let snr_med = {
+            let mut v: Vec<f64> = det.iter().map(|d| d.2).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        for d in &det {
+            let mut bd = f64::MAX;
+            for r in &rot {
+                let dd = (d.0 - r.0).powi(2) + (d.1 - r.1).powi(2);
+                if dd < bd {
+                    bd = dd;
+                }
+            }
+            let r = bd.sqrt();
+            if r < 8.0 {
+                if d.2 < snr_med {
+                    res_lo.push(r);
+                } else {
+                    res_hi.push(r);
+                }
+            }
+        }
+        let mean = |v: &[f64]| if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 };
+        // brightest-20 by flux (the real quad pool) residual
+        let mut byflux: Vec<&_> = an.stars.iter().collect();
+        byflux.sort_by(|a, b| b.flux.partial_cmp(&a.flux).unwrap());
+        let qp: Vec<f64> = byflux
+            .iter()
+            .take(20)
+            .map(|s| {
+                let mut bd = f64::MAX;
+                for r in &rot {
+                    let dd = (s.x as f64 - r.0).powi(2) + (s.y as f64 - r.1).powi(2);
+                    if dd < bd {
+                        bd = dd;
+                    }
+                }
+                bd.sqrt()
+            })
+            .collect();
+
+        println!("\n== {label} ==  {} det, {} cat, scale {:.2}\"/px, FOV {:.2}°",
+            an.stars.len(), cat_stars.len(), scale, fov);
+        println!(
+            "  best align: {m}/{} det_b matched ≤{TOL}px, RMS {:.2}px (θ={:.0}°, parity {})",
+            det_b.len(), rms, theta.to_degrees(), if par > 0.0 { "normal" } else { "mirrored" }
+        );
+        println!(
+            "  residual mean: low-SNR(neb) {:.2}px (n={})  vs  high-SNR {:.2}px (n={})",
+            mean(&res_lo), res_lo.len(), mean(&res_hi), res_hi.len()
+        );
+        println!(
+            "  brightest-20 quad-pool residual: mean {:.2}px, max {:.2}px  [<{TOL} = usable]",
+            mean(&qp), qp.iter().cloned().fold(0.0, f64::max)
+        );
+    }
+}
+
+/// Saturation probe for the M78 vs NGC 2024 (Flame) control pair.
+///
+/// Pure detector measurement — no catalog, WCS, or parity solver. Tests the
+/// hypothesis that M78 fails because its bright, catalog-matchable stars are
+/// saturated (clipped flat tops → biased centroids → quads don't match),
+/// while the Flame at 1960mm/0.39"/px spreads the same stars over ~6× more
+/// pixels and stays unsaturated. The Flame solves; M78 doesn't — same
+/// catalog density, same detection count, so the discriminator must be here.
+#[test]
+#[ignore = "dev diagnostic; needs the corpus"]
+fn saturation_probe_m78_vs_flame() {
+    let dir = env_or("BENCH_DIR", DEF_DIR);
+    // 16-bit sensors clip at 65535; ASTAP/our analyzer treat ≳62000 as
+    // saturated (a flat top biases the centroid).
+    const SAT: f32 = 60000.0;
+    for (label, fname, scale) in [
+        ("M78    1000mm 0.96\"/px (FAILS)", "2024-01-13_20-27-32_L_-10.00_120.00s_0081.fits", 0.96),
+        ("Flame  1960mm 0.39\"/px (SOLVES)", "2024-09-08_04-30-13_L_-9.90_180.00s_0008.fits", 0.39),
+    ] {
+        let path = std::path::PathBuf::from(&dir).join(fname);
+        let an = ImageAnalyzer::new()
+            .with_detection_sigma(5.0)
+            .with_max_stars(600)
+            .with_saturation_fraction(1.0);
+        let det = an.detect_fast(path.to_str().unwrap()).expect("detect");
+        let mut by_flux: Vec<_> = det.stars.iter().collect();
+        by_flux.sort_by(|s, t| t.flux.partial_cmp(&s.flux).unwrap());
+
+        let k = 50.min(by_flux.len());
+        let sat_top = by_flux[..k].iter().filter(|s| s.peak >= SAT).count();
+        let max_peak = by_flux
+            .iter()
+            .map(|s| s.peak)
+            .fold(0.0f32, f32::max);
+        println!(
+            "\n== {label} ==  {} stars, {}x{}",
+            det.stars.len(),
+            det.width,
+            det.height
+        );
+        println!(
+            "  brightest {k} detections (the quad pool): {sat_top} saturated (peak≥{:.0}) = {:.0}%; max peak overall = {:.0} (scale {scale}\"/px)",
+            SAT,
+            100.0 * sat_top as f64 / k as f64,
+            max_peak
+        );
+        println!("  top 12 by flux  (x, y, peak, flux, peak/flux):");
+        for s in by_flux.iter().take(12) {
+            println!(
+                "    ({:7.1},{:7.1}) peak={:9.0} flux={:12.0} pf={:.3} {}",
+                s.x,
+                s.y,
+                s.peak,
+                s.flux,
+                s.peak as f64 / (s.flux as f64).max(1e-6),
+                if s.peak >= SAT { "SAT" } else { "ok" }
+            );
+        }
     }
 }
 

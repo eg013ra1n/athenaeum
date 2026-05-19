@@ -347,36 +347,42 @@ pub fn solve_frame_with_hints(
     // `scale_corrected` is true once a stage that cleared the scale hint
     // produced the winning result — the header FOCALLEN is then known-wrong
     // and gets corrected on writeback.
-    let (mut solved, mut scale_corrected) = solve_cascade(&image_stars, &image_positions);
-
-    // SNR-ordered rescue (cheap; tried before the analyze() rescue). A
-    // bright galaxy/nebula injects extended knots with huge FLUX but low
-    // aperture SNR; they top the flux-ranked quad pool and stop a correct
-    // quad forming (visually confirmed on M51 — the brightest-by-flux
-    // detections sat on the galaxy core/spiral). Re-run the cascade with
-    // the SAME detections re-ranked by SNR: compact point sources lead,
-    // extended structure sinks. Purely additive — runs only after the
-    // normal flux-ordered cascade has failed, so frames that solve normally
-    // (incl. NGC 2024, which a global SNR re-rank regressed) are never
-    // reordered.
-    if solved.is_err() {
-        if let Some(pk) = snr_first.as_ref() {
-            if pk.len() >= 20 {
-                let pos: Vec<(f64, f64)> = pk.iter().map(|s| (s.x, s.y)).collect();
+    // ASTAP-faithful star selection (ground-truth measured on M78): ASTAP
+    // `find_stars` keeps the brightest-by-**SNR** stars (`:1571`
+    // get_brightest_stars), NOT by flux. On a bright nebula the
+    // highest-FLUX detections are the extended nebula blobs (huge flux, low
+    // aperture SNR `flux/√(flux+πr²σ²)`); flux-ranked quads are then built
+    // from nebulosity and no correct quad forms (M78 measured: only ~17 of
+    // 600 detections are catalog stars; quad pool ~40% nebula). SNR ranking
+    // sinks extended structure and floats compact point sources — ASTAP's
+    // exact behaviour.
+    //
+    // Run the SNR-ranked list as the PRIMARY attempt; fall back to the
+    // historical flux-ordered cascade if it fails. This is regression-proof:
+    // anything SNR-primary cannot solve drops through to today's exact path
+    // (so NGC 2024 / the proven set cannot regress — a prior *global* SNR
+    // *replacement* had regressed NGC 2024; this keeps flux as the net).
+    let (mut solved, mut scale_corrected) =
+        if let Some(pk) = snr_first.as_ref().filter(|p| p.len() >= 20) {
+            let pos: Vec<(f64, f64)> = pk.iter().map(|s| (s.x, s.y)).collect();
+            eprintln!(
+                "plate_solve [{}]: ASTAP star select — SNR-ranked primary ({} stars)",
+                filename,
+                pk.len()
+            );
+            let (s, sc) = solve_cascade(pk, &pos);
+            if s.is_ok() {
+                (s, sc)
+            } else {
                 eprintln!(
-                    "plate_solve [{}]: SNR-ordered rescue — re-solving with {} \
-                     SNR-ranked stars",
-                    filename,
-                    pk.len()
+                    "plate_solve [{}]: SNR-primary failed; falling back to flux-ordered cascade",
+                    filename
                 );
-                let (s2, sc2) = solve_cascade(pk, &pos);
-                if s2.is_ok() {
-                    solved = s2;
-                    scale_corrected = sc2;
-                }
+                solve_cascade(&image_stars, &image_positions)
             }
-        }
-    }
+        } else {
+            solve_cascade(&image_stars, &image_positions)
+        };
 
     // Extended-object rescue: `detect_fast` returns flux only (no shape), so
     // on frames with a bright nebula/galaxy the brightest detections — which
