@@ -19,6 +19,14 @@ opt-level = 2
 [profile.dev.package.athenaeum-core]
 opt-level = 2
 
+# solvemyastro is the hot numeric path (gnomonic projection, quad matching,
+# per-trial rayon spiral, cone reads, nalgebra SIP/affine lsq). As a
+# workspace member it is NOT covered by package."*"; without this it builds
+# at opt-level 0 in `tauri dev`, making plate solving ~an order of magnitude
+# slower. Highest opt-level since it is the tightest float code in the app.
+[profile.dev.package.solvemyastro]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 4
