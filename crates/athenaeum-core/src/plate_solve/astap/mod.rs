@@ -134,17 +134,20 @@ pub fn solve(
         stage,
     );
 
-    // ASTAP `solve_image` density matching: read the BRIGHTEST `budget`
-    // catalog stars within an `oversize·FOV` window so the catalog quad pool
-    // has the same star density as the image — the alignment that makes the
-    // correct quad co-occur in both pools (the verified fix; the prior fixed
-    // mag-cut over a 0.75·FOV cone broke this).
+    // ASTAP `solve_image` reads the brightest `nrstars_required·oversize²`
+    // stars within an `oversize·FOV` window — but on a sparse-bright field
+    // that count is large enough that it spans DOWN TO FAINT stars (ASTAP's
+    // M78 solve log: "Used stars down to magnitude 16.7"). My earlier port
+    // truncated to ~image_count·h/w ≈ a few hundred brightest, which only
+    // reaches ≈mag 13 in M78's Gaia cone — starving the faint asterism M78
+    // actually needs. Correct behaviour: keep the DEEP set (≤mag 18) so the
+    // per-trial quad pool can form M78's faint match, capped only to bound
+    // quad explosion.
     let ovr = trial::oversize(n);
-    let budget = trial::catalog_star_budget(n, image_size.0, image_size.1, ovr);
+    const MAX_CAT_STARS: usize = 6000;
     eprintln!(
-        "plate_solve [{}]: astap density-match — oversize {:.2}, catalog budget {} \
-         (brightest, ≤mag {})",
-        filename, ovr, budget, CAT_READ_MAG_LIMIT
+        "plate_solve [{}]: astap deep read — oversize {:.2}, ≤mag {}, cap {}",
+        filename, ovr, CAT_READ_MAG_LIMIT, MAX_CAT_STARS
     );
 
     for rung in &rungs {
@@ -162,14 +165,13 @@ pub fn solve(
             if cat_stars.len() < 4 {
                 continue;
             }
-            // Keep only the brightest `budget` (ASTAP reads brightest-N, not
-            // a fixed magnitude cut). cone_search aggregates per-pixel files
-            // so the result isn't globally mag-sorted — sort then truncate.
-            if cat_stars.len() > budget {
+            // Keep the deep set; only if pathologically large, keep the
+            // brightest MAX_CAT_STARS (still spans well past mag 16).
+            if cat_stars.len() > MAX_CAT_STARS {
                 cat_stars.sort_by(|a, b| {
                     a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal)
                 });
-                cat_stars.truncate(budget);
+                cat_stars.truncate(MAX_CAT_STARS);
             }
 
             let Some(fit) = trial::run_cell(

@@ -89,20 +89,6 @@ pub fn oversize(n_img: usize) -> f64 {
     o.clamp(1.0, 2.0)
 }
 
-/// ASTAP catalog star budget for one trial: read the **brightest** this many
-/// stars in the window so catalog star *density matches the image*
-/// (`unit_command_line_solving.pas:2445` `nrstars_required =
-/// round(n_img·height/width)`; `:2553` `nrstars_required2 =
-/// round(nrstars_required·oversize²)`). This — not a fixed magnitude cut —
-/// is what makes the image and catalog quad pools the same family.
-/// Floored so a quad can always form.
-pub fn catalog_star_budget(n_img: usize, image_w: u32, image_h: u32, oversize: f64) -> usize {
-    let w = (image_w.max(1)) as f64;
-    let h = (image_h.max(1)) as f64;
-    let nrstars_required = (n_img as f64 * h / w).round();
-    let n2 = (nrstars_required * oversize * oversize).round();
-    (n2 as usize).max(8)
-}
 
 /// Run one (FOV, sky-cell) trial.
 ///
@@ -390,19 +376,6 @@ mod tests {
         assert!((oversize(140) - 1.0).abs() < 1e-9);
         // n=70 → 2·sqrt(0.5) ≈ 1.4142
         assert!((oversize(70) - 1.414_213_562).abs() < 1e-6);
-    }
-
-    #[test]
-    fn catalog_budget_matches_image_density() {
-        // ASTAP: nrstars_required = round(n·h/w); ·oversize².
-        // 300 stars, 4000×2800, oversize 1 → round(300·0.7)=210.
-        assert_eq!(catalog_star_budget(300, 4000, 2800, 1.0), 210);
-        // oversize 2 → 210·4 = 840.
-        assert_eq!(catalog_star_budget(300, 4000, 2800, 2.0), 840);
-        // Square frame, oversize 1 → n itself.
-        assert_eq!(catalog_star_budget(120, 1000, 1000, 1.0), 120);
-        // Tiny field floored so a quad can still form.
-        assert_eq!(catalog_star_budget(2, 4000, 4000, 1.0), 8);
     }
 
     #[test]
