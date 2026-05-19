@@ -141,6 +141,7 @@ fn main() -> anyhow::Result<()> {
             &hints,
             &cache,
             cfg,
+            None,
         );
         let elapsed_ms = t.elapsed().as_millis();
         match res {

@@ -270,9 +270,14 @@ pub async fn plate_solve_batch(
             for _ in 0..concurrency {
                 s.spawn(|| loop {
                     if cancel_worker.load(Ordering::Relaxed) {
+                        eprintln!("[cancel-diag] worker saw cancel flag -> breaking");
                         break;
                     }
                     let Some(item) = work.lock().unwrap().next() else { break };
+                    eprintln!(
+                        "[cancel-diag] worker picked a frame (cancel flag = {})",
+                        cancel_worker.load(Ordering::Relaxed)
+                    );
 
                     let outcome = match item {
                         WorkItem::LoadFailed { frame_id, error } => {
@@ -314,6 +319,7 @@ pub async fn plate_solve_batch(
                                     &hints,
                                     star_cache_arc.as_ref(),
                                     ps_config_arc.as_ref(),
+                                    Some(cancel_worker.as_ref()),
                                 )
                             }));
                             match solve {
@@ -455,8 +461,15 @@ enum WorkResult {
 #[tauri::command]
 pub async fn cancel_plate_solve(state: State<'_, AppState>) -> Result<(), String> {
     let solves = state.ctx.active_plate_solves.lock().unwrap();
+    eprintln!(
+        "[cancel-diag] cancel_plate_solve invoked; active handle keys = {:?}",
+        solves.keys().collect::<Vec<_>>()
+    );
     if let Some(handle) = solves.get(&0) {
         handle.cancel_flag.store(true, Ordering::Relaxed);
+        eprintln!("[cancel-diag] key 0 cancel flag set TRUE");
+    } else {
+        eprintln!("[cancel-diag] NO handle at key 0 — backend not told to stop");
     }
     Ok(())
 }

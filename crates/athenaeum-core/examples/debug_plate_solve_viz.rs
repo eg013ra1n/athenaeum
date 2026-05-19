@@ -200,6 +200,7 @@ fn main() -> anyhow::Result<()> {
         &hints,
         &cache,
         &ps_config,
+        None,
     );
 
     // ── Rotation sweep: brute-force rotate the solved WCS in small

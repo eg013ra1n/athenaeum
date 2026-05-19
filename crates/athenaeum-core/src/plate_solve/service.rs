@@ -117,7 +117,7 @@ pub fn solve_frame(
     config: &PlateSolveConfig,
 ) -> Result<SolveResult> {
     let hints = extract_hints(frame, Some(conn));
-    solve_frame_with_hints(frame, file_path, &hints, cache, config)
+    solve_frame_with_hints(frame, file_path, &hints, cache, config, None)
 }
 
 /// Solve a single frame using pre-extracted hints and the `solvemyastro`
@@ -130,6 +130,7 @@ pub fn solve_frame_with_hints(
     hints: &SolveHints,
     cache: &StarCache,
     config: &PlateSolveConfig,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveResult> {
     let total_start = Instant::now();
 
@@ -158,6 +159,7 @@ pub fn solve_frame_with_hints(
         &sma_hints,
         cache,
         &sma_cfg,
+        cancel,
     )
     .with_context(|| format!("solvemyastro::solve failed for {file_path}"))?;
 

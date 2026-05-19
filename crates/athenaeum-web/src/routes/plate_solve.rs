@@ -282,6 +282,7 @@ pub async fn plate_solve_batch(
                                     &hints,
                                     star_cache.as_ref(),
                                     ps_config.as_ref(),
+                                    Some(cancel_flag.as_ref()),
                                 ) {
                                     Ok(result) => WorkResult::Solved { frame_id, result },
                                     Err(e) => {
