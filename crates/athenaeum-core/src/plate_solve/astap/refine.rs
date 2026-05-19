@@ -187,6 +187,12 @@ pub(crate) fn refine_trial(
         focallen_corrected: false,
         expected_catalog_stars_in_fov: verify_stars.len(),
         inlier_ratio: ratio,
+        // astap_port path: SIP not fitted (legacy path, dead after Phase 4).
+        sip_order: None,
+        sip_a_coeffs: None,
+        sip_b_coeffs: None,
+        sip_ap_coeffs: None,
+        sip_bp_coeffs: None,
     };
     Some((result, final_inliers, verify_stars.len()))
 }

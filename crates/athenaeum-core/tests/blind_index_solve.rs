@@ -1,8 +1,12 @@
-//! Integration test: build the all-sky quad index from the installed Tycho-2
-//! catalog and use it to blind-solve a real FITS file whose coordinates we
-//! already know (so we can verify the result).
+//! Integration test: quad index lookup and end-to-end blind solve using real
+//! on-disk data. Ported from the legacy Tycho-2/QuadIndex harness to the
+//! Phase-3 solvemyastro StarCache backend for the solve tests; the quad-index
+//! lookup test retains the legacy index types since it tests index building,
+//! not solving.
 //!
 //! Run: cargo test -p athenaeum-core --test blind_index_solve -- --nocapture
+
+#![allow(unused_imports)]
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -22,6 +26,7 @@ use athenaeum_core::plate_solve::storage;
 
 const CATALOG_DIR: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/tycho2";
 const INDEX_PATH: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/tycho2/quad_index.bin";
+const SMAC_DIR: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia";
 
 // Known-truth frame: C/2025 A6 Lemmon, frame 93094
 const TEST_FITS: &str = "/Volumes/BigMac/Users/astrobureau/Pictures/Unsorted/edph/asiduo/C-2025 A6 (Lemmon)/2025-10-25/LIGHT/2025-10-25_19-28-45_-10.00_15.00s_0123.fits";
@@ -34,6 +39,15 @@ fn catalog_exists() -> bool {
 
 fn fits_exists() -> bool {
     PathBuf::from(TEST_FITS).exists()
+}
+
+fn smac_exists() -> bool {
+    PathBuf::from(SMAC_DIR).exists()
+}
+
+fn open_cache() -> solvemyastro::StarCache {
+    solvemyastro::StarCache::open(PathBuf::from(SMAC_DIR).as_path())
+        .expect("open smac_gaia cache")
 }
 
 /// Build the index if it doesn't exist yet. Uses the installed Tycho-2 catalog.
@@ -90,6 +104,7 @@ fn build_full_index() {
 }
 
 /// Does a hash lookup produce candidates for a real image's brightest quads?
+/// (Uses the legacy Tycho-2 QuadIndex directly — tests index building, not solving.)
 #[test]
 #[ignore = "requires built index and FITS file"]
 fn lookup_real_image_quads() {
@@ -168,13 +183,13 @@ fn lookup_real_image_quads() {
     );
 }
 
-/// Full end-to-end blind solve: load the index, call `service::solve_frame`
-/// with a mock database connection, verify the result is within 30' of truth.
+/// Full end-to-end blind solve: open the smac_gaia StarCache, call
+/// `service::solve_frame`, verify the result is within 1° of truth.
 #[test]
-#[ignore = "requires built index and FITS file"]
+#[ignore = "requires smac_gaia star cache and FITS file"]
 fn blind_solve_end_to_end() {
-    if !fits_exists() || !PathBuf::from(INDEX_PATH).exists() {
-        eprintln!("SKIP: need index and FITS");
+    if !fits_exists() || !smac_exists() {
+        eprintln!("SKIP: need smac_gaia cache and FITS");
         return;
     }
 
@@ -198,17 +213,11 @@ fn blind_solve_end_to_end() {
         ..Default::default()
     };
 
-    // Tycho-2 catalog engine for the verification cone search
-    let catalog_dir = PathBuf::from(
-        "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs",
-    );
-    let catalog = CatalogEngine::with_catalog_dir(&catalog_dir);
-
-    let index = QuadIndex::load(&PathBuf::from(INDEX_PATH)).expect("load index");
+    let cache = open_cache();
     let config = PlateSolveConfig::default();
 
     let start = Instant::now();
-    let result = service::solve_frame(&frame, TEST_FITS, &conn, &catalog, &index, &config, None);
+    let result = service::solve_frame(&frame, TEST_FITS, &conn, &cache, &config);
 
     match result {
         Ok(solve) => {
@@ -285,25 +294,18 @@ fn make_test_frame() -> athenaeum_core::models::Frame {
     }
 }
 
-fn make_catalog_engine() -> CatalogEngine {
-    let catalog_dir = PathBuf::from(
-        "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs",
-    );
-    CatalogEngine::with_catalog_dir(&catalog_dir)
-}
-
 /// Fast-path end-to-end blind solve on the real Lemmon frame.
 ///
-/// Exercises `service::solve_frame(use_fast_detection = true)`:
+/// Exercises `service::solve_frame` via smac_gaia StarCache:
 ///   * position within 1° of truth
 ///   * pixel scale within 10% of 1.87 "/px
 ///   * total solve time under 1.5 s (the plan's end-to-end target)
 ///   * DSO labeling still works when `store_result` gets a DsoCatalog
 #[test]
-#[ignore = "requires built index and FITS file"]
+#[ignore = "requires smac_gaia star cache and FITS file"]
 fn blind_solve_fast_path() {
-    if !fits_exists() || !PathBuf::from(INDEX_PATH).exists() {
-        eprintln!("SKIP: need index and FITS");
+    if !fits_exists() || !smac_exists() {
+        eprintln!("SKIP: need smac_gaia cache and FITS");
         return;
     }
 
@@ -313,15 +315,14 @@ fn blind_solve_fast_path() {
     init_db(&conn).expect("init schema");
 
     let frame = make_test_frame();
-    let catalog = make_catalog_engine();
-    let index = QuadIndex::load(&PathBuf::from(INDEX_PATH)).expect("load index");
+    let cache = open_cache();
 
     let mut config = PlateSolveConfig::default();
     config.use_fast_detection = true;
     assert!(config.use_fast_detection, "fast detection must be on");
 
     let start = Instant::now();
-    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &catalog, &index, &config, None)
+    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &cache, &config)
         .expect("fast-path blind solve must succeed on the Lemmon frame");
     let wall_ms = start.elapsed().as_millis() as u64;
 
@@ -373,23 +374,21 @@ fn blind_solve_fast_path() {
     let _ = storage::get_plate_solve(&conn, frame_id).expect("plate solve row written");
 }
 
-/// Run both the fast and slow detectors against the Lemmon frame back-to-back
-/// and compare. This is the plan's headline speedup gate: on a real 6248×4176
-/// frame the fast path must be materially faster AND converge to the same
-/// sky position as the precise pipeline.
+/// Run both detectors against the Lemmon frame back-to-back and compare.
+/// With the solvemyastro backend, `use_fast_detection` is a hint to the
+/// image analyzer — convergence to the same sky position is the main check.
 #[test]
-#[ignore = "requires built index and FITS file — slow (~10s total)"]
+#[ignore = "requires smac_gaia star cache and FITS file — slow (~10s total)"]
 fn blind_solve_fast_vs_slow() {
-    if !fits_exists() || !PathBuf::from(INDEX_PATH).exists() {
-        eprintln!("SKIP: need index and FITS");
+    if !fits_exists() || !smac_exists() {
+        eprintln!("SKIP: need smac_gaia cache and FITS");
         return;
     }
 
     use athenaeum_core::db::schema::init_db;
     use rusqlite::Connection;
 
-    let catalog = make_catalog_engine();
-    let index = QuadIndex::load(&PathBuf::from(INDEX_PATH)).expect("load index");
+    let cache = open_cache();
     let frame = make_test_frame();
 
     // Slow path (reference).
@@ -398,7 +397,7 @@ fn blind_solve_fast_vs_slow() {
     let mut cfg_slow = PlateSolveConfig::default();
     cfg_slow.use_fast_detection = false;
     let slow_solve =
-        service::solve_frame(&frame, TEST_FITS, &conn_slow, &catalog, &index, &cfg_slow, None)
+        service::solve_frame(&frame, TEST_FITS, &conn_slow, &cache, &cfg_slow)
             .expect("slow-path blind solve");
 
     // Fast path.
@@ -407,7 +406,7 @@ fn blind_solve_fast_vs_slow() {
     let mut cfg_fast = PlateSolveConfig::default();
     cfg_fast.use_fast_detection = true;
     let fast_solve =
-        service::solve_frame(&frame, TEST_FITS, &conn_fast, &catalog, &index, &cfg_fast, None)
+        service::solve_frame(&frame, TEST_FITS, &conn_fast, &cache, &cfg_fast)
             .expect("fast-path blind solve");
 
     let dra = fast_solve.wcs.crval.0 - slow_solve.wcs.crval.0;
@@ -428,14 +427,6 @@ fn blind_solve_fast_vs_slow() {
         sep_arcsec,
     );
 
-    // Since Phase 4 added a 50-star first retry pass, both detectors solve
-    // on pass 1 before hitting the detector-heavy paths, so the detector
-    // cost gap has closed. What matters is:
-    //   (a) fast is never materially slower than slow, and
-    //   (b) both finish well under the 1500 ms production gate enforced in
-    //       `blind_solve_fast_path`.
-    // A slightly slower fast-path is tolerated (release-mode noise), just
-    // not a serious regression.
     assert!(
         (fast_solve.solve_time_ms as i64) - (slow_solve.solve_time_ms as i64) < 200,
         "fast solve significantly slower than slow: fast={}ms slow={}ms",

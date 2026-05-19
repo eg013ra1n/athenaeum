@@ -1,21 +1,18 @@
 //! Integration test: the three-stage blind-scale fallback + focal-length
-//! correction. Uses the installed Tycho-2 quad index and a real on-disk
-//! frame with known truth.
+//! correction. Ported from the legacy Tycho-2/QuadIndex harness to the
+//! Phase-3 solvemyastro StarCache backend.
 //!
 //! Run: cargo test -p athenaeum-core --test fallback_blind_scale -- --ignored --nocapture
 
 use std::path::PathBuf;
 
-use athenaeum_core::catalog::CatalogEngine;
 use athenaeum_core::db::schema::init_db;
 use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::config::PlateSolveConfig;
-use athenaeum_core::plate_solve::quad_index::QuadIndex;
 use athenaeum_core::plate_solve::service;
 use rusqlite::Connection;
 
-const INDEX_PATH: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/tycho2/quad_index.bin";
-const CATALOG_DIR: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs";
+const SMAC_DIR: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia";
 
 // Real on-disk Heart-nebula mosaic pane, already plate-solved in the catalog.
 const TEST_FITS: &str = "/Volumes/BigMac/Users/astrobureau/Pictures/Astro Pano/Heart/Pane 1/registered/Light_BIN-1_5496x3672_EXPOSURE-300.00s_FILTER-H_Mono/Light_Pane 1_300.0s_Bin1_H_gain111_20211007-235244_-10.0C_0029_c_lps_r.xisf";
@@ -33,7 +30,7 @@ const BINNING: i32 = 1;
 const WRONG_FOCALLEN: f64 = 900.0;
 
 fn assets_present() -> bool {
-    PathBuf::from(INDEX_PATH).exists() && PathBuf::from(TEST_FITS).exists()
+    PathBuf::from(SMAC_DIR).exists() && PathBuf::from(TEST_FITS).exists()
 }
 
 fn mem_conn() -> Connection {
@@ -42,8 +39,9 @@ fn mem_conn() -> Connection {
     conn
 }
 
-fn catalog() -> CatalogEngine {
-    CatalogEngine::with_catalog_dir(&PathBuf::from(CATALOG_DIR))
+fn open_cache() -> solvemyastro::StarCache {
+    solvemyastro::StarCache::open(PathBuf::from(SMAC_DIR).as_path())
+        .expect("open smac_gaia cache")
 }
 
 fn frame_with_focallen(focallen: f64) -> Frame {
@@ -71,19 +69,18 @@ fn dist_deg(ra: f64, dec: f64) -> f64 {
 /// Stage 2: a wrong header FOCALLEN makes the hinted solve fail; the
 /// scale-cleared retry succeeds and the corrected focal length is returned.
 #[test]
-#[ignore = "requires built index and the Heart frame on disk"]
+#[ignore = "requires smac_gaia star cache and the Heart frame on disk"]
 fn fallback_corrects_wrong_focallen() {
     if !assets_present() {
-        eprintln!("SKIP: need index + Heart frame");
+        eprintln!("SKIP: need smac_gaia cache + Heart frame");
         return;
     }
     let conn = mem_conn();
-    let cat = catalog();
-    let index = QuadIndex::load(&PathBuf::from(INDEX_PATH)).expect("load index");
+    let cache = open_cache();
     let config = PlateSolveConfig::default(); // fallback on by default
 
     let frame = frame_with_focallen(WRONG_FOCALLEN);
-    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &cat, &index, &config, None)
+    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &cache, &config)
         .expect("blind-scale fallback must rescue a wrong-FOCALLEN frame");
 
     let d = dist_deg(solve.wcs.crval.0, solve.wcs.crval.1);
@@ -119,19 +116,18 @@ fn fallback_corrects_wrong_focallen() {
 /// No-regression: a correct FOCALLEN solves on stage 1 (hinted); no
 /// correction, and the existing header value is left untouched.
 #[test]
-#[ignore = "requires built index and the Heart frame on disk"]
+#[ignore = "requires smac_gaia star cache and the Heart frame on disk"]
 fn correct_focallen_no_fallback_no_correction() {
     if !assets_present() {
-        eprintln!("SKIP: need index + Heart frame");
+        eprintln!("SKIP: need smac_gaia cache + Heart frame");
         return;
     }
     let conn = mem_conn();
-    let cat = catalog();
-    let index = QuadIndex::load(&PathBuf::from(INDEX_PATH)).expect("load index");
+    let cache = open_cache();
     let config = PlateSolveConfig::default();
 
     let frame = frame_with_focallen(HEADER_FOCALLEN);
-    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &cat, &index, &config, None)
+    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &cache, &config)
         .expect("correct-FOCALLEN frame must solve on the hinted path");
 
     let d = dist_deg(solve.wcs.crval.0, solve.wcs.crval.1);
@@ -152,15 +148,14 @@ fn correct_focallen_no_fallback_no_correction() {
 /// rejects the correct candidate against the bad hint), stage 3 drops the
 /// prior too and still solves. The corrected focal length is written.
 #[test]
-#[ignore = "requires built index and the Heart frame on disk"]
+#[ignore = "requires smac_gaia star cache and the Heart frame on disk"]
 fn full_blind_stage3_wrong_focallen_and_bogus_position() {
     if !assets_present() {
-        eprintln!("SKIP: need index + Heart frame");
+        eprintln!("SKIP: need smac_gaia cache + Heart frame");
         return;
     }
     let conn = mem_conn();
-    let cat = catalog();
-    let index = QuadIndex::load(&PathBuf::from(INDEX_PATH)).expect("load index");
+    let cache = open_cache();
     let config = PlateSolveConfig::default();
 
     let mut frame = frame_with_focallen(WRONG_FOCALLEN);
@@ -168,7 +163,7 @@ fn full_blind_stage3_wrong_focallen_and_bogus_position() {
     frame.ra = Some(200.0);
     frame.dec = Some(-30.0);
 
-    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &cat, &index, &config, None)
+    let solve = service::solve_frame(&frame, TEST_FITS, &conn, &cache, &config)
         .expect("full-blind stage 3 must rescue wrong FOCALLEN + bad pointing");
 
     let d = dist_deg(solve.wcs.crval.0, solve.wcs.crval.1);
@@ -189,20 +184,19 @@ fn full_blind_stage3_wrong_focallen_and_bogus_position() {
 /// Toggle off: with the fallback disabled, a wrong FOCALLEN fails again
 /// (old behavior preserved).
 #[test]
-#[ignore = "requires built index and the Heart frame on disk"]
+#[ignore = "requires smac_gaia star cache and the Heart frame on disk"]
 fn fallback_disabled_wrong_focallen_fails() {
     if !assets_present() {
-        eprintln!("SKIP: need index + Heart frame");
+        eprintln!("SKIP: need smac_gaia cache + Heart frame");
         return;
     }
     let conn = mem_conn();
-    let cat = catalog();
-    let index = QuadIndex::load(&PathBuf::from(INDEX_PATH)).expect("load index");
+    let cache = open_cache();
     let mut config = PlateSolveConfig::default();
     config.fallback_to_blind_scale = false;
 
     let frame = frame_with_focallen(WRONG_FOCALLEN);
-    let res = service::solve_frame(&frame, TEST_FITS, &conn, &cat, &index, &config, None);
+    let res = service::solve_frame(&frame, TEST_FITS, &conn, &cache, &config);
     assert!(
         res.is_err(),
         "with the fallback disabled a wrong FOCALLEN must still fail, got {:?}",

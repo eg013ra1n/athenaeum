@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
+#[allow(unused_imports)]
 use athenaeum_core::catalog::CatalogEngine;
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
 use athenaeum_core::plate_solve::hints::extract_hints;
+#[allow(unused_imports)]
 use athenaeum_core::plate_solve::quad_index::QuadIndex;
 use athenaeum_core::plate_solve::service::SolveResult;
 use athenaeum_core::plate_solve::{service, storage, SolveHints};
@@ -37,27 +39,48 @@ fn get_dso_catalog(state: &WebAppState) -> Option<Arc<DsoCatalog>> {
     }
 }
 
-fn require_quad_index(state: &WebAppState) -> Result<Arc<QuadIndex>, (StatusCode, String)> {
+/// Locate and open the solvemyastro star cache (`stars.smac`) from the
+/// app-data catalogs directory, caching the result in `state`.
+fn require_star_cache(
+    state: &WebAppState,
+) -> Result<Arc<solvemyastro::StarCache>, (StatusCode, String)> {
+    // Fast path: already open.
     {
-        let guard = state.ctx.quad_index.read().unwrap();
-        if let Some(ref idx) = *guard {
-            return Ok(idx.clone());
+        let guard = state.ctx.star_cache.read().unwrap();
+        if let Some(ref sc) = *guard {
+            return Ok(sc.clone());
         }
     }
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+
+    let db = state.ctx.db.get().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "DB not initialized".into(),
+    ))?;
     let db_path = db.path();
     let parent = std::path::Path::new(&db_path).parent().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "Cannot determine app data dir".into(),
     ))?;
-    let index_path = parent.join("catalogs").join("tycho2").join("quad_index.bin");
-    if !index_path.exists() {
-        return Err((StatusCode::PRECONDITION_FAILED, "Quad index not built".into()));
+    let cache_dir = parent.join("catalogs").join("smac_gaia");
+    if !cache_dir.exists() {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            format!(
+                "solvemyastro star cache not found at {}. \
+                 Please download the Gaia DR3 prebuilt catalog.",
+                cache_dir.display()
+            ),
+        ));
     }
-    let loaded = QuadIndex::load(&index_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Load failed: {e}")))?;
-    let arc = Arc::new(loaded);
+    let sc = solvemyastro::StarCache::open(&cache_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to open star cache: {e}"),
+        )
+    })?;
+    let arc = Arc::new(sc);
     {
-        let mut guard = state.ctx.quad_index.write().unwrap();
+        let mut guard = state.ctx.star_cache.write().unwrap();
         *guard = Some(arc.clone());
     }
     Ok(arc)
@@ -131,14 +154,12 @@ pub async fn plate_solve_frame(
     let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
     let conn = db.conn();
     let ps_config = config::load_config(&conn);
-    let catalog = build_catalog_engine(&state)?;
-    let index = require_quad_index(&state)?;
-    let pool = Some(state.ctx.image_pool.clone());
+    let star_cache = require_star_cache(&state)?;
 
     let (frame, file_path) = load_frame_with_path(&conn, args.frame_id)?;
 
     let dso = get_dso_catalog(&state);
-    let result = service::solve_frame(&frame, &file_path, &conn, &catalog, &index, &ps_config, pool)
+    let result = service::solve_frame(&frame, &file_path, &conn, &star_cache, &ps_config)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     service::store_result(&conn, args.frame_id, &result, dso.as_deref(), &ps_config)
@@ -162,10 +183,8 @@ pub async fn plate_solve_batch(
         .get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
     let ps_config = Arc::new(config::load_config(&db.conn()));
-    let catalog = Arc::new(build_catalog_engine(&state)?);
-    let index = require_quad_index(&state)?;
+    let star_cache = require_star_cache(&state)?;
     let dso = get_dso_catalog(&state);
-    let pool = state.ctx.image_pool.clone();
     let event_tx = state.event_tx.clone();
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -261,10 +280,8 @@ pub async fn plate_solve_batch(
                                     &frame,
                                     &file_path,
                                     &hints,
-                                    catalog.as_ref(),
-                                    index.as_ref(),
+                                    star_cache.as_ref(),
                                     ps_config.as_ref(),
-                                    Some(Arc::clone(&pool)),
                                 ) {
                                     Ok(result) => WorkResult::Solved { frame_id, result },
                                     Err(e) => {

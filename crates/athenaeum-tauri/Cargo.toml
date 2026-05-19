@@ -34,3 +34,4 @@ base64 = "0.22"
 reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
 semver = "1"
+solvemyastro = { path = "../../solvemyastro" }

@@ -12,15 +12,12 @@
 //! by a threshold, or whether the algorithm never gets close.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use athenaeum_core::catalog::CatalogEngine;
 use athenaeum_core::db::Database;
 use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::{
     config::PlateSolveConfig,
     hints::extract_hints,
-    quad_index::QuadIndex,
     service::{solve_frame_with_hints, SolveResult},
 };
 use rusqlite::Connection;
@@ -64,30 +61,18 @@ fn main() -> anyhow::Result<()> {
         hints.ra, hints.dec, hints.pixel_scale_arcsec, hints.fov_deg
     );
 
-    // ── Catalog + index ──
-    let catalog_dir = match std::env::var("ATHENAEUM_CATALOG").ok() {
-        Some(p) => PathBuf::from(p),
+    // ── Star cache (solvemyastro smac_gaia) ──
+    let smac_dir = match std::env::var("ATHENAEUM_CATALOG").ok() {
+        Some(p) => PathBuf::from(p).join("smac_gaia"),
         None => db_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("no parent dir for db path"))?
-            .join("catalogs"),
+            .join("catalogs")
+            .join("smac_gaia"),
     };
-    println!("catalog dir:  {}", catalog_dir.display());
-
-    let catalog = CatalogEngine::with_catalog_dir(&catalog_dir);
-    let index_path = catalog_dir.join("tycho2").join("quad_index.bin");
-    println!("index path:   {}", index_path.display());
-    let index = QuadIndex::load(&index_path)?;
-    println!("index quads:  {}", index.quad_count());
-
-    // ── Build a shared rayon pool so star detection parallelises ──
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(cores)
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build rayon pool: {e}"))?,
-    );
+    println!("smac_gaia dir: {}", smac_dir.display());
+    let cache = solvemyastro::StarCache::open(&smac_dir)
+        .map_err(|e| anyhow::anyhow!("failed to open smac_gaia cache: {e}"))?;
 
     // ── Config variants ──
     let base = PlateSolveConfig::default();
@@ -154,10 +139,8 @@ fn main() -> anyhow::Result<()> {
             &frame,
             &file_path,
             &hints,
-            &catalog,
-            &index,
+            &cache,
             cfg,
-            Some(pool.clone()),
         );
         let elapsed_ms = t.elapsed().as_millis();
         match res {

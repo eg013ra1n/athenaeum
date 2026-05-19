@@ -29,6 +29,7 @@ use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::config::PlateSolveConfig;
 use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
 use athenaeum_core::plate_solve::hints::observation_epoch;
+#[allow(unused_imports)]
 use athenaeum_core::plate_solve::quad_index::QuadIndex;
 use athenaeum_core::plate_solve::service;
 use rusqlite::Connection;
@@ -36,7 +37,7 @@ use rusqlite::Connection;
 const DEF_ASTAP: &str = "/Applications/ASTAP.app/Contents/MacOS/astap";
 const DEF_DIR: &str = "/Volumes/BigMac/Users/astrobureau/Pictures/Astro/Platesolve Bench";
 const CATALOG_DIR: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs";
-const INDEX: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/tycho2/quad_index.bin";
+const SMAC_DIR: &str = "/Volumes/BigMac/Users/astrobureau/Library/Application Support/com.vsharifov.athenaeum/catalogs/smac_gaia";
 
 fn env_or(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
@@ -251,17 +252,11 @@ struct Ath {
     err: String,
 }
 
-fn solve_athenaeum(path: &Path, frame: &Frame, cat: &CatalogEngine, idx: &QuadIndex) -> Ath {
+fn solve_athenaeum(path: &Path, frame: &Frame, cache: &solvemyastro::StarCache) -> Ath {
     let conn = Connection::open_in_memory().expect("mem db");
     init_db(&conn).expect("init schema");
-    let mut cfg = PlateSolveConfig::default();
-    // T7 A/B knob: BENCH_SOLVER_BACKEND=astap exercises the ASTAP-port
-    // backend against the same corpus/oracle without a production cutover
-    // (default keeps the committed legacy baseline).
-    if let Ok(b) = std::env::var("BENCH_SOLVER_BACKEND") {
-        cfg.solver_backend = b;
-    }
-    match service::solve_frame(frame, path.to_str().unwrap(), &conn, cat, idx, &cfg, None) {
+    let cfg = PlateSolveConfig::default();
+    match service::solve_frame(frame, path.to_str().unwrap(), &conn, cache, &cfg) {
         Ok(s) => Ath {
             solved: true,
             ra: s.wcs.crval.0,
@@ -877,12 +872,12 @@ fn bench_astap_vs_athenaeum() {
         eprintln!("SKIP: ASTAP not found at {astap}");
         return;
     }
-    if !Path::new(INDEX).exists() {
-        eprintln!("SKIP: quad index not found at {INDEX}");
+    if !Path::new(SMAC_DIR).exists() {
+        eprintln!("SKIP: smac_gaia star cache not found at {SMAC_DIR}");
         return;
     }
     let cat = CatalogEngine::with_catalog_dir(Path::new(CATALOG_DIR));
-    let idx = QuadIndex::load(Path::new(INDEX)).expect("load index");
+    let cache = solvemyastro::StarCache::open(Path::new(SMAC_DIR)).expect("open smac_gaia");
     let dso = DsoCatalog::load().ok();
     if dso.is_none() {
         println!("(DSO catalog unavailable — object self-check disabled)");
@@ -959,7 +954,7 @@ ath_solved,ath_ra,ath_dec,ath_scale,ath_ratio,dpos_arcsec,dscale_pct,err\n",
         };
         let ta = t0.elapsed().as_secs_f64();
         let t1 = Instant::now();
-        let ath = guard(|| solve_athenaeum(path, &frame, &cat, &idx)).unwrap_or_else(|m| Ath {
+        let ath = guard(|| solve_athenaeum(path, &frame, &cache)).unwrap_or_else(|m| Ath {
             solved: false,
             ra: 0.0,
             dec: 0.0,

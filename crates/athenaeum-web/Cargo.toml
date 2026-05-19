@@ -24,3 +24,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 base64 = "0.22"
+solvemyastro = { path = "../../solvemyastro" }

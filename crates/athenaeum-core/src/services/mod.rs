@@ -59,10 +59,17 @@ pub struct ServiceContext {
     pub active_archives: Arc<Mutex<HashMap<i64, ArchiveHandle>>>,
     /// Lazy-loaded pre-built all-sky quad index for plate solving.
     /// None until the user builds the index or the app detects an existing one.
+    /// Phase 4 will remove this once the solvemyastro adapter is the only path.
     pub quad_index: Arc<RwLock<Option<Arc<QuadIndex>>>>,
     /// Lazy-loaded deep-sky object catalog, used to auto-label plate-solve
     /// results (e.g. "M 42", "NGC 7000"). Parsed on first use, then cached.
     pub dso_catalog: Arc<RwLock<Option<Arc<DsoCatalog>>>>,
+    /// Lazy-opened solvemyastro star-cache (`stars.smac`). Loaded on first
+    /// solve attempt and shared read-only across all worker threads.
+    /// `None` until the cache file is located (opens from the `smac_gaia`
+    /// subdir of the app-data catalogs dir). If the file is absent the solve
+    /// command returns an actionable error.
+    pub star_cache: Arc<RwLock<Option<Arc<solvemyastro::StarCache>>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
     /// Single serialized worker queue shared by ZIP archive + file ops.
     /// Created at startup; lives for the process lifetime.

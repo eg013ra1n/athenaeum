@@ -26,7 +26,6 @@ use athenaeum_core::db::Database;
 use athenaeum_core::models::Frame;
 use athenaeum_core::plate_solve::{
     hints::{extract_hints, observation_epoch},
-    quad_index::QuadIndex,
     service::solve_frame_with_hints,
 };
 use astroimage::platesolving::WcsSolution;
@@ -188,18 +187,19 @@ fn main() -> anyhow::Result<()> {
         Some(p) => PathBuf::from(p),
         None => db_path.parent().unwrap().join("catalogs"),
     };
+    // CatalogEngine is kept for render_solve_overlay / rotation_sweep (viz only).
     let catalog = CatalogEngine::with_catalog_dir(&catalog_dir);
-    let index = QuadIndex::load(&catalog_dir.join("tycho2").join("quad_index.bin"))?;
-    println!("index:   {} quads", index.quad_count());
+    // Star cache for the solvemyastro backend.
+    let smac_dir = catalog_dir.join("smac_gaia");
+    let cache = solvemyastro::StarCache::open(&smac_dir)
+        .map_err(|e| anyhow::anyhow!("failed to open smac_gaia cache at {}: {e}", smac_dir.display()))?;
 
     let solve = solve_frame_with_hints(
         &frame,
         &file_path,
         &hints,
-        &catalog,
-        &index,
+        &cache,
         &ps_config,
-        Some(Arc::clone(&pool)),
     );
 
     // ── Rotation sweep: brute-force rotate the solved WCS in small

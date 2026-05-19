@@ -15,6 +15,45 @@ use athenaeum_core::services::PlateSolveHandle;
 
 use super::AppState;
 
+// ── solvemyastro star-cache helpers ─────────────────────────────────────────
+
+/// Resolve the smac_gaia star-cache directory from the app-data catalogs dir,
+/// open `StarCache`, cache it in state, and return an `Arc` to it.
+///
+/// The path mirrors Phase 1's build step: `<app-data>/catalogs/smac_gaia/`.
+fn require_star_cache(state: &AppState) -> Result<Arc<solvemyastro::StarCache>, String> {
+    // Fast path: already open.
+    {
+        let guard = state.ctx.star_cache.read().unwrap();
+        if let Some(ref sc) = *guard {
+            return Ok(sc.clone());
+        }
+    }
+
+    // Slow path: locate the stars.smac file and open the cache.
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let db_path = db.path().to_path_buf();
+    let parent = db_path
+        .parent()
+        .ok_or("Cannot determine app data directory")?;
+    let cache_dir = parent.join("catalogs").join("smac_gaia");
+    if !cache_dir.exists() {
+        return Err(format!(
+            "solvemyastro star cache not found at {}. \
+             Please download the Gaia DR3 prebuilt catalog from Settings → Plate Solving.",
+            cache_dir.display()
+        ));
+    }
+    let sc = solvemyastro::StarCache::open(&cache_dir)
+        .map_err(|e| format!("Failed to open star cache at {}: {e}", cache_dir.display()))?;
+    let arc = Arc::new(sc);
+    {
+        let mut guard = state.ctx.star_cache.write().unwrap();
+        *guard = Some(arc.clone());
+    }
+    Ok(arc)
+}
+
 /// Lazy-load the DSO catalog once and cache it in the ServiceContext.
 fn get_dso_catalog(state: &AppState) -> Option<Arc<DsoCatalog>> {
     {
@@ -132,15 +171,13 @@ pub async fn plate_solve_frame(
     let conn = db.conn();
 
     let ps_config = config::load_config(&conn);
-    let catalog = build_catalog_engine(&state)?;
-    let index = require_quad_index(&state)?;
+    let star_cache = require_star_cache(&state)?;
     let dso = get_dso_catalog(&state);
-    let pool = Some(state.ctx.image_pool.clone());
 
     let (frame, file_path) = load_frame_with_path(&conn, frame_id)?;
 
     let result = service::solve_frame(
-        &frame, &file_path, &conn, &catalog, &index, &ps_config, pool,
+        &frame, &file_path, &conn, &star_cache, &ps_config,
     )
     .map_err(|e| e.to_string())?;
 
@@ -159,14 +196,12 @@ pub async fn plate_solve_batch(
     frame_ids: Vec<i64>,
 ) -> Result<(), String> {
     // ── Phase 1: load everything on the main thread (holds DB lock) ──
-    let (ps_config, catalog, index, dso, pool, cancel_flag, work_items) = {
+    let (ps_config, star_cache, dso, cancel_flag, work_items) = {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
         let ps_config = Arc::new(config::load_config(&conn));
-        let catalog = Arc::new(build_catalog_engine(&state)?);
-        let index = require_quad_index(&state)?;
+        let star_cache = require_star_cache(&state)?;
         let dso = get_dso_catalog(&state);
-        let pool = state.ctx.image_pool.clone();
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
         // Register the cancel handle (key 0 = plate-solve batch).
@@ -200,7 +235,7 @@ pub async fn plate_solve_batch(
             }
         }
 
-        (ps_config, catalog, index, dso, pool, cancel_flag, work_items)
+        (ps_config, star_cache, dso, cancel_flag, work_items)
     };
 
     let total = work_items.len();
@@ -225,8 +260,7 @@ pub async fn plate_solve_batch(
     let app_workers = app.clone();
     let cancel_worker = Arc::clone(&cancel_flag);
     let ps_config_arc = Arc::clone(&ps_config);
-    let catalog_arc = Arc::clone(&catalog);
-    let index_arc = Arc::clone(&index);
+    let star_cache_arc = Arc::clone(&star_cache);
 
     let results: Vec<WorkResult> = tokio::task::spawn_blocking(move || {
         let work = Mutex::new(work_items.into_iter());
@@ -278,10 +312,8 @@ pub async fn plate_solve_batch(
                                     &frame,
                                     &file_path,
                                     &hints,
-                                    catalog_arc.as_ref(),
-                                    index_arc.as_ref(),
+                                    star_cache_arc.as_ref(),
                                     ps_config_arc.as_ref(),
-                                    Some(Arc::clone(&pool)),
                                 )
                             }));
                             match solve {
@@ -628,6 +660,10 @@ fn quad_index_path(state: &AppState) -> Result<std::path::PathBuf, String> {
     Ok(parent.join("catalogs").join("tycho2").join("quad_index.bin"))
 }
 
+/// Returns the status of the legacy Tycho-2 quad index.
+/// Phase 3 stub: the index is no longer used for solving (solvemyastro
+/// handles all solves via StarCache). The command is kept present and
+/// compiling to preserve the frontend contract; Phase 4 removes it.
 #[tauri::command]
 pub async fn get_quad_index_status(
     state: State<'_, AppState>,
@@ -642,7 +678,7 @@ pub async fn get_quad_index_status(
         });
     }
 
-    // Load the index header to report counts
+    // Load the index header to report counts (still compiles; ignored by solver).
     match athenaeum_core::plate_solve::quad_index::QuadIndex::load(&path) {
         Ok(idx) => {
             let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -662,95 +698,37 @@ pub async fn get_quad_index_status(
     }
 }
 
+/// Builds the legacy Tycho-2 quad index.
+/// Phase 3 stub: the index is no longer used for solving; this command is
+/// kept present to preserve the frontend contract. Phase 4 removes it.
+/// Returns a "not available" status (no build is performed).
 #[tauri::command]
 pub async fn build_quad_index(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<QuadIndexStatus, String> {
+    // Phase 3: quad index is superseded by solvemyastro StarCache.
+    // Return the current on-disk status without building anything.
     let path = quad_index_path(&state)?;
-    let catalog_dir = path
-        .parent()
-        .ok_or_else(|| format!("Quad index path has no parent directory: {}", path.display()))?
-        .to_path_buf();
-    if !catalog_dir.exists() {
-        return Err(format!(
-            "Tycho-2 catalog directory not found at {}. Please download the catalog first.",
-            catalog_dir.display()
-        ));
+    if path.exists() {
+        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let quad_count = athenaeum_core::plate_solve::quad_index::QuadIndex::load(&path)
+            .map(|idx| idx.quad_count())
+            .unwrap_or(0);
+        Ok(QuadIndexStatus {
+            built: true,
+            path: Some(path.to_string_lossy().to_string()),
+            quad_count,
+            size_bytes,
+        })
+    } else {
+        Ok(QuadIndexStatus {
+            built: false,
+            path: None,
+            quad_count: 0,
+            size_bytes: 0,
+        })
     }
-
-    let ps_config = {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        let conn = db.conn();
-        config::load_config(&conn)
-    };
-
-    let app_clone = app.clone();
-    let path_clone = path.clone();
-    let catalog_dir_clone = catalog_dir.clone();
-    let mag_limit = ps_config.index_mag_limit;
-    let hash_tolerance = ps_config.hash_tolerance;
-
-    let result = tokio::task::spawn_blocking(move || {
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        athenaeum_core::plate_solve::index_builder::IndexBuilder::build(
-            &catalog_dir_clone,
-            &path_clone,
-            mag_limit,
-            hash_tolerance,
-            cancel_flag,
-            &move |progress| {
-                use athenaeum_core::plate_solve::index_builder::IndexBuildProgress;
-                let event = match progress {
-                    IndexBuildProgress::Reading { pixel, total, quads_so_far } => {
-                        QuadIndexProgressEvent {
-                            phase: "reading".into(),
-                            pixel,
-                            total,
-                            quads_so_far,
-                            percent: pixel as f64 / total as f64 * 100.0,
-                        }
-                    }
-                    IndexBuildProgress::Writing { bytes_written, total_bytes } => {
-                        QuadIndexProgressEvent {
-                            phase: "writing".into(),
-                            pixel: bytes_written,
-                            total: total_bytes,
-                            quads_so_far: 0,
-                            percent: if total_bytes > 0 { bytes_written as f64 / total_bytes as f64 * 100.0 } else { 0.0 },
-                        }
-                    }
-                    IndexBuildProgress::Complete { quad_count, size_bytes: _ } => {
-                        QuadIndexProgressEvent {
-                            phase: "complete".into(),
-                            pixel: 0,
-                            total: 0,
-                            quads_so_far: quad_count,
-                            percent: 100.0,
-                        }
-                    }
-                };
-                let _ = app_clone.emit("quad-index-progress", event);
-            },
-        )
-    })
-    .await
-    .map_err(|e| format!("Task failed: {e}"))?
-    .map_err(|e| format!("Index build failed: {e}"))?;
-
-    // Refresh the cached index
-    {
-        let mut guard = state.ctx.quad_index.write().unwrap();
-        *guard = None;
-    }
-
-    let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    Ok(QuadIndexStatus {
-        built: true,
-        path: Some(path.to_string_lossy().to_string()),
-        quad_count: result,
-        size_bytes,
-    })
 }
 
 // ========== Catalog Download ==========
