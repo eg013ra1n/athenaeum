@@ -71,6 +71,39 @@ pub fn minimum_quads(image_star_count: usize) -> usize {
     (3 + image_star_count / 140).max(3)
 }
 
+/// ASTAP `solve_image` search-window oversize factor
+/// (`unit_command_line_solving.pas:2457-2465`): for sparse fields the
+/// database read window is enlarged so *all* image quads are guaranteed to
+/// have a catalog counterpart while stepping the spiral.
+///   `< 35` stars → 2.0; `> 140` → 1.0; between → `2·sqrt(35/n)`.
+/// Clamped to [1, 2] (ASTAP also clamps to one DB tile; 2 is our practical
+/// ceiling — the brightest-N budget below, not area, bounds the pool).
+pub fn oversize(n_img: usize) -> f64 {
+    let o = if n_img < 35 {
+        2.0
+    } else if n_img > 140 {
+        1.0
+    } else {
+        2.0 * (35.0 / n_img as f64).sqrt()
+    };
+    o.clamp(1.0, 2.0)
+}
+
+/// ASTAP catalog star budget for one trial: read the **brightest** this many
+/// stars in the window so catalog star *density matches the image*
+/// (`unit_command_line_solving.pas:2445` `nrstars_required =
+/// round(n_img·height/width)`; `:2553` `nrstars_required2 =
+/// round(nrstars_required·oversize²)`). This — not a fixed magnitude cut —
+/// is what makes the image and catalog quad pools the same family.
+/// Floored so a quad can always form.
+pub fn catalog_star_budget(n_img: usize, image_w: u32, image_h: u32, oversize: f64) -> usize {
+    let w = (image_w.max(1)) as f64;
+    let h = (image_h.max(1)) as f64;
+    let nrstars_required = (n_img as f64 * h / w).round();
+    let n2 = (nrstars_required * oversize * oversize).round();
+    (n2 as usize).max(8)
+}
+
 /// Run one (FOV, sky-cell) trial.
 ///
 /// * `image_quads` — quads built once from the detected image stars (Task 6).
@@ -344,6 +377,32 @@ mod tests {
         ];
         let proj = project_catalog(&stars, 180.0, 40.0);
         assert_eq!(proj.len(), 1, "the antipodal-ish star must be culled");
+    }
+
+    #[test]
+    fn oversize_follows_astap_solve_image() {
+        assert_eq!(oversize(20), 2.0); // < 35 → 2
+        assert_eq!(oversize(34), 2.0);
+        assert_eq!(oversize(35), 2.0); // 2·sqrt(35/35)
+        assert_eq!(oversize(141), 1.0); // > 140 → 1
+        assert_eq!(oversize(300), 1.0);
+        // n=140 → 2·sqrt(35/140)=2·0.5=1.0 (boundary, not >140)
+        assert!((oversize(140) - 1.0).abs() < 1e-9);
+        // n=70 → 2·sqrt(0.5) ≈ 1.4142
+        assert!((oversize(70) - 1.414_213_562).abs() < 1e-6);
+    }
+
+    #[test]
+    fn catalog_budget_matches_image_density() {
+        // ASTAP: nrstars_required = round(n·h/w); ·oversize².
+        // 300 stars, 4000×2800, oversize 1 → round(300·0.7)=210.
+        assert_eq!(catalog_star_budget(300, 4000, 2800, 1.0), 210);
+        // oversize 2 → 210·4 = 840.
+        assert_eq!(catalog_star_budget(300, 4000, 2800, 2.0), 840);
+        // Square frame, oversize 1 → n itself.
+        assert_eq!(catalog_star_budget(120, 1000, 1000, 1.0), 120);
+        // Tiny field floored so a quad can still form.
+        assert_eq!(catalog_star_budget(2, 4000, 4000, 1.0), 8);
     }
 
     #[test]

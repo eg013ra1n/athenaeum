@@ -56,9 +56,12 @@ const QUAD_TOLERANCE: f64 = 0.007;
 const POS_CORROBORATION_RADIUS_DEG: f64 = 1.0;
 const POS_CORROBORATED_MIN_INLIERS: usize = 8;
 
-/// Catalog cone radius for a trial, as a fraction of the rung FOV — large
-/// enough to cover the cell's field plus spiral-step slop.
-const TRIAL_CONE_FOV_FRAC: f64 = 0.75;
+/// Generous magnitude ceiling for the per-trial catalog read. ASTAP reads
+/// the *brightest N* stars regardless of depth (`read_stars`); the
+/// brightest-N budget — not this cap — bounds the pool, so this only needs
+/// to be deep enough to expose Gaia (G≤16) while harmlessly covering
+/// Tycho-2 (tops ≈V12).
+const CAT_READ_MAG_LIMIT: f32 = 18.0;
 
 /// Entry point for the ASTAP-port backend. Same signature as
 /// [`crate::plate_solve::service::solve_frame_with_hints`] so the dispatch
@@ -131,20 +134,42 @@ pub fn solve(
         stage,
     );
 
+    // ASTAP `solve_image` density matching: read the BRIGHTEST `budget`
+    // catalog stars within an `oversize·FOV` window so the catalog quad pool
+    // has the same star density as the image — the alignment that makes the
+    // correct quad co-occur in both pools (the verified fix; the prior fixed
+    // mag-cut over a 0.75·FOV cone broke this).
+    let ovr = trial::oversize(n);
+    let budget = trial::catalog_star_budget(n, image_size.0, image_size.1, ovr);
+    eprintln!(
+        "plate_solve [{}]: astap density-match — oversize {:.2}, catalog budget {} \
+         (brightest, ≤mag {})",
+        filename, ovr, budget, CAT_READ_MAG_LIMIT
+    );
+
     for rung in &rungs {
-        let cone_radius = (rung.fov_deg * TRIAL_CONE_FOV_FRAC).min(89.0);
+        let cone_radius = (rung.fov_deg * ovr).min(89.0);
         for cell in
             sky_search::spiral_cells(center, config.position_hint_radius_deg, rung.fov_deg)
         {
-            let cat_stars = src.stars_in_cone(
+            let mut cat_stars = src.stars_in_cone(
                 cell.0,
                 cell.1,
                 cone_radius,
-                config.index_mag_limit,
+                CAT_READ_MAG_LIMIT,
                 obs_epoch,
             );
             if cat_stars.len() < 4 {
                 continue;
+            }
+            // Keep only the brightest `budget` (ASTAP reads brightest-N, not
+            // a fixed magnitude cut). cone_search aggregates per-pixel files
+            // so the result isn't globally mag-sorted — sort then truncate.
+            if cat_stars.len() > budget {
+                cat_stars.sort_by(|a, b| {
+                    a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                cat_stars.truncate(budget);
             }
 
             let Some(fit) = trial::run_cell(
