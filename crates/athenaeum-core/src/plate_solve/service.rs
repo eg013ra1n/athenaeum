@@ -399,7 +399,17 @@ pub fn solve_frame_with_hints(
                 fwhms.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let med = fwhms[fwhms.len() / 2];
                 let (lo, hi) = (med * 0.4, med * 2.5);
-                let clean: Vec<ImageStar> = an
+                // ASTAP `find_stars` star selection ported faithfully
+                // (`unit_command_line_solving.pas:1454` accept gate,
+                // `:1571` `get_brightest_stars`): reject too-large
+                // (nebula/galaxy/saturated blob — HFD-ceiling ≈ fwhm≤2.5·med),
+                // too-small (hot pixel — fwhm≥0.4·med ≡ hfd_min), elongated
+                // (ecc), and faint (ASTAP **SNR>10**, not the old ≥5), then
+                // keep the survivors **ranked by SNR** (ASTAP keeps the
+                // brightest-by-SNR `max_stars`; the cascade builds quads from
+                // the leading N, so SNR-first ordering = ASTAP's exact
+                // compact-point-source quad pool — the M78 fix).
+                let mut kept: Vec<&_> = an
                     .stars
                     .iter()
                     .filter(|s| {
@@ -408,8 +418,14 @@ pub fn solve_frame_with_hints(
                             && f.is_finite()
                             && f >= lo
                             && f <= hi
-                            && s.snr >= 5.0
+                            && s.snr > 10.0
                     })
+                    .collect();
+                kept.sort_by(|a, b| {
+                    b.snr.partial_cmp(&a.snr).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let clean: Vec<ImageStar> = kept
+                    .iter()
                     .map(|s| ImageStar {
                         x: s.x as f64,
                         y: s.y as f64,
@@ -417,8 +433,8 @@ pub fn solve_frame_with_hints(
                     })
                     .collect();
                 eprintln!(
-                    "plate_solve [{}]: extended-object rescue — stellarity filter \
-                     {} → {} stars (ecc<0.7, fwhm∈[{:.1},{:.1}], snr≥5); re-solving",
+                    "plate_solve [{}]: extended-object rescue — ASTAP star select \
+                     {} → {} stars (ecc<0.7, fwhm∈[{:.1},{:.1}], SNR>10, SNR-ranked); re-solving",
                     filename,
                     an.stars.len(),
                     clean.len(),
