@@ -259,13 +259,13 @@ pub fn solve_frame_with_hints(
     // matched_stars / expected (computed with the same bright star cone).
     let inlier_ratio = solution.inlier_ratio;
 
-    // Derived focal length: if the frame lacked FOCALLEN, derive it from the
-    // solved pixel scale and the frame's pixel-size + binning. solvemyastro
-    // does not report whether the scale hint was cleared (it handles that
-    // internally), so we conservatively set focallen_corrected=false — the
-    // write-back still fills a NULL focallen correctly, and a wrong header
-    // value is harmless (the next solve will use the solved scale anyway).
-    let derived_focallen_mm = if frame.focallen.is_none() && solution.pixel_scale_arcsec > 0.0 {
+    // Derive focal length from the solved pixel scale + the frame's pixel
+    // size, ALWAYS when computable (not only when header was missing). This
+    // lets us detect-and-correct a wrong header FOCALLEN — without it, a
+    // bogus header value silently survives every solve and locks subsequent
+    // solves into the wrong scale-ladder rung. Inverts the hint formula in
+    // hints.rs (scale_tan = px_mm/fl ⇒ fl = px_mm / tan(scale)).
+    let derived_focallen_mm = if solution.pixel_scale_arcsec > 0.0 {
         frame.xpixsz.and_then(|xpixsz| {
             if xpixsz <= 0.0 {
                 return None;
@@ -284,6 +284,20 @@ pub fn solve_frame_with_hints(
         None
     };
 
+    // `focallen_corrected = true` makes update_frame_from_solve OVERWRITE the
+    // frames.focallen value (storage.rs:198); `false` only writes when the
+    // header was NULL. We mark corrected when either:
+    //   - header focallen was missing (fill), or
+    //   - the solved value differs from the header by > 2% (header was wrong
+    //     — solvemyastro must have discarded the hint and re-derived scale).
+    let focallen_corrected = match (frame.focallen, derived_focallen_mm) {
+        (None, Some(_)) => true,
+        (Some(hdr), Some(derived)) if derived > 0.0 => {
+            ((derived - hdr).abs() / derived) > 0.02
+        }
+        _ => false,
+    };
+
     Ok(SolveResult {
         wcs,
         matched_stars: solution.matched_stars,
@@ -296,7 +310,7 @@ pub fn solve_frame_with_hints(
         catalog_used: solution.catalog_used,
         algorithm_used: solution.algorithm,
         derived_focallen_mm,
-        focallen_corrected: false,
+        focallen_corrected,
         expected_catalog_stars_in_fov,
         inlier_ratio,
         sip_order,
@@ -2940,5 +2954,64 @@ mod tests {
             result.is_none(),
             "opposite-hemisphere candidate must be skipped, not panic"
         );
+    }
+
+    // ── focallen derivation + correction policy ──────────────────────────
+    //
+    // Replicates the (xpixsz, scale) → derived_focallen_mm computation and
+    // the focallen_corrected match used in `solve_frame_with_hints`. Mirrors
+    // the SIP-mapping test pattern (verify the conversion snippet without
+    // running the live solver).
+    fn derived_focallen_mm(xpixsz_um: f64, scale_arcsec: f64) -> Option<f64> {
+        if scale_arcsec <= 0.0 || xpixsz_um <= 0.0 {
+            return None;
+        }
+        let pixel_size_mm = xpixsz_um / 1000.0;
+        let scale_tan = (scale_arcsec / 3600.0).to_radians().tan();
+        if scale_tan > 0.0 { Some(pixel_size_mm / scale_tan) } else { None }
+    }
+
+    fn focallen_corrected(header: Option<f64>, derived: Option<f64>) -> bool {
+        match (header, derived) {
+            (None, Some(_)) => true,
+            (Some(hdr), Some(d)) if d > 0.0 => ((d - hdr).abs() / d) > 0.02,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn derived_focallen_roundtrips_through_hint_formula() {
+        // 1750 mm scope, 3.76 µm pixels: 0.443"/px expected.
+        let derived = derived_focallen_mm(3.76, 0.443).expect("solvable");
+        assert!(
+            (derived - 1750.0).abs() < 10.0,
+            "expected ~1750 mm, got {derived:.2}"
+        );
+    }
+
+    #[test]
+    fn derived_focallen_returns_none_for_invalid_inputs() {
+        assert!(derived_focallen_mm(0.0, 0.443).is_none(),  "xpixsz=0 → None");
+        assert!(derived_focallen_mm(-3.76, 0.443).is_none(), "xpixsz<0 → None");
+        assert!(derived_focallen_mm(3.76, 0.0).is_none(),    "scale=0 → None");
+    }
+
+    #[test]
+    fn focallen_corrected_fills_null_header() {
+        assert!(focallen_corrected(None, Some(1750.0)), "null header + derived → fill");
+        assert!(!focallen_corrected(None, None),        "no derived → no write");
+    }
+
+    #[test]
+    fn focallen_corrected_overwrites_wrong_header() {
+        // 5% mismatch → corrected (legacy threshold is 2%).
+        assert!(focallen_corrected(Some(1666.0), Some(1750.0)),
+            "header off by 5% → must overwrite");
+        // 1% mismatch → leave header alone (within tolerance).
+        assert!(!focallen_corrected(Some(1733.0), Some(1750.0)),
+            "header within 2% → keep");
+        // Exact match → no correction needed.
+        assert!(!focallen_corrected(Some(1750.0), Some(1750.0)),
+            "exact match → keep");
     }
 }
