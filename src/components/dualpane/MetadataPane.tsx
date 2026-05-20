@@ -307,17 +307,6 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
   const [plateSolve, setPlateSolve] = useState<PlateSolveRecord | null>(null);
   const plateSolveGenRef = useRef(0);
 
-  // "Revert WCS to FITS header" pipelines: ra / dec / rotation / objctra /
-  // objctdec / plate_solves row all clear together so the frame doesn't end
-  // up with a half-cleared coordinate state (the columns are derived from
-  // one solve — they belong as a unit). The flag is set by `revertWcs`,
-  // honoured by `commitSave` AFTER the bulk_update_frame_metadata write so
-  // the deletion + the column clears land in the same user action.
-  const [pendingPlateSolveDelete, setPendingPlateSolveDelete] = useState(false);
-  useEffect(() => {
-    setPendingPlateSolveDelete(false);
-  }, [selectionKey]);
-
   // "Recalculate focallen" action lives on the Plate-solve result card: when
   // a frame has XPIXSZ AND a plate-solve, fl = (xpixsz_µm/1000) / tan(scale)
   // gives the focal length on demand without re-solving. Single-frame only.
@@ -495,13 +484,15 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     [originalForField],
   );
 
-  /** Atomic WCS revert: ra / dec / rotation all snap back to their FITS-header
-   *  originals in one click, and `pendingPlateSolveDelete` is raised so the
-   *  next Apply also drops the stored `plate_solves` row. OBJCTRA / OBJCTDEC
-   *  are derived in the backend's ra/dec SET clause — clearing those columns
-   *  in lockstep is already guaranteed there, so we don't need separate edits.
-   *  See task #75 / commit notes. */
-  const revertWcs = useCallback(() => {
+  /** Atomic WCS revert — ONE-SHOT (not staged): ra / dec / rotation snap
+   *  back to FITS-header originals AND the stored `plate_solves` row is
+   *  deleted, all in a single user action with no follow-up Apply click
+   *  needed. OBJCTRA / OBJCTDEC are mirrored automatically by the backend
+   *  ra/dec SET clause. Bypasses the relations-precheck dialog — none of
+   *  ra/dec/rotation are calibration-matching fields, so no cascade fires.
+   *  See task #75. */
+  const revertWcs = useCallback(async () => {
+    if (frameIds.length === 0) return;
     const raOrig = originalForField('ra');
     const decOrig = originalForField('dec');
     const rotOrig = originalForField('rotation');
@@ -511,14 +502,62 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       );
       return;
     }
-    setEdits((prev) => ({
-      ...prev,
-      ra: { enabled: true, value: raOrig },
-      dec: { enabled: true, value: decOrig },
-      rotation: { enabled: true, value: rotOrig },
-    }));
-    setPendingPlateSolveDelete(true);
-  }, [originalForField]);
+    // '' (empty original) → null (clear), value string → number (set).
+    // The backend's `deserialize_double_option` maps null → Some(None) =
+    // SET col = NULL, and a bare number → Some(Some(v)) = SET col = v.
+    const toEdit = (v: string): number | null => {
+      if (v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const payload = {
+      ra: toEdit(raOrig),
+      dec: toEdit(decOrig),
+      rotation: toEdit(rotOrig),
+    };
+    setSaving(true);
+    try {
+      await api.invoke('bulk_update_frame_metadata', {
+        frameIds,
+        edits: payload,
+      });
+      // Drop the stored plate_solves row(s) so the result card disappears in
+      // lockstep with the cleared coords. Best-effort per frame.
+      await Promise.all(
+        frameIds.map((id) =>
+          api
+            .invoke('delete_plate_solve_for_frame', { frameId: id })
+            .catch((e) =>
+              console.error(
+                `delete_plate_solve_for_frame failed (frame ${id}):`,
+                e,
+              ),
+            ),
+        ),
+      );
+      // Refresh the read-only Plate-solve card immediately for the
+      // single-selection case (multi-select has no card to refresh).
+      if (frameIds.length === 1) {
+        try {
+          const rec = await api.invoke<PlateSolveRecord | null>(
+            'get_plate_solve_result',
+            { frameId: frameIds[0] },
+          );
+          setPlateSolve(rec);
+        } catch (e) {
+          console.error('get_plate_solve_result refresh failed:', e);
+          setPlateSolve(null);
+        }
+      }
+      setSavedAt(Date.now());
+      onSaved();
+    } catch (e) {
+      console.error('revertWcs failed:', e);
+      alert(`Revert WCS failed: ${e}`);
+    } finally {
+      setSaving(false);
+    }
+  }, [frameIds, originalForField, onSaved]);
 
   /** Whether ANY of the WCS triplet (ra / dec / rotation) differs from its
    *  FITS-header original. Gates the visibility of the atomic "Revert WCS to
@@ -664,40 +703,6 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
           frameIds,
           edits: payload,
         });
-        // Revert WCS pipeline (set by `revertWcs`): also drop the stored
-        // `plate_solves` row(s) for the touched frames so the metadata pane's
-        // Plate-solve result card disappears with the coords. Best-effort —
-        // log and continue per-frame so one missing row doesn't abort the
-        // whole apply.
-        if (pendingPlateSolveDelete) {
-          await Promise.all(
-            frameIds.map((id) =>
-              api
-                .invoke('delete_plate_solve_for_frame', { frameId: id })
-                .catch((e) => {
-                  console.error(
-                    `delete_plate_solve_for_frame failed (frame ${id}):`,
-                    e,
-                  );
-                }),
-            ),
-          );
-          setPendingPlateSolveDelete(false);
-          // Refresh the read-only Plate-solve card immediately for the
-          // single-selection case (multi-select has no card to refresh).
-          if (frameIds.length === 1) {
-            try {
-              const rec = await api.invoke<PlateSolveRecord | null>(
-                'get_plate_solve_result',
-                { frameId: frameIds[0] },
-              );
-              setPlateSolve(rec);
-            } catch (e) {
-              console.error('get_plate_solve_result refresh failed:', e);
-              setPlateSolve(null);
-            }
-          }
-        }
         setSavedAt(Date.now());
         onSaved();
       } catch (e) {
@@ -707,7 +712,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
         setSaving(false);
       }
     },
-    [frameIds, onSaved, pendingPlateSolveDelete],
+    [frameIds, onSaved],
   );
 
   const onConfirmUnlink = useCallback(async () => {
