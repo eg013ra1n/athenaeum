@@ -160,16 +160,20 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
     let date_obs = get("DATE-OBS").or_else(|| get("DATE_OBS"));
 
     // RA: prefer sexagesimal OBJCTRA (HH:MM:SS); fall back to numeric RA in
-    // decimal degrees. Numeric RA values from a FITS header are typically
-    // already in degrees, but we accept both ":"-separated and bare-decimal
-    // forms — `parse_ra_sexagesimal` only handles the former, so we route
-    // accordingly.
+    // decimal degrees, then to CRVAL1 (FITS WCS reference-pixel sky RA in
+    // degrees — present on plate-solved/survey frames whose embedded WCS
+    // describes the same astrometry the metadata pane wants to revert to).
+    // Without the CRVAL1 fallback, ra/dec would clear on revert for any
+    // file whose header has CRVAL1/CRVAL2 but no OBJCTRA/RA — out of step
+    // with `rotation`, which already picks up CD-matrix derived values.
     let ra = get("OBJCTRA")
         .and_then(|s| crate::coordinates::parse_ra_sexagesimal(&s).ok())
-        .or_else(|| get("RA").and_then(|s| s.parse::<f64>().ok()));
+        .or_else(|| get("RA").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| get("CRVAL1").and_then(|s| s.parse::<f64>().ok()));
     let dec = get("OBJCTDEC")
         .and_then(|s| crate::coordinates::parse_dec_sexagesimal(&s).ok())
-        .or_else(|| get("DEC").and_then(|s| s.parse::<f64>().ok()));
+        .or_else(|| get("DEC").and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| get("CRVAL2").and_then(|s| s.parse::<f64>().ok()));
     // Rotation: must match the scanner's keyword priority in
     // `fits_parser/mod.rs::extract_metadata` exactly, otherwise the
     // metadata pane shows a phantom "original differs from current" diff
@@ -316,6 +320,41 @@ fn parse_xisf_xml_text(text: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Survey / processed frames (e.g. SkyMapper `1_18_r_1_P.fit`) ship
+    /// with full FITS WCS — `CRVAL1`/`CRVAL2` + a CD matrix — but no
+    /// OBJCTRA/RA or OBJCTDEC/DEC. The snapshot must extract ra/dec from
+    /// CRVAL* so the metadata pane's revert can restore them; otherwise
+    /// the FITS-header column shows blank ra/dec while rotation is
+    /// populated (from CD matrix) and "Revert WCS to header" clears
+    /// ra/dec but leaves rotation, surprising the user.
+    #[test]
+    fn snapshot_falls_back_to_crval_when_objctra_missing() {
+        // Header with WCS only — no OBJCTRA / RA / OBJCTDEC / DEC.
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("CRVAL1".to_string(), "234.6002".to_string());
+        keys.insert("CRVAL2".to_string(), "-33.2365".to_string());
+        keys.insert("CD1_2".to_string(), "-1.2e-7".to_string());
+        keys.insert("CD2_2".to_string(), "0.000138".to_string());
+
+        let snap = snapshot_from_keys(42, &keys);
+        let ra = snap.ra.expect("ra must come from CRVAL1");
+        let dec = snap.dec.expect("dec must come from CRVAL2");
+        assert!((ra - 234.6002).abs() < 1e-6, "ra={ra}");
+        assert!((dec - -33.2365).abs() < 1e-6, "dec={dec}");
+        // CD-matrix-derived rotation still works (this is what motivated
+        // the bug — extracting it but NOT ra/dec was the inconsistency).
+        assert!(snap.rotation.is_some(), "rotation must be derived from CD matrix");
+
+        // Sanity: OBJCTRA wins over CRVAL1 when present, so survey frames
+        // that DO have OBJCTRA continue to use it.
+        let mut keys2 = std::collections::HashMap::new();
+        keys2.insert("OBJCTRA".to_string(), "15 00 00".to_string());
+        keys2.insert("CRVAL1".to_string(), "999.0".to_string());
+        let snap2 = snapshot_from_keys(43, &keys2);
+        let ra2 = snap2.ra.expect("ra");
+        assert!((ra2 - 225.0).abs() < 0.01, "OBJCTRA must win over CRVAL1; got {ra2}");
+    }
 
     #[test]
     fn parses_fits_card_text_basic_keys() {
