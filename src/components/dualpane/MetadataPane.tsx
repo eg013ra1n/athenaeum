@@ -22,7 +22,7 @@ import {
   PlateSolveBatchPanel,
   type PlateSolveBatchPanelHandle,
 } from '../plate-solve/PlateSolveBatchPanel';
-import type { PlateSolveProgressEvent, PlateSolveRecord } from '../../types/plate-solve';
+import type { PlateSolveCompleteEvent, PlateSolveRecord } from '../../types/plate-solve';
 import { formatTimestamp } from '../../utils/dateFormatting';
 
 interface Props {
@@ -372,24 +372,30 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectionKey]);
 
-  // Refresh the read-only Plate-solve card when a frame in the current
-  // selection finishes solving — the fetch above only re-runs on selection
-  // change, so without this the result row stays hidden until the user
-  // deselects + reselects. Listens to the same `plate-solve-progress`
-  // events the global queue indicator uses (status='solved'), so the card
-  // appears immediately after the solver completes the frame. Pattern
-  // follows the StrictMode-safe listener guidance in CLAUDE.md.
+  // Refresh the read-only Plate-solve card after a batch finishes — the
+  // initial fetch above only re-runs on selection change, so without this
+  // a freshly-solved frame'\''s card stays hidden until the user deselects
+  // + reselects.
+  //
+  // **Must listen to `plate-solve-complete`, NOT `plate-solve-progress`**:
+  // the batch worker emits per-frame `progress` events with status='solved'
+  // immediately after each solve (Phase 2 in commands/plate_solve.rs), but
+  // the actual `plate_solves` row is not written until Phase 3 commits the
+  // batch as one transaction. Fetching on `progress` returns null and
+  // overwrites our state. `plate-solve-complete` fires *after* the commit
+  // so the row is guaranteed visible by the time we read.
+  //
+  // We don'\''t know from the event payload which frames were in the batch,
+  // so just unconditionally re-fetch for the current single-frame selection.
+  // Pattern follows the StrictMode-safe listener guidance in CLAUDE.md.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     const ids = frameIds;
+    if (ids.length !== 1) return;
     api
-      .listen<PlateSolveProgressEvent>('plate-solve-progress', (evt) => {
+      .listen<PlateSolveCompleteEvent>('plate-solve-complete', () => {
         if (cancelled) return;
-        if (evt.status !== 'solved') return;
-        // Only refresh if the just-solved frame is the one we're showing
-        // (the card is single-selection only — multi-select hides it).
-        if (ids.length !== 1 || evt.frame_id !== ids[0]) return;
         const gen = ++plateSolveGenRef.current;
         api
           .invoke<PlateSolveRecord | null>('get_plate_solve_result', { frameId: ids[0] })
@@ -398,7 +404,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
             setPlateSolve(rec);
           })
           .catch((e) => {
-            console.error('plate-solve refresh after solve failed:', e);
+            console.error('plate-solve refresh after complete failed:', e);
           });
       })
       .then((fn) => {
@@ -406,7 +412,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
         else unlisten = fn;
       })
       .catch((err) =>
-        console.error('[plate-solve-progress] listen failed:', err),
+        console.error('[plate-solve-complete] listen failed:', err),
       );
     return () => {
       cancelled = true;
