@@ -32,6 +32,10 @@ pub struct FrameOriginalSnapshot {
     pub instrume: Option<String>,
     pub telescop: Option<String>,
     pub focallen: Option<f64>,
+    /// Pixel size in µm (FITS XPIXSZ). Required alongside FOCALLEN for the
+    /// plate-solve scale hint; surfaced here so the metadata pane can revert
+    /// to the header value just like any other numeric field.
+    pub xpixsz: Option<f64>,
     pub gain: Option<f64>,
     pub offset: Option<f64>,
     /// Reconstructed "AxB" string from XBINNING/YBINNING (or the raw BINNING
@@ -132,6 +136,7 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
     let instrume = get("INSTRUME");
     let telescop = get("TELESCOP");
     let focallen = get("FOCALLEN").and_then(|s| s.parse::<f64>().ok());
+    let xpixsz = get("XPIXSZ").and_then(|s| s.parse::<f64>().ok());
     // Many cameras store gain under EGAIN and software-set gain under GAIN —
     // prefer the simpler GAIN keyword first, falling back to EGAIN.
     let gain = get("GAIN")
@@ -205,6 +210,7 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
         instrume,
         telescop,
         focallen,
+        xpixsz,
         gain,
         offset,
         binning,

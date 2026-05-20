@@ -49,6 +49,7 @@ export interface FrameOriginalSnapshot {
   instrume: string | null;
   telescop: string | null;
   focallen: number | null;
+  xpixsz: number | null;
   gain: number | null;
   offset: number | null;
   binning: string | null;

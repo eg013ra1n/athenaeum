@@ -804,6 +804,10 @@ pub struct FrameMetadataEdits {
     pub telescop: Option<String>,
     /// Focal length in mm (FITS FOCALLEN).
     pub focallen: Option<f64>,
+    /// Pixel size in µm (FITS XPIXSZ). Required alongside FOCALLEN for the
+    /// plate-solve scale hint; user-editable on any frame for sparse headers
+    /// (some surveys ship without XPIXSZ — e.g. SkyMapper).
+    pub xpixsz: Option<f64>,
     /// Sensor gain (FITS GAIN). Typically 0-1000.
     pub gain: Option<f64>,
     /// Sensor offset (FITS OFFSET). Typically 0+.

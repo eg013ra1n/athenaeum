@@ -123,6 +123,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       instrume: commonValueStr(selectedItems.map((f) => f.frame?.instrume)),
       telescop: commonValueStr(selectedItems.map((f) => f.frame?.telescop)),
       focallen: commonValueNum(selectedItems.map((f) => f.frame?.focallen)),
+      xpixsz: commonValueNum(selectedItems.map((f) => f.frame?.xpixsz)),
       dateObs: commonValueStr(selectedItems.map((f) => f.frame?.date_obs)),
       gain: commonValueNum(selectedItems.map((f) => f.frame?.gain)),
       offset: commonValueNum(selectedItems.map((f) => f.frame?.offset)),
@@ -154,6 +155,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       instrume: { enabled: false, value: common.instrume === VARIES ? '' : common.instrume },
       telescop: { enabled: false, value: common.telescop === VARIES ? '' : common.telescop },
       focallen: { enabled: false, value: common.focallen === VARIES ? '' : common.focallen },
+      xpixsz: { enabled: false, value: common.xpixsz === VARIES ? '' : common.xpixsz },
       gain: { enabled: false, value: common.gain === VARIES ? '' : common.gain },
       offset: { enabled: false, value: common.offset === VARIES ? '' : common.offset },
       binning: { enabled: false, value: common.binning === VARIES ? '' : common.binning },
@@ -426,6 +428,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       // Numeric fields with bounded ranges. Empty string clears the value.
       const numericFields: Record<string, { label: string; min?: number; max?: number; positive?: boolean }> = {
         focallen: { label: 'Focal length', min: 0, max: 100000 },
+        xpixsz:   { label: 'Pixel size',   min: 0, max: 100, positive: true },
         gain:     { label: 'Gain',         min: 0, max: 1000 },
         offset:   { label: 'Offset',       min: 0, max: 100000 },
         exptime:  { label: 'Exposure',     positive: true },
@@ -618,6 +621,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     { key: 'focallen', label: 'FOCALLEN (mm)',    numeric: true, step: '0.1', min: 0,    max: 100000, originalKey: 'focallen' },
     { key: 'gain',     label: 'GAIN',             numeric: true, step: '1',   min: 0,    max: 1000,    originalKey: 'gain' },
     { key: 'offset',   label: 'OFFSET',           numeric: true, step: '1',   min: 0,    max: 100000,  originalKey: 'offset' },
+    { key: 'xpixsz',   label: 'XPIXSZ (µm)',      numeric: true, step: '0.01', min: 0,   max: 100,     originalKey: 'xpixsz' },
     {
       key: 'binning',
       label: 'BINNING',

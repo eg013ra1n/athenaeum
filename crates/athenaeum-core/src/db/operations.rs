@@ -1004,6 +1004,7 @@ pub fn bulk_update_frame_metadata(
         && edits.filter.is_none()
         && edits.telescop.is_none()
         && edits.focallen.is_none()
+        && edits.xpixsz.is_none()
         && edits.gain.is_none()
         && edits.offset.is_none()
         && edits.binning.is_none()
@@ -1070,6 +1071,10 @@ pub fn bulk_update_frame_metadata(
     if let Some(focallen) = edits.focallen {
         set_clauses.push("focallen = ?");
         values.push(Value::Real(focallen));
+    }
+    if let Some(xpixsz) = edits.xpixsz {
+        set_clauses.push("xpixsz = ?");
+        values.push(Value::Real(xpixsz));
     }
     if let Some(gain) = edits.gain {
         set_clauses.push("gain = ?");
