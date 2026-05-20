@@ -782,6 +782,21 @@ pub struct CalibrationMetadataEdits {
     pub exptime: Option<f64>,
 }
 
+/// Serde helper: distinguish "field absent" from "field present with null".
+/// Used by `FrameMetadataEdits` so the metadata-pane revert path can clear
+/// a value back to `NULL` — a plain `Option<T>` collapses both states into
+/// `None` and silently drops the clear.
+///   - JSON key absent       → outer `None`        (no edit)
+///   - JSON `{ key: null }`  → `Some(None)`        (clear to NULL)
+///   - JSON `{ key: value }` → `Some(Some(value))` (set)
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Bulk edits for light/calibration frame metadata in the `frames` table.
 /// Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type actions.
 /// None means don't change that field.
@@ -807,7 +822,18 @@ pub struct FrameMetadataEdits {
     /// Pixel size in µm (FITS XPIXSZ). Required alongside FOCALLEN for the
     /// plate-solve scale hint; user-editable on any frame for sparse headers
     /// (some surveys ship without XPIXSZ — e.g. SkyMapper).
-    pub xpixsz: Option<f64>,
+    ///
+    /// `Option<Option<f64>>` (not the usual `Option<f64>`) so the wire format
+    /// can distinguish three states cleanly — required for the metadata-pane
+    /// revert path to clear a user-typed value back to `NULL` on frames whose
+    /// header had no XPIXSZ:
+    ///   - absent in JSON → outer `None` → "no edit"
+    ///   - `null` in JSON → `Some(None)` → "clear to NULL"
+    ///   - value in JSON → `Some(Some(v))` → "set to v"
+    /// A plain `Option<f64>` collapses the first two and silently drops the
+    /// clear (the SET clause only fires on `Some(v)`).
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub xpixsz: Option<Option<f64>>,
     /// Sensor gain (FITS GAIN). Typically 0-1000.
     pub gain: Option<f64>,
     /// Sensor offset (FITS OFFSET). Typically 0+.

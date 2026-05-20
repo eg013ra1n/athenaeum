@@ -1072,9 +1072,16 @@ pub fn bulk_update_frame_metadata(
         set_clauses.push("focallen = ?");
         values.push(Value::Real(focallen));
     }
-    if let Some(xpixsz) = edits.xpixsz {
+    // `xpixsz` uses the double-Option wire format (see `deserialize_double_option`
+    // in models.rs) so revert-to-NULL is distinguishable from no-edit. The
+    // metadata pane's revert button sends `{xpixsz: null}` for frames whose
+    // header had no XPIXSZ — that clears the column instead of silently no-opping.
+    if let Some(maybe_xpixsz) = edits.xpixsz {
         set_clauses.push("xpixsz = ?");
-        values.push(Value::Real(xpixsz));
+        values.push(match maybe_xpixsz {
+            Some(v) => Value::Real(v),
+            None => Value::Null,
+        });
     }
     if let Some(gain) = edits.gain {
         set_clauses.push("gain = ?");
@@ -4076,6 +4083,75 @@ mod bulk_metadata_tests {
         assert_eq!(rel.calibration_set_consumer_count, 1);
         assert_eq!(rel.session_member_count, 1);
         assert_eq!(rel.affected_frame_count, 2, "f1 and f2 are both linked somewhere");
+    }
+
+    /// The metadata pane's revert button must be able to clear a user-typed
+    /// XPIXSZ back to NULL on frames whose FITS header had no XPIXSZ. This
+    /// only works because `FrameMetadataEdits.xpixsz` is `Option<Option<f64>>`
+    /// with a custom serde deserializer — a plain `Option<f64>` would collapse
+    /// "no edit" and "set to NULL" into the same `None` and silently drop the
+    /// clear (no SET clause emitted).
+    #[test]
+    fn xpixsz_revert_to_null_clears_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let id = insert_frame(&conn, "/x/a.fits", Some("Light"));
+
+        // Seed a user-typed value.
+        let set_edits = FrameMetadataEdits {
+            xpixsz: Some(Some(3.76)),
+            ..Default::default()
+        };
+        let n = bulk_update_frame_metadata(&conn, &[id], &set_edits).unwrap();
+        assert_eq!(n, 1, "set xpixsz should update 1 row");
+        let stored: Option<f64> = conn
+            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, Some(3.76), "xpixsz must be set after the edit");
+
+        // Now revert to NULL via Some(None) — the wire JSON {xpixsz: null}.
+        let clear_edits = FrameMetadataEdits {
+            xpixsz: Some(None),
+            ..Default::default()
+        };
+        let n = bulk_update_frame_metadata(&conn, &[id], &clear_edits).unwrap();
+        assert_eq!(n, 1, "clear xpixsz should update 1 row");
+        let stored: Option<f64> = conn
+            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert!(stored.is_none(), "xpixsz must be NULL after the revert");
+
+        // Counter-test: `xpixsz: None` (no edit, all other fields also None)
+        // must be a no-op — distinguishable from the clear above.
+        let conn2 = Connection::open_in_memory().unwrap();
+        init_db(&conn2).unwrap();
+        let id2 = insert_frame(&conn2, "/x/b.fits", Some("Light"));
+        bulk_update_frame_metadata(&conn2, &[id2], &FrameMetadataEdits {
+            xpixsz: Some(Some(2.5)),
+            ..Default::default()
+        }).unwrap();
+        let no_edit = FrameMetadataEdits::default(); // every field is the outer None
+        let n = bulk_update_frame_metadata(&conn2, &[id2], &no_edit).unwrap();
+        assert_eq!(n, 0, "default edits (all outer None) must be a no-op");
+        let stored: Option<f64> = conn2
+            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id2], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, Some(2.5), "no-edit must NOT clear the previously-set value");
+    }
+
+    /// Wire-format check: confirm the custom serde deserializer distinguishes
+    /// the three input shapes the metadata pane round-trips through JSON.
+    #[test]
+    fn xpixsz_serde_distinguishes_absent_null_value() {
+        // Absent: outer None → "no edit".
+        let edits: FrameMetadataEdits = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(edits.xpixsz.is_none(), "absent key → outer None");
+        // null: Some(None) → "clear to NULL".
+        let edits: FrameMetadataEdits = serde_json::from_str(r#"{"xpixsz": null}"#).unwrap();
+        assert_eq!(edits.xpixsz, Some(None), "null → Some(None)");
+        // value: Some(Some(v)) → "set to v".
+        let edits: FrameMetadataEdits = serde_json::from_str(r#"{"xpixsz": 3.76}"#).unwrap();
+        assert_eq!(edits.xpixsz, Some(Some(3.76)), "value → Some(Some(v))");
     }
 }
 
