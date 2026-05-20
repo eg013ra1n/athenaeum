@@ -22,7 +22,7 @@ import {
   PlateSolveBatchPanel,
   type PlateSolveBatchPanelHandle,
 } from '../plate-solve/PlateSolveBatchPanel';
-import type { PlateSolveConfig, PlateSolveRecord } from '../../types/plate-solve';
+import type { PlateSolveRecord } from '../../types/plate-solve';
 import { formatTimestamp } from '../../utils/dateFormatting';
 
 interface Props {
@@ -307,19 +307,6 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
   const [plateSolve, setPlateSolve] = useState<PlateSolveRecord | null>(null);
   const plateSolveGenRef = useRef(0);
 
-  // Per-camera XPIXSZ default — inline action shown when the selected
-  // frame's header lacks XPIXSZ but has INSTRUME, so focallen cannot be
-  // algebraically derived from the solved arcsec/px. The user supplies the
-  // missing input and we persist it under `PlateSolveConfig.camera_defaults`
-  // (next solve fills focallen for any frame from this camera).
-  const [cdInput, setCdInput] = useState<string>('');
-  const [cdSaving, setCdSaving] = useState(false);
-  const [cdSavedAt, setCdSavedAt] = useState<number | null>(null);
-  useEffect(() => {
-    setCdInput('');
-    setCdSavedAt(null);
-  }, [selectionKey]);
-
   // "Revert WCS to FITS header" pipelines: ra / dec / rotation / objctra /
   // objctdec / plate_solves row all clear together so the frame doesn't end
   // up with a half-cleared coordinate state (the columns are derived from
@@ -331,31 +318,36 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     setPendingPlateSolveDelete(false);
   }, [selectionKey]);
 
-  const saveCameraDefault = useCallback(async () => {
+  // "Recalculate focallen" action lives on the Plate-solve result card: when
+  // a frame has XPIXSZ AND a plate-solve, fl = (xpixsz_µm/1000) / tan(scale)
+  // gives the focal length on demand without re-solving. Single-frame only.
+  const [recalcSaving, setRecalcSaving] = useState(false);
+  const recalcFocallen = useCallback(async () => {
+    if (frameIds.length !== 1 || plateSolve == null) return;
     const sel = selectedItems[0];
-    const instrume = sel?.frame?.instrume?.trim();
-    if (!instrume) return;
-    const xpixsz_um = parseFloat(cdInput);
-    if (!Number.isFinite(xpixsz_um) || xpixsz_um <= 0) return;
-    setCdSaving(true);
+    const xpixsz = sel?.frame?.xpixsz;
+    const scale = plateSolve.pixel_scale_arcsec;
+    if (xpixsz == null || xpixsz <= 0 || !(scale > 0)) return;
+    const scaleTan = Math.tan(((scale / 3600) * Math.PI) / 180);
+    if (!Number.isFinite(scaleTan) || scaleTan <= 0) return;
+    const derived = xpixsz / 1000 / scaleTan;
+    if (!Number.isFinite(derived) || derived <= 0) return;
+    setRecalcSaving(true);
     try {
-      // Atomic-from-user-POV: load → patch → save. The backend round-trips
-      // the full config, so unknown fields the TS interface doesn't model
-      // are preserved by JSON.stringify.
-      const cfg = await api.invoke<PlateSolveConfig>('get_plate_solve_config');
-      const updated: PlateSolveConfig = {
-        ...cfg,
-        camera_defaults: { ...(cfg.camera_defaults ?? {}), [instrume]: xpixsz_um },
-      };
-      await api.invoke('set_plate_solve_config', { config: updated });
-      setCdSavedAt(Date.now());
-      setCdInput('');
+      await api.invoke('bulk_update_frame_metadata', {
+        frameIds,
+        // `focallen` uses the double-Option wire format on the backend — a
+        // bare number deserialises to Some(Some(v)) → SET focallen = v.
+        edits: { focallen: derived },
+      });
+      onSaved();
     } catch (e) {
-      console.error('set camera default failed:', e);
+      console.error('recalcFocallen failed:', e);
+      alert(`Could not save focallen: ${e}`);
     } finally {
-      setCdSaving(false);
+      setRecalcSaving(false);
     }
-  }, [selectedItems, cdInput]);
+  }, [frameIds, plateSolve, selectedItems, onSaved]);
   useEffect(() => {
     const ids = frameIds;
     if (ids.length !== 1) {
@@ -1163,53 +1155,75 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                     </span>
                   </div>
                 </div>
+                {/* "Recalculate focallen" action: derive focal length from
+                    the solved pixel scale + the frame's XPIXSZ
+                    (fl_mm = xpixsz_µm/1000 / tan(scale_rad)) and write it
+                    to frames.focallen. Single-frame only.
+                      - hidden when XPIXSZ is missing (a one-line hint
+                        directing the user to the XPIXSZ field above is
+                        rendered separately, below the result card)
+                      - hidden when the derived value already matches
+                        frames.focallen within 1% (nothing to do) */}
+                {(() => {
+                  if (selectedItems.length !== 1) return null;
+                  const xp = selectedItems[0].frame?.xpixsz;
+                  if (xp == null || xp <= 0) return null;
+                  const scale = plateSolve.pixel_scale_arcsec;
+                  if (!(scale > 0)) return null;
+                  const scaleTan = Math.tan(((scale / 3600) * Math.PI) / 180);
+                  if (!Number.isFinite(scaleTan) || scaleTan <= 0) return null;
+                  const derived = xp / 1000 / scaleTan;
+                  const current = selectedItems[0].frame?.focallen;
+                  const matches =
+                    current != null &&
+                    derived > 0 &&
+                    Math.abs(current - derived) / derived < 0.01;
+                  if (matches) return null;
+                  return (
+                    <div className="mt-2 flex items-center justify-between gap-2 text-xs">
+                      <span className="text-content-muted">
+                        Derived FOCALLEN:{' '}
+                        <span className="font-mono text-content">
+                          {derived.toFixed(1)} mm
+                        </span>
+                        {current != null && (
+                          <>
+                            {' '}(current{' '}
+                            <span className="font-mono text-content">
+                              {current.toFixed(1)} mm
+                            </span>
+                            )
+                          </>
+                        )}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={recalcFocallen}
+                        disabled={recalcSaving}
+                        title="Compute focallen = (xpixsz/1000) / tan(scale) and save it to this frame."
+                        className="px-2.5 py-1 rounded bg-surface hover:bg-surface-hover border border-border text-content text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {recalcSaving ? 'Saving…' : 'Recalculate focallen'}
+                      </button>
+                    </div>
+                  );
+                })()}
               </div>
             )}
-            {/* Per-camera XPIXSZ default — only when the user has algebra
-                blocking the focallen back-fill (header lacks XPIXSZ but
-                INSTRUME is set). Saving stores the default in
-                PlateSolveConfig.camera_defaults; next solve fills focallen
-                for this camera. */}
+            {/* XPIXSZ hint: when a single frame has a successful solve but
+                no XPIXSZ in the catalog, focallen cannot be derived from
+                arcsec/px alone — point the user at the XPIXSZ field above
+                (the regular editable form) so they can fill it once and
+                then use Recalculate focallen inside the result card. */}
             {plateSolve &&
               selectedItems.length === 1 &&
-              selectedItems[0].frame?.xpixsz == null &&
-              selectedItems[0].frame?.instrume?.trim() && (
-                <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2 text-xs">
-                  <div className="text-content-muted mb-2">
-                    Frame's <span className="font-mono">XPIXSZ</span> is missing — focallen can't
-                    be derived from arcsec/px alone. Set a default for{' '}
-                    <span className="font-mono text-content">
-                      {selectedItems[0].frame!.instrume!.trim()}
-                    </span>
-                    {' '}so future solves fill it automatically.
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="0"
-                      placeholder="XPIXSZ µm"
-                      value={cdInput}
-                      onChange={(e) => setCdInput(e.target.value)}
-                      disabled={cdSaving}
-                      className="flex-1 px-2 py-1 rounded bg-surface border border-border text-content text-xs font-mono disabled:opacity-50"
-                    />
-                    <button
-                      type="button"
-                      onClick={saveCameraDefault}
-                      disabled={
-                        cdSaving ||
-                        !Number.isFinite(parseFloat(cdInput)) ||
-                        parseFloat(cdInput) <= 0
-                      }
-                      className="px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed text-xs"
-                    >
-                      {cdSaving ? 'Saving…' : 'Save default'}
-                    </button>
-                    {cdSavedAt && Date.now() - cdSavedAt < 4000 && (
-                      <span className="text-green-500">Saved.</span>
-                    )}
-                  </div>
+              selectedItems[0].frame?.xpixsz == null && (
+                <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2 text-xs text-content-muted">
+                  Frame's <span className="font-mono">XPIXSZ</span> is missing — focallen
+                  can't be derived from arcsec/px alone. Enter the camera's pixel size
+                  in the <span className="font-mono text-content">XPIXSZ (µm)</span> field
+                  above, then use <em>Recalculate focallen</em> in the Plate-solve result
+                  card.
                 </div>
               )}
           </div>
