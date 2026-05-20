@@ -27,6 +27,11 @@ export interface PlateSolveConfig {
    * scale-cleared then a full-blind retry before giving up, and write the
    * corrected focal length back on success. Default: true. */
   fallback_to_blind_scale?: boolean;
+  /** Per-camera XPIXSZ defaults (`INSTRUME` or `TELESCOP` → µm). Consulted
+   * when a frame's FITS header lacks XPIXSZ — without a default, focallen
+   * cannot be derived from arcsec/px alone. Default: empty (behaviour
+   * unchanged for frames that have XPIXSZ in their headers). */
+  camera_defaults?: Record<string, number>;
 }
 
 // QuadIndexStatus fields are camelCase: the Rust struct uses #[serde(rename_all = "camelCase")].

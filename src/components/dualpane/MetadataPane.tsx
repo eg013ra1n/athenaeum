@@ -22,7 +22,7 @@ import {
   PlateSolveBatchPanel,
   type PlateSolveBatchPanelHandle,
 } from '../plate-solve/PlateSolveBatchPanel';
-import type { PlateSolveRecord } from '../../types/plate-solve';
+import type { PlateSolveConfig, PlateSolveRecord } from '../../types/plate-solve';
 import { formatTimestamp } from '../../utils/dateFormatting';
 
 interface Props {
@@ -271,6 +271,45 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
   // stale fetches don't clobber newer state.
   const [plateSolve, setPlateSolve] = useState<PlateSolveRecord | null>(null);
   const plateSolveGenRef = useRef(0);
+
+  // Per-camera XPIXSZ default — inline action shown when the selected
+  // frame's header lacks XPIXSZ but has INSTRUME, so focallen cannot be
+  // algebraically derived from the solved arcsec/px. The user supplies the
+  // missing input and we persist it under `PlateSolveConfig.camera_defaults`
+  // (next solve fills focallen for any frame from this camera).
+  const [cdInput, setCdInput] = useState<string>('');
+  const [cdSaving, setCdSaving] = useState(false);
+  const [cdSavedAt, setCdSavedAt] = useState<number | null>(null);
+  useEffect(() => {
+    setCdInput('');
+    setCdSavedAt(null);
+  }, [selectionKey]);
+
+  const saveCameraDefault = useCallback(async () => {
+    const sel = selectedItems[0];
+    const instrume = sel?.frame?.instrume?.trim();
+    if (!instrume) return;
+    const xpixsz_um = parseFloat(cdInput);
+    if (!Number.isFinite(xpixsz_um) || xpixsz_um <= 0) return;
+    setCdSaving(true);
+    try {
+      // Atomic-from-user-POV: load → patch → save. The backend round-trips
+      // the full config, so unknown fields the TS interface doesn't model
+      // are preserved by JSON.stringify.
+      const cfg = await api.invoke<PlateSolveConfig>('get_plate_solve_config');
+      const updated: PlateSolveConfig = {
+        ...cfg,
+        camera_defaults: { ...(cfg.camera_defaults ?? {}), [instrume]: xpixsz_um },
+      };
+      await api.invoke('set_plate_solve_config', { config: updated });
+      setCdSavedAt(Date.now());
+      setCdInput('');
+    } catch (e) {
+      console.error('set camera default failed:', e);
+    } finally {
+      setCdSaving(false);
+    }
+  }, [selectedItems, cdInput]);
   useEffect(() => {
     const ids = frameIds;
     if (ids.length !== 1) {
@@ -891,6 +930,53 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                 </div>
               </div>
             )}
+            {/* Per-camera XPIXSZ default — only when the user has algebra
+                blocking the focallen back-fill (header lacks XPIXSZ but
+                INSTRUME is set). Saving stores the default in
+                PlateSolveConfig.camera_defaults; next solve fills focallen
+                for this camera. */}
+            {plateSolve &&
+              selectedItems.length === 1 &&
+              selectedItems[0].frame?.xpixsz == null &&
+              selectedItems[0].frame?.instrume?.trim() && (
+                <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2 text-xs">
+                  <div className="text-content-muted mb-2">
+                    Frame's <span className="font-mono">XPIXSZ</span> is missing — focallen can't
+                    be derived from arcsec/px alone. Set a default for{' '}
+                    <span className="font-mono text-content">
+                      {selectedItems[0].frame!.instrume!.trim()}
+                    </span>
+                    {' '}so future solves fill it automatically.
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="XPIXSZ µm"
+                      value={cdInput}
+                      onChange={(e) => setCdInput(e.target.value)}
+                      disabled={cdSaving}
+                      className="flex-1 px-2 py-1 rounded bg-surface border border-border text-content text-xs font-mono disabled:opacity-50"
+                    />
+                    <button
+                      type="button"
+                      onClick={saveCameraDefault}
+                      disabled={
+                        cdSaving ||
+                        !Number.isFinite(parseFloat(cdInput)) ||
+                        parseFloat(cdInput) <= 0
+                      }
+                      className="px-2.5 py-1 rounded bg-accent text-white hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed text-xs"
+                    >
+                      {cdSaving ? 'Saving…' : 'Save default'}
+                    </button>
+                    {cdSavedAt && Date.now() - cdSavedAt < 4000 && (
+                      <span className="text-green-500">Saved.</span>
+                    )}
+                  </div>
+                </div>
+              )}
           </div>
         )}
 
