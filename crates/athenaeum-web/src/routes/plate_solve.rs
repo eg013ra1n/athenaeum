@@ -583,6 +583,21 @@ pub async fn get_plate_solve_result(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+/// Delete the `plate_solves` row for a frame. Mirror of the Tauri command;
+/// used by the metadata pane's "Revert WCS to FITS header" flow so the
+/// stored WCS doesn't outlive the cleared ra/dec/rotation/objctra/objctdec
+/// columns.
+pub async fn delete_plate_solve_for_frame(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameIdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+    let conn = db.conn();
+    storage::delete_plate_solve(&conn, args.frame_id)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogStatusInfo {

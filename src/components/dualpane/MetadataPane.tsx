@@ -287,6 +287,17 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     setCdSavedAt(null);
   }, [selectionKey]);
 
+  // "Revert WCS to FITS header" pipelines: ra / dec / rotation / objctra /
+  // objctdec / plate_solves row all clear together so the frame doesn't end
+  // up with a half-cleared coordinate state (the columns are derived from
+  // one solve — they belong as a unit). The flag is set by `revertWcs`,
+  // honoured by `commitSave` AFTER the bulk_update_frame_metadata write so
+  // the deletion + the column clears land in the same user action.
+  const [pendingPlateSolveDelete, setPendingPlateSolveDelete] = useState(false);
+  useEffect(() => {
+    setPendingPlateSolveDelete(false);
+  }, [selectionKey]);
+
   const saveCameraDefault = useCallback(async () => {
     const sel = selectedItems[0];
     const instrume = sel?.frame?.instrume?.trim();
@@ -410,6 +421,63 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
     [originalForField],
   );
 
+  /** Atomic WCS revert: ra / dec / rotation all snap back to their FITS-header
+   *  originals in one click, and `pendingPlateSolveDelete` is raised so the
+   *  next Apply also drops the stored `plate_solves` row. OBJCTRA / OBJCTDEC
+   *  are derived in the backend's ra/dec SET clause — clearing those columns
+   *  in lockstep is already guaranteed there, so we don't need separate edits.
+   *  See task #75 / commit notes. */
+  const revertWcs = useCallback(() => {
+    const raOrig = originalForField('ra');
+    const decOrig = originalForField('dec');
+    const rotOrig = originalForField('rotation');
+    if (raOrig === VARIES || decOrig === VARIES || rotOrig === VARIES) {
+      alert(
+        'WCS originals differ across the selection — revert one frame at a time.',
+      );
+      return;
+    }
+    setEdits((prev) => ({
+      ...prev,
+      ra: { enabled: true, value: raOrig },
+      dec: { enabled: true, value: decOrig },
+      rotation: { enabled: true, value: rotOrig },
+    }));
+    setPendingPlateSolveDelete(true);
+  }, [originalForField]);
+
+  /** Whether ANY of the WCS triplet (ra / dec / rotation) differs from its
+   *  FITS-header original. Gates the visibility of the atomic "Revert WCS to
+   *  header" button — no need to surface the action on freshly-scanned frames
+   *  that were never solved, or on frames that have already been reverted. */
+  const wcsDiffersFromHeader = useMemo(() => {
+    if (!anyOverridden || originals == null) return false;
+    const triplet: Array<['ra' | 'dec' | 'rotation', keyof FrameOriginalSnapshot]> = [
+      ['ra', 'ra'],
+      ['dec', 'dec'],
+      ['rotation', 'rotation'],
+    ];
+    return triplet.some(([k, snapKey]) => {
+      const cv = common[k];
+      const orig = originalForField(snapKey);
+      if (cv === VARIES || orig === VARIES) return false; // can't tell — be conservative
+      const curStr = String(cv ?? '');
+      // Coordinate fields use numeric tolerance (display rounding can make
+      // strings differ for byte-identical values); rotation compares as
+      // string since the catalog stores the f64 with full precision.
+      if (k === 'ra' || k === 'dec') {
+        if (curStr === '' && orig === '') return false;
+        const cn = Number(curStr);
+        const on = Number(orig);
+        if (Number.isFinite(cn) && Number.isFinite(on)) {
+          return Math.abs(cn - on) >= 1e-6;
+        }
+        return curStr !== orig;
+      }
+      return curStr !== orig;
+    });
+  }, [anyOverridden, originals, common, originalForField]);
+
   const setField = (key: string, patch: Partial<EditState>) => {
     setEdits((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
   };
@@ -522,6 +590,40 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
           frameIds,
           edits: payload,
         });
+        // Revert WCS pipeline (set by `revertWcs`): also drop the stored
+        // `plate_solves` row(s) for the touched frames so the metadata pane's
+        // Plate-solve result card disappears with the coords. Best-effort —
+        // log and continue per-frame so one missing row doesn't abort the
+        // whole apply.
+        if (pendingPlateSolveDelete) {
+          await Promise.all(
+            frameIds.map((id) =>
+              api
+                .invoke('delete_plate_solve_for_frame', { frameId: id })
+                .catch((e) => {
+                  console.error(
+                    `delete_plate_solve_for_frame failed (frame ${id}):`,
+                    e,
+                  );
+                }),
+            ),
+          );
+          setPendingPlateSolveDelete(false);
+          // Refresh the read-only Plate-solve card immediately for the
+          // single-selection case (multi-select has no card to refresh).
+          if (frameIds.length === 1) {
+            try {
+              const rec = await api.invoke<PlateSolveRecord | null>(
+                'get_plate_solve_result',
+                { frameId: frameIds[0] },
+              );
+              setPlateSolve(rec);
+            } catch (e) {
+              console.error('get_plate_solve_result refresh failed:', e);
+              setPlateSolve(null);
+            }
+          }
+        }
         setSavedAt(Date.now());
         onSaved();
       } catch (e) {
@@ -531,7 +633,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
         setSaving(false);
       }
     },
-    [frameIds, onSaved],
+    [frameIds, onSaved, pendingPlateSolveDelete],
   );
 
   const onConfirmUnlink = useCallback(async () => {
@@ -725,12 +827,19 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
             // originals fetched yet" with "FITS header had no value for this
             // keyword", so auto-filled-from-null fields like Find Object's
             // OBJECT couldn't be reverted back to empty).
+            // RA / DEC / ROTATION are grouped under the atomic "Revert WCS to
+            // header" button above — suppress their per-field ↺ so reverting
+            // one without the others can't leave the frame in a half-cleared
+            // coordinate state (the columns come from a single solve).
+            const isWcsField =
+              f.key === 'ra' || f.key === 'dec' || f.key === 'rotation';
             const showRevert =
               anyOverridden &&
               f.originalKey != null &&
               originals != null &&
               origVal !== VARIES &&
-              !valuesMatch;
+              !valuesMatch &&
+              !isWcsField;
             // Three-column row layout:
             //   - Left (140px): label only.
             //   - Middle (1fr): current value (and original when overridden).
@@ -868,6 +977,31 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                 Plate Solve {frameIds.length} frame{frameIds.length === 1 ? '' : 's'}
               </button>
             </div>
+            {/* Atomic "Revert WCS to FITS header" action. ra / dec / rotation
+                are derived from a single plate-solve write and only make sense
+                as a unit, so we replace the per-field ↺ buttons with one
+                group button — and also drop the stored `plate_solves` row so
+                the result card disappears in lockstep. Shown only when at
+                least one WCS column actually differs from its header
+                original (no clutter on freshly-scanned frames that were
+                never solved, no clutter once already reverted). */}
+            {wcsDiffersFromHeader && (
+              <div className="flex items-center justify-between gap-3 rounded-md border border-amber-700/40 bg-surface-elevated/40 px-3 py-2">
+                <div className="text-xs text-content-muted">
+                  Plate-solved coordinates override the FITS header.
+                </div>
+                <button
+                  type="button"
+                  onClick={revertWcs}
+                  disabled={saving || frameIds.length === 0 || originals == null}
+                  title="Clear ra / dec / rotation / objctra / objctdec back to their FITS-header values (NULL for sparse headers) and drop the stored plate-solve row. Click Apply to commit."
+                  className="flex items-center gap-2 px-2.5 py-1 rounded bg-surface hover:bg-surface-hover border border-amber-600/40 text-amber-400 text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <RotateCcw size={12} />
+                  Revert WCS to header
+                </button>
+              </div>
+            )}
             <PlateSolveBatchPanel
               ref={plateSolveRef}
               hideTriggerButtons

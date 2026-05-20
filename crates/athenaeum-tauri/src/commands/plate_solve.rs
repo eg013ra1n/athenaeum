@@ -618,6 +618,20 @@ pub async fn get_plate_solve_result(
     storage::get_plate_solve(&conn, frame_id).map_err(|e| e.to_string())
 }
 
+/// Delete the `plate_solves` row for a frame. Called by the metadata pane's
+/// "Revert WCS to FITS header" action so the stored WCS doesn't outlive the
+/// `frames.ra/dec/rotation/objctra/objctdec` columns that were just cleared
+/// — otherwise the pane's Plate-solve result card would render stale data.
+#[tauri::command]
+pub async fn delete_plate_solve_for_frame(
+    state: State<'_, AppState>,
+    frame_id: i64,
+) -> Result<(), String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    storage::delete_plate_solve(&conn, frame_id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn get_catalog_status(
     state: State<'_, AppState>,

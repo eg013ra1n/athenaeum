@@ -323,6 +323,7 @@ pub fn run() {
             commands::autofind_objects_from_coordinates,
             commands::cancel_autofind_objects,
             commands::get_plate_solve_result,
+            commands::delete_plate_solve_for_frame,
             commands::get_catalog_status,
             commands::download_tycho2_catalog,
             commands::download_gaia_dr3_catalog,
