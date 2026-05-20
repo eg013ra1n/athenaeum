@@ -22,6 +22,8 @@ import {
   PlateSolveBatchPanel,
   type PlateSolveBatchPanelHandle,
 } from '../plate-solve/PlateSolveBatchPanel';
+import type { PlateSolveRecord } from '../../types/plate-solve';
+import { formatTimestamp } from '../../utils/dateFormatting';
 
 interface Props {
   /** Listing of the FILE pane (the other side). */
@@ -256,6 +258,36 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       .catch((e) => {
         console.error('get_frame_memberships failed:', e);
         if (!cancelled) setMemberships(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectionKey]);
+
+  // Single-frame plate-solve record (read-only view). Fetched only when
+  // exactly one frame is selected — multi-select aggregation would just
+  // be noise here. Mirrors the memberships generation-counter guard so
+  // stale fetches don't clobber newer state.
+  const [plateSolve, setPlateSolve] = useState<PlateSolveRecord | null>(null);
+  const plateSolveGenRef = useRef(0);
+  useEffect(() => {
+    const ids = frameIds;
+    if (ids.length !== 1) {
+      setPlateSolve(null);
+      return;
+    }
+    const gen = ++plateSolveGenRef.current;
+    let cancelled = false;
+    api
+      .invoke<PlateSolveRecord | null>('get_plate_solve_result', { frameId: ids[0] })
+      .then((rec) => {
+        if (cancelled || gen !== plateSolveGenRef.current) return;
+        setPlateSolve(rec);
+      })
+      .catch((e) => {
+        console.error('get_plate_solve_result failed:', e);
+        if (!cancelled) setPlateSolve(null);
       });
     return () => {
       cancelled = true;
@@ -798,6 +830,67 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
               hideTriggerButtons
               onSolveComplete={onSaved}
             />
+            {/* Read-only solved-WCS summary for the single-selection case.
+                Surfaces the exact `plate_solves.pixel_scale_arcsec` (and the
+                rest of the WCS) for frames whose FITS header lacks XPIXSZ
+                or FOCALLEN — in that case `frames.focallen` legitimately
+                stays NULL (the algebra needs both), but the solved scale
+                is still known precisely and worth showing. */}
+            {plateSolve && (
+              <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2">
+                <div className="text-xs text-content-muted mb-1">Plate-solve result</div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                  <div>
+                    <span className="text-content-muted">Pixel scale: </span>
+                    <span className="font-mono text-content">
+                      {plateSolve.pixel_scale_arcsec.toFixed(3)}″/px
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-content-muted">Rotation: </span>
+                    <span className="font-mono text-content">
+                      {plateSolve.field_rotation_deg.toFixed(2)}°
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-content-muted">Centre RA: </span>
+                    <span className="font-mono text-content">
+                      {plateSolve.crval1.toFixed(4)}°
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-content-muted">Centre Dec: </span>
+                    <span className="font-mono text-content">
+                      {plateSolve.crval2.toFixed(4)}°
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-content-muted">RMS: </span>
+                    <span className="font-mono text-content">
+                      {plateSolve.rms_residual_arcsec.toFixed(2)}″ ({plateSolve.rms_residual_px.toFixed(2)}px)
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-content-muted">Inliers: </span>
+                    <span className="font-mono text-content">
+                      {plateSolve.matched_stars}
+                      {plateSolve.expected_catalog_stars_in_fov != null
+                        ? ` / ${plateSolve.expected_catalog_stars_in_fov}`
+                        : ''}
+                    </span>
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-content-muted">Solved: </span>
+                    <span className="font-mono text-content">
+                      {formatTimestamp(plateSolve.solved_at)}
+                    </span>
+                    <span className="text-content-muted">
+                      {' '}via {plateSolve.algorithm_used} ({plateSolve.catalog_used})
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
