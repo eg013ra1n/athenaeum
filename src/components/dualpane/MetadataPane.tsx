@@ -86,6 +86,39 @@ function display(v: string): string {
   return v === VARIES ? '(varies)' : v || '(empty)';
 }
 
+/** Decimal RA degrees → "HH MM SS.SS" sexagesimal. Mirrors the backend's
+ *  `coordinates::format_ra_sexagesimal`. Used in the WCS comparison block
+ *  so the FITS-header column shows OBJCTRA derived from its decimal RA
+ *  without round-tripping through the backend. Returns '' for non-finite. */
+function formatRaSexagesimalJs(deg: number): string {
+  if (!Number.isFinite(deg)) return '';
+  let hours = deg / 15;
+  if (hours < 0) hours += 24;
+  if (hours >= 24) hours -= 24;
+  const h = Math.floor(hours);
+  const remMin = (hours - h) * 60;
+  const m = Math.floor(remMin);
+  const s = (remMin - m) * 60;
+  return `${String(h).padStart(2, '0')} ${String(m).padStart(2, '0')} ${s
+    .toFixed(2)
+    .padStart(5, '0')}`;
+}
+
+/** Decimal Dec degrees → "+DD MM SS.SS" sexagesimal. Mirrors the backend's
+ *  `coordinates::format_dec_sexagesimal`. Returns '' for non-finite. */
+function formatDecSexagesimalJs(deg: number): string {
+  if (!Number.isFinite(deg)) return '';
+  const sign = deg < 0 ? '-' : '+';
+  const abs = Math.abs(deg);
+  const d = Math.floor(abs);
+  const remMin = (abs - d) * 60;
+  const m = Math.floor(remMin);
+  const s = (remMin - m) * 60;
+  return `${sign}${String(d).padStart(2, '0')} ${String(m).padStart(2, '0')} ${s
+    .toFixed(2)
+    .padStart(5, '0')}`;
+}
+
 /** True for IMAGETYP values that represent on-sky light frames (single
  *  exposures or stacked masters). Coordinates / plate-solve only make
  *  sense for these — calibration frames legitimately have no RA/Dec.
@@ -774,9 +807,16 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
 
         <div className="space-y-2">
           {fields.map((f) => {
-            // RA / DEC / ROTATION live in the dedicated WCS comparison block
-            // below — skip them here so we don't show them in two places.
-            if (f.key === 'ra' || f.key === 'dec' || f.key === 'rotation') {
+            // RA / DEC / ROTATION / OBJCTRA / OBJCTDEC live in the dedicated
+            // WCS comparison block below — skip them here so the same info
+            // doesn't render in two places.
+            if (
+              f.key === 'ra' ||
+              f.key === 'dec' ||
+              f.key === 'rotation' ||
+              f.key === 'objctra' ||
+              f.key === 'objctdec'
+            ) {
               return null;
             }
             const cv = common[f.key];
@@ -1009,24 +1049,39 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
               const headerRa = originalForField('ra');
               const headerDec = originalForField('dec');
               const headerRot = originalForField('rotation');
+              // Derive header sexagesimal from header decimal so the OBJCTRA /
+              // OBJCTDEC rows mirror the catalog side (the FITS snapshot only
+              // stores decimal ra/dec; we re-format here for display parity).
+              const derivSex = (v: string, isRa: boolean): string => {
+                if (v === VARIES) return VARIES;
+                if (v === '') return '';
+                const n = Number(v);
+                return Number.isFinite(n)
+                  ? isRa ? formatRaSexagesimalJs(n) : formatDecSexagesimalJs(n)
+                  : '';
+              };
+              const headerObjctra = derivSex(headerRa, true);
+              const headerObjctdec = derivSex(headerDec, false);
               return (
                 <div className="grid grid-cols-2 gap-2">
                   <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2">
                     <div className="text-xs text-content-muted mb-2">Current WCS</div>
                     <div className="space-y-1 text-xs font-mono">
                       {fmtRow('RA',       common.ra,       true)}
-                      {fmtRow('DEC',      common.dec,      true)}
-                      {fmtRow('ROT',      common.rotation, true)}
                       {fmtRow('OBJCTRA',  common.objctra,  false)}
+                      {fmtRow('DEC',      common.dec,      true)}
                       {fmtRow('OBJCTDEC', common.objctdec, false)}
+                      {fmtRow('ROT',      common.rotation, true)}
                     </div>
                   </div>
                   <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2 flex flex-col">
                     <div className="text-xs text-content-muted mb-2">FITS header</div>
                     <div className="space-y-1 text-xs font-mono flex-1">
-                      {fmtRow('RA',  headerRa,  true)}
-                      {fmtRow('DEC', headerDec, true)}
-                      {fmtRow('ROT', headerRot, true)}
+                      {fmtRow('RA',       headerRa,       true)}
+                      {fmtRow('OBJCTRA',  headerObjctra,  false)}
+                      {fmtRow('DEC',      headerDec,      true)}
+                      {fmtRow('OBJCTDEC', headerObjctdec, false)}
+                      {fmtRow('ROT',      headerRot,      true)}
                     </div>
                     {wcsDiffersFromHeader && (
                       <button
