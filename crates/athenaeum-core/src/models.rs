@@ -799,66 +799,82 @@ where
 
 /// Bulk edits for light/calibration frame metadata in the `frames` table.
 /// Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type actions.
-/// None means don't change that field.
+///
+/// Every nullable field uses `Option<Option<T>>` with a custom serde
+/// deserializer so the wire format can distinguish three states cleanly:
+///   - absent in JSON       → outer `None`        → no edit
+///   - `null` in JSON       → `Some(None)`        → clear to `NULL`
+///   - value in JSON        → `Some(Some(v))`     → set to `v`
+/// A plain `Option<T>` collapses the first two into `None`, and the SET-clause
+/// loop only fires on `Some(v)` — so revert-to-NULL would silently no-op. The
+/// metadata pane's revert button depends on this distinction.
+///
+/// `is_master` is the one exception: it's a derived tri-state paired with
+/// `imagetyp`, not a user-typed value, so plain `Option<bool>` is fine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameMetadataEdits {
-    pub instrume: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub instrume: Option<Option<String>>,
     /// RFC 3339 / ISO 8601 datetime string (frontend converts from user input).
-    pub date_obs: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub date_obs: Option<Option<String>>,
     /// Raw IMAGETYP value — "LIGHT", "DARK", "FLAT", "BIAS", "DARKFLAT".
     /// For master variants, pair with `is_master = Some(true)` and a base
     /// type (e.g. `imagetyp = "DARK"`, `is_master = true` → master dark).
-    pub imagetyp: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub imagetyp: Option<Option<String>>,
     pub is_master: Option<bool>,
     /// Target name (FITS OBJECT). Common cleanup case for misnamed targets.
-    pub object: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub object: Option<Option<String>>,
     /// Filter name (FITS FILTER). Common cleanup case for ASIAir mis-records.
-    pub filter: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub filter: Option<Option<String>>,
     /// Telescope name (FITS TELESCOP).
-    pub telescop: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub telescop: Option<Option<String>>,
     /// Focal length in mm (FITS FOCALLEN).
-    pub focallen: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub focallen: Option<Option<f64>>,
     /// Pixel size in µm (FITS XPIXSZ). Required alongside FOCALLEN for the
     /// plate-solve scale hint; user-editable on any frame for sparse headers
     /// (some surveys ship without XPIXSZ — e.g. SkyMapper).
-    ///
-    /// `Option<Option<f64>>` (not the usual `Option<f64>`) so the wire format
-    /// can distinguish three states cleanly — required for the metadata-pane
-    /// revert path to clear a user-typed value back to `NULL` on frames whose
-    /// header had no XPIXSZ:
-    ///   - absent in JSON → outer `None` → "no edit"
-    ///   - `null` in JSON → `Some(None)` → "clear to NULL"
-    ///   - value in JSON → `Some(Some(v))` → "set to v"
-    /// A plain `Option<f64>` collapses the first two and silently drops the
-    /// clear (the SET clause only fires on `Some(v)`).
     #[serde(default, deserialize_with = "deserialize_double_option")]
     pub xpixsz: Option<Option<f64>>,
     /// Sensor gain (FITS GAIN). Typically 0-1000.
-    pub gain: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub gain: Option<Option<f64>>,
     /// Sensor offset (FITS OFFSET). Typically 0+.
-    pub offset: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub offset: Option<Option<f64>>,
     /// Binning string (e.g. "1x1", "2x2"). When set, xbinning/ybinning are
     /// also updated to match the parsed components.
-    pub binning: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub binning: Option<Option<String>>,
     /// Exposure time in seconds (FITS EXPTIME). Must be > 0.
-    pub exptime: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub exptime: Option<Option<f64>>,
     /// CCD temperature in °C (FITS CCD-TEMP). Typically -50..50.
-    pub ccd_temp: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub ccd_temp: Option<Option<f64>>,
     /// Right Ascension in decimal degrees [0, 360). Only set by the metadata
     /// pane's RA/DEC revert path — there is no text input for these. The
     /// "manual update" path for coordinates is plate-solving. When set,
     /// `bulk_update_frame_metadata` also writes the parallel sexagesimal
     /// `objctra` so derived consumers stay consistent with what the scanner
     /// and plate solver produce.
-    pub ra: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub ra: Option<Option<f64>>,
     /// Declination in decimal degrees [-90, 90]. See `ra`.
-    pub dec: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub dec: Option<Option<f64>>,
     /// Image position angle in degrees (north through east). Plate solving
     /// derives this from the CD matrix. The metadata pane lets the user
     /// override or revert it just like any other numeric field. Range is
     /// `[-360, 360]` to accept either sign convention.
-    pub rotation: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub rotation: Option<Option<f64>>,
 }
 
 /// Excluded frame entry (frame excluded during auto-generation)

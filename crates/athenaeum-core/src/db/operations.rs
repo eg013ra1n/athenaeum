@@ -1022,30 +1022,58 @@ pub fn bulk_update_frame_metadata(
     let mut set_clauses: Vec<&str> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
 
-    if let Some(instrume) = &edits.instrume {
-        set_clauses.push("instrume = ?");
-        values.push(Value::Text(instrume.clone()));
+    // Every nullable field uses `Option<Option<T>>` so the wire format can
+    // tell "no edit" (outer None — skip), "clear to NULL" (Some(None) —
+    // emit `SET col = NULL`), and "set to v" (Some(Some(v))) apart. The
+    // metadata-pane revert button depends on this distinction; a plain
+    // `Option<T>` collapses the first two and silently no-ops the clear.
+    // Helpers keep the body readable.
+    fn text_value(maybe: &Option<String>) -> Value {
+        match maybe {
+            Some(s) => Value::Text(s.clone()),
+            None => Value::Null,
+        }
     }
-    if let Some(date_obs) = &edits.date_obs {
+    fn real_value(maybe: Option<f64>) -> Value {
+        match maybe {
+            Some(v) => Value::Real(v),
+            None => Value::Null,
+        }
+    }
+
+    if let Some(maybe_instrume) = &edits.instrume {
+        set_clauses.push("instrume = ?");
+        values.push(text_value(maybe_instrume));
+    }
+    if let Some(maybe_date_obs) = &edits.date_obs {
         set_clauses.push("date_obs = ?");
-        values.push(Value::Text(date_obs.clone()));
+        values.push(text_value(maybe_date_obs));
     }
     // imagetyp + is_master are paired: setting imagetyp also writes the
     // matching is_master bool (true for any Master* variant, false for the
     // base variants). This keeps Equipment's master detection (which filters
     // on the imagetyp string) and any code that reads frames.is_master in
-    // sync — no UI checkbox is needed for the toggle.
+    // sync — no UI checkbox is needed for the toggle. Clearing imagetyp to
+    // NULL leaves is_master alone (no sensible default for a typeless row).
     let mut imagetyp_set_master_flag: Option<bool> = None;
-    if let Some(imagetyp) = &edits.imagetyp {
-        let parsed = ImageType::from_str(imagetyp);
-        let normalized = parsed
-            .as_ref()
-            .map(|t| format!("{:?}", t))
-            .unwrap_or_else(|| imagetyp.clone());
-        set_clauses.push("imagetyp = ?");
-        values.push(Value::Text(normalized));
-        if let Some(t) = parsed {
-            imagetyp_set_master_flag = Some(t.is_master());
+    if let Some(maybe_imagetyp) = &edits.imagetyp {
+        match maybe_imagetyp {
+            Some(imagetyp) => {
+                let parsed = ImageType::from_str(imagetyp);
+                let normalized = parsed
+                    .as_ref()
+                    .map(|t| format!("{:?}", t))
+                    .unwrap_or_else(|| imagetyp.clone());
+                set_clauses.push("imagetyp = ?");
+                values.push(Value::Text(normalized));
+                if let Some(t) = parsed {
+                    imagetyp_set_master_flag = Some(t.is_master());
+                }
+            }
+            None => {
+                set_clauses.push("imagetyp = ?");
+                values.push(Value::Null);
+            }
         }
     }
     // Derived is_master from imagetyp wins over an explicit edits.is_master
@@ -1056,126 +1084,158 @@ pub fn bulk_update_frame_metadata(
         set_clauses.push("is_master = ?");
         values.push(Value::Integer(if is_master { 1 } else { 0 }));
     }
-    if let Some(object) = &edits.object {
+    if let Some(maybe_object) = &edits.object {
         set_clauses.push("object = ?");
-        values.push(Value::Text(object.clone()));
+        values.push(text_value(maybe_object));
     }
-    if let Some(filter) = &edits.filter {
+    if let Some(maybe_filter) = &edits.filter {
         set_clauses.push("filter = ?");
-        values.push(Value::Text(filter.clone()));
+        values.push(text_value(maybe_filter));
     }
-    if let Some(telescop) = &edits.telescop {
+    if let Some(maybe_telescop) = &edits.telescop {
         set_clauses.push("telescop = ?");
-        values.push(Value::Text(telescop.clone()));
+        values.push(text_value(maybe_telescop));
     }
-    if let Some(focallen) = edits.focallen {
+    if let Some(maybe_focallen) = edits.focallen {
         set_clauses.push("focallen = ?");
-        values.push(Value::Real(focallen));
+        values.push(real_value(maybe_focallen));
     }
-    // `xpixsz` uses the double-Option wire format (see `deserialize_double_option`
-    // in models.rs) so revert-to-NULL is distinguishable from no-edit. The
-    // metadata pane's revert button sends `{xpixsz: null}` for frames whose
-    // header had no XPIXSZ — that clears the column instead of silently no-opping.
     if let Some(maybe_xpixsz) = edits.xpixsz {
         set_clauses.push("xpixsz = ?");
-        values.push(match maybe_xpixsz {
-            Some(v) => Value::Real(v),
-            None => Value::Null,
-        });
+        values.push(real_value(maybe_xpixsz));
     }
-    if let Some(gain) = edits.gain {
+    if let Some(maybe_gain) = edits.gain {
         set_clauses.push("gain = ?");
-        values.push(Value::Real(gain));
+        values.push(real_value(maybe_gain));
     }
-    if let Some(offset) = edits.offset {
+    if let Some(maybe_offset) = edits.offset {
         set_clauses.push("offset = ?");
-        values.push(Value::Real(offset));
+        values.push(real_value(maybe_offset));
     }
-    if let Some(binning) = &edits.binning {
-        // Validate "AxB" format with positive integers and store xbinning /
-        // ybinning in lockstep so derived queries (calibration matching, etc.)
-        // see consistent values.
-        let parts: Vec<&str> = binning.split('x').collect();
-        if parts.len() != 2 {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format!("binning must be in 'AxB' format (e.g. '1x1'), got '{}'", binning).into(),
-            ));
+    if let Some(maybe_binning) = &edits.binning {
+        match maybe_binning {
+            Some(binning) => {
+                // Validate "AxB" with positive integers; store xbinning/ybinning
+                // in lockstep so calibration-matching consumers see consistent
+                // values.
+                let parts: Vec<&str> = binning.split('x').collect();
+                if parts.len() != 2 {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        format!("binning must be in 'AxB' format (e.g. '1x1'), got '{}'", binning).into(),
+                    ));
+                }
+                let xb: i64 = parts[0].parse().map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(
+                        format!("binning x component must be an integer, got '{}'", parts[0]).into(),
+                    )
+                })?;
+                let yb: i64 = parts[1].parse().map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(
+                        format!("binning y component must be an integer, got '{}'", parts[1]).into(),
+                    )
+                })?;
+                if xb < 1 || yb < 1 || xb > 16 || yb > 16 {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        format!("binning components must be 1-16, got '{}'", binning).into(),
+                    ));
+                }
+                set_clauses.push("binning = ?");
+                values.push(Value::Text(binning.clone()));
+                set_clauses.push("xbinning = ?");
+                values.push(Value::Integer(xb));
+                set_clauses.push("ybinning = ?");
+                values.push(Value::Integer(yb));
+            }
+            None => {
+                // Clear all three columns in lockstep — leaving xbinning/ybinning
+                // populated when binning string is NULL would confuse downstream
+                // consumers.
+                set_clauses.push("binning = ?");
+                values.push(Value::Null);
+                set_clauses.push("xbinning = ?");
+                values.push(Value::Null);
+                set_clauses.push("ybinning = ?");
+                values.push(Value::Null);
+            }
         }
-        let xb: i64 = parts[0].parse().map_err(|_| {
-            rusqlite::Error::ToSqlConversionFailure(
-                format!("binning x component must be an integer, got '{}'", parts[0]).into(),
-            )
-        })?;
-        let yb: i64 = parts[1].parse().map_err(|_| {
-            rusqlite::Error::ToSqlConversionFailure(
-                format!("binning y component must be an integer, got '{}'", parts[1]).into(),
-            )
-        })?;
-        if xb < 1 || yb < 1 || xb > 16 || yb > 16 {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format!("binning components must be 1-16, got '{}'", binning).into(),
-            ));
-        }
-        set_clauses.push("binning = ?");
-        values.push(Value::Text(binning.clone()));
-        set_clauses.push("xbinning = ?");
-        values.push(Value::Integer(xb));
-        set_clauses.push("ybinning = ?");
-        values.push(Value::Integer(yb));
     }
-    if let Some(exptime) = edits.exptime {
-        if !exptime.is_finite() || exptime <= 0.0 {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format!("exptime must be > 0 seconds, got {}", exptime).into(),
-            ));
+    if let Some(maybe_exptime) = edits.exptime {
+        if let Some(v) = maybe_exptime {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!("exptime must be > 0 seconds, got {}", v).into(),
+                ));
+            }
         }
         set_clauses.push("exptime = ?");
-        values.push(Value::Real(exptime));
+        values.push(real_value(maybe_exptime));
     }
-    if let Some(ccd_temp) = edits.ccd_temp {
-        if !ccd_temp.is_finite() {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format!("ccd_temp must be a finite number, got {}", ccd_temp).into(),
-            ));
+    if let Some(maybe_ccd_temp) = edits.ccd_temp {
+        if let Some(v) = maybe_ccd_temp {
+            if !v.is_finite() {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!("ccd_temp must be a finite number, got {}", v).into(),
+                ));
+            }
         }
         set_clauses.push("ccd_temp = ?");
-        values.push(Value::Real(ccd_temp));
+        values.push(real_value(maybe_ccd_temp));
     }
-    // RA / DEC: write decimal degrees AND mirror sexagesimal OBJCTRA / OBJCTDEC
-    // so calibration-matching, sky-chart and clustering consumers (which read
-    // from either column) stay in sync with what the scanner and plate solver
-    // produce. The metadata pane is the only call site that supplies these
-    // today; its revert button feeds back the FITS-header decimal value.
-    if let Some(ra) = edits.ra {
-        if !ra.is_finite() || !(0.0..360.0).contains(&ra) {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format!("ra must be in [0, 360) degrees, got {}", ra).into(),
-            ));
+    // RA / DEC: when set, also mirror to sexagesimal OBJCTRA/OBJCTDEC so
+    // calibration-matching, sky-chart and clustering consumers stay in sync.
+    // When cleared, NULL both columns in lockstep.
+    if let Some(maybe_ra) = edits.ra {
+        match maybe_ra {
+            Some(ra) => {
+                if !ra.is_finite() || !(0.0..360.0).contains(&ra) {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        format!("ra must be in [0, 360) degrees, got {}", ra).into(),
+                    ));
+                }
+                set_clauses.push("ra = ?");
+                values.push(Value::Real(ra));
+                set_clauses.push("objctra = ?");
+                values.push(Value::Text(crate::coordinates::format_ra_sexagesimal(ra)));
+            }
+            None => {
+                set_clauses.push("ra = ?");
+                values.push(Value::Null);
+                set_clauses.push("objctra = ?");
+                values.push(Value::Null);
+            }
         }
-        set_clauses.push("ra = ?");
-        values.push(Value::Real(ra));
-        set_clauses.push("objctra = ?");
-        values.push(Value::Text(crate::coordinates::format_ra_sexagesimal(ra)));
     }
-    if let Some(dec) = edits.dec {
-        if !dec.is_finite() || !(-90.0..=90.0).contains(&dec) {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format!("dec must be in [-90, 90] degrees, got {}", dec).into(),
-            ));
+    if let Some(maybe_dec) = edits.dec {
+        match maybe_dec {
+            Some(dec) => {
+                if !dec.is_finite() || !(-90.0..=90.0).contains(&dec) {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        format!("dec must be in [-90, 90] degrees, got {}", dec).into(),
+                    ));
+                }
+                set_clauses.push("dec = ?");
+                values.push(Value::Real(dec));
+                set_clauses.push("objctdec = ?");
+                values.push(Value::Text(crate::coordinates::format_dec_sexagesimal(dec)));
+            }
+            None => {
+                set_clauses.push("dec = ?");
+                values.push(Value::Null);
+                set_clauses.push("objctdec = ?");
+                values.push(Value::Null);
+            }
         }
-        set_clauses.push("dec = ?");
-        values.push(Value::Real(dec));
-        set_clauses.push("objctdec = ?");
-        values.push(Value::Text(crate::coordinates::format_dec_sexagesimal(dec)));
     }
-    if let Some(rotation) = edits.rotation {
-        if !rotation.is_finite() || !(-360.0..=360.0).contains(&rotation) {
-            return Err(rusqlite::Error::ToSqlConversionFailure(
-                format!("rotation must be in [-360, 360] degrees, got {}", rotation).into(),
-            ));
+    if let Some(maybe_rotation) = edits.rotation {
+        if let Some(v) = maybe_rotation {
+            if !v.is_finite() || !(-360.0..=360.0).contains(&v) {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!("rotation must be in [-360, 360] degrees, got {}", v).into(),
+                ));
+            }
         }
         set_clauses.push("rotation = ?");
-        values.push(Value::Real(rotation));
+        values.push(real_value(maybe_rotation));
     }
     // Always flag touched rows as override so rescans preserve the edit.
     set_clauses.push("override = 1");
@@ -3458,7 +3518,7 @@ mod bulk_metadata_tests {
 
         // Reclassify the frame: Dark → Light.
         let edits = FrameMetadataEdits {
-            imagetyp: Some("LIGHT".into()),
+            imagetyp: Some(Some("LIGHT".into())),
             ..Default::default()
         };
         let changed = bulk_update_frame_metadata(&conn, &[dark_id], &edits).unwrap();
@@ -3517,7 +3577,7 @@ mod bulk_metadata_tests {
         ).unwrap();
 
         let edits = FrameMetadataEdits {
-            object: Some("M31".into()),
+            object: Some(Some("M31".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
@@ -3558,7 +3618,7 @@ mod bulk_metadata_tests {
         let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
 
         let edits = FrameMetadataEdits {
-            binning: Some("2x2".into()),
+            binning: Some(Some("2x2".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
@@ -3582,7 +3642,7 @@ mod bulk_metadata_tests {
         let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
         for bad in ["foo", "1", "x1", "0x1", "20x20", ""] {
             let edits = FrameMetadataEdits {
-                binning: Some(bad.into()),
+                binning: Some(Some(bad.into())),
                 ..Default::default()
             };
             let r = bulk_update_frame_metadata(&conn, &[frame_id], &edits);
@@ -3597,7 +3657,7 @@ mod bulk_metadata_tests {
         let frame_id = insert_frame(&conn, "/x/a.fits", Some("Light"));
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let edits = FrameMetadataEdits {
-                exptime: Some(bad),
+                exptime: Some(Some(bad)),
                 ..Default::default()
             };
             let r = bulk_update_frame_metadata(&conn, &[frame_id], &edits);
@@ -3690,7 +3750,7 @@ mod bulk_metadata_tests {
 
         // Step 1: user edits OBJECT to "M 42" — bulk_update sets override = 1.
         let edits = FrameMetadataEdits {
-            object: Some("M 42".into()),
+            object: Some(Some("M 42".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
@@ -3705,7 +3765,7 @@ mod bulk_metadata_tests {
 
         // Step 2: user reverts OBJECT to the FITS-header original ("M42").
         let revert = FrameMetadataEdits {
-            object: Some("M42".into()),
+            object: Some(Some("M42".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &revert).unwrap();
@@ -3751,14 +3811,14 @@ mod bulk_metadata_tests {
 
         // Edit OBJECT and FILTER both. Then revert OBJECT only.
         let edits1 = FrameMetadataEdits {
-            object: Some("OTHER".into()),
-            filter: Some("R".into()),
+            object: Some(Some("OTHER".into())),
+            filter: Some(Some("R".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &edits1).unwrap();
 
         let edits2 = FrameMetadataEdits {
-            object: Some("M42".into()),
+            object: Some(Some("M42".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &edits2).unwrap();
@@ -3813,7 +3873,7 @@ mod bulk_metadata_tests {
 
         // Reclassify the MasterFlat → LIGHT.
         let edits = FrameMetadataEdits {
-            imagetyp: Some("LIGHT".into()),
+            imagetyp: Some(Some("LIGHT".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[masterflat_id], &edits).unwrap();
@@ -3868,7 +3928,7 @@ mod bulk_metadata_tests {
 
         // Reclassify dark_a → LIGHT.
         let edits = FrameMetadataEdits {
-            imagetyp: Some("LIGHT".into()),
+            imagetyp: Some(Some("LIGHT".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[dark_a], &edits).unwrap();
@@ -3904,7 +3964,7 @@ mod bulk_metadata_tests {
             conn.execute("UPDATE frames SET is_master = 0 WHERE id = ?1", [frame_id])
                 .unwrap();
             let edits = FrameMetadataEdits {
-                imagetyp: Some(input.into()),
+                imagetyp: Some(Some(input.into())),
                 ..Default::default()
             };
             bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
@@ -3932,7 +3992,7 @@ mod bulk_metadata_tests {
             .unwrap();
 
         let edits = FrameMetadataEdits {
-            imagetyp: Some("DARK".into()),
+            imagetyp: Some(Some("DARK".into())),
             ..Default::default()
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
@@ -3957,7 +4017,7 @@ mod bulk_metadata_tests {
         let frame_id = insert_frame(&conn, "/x/d.fits", Some("Dark"));
 
         let edits = FrameMetadataEdits {
-            imagetyp: Some("MasterDark".into()),
+            imagetyp: Some(Some("MasterDark".into())),
             is_master: Some(false),
             ..Default::default()
         };
