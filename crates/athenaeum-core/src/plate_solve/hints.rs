@@ -14,9 +14,14 @@ use crate::models::Frame;
 /// 2. Direct numeric ra/dec — the mount's *reported* pointing. Wrong on
 ///    mis-synced mounts (e.g., dual-OTA setups where one NINA instance had
 ///    a stale sync at the time the FITS was written).
-/// 3. Nearby solved frame in the same directory.
+/// 3. Stored FITS-header WCS (`CRVAL1`/`CRVAL2`) — the file's own embedded
+///    astrometry (survey frames like SkyMapper ship with CTYPE/CRVAL/CD but
+///    no OBJCTRA/RA). Read from the `fits_header` blob via the existing
+///    snapshot path, so frames scanned before the scanner had CRVAL
+///    extraction don't need a rescan to get a position hint.
+/// 4. Nearby solved frame in the same directory.
 ///
-/// In all three branches, sentinel values (NULL, exact 0/0, or sexagesimal
+/// In all branches, sentinel values (NULL, exact 0/0, or sexagesimal
 /// "00 00 00" / "+00 00 00" / "00:00:00") are rejected — they're FITS-pipeline
 /// placeholders, not actual sky positions.
 ///
@@ -41,6 +46,29 @@ pub fn extract_hints(frame: &Frame, conn: Option<&Connection>) -> SolveHints {
             if !is_sentinel_position(ra, dec) {
                 hints.ra = Some(ra);
                 hints.dec = Some(dec);
+            }
+        }
+    }
+
+    // Stored-header WCS fallback: re-parse the `fits_header` blob and pull
+    // ra/dec from its snapshot (which has the CTYPE-guarded CRVAL1/CRVAL2
+    // fallback from `stored_header::snapshot_from_keys`). Closes the gap for
+    // frames whose scanner run predated the scanner's CRVAL extraction in
+    // `fits_parser/mod.rs:292`: those rows have `frame.ra/dec = NULL` even
+    // though the WCS sits in the stored header — without this branch they'd
+    // solve blindly. Only the (ra,dec) PAIR is taken — partial fills don't
+    // make sense.
+    if hints.ra.is_none() && hints.dec.is_none() {
+        if let (Some(conn), Some(frame_id)) = (conn, frame.id) {
+            if let Ok(snaps) = crate::db::get_frame_metadata_originals(conn, &[frame_id]) {
+                if let Some(snap) = snaps.into_iter().next() {
+                    if let (Some(ra), Some(dec)) = (snap.ra, snap.dec) {
+                        if !is_sentinel_position(ra, dec) {
+                            hints.ra = Some(ra);
+                            hints.dec = Some(dec);
+                        }
+                    }
+                }
             }
         }
     }
@@ -231,6 +259,70 @@ mod tests {
     #[test]
     fn numeric_zero_zero_sentinel_rejected_with_no_sexagesimal() {
         let frame = frame_with(Some(0.0), Some(0.0), None, None);
+        let hints = extract_hints(&frame, None);
+        assert_eq!(hints.ra, None);
+        assert_eq!(hints.dec, None);
+    }
+
+    /// Survey-WCS fallback (user-reported case, SkyMapper `1_18_r_1_P.fit`):
+    /// the catalog has `frame.ra = NULL` / `frame.dec = NULL` and
+    /// `objctra / objctdec` are also missing, but the stored fits_header
+    /// blob carries `CTYPE1 = 'RA---TAN'` + `CRVAL1 = 234.42` (and
+    /// `CTYPE2='DEC--TAN'` + `CRVAL2 = -34.14`). Without the
+    /// stored-header fallback, the solver runs blind across the whole
+    /// sky; with it, it gets a 10° hinted search.
+    #[test]
+    fn stored_header_crval_used_when_objctra_and_ra_both_null() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        // Insert a file row + frame row with no objctra/ra populated.
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES ('/x/sky.fits', 'sky.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = '/x/sky.fits'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Light')",
+            [file_id],
+        ).unwrap();
+        let frame_id: i64 = conn
+            .query_row("SELECT id FROM frames WHERE file_id = ?1", [file_id], |r| r.get(0))
+            .unwrap();
+        // Seed the fits_header blob with CTYPE-guarded CRVAL only — no
+        // OBJCTRA/RA. The scanner-style 80-char card text format works for
+        // FITS files via `parse_fits_card_text`.
+        let card = |k: &str, v: &str| format!("{:<80}", format!("{:<8}= {:<20}", k, v));
+        let blob = [
+            card("CTYPE1", "'RA---TAN'"),
+            card("CTYPE2", "'DEC--TAN'"),
+            card("CRVAL1", "234.42"),
+            card("CRVAL2", "-34.14"),
+        ]
+        .join("\n");
+        crate::db::insert_fits_header(&conn, file_id, &blob).unwrap();
+
+        let frame = Frame {
+            id: Some(frame_id),
+            file_id,
+            ..frame_with(None, None, None, None)
+        };
+        let hints = extract_hints(&frame, Some(&conn));
+        assert_eq!(hints.ra, Some(234.42), "CRVAL1 must fill ra hint");
+        assert_eq!(hints.dec, Some(-34.14), "CRVAL2 must fill dec hint");
+    }
+
+    /// Sanity: the new fallback must NOT fire when frame.id is absent
+    /// (newly-constructed Frame with no DB identity) — passing `0` as a
+    /// frame_id would return an empty snapshot list and gracefully fall
+    /// through to "no hint".
+    #[test]
+    fn stored_header_fallback_skipped_without_frame_id() {
+        let frame = frame_with(None, None, None, None);
+        // No conn at all → no fallback.
         let hints = extract_hints(&frame, None);
         assert_eq!(hints.ra, None);
         assert_eq!(hints.dec, None);
