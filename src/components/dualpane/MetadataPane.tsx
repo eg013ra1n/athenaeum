@@ -774,6 +774,11 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
 
         <div className="space-y-2">
           {fields.map((f) => {
+            // RA / DEC / ROTATION live in the dedicated WCS comparison block
+            // below — skip them here so we don't show them in two places.
+            if (f.key === 'ra' || f.key === 'dec' || f.key === 'rotation') {
+              return null;
+            }
             const cv = common[f.key];
             const e = edits[f.key as string];
             const origVal = f.originalKey && originals
@@ -827,19 +832,15 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
             // originals fetched yet" with "FITS header had no value for this
             // keyword", so auto-filled-from-null fields like Find Object's
             // OBJECT couldn't be reverted back to empty).
-            // RA / DEC / ROTATION are grouped under the atomic "Revert WCS to
-            // header" button above — suppress their per-field ↺ so reverting
-            // one without the others can't leave the frame in a half-cleared
-            // coordinate state (the columns come from a single solve).
-            const isWcsField =
-              f.key === 'ra' || f.key === 'dec' || f.key === 'rotation';
+            // (RA/DEC/ROTATION are filtered out at the top of the map and
+            // surfaced in the dedicated WCS comparison block, so no extra
+            // exclusion is needed here.)
             const showRevert =
               anyOverridden &&
               f.originalKey != null &&
               originals != null &&
               origVal !== VARIES &&
-              !valuesMatch &&
-              !isWcsField;
+              !valuesMatch;
             // Three-column row layout:
             //   - Left (140px): label only.
             //   - Middle (1fr): current value (and original when overridden).
@@ -977,31 +978,72 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
                 Plate Solve {frameIds.length} frame{frameIds.length === 1 ? '' : 's'}
               </button>
             </div>
-            {/* Atomic "Revert WCS to FITS header" action. ra / dec / rotation
-                are derived from a single plate-solve write and only make sense
-                as a unit, so we replace the per-field ↺ buttons with one
-                group button — and also drop the stored `plate_solves` row so
-                the result card disappears in lockstep. Shown only when at
-                least one WCS column actually differs from its header
-                original (no clutter on freshly-scanned frames that were
-                never solved, no clutter once already reverted). */}
-            {wcsDiffersFromHeader && (
-              <div className="flex items-center justify-between gap-3 rounded-md border border-amber-700/40 bg-surface-elevated/40 px-3 py-2">
-                <div className="text-xs text-content-muted">
-                  Plate-solved coordinates override the FITS header.
+            {/* WCS comparison block — replaces the per-field ↺ on
+                ra/dec/rotation (hidden from the regular field list) and the
+                old amber button row. Side-by-side: current values on the
+                left, FITS-header originals on the right. The single
+                "Revert WCS to header" button lives at the bottom of the
+                right column and only appears when there's actually a diff
+                (so freshly-scanned + never-solved frames just show
+                "—" everywhere with no action). */}
+            {(() => {
+              const fmtRow = (label: string, value: string, withUnit: boolean) => {
+                let display: string;
+                let cls = 'text-content';
+                if (value === VARIES) {
+                  display = '(varies)';
+                  cls = 'text-amber-400';
+                } else if (value === '') {
+                  display = '—';
+                  cls = 'text-content-muted';
+                } else {
+                  display = withUnit ? `${value}°` : value;
+                }
+                return (
+                  <div className="flex justify-between gap-2" key={label}>
+                    <span className="text-content-muted">{label}</span>
+                    <span className={`${cls} break-all text-right`}>{display}</span>
+                  </div>
+                );
+              };
+              const headerRa = originalForField('ra');
+              const headerDec = originalForField('dec');
+              const headerRot = originalForField('rotation');
+              return (
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2">
+                    <div className="text-xs text-content-muted mb-2">Current WCS</div>
+                    <div className="space-y-1 text-xs font-mono">
+                      {fmtRow('RA',       common.ra,       true)}
+                      {fmtRow('DEC',      common.dec,      true)}
+                      {fmtRow('ROT',      common.rotation, true)}
+                      {fmtRow('OBJCTRA',  common.objctra,  false)}
+                      {fmtRow('OBJCTDEC', common.objctdec, false)}
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-border bg-surface-elevated/40 px-3 py-2 flex flex-col">
+                    <div className="text-xs text-content-muted mb-2">FITS header</div>
+                    <div className="space-y-1 text-xs font-mono flex-1">
+                      {fmtRow('RA',  headerRa,  true)}
+                      {fmtRow('DEC', headerDec, true)}
+                      {fmtRow('ROT', headerRot, true)}
+                    </div>
+                    {wcsDiffersFromHeader && (
+                      <button
+                        type="button"
+                        onClick={revertWcs}
+                        disabled={saving || originals == null}
+                        title="Clear ra / dec / rotation / objctra / objctdec back to their FITS-header values (NULL for sparse headers) and drop the stored plate-solve row. Click Apply to commit."
+                        className="mt-2 flex items-center justify-center gap-2 px-2.5 py-1 rounded bg-surface hover:bg-surface-hover border border-amber-600/40 text-amber-400 text-xs disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <RotateCcw size={12} />
+                        Revert WCS to header
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={revertWcs}
-                  disabled={saving || frameIds.length === 0 || originals == null}
-                  title="Clear ra / dec / rotation / objctra / objctdec back to their FITS-header values (NULL for sparse headers) and drop the stored plate-solve row. Click Apply to commit."
-                  className="flex items-center gap-2 px-2.5 py-1 rounded bg-surface hover:bg-surface-hover border border-amber-600/40 text-amber-400 text-xs disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  <RotateCcw size={12} />
-                  Revert WCS to header
-                </button>
-              </div>
-            )}
+              );
+            })()}
             <PlateSolveBatchPanel
               ref={plateSolveRef}
               hideTriggerButtons
