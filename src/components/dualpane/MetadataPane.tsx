@@ -22,7 +22,7 @@ import {
   PlateSolveBatchPanel,
   type PlateSolveBatchPanelHandle,
 } from '../plate-solve/PlateSolveBatchPanel';
-import type { PlateSolveRecord } from '../../types/plate-solve';
+import type { PlateSolveProgressEvent, PlateSolveRecord } from '../../types/plate-solve';
 import { formatTimestamp } from '../../utils/dateFormatting';
 
 interface Props {
@@ -368,6 +368,49 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       });
     return () => {
       cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectionKey]);
+
+  // Refresh the read-only Plate-solve card when a frame in the current
+  // selection finishes solving — the fetch above only re-runs on selection
+  // change, so without this the result row stays hidden until the user
+  // deselects + reselects. Listens to the same `plate-solve-progress`
+  // events the global queue indicator uses (status='solved'), so the card
+  // appears immediately after the solver completes the frame. Pattern
+  // follows the StrictMode-safe listener guidance in CLAUDE.md.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const ids = frameIds;
+    api
+      .listen<PlateSolveProgressEvent>('plate-solve-progress', (evt) => {
+        if (cancelled) return;
+        if (evt.status !== 'solved') return;
+        // Only refresh if the just-solved frame is the one we're showing
+        // (the card is single-selection only — multi-select hides it).
+        if (ids.length !== 1 || evt.frame_id !== ids[0]) return;
+        const gen = ++plateSolveGenRef.current;
+        api
+          .invoke<PlateSolveRecord | null>('get_plate_solve_result', { frameId: ids[0] })
+          .then((rec) => {
+            if (cancelled || gen !== plateSolveGenRef.current) return;
+            setPlateSolve(rec);
+          })
+          .catch((e) => {
+            console.error('plate-solve refresh after solve failed:', e);
+          });
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) =>
+        console.error('[plate-solve-progress] listen failed:', err),
+      );
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectionKey]);
