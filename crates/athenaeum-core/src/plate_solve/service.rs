@@ -265,8 +265,20 @@ pub fn solve_frame_with_hints(
     // bogus header value silently survives every solve and locks subsequent
     // solves into the wrong scale-ladder rung. Inverts the hint formula in
     // hints.rs (scale_tan = px_mm/fl ⇒ fl = px_mm / tan(scale)).
+    //
+    // When the FITS header lacks XPIXSZ entirely (some surveys ship sparse
+    // headers — e.g. SkyMapper), fall back to a user-configured per-camera
+    // default keyed by INSTRUME or TELESCOP. Without that fallback, focallen
+    // cannot be algebraically derived from arcsec/px alone (two unknowns).
+    let effective_xpixsz = frame.xpixsz.or_else(|| {
+        let lookup = |key: Option<&str>| -> Option<f64> {
+            let k = key.map(str::trim).filter(|s| !s.is_empty())?;
+            config.camera_defaults.get(k).copied()
+        };
+        lookup(frame.instrume.as_deref()).or_else(|| lookup(frame.telescop.as_deref()))
+    });
     let derived_focallen_mm = if solution.pixel_scale_arcsec > 0.0 {
-        frame.xpixsz.and_then(|xpixsz| {
+        effective_xpixsz.and_then(|xpixsz| {
             if xpixsz <= 0.0 {
                 return None;
             }
@@ -3000,6 +3012,46 @@ mod tests {
     fn focallen_corrected_fills_null_header() {
         assert!(focallen_corrected(None, Some(1750.0)), "null header + derived → fill");
         assert!(!focallen_corrected(None, None),        "no derived → no write");
+    }
+
+    /// Replicates the `effective_xpixsz` closure in `solve_frame_with_hints`.
+    /// Header xpixsz wins; otherwise INSTRUME default; then TELESCOP default;
+    /// blank/whitespace keys are ignored.
+    fn effective_xpixsz(
+        frame_xpixsz: Option<f64>,
+        instrume: Option<&str>,
+        telescop: Option<&str>,
+        defaults: &std::collections::HashMap<String, f64>,
+    ) -> Option<f64> {
+        frame_xpixsz.or_else(|| {
+            let lookup = |key: Option<&str>| -> Option<f64> {
+                let k = key.map(str::trim).filter(|s| !s.is_empty())?;
+                defaults.get(k).copied()
+            };
+            lookup(instrume).or_else(|| lookup(telescop))
+        })
+    }
+
+    #[test]
+    fn effective_xpixsz_resolution_order() {
+        let mut defaults = std::collections::HashMap::new();
+        defaults.insert("SkyMapper".to_string(), 10.5);
+        defaults.insert("ASI294MM".to_string(), 4.63);
+
+        // Header xpixsz present → wins; defaults ignored.
+        assert_eq!(effective_xpixsz(Some(3.76), Some("SkyMapper"), None, &defaults), Some(3.76));
+        // Header missing → INSTRUME default kicks in.
+        assert_eq!(effective_xpixsz(None, Some("SkyMapper"), None, &defaults), Some(10.5));
+        // INSTRUME not in defaults → TELESCOP fallback.
+        assert_eq!(effective_xpixsz(None, Some("UnknownCam"), Some("SkyMapper"), &defaults), Some(10.5));
+        // INSTRUME missing entirely → TELESCOP fallback.
+        assert_eq!(effective_xpixsz(None, None, Some("SkyMapper"), &defaults), Some(10.5));
+        // Neither in defaults → None (focallen stays NULL, as before).
+        assert_eq!(effective_xpixsz(None, Some("Foo"), Some("Bar"), &defaults), None);
+        // No identifiers at all → None.
+        assert_eq!(effective_xpixsz(None, None, None, &defaults), None);
+        // Empty/whitespace keys are not looked up.
+        assert_eq!(effective_xpixsz(None, Some(""), Some("  "), &defaults), None);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -125,6 +127,14 @@ pub struct PlateSolveConfig {
     /// the astap path is bench-proven; flipping this is the cutover switch.
     #[serde(default = "default_solver_backend")]
     pub solver_backend: String,
+    /// Per-camera pixel-size defaults (`INSTRUME` or `TELESCOP` → xpixsz_µm).
+    /// Consulted by the focallen back-fill when a frame's FITS header lacks
+    /// `XPIXSZ` (some surveys ship sparse headers — e.g. SkyMapper). Without
+    /// a default, focallen cannot be algebraically derived from arcsec/px
+    /// alone (two unknowns, one equation), so `frames.focallen` stays NULL.
+    /// Empty default → behaviour unchanged.
+    #[serde(default)]
+    pub camera_defaults: HashMap<String, f64>,
 }
 
 fn default_max_image_stars() -> usize { 300 }
@@ -177,6 +187,7 @@ impl Default for PlateSolveConfig {
             blind_scale_sanity_max: default_blind_scale_sanity_max(),
             blind_scale_header_tol: default_blind_scale_header_tol(),
             solver_backend: default_solver_backend(),
+            camera_defaults: HashMap::new(),
         }
     }
 }
