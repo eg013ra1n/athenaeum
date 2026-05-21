@@ -1,3 +1,6 @@
 [submodule "rustafits"]
 	path = rustafits
 	url = https://github.com/eg013ra1n/rustafits.git
+[submodule "solvemyastro"]
+	path = solvemyastro
+	url = http://192.168.31.208:9080/root/solvemyastro.git
