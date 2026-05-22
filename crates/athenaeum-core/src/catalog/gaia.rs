@@ -1,17 +1,17 @@
-//! Gaia DR3 (G ≤ 16) all-sky catalog ingest.
+//! Gaia DR3 (G ≤ 19) all-sky catalog ingest.
 //!
 //! Mirrors the [`super::tycho2`] pipeline, but Gaia is far too large to bulk
-//! download (the `gaia_source` repo is HEALPix-partitioned, *not*
-//! magnitude-partitioned — a G≤16 subset would still mean ~600 GB of
-//! transfer). Instead we extract via the ESA TAP **async** service, tiled by
-//! `source_id` range so the server filters `phot_g_mean_mag < 16` and
+//! download. Instead we extract via the ESA TAP **async** service, tiled by
+//! `source_id` range so the server filters `phot_g_mean_mag < 19` and
 //! projects `ra,dec,phot_g_mean_mag,pmra,pmdec,ruwe`. Each tile is an
 //! independent, resumable checkpoint.
 //!
 //! `source_id` encodes position: the HEALPix level-*n* index is
-//! `source_id / (2^35 · 4^(12−n))`. We tile at **level 3** (nested):
-//! `12 · 4^3 = 768` pixels, divisor `2^35 · 4^9 = 2^53`. At G≤16 that is
-//! ≈390 k rows/tile — comfortably under the 3 M-row anonymous async cap.
+//! `source_id / (2^35 · 4^(12−n))`. We tile at **level 5** (nested):
+//! `12 · 4^5 = 12 288` pixels, divisor `2^35 · 4^7 = 2^49`. At G≤19 that is
+//! ≈73 k rows/tile average — the densest galactic-plane tiles stay under
+//! the ~3 M-row anonymous async cap (a level-3 tiling would not at this
+//! depth). The full ingest is ~900 M sources, ~3–4 days of TAP traffic.
 //!
 //! ## Persistent raw-CSV cache
 //!
@@ -23,7 +23,7 @@
 //!
 //! ## Quality filtering
 //!
-//! `phot_g_mean_mag < 16` is the only server-side filter (it bounds size).
+//! `phot_g_mean_mag < 19` is the only server-side filter (it bounds size).
 //! RUWE is projected but filtered **locally** at bin time in
 //! [`parse_gaia_csv_row`] against [`GAIA_RUWE_MAX`] — keeping it out of the
 //! `WHERE` clause makes the cached CSVs a full superset.
@@ -50,7 +50,7 @@ use super::healpix;
 pub const GAIA_TAP_ASYNC: &str = "https://gea.esac.esa.int/tap-server/tap/async";
 
 /// Magnitude cut (Gaia G, Vega) applied server-side.
-pub const GAIA_MAG_LIMIT: f32 = 16.0;
+pub const GAIA_MAG_LIMIT: f32 = 19.0;
 
 /// RUWE (Renormalised Unit Weight Error) ceiling, applied locally at bin
 /// time. Gaia DR3 sources with RUWE >= 1.4 have unreliable astrometric
@@ -62,13 +62,19 @@ pub const GAIA_MAG_LIMIT: f32 = 16.0;
 pub const GAIA_RUWE_MAX: f64 = 1.4;
 
 /// HEALPix level used to tile the `source_id` space for TAP extraction.
-pub const GAIA_HEALPIX_LEVEL: u32 = 3;
+///
+/// Level 5 (not 3) because at the `G < 19` depth a level-3 tile in the
+/// galactic plane would hold several million rows — past ESA's anonymous
+/// async per-query cap. Level 5 gives ~73 k rows/tile average and keeps the
+/// densest tiles comfortably under cap. (Tiling level only chunks the
+/// *download*; the binner always emits depth-6 HEALPix output regardless.)
+pub const GAIA_HEALPIX_LEVEL: u32 = 5;
 
-/// Number of nested HEALPix level-3 pixels: `12 · 4^3`.
-pub const GAIA_TILE_COUNT: u64 = 768;
+/// Number of nested HEALPix level-5 pixels: `12 · 4^5`.
+pub const GAIA_TILE_COUNT: u64 = 12_288;
 
-/// `source_id` span per level-3 tile: `2^35 · 4^(12−3)` = `2^53`.
-pub const SOURCE_ID_TILE_SPAN: u64 = 1 << 53;
+/// `source_id` span per level-5 tile: `2^35 · 4^(12−5)` = `2^49`.
+pub const SOURCE_ID_TILE_SPAN: u64 = 1 << 49;
 
 /// Concurrent in-flight TAP jobs. ESA publishes no hard scripted limit but
 /// asks users to be considerate; 3 is the documented fair-use ceiling and
@@ -105,7 +111,7 @@ pub enum GaiaProgress {
     Error(String),
 }
 
-/// Inclusive `source_id` range `[lo, hi]` covered by level-3 `tile`
+/// Inclusive `source_id` range `[lo, hi]` covered by level-5 `tile`
 /// (`0..GAIA_TILE_COUNT`). Tiles tile the `source_id` space contiguously.
 pub fn tile_source_id_range(tile: u64) -> (u64, u64) {
     let lo = tile * SOURCE_ID_TILE_SPAN;
@@ -113,7 +119,7 @@ pub fn tile_source_id_range(tile: u64) -> (u64, u64) {
     (lo, hi)
 }
 
-/// Build the ADQL for one level-3 tile: server-side magnitude cut + the
+/// Build the ADQL for one level-5 tile: server-side magnitude cut + the
 /// columns we need, constrained to the tile's `source_id` range (which is
 /// the spatial partition — `source_id BETWEEN` is primary-key indexed, so
 /// this is the fast form).
@@ -482,7 +488,7 @@ pub fn download_gaia_dr3(
                 }
                 let fetch = (|| -> Result<Vec<StarRecord>> {
                     // Cached CSV present → re-bin from disk, no TAP round-trip.
-                    let csv_path = raw_csv_dir.join(format!("tile_{tile:03}.csv"));
+                    let csv_path = raw_csv_dir.join(format!("tile_{tile:05}.csv"));
                     let csv = if csv_path.is_file() {
                         std::fs::read_to_string(&csv_path).with_context(|| {
                             format!("read cached tile CSV {}", csv_path.display())
@@ -571,7 +577,7 @@ pub fn download_gaia_dr3(
     Ok(written)
 }
 
-/// Full Gaia DR3 (G≤16) catalog setup. Idempotent (skips if
+/// Full Gaia DR3 (G≤19) catalog setup. Idempotent (skips if
 /// `catalogs/gaia_dr3/` already populated, mirroring
 /// [`super::tycho2::setup_tycho2_catalog`]); resumable via the tile
 /// manifest. Returns the catalog directory, auto-discovered by
@@ -611,23 +617,23 @@ mod tests {
     fn tile_range_partitions_source_id_space() {
         // Tile 0 starts at 0.
         assert_eq!(tile_source_id_range(0).0, 0);
-        // Span is exactly 2^53.
+        // Span is exactly 2^49 (level-5 tiling).
         let (lo0, hi0) = tile_source_id_range(0);
         assert_eq!(hi0 - lo0 + 1, SOURCE_ID_TILE_SPAN);
-        assert_eq!(SOURCE_ID_TILE_SPAN, 9_007_199_254_740_992);
+        assert_eq!(SOURCE_ID_TILE_SPAN, 562_949_953_421_312);
 
-        // Contiguous + non-overlapping across all 768 tiles.
+        // Contiguous + non-overlapping across all tiles.
         for t in 0..GAIA_TILE_COUNT - 1 {
             let (_, hi) = tile_source_id_range(t);
             let (next_lo, _) = tile_source_id_range(t + 1);
             assert_eq!(hi + 1, next_lo, "gap/overlap between tile {t} and {}", t + 1);
         }
 
-        // 768 tiles cover [0, 768·2^53).
+        // All tiles cover [0, GAIA_TILE_COUNT·SOURCE_ID_TILE_SPAN).
         let (last_lo, last_hi) = tile_source_id_range(GAIA_TILE_COUNT - 1);
         assert_eq!(last_lo, (GAIA_TILE_COUNT - 1) * SOURCE_ID_TILE_SPAN);
         assert_eq!(last_hi + 1, GAIA_TILE_COUNT * SOURCE_ID_TILE_SPAN);
-        // …and stay within the u64 source_id space (768·2^53 ≈ 6.9e18 < 2^63).
+        // …and stay within the u64 source_id space (12 288·2^49 = 12·2^59 < 2^63).
         assert!(GAIA_TILE_COUNT * SOURCE_ID_TILE_SPAN < (1u64 << 63));
     }
 
@@ -635,15 +641,16 @@ mod tests {
     fn adql_is_well_formed() {
         let q0 = tile_adql(0);
         assert!(q0.contains("FROM gaiadr3.gaia_source"));
-        assert!(q0.contains("phot_g_mean_mag < 16"));
+        assert!(q0.contains("phot_g_mean_mag < 19"));
+        // Tile 0 spans [0, 2^49 - 1].
         assert!(
-            q0.contains("source_id BETWEEN 0 AND 9007199254740991"),
+            q0.contains("source_id BETWEEN 0 AND 562949953421311"),
             "tile 0 range wrong: {q0}"
         );
-        // Tile 1's lower bound is exactly 2^53.
+        // Tile 1's lower bound is exactly 2^49.
         let q1 = tile_adql(1);
         assert!(
-            q1.contains("BETWEEN 9007199254740992 AND "),
+            q1.contains("BETWEEN 562949953421312 AND "),
             "tile 1 lower bound wrong: {q1}"
         );
         // The 5 stored columns plus ruwe (for the local quality cut).
@@ -798,8 +805,9 @@ mod tests {
     }
 
     #[test]
-    fn level3_has_768_pixels() {
-        // Nested HEALPix: 12 · 4^level.
+    fn tile_count_matches_healpix_level() {
+        // Nested HEALPix: 12 · 4^level. Level 5 → 12 288 tiles.
         assert_eq!(12 * 4u64.pow(GAIA_HEALPIX_LEVEL), GAIA_TILE_COUNT);
+        assert_eq!(GAIA_TILE_COUNT, 12_288);
     }
 }
