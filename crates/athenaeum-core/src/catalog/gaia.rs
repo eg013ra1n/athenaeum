@@ -5,13 +5,28 @@
 //! magnitude-partitioned — a G≤16 subset would still mean ~600 GB of
 //! transfer). Instead we extract via the ESA TAP **async** service, tiled by
 //! `source_id` range so the server filters `phot_g_mean_mag < 16` and
-//! projects only the 5 columns we store. Each tile is an independent,
-//! resumable checkpoint.
+//! projects `ra,dec,phot_g_mean_mag,pmra,pmdec,ruwe`. Each tile is an
+//! independent, resumable checkpoint.
 //!
 //! `source_id` encodes position: the HEALPix level-*n* index is
 //! `source_id / (2^35 · 4^(12−n))`. We tile at **level 3** (nested):
 //! `12 · 4^3 = 768` pixels, divisor `2^35 · 4^9 = 2^53`. At G≤16 that is
 //! ≈390 k rows/tile — comfortably under the 3 M-row anonymous async cap.
+//!
+//! ## Persistent raw-CSV cache
+//!
+//! Each tile's verbatim ESA CSV is kept forever in `<scratch>/raw_csv/`.
+//! Nothing deletes it. A re-run reads the cached CSV instead of re-querying
+//! TAP, so a re-bin (e.g. a changed [`GAIA_RUWE_MAX`] threshold or a record
+//! format change) costs zero ESA traffic. The expensive ~4–8 h download
+//! happens exactly once.
+//!
+//! ## Quality filtering
+//!
+//! `phot_g_mean_mag < 16` is the only server-side filter (it bounds size).
+//! RUWE is projected but filtered **locally** at bin time in
+//! [`parse_gaia_csv_row`] against [`GAIA_RUWE_MAX`] — keeping it out of the
+//! `WHERE` clause makes the cached CSVs a full superset.
 //!
 //! Output goes to `catalogs/gaia_dr3/` in the existing depth-6 HEALPix
 //! [`StarRecord`] format; [`crate::catalog::CatalogEngine::with_catalog_dir`]
@@ -36,6 +51,15 @@ pub const GAIA_TAP_ASYNC: &str = "https://gea.esac.esa.int/tap-server/tap/async"
 
 /// Magnitude cut (Gaia G, Vega) applied server-side.
 pub const GAIA_MAG_LIMIT: f32 = 16.0;
+
+/// RUWE (Renormalised Unit Weight Error) ceiling, applied locally at bin
+/// time. Gaia DR3 sources with RUWE >= 1.4 have unreliable astrometric
+/// solutions (typically unresolved binaries — the catalog position itself
+/// is biased) and are dropped at ingest. Rows with no RUWE value (Gaia
+/// 2-parameter solutions, which have no RUWE by construction) are kept — a
+/// missing RUWE is not a quality failure. Changing this threshold only
+/// requires re-binning the cached raw CSVs, never a re-download.
+pub const GAIA_RUWE_MAX: f64 = 1.4;
 
 /// HEALPix level used to tile the `source_id` space for TAP extraction.
 pub const GAIA_HEALPIX_LEVEL: u32 = 3;
@@ -90,13 +114,19 @@ pub fn tile_source_id_range(tile: u64) -> (u64, u64) {
 }
 
 /// Build the ADQL for one level-3 tile: server-side magnitude cut + the
-/// 5 columns we store, constrained to the tile's `source_id` range (which
-/// is the spatial partition — `source_id BETWEEN` is primary-key indexed,
-/// so this is the fast form).
+/// columns we need, constrained to the tile's `source_id` range (which is
+/// the spatial partition — `source_id BETWEEN` is primary-key indexed, so
+/// this is the fast form).
+///
+/// `ruwe` is projected so the raw CSV cache can be RUWE-filtered locally at
+/// bin time. RUWE is **not** filtered server-side on purpose: it is a
+/// per-star quality flag, not a size driver, so keeping it out of the
+/// `WHERE` makes the cached download a full superset — the RUWE threshold
+/// then becomes a local knob and changing it never needs a re-download.
 pub fn tile_adql(tile: u64) -> String {
     let (lo, hi) = tile_source_id_range(tile);
     format!(
-        "SELECT ra,dec,phot_g_mean_mag,pmra,pmdec FROM gaiadr3.gaia_source \
+        "SELECT ra,dec,phot_g_mean_mag,pmra,pmdec,ruwe FROM gaiadr3.gaia_source \
          WHERE phot_g_mean_mag < {} AND source_id BETWEEN {lo} AND {hi}",
         GAIA_MAG_LIMIT as u32
     )
@@ -258,8 +288,12 @@ pub fn fetch_job_csv(client: &reqwest::blocking::Client, job_url: &str) -> Resul
     })
 }
 
-/// Parse one TAP CSV line (`ra,dec,phot_g_mean_mag,pmra,pmdec`) into a
-/// [`StarRecord`]. Returns `None` for the header and malformed/short rows.
+/// Parse one TAP CSV line into a [`StarRecord`]. Returns `None` for the
+/// header, malformed/short rows, and rows that fail the RUWE quality cut.
+///
+/// Accepts both the 5-column legacy form (`ra,dec,phot_g_mean_mag,pmra,
+/// pmdec`) and the 6-column form with a trailing `ruwe` — so old cached
+/// CSVs and freshly-downloaded ones both parse.
 ///
 /// Gaia 2-parameter astrometric solutions have empty `pmra`/`pmdec`; those
 /// stars are still useful for matching, so a missing PM is treated as 0.
@@ -267,6 +301,10 @@ pub fn fetch_job_csv(client: &reqwest::blocking::Client, job_url: &str) -> Resul
 /// `phot_g_mean_mag < 16` filter already excludes null-G rows). `pmra` is
 /// Gaia μα\* (cos δ included) — stored as-is; this matches the Tycho-2 path
 /// and `cone_search`'s proper-motion expectation (asserted in Task 7).
+///
+/// RUWE cut: a present 6th column parsed to a value >= [`GAIA_RUWE_MAX`]
+/// drops the row. An absent or empty RUWE keeps the row (5-column input, or
+/// a 2-parameter Gaia solution that has no RUWE by construction).
 pub fn parse_gaia_csv_row(row: &str) -> Option<StarRecord> {
     let mut f = row.split(',');
     let ra: f64 = f.next()?.trim().parse().ok()?;
@@ -280,6 +318,19 @@ pub fn parse_gaia_csv_row(row: &str) -> Option<StarRecord> {
         "" => 0.0,
         s => s.parse().ok()?,
     };
+    // Optional 6th column: RUWE. Absent/empty → keep; present and bad → drop.
+    if let Some(ruwe) = f.next().and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            t.parse::<f64>().ok()
+        }
+    }) {
+        if ruwe >= GAIA_RUWE_MAX {
+            return None;
+        }
+    }
     Some(StarRecord::from_values(ra as f32, dec as f32, g, pmra, pmdec))
 }
 
@@ -386,6 +437,14 @@ pub fn download_gaia_dr3(
     let manifest_path = scratch_dir.join("done.manifest");
     let done = read_done_manifest(&manifest_path);
     let binner = HealpixBinner::open(&scratch_dir.join("bins"))?;
+    // Persistent raw-CSV cache: each tile's verbatim ESA CSV is kept here
+    // forever. Nothing deletes it (`finalize` only removes the per-pixel
+    // `bins/p_*.raw` scratch). The presence of `tile_NNN.csv` lets a re-run
+    // skip the slow TAP round-trip — so a re-bin (new RUWE threshold, format
+    // change) costs zero ESA traffic.
+    let raw_csv_dir = scratch_dir.join("raw_csv");
+    std::fs::create_dir_all(&raw_csv_dir)
+        .with_context(|| format!("create raw-csv cache {}", raw_csv_dir.display()))?;
     let client = tap_client()?;
 
     // `GAIA_CONCURRENCY` producer threads each pull tiles from a shared
@@ -412,7 +471,7 @@ pub fn download_gaia_dr3(
             let tx = tx.clone();
             let (next, first_err, cancel_flag) =
                 (Arc::clone(&next), Arc::clone(&first_err), Arc::clone(&cancel_flag));
-            let (client, done) = (&client, &done);
+            let (client, done, raw_csv_dir) = (&client, &done, &raw_csv_dir);
             s.spawn(move || loop {
                 let tile = next.fetch_add(1, Ordering::Relaxed);
                 if tile >= GAIA_TILE_COUNT || cancel_flag.load(Ordering::Relaxed) {
@@ -422,9 +481,29 @@ pub fn download_gaia_dr3(
                     continue;
                 }
                 let fetch = (|| -> Result<Vec<StarRecord>> {
-                    let job = submit_tap_job(client, &tile_adql(tile))?;
-                    poll_job(client, &job, &cancel_flag)?;
-                    let csv = fetch_job_csv(client, &job)?;
+                    // Cached CSV present → re-bin from disk, no TAP round-trip.
+                    let csv_path = raw_csv_dir.join(format!("tile_{tile:03}.csv"));
+                    let csv = if csv_path.is_file() {
+                        std::fs::read_to_string(&csv_path).with_context(|| {
+                            format!("read cached tile CSV {}", csv_path.display())
+                        })?
+                    } else {
+                        let job = submit_tap_job(client, &tile_adql(tile))?;
+                        poll_job(client, &job, &cancel_flag)?;
+                        let fetched = fetch_job_csv(client, &job)?;
+                        // Persist the raw CSV before parsing, so future
+                        // rebuilds never re-download. Temp-then-rename so a
+                        // crash mid-write cannot leave a truncated file that
+                        // looks complete.
+                        let tmp = csv_path.with_extension("csv.partial");
+                        std::fs::write(&tmp, &fetched).with_context(|| {
+                            format!("write cached tile CSV {}", tmp.display())
+                        })?;
+                        std::fs::rename(&tmp, &csv_path).with_context(|| {
+                            format!("commit cached tile CSV {}", csv_path.display())
+                        })?;
+                        fetched
+                    };
                     Ok(csv.lines().filter_map(parse_gaia_csv_row).collect())
                 })();
                 match fetch {
@@ -567,8 +646,10 @@ mod tests {
             q1.contains("BETWEEN 9007199254740992 AND "),
             "tile 1 lower bound wrong: {q1}"
         );
-        // Only the 5 stored columns are projected.
-        assert!(q0.starts_with("SELECT ra,dec,phot_g_mean_mag,pmra,pmdec FROM"));
+        // The 5 stored columns plus ruwe (for the local quality cut).
+        assert!(q0.starts_with("SELECT ra,dec,phot_g_mean_mag,pmra,pmdec,ruwe FROM"));
+        // RUWE is projected but NOT filtered server-side.
+        assert!(!q0.contains("ruwe <") && !q0.contains("ruwe<"));
     }
 
     #[test]
@@ -590,6 +671,14 @@ mod tests {
         // Short/garbage rows → None.
         assert!(parse_gaia_csv_row("1.0,2.0").is_none());
         assert!(parse_gaia_csv_row("").is_none());
+        // 6-column form with a good RUWE → kept.
+        let s3 = parse_gaia_csv_row("12.0,34.0,13.0,1.1,2.2,1.05").expect("good-ruwe row");
+        assert!((s3.mag() - 13.0).abs() < 1e-3);
+        // 6-column form with RUWE >= 1.4 → dropped (unreliable astrometry).
+        assert!(parse_gaia_csv_row("12.0,34.0,13.0,1.1,2.2,1.40").is_none());
+        assert!(parse_gaia_csv_row("12.0,34.0,13.0,1.1,2.2,3.7").is_none());
+        // 6-column form with empty RUWE (2-param solution) → kept.
+        assert!(parse_gaia_csv_row("12.0,34.0,13.0,,,").is_some());
     }
 
     #[test]
