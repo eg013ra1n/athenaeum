@@ -149,9 +149,10 @@ pub fn solve_frame_with_hints(
 
     let sma_cfg = SolveConfig {
         quad_tolerance: 0.007,
-        catalog_mag_limit: 18.0,
+        catalog_mag_limit: 19.0,
         fit_sip: true,
         sip_order: config.sip_order,
+        print_timing: false,
     };
 
     let solution = solvemyastro::solve(
