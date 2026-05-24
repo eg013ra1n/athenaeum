@@ -1,5 +1,6 @@
 pub mod binary_format;
 pub mod gaia;
+pub mod gaia_bulk;
 pub mod gaia_prebuilt;
 pub mod healpix;
 pub mod tycho2;

@@ -23,6 +23,7 @@ rustafits = { path = "../../rustafits", features = ["debug-pipeline"] }
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.
 solvemyastro = { path = "../../solvemyastro" }
 sha2 = "0.10"
+md-5 = "0.10"
 jpeg-encode = { path = "../jpeg-encode" }
 memmap2 = "0.9"
 byteorder = "1"
