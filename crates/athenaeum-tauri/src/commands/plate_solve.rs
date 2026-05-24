@@ -17,6 +17,62 @@ use super::AppState;
 
 // ── solvemyastro star-cache helpers ─────────────────────────────────────────
 
+/// Resolve and open the optional bright sub-catalog. Honours an explicit
+/// `PlateSolveConfig::bright_cache_path` if set; otherwise tries the
+/// convention path `<app-data>/catalogs/smac_gaia_bright/`. Returns
+/// `None` (with a log line) if neither exists — never fatal: the
+/// solver falls back to the deep cache.
+fn require_bright_cache(state: &AppState) -> Option<Arc<solvemyastro::StarCache>> {
+    // Fast path: already open.
+    {
+        let guard = state.ctx.bright_cache.read().unwrap();
+        if let Some(ref bc) = *guard {
+            return Some(bc.clone());
+        }
+    }
+
+    let db = state.ctx.db.get()?;
+    let ps_config = config::load_config(&db.conn());
+
+    // Resolve candidate path: explicit config override > convention.
+    let cache_dir: std::path::PathBuf = match &ps_config.bright_cache_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let db_path = db.path().to_path_buf();
+            let parent = db_path.parent()?;
+            parent.join("catalogs").join("smac_gaia_bright")
+        }
+    };
+
+    if !cache_dir.exists() {
+        eprintln!(
+            "plate_solve: no bright sub-catalog at {} — using deep cache only",
+            cache_dir.display()
+        );
+        return None;
+    }
+    match solvemyastro::StarCache::open(&cache_dir) {
+        Ok(bc) => {
+            let arc = Arc::new(bc);
+            eprintln!(
+                "plate_solve: opened bright sub-catalog at {} ({} stars)",
+                cache_dir.display(),
+                arc.star_count()
+            );
+            let mut guard = state.ctx.bright_cache.write().unwrap();
+            *guard = Some(arc.clone());
+            Some(arc)
+        }
+        Err(e) => {
+            eprintln!(
+                "plate_solve: failed to open bright cache at {}: {e} — using deep only",
+                cache_dir.display()
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the smac_gaia star-cache directory from the app-data catalogs dir,
 /// open `StarCache`, cache it in state, and return an `Arc` to it.
 ///
@@ -172,12 +228,15 @@ pub async fn plate_solve_frame(
 
     let ps_config = config::load_config(&conn);
     let star_cache = require_star_cache(&state)?;
+    let bright_cache = require_bright_cache(&state);
     let dso = get_dso_catalog(&state);
 
     let (frame, file_path) = load_frame_with_path(&conn, frame_id)?;
 
-    let result = service::solve_frame(
-        &frame, &file_path, &conn, &star_cache, &ps_config,
+    let result = service::solve_frame_tiered(
+        &frame, &file_path, &conn, &star_cache,
+        bright_cache.as_deref(),
+        &ps_config,
     )
     .map_err(|e| e.to_string())?;
 
@@ -196,11 +255,12 @@ pub async fn plate_solve_batch(
     frame_ids: Vec<i64>,
 ) -> Result<(), String> {
     // ── Phase 1: load everything on the main thread (holds DB lock) ──
-    let (ps_config, star_cache, dso, cancel_flag, work_items) = {
+    let (ps_config, star_cache, bright_cache, dso, cancel_flag, work_items) = {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
         let ps_config = Arc::new(config::load_config(&conn));
         let star_cache = require_star_cache(&state)?;
+        let bright_cache = require_bright_cache(&state);
         let dso = get_dso_catalog(&state);
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
@@ -235,7 +295,7 @@ pub async fn plate_solve_batch(
             }
         }
 
-        (ps_config, star_cache, dso, cancel_flag, work_items)
+        (ps_config, star_cache, bright_cache, dso, cancel_flag, work_items)
     };
 
     let total = work_items.len();
@@ -261,6 +321,7 @@ pub async fn plate_solve_batch(
     let cancel_worker = Arc::clone(&cancel_flag);
     let ps_config_arc = Arc::clone(&ps_config);
     let star_cache_arc = Arc::clone(&star_cache);
+    let bright_cache_arc = bright_cache.clone();
 
     let results: Vec<WorkResult> = tokio::task::spawn_blocking(move || {
         let work = Mutex::new(work_items.into_iter());
@@ -318,6 +379,7 @@ pub async fn plate_solve_batch(
                                     &file_path,
                                     &hints,
                                     star_cache_arc.as_ref(),
+                                    bright_cache_arc.as_deref(),
                                     ps_config_arc.as_ref(),
                                     Some(cancel_worker.as_ref()),
                                 )

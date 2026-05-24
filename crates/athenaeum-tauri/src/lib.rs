@@ -75,6 +75,7 @@ pub fn run() {
                     quad_index: Arc::new(std::sync::RwLock::new(None)),
                     dso_catalog: Arc::new(std::sync::RwLock::new(None)),
                     star_cache: Arc::new(std::sync::RwLock::new(None)),
+                    bright_cache: Arc::new(std::sync::RwLock::new(None)),
                     image_pool: Arc::new(
                         rayon::ThreadPoolBuilder::new()
                             .num_threads(max_threads)

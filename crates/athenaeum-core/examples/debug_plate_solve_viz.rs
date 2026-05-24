@@ -199,6 +199,7 @@ fn main() -> anyhow::Result<()> {
         &file_path,
         &hints,
         &cache,
+        None, // bright_cache — not configured for this debug tool
         &ps_config,
         None,
     );

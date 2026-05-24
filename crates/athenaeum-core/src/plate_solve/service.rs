@@ -116,19 +116,41 @@ pub fn solve_frame(
     cache: &StarCache,
     config: &PlateSolveConfig,
 ) -> Result<SolveResult> {
+    solve_frame_tiered(frame, file_path, conn, cache, None, config)
+}
+
+/// Variant of [`solve_frame`] that also accepts an optional bright
+/// sub-catalog. When `Some`, the solvemyastro backend uses
+/// `Caches::tiered(cache, bright)` for fast quad matching with
+/// auto-fallback to `cache` on under-population. When `None`, behaves
+/// identically to [`solve_frame`].
+pub fn solve_frame_tiered(
+    frame: &Frame,
+    file_path: &str,
+    conn: &Connection,
+    cache: &StarCache,
+    bright_cache: Option<&StarCache>,
+    config: &PlateSolveConfig,
+) -> Result<SolveResult> {
     let hints = extract_hints(frame, Some(conn));
-    solve_frame_with_hints(frame, file_path, &hints, cache, config, None)
+    solve_frame_with_hints(frame, file_path, &hints, cache, bright_cache, config, None)
 }
 
 /// Solve a single frame using pre-extracted hints and the `solvemyastro`
 /// star-cache backend. This is the hot-path function used by the batch
 /// worker pool — it is DB-free, fully `Send`, and shares read-only
 /// cache/config state across threads.
+///
+/// `bright_cache` is the optional bright sub-catalog (`G<16` hybrid build).
+/// When `Some`, quad matching uses it first with auto-fallback to `cache`
+/// for sparse cones. When `None`, all queries hit `cache` (pre-bright
+/// behaviour).
 pub fn solve_frame_with_hints(
     frame: &Frame,
     file_path: &str,
     hints: &SolveHints,
     cache: &StarCache,
+    bright_cache: Option<&StarCache>,
     config: &PlateSolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveResult> {
@@ -156,10 +178,14 @@ pub fn solve_frame_with_hints(
         ..SolveConfig::default()
     };
 
+    let caches = match bright_cache {
+        Some(b) => solvemyastro::Caches::tiered(cache, b),
+        None    => solvemyastro::Caches::deep_only(cache),
+    };
     let solution = solvemyastro::solve(
         std::path::Path::new(file_path),
         &sma_hints,
-        cache,
+        &caches,
         &sma_cfg,
         cancel,
     )

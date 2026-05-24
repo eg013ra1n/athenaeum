@@ -70,6 +70,12 @@ pub struct ServiceContext {
     /// subdir of the app-data catalogs dir). If the file is absent the solve
     /// command returns an actionable error.
     pub star_cache: Arc<RwLock<Option<Arc<solvemyastro::StarCache>>>>,
+    /// Optional bright sub-catalog (G<16 hybrid floor + density top-up;
+    /// built via `solvemyastro build-bright-cache`). When present, the
+    /// plate-solve hot path uses it for fast quad matching with
+    /// auto-fallback to `star_cache`. `None` if no bright cache is
+    /// available — production runs on the deep cache alone.
+    pub bright_cache: Arc<RwLock<Option<Arc<solvemyastro::StarCache>>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
     /// Single serialized worker queue shared by ZIP archive + file ops.
     /// Created at startup; lives for the process lifetime.

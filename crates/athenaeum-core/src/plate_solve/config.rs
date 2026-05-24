@@ -135,6 +135,14 @@ pub struct PlateSolveConfig {
     /// Empty default → behaviour unchanged.
     #[serde(default)]
     pub camera_defaults: HashMap<String, f64>,
+    /// Path to the optional bright sub-catalog used by the solvemyastro
+    /// backend for fast quad matching (G<14 stars with per-HEALPix-cell
+    /// density top-up; see `solvemyastro build-bright-cache`). When
+    /// `None` or absent, solvemyastro uses only the deep catalog — same
+    /// behaviour as before the bright path existed. The verify stage
+    /// always uses the deep catalog regardless of this setting.
+    #[serde(default)]
+    pub bright_cache_path: Option<String>,
 }
 
 fn default_max_image_stars() -> usize { 300 }
@@ -188,6 +196,7 @@ impl Default for PlateSolveConfig {
             blind_scale_header_tol: default_blind_scale_header_tol(),
             solver_backend: default_solver_backend(),
             camera_defaults: HashMap::new(),
+            bright_cache_path: None,
         }
     }
 }
