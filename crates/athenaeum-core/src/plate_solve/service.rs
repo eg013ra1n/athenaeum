@@ -153,6 +153,7 @@ pub fn solve_frame_with_hints(
         fit_sip: true,
         sip_order: config.sip_order,
         print_timing: false,
+        ..SolveConfig::default()
     };
 
     let solution = solvemyastro::solve(
