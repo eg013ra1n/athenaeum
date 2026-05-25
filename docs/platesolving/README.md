@@ -127,6 +127,91 @@ Verified star counts within a 1.7° cone around three reference sky regions (cov
 
 Rule of thumb: if bright stars in your image saturate (common for 180 s+ OSC exposures of dense fields), you need a deeper index because the detector's top-N is shifted down into the mag 9–13 range that the old mag-11 index did not cover.
 
+## Tiered Star Cache (Bright + Deep, 2026-05)
+
+> Applies to the `solvemyastro` Gaia-DR3 pipeline that has replaced the legacy Tycho-2 `CatalogEngine` + `QuadIndex` flow in `solve_frame_with_hints`. The older sections above describe the original blind-index design and remain accurate for the Tycho-2 path; the parts that refer to a single `CatalogEngine` are superseded for the Gaia pipeline by the two-cache model below.
+
+The hot path now consults **two on-disk star caches**, not one:
+
+| Cache | Convention path | Depth | Size | Used by |
+| ---- | ---- | ---- | ---- | ---- |
+| **Deep** | `<app-data>/catalogs/smac_gaia/` | Gaia DR3 G<19 | ~540 M stars | Verify stage (always) + quad-matching cone when no bright cache is configured **or** when the bright cone is too sparse |
+| **Bright** (optional) | `<app-data>/catalogs/smac_gaia_bright/` | Hybrid (see below) | ~70.5 M stars (~2.6 GB) | Quad-matching cone, tried *first* |
+
+Both are produced by `solvemyastro`'s SMAC writer. They are independent files — the bright cache is *derived* from the deep cache via the `build-bright-cache` subcommand, not from raw Gaia ingest.
+
+### Hybrid build algorithm
+
+Per HEALPix-6 cell (49,152 cells across the sky), the bright cache is filled with:
+
+1. **Floor** — every star with `mag < bright_floor` (athenaeum ships with floor = **16**).
+2. **Top-up** — if the floor count is below `target_density` (default 100), append the next-brightest stars (continuing past the floor up to the deep cache's G<19 ceiling) until reaching the target *or* exhausting the cell.
+3. **No hard ceiling** — Milky-Way-plane cells keep all 500+ bright stars; sparse polar cells get e.g. 30 floor + 70 top-up = 100.
+
+Net effect: bright-rich regions get a true G<16 sub-cache, sparse regions get an opportunistic density-100 sub-cache. The bright cache never goes deeper than its source (G<19), so the deepest "top-up" star is around G≈19, not G≈21.
+
+### Why floor=16 (and not the CLI default of 14)
+
+The `build-bright-cache` CLI defaults `--bright-floor` to 14, but athenaeum's documented build command uses **16**:
+
+```bash
+solvemyastro build-bright-cache --from <smac_gaia> --out <smac_gaia_bright> \
+    --bright-floor 16 --target-density 100 --mode hybrid
+```
+
+Reasoning: typical user exposures (120–300 s OSC subs) detect down to m ≈ 14–16. A floor=14 bright cache would simply have no catalog counterpart for the dimmer half of the detections, the quad-matching cone would fall under threshold on most cells, and the auto-fallback would punt every cone to the deep cache anyway — wiping out the speedup. Floor=16 aligns the cache with what the cameras actually see while still being **7.7× smaller** than the deep G<19 (70.5 M vs 540 M).
+
+### Auto-fallback rule
+
+In `solvemyastro::orchestrate::cone_for_quad_match`:
+
+1. If a bright cache is configured, the quad-matching cone is queried against it first.
+2. If the cone returns **≥ `SolveConfig::bright_fallback_threshold` (default 30)** stars, those are used.
+3. Otherwise the same cone is retried against the deep cache and *those* stars are used instead.
+
+The fallback returns one set, never a union. The deep cache is therefore always reachable as a safety net for HEALPix singular caps or other geometric degeneracies.
+
+### Verify stage is deep-only
+
+The Bayesian log-odds gate in `solvemyastro::verify` needs `NR = true number of catalog stars in the FOV` to score solves correctly. Using the thinned bright cache there would inflate the log-odds and admit false solves, so the verify cone is hard-coded to the deep cache regardless of whether a bright cache is configured. **Only quad matching is tiered.**
+
+### Athenaeum integration
+
+Plumbing added in `feat(plate_solve): bright sub-catalog integration` (2026-05-25):
+
+| Layer | Change |
+| ---- | ---- |
+| `athenaeum-core` | `PlateSolveConfig::bright_cache_path: Option<String>` (serde default `None` — old configs deserialize unchanged). `ServiceContext::bright_cache: Arc<RwLock<Option<Arc<StarCache>>>>`. New `service::solve_frame_tiered` convenience + a `bright_cache: Option<&StarCache>` parameter on `solve_frame_with_hints` (`None` = pre-bright behaviour). |
+| `athenaeum-tauri` / `athenaeum-web` | `require_bright_cache(state) -> Option<Arc<StarCache>>` helper, mirroring `require_star_cache`. Resolution order: explicit `PlateSolveConfig::bright_cache_path` → convention path `<app-data>/catalogs/smac_gaia_bright/`. Cache is opened once per process and stashed in `ServiceContext`. Single-frame and batch entry points open it once and pass it through. |
+
+Cache opening is **best-effort and never fatal**: a missing directory logs `plate_solve: no bright sub-catalog at <path> — using deep cache only` and the solve continues against the deep cache. A corrupt cache logs the open error and likewise falls back.
+
+### Measured impact
+
+Corpus_bench, 19 frames, M1:
+
+| Metric | Deep-only | Tiered (bright + deep) |
+| ---- | ---- | ---- |
+| Truth-matched | 14/14 | **14/14** (no regression) |
+| Successful solves | 19/19 | **19/19** |
+| Wrong-position solves | 0 | **0** |
+| Wall-clock total | 52.4 s | **19.66 s (−62 %)** |
+| Typical hinted solve | ~1700 ms | **~230 ms (−86 %)** |
+| Slowest blind solve | ~12 s | **~5 s** |
+
+### One-time build
+
+```bash
+solvemyastro build-bright-cache \
+    --from   <app-data>/catalogs/smac_gaia \
+    --out    <app-data>/catalogs/smac_gaia_bright \
+    --bright-floor 16 --target-density 100 --mode hybrid
+```
+
+~5 minutes on M1. Produces `stars.smac` plus a sidecar `bright.meta.json` recording `source_smac_size`, `source_epoch`, `bright_floor`, `target_density`, `mode`, `output_star_count` for stale-cache debugging.
+
+`--mode` accepts `hybrid` (default; the algorithm above), `floor-only` (skip the density top-up), or `cap-only` (no floor, just take the brightest `target_density` per cell). Production uses `hybrid`.
+
 ## Per-Frame Pipeline
 
 The solver entry point is `athenaeum_core::plate_solve::service::solve_frame()`.
@@ -522,6 +607,18 @@ These items are explicitly out of scope for the current blind solver and are pla
 - **Auto re-cluster solved frames into correct frame sets** — see Known Failure Modes above.
 
 ## Changelog
+
+### 2026-05 — Bright sub-catalog (tiered Gaia caches)
+
+Catalog separation for the solvemyastro/Gaia pipeline. Full detail in the [Tiered Star Cache](#tiered-star-cache-bright--deep-2026-05) section above.
+
+- **New optional second cache** at `<app-data>/catalogs/smac_gaia_bright/`, ~70.5 M stars (~2.6 GB) — derived from the deep G<19 cache via a per-HEALPix-cell hybrid algorithm (floor `mag < 16` + density top-up to 100).
+- **Athenaeum picks it up automatically** via the convention path, or via the new `PlateSolveConfig::bright_cache_path` setting. Missing/corrupt is non-fatal; the solver falls back to deep-only and logs a warning.
+- **Quad-matching cone tries bright first**, auto-falls-back to deep when the cone returns fewer than `SolveConfig::bright_fallback_threshold = 30` stars. **Verify always uses deep** (Bayesian NR correctness).
+- **Why floor=16 (not the CLI default 14):** typical 120–300 s exposures detect to m ≈ 14–16, so a floor=14 cache would force the auto-fallback on most cells and erase the speedup.
+- **Measured:** corpus_bench wall 52.4 s → **19.66 s (−62 %)**, 14/14 truth, 19/19 solves, 0 wrong.
+- **New API:** `solvemyastro::Caches<'a> { deep, bright: Option<&StarCache> }`; `solve()` signature now takes `&Caches<'_>` instead of `&StarCache`. Athenaeum-side: `service::solve_frame_tiered`, `solve_frame_with_hints(bright_cache: Option<&StarCache>, …)`, `ServiceContext::bright_cache`.
+- **Build once:** `solvemyastro build-bright-cache --from <smac_gaia> --out <smac_gaia_bright> --bright-floor 16 --target-density 100 --mode hybrid` (~5 min, writes a sidecar `bright.meta.json`).
 
 ### 2026-04 — Phase 4 + mag-13 default
 
