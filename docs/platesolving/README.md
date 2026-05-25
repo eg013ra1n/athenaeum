@@ -122,8 +122,8 @@ Verified star counts within a 1.7° cone around three reference sky regions (cov
 | Region | mag ≤ 11 | mag ≤ 12 | mag ≤ 12.5 | mag ≤ 13.0 | mag ≤ 14 |
 | ---- | ---- | ---- | ---- | ---- | ---- |
 | Barnard 150 (Cepheus) | 551 | 1,176 | 1,406 | 1,455 | 1,463 |
-| Orion                 | 558 |   912 |   986 |   996 |   996 |
-| Galactic centre       | 785 | 1,684 | 1,857 | 1,872 | 1,873 |
+| Orion | 558 | 912 | 986 | 996 | 996 |
+| Galactic centre | 785 | 1,684 | 1,857 | 1,872 | 1,873 |
 
 Rule of thumb: if bright stars in your image saturate (common for 180 s+ OSC exposures of dense fields), you need a deeper index because the detector's top-N is shifted down into the mag 9–13 range that the old mag-11 index did not cover.
 
@@ -254,10 +254,12 @@ The solver keeps only the `(x, y, flux)` triples. Detection is capped at `max(re
 The solver **does not use `max_image_stars` directly**. Instead it runs up to 4 attempts in increasing size from `config.retry_passes` (default `[50, 150, 300, 600]`). Each pass builds its own image quads from the brightest N detected stars and runs the full hash-lookup → scale-filter → per-candidate verify cycle below. The first pass that meets the density-aware acceptance gate wins and the loop short-circuits.
 
 Rationale:
+
 - The 50-star preamble targets dense galactic-plane fields where only the very brightest detected stars reliably match indexed stars.
 - Passes 2–4 back off to progressively larger star sets, catching sparse/dim fields and long-exposure frames where bright stars have saturated and were excluded by the detector.
 
 Typical outcomes:
+
 - Sparse high-galactic-latitude field → pass 1 solves with 100+ inliers in < 500 ms.
 - Dense Milky Way field → needs pass 3 (300 stars) for enough real nearest-neighbour overlap with the deep catalog.
 
