@@ -1,45 +1,29 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Save, RotateCw, CheckCircle, AlertCircle, Package, Download, Database } from 'lucide-react';
+import { Save, RotateCw, CheckCircle, AlertCircle, Package, Download } from 'lucide-react';
 import { api } from '../../api';
 import type {
   PlateSolveConfig,
   CatalogStatusInfo,
   CatalogDownloadProgress,
-  QuadIndexStatus,
-  QuadIndexProgressEvent,
 } from '../../types/plate-solve';
 
-// Fallback default shown while loading, matching backend defaults.
+// Fallback default shown while loading, matching backend defaults. The full
+// config object is replaced by `get_plate_solve_config` on mount; saves spread
+// the loaded object, so backend-only fields (blind-gate thresholds, bright
+// cache path) round-trip untouched even though they're not typed here.
 const DEFAULT_CONFIG: PlateSolveConfig = {
-  max_image_stars: 300,
-  min_matched_stars: 6,
-  verification_tolerance_px: 10.0,
-  index_mag_limit: 13.0,
-  hash_tolerance: 0.005,
   sip_order: 3,
-  use_fast_detection: true,
   autofind_tolerance_deg: 0.5,
-  min_inlier_ratio: 0.10,
-  retry_passes: [50, 150, 300, 600],
   base_verification_tolerance_arcsec: 8.0,
-  fallback_to_blind_scale: true,
 };
 
-// Static metadata for catalogs that are not dynamically fetched.
-const GAIA_CATALOG_META: CatalogStatusInfo = {
-  name: 'Gaia DR3',
+// Fallback metadata shown before `get_catalog_status` resolves (or if it fails).
+const STAR_CATALOG_FALLBACK: CatalogStatusInfo = {
+  name: 'Gaia DR3 (stars.smac)',
   installed: false,
   epoch: 2016,
-  star_count_approx: 300_000_000,
-  mag_limit: 16.0,
-};
-
-const TYCHO2_FALLBACK_META: CatalogStatusInfo = {
-  name: 'Tycho-2',
-  installed: false,
-  epoch: 2000,
-  star_count_approx: 2539913,
-  mag_limit: 12.5,
+  star_count_approx: 0,
+  mag_limit: 19.0,
 };
 
 function formatStarCount(n: number): string {
@@ -59,13 +43,6 @@ function formatElapsed(ms: number): string {
   return `${sec}s`;
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
-  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
-  if (bytes >= 1_024) return `${(bytes / 1_024).toFixed(0)} KB`;
-  return `${bytes} B`;
-}
-
 export function PlateSolveSettingsPanel() {
   const [config, setConfig] = useState<PlateSolveConfig>(DEFAULT_CONFIG);
   const [loading, setLoading] = useState(true);
@@ -77,27 +54,18 @@ export function PlateSolveSettingsPanel() {
   const [catalogs, setCatalogs] = useState<CatalogStatusInfo[]>([]);
   const [catalogsLoading, setCatalogsLoading] = useState(true);
   const [downloading, setDownloading] = useState(false);
-  const [downloadKind, setDownloadKind] = useState<'tycho2' | 'gaia' | 'gaia-prebuilt' | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<CatalogDownloadProgress | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloadStartedAt, setDownloadStartedAt] = useState<number | null>(null);
   const [nowTs, setNowTs] = useState<number>(() => Date.now());
 
-  // Quad index state
-  const [quadIndexStatus, setQuadIndexStatus] = useState<QuadIndexStatus | null>(null);
-  const [quadIndexLoading, setQuadIndexLoading] = useState(true);
-  const [buildingIndex, setBuildingIndex] = useState(false);
-  const [indexBuildProgress, setIndexBuildProgress] = useState<QuadIndexProgressEvent | null>(null);
-  const [indexBuildError, setIndexBuildError] = useState<string | null>(null);
-
   useEffect(() => {
     loadConfig();
     loadCatalogStatus();
-    loadQuadIndexStatus();
   }, []);
 
   // Tick once a second while a catalog download is active so the elapsed
-  // timer keeps moving even during the long first-tile wait (liveness).
+  // timer keeps moving even during the long first wait (liveness).
   useEffect(() => {
     if (!downloading) return;
     const id = setInterval(() => setNowTs(Date.now()), 1000);
@@ -154,146 +122,63 @@ export function PlateSolveSettingsPanel() {
       setCatalogs(result);
     } catch (err) {
       console.error('Failed to load catalog status:', err);
-      // On error fall back to an empty list — the UI will show the download button
+      // On error fall back to an empty list — the UI shows the download button.
       setCatalogs([]);
     } finally {
       setCatalogsLoading(false);
     }
   };
 
-  const loadQuadIndexStatus = async () => {
-    try {
-      setQuadIndexLoading(true);
-      const result = await api.invoke<QuadIndexStatus>('get_quad_index_status');
-      setQuadIndexStatus(result);
-    } catch (err) {
-      console.error('Failed to load quad index status:', err);
-      setQuadIndexStatus(null);
-    } finally {
-      setQuadIndexLoading(false);
-    }
-  };
-
-  // Shared download driver for both catalogs — identical flow, only the
-  // backend command differs. Both emit the same `catalog-download-progress`
-  // event; `downloadKind` scopes the progress UI to the active card.
-  const runCatalogDownload = useCallback(
-    async (kind: 'tycho2' | 'gaia' | 'gaia-prebuilt') => {
-      setDownloadKind(kind);
-      setDownloading(true);
-      setDownloadError(null);
-      setDownloadProgress(null);
-      setDownloadStartedAt(Date.now());
-      setNowTs(Date.now());
-
-      // Track whether the operation ended via a phase event so we know
-      // whether to clean up the listener ourselves.
-      let resolvedViaEvent = false;
-      let unlisten: (() => void) | null = null;
-      try {
-        unlisten = await api.listen<CatalogDownloadProgress>('catalog-download-progress', (payload) => {
-          setDownloadProgress(payload);
-          if (payload.phase === 'complete') {
-            resolvedViaEvent = true;
-            setDownloading(false);
-            setDownloadProgress(null);
-            setDownloadKind(null);
-            setDownloadStartedAt(null);
-            unlisten?.();
-            loadCatalogStatus();
-          } else if (payload.phase === 'error') {
-            resolvedViaEvent = true;
-            setDownloading(false);
-            setDownloadProgress(null);
-            setDownloadKind(null);
-            setDownloadStartedAt(null);
-            setDownloadError('Download failed. Please check your connection and try again.');
-            unlisten?.();
-          }
-        });
-        await api.invoke(
-          kind === 'tycho2'
-            ? 'download_tycho2_catalog'
-            : kind === 'gaia-prebuilt'
-              ? 'download_gaia_dr3_prebuilt_catalog'
-              : 'download_gaia_dr3_catalog',
-        );
-        // The invoke resolves only once the whole command finished OK. If we
-        // never saw a terminal 'complete'/'error' event (e.g. the catalog
-        // was already installed → backend returns immediately with no
-        // progress), resolve the UI here so the spinner can't hang forever.
-        if (!resolvedViaEvent) {
-          setDownloading(false);
-          setDownloadProgress(null);
-          setDownloadKind(null);
-          setDownloadStartedAt(null);
-          unlisten?.();
-          loadCatalogStatus();
-        }
-      } catch (err) {
-        console.error(`Failed to start ${kind} download:`, err);
-        setDownloadError(String(err));
-        setDownloading(false);
-        setDownloadProgress(null);
-        setDownloadKind(null);
-        setDownloadStartedAt(null);
-        if (!resolvedViaEvent) {
-          unlisten?.();
-        }
-      }
-    },
-    [],
-  );
-
-  const handleDownloadTycho2 = useCallback(
-    () => runCatalogDownload('tycho2'),
-    [runCatalogDownload],
-  );
-  const handleDownloadGaia = useCallback(
-    () => runCatalogDownload('gaia'),
-    [runCatalogDownload],
-  );
-  const handleDownloadGaiaPrebuilt = useCallback(
-    () => runCatalogDownload('gaia-prebuilt'),
-    [runCatalogDownload],
-  );
-
-  const handleBuildQuadIndex = useCallback(async () => {
-    setBuildingIndex(true);
-    setIndexBuildError(null);
-    setIndexBuildProgress(null);
+  // Download the prebuilt solver star catalog (`stars.smac`). Emits the shared
+  // `catalog-download-progress` event; the invoke resolves when the whole
+  // command finishes (the catalog may already be present → no progress).
+  const downloadStarCatalog = useCallback(async () => {
+    setDownloading(true);
+    setDownloadError(null);
+    setDownloadProgress(null);
+    setDownloadStartedAt(Date.now());
+    setNowTs(Date.now());
 
     let resolvedViaEvent = false;
     let unlisten: (() => void) | null = null;
     try {
-      // Persist the current config (including index_mag_limit) BEFORE
-      // starting the rebuild — the backend reads the saved config when
-      // it builds, so changes made in the inline control wouldn't take
-      // effect otherwise.
-      await api.invoke('set_plate_solve_config', { config });
-
-      unlisten = await api.listen<QuadIndexProgressEvent>('quad-index-progress', (payload) => {
-        setIndexBuildProgress(payload);
+      unlisten = await api.listen<CatalogDownloadProgress>('catalog-download-progress', (payload) => {
+        setDownloadProgress(payload);
         if (payload.phase === 'complete') {
           resolvedViaEvent = true;
+          setDownloading(false);
+          setDownloadProgress(null);
+          setDownloadStartedAt(null);
           unlisten?.();
-          // Status will be refreshed after the invoke resolves
+          loadCatalogStatus();
+        } else if (payload.phase === 'error') {
+          resolvedViaEvent = true;
+          setDownloading(false);
+          setDownloadProgress(null);
+          setDownloadStartedAt(null);
+          setDownloadError('Download failed. Please check your connection and try again.');
+          unlisten?.();
         }
       });
-
-      const status = await api.invoke<QuadIndexStatus>('build_quad_index');
-      setQuadIndexStatus(status);
+      await api.invoke('download_gaia_dr3_prebuilt_catalog');
+      if (!resolvedViaEvent) {
+        setDownloading(false);
+        setDownloadProgress(null);
+        setDownloadStartedAt(null);
+        unlisten?.();
+        loadCatalogStatus();
+      }
     } catch (err) {
-      console.error('Failed to build quad index:', err);
-      setIndexBuildError(String(err));
-    } finally {
-      setBuildingIndex(false);
-      setIndexBuildProgress(null);
+      console.error('Failed to start star catalog download:', err);
+      setDownloadError(String(err));
+      setDownloading(false);
+      setDownloadProgress(null);
+      setDownloadStartedAt(null);
       if (!resolvedViaEvent) {
         unlisten?.();
       }
     }
-  }, [config]);
+  }, []);
 
   const setField = <K extends keyof PlateSolveConfig>(key: K, value: PlateSolveConfig[K]) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
@@ -308,10 +193,8 @@ export function PlateSolveSettingsPanel() {
     );
   }
 
-  const tycho2 = catalogs.find((c) => c.name === 'Tycho-2') ?? TYCHO2_FALLBACK_META;
-  const tycho2Installed = tycho2.installed;
-  const gaia = catalogs.find((c) => c.name === 'Gaia DR3') ?? GAIA_CATALOG_META;
-  const gaiaInstalled = gaia.installed;
+  const catalog = catalogs[0] ?? STAR_CATALOG_FALLBACK;
+  const catalogInstalled = catalog.installed;
 
   return (
     <div className="space-y-6">
@@ -334,10 +217,10 @@ export function PlateSolveSettingsPanel() {
         </div>
       )}
 
-      {/* Catalog Status */}
+      {/* Star Catalog */}
       <section>
         <h4 className="text-sm font-semibold uppercase tracking-wider text-content-muted mb-3">
-          Star Catalogs
+          Star Catalog
         </h4>
         {catalogsLoading ? (
           <div className="flex items-center gap-2 text-sm text-content-muted py-2">
@@ -345,297 +228,87 @@ export function PlateSolveSettingsPanel() {
             Checking catalog status...
           </div>
         ) : (
-          <div className="space-y-2">
-            {/* Tycho-2 — dynamic based on get_catalog_status result */}
-            <div className="rounded-lg border border-border bg-surface px-4 py-3 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <Package size={18} className={tycho2Installed ? 'text-accent' : 'text-content-muted'} />
-                  <div>
-                    <p className="font-medium text-sm">{tycho2.name}</p>
-                    <p className="text-xs text-content-muted">
-                      Epoch {tycho2.epoch} &middot; {formatStarCount(tycho2.star_count_approx)} stars &middot; mag &le;{tycho2.mag_limit}
-                    </p>
-                  </div>
-                </div>
-                {tycho2Installed ? (
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-success/20 text-success border border-success/30">
-                    Installed
-                  </span>
-                ) : (
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-surface-hover text-content-muted border border-border">
-                    Not installed
-                  </span>
-                )}
-              </div>
-
-              {/* Download controls — only when Tycho-2 is not installed */}
-              {!tycho2Installed && (
-                <div className="space-y-2">
-                  {downloadError && (
-                    <p className="text-xs text-red-400">{downloadError}</p>
-                  )}
-                  {downloading && downloadKind === 'tycho2' && downloadProgress ? (
-                    <div className="space-y-1.5">
-                      <p className="text-xs text-content-muted">
-                        {downloadProgress.phase === 'downloading'
-                          ? `Downloading file ${downloadProgress.current}/${downloadProgress.total}`
-                          : 'Converting stars...'}
-                      </p>
-                      <div className="w-full h-1.5 bg-surface-hover rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-violet-500 rounded-full transition-all duration-300"
-                          style={{ width: `${downloadProgress.percent}%` }}
-                        />
-                      </div>
-                      <p className="text-xs text-content-muted text-right">
-                        {downloadProgress.percent.toFixed(0)}%
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="flex items-start gap-3">
-                      <button
-                        onClick={handleDownloadTycho2}
-                        disabled={downloading}
-                        className="flex items-center gap-2 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 rounded-lg text-xs font-medium transition-colors text-white"
-                      >
-                        <Download size={13} />
-                        Download Tycho-2 Catalog
-                      </button>
-                      <p className="text-xs text-content-muted leading-relaxed pt-0.5">
-                        ~160 MB download + local conversion required.
-                      </p>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Gaia DR3 — deep catalog; functional download */}
-            <div className="rounded-lg border border-border bg-surface px-4 py-3 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <Package size={18} className={gaiaInstalled ? 'text-accent' : 'text-content-muted'} />
-                  <div>
-                    <p className="font-medium text-sm">{gaia.name}</p>
-                    <p className="text-xs text-content-muted">
-                      Epoch {gaia.epoch} &middot; {formatStarCount(gaia.star_count_approx)} stars &middot; mag &le;{gaia.mag_limit}
-                    </p>
-                  </div>
-                </div>
-                {gaiaInstalled ? (
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-success/20 text-success border border-success/30">
-                    Installed
-                  </span>
-                ) : (
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-surface-hover text-content-muted border border-border">
-                    Not installed
-                  </span>
-                )}
-              </div>
-
-              {!gaiaInstalled && (
-                <div className="space-y-2">
-                  {downloadError &&
-                    (downloadKind === 'gaia' || downloadKind === 'gaia-prebuilt') && (
-                      <p className="text-xs text-red-400">{downloadError}</p>
-                    )}
-                  {downloading &&
-                  (downloadKind === 'gaia' || downloadKind === 'gaia-prebuilt') ? (
-                    <div className="space-y-1.5">
-                      <div className="flex items-center gap-2 text-xs text-content-muted">
-                        <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-violet-500 flex-shrink-0" />
-                        <span>
-                          {!downloadProgress
-                            ? downloadKind === 'gaia-prebuilt'
-                              ? 'Starting — connecting to the prebuilt catalog server…'
-                              : 'Starting — contacting ESA Gaia archive (the first tiles can take a few minutes)…'
-                            : downloadProgress.phase === 'downloading'
-                              ? downloadKind === 'gaia-prebuilt'
-                                ? `Downloading archive · ${(downloadProgress.current / 1048576).toFixed(0)} / ${(downloadProgress.total / 1048576).toFixed(0)} MB`
-                                : `Downloading tiles · ${downloadProgress.current}/${downloadProgress.total}`
-                              : downloadProgress.phase === 'verifying'
-                                ? 'Verifying download integrity…'
-                                : downloadProgress.phase === 'extracting'
-                                  ? `Extracting · ${downloadProgress.current}/${downloadProgress.total}`
-                                  : downloadProgress.phase === 'converting'
-                                    ? 'Converting stars to catalog format…'
-                                    : downloadProgress.phase === 'complete'
-                                      ? 'Finishing…'
-                                      : 'Working…'}
-                        </span>
-                      </div>
-                      <div className="w-full h-1.5 bg-surface-hover rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-violet-500 rounded-full transition-all duration-300"
-                          style={{
-                            width: downloadProgress ? `${downloadProgress.percent}%` : '4%',
-                          }}
-                        />
-                      </div>
-                      <p className="text-xs text-content-muted flex justify-between">
-                        <span>
-                          {downloadStartedAt != null
-                            ? `elapsed ${formatElapsed(nowTs - downloadStartedAt)} · resumable — safe to leave running`
-                            : 'resumable — safe to leave running'}
-                        </span>
-                        {downloadProgress && <span>{downloadProgress.percent.toFixed(0)}%</span>}
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="space-y-2">
-                      <div className="flex items-start gap-3">
-                        <button
-                          onClick={handleDownloadGaiaPrebuilt}
-                          disabled={downloading}
-                          className="flex items-center gap-2 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 rounded-lg text-xs font-medium transition-colors text-white"
-                        >
-                          <Download size={13} />
-                          Download Gaia DR3 (prebuilt)
-                        </button>
-                        <p className="text-xs text-content-muted leading-relaxed pt-0.5">
-                          Recommended · ~4 GB single download, resumable. Deep catalog
-                          needed for long-focal-length / headerless fields Tycho-2 cannot
-                          solve.
-                        </p>
-                      </div>
-                      <button
-                        onClick={handleDownloadGaia}
-                        disabled={downloading}
-                        className="text-xs text-content-muted hover:text-content underline disabled:opacity-50"
-                      >
-                        Advanced: build from the ESA archive instead (~hours, heavy)
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-      </section>
-
-      {/* Quad Index */}
-      <section>
-        <h4 className="text-sm font-semibold uppercase tracking-wider text-content-muted mb-3">
-          Quad Index
-        </h4>
-        {quadIndexLoading ? (
-          <div className="flex items-center gap-2 text-sm text-content-muted py-2">
-            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-accent" />
-            Checking index status...
-          </div>
-        ) : (
           <div className="rounded-lg border border-border bg-surface px-4 py-3 space-y-3">
-            {/* Status row */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <Database
-                  size={18}
-                  className={quadIndexStatus?.built ? 'text-accent' : 'text-content-muted'}
-                />
+                <Package size={18} className={catalogInstalled ? 'text-accent' : 'text-content-muted'} />
                 <div>
-                  <p className="font-medium text-sm">Quad Index</p>
-                  {quadIndexStatus?.built ? (
-                    <p className="text-xs text-content-muted">
-                      {quadIndexStatus.quadCount.toLocaleString()} quads &middot; {formatBytes(quadIndexStatus.sizeBytes)}
-                    </p>
-                  ) : (
-                    <p className="text-xs text-content-muted">Not built</p>
-                  )}
+                  <p className="font-medium text-sm">{catalog.name}</p>
+                  <p className="text-xs text-content-muted">
+                    Epoch {catalog.epoch}
+                    {catalog.star_count_approx > 0 && (
+                      <> &middot; {formatStarCount(catalog.star_count_approx)} stars</>
+                    )}{' '}
+                    &middot; mag &le;{catalog.mag_limit}
+                  </p>
                 </div>
               </div>
-              {quadIndexStatus?.built ? (
+              {catalogInstalled ? (
                 <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-success/20 text-success border border-success/30">
-                  Built
+                  Installed
                 </span>
               ) : (
                 <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-surface-hover text-content-muted border border-border">
-                  Not built
+                  Not installed
                 </span>
               )}
             </div>
 
-            {/* Build controls */}
-            <div className="space-y-2">
-              {indexBuildError && (
-                <p className="text-xs text-red-400">{indexBuildError}</p>
-              )}
-              {buildingIndex && indexBuildProgress ? (
-                <div className="space-y-1.5">
-                  <p className="text-xs text-content-muted">
-                    {indexBuildProgress.phase === 'reading'
-                      ? `Reading pixel ${indexBuildProgress.pixel.toLocaleString()}/${indexBuildProgress.total.toLocaleString()} (${indexBuildProgress.quadsSoFar.toLocaleString()} quads so far)`
-                      : indexBuildProgress.phase === 'writing'
-                      ? 'Writing index to disk...'
-                      : 'Complete'}
-                  </p>
-                  <div className="w-full h-1.5 bg-surface-hover rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-violet-500 rounded-full transition-all duration-300"
-                      style={{ width: `${indexBuildProgress.percent}%` }}
-                    />
+            {/* Download controls — only when the catalog is not installed */}
+            {!catalogInstalled && (
+              <div className="space-y-2">
+                {downloadError && <p className="text-xs text-red-400">{downloadError}</p>}
+                {downloading ? (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-2 text-xs text-content-muted">
+                      <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-violet-500 flex-shrink-0" />
+                      <span>
+                        {!downloadProgress
+                          ? 'Starting — connecting to the catalog server…'
+                          : downloadProgress.phase === 'downloading'
+                            ? `Downloading archive · ${(downloadProgress.current / 1048576).toFixed(0)} / ${(downloadProgress.total / 1048576).toFixed(0)} MB`
+                            : downloadProgress.phase === 'verifying'
+                              ? 'Verifying download integrity…'
+                              : downloadProgress.phase === 'extracting'
+                                ? 'Extracting star catalog…'
+                                : downloadProgress.phase === 'complete'
+                                  ? 'Finishing…'
+                                  : 'Working…'}
+                      </span>
+                    </div>
+                    <div className="w-full h-1.5 bg-surface-hover rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-violet-500 rounded-full transition-all duration-300"
+                        style={{ width: downloadProgress ? `${downloadProgress.percent}%` : '4%' }}
+                      />
+                    </div>
+                    <p className="text-xs text-content-muted flex justify-between">
+                      <span>
+                        {downloadStartedAt != null
+                          ? `elapsed ${formatElapsed(nowTs - downloadStartedAt)} · resumable — safe to leave running`
+                          : 'resumable — safe to leave running'}
+                      </span>
+                      {downloadProgress && <span>{downloadProgress.percent.toFixed(0)}%</span>}
+                    </p>
                   </div>
-                  <p className="text-xs text-content-muted text-right">
-                    {indexBuildProgress.percent.toFixed(0)}%
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center gap-3">
+                ) : (
+                  <div className="flex items-start gap-3">
                     <button
-                      onClick={handleBuildQuadIndex}
-                      disabled={buildingIndex || !tycho2Installed}
-                      title={
-                        !tycho2Installed
-                          ? 'Install the Tycho-2 catalog first'
-                          : quadIndexStatus?.built
-                          ? 'Rebuild the quad index using the magnitude limit on the right'
-                          : 'Build the quad index'
-                      }
+                      onClick={downloadStarCatalog}
+                      disabled={downloading}
                       className="flex items-center gap-2 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 rounded-lg text-xs font-medium transition-colors text-white"
                     >
-                      <Database size={13} />
-                      {buildingIndex
-                        ? 'Building...'
-                        : quadIndexStatus?.built
-                        ? 'Rebuild Quad Index'
-                        : 'Build Quad Index'}
+                      <Download size={13} />
+                      Download Star Catalog
                     </button>
-                    <label className="flex items-center gap-2 text-xs text-content-secondary">
-                      <span>at mag &le;</span>
-                      <input
-                        type="number"
-                        min={8}
-                        max={13}
-                        step={0.5}
-                        value={config.index_mag_limit}
-                        onChange={(e) =>
-                          setField(
-                            'index_mag_limit',
-                            parseFloat(e.target.value) || 0
-                          )
-                        }
-                        disabled={buildingIndex || !tycho2Installed}
-                        className="w-16 bg-surface-hover border border-border rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-accent disabled:opacity-50"
-                      />
-                    </label>
+                    <p className="text-xs text-content-muted leading-relaxed pt-0.5">
+                      Single prebuilt download (resumable). Required before any frame can be
+                      plate-solved.
+                    </p>
                   </div>
-                  {!tycho2Installed && (
-                    <p className="text-xs text-content-muted leading-relaxed">
-                      Requires the Tycho-2 catalog to be installed first.
-                    </p>
-                  )}
-                  {tycho2Installed && (
-                    <p className="text-xs text-content-muted leading-relaxed">
-                      {quadIndexStatus?.built
-                        ? 'Change the magnitude limit above and click Rebuild to use a deeper or shallower index. Deeper indexes (mag 12–13) cover long-exposure dense fields; shallower (mag 11) is smaller and faster. 13.0 is the Tycho-2 ceiling.'
-                        : 'Builds the all-sky star quad index from the Tycho-2 catalog. Default mag 13 covers long-exposure dense fields; build time ~15–40 s.'}
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -646,67 +319,6 @@ export function PlateSolveSettingsPanel() {
           Solver Parameters
         </h4>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-
-          {/* Max Image Stars */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Max Image Stars
-            </label>
-            <input
-              type="number"
-              min={10}
-              max={1000}
-              value={config.max_image_stars}
-              onChange={(e) => setField('max_image_stars', parseInt(e.target.value, 10) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Maximum number of detected stars used for quad building. Lower values are faster.
-            </p>
-          </div>
-
-          {/* Min Matched Stars */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Min Matched Stars (floor)
-            </label>
-            <input
-              type="number"
-              min={4}
-              max={100}
-              value={config.min_matched_stars}
-              onChange={(e) => setField('min_matched_stars', parseInt(e.target.value, 10) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Absolute minimum inliers required, regardless of field density.
-              The actual threshold is the larger of this value and the
-              density-aware requirement (below). Default 6.
-            </p>
-          </div>
-
-          {/* Min Inlier Ratio */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Min Inlier Ratio (dense fields)
-            </label>
-            <input
-              type="number"
-              min={0.02}
-              max={0.5}
-              step={0.01}
-              value={config.min_inlier_ratio ?? 0.10}
-              onChange={(e) => setField('min_inlier_ratio', parseFloat(e.target.value) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              For dense fields (&gt;100 catalog stars in FOV), the minimum
-              fraction of catalog stars that must match. Default 0.10 (10%).
-              Sparse fields use an absolute floor; this gate only tightens
-              acceptance in star-rich regions.
-            </p>
-          </div>
-
           {/* Base Verification Tolerance */}
           <div>
             <label className="block text-sm font-medium text-content-secondary mb-1">
@@ -719,87 +331,14 @@ export function PlateSolveSettingsPanel() {
               step={0.5}
               value={config.base_verification_tolerance_arcsec ?? 8.0}
               onChange={(e) =>
-                setField(
-                  'base_verification_tolerance_arcsec',
-                  parseFloat(e.target.value) || 0
-                )
+                setField('base_verification_tolerance_arcsec', parseFloat(e.target.value) || 0)
               }
               className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
             />
             <p className="mt-1 text-xs text-content-muted">
-              Base angular tolerance for counting a catalog star as a
-              verification match. The actual pixel tolerance adapts per
-              frame: <code>base / pixel_scale</code>, clamped to [4, 20] px.
-              Default 8.0".
-            </p>
-          </div>
-
-          {/* Retry Passes */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Retry Passes (star counts)
-            </label>
-            <input
-              type="text"
-              value={(config.retry_passes ?? [50, 150, 300, 600]).join(', ')}
-              onChange={(e) => {
-                const parsed = e.target.value
-                  .split(',')
-                  .map((s) => parseInt(s.trim(), 10))
-                  .filter((n) => Number.isFinite(n) && n > 0);
-                setField('retry_passes', parsed.length > 0 ? parsed : [50, 150, 300, 600]);
-              }}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Progressive star-count retry passes (comma-separated). The
-              solver tries the first value first, escalating only when
-              acceptance fails. Default <code>50, 150, 300, 600</code> — the
-              small first pass targets dense galactic-plane fields where only
-              the very brightest stars reliably match the catalog.
-            </p>
-          </div>
-
-          {/* Index Mag Limit */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Index Magnitude Limit
-            </label>
-            <input
-              type="number"
-              min={6}
-              max={13}
-              step={0.5}
-              value={config.index_mag_limit}
-              onChange={(e) => setField('index_mag_limit', parseFloat(e.target.value) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Faintest magnitude included when building the quad index.
-              Default 13.0 — the practical ceiling of Tycho-2 (beyond this
-              the catalog itself has no more stars). Covers long-exposure
-              frames where the brightest visual stars are saturated and
-              the detector's top-N falls into the mag 9–13 range.
-              Changing this requires a rebuild.
-            </p>
-          </div>
-
-          {/* Hash Tolerance */}
-          <div>
-            <label className="block text-sm font-medium text-content-secondary mb-1">
-              Hash Tolerance
-            </label>
-            <input
-              type="number"
-              min={0.001}
-              max={0.05}
-              step={0.001}
-              value={config.hash_tolerance}
-              onChange={(e) => setField('hash_tolerance', parseFloat(e.target.value) || 0)}
-              className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-            />
-            <p className="mt-1 text-xs text-content-muted">
-              Fractional tolerance when comparing geometric quad codes. Increase slightly for noisier data.
+              Base angular tolerance for the persisted-solve confidence gate. The
+              actual pixel tolerance adapts per frame: <code>base / pixel_scale</code>,
+              clamped to [4, 20] px. Default 8.0".
             </p>
           </div>
 
@@ -817,7 +356,8 @@ export function PlateSolveSettingsPanel() {
               className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
             />
             <p className="mt-1 text-xs text-content-muted">
-              Polynomial order for SIP distortion coefficients (2&ndash;5). Set to 2 to disable higher-order correction.
+              Polynomial order for the SIP distortion fit passed to the solver
+              (2&ndash;5). Higher orders fit more distortion but need more matched stars.
             </p>
           </div>
 
@@ -832,9 +372,7 @@ export function PlateSolveSettingsPanel() {
               max={5}
               step={0.05}
               value={config.autofind_tolerance_deg}
-              onChange={(e) =>
-                setField('autofind_tolerance_deg', parseFloat(e.target.value) || 0)
-              }
+              onChange={(e) => setField('autofind_tolerance_deg', parseFloat(e.target.value) || 0)}
               className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
             />
             <p className="mt-1 text-xs text-content-muted">
@@ -844,35 +382,6 @@ export function PlateSolveSettingsPanel() {
               more frames; looser values risk labelling unrelated fields with
               distant objects. Default 0.5°.
             </p>
-          </div>
-
-          {/* Blind-solve fallback */}
-          <div className="sm:col-span-2">
-            <label className="flex items-start gap-2.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={config.fallback_to_blind_scale ?? true}
-                onChange={(e) =>
-                  setField('fallback_to_blind_scale', e.target.checked)
-                }
-                className="mt-0.5 h-4 w-4 rounded border-border bg-surface-hover text-accent focus:ring-2 focus:ring-accent"
-              />
-              <span>
-                <span className="block text-sm font-medium text-content-secondary">
-                  Fall back to a blind solve when the focal-length hint fails
-                  (recommended)
-                </span>
-                <span className="mt-1 block text-xs text-content-muted">
-                  When a solve using the FITS FOCALLEN fails, retry with the
-                  scale hint cleared, then a full blind solve (scale and
-                  position prior cleared). A wrong FOCALLEN &mdash; focal
-                  reducer, wrong rig profile, or binning mismatch &mdash;
-                  otherwise filters out every correct candidate and a
-                  solvable frame fails permanently. On success the corrected
-                  focal length is written back to the frame. Default: on.
-                </span>
-              </span>
-            </label>
           </div>
         </div>
       </section>

@@ -2,53 +2,22 @@
 // These mirror the Rust structs on the backend (snake_case preserved for IPC boundary).
 
 // PlateSolveConfig fields are snake_case: the Rust struct has no rename_all attribute,
-// so field names cross the IPC boundary unchanged.
+// so field names cross the IPC boundary unchanged. This is a partial mirror —
+// only the fields surfaced in the settings UI are typed here; the solver's
+// confidence-gate thresholds and bright-cache path round-trip untouched because
+// the panel loads and re-saves the whole config object.
 export interface PlateSolveConfig {
-  max_image_stars: number;           // default: 300
-  min_matched_stars: number;         // default: 6 (absolute floor for the density-aware gate)
-  verification_tolerance_px: number; // default: 10.0 (legacy; superseded by base_verification_tolerance_arcsec)
-  index_mag_limit: number;           // default: 11.0
-  hash_tolerance: number;            // default: 0.005
-  sip_order: number;                 // default: 3
-  use_fast_detection?: boolean;      // default: true
+  sip_order: number;                 // default: 3 (SIP distortion order passed to solvemyastro)
   autofind_tolerance_deg: number;    // default: 0.5
-  /** Minimum inlier / expected-in-FOV ratio for the density-aware
-   * acceptance gate. Default 0.10 — dense fields must match ≥10% of
-   * catalog stars; sparse fields fall back to absolute floor. */
-  min_inlier_ratio?: number;
-  /** Progressive star-count retry passes. Solver tries each in order;
-   * short-circuits on density-aware acceptance. Default: [150, 300, 600]. */
-  retry_passes?: number[];
   /** Base verification tolerance in arcseconds. Per-frame pixel
    * tolerance = base_arcsec / pixel_scale_arcsec, clamped [4, 20] px.
    * Default: 8.0. */
   base_verification_tolerance_arcsec?: number;
-  /** When a focal-length-hinted solve fails, escalate through a
-   * scale-cleared then a full-blind retry before giving up, and write the
-   * corrected focal length back on success. Default: true. */
-  fallback_to_blind_scale?: boolean;
   /** Per-camera XPIXSZ defaults (`INSTRUME` or `TELESCOP` → µm). Consulted
    * when a frame's FITS header lacks XPIXSZ — without a default, focallen
    * cannot be derived from arcsec/px alone. Default: empty (behaviour
    * unchanged for frames that have XPIXSZ in their headers). */
   camera_defaults?: Record<string, number>;
-}
-
-// QuadIndexStatus fields are camelCase: the Rust struct uses #[serde(rename_all = "camelCase")].
-export interface QuadIndexStatus {
-  built: boolean;
-  path: string | null;
-  quadCount: number;
-  sizeBytes: number;
-}
-
-// QuadIndexProgressEvent fields are camelCase: the Rust struct uses #[serde(rename_all = "camelCase")].
-export interface QuadIndexProgressEvent {
-  phase: "reading" | "writing" | "complete";
-  pixel: number;
-  total: number;
-  quadsSoFar: number;
-  percent: number;
 }
 
 export interface PlateSolveRecord {
@@ -91,6 +60,11 @@ export interface PlateSolveProgressEvent {
   matched_stars?: number;
   rms_arcsec?: number;
   error?: string;
+  /** Machine code for a failure (solvemyastro FailureClass, e.g. "VERIFY_GAP",
+   * or "REJECTED_LOW_CONFIDENCE" / "PANIC"). Lets the UI group/style reasons. */
+  failure_code?: string;
+  /** Frame filename, for labelling per-frame rows without a separate lookup. */
+  filename?: string;
 }
 
 export interface PlateSolveCompleteEvent {

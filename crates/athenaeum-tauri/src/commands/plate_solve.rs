@@ -4,13 +4,11 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use tauri::{Emitter, State};
 
-use athenaeum_core::catalog::CatalogEngine;
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
 use athenaeum_core::plate_solve::hints::extract_hints;
-use athenaeum_core::plate_solve::quad_index::QuadIndex;
 use athenaeum_core::plate_solve::service::{self, SolveResult};
-use athenaeum_core::plate_solve::{storage, SolveHints};
+use athenaeum_core::plate_solve::{describe_solve_failure, storage, SolveHints, StoreOutcome};
 use athenaeum_core::services::PlateSolveHandle;
 
 use super::AppState;
@@ -132,39 +130,6 @@ fn get_dso_catalog(state: &AppState) -> Option<Arc<DsoCatalog>> {
     }
 }
 
-/// Load the quad index lazily from the catalog directory. Returns an error
-/// if the index file doesn't exist (user must build it first).
-fn require_quad_index(state: &AppState) -> Result<Arc<QuadIndex>, String> {
-    // Fast path: already loaded
-    {
-        let guard = state.ctx.quad_index.read().unwrap();
-        if let Some(ref idx) = *guard {
-            return Ok(idx.clone());
-        }
-    }
-
-    // Slow path: try to load from disk
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let db_path = db.path();
-    let parent = std::path::Path::new(&db_path)
-        .parent()
-        .ok_or("Cannot determine app data directory")?;
-    let index_path = parent.join("catalogs").join("tycho2").join("quad_index.bin");
-    if !index_path.exists() {
-        return Err(
-            "Quad index not found. Please build it from Settings \u{2192} Plate Solving."
-                .to_string(),
-        );
-    }
-    let loaded = QuadIndex::load(&index_path).map_err(|e| format!("Failed to load quad index: {e}"))?;
-    let arc = Arc::new(loaded);
-    {
-        let mut guard = state.ctx.quad_index.write().unwrap();
-        *guard = Some(arc.clone());
-    }
-    Ok(arc)
-}
-
 // ========== Config Commands ==========
 
 #[tauri::command]
@@ -208,6 +173,11 @@ struct PlateSolveProgressEvent {
     matched_stars: Option<usize>,
     rms_arcsec: Option<f64>,
     error: Option<String>,
+    /// Machine code for a failure (solvemyastro `FailureClass` or
+    /// `REJECTED_LOW_CONFIDENCE` / `PANIC`); lets the UI group/style reasons.
+    failure_code: Option<String>,
+    /// Frame filename, so the UI can label per-frame rows without a lookup.
+    filename: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -238,10 +208,14 @@ pub async fn plate_solve_frame(
         bright_cache.as_deref(),
         &ps_config,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| describe_solve_failure(&e).message)?;
 
-    service::store_result(&conn, frame_id, &result, dso.as_deref(), &ps_config)
-        .map_err(|e| e.to_string())?;
+    match service::store_result(&conn, frame_id, &result, dso.as_deref(), &ps_config)
+        .map_err(|e| e.to_string())?
+    {
+        StoreOutcome::Persisted => {}
+        StoreOutcome::RejectedLowConfidence { reason } => return Err(reason),
+    }
 
     storage::get_plate_solve(&conn, frame_id)
         .map_err(|e| e.to_string())?
@@ -342,9 +316,14 @@ pub async fn plate_solve_batch(
 
                     let outcome = match item {
                         WorkItem::LoadFailed { frame_id, error } => {
-                            WorkResult::Failed { frame_id, error }
+                            WorkResult::Failed { frame_id, error, code: None, filename: None }
                         }
                         WorkItem::Ready { frame_id, frame, file_path, hints } => {
+                            let filename = std::path::Path::new(&file_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| file_path.clone());
+
                             // Emit "solving" as the worker picks up the frame
                             // so the UI shows forward progress even on slow solves.
                             let done_so_far = completed.load(Ordering::Relaxed);
@@ -358,13 +337,11 @@ pub async fn plate_solve_batch(
                                     matched_stars: None,
                                     rms_arcsec: None,
                                     error: None,
+                                    failure_code: None,
+                                    filename: Some(filename.clone()),
                                 },
                             );
 
-                            let filename = std::path::Path::new(&file_path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| file_path.clone());
                             // Isolate per-frame panics: a single degenerate
                             // frame (e.g. a solver assertion deep in the
                             // candidate verifier) must not propagate out of
@@ -385,12 +362,22 @@ pub async fn plate_solve_batch(
                                 )
                             }));
                             match solve {
-                                Ok(Ok(result)) => WorkResult::Solved { frame_id, result },
+                                Ok(Ok(result)) => WorkResult::Solved { frame_id, result, filename },
                                 Ok(Err(e)) => {
+                                    // Translate the structured solvemyastro failure
+                                    // into a user-facing reason + code for the UI.
+                                    let info = describe_solve_failure(&e);
                                     eprintln!(
-                                        "plate_solve: solve failed for {filename} (frame {frame_id}): {e}"
+                                        "plate_solve: solve failed for {filename} (frame {frame_id}): {} [{}]",
+                                        info.message,
+                                        info.code.as_deref().unwrap_or("?")
                                     );
-                                    WorkResult::Failed { frame_id, error: e.to_string() }
+                                    WorkResult::Failed {
+                                        frame_id,
+                                        error: info.message,
+                                        code: info.code,
+                                        filename: Some(filename),
+                                    }
                                 }
                                 Err(panic) => {
                                     let msg = panic
@@ -403,7 +390,9 @@ pub async fn plate_solve_batch(
                                     );
                                     WorkResult::Failed {
                                         frame_id,
-                                        error: format!("solver panicked: {msg}"),
+                                        error: format!("Solver crashed: {msg}"),
+                                        code: Some("PANIC".to_string()),
+                                        filename: Some(filename),
                                     }
                                 }
                             }
@@ -412,7 +401,7 @@ pub async fn plate_solve_batch(
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                     match &outcome {
-                        WorkResult::Solved { frame_id, result } => {
+                        WorkResult::Solved { frame_id, result, filename } => {
                             let _ = app_workers.emit(
                                 "plate-solve-progress",
                                 PlateSolveProgressEvent {
@@ -423,10 +412,12 @@ pub async fn plate_solve_batch(
                                     matched_stars: Some(result.matched_stars),
                                     rms_arcsec: Some(result.rms_residual_arcsec),
                                     error: None,
+                                    failure_code: None,
+                                    filename: Some(filename.clone()),
                                 },
                             );
                         }
-                        WorkResult::Failed { frame_id, error } => {
+                        WorkResult::Failed { frame_id, error, code, filename } => {
                             let _ = app_workers.emit(
                                 "plate-solve-progress",
                                 PlateSolveProgressEvent {
@@ -437,6 +428,8 @@ pub async fn plate_solve_batch(
                                     matched_stars: None,
                                     rms_arcsec: None,
                                     error: Some(error.clone()),
+                                    failure_code: code.clone(),
+                                    filename: filename.clone(),
                                 },
                             );
                         }
@@ -461,16 +454,41 @@ pub async fn plate_solve_batch(
         conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
         for r in &results {
             match r {
-                WorkResult::Solved { frame_id, result } => {
-                    if let Err(e) =
-                        service::store_result(&conn, *frame_id, result, dso.as_deref(), ps_config.as_ref())
-                    {
-                        eprintln!(
-                            "plate_solve: failed to store result for frame {frame_id}: {e}"
-                        );
-                        failed += 1;
-                    } else {
-                        solved += 1;
+                WorkResult::Solved { frame_id, result, filename } => {
+                    match service::store_result(
+                        &conn,
+                        *frame_id,
+                        result,
+                        dso.as_deref(),
+                        ps_config.as_ref(),
+                    ) {
+                        Ok(StoreOutcome::Persisted) => solved += 1,
+                        Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
+                            // The Phase-2 "solved" event already reached the UI;
+                            // emit a correction so the frame flips to failed with
+                            // the rejection reason (totals count it as failed too).
+                            failed += 1;
+                            let _ = app.emit(
+                                "plate-solve-progress",
+                                PlateSolveProgressEvent {
+                                    frame_id: *frame_id,
+                                    current: total,
+                                    total,
+                                    status: "failed".into(),
+                                    matched_stars: None,
+                                    rms_arcsec: None,
+                                    error: Some(reason),
+                                    failure_code: Some("REJECTED_LOW_CONFIDENCE".to_string()),
+                                    filename: Some(filename.clone()),
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "plate_solve: failed to store result for frame {frame_id}: {e}"
+                            );
+                            failed += 1;
+                        }
                     }
                 }
                 WorkResult::Failed { .. } => {
@@ -516,8 +534,17 @@ enum WorkItem {
 
 /// Result of a single worker attempting to solve a frame.
 enum WorkResult {
-    Solved { frame_id: i64, result: SolveResult },
-    Failed { frame_id: i64, error: String },
+    Solved {
+        frame_id: i64,
+        result: SolveResult,
+        filename: String,
+    },
+    Failed {
+        frame_id: i64,
+        error: String,
+        code: Option<String>,
+        filename: Option<String>,
+    },
 }
 
 #[tauri::command]
@@ -694,22 +721,36 @@ pub async fn delete_plate_solve_for_frame(
     storage::delete_plate_solve(&conn, frame_id).map_err(|e| e.to_string())
 }
 
+/// Report the installed solver star catalog (the solvemyastro `stars.smac`
+/// deep cache). The shape is unchanged so the frontend keeps working; only the
+/// data source moved from the legacy `CatalogEngine` to the smac cache.
 #[tauri::command]
 pub async fn get_catalog_status(
     state: State<'_, AppState>,
 ) -> Result<Vec<CatalogStatusInfo>, String> {
-    let catalog = build_catalog_engine(&state)?;
-    let infos = catalog.available_catalogs();
-    Ok(infos
-        .into_iter()
-        .map(|c| CatalogStatusInfo {
-            name: c.name,
-            installed: true,
-            epoch: c.epoch,
-            star_count_approx: c.star_count_approx,
-            mag_limit: c.mag_limit,
-        })
-        .collect())
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let db_path = db.path().to_path_buf();
+    let parent = db_path
+        .parent()
+        .ok_or("Cannot determine app data directory")?;
+    let smac_dir = parent.join("catalogs").join("smac_gaia");
+
+    // Opening the cache memory-maps the header; if `stars.smac` is absent the
+    // catalog is simply not installed yet (the download command provides it).
+    let (installed, star_count_approx, epoch) = match solvemyastro::StarCache::open(&smac_dir) {
+        Ok(cache) => (true, cache.star_count(), cache.catalog_epoch()),
+        Err(_) => (false, 0, 2016.0),
+    };
+
+    Ok(vec![CatalogStatusInfo {
+        name: "Gaia DR3 (stars.smac)".to_string(),
+        installed,
+        epoch,
+        star_count_approx,
+        // Nominal solver depth (SolveConfig::catalog_mag_limit); the on-disk
+        // cache carries no explicit limit in its header.
+        mag_limit: 19.0,
+    }])
 }
 
 #[derive(Clone, Serialize)]
@@ -721,105 +762,6 @@ pub struct CatalogStatusInfo {
     pub mag_limit: f32,
 }
 
-// ========== Quad Index ==========
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuadIndexStatus {
-    pub built: bool,
-    pub path: Option<String>,
-    pub quad_count: u64,
-    pub size_bytes: u64,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct QuadIndexProgressEvent {
-    phase: String,
-    pixel: u64,
-    total: u64,
-    quads_so_far: u64,
-    percent: f64,
-}
-
-fn quad_index_path(state: &AppState) -> Result<std::path::PathBuf, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let db_path = db.path().to_path_buf();
-    let parent = db_path.parent().ok_or("Cannot determine app data dir")?;
-    Ok(parent.join("catalogs").join("tycho2").join("quad_index.bin"))
-}
-
-/// Returns the status of the legacy Tycho-2 quad index.
-/// Phase 3 stub: the index is no longer used for solving (solvemyastro
-/// handles all solves via StarCache). The command is kept present and
-/// compiling to preserve the frontend contract; Phase 4 removes it.
-#[tauri::command]
-pub async fn get_quad_index_status(
-    state: State<'_, AppState>,
-) -> Result<QuadIndexStatus, String> {
-    let path = quad_index_path(&state)?;
-    if !path.exists() {
-        return Ok(QuadIndexStatus {
-            built: false,
-            path: None,
-            quad_count: 0,
-            size_bytes: 0,
-        });
-    }
-
-    // Load the index header to report counts (still compiles; ignored by solver).
-    match athenaeum_core::plate_solve::quad_index::QuadIndex::load(&path) {
-        Ok(idx) => {
-            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            Ok(QuadIndexStatus {
-                built: true,
-                path: Some(path.to_string_lossy().to_string()),
-                quad_count: idx.quad_count(),
-                size_bytes,
-            })
-        }
-        Err(_) => Ok(QuadIndexStatus {
-            built: false,
-            path: None,
-            quad_count: 0,
-            size_bytes: 0,
-        }),
-    }
-}
-
-/// Builds the legacy Tycho-2 quad index.
-/// Phase 3 stub: the index is no longer used for solving; this command is
-/// kept present to preserve the frontend contract. Phase 4 removes it.
-/// Returns a "not available" status (no build is performed).
-#[tauri::command]
-pub async fn build_quad_index(
-    _app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<QuadIndexStatus, String> {
-    // Phase 3: quad index is superseded by solvemyastro StarCache.
-    // Return the current on-disk status without building anything.
-    let path = quad_index_path(&state)?;
-    if path.exists() {
-        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let quad_count = athenaeum_core::plate_solve::quad_index::QuadIndex::load(&path)
-            .map(|idx| idx.quad_count())
-            .unwrap_or(0);
-        Ok(QuadIndexStatus {
-            built: true,
-            path: Some(path.to_string_lossy().to_string()),
-            quad_count,
-            size_bytes,
-        })
-    } else {
-        Ok(QuadIndexStatus {
-            built: false,
-            path: None,
-            quad_count: 0,
-            size_bytes: 0,
-        })
-    }
-}
-
 // ========== Catalog Download ==========
 
 #[derive(Clone, Serialize)]
@@ -829,154 +771,6 @@ struct CatalogDownloadProgress {
     current: usize,
     total: usize,
     percent: f64,
-}
-
-#[tauri::command]
-pub async fn download_tycho2_catalog(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let db_path = db.path().to_path_buf();
-    let app_data_dir = db_path.parent()
-        .ok_or("Cannot determine app data directory")?
-        .to_path_buf();
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let app_clone = app.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        athenaeum_core::catalog::tycho2::setup_tycho2_catalog(
-            &app_data_dir,
-            cancel_flag,
-            &|progress| {
-                let event = match progress {
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Downloading {
-                        file_index,
-                        total_files,
-                        ..
-                    } => CatalogDownloadProgress {
-                        phase: "downloading".into(),
-                        current: file_index,
-                        total: total_files,
-                        percent: file_index as f64 / total_files as f64 * 100.0,
-                    },
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Converting {
-                        stars_processed,
-                        total_stars,
-                    } => CatalogDownloadProgress {
-                        phase: "converting".into(),
-                        current: stars_processed,
-                        total: total_stars,
-                        percent: stars_processed as f64 / total_stars as f64 * 100.0,
-                    },
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Complete { total_stars } => {
-                        CatalogDownloadProgress {
-                            phase: "complete".into(),
-                            current: total_stars,
-                            total: total_stars,
-                            percent: 100.0,
-                        }
-                    }
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Error(ref _msg) => {
-                        CatalogDownloadProgress {
-                            phase: "error".into(),
-                            current: 0,
-                            total: 0,
-                            percent: 0.0,
-                        }
-                    }
-                };
-                let _ = app_clone.emit("catalog-download-progress", event);
-            },
-        )
-    })
-    .await
-    .map_err(|e| format!("Download task failed: {e}"))?
-    .map_err(|e| format!("Tycho-2 setup failed: {e}"))?;
-
-    Ok(result.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-pub async fn download_gaia_dr3_catalog(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let db_path = db.path().to_path_buf();
-    let app_data_dir = db_path
-        .parent()
-        .ok_or("Cannot determine app data directory")?
-        .to_path_buf();
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let app_clone = app.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        athenaeum_core::catalog::gaia::setup_gaia_dr3_catalog(
-            &app_data_dir,
-            cancel_flag,
-            &|progress| {
-                let event = match progress {
-                    athenaeum_core::catalog::gaia::GaiaProgress::Started {
-                        total_tiles,
-                        already_done,
-                    } => CatalogDownloadProgress {
-                        phase: "downloading".into(),
-                        current: already_done as usize,
-                        total: total_tiles as usize,
-                        percent: already_done as f64 / total_tiles as f64 * 100.0,
-                    },
-                    athenaeum_core::catalog::gaia::GaiaProgress::Querying {
-                        completed,
-                        total_tiles,
-                        ..
-                    } => CatalogDownloadProgress {
-                        phase: "downloading".into(),
-                        current: completed as usize,
-                        total: total_tiles as usize,
-                        percent: completed as f64 / total_tiles as f64 * 100.0,
-                    },
-                    athenaeum_core::catalog::gaia::GaiaProgress::Converting {
-                        stars_processed,
-                        total_stars,
-                    } => CatalogDownloadProgress {
-                        phase: "converting".into(),
-                        current: stars_processed,
-                        total: total_stars,
-                        percent: if total_stars > 0 {
-                            stars_processed as f64 / total_stars as f64 * 100.0
-                        } else {
-                            0.0
-                        },
-                    },
-                    athenaeum_core::catalog::gaia::GaiaProgress::Complete { total_stars } => {
-                        CatalogDownloadProgress {
-                            phase: "complete".into(),
-                            current: total_stars,
-                            total: total_stars,
-                            percent: 100.0,
-                        }
-                    }
-                    athenaeum_core::catalog::gaia::GaiaProgress::Error(ref _msg) => {
-                        CatalogDownloadProgress {
-                            phase: "error".into(),
-                            current: 0,
-                            total: 0,
-                            percent: 0.0,
-                        }
-                    }
-                };
-                let _ = app_clone.emit("catalog-download-progress", event);
-            },
-        )
-    })
-    .await
-    .map_err(|e| format!("Download task failed: {e}"))?
-    .map_err(|e| format!("Gaia DR3 setup failed: {e:#}"))?;
-
-    Ok(result.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1052,38 +846,6 @@ pub async fn download_gaia_dr3_prebuilt_catalog(
 }
 
 // ========== Helpers ==========
-
-fn build_catalog_engine(state: &AppState) -> Result<CatalogEngine, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Get the catalog directory from settings, or use app data dir
-    let catalog_dir_str: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'catalog.directory'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    if let Some(dir) = catalog_dir_str {
-        let path = std::path::PathBuf::from(dir);
-        if path.exists() {
-            return Ok(CatalogEngine::with_catalog_dir(&path));
-        }
-    }
-
-    // Fall back to app data dir / catalogs
-    let db_path = db.path();
-    if let Some(parent) = std::path::Path::new(&db_path).parent() {
-        let catalog_dir = parent.join("catalogs");
-        if catalog_dir.exists() {
-            return Ok(CatalogEngine::with_catalog_dir(&catalog_dir));
-        }
-    }
-
-    Ok(CatalogEngine::new())
-}
 
 fn load_frame_with_path(
     conn: &rusqlite::Connection,

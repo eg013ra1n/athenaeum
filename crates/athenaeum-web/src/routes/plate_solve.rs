@@ -4,15 +4,11 @@ use std::sync::{Arc, Mutex};
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
-#[allow(unused_imports)]
-use athenaeum_core::catalog::CatalogEngine;
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
 use athenaeum_core::plate_solve::hints::extract_hints;
-#[allow(unused_imports)]
-use athenaeum_core::plate_solve::quad_index::QuadIndex;
 use athenaeum_core::plate_solve::service::SolveResult;
-use athenaeum_core::plate_solve::{service, storage, SolveHints};
+use athenaeum_core::plate_solve::{describe_solve_failure, service, storage, SolveHints, StoreOutcome};
 use athenaeum_core::services::PlateSolveHandle;
 
 use crate::events::SseEvent;
@@ -158,6 +154,11 @@ struct PlateSolveProgressEvent {
     matched_stars: Option<usize>,
     rms_arcsec: Option<f64>,
     error: Option<String>,
+    /// Machine code for a failure (solvemyastro `FailureClass` or
+    /// `REJECTED_LOW_CONFIDENCE`); lets the UI group/style reasons.
+    failure_code: Option<String>,
+    /// Frame filename, so the UI can label per-frame rows without a lookup.
+    filename: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -215,10 +216,16 @@ pub async fn plate_solve_frame(
         bright_cache.as_deref(),
         &ps_config,
     )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, describe_solve_failure(&e).message))?;
 
-    service::store_result(&conn, args.frame_id, &result, dso.as_deref(), &ps_config)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match service::store_result(&conn, args.frame_id, &result, dso.as_deref(), &ps_config)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        StoreOutcome::Persisted => {}
+        StoreOutcome::RejectedLowConfidence { reason } => {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, reason));
+        }
+    }
 
     let record = storage::get_plate_solve(&conn, args.frame_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -310,9 +317,14 @@ pub async fn plate_solve_batch(
 
                         let outcome = match item {
                             WorkItem::LoadFailed { frame_id, error } => {
-                                WorkResult::Failed { frame_id, error }
+                                WorkResult::Failed { frame_id, error, code: None, filename: None }
                             }
                             WorkItem::Ready { frame_id, frame, file_path, hints } => {
+                                let filename = std::path::Path::new(&file_path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| file_path.clone());
+
                                 let done_so_far = completed.load(Ordering::Relaxed);
                                 let _ = event_tx.send(SseEvent {
                                     event_name: "plate-solve-progress".into(),
@@ -324,14 +336,12 @@ pub async fn plate_solve_batch(
                                         matched_stars: None,
                                         rms_arcsec: None,
                                         error: None,
+                                        failure_code: None,
+                                        filename: Some(filename.clone()),
                                     })
                                     .unwrap_or_default(),
                                 });
 
-                                let filename = std::path::Path::new(&file_path)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| file_path.clone());
                                 match service::solve_frame_with_hints(
                                     &frame,
                                     &file_path,
@@ -341,14 +351,19 @@ pub async fn plate_solve_batch(
                                     ps_config.as_ref(),
                                     Some(cancel_flag.as_ref()),
                                 ) {
-                                    Ok(result) => WorkResult::Solved { frame_id, result },
+                                    Ok(result) => WorkResult::Solved { frame_id, result, filename },
                                     Err(e) => {
+                                        let info = describe_solve_failure(&e);
                                         eprintln!(
-                                            "plate_solve: solve failed for {filename} (frame {frame_id}): {e}"
+                                            "plate_solve: solve failed for {filename} (frame {frame_id}): {} [{}]",
+                                            info.message,
+                                            info.code.as_deref().unwrap_or("?")
                                         );
                                         WorkResult::Failed {
                                             frame_id,
-                                            error: e.to_string(),
+                                            error: info.message,
+                                            code: info.code,
+                                            filename: Some(filename),
                                         }
                                     }
                                 }
@@ -357,7 +372,7 @@ pub async fn plate_solve_batch(
 
                         let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                         match &outcome {
-                            WorkResult::Solved { frame_id, result } => {
+                            WorkResult::Solved { frame_id, result, filename } => {
                                 let _ = event_tx.send(SseEvent {
                                     event_name: "plate-solve-progress".into(),
                                     data: serde_json::to_value(PlateSolveProgressEvent {
@@ -368,11 +383,13 @@ pub async fn plate_solve_batch(
                                         matched_stars: Some(result.matched_stars),
                                         rms_arcsec: Some(result.rms_residual_arcsec),
                                         error: None,
+                                        failure_code: None,
+                                        filename: Some(filename.clone()),
                                     })
                                     .unwrap_or_default(),
                                 });
                             }
-                            WorkResult::Failed { frame_id, error } => {
+                            WorkResult::Failed { frame_id, error, code, filename } => {
                                 let _ = event_tx.send(SseEvent {
                                     event_name: "plate-solve-progress".into(),
                                     data: serde_json::to_value(PlateSolveProgressEvent {
@@ -383,6 +400,8 @@ pub async fn plate_solve_batch(
                                         matched_stars: None,
                                         rms_arcsec: None,
                                         error: Some(error.clone()),
+                                        failure_code: code.clone(),
+                                        filename: filename.clone(),
                                     })
                                     .unwrap_or_default(),
                                 });
@@ -408,16 +427,42 @@ pub async fn plate_solve_batch(
             }
             for r in &results {
                 match r {
-                    WorkResult::Solved { frame_id, result } => {
-                        if let Err(e) =
-                            service::store_result(&conn, *frame_id, result, dso.as_deref(), ps_config.as_ref())
-                        {
-                            eprintln!(
-                                "plate_solve: failed to store result for frame {frame_id}: {e}"
-                            );
-                            failed += 1;
-                        } else {
-                            solved += 1;
+                    WorkResult::Solved { frame_id, result, filename } => {
+                        match service::store_result(
+                            &conn,
+                            *frame_id,
+                            result,
+                            dso.as_deref(),
+                            ps_config.as_ref(),
+                        ) {
+                            Ok(StoreOutcome::Persisted) => solved += 1,
+                            Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
+                                // The Phase-2 "solved" event already reached the
+                                // UI; emit a correction so the frame flips to
+                                // failed with the rejection reason.
+                                failed += 1;
+                                let _ = event_tx.send(SseEvent {
+                                    event_name: "plate-solve-progress".into(),
+                                    data: serde_json::to_value(PlateSolveProgressEvent {
+                                        frame_id: *frame_id,
+                                        current: total,
+                                        total,
+                                        status: "failed".into(),
+                                        matched_stars: None,
+                                        rms_arcsec: None,
+                                        error: Some(reason),
+                                        failure_code: Some("REJECTED_LOW_CONFIDENCE".to_string()),
+                                        filename: Some(filename.clone()),
+                                    })
+                                    .unwrap_or_default(),
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "plate_solve: failed to store result for frame {frame_id}: {e}"
+                                );
+                                failed += 1;
+                            }
                         }
                     }
                     WorkResult::Failed { .. } => {
@@ -466,8 +511,17 @@ enum WorkItem {
 
 /// Result of a single worker attempting to solve a frame.
 enum WorkResult {
-    Solved { frame_id: i64, result: SolveResult },
-    Failed { frame_id: i64, error: String },
+    Solved {
+        frame_id: i64,
+        result: SolveResult,
+        filename: String,
+    },
+    Failed {
+        frame_id: i64,
+        error: String,
+        code: Option<String>,
+        filename: Option<String>,
+    },
 }
 
 pub async fn cancel_plate_solve(
@@ -665,205 +719,36 @@ pub struct CatalogStatusInfo {
     pub mag_limit: f32,
 }
 
+/// Report the installed solver star catalog (the solvemyastro `stars.smac`
+/// deep cache). Shape unchanged; only the data source moved from the legacy
+/// `CatalogEngine` to the smac cache.
 pub async fn get_catalog_status(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<CatalogStatusInfo>>, (StatusCode, String)> {
-    let catalog = build_catalog_engine(&state)?;
-    let infos: Vec<CatalogStatusInfo> = catalog.available_catalogs().into_iter()
-        .map(|c| CatalogStatusInfo {
-            name: c.name, installed: true, epoch: c.epoch,
-            star_count_approx: c.star_count_approx, mag_limit: c.mag_limit,
-        }).collect();
-    Ok(Json(infos))
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuadIndexStatus {
-    pub built: bool,
-    pub path: Option<String>,
-    pub quad_count: u64,
-    pub size_bytes: u64,
-}
-
-fn quad_index_path(state: &WebAppState) -> Result<std::path::PathBuf, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+    let db = state
+        .ctx
+        .db
+        .get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".to_string()))?;
     let db_path = db.path().to_path_buf();
-    let parent = db_path.parent().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?.to_path_buf();
-    Ok(parent.join("catalogs").join("tycho2").join("quad_index.bin"))
-}
+    let parent = db_path.parent().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Cannot determine app data dir".to_string(),
+    ))?;
+    let smac_dir = parent.join("catalogs").join("smac_gaia");
 
-pub async fn get_quad_index_status(
-    State(state): State<WebAppState>,
-) -> Result<Json<QuadIndexStatus>, (StatusCode, String)> {
-    let path = quad_index_path(&state)?;
-    if !path.exists() {
-        return Ok(Json(QuadIndexStatus { built: false, path: None, quad_count: 0, size_bytes: 0 }));
-    }
-    match QuadIndex::load(&path) {
-        Ok(idx) => {
-            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            Ok(Json(QuadIndexStatus {
-                built: true,
-                path: Some(path.to_string_lossy().to_string()),
-                quad_count: idx.quad_count(),
-                size_bytes,
-            }))
-        }
-        Err(_) => Ok(Json(QuadIndexStatus { built: false, path: None, quad_count: 0, size_bytes: 0 })),
-    }
-}
-
-pub async fn build_quad_index(
-    State(state): State<WebAppState>,
-) -> Result<Json<QuadIndexStatus>, (StatusCode, String)> {
-    let path = quad_index_path(&state)?;
-    let catalog_dir = path.parent().unwrap().to_path_buf();
-    if !catalog_dir.exists() {
-        return Err((StatusCode::PRECONDITION_FAILED, "Tycho-2 catalog not found".into()));
-    }
-    let ps_config = {
-        let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-        let conn = db.conn();
-        config::load_config(&conn)
+    let (installed, star_count_approx, epoch) = match solvemyastro::StarCache::open(&smac_dir) {
+        Ok(cache) => (true, cache.star_count(), cache.catalog_epoch()),
+        Err(_) => (false, 0, 2016.0),
     };
-    let event_tx = state.event_tx.clone();
-    let path_clone = path.clone();
-    let catalog_dir_clone = catalog_dir.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        athenaeum_core::plate_solve::index_builder::IndexBuilder::build(
-            &catalog_dir_clone,
-            &path_clone,
-            ps_config.index_mag_limit,
-            ps_config.hash_tolerance,
-            cancel_flag,
-            &move |progress| {
-                use athenaeum_core::plate_solve::index_builder::IndexBuildProgress;
-                let payload = match progress {
-                    IndexBuildProgress::Reading { pixel, total, quads_so_far } => serde_json::json!({
-                        "phase": "reading", "pixel": pixel, "total": total,
-                        "quads_so_far": quads_so_far,
-                        "percent": pixel as f64 / total as f64 * 100.0,
-                    }),
-                    IndexBuildProgress::Writing { bytes_written, total_bytes } => serde_json::json!({
-                        "phase": "writing", "bytes_written": bytes_written, "total_bytes": total_bytes,
-                        "percent": if total_bytes > 0 { bytes_written as f64 / total_bytes as f64 * 100.0 } else { 0.0 },
-                    }),
-                    IndexBuildProgress::Complete { quad_count, size_bytes } => serde_json::json!({
-                        "phase": "complete", "quad_count": quad_count, "size_bytes": size_bytes,
-                        "percent": 100.0,
-                    }),
-                };
-                let _ = event_tx.send(SseEvent {
-                    event_name: "quad-index-progress".into(),
-                    data: payload,
-                });
-            },
-        )
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Build failed: {e}")))?;
-
-    {
-        let mut guard = state.ctx.quad_index.write().unwrap();
-        *guard = None;
-    }
-    let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    Ok(Json(QuadIndexStatus {
-        built: true,
-        path: Some(path.to_string_lossy().to_string()),
-        quad_count: result,
-        size_bytes,
-    }))
-}
-
-pub async fn download_tycho2_catalog(
-    State(state): State<WebAppState>,
-) -> Result<Json<String>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let db_path = db.path().to_path_buf();
-    let app_data_dir = db_path.parent()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?
-        .to_path_buf();
-
-    let event_tx = state.event_tx.clone();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-
-    let result = tokio::task::spawn_blocking(move || {
-        athenaeum_core::catalog::tycho2::setup_tycho2_catalog(
-            &app_data_dir,
-            cancel_flag,
-            &|progress| {
-                let (phase, current, total) = match progress {
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Downloading { file_index, total_files, .. } =>
-                        ("downloading", file_index, total_files),
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Converting { stars_processed, total_stars } =>
-                        ("converting", stars_processed, total_stars),
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Complete { total_stars } =>
-                        ("complete", total_stars, total_stars),
-                    athenaeum_core::catalog::tycho2::Tycho2Progress::Error(_) =>
-                        ("error", 0, 0),
-                };
-                let _ = event_tx.send(SseEvent {
-                    event_name: "catalog-download-progress".into(),
-                    data: serde_json::json!({ "phase": phase, "current": current, "total": total,
-                        "percent": if total > 0 { current as f64 / total as f64 * 100.0 } else { 0.0 } }),
-                });
-            },
-        )
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Setup failed: {e:#}")))?;
-
-    Ok(Json(result.to_string_lossy().to_string()))
-}
-
-pub async fn download_gaia_dr3_catalog(
-    State(state): State<WebAppState>,
-) -> Result<Json<String>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let db_path = db.path().to_path_buf();
-    let app_data_dir = db_path.parent()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?
-        .to_path_buf();
-
-    let event_tx = state.event_tx.clone();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-
-    let result = tokio::task::spawn_blocking(move || {
-        athenaeum_core::catalog::gaia::setup_gaia_dr3_catalog(
-            &app_data_dir,
-            cancel_flag,
-            &|progress| {
-                let (phase, current, total) = match progress {
-                    athenaeum_core::catalog::gaia::GaiaProgress::Started { total_tiles, already_done } =>
-                        ("downloading", already_done as usize, total_tiles as usize),
-                    athenaeum_core::catalog::gaia::GaiaProgress::Querying { completed, total_tiles, .. } =>
-                        ("downloading", completed as usize, total_tiles as usize),
-                    athenaeum_core::catalog::gaia::GaiaProgress::Converting { stars_processed, total_stars } =>
-                        ("converting", stars_processed, total_stars),
-                    athenaeum_core::catalog::gaia::GaiaProgress::Complete { total_stars } =>
-                        ("complete", total_stars, total_stars),
-                    athenaeum_core::catalog::gaia::GaiaProgress::Error(_) =>
-                        ("error", 0, 0),
-                };
-                let _ = event_tx.send(SseEvent {
-                    event_name: "catalog-download-progress".into(),
-                    data: serde_json::json!({ "phase": phase, "current": current, "total": total,
-                        "percent": if total > 0 { current as f64 / total as f64 * 100.0 } else { 0.0 } }),
-                });
-            },
-        )
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Setup failed: {e:#}")))?;
-
-    Ok(Json(result.to_string_lossy().to_string()))
+    Ok(Json(vec![CatalogStatusInfo {
+        name: "Gaia DR3 (stars.smac)".to_string(),
+        installed,
+        epoch,
+        star_count_approx,
+        mag_limit: 19.0,
+    }]))
 }
 
 pub async fn download_gaia_dr3_prebuilt_catalog(
@@ -905,33 +790,6 @@ pub async fn download_gaia_dr3_prebuilt_catalog(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Prebuilt download failed: {e:#}")))?;
 
     Ok(Json(result.to_string_lossy().to_string()))
-}
-
-fn build_catalog_engine(state: &WebAppState) -> Result<CatalogEngine, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let conn = db.conn();
-
-    let catalog_dir_str: Option<String> = conn.query_row(
-        "SELECT value FROM settings WHERE key = 'catalog.directory'",
-        [], |row| row.get(0),
-    ).ok();
-
-    if let Some(dir) = catalog_dir_str {
-        let path = std::path::PathBuf::from(dir);
-        if path.exists() {
-            return Ok(CatalogEngine::with_catalog_dir(&path));
-        }
-    }
-
-    let db_path = db.path();
-    if let Some(parent) = std::path::Path::new(&db_path).parent() {
-        let catalog_dir = parent.join("catalogs");
-        if catalog_dir.exists() {
-            return Ok(CatalogEngine::with_catalog_dir(&catalog_dir));
-        }
-    }
-
-    Ok(CatalogEngine::new())
 }
 
 fn load_frame_with_path(

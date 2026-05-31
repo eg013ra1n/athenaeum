@@ -134,7 +134,6 @@ async fn main() {
         active_analyses: Arc::new(Mutex::new(HashMap::new())),
         active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
         active_archives: Arc::new(Mutex::new(HashMap::new())),
-        quad_index: Arc::new(std::sync::RwLock::new(None)),
         dso_catalog: Arc::new(std::sync::RwLock::new(None)),
         star_cache: Arc::new(std::sync::RwLock::new(None)),
         bright_cache: Arc::new(std::sync::RwLock::new(None)),

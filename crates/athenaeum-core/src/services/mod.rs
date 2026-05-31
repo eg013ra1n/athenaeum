@@ -8,7 +8,6 @@ pub mod operation_queue;
 use crate::cache::MemoryImageCache;
 use crate::db::Database;
 use crate::plate_solve::dso_lookup::DsoCatalog;
-use crate::plate_solve::quad_index::QuadIndex;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -57,10 +56,6 @@ pub struct ServiceContext {
     /// time by command-layer enforcement; HashMap form keeps the same shape
     /// as the other active-handle maps for consistency.
     pub active_archives: Arc<Mutex<HashMap<i64, ArchiveHandle>>>,
-    /// Lazy-loaded pre-built all-sky quad index for plate solving.
-    /// None until the user builds the index or the app detects an existing one.
-    /// Phase 4 will remove this once the solvemyastro adapter is the only path.
-    pub quad_index: Arc<RwLock<Option<Arc<QuadIndex>>>>,
     /// Lazy-loaded deep-sky object catalog, used to auto-label plate-solve
     /// results (e.g. "M 42", "NGC 7000"). Parsed on first use, then cached.
     pub dso_catalog: Arc<RwLock<Option<Arc<DsoCatalog>>>>,

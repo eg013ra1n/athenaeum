@@ -1,6 +1,7 @@
-//! Integration test: the three-stage blind-scale fallback + focal-length
-//! correction. Ported from the legacy Tycho-2/QuadIndex harness to the
-//! Phase-3 solvemyastro StarCache backend.
+//! Integration test: blind solve + focal-length correction on a frame with a
+//! wrong header FOCALLEN. The solvemyastro backend re-derives scale blindly;
+//! `solve_frame_with_hints` detects the mismatch and writes the corrected
+//! focal length back.
 //!
 //! Run: cargo test -p athenaeum-core --test fallback_blind_scale -- --ignored --nocapture
 
@@ -40,8 +41,7 @@ fn mem_conn() -> Connection {
 }
 
 fn open_cache() -> solvemyastro::StarCache {
-    solvemyastro::StarCache::open(PathBuf::from(SMAC_DIR).as_path())
-        .expect("open smac_gaia cache")
+    solvemyastro::StarCache::open(PathBuf::from(SMAC_DIR).as_path()).expect("open smac_gaia cache")
 }
 
 fn frame_with_focallen(focallen: f64) -> Frame {
@@ -86,8 +86,12 @@ fn fallback_corrects_wrong_focallen() {
     let d = dist_deg(solve.wcs.crval.0, solve.wcs.crval.1);
     eprintln!(
         "SOLVED RA={:.4} Dec={:.4} dist={:.3}° scale={:.4}\"/px corrected={} derived_fl={:?}",
-        solve.wcs.crval.0, solve.wcs.crval.1, d, solve.pixel_scale_arcsec,
-        solve.focallen_corrected, solve.derived_focallen_mm
+        solve.wcs.crval.0,
+        solve.wcs.crval.1,
+        d,
+        solve.pixel_scale_arcsec,
+        solve.focallen_corrected,
+        solve.derived_focallen_mm
     );
 
     assert!(d < 1.0, "position off by {d:.3}°");
@@ -96,7 +100,10 @@ fn fallback_corrects_wrong_focallen() {
         "pixel scale {:.4} not within 10% of {TRUE_SCALE}",
         solve.pixel_scale_arcsec
     );
-    assert!(solve.focallen_corrected, "should be flagged as a correction");
+    assert!(
+        solve.focallen_corrected,
+        "should be flagged as a correction"
+    );
 
     let fl = solve.derived_focallen_mm.expect("corrected focal length");
     // Exact inverse of hints.rs's atan formula, binning-aware.
@@ -169,37 +176,20 @@ fn full_blind_stage3_wrong_focallen_and_bogus_position() {
     let d = dist_deg(solve.wcs.crval.0, solve.wcs.crval.1);
     eprintln!(
         "SOLVED RA={:.4} Dec={:.4} dist={:.3}° corrected={} derived_fl={:?}",
-        solve.wcs.crval.0, solve.wcs.crval.1, d, solve.focallen_corrected,
+        solve.wcs.crval.0,
+        solve.wcs.crval.1,
+        d,
+        solve.focallen_corrected,
         solve.derived_focallen_mm
     );
     assert!(d < 1.0, "position off by {d:.3}°");
-    assert!(solve.focallen_corrected, "should be flagged as a correction");
+    assert!(
+        solve.focallen_corrected,
+        "should be flagged as a correction"
+    );
     let fl = solve.derived_focallen_mm.expect("corrected focal length");
     assert!(
         (450.0..650.0).contains(&fl),
         "derived FL {fl:.2} should be the true ~560mm"
-    );
-}
-
-/// Toggle off: with the fallback disabled, a wrong FOCALLEN fails again
-/// (old behavior preserved).
-#[test]
-#[ignore = "requires smac_gaia star cache and the Heart frame on disk"]
-fn fallback_disabled_wrong_focallen_fails() {
-    if !assets_present() {
-        eprintln!("SKIP: need smac_gaia cache + Heart frame");
-        return;
-    }
-    let conn = mem_conn();
-    let cache = open_cache();
-    let mut config = PlateSolveConfig::default();
-    config.fallback_to_blind_scale = false;
-
-    let frame = frame_with_focallen(WRONG_FOCALLEN);
-    let res = service::solve_frame(&frame, TEST_FITS, &conn, &cache, &config);
-    assert!(
-        res.is_err(),
-        "with the fallback disabled a wrong FOCALLEN must still fail, got {:?}",
-        res.map(|s| (s.wcs.crval.0, s.wcs.crval.1))
     );
 }

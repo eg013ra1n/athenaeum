@@ -202,11 +202,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_plate_solve_result", post(plate_solve::get_plate_solve_result))
         .route("/api/delete_plate_solve_for_frame", post(plate_solve::delete_plate_solve_for_frame))
         .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
-        .route("/api/download_tycho2_catalog", post(plate_solve::download_tycho2_catalog))
-        .route("/api/download_gaia_dr3_catalog", post(plate_solve::download_gaia_dr3_catalog))
         .route("/api/download_gaia_dr3_prebuilt_catalog", post(plate_solve::download_gaia_dr3_prebuilt_catalog))
-        .route("/api/get_quad_index_status", post(plate_solve::get_quad_index_status))
-        .route("/api/build_quad_index", post(plate_solve::build_quad_index))
         // Archive feature
         .route("/api/get_archive_settings", post(archive::get_archive_settings))
         .route("/api/set_archive_root_path", post(archive::set_archive_root_path))

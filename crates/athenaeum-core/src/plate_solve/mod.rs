@@ -1,16 +1,15 @@
-pub mod astap;
 pub mod config;
 pub mod dso_lookup;
+pub mod failure;
 pub mod gate_audit;
 pub mod hints;
-pub mod index_builder;
 pub mod object_fill;
-pub mod quad_index;
 pub mod service;
 pub mod storage;
 
 pub use config::PlateSolveConfig;
-pub use service::{solve_frame, solve_frame_with_hints, store_result, SolveResult};
+pub use failure::{describe_solve_failure, SolveFailureInfo};
+pub use service::{solve_frame, solve_frame_with_hints, store_result, SolveResult, StoreOutcome};
 
 pub use astroimage::platesolving::SolveHints;
 pub use storage::{

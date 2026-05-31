@@ -7,46 +7,26 @@ use serde::{Deserialize, Serialize};
 const SETTINGS_KEY: &str = "plate_solve.config";
 
 /// Plate solve configuration, stored as JSON in the settings table.
+///
+/// The solver itself is `solvemyastro` (the only backend); these are the
+/// app-level knobs around it — the SIP order passed through, the DSO-label
+/// search radius, batch concurrency, the persisted-result confidence gate,
+/// and per-camera pixel-size defaults. Every field is `#[serde(default)]`,
+/// so configs written by older versions (which carried extra, now-removed
+/// keys) still load — unknown keys are ignored.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlateSolveConfig {
-    #[serde(default = "default_max_image_stars")]
-    pub max_image_stars: usize,
-    #[serde(default = "default_min_matched_stars")]
-    pub min_matched_stars: usize,
-    #[serde(default = "default_verification_tolerance_px")]
-    pub verification_tolerance_px: f64,
-    #[serde(default = "default_index_mag_limit")]
-    pub index_mag_limit: f32,
-    #[serde(default = "default_hash_tolerance")]
-    pub hash_tolerance: f64,
+    /// SIP distortion polynomial order passed to `solvemyastro` (2 or 3).
+    /// Higher orders fit more distortion at the cost of needing more matched
+    /// stars. Default: 3.
     #[serde(default = "default_sip_order")]
     pub sip_order: u8,
-    /// Minimum inlier / expected-in-FOV ratio for the density-aware
-    /// acceptance gate. 0.10 means "10% of catalog stars in the FOV must
-    /// match". Only used on the dense-field branch (>100 catalog stars
-    /// in FOV); sparse fields use a lower absolute floor. Default: 0.10.
-    #[serde(default = "default_min_inlier_ratio")]
-    pub min_inlier_ratio: f64,
-    /// Progressive star-count retry passes. The solver first tries with
-    /// the first value; if the density-aware acceptance fails, it retries
-    /// with the next. Default: [150, 300, 600]. Dim fields and dense
-    /// fields that need more stars to find good quads benefit from the
-    /// later passes.
-    #[serde(default = "default_retry_passes")]
-    pub retry_passes: Vec<usize>,
     /// Base verification tolerance in arcseconds. The actual per-frame
     /// pixel tolerance is `base_arcsec / pixel_scale_arcsec`, clamped to
-    /// [4, 20] px. Replaces the old fixed-pixel `verification_tolerance_px`
-    /// which was too tight on slightly-defocused frames and too loose on
-    /// sharp narrow-FOV frames. Default: 8.0".
+    /// [4, 20] px — tight FOVs get smaller pixel tolerances, wide-field
+    /// frames larger ones. Default: 8.0".
     #[serde(default = "default_base_verification_tolerance_arcsec")]
     pub base_verification_tolerance_arcsec: f64,
-    /// Use the rough (no-PSF) star detector for blind solving. When true,
-    /// `solve_frame` calls `ImageAnalyzer::detect_fast` instead of `analyze`,
-    /// cutting end-to-end blind-solve time from ~6 s to ~1 s on a typical
-    /// full-frame image. Defaults to `true`.
-    #[serde(default = "default_use_fast_detection")]
-    pub use_fast_detection: bool,
     /// Maximum great-circle distance (in degrees) for the "Autofind object
     /// from coordinates" feature to accept a DSO match as a label. Tighter
     /// values reject more frames but avoid labelling unrelated fields with
@@ -58,75 +38,44 @@ pub struct PlateSolveConfig {
     /// shares the global rayon pool for intra-frame star detection.
     #[serde(default = "default_batch_concurrency")]
     pub batch_concurrency: u32,
-    /// Maximum great-circle distance (degrees) between a candidate's seed
-    /// WCS center and the FITS positional hint (RA/Dec) before the candidate
-    /// is rejected. A generous default tolerates moderate mount sync errors
-    /// while still eliminating dense-Milky-Way false positives that would
-    /// otherwise win the inlier tournament on raw count alone. Skipped when
-    /// no positional hint is available (true blind solve). Set to a value
-    /// >= 180 to disable gating entirely. Default: 10.0°.
-    #[serde(default = "default_position_hint_radius_deg")]
-    pub position_hint_radius_deg: f64,
-    /// Per-dimension tolerance for the catalog quad-index hash lookup. With
-    /// `1` (the default), each query probes the target bucket plus ±1
-    /// neighbors and accepts entries whose 5 hash dimensions are all within
-    /// ±1 bin. With `2`, it widens to ±2 — ~7× more candidates per query
-    /// at the cost of more verification work, but rescues frames whose
-    /// detection produces ratios drifted by 1-2% (typical for OSC images
-    /// whose green-only interpolation biases red/blue star centroids).
-    /// Don't go higher than 2: the false-positive rate grows fast and the
-    /// positional-prior gate is the only thing keeping noise alignments out.
-    /// Default: 1.
-    #[serde(default = "default_index_lookup_tolerance")]
-    pub index_lookup_tolerance: i32,
-    /// When a focal-length-hinted solve fails, automatically escalate through
-    /// less-constrained retries before giving up: (2) clear the pixel-scale
-    /// hint but keep the positional prior, then (3) a full blind solve with
-    /// both the scale hint and the positional prior cleared. A wrong FITS
-    /// `FOCALLEN` (focal reducer not accounted for, wrong rig profile, binning
-    /// mismatch) otherwise filters out every correct candidate and the solve
-    /// fails permanently even though a blind solve would succeed. On success
-    /// after the scale hint was cleared the corrected focal length is written
-    /// back to the frame. Default: true.
-    #[serde(default = "default_fallback_to_blind_scale")]
-    pub fallback_to_blind_scale: bool,
-    /// Apply the stricter acceptance gate on the blind / full-blind path
-    /// (scale hint cleared and/or position prior disabled). The hinted
-    /// stage-1 path is never affected. Default: true.
+    /// Apply the stricter acceptance gate before persisting a solve (defends
+    /// against catalog-corruption false positives writing WCS/focal length
+    /// back with override=1). Default: true.
     #[serde(default = "default_blind_gate_enabled")]
     pub blind_gate_enabled: bool,
-    /// RMS-residual ceiling on the blind path, as a multiple of the
-    /// per-frame adaptive pixel tolerance. Reject if
-    /// rms_residual_px > mult * adaptive_tol_px. Loose backstop (rms was
-    /// non-discriminating in calibration). Default: 2.5.
+    /// RMS-residual ceiling, as a multiple of the per-frame adaptive pixel
+    /// tolerance. Reject if `rms_residual_px > mult * adaptive_tol_px`. Loose
+    /// backstop (rms was non-discriminating in calibration). Default: 2.5.
     #[serde(default = "default_blind_rms_max_px_mult")]
     pub blind_rms_max_px_mult: f64,
-    /// Minimum inlier_ratio on the blind path, applied only to dense fields
-    /// (expected_in_fov > 100); sparse fields keep the absolute floor. This
-    /// is the primary false-positive discriminator. Default: 0.04.
+    /// Minimum inlier_ratio, applied only to dense fields (expected_in_fov >
+    /// 100); sparse fields keep the absolute floor. This is the primary
+    /// false-positive discriminator. Default: 0.04.
     #[serde(default = "default_blind_min_inlier_ratio")]
     pub blind_min_inlier_ratio: f64,
-    /// Absolute minimum inliers on the blind path (>= min_matched_stars).
-    /// Weak backstop only. Default: 12.
+    /// Absolute minimum inliers — a TRUE hard floor, not a discriminator.
+    /// The real-library calibration found inlier COUNT does not separate real
+    /// solves from false positives (`inlier_ratio` does — see
+    /// `blind_min_inlier_ratio`), so this is only a backstop. Set to 6 to match
+    /// solvemyastro's own `MIN_ABSOLUTE_INLIERS` acceptance floor: the solver
+    /// never emits a solution below 6 inliers, so athenaeum never
+    /// count-rejects a solve the solver itself already accepted. Raising it
+    /// above 6 silently discards correct-but-sparse solves — e.g. a slightly
+    /// out-of-focus frame whose bloated stars yield only ~10 inliers but a
+    /// healthy ratio and the right sky position. Default: 6.
     #[serde(default = "default_blind_inlier_floor")]
     pub blind_inlier_floor: usize,
-    /// Recovered pixel scale must be within [min,max] arcsec/px on the
-    /// blind path (nonphysical-rig guard). Default: 0.05 .. 60.0.
+    /// Recovered pixel scale must be within [min,max] arcsec/px
+    /// (nonphysical-rig guard). Default: 0.05 .. 60.0.
     #[serde(default = "default_blind_scale_sanity_min")]
     pub blind_scale_sanity_min: f64,
     #[serde(default = "default_blind_scale_sanity_max")]
     pub blind_scale_sanity_max: f64,
     /// If the header gave a pixel scale, the recovered scale must be within
     /// this factor of it. Deliberately generous so a legitimately very-wrong
-    /// header FOCALLEN (the whole point of the blind fallback) is not
-    /// rejected. Default: 8.0.
+    /// header FOCALLEN is not rejected. Default: 8.0.
     #[serde(default = "default_blind_scale_header_tol")]
     pub blind_scale_header_tol: f64,
-    /// Solver backend: `"legacy"` (prebuilt-index retry cascade) or
-    /// `"astap"` (per-trial gnomonic ASTAP port). Default `"legacy"` until
-    /// the astap path is bench-proven; flipping this is the cutover switch.
-    #[serde(default = "default_solver_backend")]
-    pub solver_backend: String,
     /// Per-camera pixel-size defaults (`INSTRUME` or `TELESCOP` → xpixsz_µm).
     /// Consulted by the focallen back-fill when a frame's FITS header lacks
     /// `XPIXSZ` (some surveys ship sparse headers — e.g. SkyMapper). Without
@@ -138,55 +87,56 @@ pub struct PlateSolveConfig {
     /// Path to the optional bright sub-catalog used by the solvemyastro
     /// backend for fast quad matching (G<14 stars with per-HEALPix-cell
     /// density top-up; see `solvemyastro build-bright-cache`). When
-    /// `None` or absent, solvemyastro uses only the deep catalog — same
-    /// behaviour as before the bright path existed. The verify stage
-    /// always uses the deep catalog regardless of this setting.
+    /// `None` or absent, solvemyastro uses only the deep catalog. The verify
+    /// stage always uses the deep catalog regardless of this setting.
     #[serde(default)]
     pub bright_cache_path: Option<String>,
 }
 
-fn default_max_image_stars() -> usize { 300 }
-fn default_min_matched_stars() -> usize { 6 }
-fn default_verification_tolerance_px() -> f64 { 10.0 }
-fn default_index_mag_limit() -> f32 { 13.0 }
-fn default_hash_tolerance() -> f64 { 0.005 }
-fn default_sip_order() -> u8 { 3 }
-fn default_use_fast_detection() -> bool { true }
-fn default_autofind_tolerance_deg() -> f64 { 0.5 }
-fn default_batch_concurrency() -> u32 { 0 }
-fn default_min_inlier_ratio() -> f64 { 0.10 }
-fn default_retry_passes() -> Vec<usize> { vec![50, 150, 300, 600] }
-fn default_base_verification_tolerance_arcsec() -> f64 { 8.0 }
-fn default_position_hint_radius_deg() -> f64 { 10.0 }
-fn default_index_lookup_tolerance() -> i32 { 1 }
-fn default_fallback_to_blind_scale() -> bool { true }
-fn default_blind_gate_enabled() -> bool { true }
-fn default_blind_rms_max_px_mult() -> f64 { 2.5 }
-fn default_blind_min_inlier_ratio() -> f64 { 0.04 }
-fn default_blind_inlier_floor() -> usize { 12 }
-fn default_blind_scale_sanity_min() -> f64 { 0.05 }
-fn default_blind_scale_sanity_max() -> f64 { 60.0 }
-fn default_blind_scale_header_tol() -> f64 { 8.0 }
-fn default_solver_backend() -> String { "legacy".to_string() }
+fn default_sip_order() -> u8 {
+    3
+}
+fn default_base_verification_tolerance_arcsec() -> f64 {
+    8.0
+}
+fn default_autofind_tolerance_deg() -> f64 {
+    0.5
+}
+fn default_batch_concurrency() -> u32 {
+    0
+}
+fn default_blind_gate_enabled() -> bool {
+    true
+}
+fn default_blind_rms_max_px_mult() -> f64 {
+    2.5
+}
+fn default_blind_min_inlier_ratio() -> f64 {
+    0.04
+}
+fn default_blind_inlier_floor() -> usize {
+    // = solvemyastro MIN_ABSOLUTE_INLIERS. Not a discriminator (the calibration
+    // showed count does not separate real/false — inlier_ratio does); only a
+    // floor matching the solver's own acceptance minimum. See the field doc.
+    6
+}
+fn default_blind_scale_sanity_min() -> f64 {
+    0.05
+}
+fn default_blind_scale_sanity_max() -> f64 {
+    60.0
+}
+fn default_blind_scale_header_tol() -> f64 {
+    8.0
+}
 
 impl Default for PlateSolveConfig {
     fn default() -> Self {
         Self {
-            max_image_stars: default_max_image_stars(),
-            min_matched_stars: default_min_matched_stars(),
-            verification_tolerance_px: default_verification_tolerance_px(),
-            index_mag_limit: default_index_mag_limit(),
-            hash_tolerance: default_hash_tolerance(),
             sip_order: default_sip_order(),
-            use_fast_detection: default_use_fast_detection(),
+            base_verification_tolerance_arcsec: default_base_verification_tolerance_arcsec(),
             autofind_tolerance_deg: default_autofind_tolerance_deg(),
             batch_concurrency: default_batch_concurrency(),
-            min_inlier_ratio: default_min_inlier_ratio(),
-            retry_passes: default_retry_passes(),
-            base_verification_tolerance_arcsec: default_base_verification_tolerance_arcsec(),
-            position_hint_radius_deg: default_position_hint_radius_deg(),
-            index_lookup_tolerance: default_index_lookup_tolerance(),
-            fallback_to_blind_scale: default_fallback_to_blind_scale(),
             blind_gate_enabled: default_blind_gate_enabled(),
             blind_rms_max_px_mult: default_blind_rms_max_px_mult(),
             blind_min_inlier_ratio: default_blind_min_inlier_ratio(),
@@ -194,12 +144,19 @@ impl Default for PlateSolveConfig {
             blind_scale_sanity_min: default_blind_scale_sanity_min(),
             blind_scale_sanity_max: default_blind_scale_sanity_max(),
             blind_scale_header_tol: default_blind_scale_header_tol(),
-            solver_backend: default_solver_backend(),
             camera_defaults: HashMap::new(),
             bright_cache_path: None,
         }
     }
 }
+
+/// The pre-2026-05 default for `blind_inlier_floor`. `save_config` serializes
+/// every field, so this old default was baked into stored configs and a plain
+/// `serde(default)` bump never reaches existing users (the key is present, so
+/// the default is not applied). The field is an internal backstop with no UI,
+/// so a stored 12 is always a stale default — never a deliberate choice — and
+/// `load_config` normalizes it to the current default on read.
+const STALE_BLIND_INLIER_FLOOR: usize = 12;
 
 /// Load the plate solve config from the database. Returns default if not set.
 pub fn load_config(conn: &Connection) -> PlateSolveConfig {
@@ -209,9 +166,23 @@ pub fn load_config(conn: &Connection) -> PlateSolveConfig {
         |row| row.get(0),
     );
 
-    match result {
+    let mut config = match result {
         Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
         Err(_) => PlateSolveConfig::default(),
+    };
+    migrate_config(&mut config);
+    config
+}
+
+/// In-place normalization of stale serialized defaults for internal (no-UI)
+/// gate fields, applied on every load. New/unset configs already get the
+/// current defaults via serde, so this only affects configs persisted before
+/// a default changed. Currently: the old `blind_inlier_floor` of 12 — too
+/// strict, it discarded correct-but-sparse solves (e.g. slightly out-of-focus
+/// frames that match only ~10 stars) — is mapped to the current default (6).
+fn migrate_config(config: &mut PlateSolveConfig) {
+    if config.blind_inlier_floor == STALE_BLIND_INLIER_FLOOR {
+        config.blind_inlier_floor = default_blind_inlier_floor();
     }
 }
 
@@ -230,12 +201,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_config_json_loads_with_blind_gate_defaults() {
-        let old = r#"{"max_image_stars":300,"min_matched_stars":6}"#;
+    fn legacy_config_json_loads_ignoring_removed_keys() {
+        // A config written by an older version carried keys that no longer
+        // exist (max_image_stars, min_matched_stars, solver_backend, …). serde
+        // ignores unknown keys, so it must still deserialize and fill every
+        // field from defaults.
+        let old = r#"{"max_image_stars":300,"min_matched_stars":6,"solver_backend":"legacy"}"#;
         let cfg: PlateSolveConfig = serde_json::from_str(old).unwrap();
         assert!(cfg.blind_gate_enabled);
         assert_eq!(cfg.blind_min_inlier_ratio, 0.04);
-        assert!(cfg.blind_inlier_floor >= cfg.min_matched_stars);
+        assert!(cfg.blind_inlier_floor >= 6);
         assert_eq!(cfg.blind_scale_header_tol, 8.0);
+        assert_eq!(cfg.sip_order, 3);
+    }
+
+    #[test]
+    fn load_config_migrates_stale_blind_inlier_floor() {
+        use crate::db::schema::init_db;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // A config persisted before the fix — real shape: removed keys + the
+        // old serialized blind_inlier_floor default of 12. serde keeps the
+        // present 12 (the new serde default of 6 never applies), so load_config
+        // must normalize it down so the defocus fix actually reaches the gate.
+        let stored = r#"{"sip_order":3,"blind_gate_enabled":true,"blind_min_inlier_ratio":0.04,"blind_inlier_floor":12,"solver_backend":"legacy"}"#;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('plate_solve.config', ?1)",
+            [stored],
+        )
+        .unwrap();
+        assert_eq!(
+            load_config(&conn).blind_inlier_floor,
+            6,
+            "stale old-default floor of 12 must be normalized to the current default on load"
+        );
+
+        // A non-stale explicit value is preserved — the migration is narrowly
+        // scoped to the old default, not a blanket clamp.
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('plate_solve.config', ?1)",
+            [r#"{"blind_inlier_floor":20}"#],
+        )
+        .unwrap();
+        assert_eq!(
+            load_config(&conn).blind_inlier_floor,
+            20,
+            "non-stale floors must be preserved"
+        );
     }
 }

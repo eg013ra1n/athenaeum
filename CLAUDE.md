@@ -5,6 +5,7 @@ Guidance for Claude Code working in the Athenaeum repo.
 ## Project Overview
 
 Athenaeum is a desktop + web app for astrophotographers to manage FITS/XISF image files and their metadata catalog (frame-set clustering by sky coordinates, calibration matching, ZIP archive, plate-solving, export templates). Tauri 2 desktop shell, Axum/SSE web server, shared `athenaeum-core` library, SQLite catalog, React/TS frontend.
+If you are using any other code base like ASTAP or other don't name it in the code and comments and do not name functions with its name.
 
 ## Workspace Layout
 

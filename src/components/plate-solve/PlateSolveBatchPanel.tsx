@@ -94,6 +94,21 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
     (s) => s.kind === 'failed',
   ).length;
 
+  // Per-frame failure reasons, surfaced as a list on completion. `code` lets
+  // us style a gate-rejected solve ("REJECTED_LOW_CONFIDENCE") differently from
+  // a genuine no-solution failure.
+  const failedFrames: Array<{
+    frameId: number;
+    error: string;
+    code?: string;
+    filename?: string;
+  }> = [];
+  for (const [frameId, s] of frameStatuses.entries()) {
+    if (s.kind === 'failed') {
+      failedFrames.push({ frameId, error: s.error, code: s.code, filename: s.filename });
+    }
+  }
+
   const progressFraction =
     progress && progress.total > 0 ? progress.current / progress.total : 0;
   const smoothedPercent = useSmoothedPercent(
@@ -248,6 +263,39 @@ export const PlateSolveBatchPanel = forwardRef<PlateSolveBatchPanelHandle, Plate
             <XCircle size={15} />
           </button>
         </div>
+      )}
+
+      {/* Per-frame failure reasons — shown on completion so the user can see
+          WHY each frame failed (or was rejected) without reading the console. */}
+      {completedSummary && !isActive && failedFrames.length > 0 && (
+        <details className="rounded-lg border border-border bg-surface text-sm" open>
+          <summary className="cursor-pointer select-none px-3 py-2 font-medium text-content-secondary">
+            Failed frames ({failedFrames.length})
+          </summary>
+          <ul className="max-h-56 divide-y divide-border/60 overflow-y-auto px-3 pb-2">
+            {failedFrames.map(({ frameId, error, code, filename }) => {
+              const rejected = code === 'REJECTED_LOW_CONFIDENCE';
+              return (
+                <li key={frameId} className="flex items-start gap-2 py-2">
+                  {rejected ? (
+                    <AlertCircle size={13} className="mt-0.5 flex-shrink-0 text-warning" />
+                  ) : (
+                    <XCircle size={13} className="mt-0.5 flex-shrink-0 text-error" />
+                  )}
+                  <div className="min-w-0">
+                    <p
+                      className="truncate font-medium text-content-secondary"
+                      title={filename ?? `Frame #${frameId}`}
+                    >
+                      {filename ?? `Frame #${frameId}`}
+                    </p>
+                    <p className="break-words text-xs text-content-muted">{error}</p>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </details>
       )}
     </div>
   );

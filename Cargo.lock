@@ -4673,6 +4673,7 @@ dependencies = [
  "nalgebra 0.33.3",
  "rayon",
  "rustafits",
+ "serde_json",
  "tempfile",
 ]
 

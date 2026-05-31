@@ -4,14 +4,14 @@ import { useNotifications } from '../contexts/NotificationContext';
 import type {
   PlateSolveProgressEvent,
   PlateSolveCompleteEvent,
-  QuadIndexStatus,
+  CatalogStatusInfo,
 } from '../types/plate-solve';
 
 export type FrameSolveStatus =
   | { kind: 'pending' }
   | { kind: 'solving' }
   | { kind: 'solved'; matched_stars: number; rms_arcsec: number }
-  | { kind: 'failed'; error: string };
+  | { kind: 'failed'; error: string; code?: string; filename?: string };
 
 export interface PlateSolveSummary {
   solved: number;
@@ -36,15 +36,15 @@ export interface ActivePlateSolveBatch {
   isComplete: boolean;
   isCancelling: boolean;
   summary: PlateSolveSummary | null;
-  /** Set when the backend rejects the whole batch (e.g. quad index missing) so the
+  /** Set when the backend rejects the whole batch (e.g. star catalog missing) so the
    *  per-batch banner can explain the failure instead of just showing "0/N solved". */
   errorMessage: string | null;
 }
 
-/** Reason the queue refused to invoke the backend. `index_missing` triggers the
- *  dedicated "Build the index from Settings" modal; `unknown` is a generic fallback. */
+/** Reason the queue refused to invoke the backend. `catalog_missing` triggers the
+ *  dedicated "Download the star catalog from Settings" modal; `unknown` is a generic fallback. */
 export type PlateSolvePrecheckError =
-  | { kind: 'index_missing'; message: string }
+  | { kind: 'catalog_missing'; message: string }
   | { kind: 'unknown'; message: string };
 
 let nextBatchId = 1;
@@ -60,10 +60,10 @@ export function usePlateSolveQueue() {
   const queueRef = useRef(queue);
   queueRef.current = queue;
 
-  // Once we've confirmed the quad index is built, skip the precheck for
-  // subsequent batches in the same session — the file-existence check is
-  // cheap but pointless to repeat once we know it's there.
-  const quadIndexVerifiedRef = useRef(false);
+  // Once we've confirmed the star catalog is present, skip the precheck for
+  // subsequent batches in the same session — the check is cheap but pointless
+  // to repeat once we know it's there.
+  const catalogVerifiedRef = useRef(false);
 
   // Backend only runs one plate-solve batch at a time (cancel handle key = 0),
   // so every incoming progress event belongs to the currently-running batch.
@@ -110,27 +110,27 @@ export function usePlateSolveQueue() {
       return updated;
     });
 
-    // Precheck: bail out before invoking the backend if the quad index isn't
-    // built yet. The backend would reject with the same error string, but
-    // detecting it here lets us show a dedicated modal that links to the
-    // build-it-from-Settings UI instead of just an inline error.
-    if (!quadIndexVerifiedRef.current) {
+    // Precheck: bail out before invoking the backend if the star catalog
+    // (solvemyastro's stars.smac) hasn't been downloaded yet. The backend would
+    // reject with an error string, but detecting it here lets us show a
+    // dedicated modal that links to the download-from-Settings UI.
+    if (!catalogVerifiedRef.current) {
       try {
-        const status = await api.invoke<QuadIndexStatus>('get_quad_index_status');
-        if (!status.built) {
+        const statuses = await api.invoke<CatalogStatusInfo[]>('get_catalog_status');
+        if (!statuses.some(s => s.installed)) {
           const message =
-            'Plate-solve indexes have not been built yet. Open Settings → Plate Solving to download the Tycho-2 catalog and build the quad index.';
+            'The star catalog has not been downloaded yet. Open Settings → Plate Solving to download the star catalog.';
           failBatch(next.batchId, next.frameIds.length, message);
-          setPrecheckError({ kind: 'index_missing', message });
+          setPrecheckError({ kind: 'catalog_missing', message });
           processingRef.current = false;
           currentBatchIdRef.current = null;
           setQueue(q => q.slice(1));
           return;
         }
-        quadIndexVerifiedRef.current = true;
+        catalogVerifiedRef.current = true;
       } catch (err) {
         // Status call itself failed — surface generically and skip the batch.
-        const message = `Could not verify plate-solve index status: ${String(err)}`;
+        const message = `Could not verify star catalog status: ${String(err)}`;
         console.error('Plate solve precheck failed:', err);
         failBatch(next.batchId, next.frameIds.length, message);
         setPrecheckError({ kind: 'unknown', message });
@@ -146,12 +146,12 @@ export function usePlateSolveQueue() {
     } catch (err) {
       console.error(`Plate solve batch ${next.batchId} failed:`, err);
       const message = String(err);
-      // Some failures only show up once the backend tries to load the index
+      // Some failures only show up once the backend tries to open the catalog
       // (e.g. file disappeared between the precheck and the call). Re-trigger
-      // the index-missing modal in that case so the user gets the right CTA.
-      if (/quad index/i.test(message) && /not found|missing/i.test(message)) {
-        quadIndexVerifiedRef.current = false;
-        setPrecheckError({ kind: 'index_missing', message });
+      // the catalog-missing modal in that case so the user gets the right CTA.
+      if (/cache|catalog|smac/i.test(message) && /not found|missing|no such/i.test(message)) {
+        catalogVerifiedRef.current = false;
+        setPrecheckError({ kind: 'catalog_missing', message });
       }
       failBatch(next.batchId, next.frameIds.length, message);
     }
@@ -198,6 +198,8 @@ export function usePlateSolveQueue() {
               frameStatuses.set(payload.frame_id, {
                 kind: 'failed',
                 error: payload.error ?? 'Solve failed',
+                code: payload.failure_code,
+                filename: payload.filename,
               });
             }
             const updated = new Map(prev);

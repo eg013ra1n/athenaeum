@@ -4,9 +4,9 @@ import { usePlateSolveProgressContext } from '../../contexts/PlateSolveProgressC
 
 /**
  * Renders when the queue refused to enqueue a plate-solve batch — most often
- * because the Tycho-2 quad index hasn't been built yet. Provides a single CTA
- * that deep-links into Settings → Plate Solving so the user can download the
- * catalog and build the index without hunting through the Settings page.
+ * because the solver star catalog (`stars.smac`) hasn't been downloaded yet.
+ * Provides a single CTA that deep-links into Settings → Plate Solving so the
+ * user can download it without hunting through the Settings page.
  *
  * Mounted once at the Layout level so every plate-solve entry point benefits
  * without per-page wiring.
@@ -17,9 +17,9 @@ export function PlateSolveIndexMissingModal() {
 
   if (!precheckError) return null;
 
-  const isIndexMissing = precheckError.kind === 'index_missing';
-  const title = isIndexMissing
-    ? 'Plate-solve indexes not built'
+  const isCatalogMissing = precheckError.kind === 'catalog_missing';
+  const title = isCatalogMissing
+    ? 'Star catalog not downloaded'
     : 'Plate solve unavailable';
 
   const goToSettings = () => {
@@ -41,15 +41,14 @@ export function PlateSolveIndexMissingModal() {
           <div className="flex-1">
             <h3 className="text-lg font-semibold text-content">{title}</h3>
             <p className="text-sm text-content-muted mt-2 leading-relaxed">
-              {isIndexMissing ? (
+              {isCatalogMissing ? (
                 <>
-                  Plate solving needs a star catalog (Tycho-2) and a pre-built
-                  quad index on disk. Open{' '}
+                  Plate solving needs the star catalog (Gaia DR3,{' '}
+                  <code>stars.smac</code>) on disk. Open{' '}
                   <span className="text-content-secondary">
                     Settings &rarr; Plate Solving
                   </span>{' '}
-                  to download the catalog and build the index — this is a
-                  one-time setup of a few hundred MB.
+                  to download it — a one-time prebuilt download.
                 </>
               ) : (
                 precheckError.message

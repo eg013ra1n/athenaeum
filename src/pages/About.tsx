@@ -259,8 +259,9 @@ export default function About() {
               {' '}— Extensible Image Serialization Format; Pleiades Astrophoto (Juan Conejero).
             </li>
             <li>
-              <ExtLink href="https://www.cosmos.esa.int/web/hipparcos/tycho-2">Tycho-2</ExtLink>
-              {' '}— star catalog (Høg et al., 2000); used for plate solving and sky-chart overlays.
+              <ExtLink href="https://www.cosmos.esa.int/web/gaia/dr3">Gaia DR3</ExtLink>
+              {' '}— ESA Gaia mission star catalog (Gaia Collaboration, 2023); used for plate solving.
+              Processed by the Gaia Data Processing and Analysis Consortium (DPAC).
             </li>
             <li>
               <ExtLink href="https://healpix.sourceforge.io/">HEALPix</ExtLink>
