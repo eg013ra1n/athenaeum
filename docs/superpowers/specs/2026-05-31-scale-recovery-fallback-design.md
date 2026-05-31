@@ -61,7 +61,7 @@ Downcast step A's `anyhow::Error` to the existing `diag::SolveFailure` and read 
 Eligibility gate (all must hold):
 
 - `scale_arcsec_per_px` is finite and ∈ [0.05, 120]″/px (the solver's existing physical bounds),
-- `inliers ≥ b1_min_inliers` (default **3**),
+- `inliers ≥ b1_min_inliers` (default **2** — see §5; B1's retry is fully verified so a low threshold is correctness-safe),
 - harvested scale differs from the supplied hint by > **15%** (otherwise step A already searched there).
 
 If eligible, retry once via `orchestrate::solve` with `ra/dec` kept and the harvested scale passed as a **point** `pixel_scale_arcsec`. Passing it as a point hint re-centres `fov_rungs` finely around the true scale (rungs land on ≈ the true full-frame FOV and its halving), reproducing the fast hinted-solve geometry — this is the mechanism by which Pane 4 then solves in ~0.7 s. Cost: one targeted, position-constrained pass.
@@ -78,7 +78,7 @@ Implementation seam: `fov_rungs(long_px, hints)` (`orchestrate.rs:126`) gains an
 ### 3.4 Configuration (`SolveConfig`, defaults preserve current behaviour on success and make the feature opt-out-able)
 
 - `scale_fallback_enabled: bool` — default **true**
-- `b1_min_inliers: usize` — default **3**
+- `b1_min_inliers: usize` — default **2** (correctness-safe; B1's retry is fully verified)
 - `b2_scale_lo_factor: f64` — default **0.125** (÷8)
 - `b2_scale_hi_factor: f64` — default **2.0** (×2)
 
@@ -95,29 +95,32 @@ Implementation seam: `fov_rungs(long_px, hints)` (`orchestrate.rs:126`) gains an
 | `src/lib.rs` | Rework `solve()` degrade orchestration into the A→B1→B2→C ladder; consume `SolveFailure.best_attempt` for B1. |
 | `src/orchestrate.rs` | Add an optional bounded scale range to `fov_rungs` (B2). No change to the search/verify core. |
 | `src/lib.rs` (`SolveConfig`) | Add the four config knobs with defaults. |
-| `tests/corpus_bench.rs` + corpus data | Add the real bad-focal-length frame and assertions (below). |
+| `tests/scale_fallback.rs` (new) | Dedicated integration test: real Pane 4 frame + reconstructed wrong (aperture-derived) scale hint, app-faithful tiered catalog; asserts a correct, cheap solve (see §5). |
+| `tests/corpus_bench.rs` | Unchanged; re-run as the no-regression gate. |
 
 No changes to the scale-invariant quad matcher, the cone/database access, or verification thresholds.
 
-## 5. Testing & acceptance criteria
+## 5. Testing & acceptance criteria — and implementation findings (2026-05-31)
 
-**Corpus gate (real data):**
+Implemented and verified via subagent-driven development. The findings below amend the original plan honestly:
 
-- Add an uncorrected-focal-length Pane 4 sub to the corpus. Assert it **solves with correct WCS** (RA ≈ 36.70, Dec ≈ 60.88, scale ≈ 0.879″/px), records **which sub-step solved it** (expect B1), and `cone_calls < BUDGET` (orders of magnitude below the all-sky path).
-- **No-regression:** every existing corpus frame is byte-for-byte unchanged — still solves at step A with `cone_calls` delta == 0 (proves the fast path is untouched and the new rungs never fire on success).
+**Integration test (`tests/scale_fallback.rs`).** Loads the real Pane 4 frame, supplies the aperture-derived wrong hint (3.52″/px) with the correct position, and the app-faithful **tiered** catalog (deep + bright); asserts a correct, cheap solve (RA ≈ 36.70, Dec ≈ 60.88, scale ≈ 0.879″/px, ≥ 10 inliers, solve < 30 s). Skips cleanly if the cache/frame are absent. (A full-corpus frame would not exercise this — the corpus harness prefers an existing-WCS scale, and the file's header lacks the bad focal length.)
 
-**Unit tests:**
+**Key finding — B1/B2 not exercised end-to-end.** Under the current baseline solver, this frame's wrong-hint case is solved **directly in step A's density-balanced pass** (~1–2 s, ~84 inliers), reproducibly across debug and release runs — so the fallback rungs do not fire for it. (An earlier one-off measurement showed step A failing → ~160 s blind solve; that did not reproduce, and there is some debug/release variation in the dense-field quad matching — a pre-existing baseline property, out of scope here.) Consequently the integration test guards the **user-facing outcome** (wrong-scale frame → correct, fast solve) but does not isolate B1/B2. The fallback is validated by the unit tests + the control-flow review, and remains a correctness-safe net for frames where step A genuinely fails. *Possible follow-up:* a deterministic forced-fallback test using a hint whose ±4-step step-A ladder cannot reach the true scale but B2's ÷8 bound can.
 
-- B1 gate: scale sanity bounds, inlier threshold, and hint-divergence acceptance/rejection.
-- B2 bounded-ladder rung generation: correct `[lo, hi]` span, asymmetry, and the no-hint→full-ladder fallback.
+**Unit tests (all green):**
 
-**Net-speed regression gate:** run corpus-bench QUIET; the deterministic `cone_calls` total must not regress on the existing set (it must be unchanged) and the new frame must be under budget.
+- `harvest_scale` (B1 gate): physical scale bounds, inlier threshold, hint-divergence accept/reject — 4 tests.
+- `b2_bounds` (B2): bounds derived from the hint; `None` when no scale hint — 2 tests.
+- `fov_rungs_bounded`: bounded span clamped to `[FOV_MIN, FOV_MAX]`, strictly descending, reaches the fine end — 1 test.
+
+**No-regression gate (`corpus_bench`, release, uncapped).** PASSED: **0 rms precision regressions** across the corpus (14/14 ground-truth frames correct, 0 wrong; M78 solves, dpos 2.9″); net wall 0.41× baseline. Confirms the fast path is untouched — every existing frame still solves at step A, and the new rungs only run after a step-A failure.
 
 ## 6. Risks & mitigations
 
 - **B1 harvests a spurious scale** → gated by sanity + inlier threshold + hint-divergence; if its one retry fails, B2 and C still run, so a bad estimate costs only one quick pass.
 - **B2 false positive in dense fields** → bounded range + unchanged verification thresholds; the corpus gate is the proof, and C remains the safety net.
-- **`b1_min_inliers = 3`** means Pane 4's specific 2-inlier near-miss does not fire B1 directly — but B2's `0.93°` rung brackets the true scale and solves it. 3 is chosen to avoid trusting 2-inlier matches; lower to 2 only if corpus evidence shows B1 is reliable there.
+- **`b1_min_inliers = 2`** (lowered from the original 3). Because B1's retry must pass full verification, a weak/spurious harvested scale cannot cause a false solve — it only costs one extra pass before B2/C run. So a low threshold is correctness-safe, and 2 catches a 2-inlier near-miss directly.
 - **Worst-case latency** for truly unsolvable frames grows; acceptable because it only occurs after the fast path has already failed, and cancellation bounds it.
 
 ## 7. Out of scope / roadmap
