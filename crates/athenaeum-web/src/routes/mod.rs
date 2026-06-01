@@ -27,6 +27,7 @@ mod images;
 mod missing_files;
 mod analysis;
 mod plate_solve;
+mod registration;
 mod archive;
 
 /// Build the complete Axum router.
@@ -203,6 +204,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/delete_plate_solve_for_frame", post(plate_solve::delete_plate_solve_for_frame))
         .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
         .route("/api/download_gaia_dr3_prebuilt_catalog", post(plate_solve::download_gaia_dr3_prebuilt_catalog))
+        // Registration (stacking preparation)
+        .route("/api/register_frame_set", post(registration::register_frame_set))
+        .route("/api/get_frame_set_registration", post(registration::get_frame_set_registration))
+        .route("/api/cancel_frame_set_registration", post(registration::cancel_frame_set_registration))
         // Archive feature
         .route("/api/get_archive_settings", post(archive::get_archive_settings))
         .route("/api/set_archive_root_path", post(archive::set_archive_root_path))

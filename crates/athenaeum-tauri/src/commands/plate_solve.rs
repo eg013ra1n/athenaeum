@@ -20,7 +20,7 @@ use super::AppState;
 /// convention path `<app-data>/catalogs/smac_gaia_bright/`. Returns
 /// `None` (with a log line) if neither exists — never fatal: the
 /// solver falls back to the deep cache.
-fn require_bright_cache(state: &AppState) -> Option<Arc<solvemyastro::StarCache>> {
+pub(super) fn require_bright_cache(state: &AppState) -> Option<Arc<solvemyastro::StarCache>> {
     // Fast path: already open.
     {
         let guard = state.ctx.bright_cache.read().unwrap();
@@ -75,7 +75,7 @@ fn require_bright_cache(state: &AppState) -> Option<Arc<solvemyastro::StarCache>
 /// open `StarCache`, cache it in state, and return an `Arc` to it.
 ///
 /// The path mirrors Phase 1's build step: `<app-data>/catalogs/smac_gaia/`.
-fn require_star_cache(state: &AppState) -> Result<Arc<solvemyastro::StarCache>, String> {
+pub(super) fn require_star_cache(state: &AppState) -> Result<Arc<solvemyastro::StarCache>, String> {
     // Fast path: already open.
     {
         let guard = state.ctx.star_cache.read().unwrap();

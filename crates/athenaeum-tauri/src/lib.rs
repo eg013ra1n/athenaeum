@@ -346,6 +346,10 @@ pub fn run() {
             commands::add_archive_root,
             commands::delete_archive_root,
             commands::set_default_archive_root,
+            // Registration (stacking preparation)
+            commands::register_frame_set,
+            commands::get_frame_set_registration,
+            commands::cancel_frame_set_registration,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

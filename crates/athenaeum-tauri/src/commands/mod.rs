@@ -40,6 +40,7 @@ pub mod calendar;
 pub mod export;
 pub mod analysis;
 pub mod plate_solve;
+pub mod registration;
 pub mod utils;
 pub mod archive;
 
@@ -58,4 +59,5 @@ pub use calendar::*;
 pub use export::*;
 pub use analysis::*;
 pub use plate_solve::*;
+pub use registration::*;
 pub use archive::*;

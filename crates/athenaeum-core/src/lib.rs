@@ -30,3 +30,4 @@ pub mod plate_solve;
 pub mod services;
 pub mod archive;
 pub mod file_op;
+pub mod registration;

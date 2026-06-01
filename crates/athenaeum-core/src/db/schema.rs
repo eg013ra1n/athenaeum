@@ -603,6 +603,52 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Registration results — stacking-preparation frame-to-reference alignment.
+    // One row per (frames_set_id, frame_id) pair. The reference frame carries
+    // is_reference=1 and an identity-like transform; every other member carries
+    // the affine sub→reference transform + a refined WCS derived by composing
+    // the reference WCS with that transform.  The table is additive and never
+    // touches frames.ra/dec or plate_solves.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS registration_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            frames_set_id INTEGER NOT NULL,
+            frame_id INTEGER NOT NULL,
+            reference_frame_id INTEGER NOT NULL,
+            is_reference INTEGER NOT NULL DEFAULT 0,
+            crpix1 REAL,
+            crpix2 REAL,
+            crval1 REAL,
+            crval2 REAL,
+            cd1_1 REAL,
+            cd1_2 REAL,
+            cd2_1 REAL,
+            cd2_2 REAL,
+            affine_a1 REAL,
+            affine_b1 REAL,
+            affine_c1 REAL,
+            affine_a2 REAL,
+            affine_b2 REAL,
+            affine_c2 REAL,
+            matched_stars INTEGER NOT NULL,
+            rms_residual_px REAL NOT NULL,
+            rms_residual_arcsec REAL,
+            status TEXT NOT NULL,
+            error TEXT,
+            compute_time_ms INTEGER NOT NULL,
+            registered_at TEXT NOT NULL,
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE,
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE,
+            UNIQUE(frames_set_id, frame_id)
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_registration_results_set ON registration_results(frames_set_id)",
+        [],
+    )?;
+
     // A5: keep `calibration_set_to_frames.source_id` consistent. The
     // `calibration_set_id` column has a FK with ON DELETE CASCADE, but
     // `source_id` does not — when a calibration_set is deleted, any sub-cal
