@@ -43,6 +43,7 @@ export type NotificationKind =
   | 'autofind'
   | 'archive'
   | 'fileop'
+  | 'registration'
   | 'generic';
 
 /** Short-lived toast shown bottom-right. */

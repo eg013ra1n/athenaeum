@@ -1166,6 +1166,69 @@ export interface FlatContourOpts {
   gradientPct: number;
 }
 
+// ========== Stacking Preparation / Frame Registration ==========
+
+/** Registration status for a single frame. */
+export type FrameRegistrationStatus =
+  | 'pending'
+  | 'aligning'
+  | 'aligned'
+  | 'reference'
+  | 'failed';
+
+/** Persisted registration result for a single frame within a frame set.
+ *  Mirrors Rust `RegistrationRecord` (serde rename_all = "camelCase"). */
+export interface RegistrationRecord {
+  id?: number;
+  framesSetId: number;
+  frameId: number;
+  referenceFrameId: number;
+  isReference: boolean;
+  crpix1?: number;
+  crpix2?: number;
+  crval1?: number;
+  crval2?: number;
+  cd11?: number;
+  cd12?: number;
+  cd21?: number;
+  cd22?: number;
+  affineA1?: number;
+  affineB1?: number;
+  affineC1?: number;
+  affineA2?: number;
+  affineB2?: number;
+  affineC2?: number;
+  matchedStars: number;
+  rmsResidualPx: number;
+  rmsResidualArcsec?: number;
+  status: 'aligned' | 'reference' | 'failed';
+  error?: string;
+  computeTimeMs: number;
+  registeredAt: string;
+}
+
+/** Live progress event emitted during frame registration.
+ *  Event name: `stacking-prep-progress`. */
+export interface StackingPrepProgressEvent {
+  frameId: number;
+  current: number;
+  total: number;
+  status: FrameRegistrationStatus;
+  matchedStars?: number;
+  rmsPx?: number;
+  error?: string;
+  filename?: string;
+}
+
+/** Completion event emitted when frame registration finishes.
+ *  Event name: `stacking-prep-complete`. */
+export interface StackingPrepCompleteEvent {
+  referenceFrameId: number;
+  aligned: number;
+  failed: number;
+  total: number;
+}
+
 /** Response from `compute_flat_contour_plot`. The `pixelsB64` field is the
  *  final 8-bit grayscale display image (length == width*height) base64-
  *  encoded for JSON transport. The frontend paints those bytes directly

@@ -15,6 +15,7 @@ import {
   Target,
   Archive,
   FolderInput,
+  Layers,
   type LucideIcon,
 } from 'lucide-react';
 import { useNotifications, type NotificationKind } from '../contexts/NotificationContext';
@@ -31,6 +32,7 @@ const KIND_ICON: Record<NotificationKind, LucideIcon> = {
   autofind: Target,
   archive: Archive,
   fileop: FolderInput,
+  registration: Layers,
   generic: Bell,
 };
 

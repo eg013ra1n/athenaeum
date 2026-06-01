@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers } from 'lucide-react';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, AlignHorizontalJustifyCenter } from 'lucide-react';
 import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
@@ -17,12 +17,13 @@ import { ArchiveProgress } from '../components/archive/ArchiveProgress';
 import { RestoreDialog } from '../components/archive/RestoreDialog';
 import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
+import { StackingPrepTab } from '../components/StackingPrepTab';
 import { revealItemInDir } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
 
-type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export';
+type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'registration';
 
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
@@ -76,6 +77,7 @@ export default function FrameSetDetail() {
     : searchParams.get('tab') === 'history' ? 'history'
     : searchParams.get('tab') === 'analysis' ? 'analysis'
     : searchParams.get('tab') === 'export' ? 'export'
+    : searchParams.get('tab') === 'registration' ? 'registration'
     : undefined;
   const [activeTab, setActiveTab] = useState<FrameSetTab>(initialTabFromUrl ?? 'analysis');
 
@@ -106,7 +108,7 @@ export default function FrameSetDetail() {
 
     if (!tabParam && !highlightSetParam && !kindParam) return;
 
-    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export') {
+    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export' || tabParam === 'registration') {
       setActiveTab(tabParam);
     }
 
@@ -736,6 +738,7 @@ export default function FrameSetDetail() {
         {([
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
           { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
+          { key: 'registration' as FrameSetTab, label: 'Stacking Preparation', icon: AlignHorizontalJustifyCenter },
           { key: 'export' as FrameSetTab, label: 'Export', icon: Layers },
           { key: 'history' as FrameSetTab, label: 'History', icon: History },
         ]).map(({ key, label, icon: Icon }) => (
@@ -764,6 +767,11 @@ export default function FrameSetDetail() {
         ) : calibrationHierarchy ? (
           activeTab === 'history' ? (
             <FrameSetHistoryTab key={historyRefreshKey} frameSetId={parseInt(id!)} />
+          ) : activeTab === 'registration' ? (
+            <StackingPrepTab
+              framesSetId={parseInt(id!)}
+              frameSetName={detail?.frames_set?.name ?? undefined}
+            />
           ) : activeTab === 'export' ? (
             <ExportTab
               frameSetId={parseInt(id!)}
