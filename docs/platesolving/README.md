@@ -136,7 +136,7 @@ The hot path now consults **two on-disk star caches**, not one:
 | Cache | Convention path | Depth | Size | Used by |
 | ---- | ---- | ---- | ---- | ---- |
 | **Deep** | `<app-data>/catalogs/smac_gaia/` | Gaia DR3 G<19 | ~540 M stars | Verify stage (always) + quad-matching cone when no bright cache is configured **or** when the bright cone is too sparse |
-| **Bright** (optional) | `<app-data>/catalogs/smac_gaia_bright/` | Hybrid (see below) | ~70.5 M stars (~2.6 GB) | Quad-matching cone, tried *first* |
+| **Bright** (optional) | `<app-data>/catalogs/smac_gaia_bright/` | Hybrid (see below) | ~70.5 M stars (~2.0 GB) | Quad-matching cone, tried *first* |
 
 Both are produced by `solvemyastro`'s SMAC writer. They are independent files — the bright cache is *derived* from the deep cache via the `build-bright-cache` subcommand, not from raw Gaia ingest.
 
@@ -149,6 +149,8 @@ Per HEALPix-6 cell (49,152 cells across the sky), the bright cache is filled wit
 3. **No hard ceiling** — Milky-Way-plane cells keep all 500+ bright stars; sparse polar cells get e.g. 30 floor + 70 top-up = 100.
 
 Net effect: bright-rich regions get a true G<16 sub-cache, sparse regions get an opportunistic density-100 sub-cache. The bright cache never goes deeper than its source (G<19), so the deepest "top-up" star is around G≈19, not G≈21.
+
+> **Reality of the shipped cache (see "Verified on-disk contents" below):** in the build athenaeum actually ships, the `target_density: 100` top-up **never engaged** — even the sparsest HEALPix-6 cell already holds 144 stars brighter than G16, which is > 100. So the delivered `smac_gaia_bright` is effectively a *clean G≤16 magnitude cut*, not a per-cell density cap. The hybrid algorithm above is what the tool *would* do; the floor simply dominated everywhere.
 
 ### Why floor=16 (and not the CLI default of 14)
 
@@ -211,6 +213,96 @@ solvemyastro build-bright-cache \
 ~5 minutes on M1. Produces `stars.smac` plus a sidecar `bright.meta.json` recording `source_smac_size`, `source_epoch`, `bright_floor`, `target_density`, `mode`, `output_star_count` for stale-cache debugging.
 
 `--mode` accepts `hybrid` (default; the algorithm above), `floor-only` (skip the density top-up), or `cap-only` (no floor, just take the brightest `target_density` per cell). Production uses `hybrid`.
+
+### Verified on-disk contents (2026-06-01 audit)
+
+Confirmed by parsing the `.smac` header + the full 49,152-entry HEALPix-6 pixel
+directory + sampled record magnitudes (format spec in `solvemyastro/src/cache.rs`:
+64-byte header with `u64 star_count`@16 / `f64 epoch`@24, then a `{u64 offset,
+u32 count}` directory, then 28-byte records `f64 ra, f64 dec, f32 mag, f32 pmra,
+f32 pmdec`, mag-sorted ascending within each cell). Per-cell counts sum exactly to
+the header `star_count` in both files.
+
+| Catalog | Stars | File size | Mag cut | Per-cell min / median / max | Stars/deg² (median / sparse) | Empty cells |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| **Deep** `smac_gaia` | 540,600,543 | ~15.1 GB | **hard G≤19.0** | 685 / 3,252 / 443,281 | 3,875 / 816 | 0 |
+| **Bright** `smac_gaia_bright` | 70,541,101 | ~2.0 GB | **hard G≤16.0** | 144 / 656 / 46,497 | 782 / 172 | 0 |
+
+Key findings:
+
+- **Bright is a clean magnitude cut, not a density cap.** Every cell — sparsest
+  (n=144) to densest (n=46,497) — ends at G≈16.00; the `target_density: 100`
+  top-up never fired (sparsest cell already > 100 stars to G16). So dense
+  galactic-plane cells still hold ~46 k stars and sparse polar cells ~144 — a
+  ~320× spread, *not* a uniform ~100/cell. This is fine (arguably better:
+  uniform G≤16 depth, full bright-star coverage for verification) — just don't
+  read `bright.meta.json`'s `target_density: 100` as the operative limit.
+- **Both catalogs cover the whole sky with zero empty cells**, north and south —
+  hemisphere is irrelevant to the solver. Only galactic latitude (plane = dense,
+  poles = sparse) changes density.
+- **The deep catalog is much deeper than strictly needed for solving** (G≤19,
+  540 M; ~26× the stars of a G<16 build). It is intentional: it both backs the
+  verify stage and rescues hard sparse/long-focal-length fields. The solver reads
+  it to `SolveConfig::catalog_mag_limit = 19.0` (set in `service.rs`).
+- A third folder, **`<app-data>/catalogs/gaia_dr3/`** (~7.1 GB, 49,152
+  `healpix_*.bin` raw bins), is the **build input only** — consumed by
+  `build-cache` to produce `smac_gaia/stars.smac`; it is *not* read at solve
+  time. Keep it only if you want to rebuild the `.smac` files without
+  re-downloading from Gaia.
+
+### When is the bright tier enough vs. when do you need deep?
+
+You never choose manually — the per-cone auto-fallback (threshold 30, above)
+switches automatically, and the verify stage always uses deep, so the deep cache
+is **mandatory** and the bright cache is a speed layer on top. But it is useful to
+know where the bright tier's *in-field* stars run thin, because that is what
+determines whether matching leans on bright or on deep.
+
+**The determinant is field of view (arcmin), not focal length on its own** —
+focal length only matters together with sensor size:
+
+| Field width | Bright (G≤16) stars in frame | Verdict |
+| ---- | ---- | ---- |
+| **≳ 20′** | ≥ ~20 even in sparse sky | Bright is plenty |
+| **~10–20′** | ~8–20 (sparse) | Bright OK at median density; thin off the plane → deep carries it |
+| **≲ 10′** | ≤ ~3 in sparse sky | Need deep (G≤19) for reliable matching + verification |
+
+Translated to focal length for three sensor sizes (Gaia density: bright median
+782 / sparse 172 per deg²; deep median 3,875 / sparse 816):
+
+| Sensor (long axis) | Bright plenty up to | Transition | Need deep beyond |
+| ---- | ---- | ---- | ---- |
+| Small (ASI533, 11.3 mm) | ~1,950 mm | 1,950–3,900 mm | ~3,900 mm |
+| APS-C (ASI2600/294, 15.6 mm) | ~2,700 mm | 2,700–5,400 mm | ~5,400 mm |
+| Full-frame (ASI6200/QHY600, 36 mm) | ~6,200 mm | 6,200–12,000 mm | ~12,000 mm |
+
+Worked example (APS-C 4144×2822 px @ 3.76 µm), catalog stars in the frame — the
+bold sparse-sky figures are what bind first:
+
+| Focal length | Field | Bright (med / sparse) | Deep (med / sparse) |
+| ---- | ---- | ---- | ---- |
+| 530 mm | 101′×69′ | 1511 / 332 | 7487 / 1577 |
+| 1000 mm | 54′×37′ | 424 / 93 | 2103 / 443 |
+| 2000 mm | 27′×18′ | 106 / **23** | 526 / 111 |
+| 4000 mm | 13′×9′ | 27 / **6** | 131 / 28 |
+| 6500 mm | 8′×6′ | 10 / **2** | 50 / 10 |
+
+Takeaways:
+
+- **Wide/medium fields (camera lenses through ~2,000–2,700 mm on APS-C, longer on
+  full-frame):** hundreds of G≤16 stars in frame — bright alone would match fine.
+- **Long focal lengths are where deep earns its keep:** below ~10′ field
+  (≈ >5,400 mm on APS-C, >3,900 mm on a small sensor, >12,000 mm on full-frame),
+  G≤16 drops to a handful in sparse sky and you need G≤19 to clear the 4-inlier
+  acceptance floor (`DEFAULT_MIN_ABSOLUTE_INLIERS = 4`).
+- **A bigger sensor pushes the whole boundary to longer focal length.** Example:
+  6,500 mm is an 8′ field on APS-C (bright too thin → leans on deep) but a 19′
+  field on full-frame (bright still plenty).
+- **Recommendation: keep both caches.** Dropping the 15 GB deep (bright-only)
+  is acceptable *only* if every rig you solve stays wide/medium-field (≳20′),
+  and even then it weakens verification everywhere (verify is always deep) and
+  breaks long-focal-length / sparse-sky solves. Deep is the load-bearing
+  catalog; bright is a speed optimization on top of it.
 
 ## Per-Frame Pipeline
 
@@ -610,11 +702,21 @@ These items are explicitly out of scope for the current blind solver and are pla
 
 ## Changelog
 
+### 2026-06 — Catalog audit + bright-vs-deep FOV guidance (docs only)
+
+No code change — documented the *verified on-disk reality* of the shipped caches
+and added focal-length/FOV guidance. See [Verified on-disk contents](#verified-on-disk-contents-2026-06-01-audit)
+and [When is the bright tier enough vs. when do you need deep?](#when-is-the-bright-tier-enough-vs-when-do-you-need-deep).
+
+- **Verified contents:** deep `smac_gaia` = 540,600,543 stars, hard **G≤19.0**, ~15.1 GB; bright `smac_gaia_bright` = 70,541,101 stars, hard **G≤16.0**, ~2.0 GB; both depth-6, 0 empty cells all-sky. Raw `gaia_dr3/` (7.1 GB) is build-input only.
+- **Correction:** the bright cache's `target_density: 100` top-up **never engaged** in the shipped build (sparsest cell already has 144 > 100 stars to G16), so it is effectively a clean G≤16 magnitude cut, not a per-cell density cap. Earlier doc size "~2.6 GB" corrected to ~2.0 GB (70.5 M × 28 B).
+- **Boundary:** the bright tier is the field-of-view determinant — plenty ≳20′, marginal 10–20′, need deep <10′. By sensor: deep becomes load-bearing beyond ~3,900 mm (small chip), ~5,400 mm (APS-C), ~12,000 mm (full-frame). Hemisphere is irrelevant (all-sky, 0 empty cells).
+
 ### 2026-05 — Bright sub-catalog (tiered Gaia caches)
 
 Catalog separation for the solvemyastro/Gaia pipeline. Full detail in the [Tiered Star Cache](#tiered-star-cache-bright--deep-2026-05) section above.
 
-- **New optional second cache** at `<app-data>/catalogs/smac_gaia_bright/`, ~70.5 M stars (~2.6 GB) — derived from the deep G<19 cache via a per-HEALPix-cell hybrid algorithm (floor `mag < 16` + density top-up to 100).
+- **New optional second cache** at `<app-data>/catalogs/smac_gaia_bright/`, ~70.5 M stars (~2.0 GB) — derived from the deep G<19 cache via a per-HEALPix-cell hybrid algorithm (floor `mag < 16` + density top-up to 100; in the shipped build the floor dominated everywhere so it is effectively a clean G≤16 cut — see the 2026-06 entry).
 - **Athenaeum picks it up automatically** via the convention path, or via the new `PlateSolveConfig::bright_cache_path` setting. Missing/corrupt is non-fatal; the solver falls back to deep-only and logs a warning.
 - **Quad-matching cone tries bright first**, auto-falls-back to deep when the cone returns fewer than `SolveConfig::bright_fallback_threshold = 30` stars. **Verify always uses deep** (Bayesian NR correctness).
 - **Why floor=16 (not the CLI default 14):** typical 120–300 s exposures detect to m ≈ 14–16, so a floor=14 cache would force the auto-fallback on most cells and erase the speedup.
