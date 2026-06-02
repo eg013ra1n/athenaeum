@@ -154,7 +154,7 @@ the WCS + transforms and persists them.
 ```text
             ┌─ detect stars (precise) in every LIGHT member
             │
-pick REFERENCE (best frame)
+REFERENCE = user's choice (Analysis tab → frame_set_reference); auto-pick fallback
             │
    precise-solve REFERENCE  ──────────────►  absolute WCS (sky anchor for the whole set)
             │
@@ -174,11 +174,33 @@ stacking than independently absolute-solving each frame. Only the **reference**
 needs an absolute (catalog) solve, to anchor the set to the sky. A member that
 can't absolute-solve can still register.
 
-### Reference selection (`registration/reference.rs::select_reference`)
+### Reference selection — user-chosen, persisted per object
 
-User override wins; otherwise the member with the most detected stars
-(tie-break: smallest `frame_id`). If the reference fails to precise-solve, the
-service retries with the next-best candidates (≤ 3) before giving up.
+The reference is **chosen by the user** in the frame-set **Analysis tab**
+("Lights Analysis & Stats"): sort/filter the lights by quality (SNR, FWHM,
+quality score…) and click **"Set as reference"** on the best frame. The choice
+is persisted in the **`frame_set_reference`** table, **keyed by `frames_set_id`**
+(object-scoped — the same frame can be the reference for one set without
+affecting another). `set_frame_set_reference` validates the frame is a LIGHT
+member of the set.
+
+`register_frame_set` uses the persisted choice: when no explicit override is
+passed it reads `frame_set_reference` and feeds it to
+`select_reference` (`registration/reference.rs`). The **auto-pick fallback**
+(most detected stars, tie-break smallest `frame_id`, then a ≤ 3-candidate
+retry if the chosen reference fails to precise-solve) only applies when no
+choice is stored — e.g. programmatic callers.
+
+**Gating.** The Stacking Preparation tab is **available only when the set is
+analyzed AND a reference is chosen** (`registrationTabReady` in
+`FrameSetDetail.tsx`); otherwise the tab is disabled with a tooltip pointing to
+the Analysis tab.
+
+**Staleness.** Each `registration_results` row records the
+`reference_frame_id` it was computed against. If the user later changes the
+reference, the stored results are **kept but flagged stale** in the UI
+(`StackingPrepTab` compares the rows' `reference_frame_id` to the current
+`frame_set_reference`) — re-run to refresh. No schema flag is needed.
 
 ### The `register()` primitive (`solvemyastro/src/register.rs`)
 
@@ -321,7 +343,8 @@ per-frame skip). TPS distortion stays a gated fallback.
 | Precise solve | `solvemyastro/src/{orchestrate.rs, sip.rs, select.rs, refine.rs, lib.rs}` |
 | Registration primitive | `solvemyastro/src/register.rs` |
 | Registration feature | `crates/athenaeum-core/src/registration/{service.rs, reference.rs, db.rs, mod.rs}` |
-| Table | `crates/athenaeum-core/src/db/schema.rs` (`registration_results`) |
-| Commands | `crates/athenaeum-{tauri/src/commands,web/src/routes}/registration.rs` |
-| UI | `src/components/StackingPrepTab.tsx`, `src/hooks/useRegistrationQueue.ts`, `src/pages/FrameSetDetail.tsx` |
+| Tables | `crates/athenaeum-core/src/db/schema.rs` (`registration_results`, `frame_set_reference`) |
+| Commands | `crates/athenaeum-{tauri/src/commands,web/src/routes}/registration.rs` (incl. `set/get/clear_frame_set_reference`) |
+| UI — registration | `src/components/StackingPrepTab.tsx`, `src/hooks/useRegistrationQueue.ts`, `src/pages/FrameSetDetail.tsx` (tab gating) |
+| UI — reference picking | `src/components/LightsAnalysisView.tsx`, `src/components/calibration/LightsAnalysisTable.tsx` (Analysis tab "Set as reference") |
 | Tests | `solvemyastro` unit tests (`register`, `sip`, `refine`, orchestrate), `crates/athenaeum-core/tests/registration_e2e.rs` |
