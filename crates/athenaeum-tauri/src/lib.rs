@@ -350,6 +350,9 @@ pub fn run() {
             commands::register_frame_set,
             commands::get_frame_set_registration,
             commands::cancel_frame_set_registration,
+            commands::set_frame_set_reference,
+            commands::get_frame_set_reference,
+            commands::clear_frame_set_reference,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

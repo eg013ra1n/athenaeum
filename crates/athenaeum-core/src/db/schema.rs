@@ -649,6 +649,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // User-chosen reference frame for registration, keyed per frame set.
+    // One row per frame set; INSERT OR REPLACE on every update.
+    // Both FKs have ON DELETE CASCADE so stale rows are auto-removed when a
+    // frame set or its member frame is deleted.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS frame_set_reference (
+            frames_set_id INTEGER PRIMARY KEY,
+            reference_frame_id INTEGER NOT NULL,
+            set_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE,
+            FOREIGN KEY (reference_frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     // A5: keep `calibration_set_to_frames.source_id` consistent. The
     // `calibration_set_id` column has a FK with ON DELETE CASCADE, but
     // `source_id` does not — when a calibration_set is deleted, any sub-cal

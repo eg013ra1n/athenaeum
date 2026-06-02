@@ -14,6 +14,12 @@ use athenaeum_core::registration;
 use athenaeum_core::registration::db::{
     get_registration_for_frame_set, RegistrationRecord,
 };
+use athenaeum_core::registration::{
+    clear_frame_set_reference as core_clear_frame_set_reference,
+    get_frame_set_reference as core_get_frame_set_reference,
+    set_frame_set_reference as core_set_frame_set_reference,
+    FrameSetReference,
+};
 use athenaeum_core::services::PlateSolveHandle;
 
 use super::AppState;
@@ -127,4 +133,43 @@ pub async fn cancel_frame_set_registration(
         eprintln!("registration: no active registration to cancel");
     }
     Ok(())
+}
+
+/// Persist the user-chosen reference frame for a frame set.
+///
+/// Validates that `frame_id` is a LIGHT member of the set before writing.
+#[tauri::command]
+pub async fn set_frame_set_reference(
+    state: State<'_, AppState>,
+    frames_set_id: i64,
+    frame_id: i64,
+) -> Result<(), String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    core_set_frame_set_reference(&conn, frames_set_id, frame_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Return the persisted user-chosen reference frame for a frame set, if any.
+#[tauri::command]
+pub async fn get_frame_set_reference(
+    state: State<'_, AppState>,
+    frames_set_id: i64,
+) -> Result<Option<FrameSetReference>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    core_get_frame_set_reference(&conn, frames_set_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Remove the persisted user-chosen reference for a frame set.
+#[tauri::command]
+pub async fn clear_frame_set_reference(
+    state: State<'_, AppState>,
+    frames_set_id: i64,
+) -> Result<(), String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    core_clear_frame_set_reference(&conn, frames_set_id)
+        .map_err(|e| e.to_string())
 }

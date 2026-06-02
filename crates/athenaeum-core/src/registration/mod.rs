@@ -16,5 +16,6 @@ pub mod db;
 pub mod reference;
 pub mod service;
 
-pub use db::RegistrationRecord;
+pub use db::{FrameSetReference, RegistrationRecord};
+pub use db::{clear_frame_set_reference, get_frame_set_reference, set_frame_set_reference};
 pub use service::{register_frame_set, RegistrationSummary};

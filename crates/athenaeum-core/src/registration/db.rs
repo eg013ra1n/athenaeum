@@ -181,6 +181,82 @@ pub fn clear_registration_for_frame_set(
     Ok(n)
 }
 
+// ── user-chosen reference frame store ────────────────────────────────────────
+
+/// A row from `frame_set_reference`, returned to callers and serialised across
+/// the IPC/HTTP boundary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameSetReference {
+    pub frames_set_id: i64,
+    pub reference_frame_id: i64,
+    /// ISO-8601 timestamp stored as TEXT in SQLite.
+    pub set_at: String,
+}
+
+/// Persist (or overwrite) the user-chosen reference frame for a frame set.
+///
+/// Validates that `frame_id` is a LIGHT member of `frames_set_id` before
+/// writing; returns an error if the frame is not a member.
+pub fn set_frame_set_reference(
+    conn: &Connection,
+    frames_set_id: i64,
+    frame_id: i64,
+) -> Result<()> {
+    let members = get_light_frame_ids_for_frame_set(conn, frames_set_id)?;
+    if !members.contains(&frame_id) {
+        anyhow::bail!(
+            "Frame {frame_id} is not a LIGHT member of frame set {frames_set_id}"
+        );
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO frame_set_reference
+             (frames_set_id, reference_frame_id, set_at)
+         VALUES (?1, ?2, strftime('%Y-%m-%d %H:%M:%S', 'now'))",
+        rusqlite::params![frames_set_id, frame_id],
+    )
+    .context("Failed to upsert frame_set_reference")?;
+    Ok(())
+}
+
+/// Retrieve the persisted user-chosen reference for a frame set, if any.
+pub fn get_frame_set_reference(
+    conn: &Connection,
+    frames_set_id: i64,
+) -> Result<Option<FrameSetReference>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT frames_set_id, reference_frame_id, set_at
+             FROM frame_set_reference
+             WHERE frames_set_id = ?1",
+        )
+        .context("Failed to prepare frame_set_reference SELECT")?;
+
+    let result = stmt.query_row([frames_set_id], |row| {
+        Ok(FrameSetReference {
+            frames_set_id: row.get(0)?,
+            reference_frame_id: row.get(1)?,
+            set_at: row.get(2)?,
+        })
+    });
+
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(e).context("Failed to query frame_set_reference")),
+    }
+}
+
+/// Remove the persisted user-chosen reference for a frame set (if any).
+pub fn clear_frame_set_reference(conn: &Connection, frames_set_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM frame_set_reference WHERE frames_set_id = ?1",
+        [frames_set_id],
+    )
+    .context("Failed to delete frame_set_reference")?;
+    Ok(())
+}
+
 // ── frame-set LIGHT member helper ─────────────────────────────────────────────
 
 /// Return the `frames.id` values of every LIGHT member of a frame set.
@@ -428,5 +504,110 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
+    }
+
+    // ── frame_set_reference store tests ──────────────────────────────────────
+
+    /// Set / get / clear round-trip.
+    #[test]
+    fn reference_store_round_trip() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        seed_frame(&conn, 1, 1, "LIGHT");
+        seed_frame(&conn, 2, 2, "LIGHT");
+        seed_frames_set(&conn, 10);
+        seed_session_member(&conn, 10, 1);
+        // Add frame 2 to the same session.
+        let session_id: i64 = conn
+            .query_row("SELECT id FROM sessions LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![session_id, 2_i64],
+        )
+        .unwrap();
+
+        // No reference stored yet.
+        assert!(get_frame_set_reference(&conn, 10).unwrap().is_none());
+
+        // Set frame 1 as reference.
+        set_frame_set_reference(&conn, 10, 1).unwrap();
+        let stored = get_frame_set_reference(&conn, 10).unwrap().unwrap();
+        assert_eq!(stored.frames_set_id, 10);
+        assert_eq!(stored.reference_frame_id, 1);
+        assert!(!stored.set_at.is_empty());
+
+        // Overwrite with frame 2.
+        set_frame_set_reference(&conn, 10, 2).unwrap();
+        let stored2 = get_frame_set_reference(&conn, 10).unwrap().unwrap();
+        assert_eq!(stored2.reference_frame_id, 2);
+
+        // Clear.
+        clear_frame_set_reference(&conn, 10).unwrap();
+        assert!(get_frame_set_reference(&conn, 10).unwrap().is_none());
+    }
+
+    /// Membership validation: setting a non-LIGHT member (or a completely
+    /// unrelated frame) as the reference must return an error.
+    #[test]
+    fn reference_store_rejects_non_member() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Frame 1 is LIGHT and a member; frame 99 is not a member at all.
+        seed_frame(&conn, 1, 1, "LIGHT");
+        seed_frame(&conn, 99, 99, "LIGHT");
+        seed_frames_set(&conn, 10);
+        seed_session_member(&conn, 10, 1);
+
+        let err = set_frame_set_reference(&conn, 10, 99);
+        assert!(err.is_err(), "expected error for non-member frame");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("not a LIGHT member"),
+            "error should mention membership: {msg}"
+        );
+    }
+
+    /// A DARK frame in the session must not be accepted as a reference.
+    #[test]
+    fn reference_store_rejects_dark_member() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        seed_frame(&conn, 1, 1, "LIGHT");
+        seed_frame(&conn, 2, 2, "Dark");
+        seed_frames_set(&conn, 10);
+        // Both frames in the same session.
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (10, '2025-01-01', '2025-01-01')",
+            [],
+        )
+        .unwrap();
+        let night_id: i64 = conn
+            .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'Cam')",
+            [night_id],
+        )
+        .unwrap();
+        let session_id: i64 = conn
+            .query_row("SELECT last_insert_rowid()", [], |r| r.get(0))
+            .unwrap();
+        for fid in [1_i64, 2] {
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![session_id, fid],
+            )
+            .unwrap();
+        }
+
+        // Frame 1 (LIGHT) should work; frame 2 (Dark) must be rejected.
+        set_frame_set_reference(&conn, 10, 1).unwrap();
+        let err = set_frame_set_reference(&conn, 10, 2);
+        assert!(err.is_err(), "expected error for Dark frame as reference");
     }
 }

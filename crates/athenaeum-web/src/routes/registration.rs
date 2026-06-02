@@ -14,6 +14,12 @@ use athenaeum_core::registration;
 use athenaeum_core::registration::db::{
     get_registration_for_frame_set, RegistrationRecord,
 };
+use athenaeum_core::registration::{
+    clear_frame_set_reference as core_clear_frame_set_reference,
+    get_frame_set_reference as core_get_frame_set_reference,
+    set_frame_set_reference as core_set_frame_set_reference,
+    FrameSetReference,
+};
 use athenaeum_core::services::PlateSolveHandle;
 
 use crate::events::SseProgressEmitter;
@@ -35,6 +41,13 @@ pub struct RegisterFrameSetArgs {
 #[serde(rename_all = "camelCase")]
 pub struct FrameSetIdArgs {
     pub frames_set_id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFrameSetReferenceArgs {
+    pub frames_set_id: i64,
+    pub frame_id: i64,
 }
 
 // ── require_*_cache helpers (mirrors plate_solve.rs pattern) ─────────────────
@@ -214,4 +227,59 @@ pub async fn cancel_frame_set_registration(
         eprintln!("registration: no active registration to cancel");
     }
     Ok(Json(()))
+}
+
+/// POST /api/set_frame_set_reference
+///
+/// Persist the user-chosen reference frame for a frame set.
+/// Validates that `frame_id` is a LIGHT member of the set.
+pub async fn set_frame_set_reference(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetFrameSetReferenceArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let db = state
+        .ctx
+        .db
+        .get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+    let conn = db.conn();
+    core_set_frame_set_reference(&conn, args.frames_set_id, args.frame_id)
+        .map(|()| Json(()))
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+}
+
+/// POST /api/get_frame_set_reference
+///
+/// Return the persisted user-chosen reference frame for a frame set, if any.
+pub async fn get_frame_set_reference(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
+) -> Result<Json<Option<FrameSetReference>>, (StatusCode, String)> {
+    let db = state
+        .ctx
+        .db
+        .get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+    let conn = db.conn();
+    core_get_frame_set_reference(&conn, args.frames_set_id)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// POST /api/clear_frame_set_reference
+///
+/// Remove the persisted user-chosen reference for a frame set.
+pub async fn clear_frame_set_reference(
+    State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let db = state
+        .ctx
+        .db
+        .get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
+    let conn = db.conn();
+    core_clear_frame_set_reference(&conn, args.frames_set_id)
+        .map(|()| Json(()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }

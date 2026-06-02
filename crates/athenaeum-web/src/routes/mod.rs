@@ -208,6 +208,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/register_frame_set", post(registration::register_frame_set))
         .route("/api/get_frame_set_registration", post(registration::get_frame_set_registration))
         .route("/api/cancel_frame_set_registration", post(registration::cancel_frame_set_registration))
+        .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
+        .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))
+        .route("/api/clear_frame_set_reference", post(registration::clear_frame_set_reference))
         // Archive feature
         .route("/api/get_archive_settings", post(archive::get_archive_settings))
         .route("/api/set_archive_root_path", post(archive::set_archive_root_path))

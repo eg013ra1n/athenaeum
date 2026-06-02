@@ -20,8 +20,8 @@ use crate::plate_solve::config::PlateSolveConfig;
 use crate::plate_solve::hints::{extract_hints, observation_epoch};
 
 use super::db::{
-    clear_registration_for_frame_set, get_light_frame_ids_for_frame_set, upsert_registration,
-    RegistrationRecord,
+    clear_registration_for_frame_set, get_frame_set_reference, get_light_frame_ids_for_frame_set,
+    upsert_registration, RegistrationRecord,
 };
 use super::reference::select_reference;
 
@@ -183,11 +183,41 @@ pub fn register_frame_set(
     }
 
     // ── Step 3: select reference ──────────────────────────────────────────────
+    //
+    // Priority order:
+    //   1. Caller-supplied `override_reference_id` (programmatic override, e.g.
+    //      a retry after a bad solve).
+    //   2. User-persisted choice in `frame_set_reference` (set via the UI).
+    //   3. Auto-pick: frame with the most star detections (tie-break: smallest
+    //      frame_id).
+    let effective_override = if override_reference_id.is_some() {
+        override_reference_id
+    } else {
+        // Consult the persisted user preference. Log but do not fail if the DB
+        // read itself errors — fall back gracefully to auto-pick.
+        match get_frame_set_reference(conn, frames_set_id) {
+            Ok(Some(r)) => {
+                eprintln!(
+                    "registration: using persisted user reference frame {}",
+                    r.reference_frame_id
+                );
+                Some(r.reference_frame_id)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!(
+                    "registration: failed to read frame_set_reference (falling back to auto): {e}"
+                );
+                None
+            }
+        }
+    };
+
     let count_pairs: Vec<(i64, usize)> = members
         .iter()
         .map(|m| (m.frame_id, m.detection_count))
         .collect();
-    let ref_id = select_reference(&count_pairs, override_reference_id);
+    let ref_id = select_reference(&count_pairs, effective_override);
     eprintln!("registration: reference frame selected: {ref_id}");
 
     // Build a ranked list of candidates to try as reference (reference first,
