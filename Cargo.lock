@@ -3927,6 +3927,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_xoshiro"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4671,6 +4680,8 @@ dependencies = [
  "cdshealpix",
  "memmap2",
  "nalgebra 0.33.3",
+ "rand 0.8.5",
+ "rand_xoshiro",
  "rayon",
  "rustafits",
  "serde_json",
