@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, AlignHorizontalJustifyCenter } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport } from '../types/models';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
@@ -72,13 +72,15 @@ export default function FrameSetDetail() {
   // (e.g. clicking a `#setId` in the Export tab's WarningsPanel pushes
   // `?tab=calibration&highlightSet=…&kind=…` and we re-consume them).
   const [searchParams, setSearchParams] = useSearchParams();
+  // 'registration' deep-link always falls back to 'analysis' on initial render
+  // (we don't know the gate state yet). The searchParams useEffect below will
+  // switch to 'registration' once the reference state is resolved if appropriate.
   const initialTabFromUrl: FrameSetTab | undefined =
     searchParams.get('tab') === 'calibration' ? 'calibration'
     : searchParams.get('tab') === 'history' ? 'history'
     : searchParams.get('tab') === 'analysis' ? 'analysis'
     : searchParams.get('tab') === 'export' ? 'export'
-    : searchParams.get('tab') === 'registration' ? 'registration'
-    : undefined;
+    : undefined; // 'registration' intentionally excluded — gating not known yet
   const [activeTab, setActiveTab] = useState<FrameSetTab>(initialTabFromUrl ?? 'analysis');
 
   const initialHighlightSetId = (() => {
@@ -108,8 +110,17 @@ export default function FrameSetDetail() {
 
     if (!tabParam && !highlightSetParam && !kindParam) return;
 
-    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export' || tabParam === 'registration') {
+    if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export') {
       setActiveTab(tabParam);
+    } else if (tabParam === 'registration') {
+      // Only allow direct navigation to registration if it is not gated.
+      // registrationTabReady may not be resolved yet on first render (reference
+      // still loading); fall back to 'analysis' if it's clearly unavailable.
+      if (referenceFrameId !== undefined && registrationTabReady) {
+        setActiveTab('registration');
+      } else {
+        setActiveTab('analysis');
+      }
     }
 
     const id = highlightSetParam != null && /^\d+$/.test(highlightSetParam)
@@ -268,6 +279,15 @@ export default function FrameSetDetail() {
   // Analysis data for SNR display in tree
   const [analysisData, setAnalysisData] = useState<Map<number, FrameAnalysis>>(new Map());
 
+  // User-chosen reference frame for Stacking Preparation gating.
+  // null = none chosen, undefined = not yet loaded.
+  const [referenceFrameId, setReferenceFrameId] = useState<number | null | undefined>(undefined);
+
+  // The registration tab is enabled only when (a) analysis exists and (b) a
+  // reference frame has been chosen.
+  const registrationTabReady =
+    analysisData.size > 0 && referenceFrameId != null && referenceFrameId !== undefined;
+
   // Reactive blackhole state — derives file IDs from hierarchy, fetches status, listens for events
   const allFileIds = useMemo(() => {
     if (!calibrationHierarchy) return [];
@@ -341,7 +361,7 @@ export default function FrameSetDetail() {
       setError(null);
 
       // Load all in parallel
-      const [detailResult, hierarchyResult, analysisResult] = await Promise.all([
+      const [detailResult, hierarchyResult, analysisResult, referenceResult] = await Promise.all([
         api.invoke<FrameSetDetail>('get_frame_set_detail', {
           framesSetId: parseInt(id),
         }),
@@ -351,6 +371,9 @@ export default function FrameSetDetail() {
         api.invoke<FrameAnalysis[]>('get_analysis_for_frame_set', {
           frameSetId: parseInt(id),
         }).catch(() => [] as FrameAnalysis[]),
+        api.invoke<FrameSetReference | null>('get_frame_set_reference', {
+          framesSetId: parseInt(id),
+        }).catch(() => null),
       ]);
 
       setDetail(detailResult);
@@ -358,6 +381,7 @@ export default function FrameSetDetail() {
       const aMap = new Map<number, FrameAnalysis>();
       for (const a of analysisResult) aMap.set(a.frame_id, a);
       setAnalysisData(aMap);
+      setReferenceFrameId(referenceResult?.referenceFrameId ?? null);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -741,20 +765,32 @@ export default function FrameSetDetail() {
           { key: 'registration' as FrameSetTab, label: 'Stacking Preparation', icon: AlignHorizontalJustifyCenter },
           { key: 'export' as FrameSetTab, label: 'Export', icon: Layers },
           { key: 'history' as FrameSetTab, label: 'History', icon: History },
-        ]).map(({ key, label, icon: Icon }) => (
-          <button
-            key={key}
-            onClick={() => setActiveTab(key)}
-            className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
-              activeTab === key
-                ? 'border-accent text-accent'
-                : 'border-transparent text-content-muted hover:text-content hover:border-border'
-            }`}
-          >
-            <Icon size={16} />
-            {label}
-          </button>
-        ))}
+        ]).map(({ key, label, icon: Icon }) => {
+          const isGated = key === 'registration' && !registrationTabReady;
+          const gateTooltip = !registrationTabReady
+            ? analysisData.size === 0
+              ? 'Analyze the lights first, then choose a reference frame in the Analysis tab'
+              : 'Choose a reference frame in the Analysis tab to enable stacking preparation'
+            : undefined;
+          return (
+            <button
+              key={key}
+              onClick={() => { if (!isGated) setActiveTab(key); }}
+              disabled={isGated}
+              title={gateTooltip}
+              className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
+                isGated
+                  ? 'border-transparent text-content-muted opacity-40 cursor-not-allowed'
+                  : activeTab === key
+                    ? 'border-accent text-accent'
+                    : 'border-transparent text-content-muted hover:text-content hover:border-border'
+              }`}
+            >
+              <Icon size={16} />
+              {label}
+            </button>
+          );
+        })}
       </div>
 
       {/* Main Content */}
@@ -771,6 +807,7 @@ export default function FrameSetDetail() {
             <StackingPrepTab
               framesSetId={parseInt(id!)}
               frameSetName={detail?.frames_set?.name ?? undefined}
+              referenceFrameId={referenceFrameId ?? null}
             />
           ) : activeTab === 'export' ? (
             <ExportTab
@@ -804,6 +841,8 @@ export default function FrameSetDetail() {
               onSplit={handleOpenSplitDialog}
               onCreateCustomSet={handleOpenCreateDialog}
               hideLocateColumn={!!detail?.frames_set?.archived_at}
+              referenceFrameId={referenceFrameId ?? null}
+              onReferenceChanged={(ref) => setReferenceFrameId(ref?.referenceFrameId ?? null)}
             />
           )
         ) : (

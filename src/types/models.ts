@@ -1166,6 +1166,16 @@ export interface FlatContourOpts {
   gradientPct: number;
 }
 
+// ========== Frame Set Reference Frame ==========
+
+/** Persisted user-chosen reference frame for a frame set.
+ *  Mirrors Rust `FrameSetReference` (serde rename_all = "camelCase"). */
+export interface FrameSetReference {
+  framesSetId: number;
+  referenceFrameId: number;
+  setAt: string; // ISO 8601
+}
+
 // ========== Stacking Preparation / Frame Registration ==========
 
 /** Registration status for a single frame. */

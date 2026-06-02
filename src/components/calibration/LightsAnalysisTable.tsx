@@ -1,5 +1,5 @@
 import { useState, useMemo, useCallback } from 'react';
-import { FolderOpen, AlertTriangle, CheckCircle, MapPin, Crosshair } from 'lucide-react';
+import { FolderOpen, AlertTriangle, CheckCircle, MapPin, Crosshair, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
 
@@ -27,6 +27,12 @@ interface LightsAnalysisTableProps {
   /** When true, hide the "Locate" column entirely. Use for ZIP-archived frame
    *  sets where the source file paths no longer point to anything on disk. */
   hideLocateColumn?: boolean;
+  /** The frame_id of the current reference frame, if one has been chosen. */
+  referenceFrameId?: number | null;
+  /** Called when the user clicks "Set as reference" on a row. */
+  onSetReference?: (frameId: number) => void;
+  /** Whether a reference-set action is in progress (disables buttons). */
+  settingReference?: boolean;
 }
 
 function formatDateTime(dateStr: string | null): string {
@@ -102,6 +108,9 @@ export function LightsAnalysisTable({
   rejectedFrameIds,
   plateScale,
   hideLocateColumn,
+  referenceFrameId,
+  onSetReference,
+  settingReference,
 }: LightsAnalysisTableProps) {
   const navigate = useNavigate();
   const [sortField, setSortField] = useState<SortField | null>('date');
@@ -318,6 +327,11 @@ export function LightsAnalysisTable({
             <th scope="col" className="w-16 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
               WCS
             </th>
+            {onSetReference && (
+              <th scope="col" className="w-24 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
+                Reference
+              </th>
+            )}
             {!hideLocateColumn && (
               <th scope="col" className="w-12 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
                 Locate
@@ -436,6 +450,29 @@ export function LightsAnalysisTable({
                     </span>
                   )}
                 </td>
+                {onSetReference && (
+                  <td className="w-24 px-1.5 py-1 text-center">
+                    {frame.frame_id === referenceFrameId ? (
+                      <span
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium bg-accent/15 text-accent border border-accent/40"
+                        title="This is the chosen reference frame"
+                      >
+                        <Star size={11} />
+                        Reference
+                      </span>
+                    ) : (
+                      <button
+                        onClick={e => { e.stopPropagation(); onSetReference(frame.frame_id); }}
+                        disabled={settingReference}
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs text-content-muted hover:text-accent hover:bg-accent/10 border border-transparent hover:border-accent/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        title="Set as reference frame for registration"
+                      >
+                        <Star size={11} />
+                        Set
+                      </button>
+                    )}
+                  </td>
+                )}
                 {!hideLocateColumn && (
                   <td className="w-12 px-1.5 py-1 text-center">
                     <button

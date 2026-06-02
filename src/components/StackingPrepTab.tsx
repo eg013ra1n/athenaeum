@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import {
   Layers,
   PlayCircle,
@@ -8,6 +8,7 @@ import {
   Loader2,
   Star,
   Info,
+  RefreshCw,
 } from 'lucide-react';
 import { api } from '../api';
 import { useRegistrationQueue } from '../hooks/useRegistrationQueue';
@@ -16,6 +17,8 @@ import type { RegistrationRecord, FrameRegistrationStatus } from '../types/model
 interface StackingPrepTabProps {
   framesSetId: number;
   frameSetName?: string;
+  /** The user-chosen reference frame id, provided by FrameSetDetail. */
+  referenceFrameId: number | null;
 }
 
 // ── Status badge ─────────────────────────────────────────────────────────────
@@ -67,7 +70,7 @@ function StatusBadge({ status }: StatusBadgeProps) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function StackingPrepTab({ framesSetId, frameSetName }: StackingPrepTabProps) {
+export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }: StackingPrepTabProps) {
   const { runState, start, cancel } = useRegistrationQueue(framesSetId);
 
   // Persisted records loaded from the backend on mount and after each run.
@@ -107,9 +110,30 @@ export function StackingPrepTab({ framesSetId, frameSetName }: StackingPrepTabPr
 
   const hasPersistedResults = records != null && records.length > 0;
   const referenceRecord = records?.find((r) => r.isReference);
-  const referenceFilename = referenceRecord
-    ? `frame #${referenceRecord.frameId}`
-    : null;
+
+  // Resolve a frame id to a display name. RegistrationRecord and FrameAnalysis
+  // don't carry filenames, so we fall back to "frame #N". When the live run is
+  // active the live status map may have a filename (populated by progress events).
+  const resolveFilename = useMemo(() => {
+    return (frameId: number): string => {
+      // Check live statuses first (available during/after a run).
+      const live = runState.frameStatuses.get(frameId);
+      if (live?.filename) return live.filename;
+      return `frame #${frameId}`;
+    };
+  }, [runState.frameStatuses]);
+
+  // The filename to show for the *chosen* reference (the user-picked one).
+  const chosenReferenceFilename: string | null =
+    referenceFrameId != null ? resolveFilename(referenceFrameId) : null;
+
+  // Staleness: persisted results exist, and the reference they were computed
+  // against differs from the current user-chosen reference.
+  const isStale =
+    hasPersistedResults &&
+    referenceRecord != null &&
+    referenceFrameId != null &&
+    referenceRecord.referenceFrameId !== referenceFrameId;
 
   // Median RMS from persisted records (aligned frames only).
   const alignedRecords = records?.filter((r) => r.status === 'aligned') ?? [];
@@ -169,9 +193,35 @@ export function StackingPrepTab({ framesSetId, frameSetName }: StackingPrepTabPr
               One frame is designated as the reference; all others are aligned to it using
               star-pattern matching.
             </p>
+            {/* Chosen reference frame */}
+            {chosenReferenceFilename && (
+              <div className="mt-2 flex items-center gap-2 text-xs text-content-muted">
+                <Star size={12} className="text-accent shrink-0" />
+                <span>
+                  Reference:{' '}
+                  <span className="font-mono text-content">{chosenReferenceFilename}</span>
+                  {' '}
+                  <span className="text-content-muted italic">
+                    — to change it, use the Analysis tab
+                  </span>
+                </span>
+              </div>
+            )}
           </div>
         </div>
       </div>
+
+      {/* Staleness warning — reference changed since the last run */}
+      {isStale && !runState.isRunning && (
+        <div className="flex items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3">
+          <RefreshCw size={16} className="text-warning mt-0.5 shrink-0" />
+          <div className="text-xs text-warning leading-relaxed">
+            <span className="font-semibold">Reference changed since the last run.</span>
+            {' '}Re-run stacking preparation to update the alignment data for the new reference.
+            The results below are from the previous run and may no longer be valid.
+          </div>
+        </div>
+      )}
 
       {/* Action bar */}
       <div className="flex items-center gap-3 flex-wrap">
@@ -201,7 +251,7 @@ export function StackingPrepTab({ framesSetId, frameSetName }: StackingPrepTabPr
         ) : (
           <button
             type="button"
-            onClick={() => start()}
+            onClick={() => start(referenceFrameId ?? undefined)}
             disabled={loadingRecords}
             className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-accent text-white hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
@@ -219,9 +269,9 @@ export function StackingPrepTab({ framesSetId, frameSetName }: StackingPrepTabPr
               {'/'}
               <span className="text-content font-medium">{records.length}</span>
               {' '}aligned
-              {referenceFilename && (
+              {referenceRecord && (
                 <>
-                  {' · '}reference: <span className="text-content font-medium">{referenceFilename}</span>
+                  {' · '}last run reference: <span className="text-content font-medium">{resolveFilename(referenceRecord.frameId)}</span>
                 </>
               )}
               {medianRms != null && (

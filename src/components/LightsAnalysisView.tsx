@@ -4,7 +4,9 @@ import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
+  FrameSetReference,
 } from '../types/models';
+import { useNotifications } from '../contexts/NotificationContext';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
 import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import { LightsAnalysisTable, type EnrichedLightFrame } from './calibration/LightsAnalysisTable';
@@ -27,9 +29,16 @@ interface LightsAnalysisViewProps {
   /** When true, hide the "Locate" column in the table — used when the frame
    *  set is ZIP-archived and source files are no longer on disk. */
   hideLocateColumn?: boolean;
+  /** Called when the user sets or clears a reference frame, so the parent
+   *  (FrameSetDetail) can re-evaluate the Stacking Preparation tab gate. */
+  onReferenceChanged?: (ref: FrameSetReference | null) => void;
+  /** The currently chosen reference frame id, loaded by the parent. If the
+   *  parent provides this, the component will use it instead of loading it
+   *  independently (avoids a double fetch). */
+  referenceFrameId?: number | null;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');
 
@@ -58,6 +67,69 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   const [thresholds, setThresholds] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
   const [defaultThresholds, setDefaultThresholds] = useState<RejectionThresholds | null>(null);
   const [rejectActive, setRejectActive] = useState(true);
+
+  const { notify } = useNotifications();
+
+  // Reference frame — loaded locally unless the parent already provides it.
+  // When the parent provides referenceFrameIdProp we skip the fetch but still
+  // track a local override so the table updates immediately on set/clear.
+  const [localReferenceFrameId, setLocalReferenceFrameId] = useState<number | null | undefined>(undefined);
+  const [settingReference, setSettingReference] = useState(false);
+
+  // Derive the effective reference frame id: prefer local override (once loaded),
+  // fall back to what the parent passes.
+  const effectiveReferenceFrameId: number | null =
+    localReferenceFrameId !== undefined
+      ? localReferenceFrameId
+      : (referenceFrameIdProp ?? null);
+
+  // Load the current reference on mount / frameSetId change (only if parent
+  // doesn't supply the value — when parent supplies it we still seed local state
+  // from it so we can apply immediate optimistic updates).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const ref = await api.invoke<FrameSetReference | null>('get_frame_set_reference', {
+          framesSetId: frameSetId,
+        });
+        if (!cancelled) setLocalReferenceFrameId(ref?.referenceFrameId ?? null);
+      } catch (err) {
+        console.error('[LightsAnalysisView] get_frame_set_reference failed:', err);
+        if (!cancelled) setLocalReferenceFrameId(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [frameSetId]);
+
+  const handleSetReference = useCallback(async (frameId: number) => {
+    if (settingReference) return;
+    setSettingReference(true);
+    try {
+      await api.invoke<void>('set_frame_set_reference', {
+        framesSetId: frameSetId,
+        frameId,
+      });
+      setLocalReferenceFrameId(frameId);
+      const newRef: FrameSetReference = {
+        framesSetId: frameSetId,
+        referenceFrameId: frameId,
+        setAt: new Date().toISOString(),
+      };
+      onReferenceChanged?.(newRef);
+      notify({
+        title: 'Reference frame set',
+        detail: 'Open Stacking Preparation to run alignment.',
+        kind: 'registration',
+        tone: 'success',
+        dedupeKey: `ref-set-${frameSetId}`,
+      });
+    } catch (err) {
+      console.error('[LightsAnalysisView] set_frame_set_reference failed:', err);
+    } finally {
+      setSettingReference(false);
+    }
+  }, [frameSetId, settingReference, onReferenceChanged, notify]);
 
   // Analysis state — uses global context for queue/progress
   const { enqueueAnalysis, isAnalyzing, cancelAnalysis, activeAnalyses } = useAnalysisProgressContext();
@@ -813,6 +885,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                   rejectedFrameIds={rejectedFrameIds}
                   plateScale={useArcsec ? plateScale : null}
                   hideLocateColumn={hideLocateColumn}
+                  referenceFrameId={effectiveReferenceFrameId}
+                  onSetReference={onReferenceChanged !== undefined ? handleSetReference : undefined}
+                  settingReference={settingReference}
                 />
               </div>
             ) : (
