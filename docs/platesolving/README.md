@@ -750,3 +750,4 @@ Verified: 6 unit tests in `service::tests`, 5 integration tests in `blind_index_
 ## Related Documents
 
 - [`star-detection.md`](./star-detection.md) — details of the rustafits `ImageAnalyzer` pipeline used by Step 1 of the solver.
+- [`precise-registration.md`](./precise-registration.md) — the opt-in **precise WCS** pipeline (PSF centroids → annealed σ-clipped SIP → robust seed → refinement-helped guard) and how **image registration** (Stacking Preparation) aligns a frame set's lights to a reference.
