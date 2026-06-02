@@ -11,7 +11,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { api } from '../api';
-import { useRegistrationQueue } from '../hooks/useRegistrationQueue';
+import { useRegistrationProgressContext } from '../contexts/RegistrationProgressContext';
 import type { RegistrationRecord, FrameRegistrationStatus } from '../types/models';
 
 interface StackingPrepTabProps {
@@ -71,7 +71,9 @@ function StatusBadge({ status }: StatusBadgeProps) {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }: StackingPrepTabProps) {
-  const { runState, start, cancel } = useRegistrationQueue(framesSetId);
+  const { enqueueRegistration, cancelRegistration, getRegistrationState } =
+    useRegistrationProgressContext();
+  const runState = getRegistrationState(framesSetId);
 
   // Persisted records loaded from the backend on mount and after each run.
   const [records, setRecords] = useState<RegistrationRecord[] | null>(null);
@@ -98,13 +100,20 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [framesSetId]);
 
+  // Derive run booleans from the nullable global state.
+  // isRunning = an entry exists in the global map and has not completed yet.
+  const isRunning = runState != null && !runState.isComplete;
+  const isCancelling = runState?.isCancelling ?? false;
+  const progress = runState?.progress ?? null;
+  const liveStatuses = runState?.frameStatuses ?? new Map();
+
   // Reload persisted records once a run completes.
   useEffect(() => {
-    if (runState.isComplete && !runState.isRunning) {
+    if (runState?.isComplete) {
       loadRecords();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runState.isComplete, runState.isRunning]);
+  }, [runState?.isComplete]);
 
   // ── Derived display data ──────────────────────────────────────────────────
 
@@ -117,11 +126,11 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
   const resolveFilename = useMemo(() => {
     return (frameId: number): string => {
       // Check live statuses first (available during/after a run).
-      const live = runState.frameStatuses.get(frameId);
+      const live = liveStatuses.get(frameId);
       if (live?.filename) return live.filename;
       return `frame #${frameId}`;
     };
-  }, [runState.frameStatuses]);
+  }, [liveStatuses]);
 
   // The filename to show for the *chosen* reference (the user-picked one).
   const chosenReferenceFilename: string | null =
@@ -146,10 +155,6 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
     const mid = Math.floor(vals.length / 2);
     return vals.length % 2 === 0 ? (vals[mid - 1] + vals[mid]) / 2 : vals[mid];
   })();
-
-  // Combine live per-frame statuses (during run) with persisted records.
-  // Live map wins while a run is active.
-  const { isRunning, isCancelling, progress, frameStatuses: liveStatuses } = runState;
 
   // Build a unified row list for the table. During a run use the live map
   // so rows update in real time; otherwise fall back to persisted records.
@@ -212,7 +217,7 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
       </div>
 
       {/* Staleness warning — reference changed since the last run */}
-      {isStale && !runState.isRunning && (
+      {isStale && !isRunning && (
         <div className="flex items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3">
           <RefreshCw size={16} className="text-warning mt-0.5 shrink-0" />
           <div className="text-xs text-warning leading-relaxed">
@@ -240,7 +245,7 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
             </div>
             <button
               type="button"
-              onClick={() => cancel()}
+              onClick={() => cancelRegistration(framesSetId)}
               disabled={isCancelling}
               className="flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg border border-error/40 bg-error-muted text-error hover:bg-error/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
@@ -251,7 +256,13 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
         ) : (
           <button
             type="button"
-            onClick={() => start(referenceFrameId ?? undefined)}
+            onClick={() =>
+              enqueueRegistration(
+                framesSetId,
+                frameSetName,
+                referenceFrameId ?? undefined,
+              )
+            }
             disabled={loadingRecords}
             className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-accent text-white hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >

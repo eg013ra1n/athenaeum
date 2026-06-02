@@ -20,16 +20,10 @@ use athenaeum_core::registration::{
     set_frame_set_reference as core_set_frame_set_reference,
     FrameSetReference,
 };
-use athenaeum_core::services::PlateSolveHandle;
+use athenaeum_core::services::RegistrationHandle;
 
 use super::AppState;
 use super::plate_solve::{require_bright_cache, require_star_cache};
-
-// ── cancel handle key ─────────────────────────────────────────────────────────
-
-/// Key into `active_plate_solves` used to store the registration cancel flag.
-/// Distinct from the plate-solve keys (0 = solve batch, 1 = autofind).
-const CANCEL_KEY: i64 = 2;
 
 // ── progress event forwarding emitter ────────────────────────────────────────
 
@@ -68,8 +62,8 @@ pub async fn register_frame_set(
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
-        let mut handles = state.ctx.active_plate_solves.lock().unwrap();
-        handles.insert(CANCEL_KEY, PlateSolveHandle { cancel_flag: cancel_flag.clone() });
+        let mut handles = state.ctx.active_registrations.lock().unwrap();
+        handles.insert(frames_set_id, RegistrationHandle { cancel_flag: cancel_flag.clone() });
     }
 
     let ctx = state.ctx.clone();
@@ -101,8 +95,8 @@ pub async fn register_frame_set(
     .map_err(|e| format!("Registration task panicked: {e}"))?;
 
     {
-        let mut handles = state.ctx.active_plate_solves.lock().unwrap();
-        handles.remove(&CANCEL_KEY);
+        let mut handles = state.ctx.active_registrations.lock().unwrap();
+        handles.remove(&frames_set_id);
     }
 
     result
@@ -120,17 +114,18 @@ pub async fn get_frame_set_registration(
         .map_err(|e| e.to_string())
 }
 
-/// Signal the running registration (if any) to stop cooperatively.
+/// Signal the running registration for `frames_set_id` to stop cooperatively.
 #[tauri::command]
 pub async fn cancel_frame_set_registration(
     state: State<'_, AppState>,
+    frames_set_id: i64,
 ) -> Result<(), String> {
-    let handles = state.ctx.active_plate_solves.lock().unwrap();
-    if let Some(handle) = handles.get(&CANCEL_KEY) {
+    let handles = state.ctx.active_registrations.lock().unwrap();
+    if let Some(handle) = handles.get(&frames_set_id) {
         handle.cancel_flag.store(true, Ordering::Relaxed);
-        eprintln!("registration: cancel flag set for key {CANCEL_KEY}");
+        eprintln!("registration: cancel flag set for frames_set_id={frames_set_id}");
     } else {
-        eprintln!("registration: no active registration to cancel");
+        eprintln!("registration: no active registration for frames_set_id={frames_set_id}");
     }
     Ok(())
 }

@@ -20,13 +20,10 @@ use athenaeum_core::registration::{
     set_frame_set_reference as core_set_frame_set_reference,
     FrameSetReference,
 };
-use athenaeum_core::services::PlateSolveHandle;
+use athenaeum_core::services::RegistrationHandle;
 
 use crate::events::SseProgressEmitter;
 use crate::WebAppState;
-
-/// Key into `active_plate_solves` used for the registration cancel handle.
-const CANCEL_KEY: i64 = 2;
 
 // ── request shapes ─────────────────────────────────────────────────────────────
 
@@ -147,8 +144,8 @@ pub async fn register_frame_set(
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
-        let mut handles = state.ctx.active_plate_solves.lock().unwrap();
-        handles.insert(CANCEL_KEY, PlateSolveHandle { cancel_flag: cancel_flag.clone() });
+        let mut handles = state.ctx.active_registrations.lock().unwrap();
+        handles.insert(args.frames_set_id, RegistrationHandle { cancel_flag: cancel_flag.clone() });
     }
 
     let ctx = state.ctx.clone();
@@ -187,8 +184,8 @@ pub async fn register_frame_set(
     })??;
 
     {
-        let mut handles = state.ctx.active_plate_solves.lock().unwrap();
-        handles.remove(&CANCEL_KEY);
+        let mut handles = state.ctx.active_registrations.lock().unwrap();
+        handles.remove(&args.frames_set_id);
     }
 
     let _ = result;
@@ -215,16 +212,17 @@ pub async fn get_frame_set_registration(
 
 /// POST /api/cancel_frame_set_registration
 ///
-/// Signal the running registration to stop cooperatively.
+/// Signal the running registration for `framesSetId` to stop cooperatively.
 pub async fn cancel_frame_set_registration(
     State(state): State<WebAppState>,
+    Json(args): Json<FrameSetIdArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
-    let handles = state.ctx.active_plate_solves.lock().unwrap();
-    if let Some(handle) = handles.get(&CANCEL_KEY) {
+    let handles = state.ctx.active_registrations.lock().unwrap();
+    if let Some(handle) = handles.get(&args.frames_set_id) {
         handle.cancel_flag.store(true, Ordering::Relaxed);
-        eprintln!("registration: cancel flag set for key {CANCEL_KEY}");
+        eprintln!("registration: cancel flag set for frames_set_id={}", args.frames_set_id);
     } else {
-        eprintln!("registration: no active registration to cancel");
+        eprintln!("registration: no active registration for frames_set_id={}", args.frames_set_id);
     }
     Ok(Json(()))
 }

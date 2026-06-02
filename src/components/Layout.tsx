@@ -10,6 +10,8 @@ import { AnalysisProgressProvider } from '../contexts/AnalysisProgressContext';
 import { AnalysisQueueIndicator } from './AnalysisQueueIndicator';
 import { PlateSolveProgressProvider } from '../contexts/PlateSolveProgressContext';
 import { PlateSolveQueueIndicator } from './PlateSolveQueueIndicator';
+import { RegistrationProgressProvider } from '../contexts/RegistrationProgressContext';
+import { RegistrationQueueIndicator } from './RegistrationQueueIndicator';
 import { PlateSolveIndexMissingModal } from './plate-solve';
 import { NotificationProvider } from '../contexts/NotificationContext';
 import { NotificationBell } from './NotificationBell';
@@ -44,6 +46,7 @@ export default function Layout() {
       <ExportProgressProvider>
         <AnalysisProgressProvider>
         <PlateSolveProgressProvider>
+        <RegistrationProgressProvider>
         <div className="flex h-screen bg-surface text-content">
           {/* Sidebar Navigation */}
           <aside
@@ -81,6 +84,7 @@ export default function Layout() {
 
             <AnalysisQueueIndicator collapsed={collapsed} />
             <PlateSolveQueueIndicator collapsed={collapsed} />
+            <RegistrationQueueIndicator collapsed={collapsed} />
             <NotificationBell collapsed={collapsed} />
 
             <div className={`${collapsed ? 'p-2' : 'p-4'} pt-0`}>
@@ -112,6 +116,7 @@ export default function Layout() {
           <NotificationPanel />
           <AutoUpdateCheck />
         </div>
+        </RegistrationProgressProvider>
         </PlateSolveProgressProvider>
         </AnalysisProgressProvider>
       </ExportProgressProvider>
