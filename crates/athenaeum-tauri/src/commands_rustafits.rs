@@ -64,7 +64,18 @@ pub async fn read_fits_image_rustafits(
     };
 
     // ── Step 2: Memory cache lookup (fast path) ──
-    let cache_key = format!("{}:{}", path, resolution_str);
+    // The key includes the file's mtime (preview_cache_key), so an in-place
+    // edit/restore invalidates naturally instead of serving a stale JPEG.
+    // The stat doubles as the existence check (fail fast for deleted files —
+    // including ones that still have a cached entry).
+    let cache_key = match crate::cache::preview_cache_key(&path_buf, &resolution_str) {
+        Ok(key) => key,
+        Err(e) => {
+            let error_msg = format!("File not found: {} ({})", path_buf.display(), e);
+            eprintln!("ERROR: {}", error_msg);
+            return Err(error_msg);
+        }
+    };
 
     {
         let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
@@ -72,13 +83,6 @@ pub async fn read_fits_image_rustafits(
             println!("⚡ Memory cache hit (fast path, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
             return Ok(cached.data.clone());
         }
-    }
-
-    // Check if file exists before acquiring semaphore
-    if !path_buf.exists() {
-        let error_msg = format!("File not found: {}", path_buf.display());
-        eprintln!("ERROR: {}", error_msg);
-        return Err(error_msg);
     }
 
     // Slow path: acquire semaphore for actual processing

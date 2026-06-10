@@ -1,6 +1,6 @@
 # Architecture Audit Findings — 2026-06-10
 
-Record of a four-track deep audit (data layer/concurrency, precision pipeline, testability, targeted bug hunt). High-severity scanner findings were fixed the same day on `feature/stacking-prep`; everything else is tracked here so it isn't re-discovered (or re-flagged) later.
+Record of a four-track deep audit (data layer/concurrency, precision pipeline, testability, targeted bug hunt). High-severity scanner findings were fixed the same day on `feature/stacking-prep`; everything else is tracked here so it isn't re-discovered (or re-flagged) later. A follow-up rustafits-specific audit (previews + analysis) is appended at the end.
 
 Companion plans produced from this audit:
 
@@ -51,3 +51,40 @@ Lesson recorded: an "errors are empty" assertion is worthless if the code can dr
 - Schema has no portable IDs / change tracking. → collaboration plan.
 - Two raw `BEGIN`/`COMMIT` sites remain in `db/operations.rs` (the reason for the defensive checkout rollback); migrate to savepoints/`unchecked_transaction` when touched.
 - SSE broadcast channel (1024) drops events for slow clients with no resync mechanism — relevant only if web mode gains real concurrent users.
+
+---
+
+# Rustafits Audit (previews + analysis) — 2026-06-11
+
+Method: 3 exploration agents over rustafits decode/render, analysis, and the athenaeum integration layer; every significant claim then independently verified by reading source AND by a faithful numerical simulation of the stretch algorithm (Rust NaN-comparison/clamp/saturating-cast semantics). The verification step killed five agent findings and one of the auditor's own.
+
+## Fixed (rustafits `feature/stacking-prep` + athenaeum)
+
+| ID | Severity | Finding | Fix |
+| ---- | ---- | ---- | ---- |
+| V1 | Medium | NaN-heavy float frames (FITS BITPIX=-32, XISF Float32/64 — e.g. registration borders) silently rendered an **all-black preview**: NaN samples poisoned the stretch median/MADN (`stretch.rs`), all params went NaN, every pixel saturating-cast to 0. Empirically: ~2% scattered NaN was survivable (NaN pixels render black — fine); ~30% NaN killed the whole frame; breakpoint partition-luck dependent. Analysis was already mostly protected (`background.rs:53` filters non-finite; detection local-max rejects NaN peaks). | Filter non-finite samples in `compute_stretch_params`; neutral-params fallback when all samples are non-finite. Unit + e2e tests incl. NaN-border frame. |
+| V2 | Medium | Stale preview cache in BOTH backends: key was `path:resolution` with no mtime (`commands_rustafits.rs`, `routes/images.rs`) — in-place edit/restore/re-parse served a stale JPEG up to 30 min; deleted files could keep serving from cache. | Shared `preview_cache_key` helper in `athenaeum-core::cache` keys on `path:mtime:resolution`; stat doubles as fail-fast existence check. Both backends wired. |
+| S1 | Low | XISF Uint8 scaled ×256 → max 65280 ≠ 65535; 8-bit XISF rendered ~0.4% darker than the same data as u16. | ×257. |
+| S2 | Low | `with_downscale(0)` unvalidated → division by zero in downscale kernels (latent API hazard; app only passes 1/4). | `.max(1)` + regression test. |
+
+## Open (documented, not fixed)
+
+| ID | Severity | Finding |
+| ---- | ---- | ---- |
+| S3 | Low-Med | `fits.rs:132-136` accepts NAXIS3 > 3 while downstream assumes 1 or 3 channels — malformed-input robustness (stride assumptions). |
+| S4 | Low | Analysis `saturation_limit` fixed at `0.95·65535` (`detection.rs:38`) — dead gate for [0,1]-domain float inputs, so clipped stars pass into PSF measurement for processed float files. Analysis targets raw u16 subs in practice. |
+| S5 | Low | Fast-detect centroid refinement hardcodes `init_sigma = 3.0` (`analysis/mod.rs:1213`) vs field-FWHM-derived in the full path; ±0.5 px divergence possible on defocused frames, bounded by the >2 px-shift revert gate. |
+| S6 | Low | Odd dimensions silently lose the last row/col in debayer/downscale (standard practice). Rayleigh trail-test p-value approximation ~5% loose at the n=20 minimum. |
+| S7 | Info | Local-only diagnostic test `rustafits/tests/fast_detect_real.rs` (gitignored, untracked) fails pre-existing on `feature/stacking-prep`: fast path covers only 28% of the slow path's top-100 stars on the dense cocoon field (threshold 85%). Unrelated to this audit's changes (verified by stash); investigate with the centroid-refinement work. |
+
+## Claims REJECTED after verification (do NOT re-flag)
+
+| Claim | Verdict |
+| ---- | ---- |
+| "[0,1] float FITS render dark — no normalization + hardcoded `max_input=65536`" | **WRONG (auditor's own initial finding, retracted after simulation).** The median/MADN-based STF is scale-adaptive: the same sub as u16 and as [0,1] float renders near-identically (bg 64 vs 63, stars 242 vs 241). Locked in by `unit_range_floats_stretch_like_u16` test. |
+| "HFR formula dimension error" | WRONG — `Σ(flux·d)/Σ(flux)` is the standard flux-weighted HFR; units are pixels (`metrics.rs:462-497`). |
+| "find_median on empty slice panics" | WRONG — explicit empty guard returns 0.0 (`stretch.rs` quickselect). |
+| "STF division-by-zero on constant/all-zero images" | WRONG — `x==0`/`x==m` guards exist; m=0.25-branch denominators algebraically ≤ −0.25; constant → gray, all-zero → black (simulated). |
+| "NaN as u8 is undefined behavior" | WRONG — Rust float→int casts saturate; NaN → 0. |
+| "Saturated stars bias FWHM statistics" | MOSTLY WRONG — saturated candidates are rejected at detection (`detection.rs:393`); only the float-domain dead-gate (S4) is real. |
+| "NaN poisons the analysis pipeline" | OVERSTATED — background cell stats filter non-finite (`background.rs:53`); detection local-max comparisons reject NaN peaks. The preview stretch was the unguarded path (V1, fixed). |

@@ -83,8 +83,21 @@ pub async fn get_frame_preview(
     };
 
     // ── 2. Check memory cache ─────────────────────────────────────────────────
+    // The key includes the file's mtime (preview_cache_key), so an in-place
+    // edit/restore invalidates naturally instead of serving a stale JPEG.
+    // The stat doubles as the existence check (fail fast for deleted files —
+    // including ones that still have a cached entry).
 
-    let cache_key = format!("{}:{}", file_path, resolution_str);
+    let cache_key = athenaeum_core::cache::preview_cache_key(
+        std::path::Path::new(&file_path),
+        &resolution_str,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("File not found: {} ({})", file_path, e),
+        )
+    })?;
 
     {
         let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
