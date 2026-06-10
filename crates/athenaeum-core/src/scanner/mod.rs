@@ -600,20 +600,92 @@ fn reparse_and_update_in_place(
         );
     }
 
-    // Wrap all DB writes in a transaction so a process kill / cancellation
-    // mid-update can't leave a half-updated row (e.g. files synced but
-    // frames stale, or fits_header deleted but not re-inserted). The
-    // pre-parse work above (metadata stat, format detection, FITS parse,
-    // hash computation, frame_count read) is read-only and intentionally
-    // stays OUTSIDE the transaction. `unchecked_transaction` skips
-    // transaction-state checking — fine here because we own the only
-    // reference; the returned `Transaction` auto-rollbacks on drop if
-    // commit() is not called.
-    let tx = conn.unchecked_transaction()?;
+    // Has the user manually edited this frame's metadata? frames.override = 1
+    // means "user has edited; scanner must not undo". The frames row is
+    // authoritative in that case: skip the frames UPDATE entirely and only
+    // refresh the files row (size/mtime/hashes) + the stored header snapshot,
+    // so the file stops being classified as "modified" without wiping the
+    // user's edits.
+    let user_override: bool = if frame_count == 1 {
+        conn.query_row(
+            "SELECT override FROM frames WHERE file_id = ?1",
+            rusqlite::params![file_id],
+            |r| r.get::<_, i64>(0),
+        )? != 0
+    } else {
+        false
+    };
 
+    // Wrap all DB writes in a SAVEPOINT so a process kill / error mid-update
+    // can't leave a half-updated row (e.g. files synced but frames stale, or
+    // fits_header deleted but not re-inserted). A SAVEPOINT — not BEGIN —
+    // because scan_directory_parallel calls this function while its own
+    // batch transaction is open, and a nested BEGIN is a SQLite error
+    // ("cannot start a transaction within a transaction"). SAVEPOINT nests
+    // inside an open transaction and acts like a regular transaction when
+    // none is open (the serial scan path). The pre-parse work above
+    // (metadata stat, format detection, FITS parse, hash computation,
+    // frame_count/override reads) is read-only and intentionally stays
+    // OUTSIDE the savepoint.
+    conn.execute_batch("SAVEPOINT reparse_in_place")?;
+    let write_result = write_reparse_rows(
+        conn,
+        file_id,
+        size,
+        &modified_dt,
+        &format,
+        &metadata_hash,
+        content_hash.as_deref(),
+        &frame,
+        new_instrume.as_deref(),
+        header_text.as_deref(),
+        frame_count,
+        user_override,
+    );
+    match write_result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE reparse_in_place")?;
+            Ok(())
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch(
+                "ROLLBACK TO reparse_in_place; RELEASE reparse_in_place",
+            ) {
+                crate::logging::log(
+                    "ERROR",
+                    &format!(
+                        "[scanner] savepoint rollback failed for {}: {}",
+                        path.display(),
+                        rb
+                    ),
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The write half of `reparse_and_update_in_place`. Runs inside the
+/// `reparse_in_place` savepoint opened by the caller — every statement here
+/// either all commits (RELEASE) or all rolls back (ROLLBACK TO).
+#[allow(clippy::too_many_arguments)]
+fn write_reparse_rows(
+    conn: &Connection,
+    file_id: i64,
+    size: i64,
+    modified_dt: &chrono::DateTime<Utc>,
+    format: &FileFormat,
+    metadata_hash: &str,
+    content_hash: Option<&str>,
+    frame: &Frame,
+    new_instrume: Option<&str>,
+    header_text: Option<&str>,
+    frame_count: i64,
+    user_override: bool,
+) -> anyhow::Result<()> {
     // UPDATE files in place. Mirrors insert_file's column list (path,
     // filename, created_at intentionally not touched).
-    tx.execute(
+    conn.execute(
         "UPDATE files
          SET size = ?1, modified_at = ?2, format = ?3,
              metadata_hash = ?4, content_hash = ?5
@@ -633,8 +705,11 @@ fn reparse_and_update_in_place(
     // `files` row but failed to parse the FITS — leaving an orphaned files
     // row with no `frames`. Without this branch, that orphan stays stuck
     // because the file would now be classified as "unchanged" on every
-    // subsequent scan.
-    if frame_count == 1 {
+    // subsequent scan. When the user has edited the frame (override = 1)
+    // the frames row is left completely untouched.
+    if user_override {
+        // Intentionally no frames UPDATE: user edits win over header values.
+    } else if frame_count == 1 {
         // Mirrors insert_frame's column list. Note that imagetyp is stored
         // as the Debug form of ImageType (matches insert_frame),
         // is_master/override are written as i64 booleans, and bayerpat is
@@ -643,7 +718,7 @@ fn reparse_and_update_in_place(
         let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
         let is_master_int = if frame.is_master { 1i64 } else { 0i64 };
         let override_int = if frame.override_ { 1i64 } else { 0i64 };
-        tx.execute(
+        conn.execute(
             "UPDATE frames SET
                 object = ?1, date_obs = ?2, telescop = ?3, instrume = ?4,
                 exptime = ?5, filter = ?6, imagetyp = ?7, is_master = ?8,
@@ -695,34 +770,33 @@ fn reparse_and_update_in_place(
         // Build a Frame with the correct file_id and the unique-camera
         // suffix applied (so both the UPDATE and INSERT branches share the
         // same instrume substitution logic), leave id = None so the
-        // canonical insert allocates a fresh auto-increment id.
-        // `Transaction` derefs to `Connection`, so &*tx satisfies
-        // insert_frame's `&Connection` parameter while keeping the write
-        // inside the transaction.
+        // canonical insert allocates a fresh auto-increment id. The write
+        // stays inside the caller's savepoint.
         let mut frame_for_insert = frame.clone();
         frame_for_insert.id = None;
         frame_for_insert.file_id = file_id;
-        frame_for_insert.instrume = new_instrume.clone();
-        insert_frame(&tx, &frame_for_insert)?;
+        frame_for_insert.instrume = new_instrume.map(|s| s.to_string());
+        insert_frame(conn, &frame_for_insert)?;
     }
 
     // fits_header has UNIQUE(file_id) — DELETE then INSERT so the
     // header_fingerprint reflects the new bytes. No FK references
-    // fits_header rows, so this is safe.
+    // fits_header rows, so this is safe. Done even when override = 1: the
+    // snapshot must reflect the current on-disk bytes (move detection +
+    // metadata-pane revert both read it).
     if let Some(h) = header_text {
-        let fingerprint = crate::fingerprint::compute_header_fingerprint(&h);
-        tx.execute(
+        let fingerprint = crate::fingerprint::compute_header_fingerprint(h);
+        conn.execute(
             "DELETE FROM fits_header WHERE file_id = ?1",
             rusqlite::params![file_id],
         )?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO fits_header (file_id, header, header_fingerprint)
              VALUES (?1, ?2, ?3)",
             rusqlite::params![file_id, h, fingerprint],
         )?;
     }
 
-    tx.commit()?;
     Ok(())
 }
 
@@ -1373,11 +1447,15 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             result.errors.push(format!("DB rollback after cancel failed: {}", rb));
         }
         // No COMMIT, no WAL checkpoint — caller still gets a populated result
-        // (with cancelled=true) but the catalog is unchanged.
-        result.errors = match Arc::try_unwrap(errors) {
+        // (with cancelled=true) but the catalog is unchanged. EXTEND, don't
+        // assign: result.errors already holds write-loop errors (in-place
+        // re-parse failures, rollback failures) that an assignment would
+        // silently discard.
+        let phase1_errors = match Arc::try_unwrap(errors) {
             Ok(mutex) => mutex.into_inner().unwrap_or_default(),
             Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         };
+        result.errors.extend(phase1_errors);
         emit_scan_complete(emitter, root_id, &result);
         return result;
     }
@@ -1398,11 +1476,15 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         crate::logging::log("WARN", &format!("Phase 2: WAL checkpoint failed: {}", e));
     }
 
-    // Collect errors
-    result.errors = match Arc::try_unwrap(errors) {
+    // Collect Phase-1 errors. EXTEND, don't assign: result.errors already
+    // holds write-loop errors (in-place re-parse failures, COMMIT/ROLLBACK
+    // failures) that an assignment would silently discard — that exact bug
+    // hid the nested-transaction failure in the re-parse path for weeks.
+    let phase1_errors = match Arc::try_unwrap(errors) {
         Ok(mutex) => mutex.into_inner().unwrap_or_default(),
         Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
     };
+    result.errors.extend(phase1_errors);
     result.lights_count = lights_count;
     result.flats_count = flat_frame_ids.len();
     result.darks_count = dark_frame_ids.len();
@@ -1782,6 +1864,20 @@ mod inplace_tests {
         );
         assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
         assert!(!scan2.cancelled);
+        // The re-parse must actually have run — not failed silently leaving
+        // the old rows in place. files_processed counts only successful
+        // re-parses, and modified_at only advances if the files UPDATE ran.
+        assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
+        let on_disk_mtime = chrono::DateTime::<chrono::Utc>::from(
+            std::fs::metadata(&f).unwrap().modified().unwrap(),
+        )
+        .to_rfc3339();
+        let db_mtime: String = conn.query_row(
+            "SELECT modified_at FROM files WHERE path = ?1",
+            [f.to_str().unwrap()], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(db_mtime, on_disk_mtime,
+            "files.modified_at must be refreshed by the in-place re-parse");
 
         let frame_id_after: i64 = conn.query_row(
             "SELECT f.id FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
@@ -1795,5 +1891,67 @@ mod inplace_tests {
             params![frame_id_after], |r| r.get(0),
         ).unwrap();
         assert_eq!(count, 1, "session membership must survive the parallel re-parse");
+    }
+
+    /// frames.override = 1 means "user has edited; scanner must not undo".
+    /// A re-parse triggered by mtime drift must refresh the `files` row
+    /// (so the file stops being classified as modified) but leave the
+    /// user's frame edits and the override flag fully intact.
+    #[test]
+    fn parallel_rescan_preserves_user_override_edits() {
+        let scan = TempDir::new().unwrap();
+        let f = scan.path().join("M33/L_003.fits");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&f);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()]).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let scan1 = scan_directory_parallel(
+            scan.path(), 1, &conn, &NullEmitter, false, cancel.clone(), false,
+        );
+        assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
+
+        // User edits the frame's metadata (the FITS header says OBJECT = 'M33').
+        conn.execute(
+            "UPDATE frames SET object = 'NGC 598 (edited)', override = 1
+             WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
+            [f.to_str().unwrap()],
+        ).unwrap();
+
+        // Touch — advance mtime by at least one filesystem tick.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let bytes = std::fs::read(&f).unwrap();
+        std::fs::write(&f, bytes).unwrap();
+
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let scan2 = scan_directory_parallel(
+            scan.path(), 1, &conn, &NullEmitter, false, cancel2, false,
+        );
+        assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
+        assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
+
+        let (object, override_flag, db_mtime): (String, i64, String) = conn.query_row(
+            "SELECT fr.object, fr.override, fi.modified_at
+             FROM frames fr JOIN files fi ON fi.id = fr.file_id
+             WHERE fi.path = ?1",
+            [f.to_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(object, "NGC 598 (edited)",
+            "user-edited OBJECT must survive the re-parse");
+        assert_eq!(override_flag, 1, "override flag must survive the re-parse");
+
+        // The files row must still be refreshed so the file is classified
+        // as unchanged on the next scan (no endless re-parse loop).
+        let on_disk_mtime = chrono::DateTime::<chrono::Utc>::from(
+            std::fs::metadata(&f).unwrap().modified().unwrap(),
+        )
+        .to_rfc3339();
+        assert_eq!(db_mtime, on_disk_mtime,
+            "files.modified_at must be refreshed even when override = 1");
     }
 }
