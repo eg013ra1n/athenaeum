@@ -779,11 +779,13 @@ fn write_reparse_rows(
         insert_frame(conn, &frame_for_insert)?;
     }
 
-    // fits_header has UNIQUE(file_id) — DELETE then INSERT so the
-    // header_fingerprint reflects the new bytes. No FK references
-    // fits_header rows, so this is safe. Done even when override = 1: the
-    // snapshot must reflect the current on-disk bytes (move detection +
-    // metadata-pane revert both read it).
+    // fits_header has NO UNIQUE(file_id) constraint, so the DELETE-then-INSERT
+    // is what keeps it to one row per file — do not drop the DELETE or this
+    // silently duplicates header rows. The re-INSERT also refreshes
+    // header_fingerprint to reflect the new bytes. No FK references fits_header
+    // rows, so this is safe. Done even when override = 1: the snapshot must
+    // reflect the current on-disk bytes (move detection + metadata-pane revert
+    // both read it).
     if let Some(h) = header_text {
         let fingerprint = crate::fingerprint::compute_header_fingerprint(h);
         conn.execute(

@@ -927,6 +927,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     for (const index of selectedFrames) {
       const frame = fitsFrames[index];
       if (!frame?.file?.id) continue;
+      // Skip files already in the black hole — re-blackholing them would create a
+      // duplicate record. Matches the `nonBlackholedInSelectionCount` shown on the
+      // toolbar button and confirm dialog. Mirrors handleRestoreSelected's filter.
+      if (blackholedFileIds.has(frame.file.id)) continue;
       try {
         await api.invoke('move_to_black_hole', { fileId: frame.file.id, fromWhere: sourceType });
         blackholedIds.push(frame.file.id);
@@ -945,7 +949,7 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     if (errors.length > 0) setBlackholeError(`${errors.length} error(s): ${errors[0]}`);
     setIsBlackholing(false);
     setShowBlackholeConfirm(false);
-  }, [selectedFrames, fitsFrames, sourceType, onFramesRemoved]);
+  }, [selectedFrames, fitsFrames, blackholedFileIds, sourceType, onFramesRemoved]);
 
   const handleRestoreSelected = useCallback(async () => {
     const toRestore = Array.from(selectedFrames)

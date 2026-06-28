@@ -19,7 +19,11 @@ pub struct BulkMoveProgressEvent {
     pub current_file: Option<String>,
 }
 
-/// Add a file to the black hole (soft delete)
+/// Add a file to the black hole (soft delete).
+///
+/// Idempotent: a `UNIQUE(file_id)` index guarantees one row per file, and
+/// `INSERT OR IGNORE` makes re-blackholing an already-blackholed file a no-op
+/// rather than a duplicate row. Returns the canonical row id either way.
 pub fn add_to_black_hole(
     conn: &Connection,
     file_id: i64,
@@ -29,21 +33,32 @@ pub fn add_to_black_hole(
     let now = Utc::now().to_rfc3339();
 
     conn.execute(
-        "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+        "INSERT OR IGNORE INTO black_hole (file_id, from_where, moved_at, original_path)
          VALUES (?1, ?2, ?3, ?4)",
         params![file_id, from_where, now, original_path],
     )?;
 
-    Ok(conn.last_insert_rowid())
+    // `last_insert_rowid()` is stale when the insert is ignored (already present),
+    // so resolve the row id explicitly — correct for both fresh and repeat calls.
+    let id: i64 = conn.query_row(
+        "SELECT id FROM black_hole WHERE file_id = ?1",
+        params![file_id],
+        |row| row.get(0),
+    )?;
+
+    Ok(id)
 }
 
 /// Move a batch of files to the black hole in a single transaction, emitting
 /// progress events as each file is processed.
 ///
-/// Per-file failures (e.g. file already in black hole, file row missing) are
-/// logged to stderr and collected into `BulkMoveResult::failed` — they do NOT
-/// abort the whole batch. A connection-level error (transaction begin/commit
-/// fails) returns `Err` and leaves the DB unchanged.
+/// Files already in the black hole are skipped as idempotent no-ops (the
+/// `UNIQUE(file_id)` index + `INSERT OR IGNORE` mean no duplicate row is
+/// created) and are counted as neither `moved` nor `failed`. Genuine per-file
+/// failures (e.g. file row missing) are logged to stderr and collected into
+/// `BulkMoveResult::failed` — they do NOT abort the whole batch. A
+/// connection-level error (transaction begin/commit fails) returns `Err` and
+/// leaves the DB unchanged.
 pub fn bulk_move_to_black_hole(
     conn: &Connection,
     file_ids: &[i64],
@@ -80,13 +95,19 @@ pub fn bulk_move_to_black_hole(
         };
 
         let insert = conn.execute(
-            "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+            "INSERT OR IGNORE INTO black_hole (file_id, from_where, moved_at, original_path)
              VALUES (?1, ?2, ?3, ?4)",
             params![file_id, from_where, now, path],
         );
 
         match insert {
-            Ok(_) => moved += 1,
+            // changed == 0 means the file was already in the black hole — a
+            // silent idempotent no-op (not a move, not a failure).
+            Ok(changed) => {
+                if changed > 0 {
+                    moved += 1;
+                }
+            }
             Err(e) => {
                 eprintln!(
                     "bulk_move_to_black_hole: failed to move file_id {} ({}): {}",
@@ -360,4 +381,65 @@ pub fn rebuild_folder_similarity_cache(
 
     conn.execute("COMMIT", [])?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::init_db;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1, '/tmp/a.fits', 'a.fits', 10, '2024-01-01T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Re-blackholing the same file must not create a duplicate row and must
+    /// return the same canonical row id.
+    #[test]
+    fn add_to_black_hole_is_idempotent() {
+        let conn = setup();
+
+        let id1 = add_to_black_hole(&conn, 1, "light", "/tmp/a.fits").unwrap();
+        let id2 = add_to_black_hole(&conn, 1, "light", "/tmp/a.fits").unwrap();
+        assert_eq!(id1, id2, "repeat blackhole must return the same row id");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM black_hole WHERE file_id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "must not create a duplicate black_hole row");
+    }
+
+    /// A bulk move over a mix of fresh and already-blackholed files counts only
+    /// the genuinely new ones as `moved`, never duplicates, never fails the dupes.
+    #[test]
+    fn bulk_move_skips_already_blackholed() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (2, '/tmp/b.fits', 'b.fits', 10, '2024-01-01T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+
+        // File 1 is already blackholed; the bulk move includes it again.
+        add_to_black_hole(&conn, 1, "light", "/tmp/a.fits").unwrap();
+
+        let res = bulk_move_to_black_hole(&conn, &[1, 2], "light", None).unwrap();
+        assert_eq!(res.moved, 1, "only the fresh file counts as moved");
+        assert!(res.failed.is_empty(), "already-blackholed is a no-op, not a failure");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "one row per file, no duplicates");
+    }
 }

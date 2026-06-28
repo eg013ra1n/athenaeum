@@ -239,6 +239,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )",
         [],
     )?;
+    // One-time cleanup: collapse duplicate black_hole rows. The table historically
+    // had no UNIQUE(file_id) constraint and a plain INSERT could duplicate a row
+    // when a file was blackholed twice. Keep the earliest row per file_id. Must
+    // run BEFORE the unique index is created, or index creation fails on a dirty DB.
+    conn.execute(
+        "DELETE FROM black_hole
+         WHERE id NOT IN (SELECT MIN(id) FROM black_hole GROUP BY file_id)",
+        [],
+    )?;
+    // Guarantee one black_hole row per file going forward. Doubles as the file_id
+    // lookup index used by get_blackholed_file_ids / restore.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_black_hole_file_id ON black_hole(file_id)",
+        [],
+    )?;
 
     // Missing files table - tracks files that no longer exist on disk
     conn.execute(
