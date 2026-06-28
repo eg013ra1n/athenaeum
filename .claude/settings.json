@@ -6,8 +6,19 @@
         "hooks": [
           {
             "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/mark-rust-dirty.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/check-rust.sh",
-            "timeout": 30,
+            "timeout": 180,
             "statusMessage": "Running cargo check..."
           }
         ]

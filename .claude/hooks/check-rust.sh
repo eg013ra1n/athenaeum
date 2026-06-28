@@ -1,25 +1,30 @@
 #!/bin/bash
-# PostToolUse hook: run cargo check after editing Rust files
-# Receives JSON input on stdin with tool_input.file_path
+# Stop hook: once per turn, if any .rs changed this session (flag set by
+# mark-rust-dirty.sh), run a single workspace `cargo check` and report ONLY the
+# error lines back into context. Silent on success; runs no cargo on
+# chat/non-Rust turns. Non-blocking (inform-only) — explicit `cargo test`/`build`
+# remain the real completion gate. Receives JSON on stdin.
 
 INPUT=$(cat)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+SESSION=$(echo "$INPUT" | jq -r '.session_id // "default"')
+FLAG="${TMPDIR:-/tmp}/claude-rust-dirty-${SESSION}"
 
-# Only process .rs files
-if [[ "$FILE_PATH" != *.rs ]]; then
-  exit 0
-fi
+# Nothing Rust changed this turn -> do nothing (no cargo).
+[ -f "$FLAG" ] || exit 0
+rm -f "$FLAG"
 
-# Run cargo check from the workspace root
 cd "$CLAUDE_PROJECT_DIR" || exit 0
-OUTPUT=$(cargo check --workspace --message-format=short 2>&1)
-EXIT_CODE=$?
 
-if [ $EXIT_CODE -ne 0 ]; then
-  # Show only errors (first 20 lines)
-  ERRORS=$(echo "$OUTPUT" | head -20)
-  echo "$ERRORS" >&2
-  exit 1
+OUTPUT=$(cargo check --workspace --message-format=short 2>&1)
+if [ $? -eq 0 ]; then
+  exit 0          # clean compile -> silent
 fi
 
+# Keep only error lines, cap to bound token cost.
+ERRORS=$(printf '%s\n' "$OUTPUT" | grep -E '(^error|: error)' | head -40)
+[ -z "$ERRORS" ] && exit 0
+
+jq -n --arg ctx "cargo check --workspace failed:
+$ERRORS" \
+  '{hookSpecificOutput: {hookEventName: "Stop", additionalContext: $ctx}}'
 exit 0

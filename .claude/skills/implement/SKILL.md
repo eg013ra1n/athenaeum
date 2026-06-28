@@ -45,9 +45,10 @@ Read CLAUDE.md first if anything below is unclear — it is the source of truth.
 
 ## Verify as you go
 
-- **Rust:** a PostToolUse hook runs `cargo check` after every `.rs` edit. Treat a
-  red check as a stop condition — fix before moving on. For logic, run
-  `cargo test -p athenaeum-core` (or `--workspace`).
+- **Rust:** a `Stop` hook runs one `cargo check --workspace` at turn end whenever
+  the turn touched a `.rs` file, reporting only the errors once (rust-analyzer LSP
+  gives live per-edit feedback in between). Treat a red check as a stop condition —
+  fix before moving on. For logic, run `cargo test -p athenaeum-core` (or `--workspace`).
 - **TypeScript:** run `npx tsc --noEmit` after frontend edits.
 - **Multi-file edits in complete passes** — don't leave the workspace in a
   half-edited non-compiling state across unrelated files; finish a coherent unit,
