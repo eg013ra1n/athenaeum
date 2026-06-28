@@ -168,17 +168,26 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
             const isBlackholed = frame.file.id ? blackholedFileIds.has(frame.file.id) : false;
             const analysis = frame.frame?.id ? analysisMap.get(frame.frame.id) : undefined;
 
+            // Two independent visual channels so the three states never hide
+            // each other:
+            //   • Background tint encodes *status* — selected (warning) takes
+            //     precedence over blackholed (error), then a faint accent wash
+            //     for a plain current row, then the default.
+            //   • "Current" (the frame on the canvas) adds an inset accent ring
+            //     ON TOP of whatever tint is in effect, so the displayed frame
+            //     is always identifiable — including when it's deleted/selected.
             let rowClasses = "px-2 py-2 text-xs cursor-pointer transition-colors border-b border-border/40 last:border-b-0";
-            if (isBlackholed && isSelected) {
-              rowClasses += " bg-warning/10 text-warning ring-1 ring-inset ring-warning/40";
+            if (isSelected) {
+              rowClasses += " bg-warning/10 text-warning";
             } else if (isBlackholed) {
               rowClasses += " bg-error/5 text-content-muted";
             } else if (isCurrent) {
-              rowClasses += " bg-accent text-surface";
-            } else if (isSelected) {
-              rowClasses += " bg-warning/10 text-warning";
+              rowClasses += " bg-accent/10 text-content";
             } else {
               rowClasses += " bg-surface-elevated text-content-secondary hover:bg-surface-hover";
+            }
+            if (isCurrent) {
+              rowClasses += " ring-2 ring-inset ring-accent";
             }
 
             return (
@@ -200,16 +209,16 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                   )}
                   <span className="font-mono">{formatTime(frame.frame?.date_obs)}</span>
                   {hasMultipleFilters && frame.frame?.filter && (
-                    <span className={`font-bold ${isCurrent ? 'text-surface/80' : 'text-content-secondary'}`}>{frame.frame.filter}</span>
+                    <span className="font-bold text-content-secondary">{frame.frame.filter}</span>
                   )}
                   {hasMultipleExptimes && frame.frame?.exptime != null && (
-                    <span className={`font-bold ${isCurrent ? 'text-surface/80' : 'text-content-secondary'}`}>{frame.frame.exptime}s</span>
+                    <span className="font-bold text-content-secondary">{frame.frame.exptime}s</span>
                   )}
                   {hasAnyAnalysis && analysis && (
                     <>
-                      <span className={`font-bold ${isCurrent ? fwhmColorCurrent(analysis.median_fwhm) : fwhmColor(analysis.median_fwhm)}`}>{analysis.median_fwhm.toFixed(2)}px</span>
-                      <span className={`font-bold ${isCurrent ? eccColorCurrent(analysis.median_eccentricity) : eccColor(analysis.median_eccentricity)}`}>{analysis.median_eccentricity.toFixed(2)}</span>
-                      <span className={`font-bold ${isCurrent ? 'text-surface/60' : 'text-content-muted'}`}>{analysis.frame_snr.toFixed(1)}dB</span>
+                      <span className={`font-bold ${fwhmColor(analysis.median_fwhm)}`}>{analysis.median_fwhm.toFixed(2)}px</span>
+                      <span className={`font-bold ${eccColor(analysis.median_eccentricity)}`}>{analysis.median_eccentricity.toFixed(2)}</span>
+                      <span className="font-bold text-content-muted">{analysis.frame_snr.toFixed(1)}dB</span>
                     </>
                   )}
                   {loadingIndices.has(index) && (
@@ -222,7 +231,7 @@ export const FrameList: React.FC<FrameListProps> = memo(function FrameList({
                         state: { reveal: { path: frame.file.path, token: Date.now() } },
                       });
                     }}
-                    className={`ml-auto p-1 rounded transition-colors flex-shrink-0 ${isCurrent ? 'text-surface/60 hover:text-surface' : 'text-content-muted hover:text-content hover:bg-surface-hover'}`}
+                    className="ml-auto p-1 rounded transition-colors flex-shrink-0 text-content-muted hover:text-content hover:bg-surface-hover"
                     title="Locate in file browser"
                   >
                     <FolderOpen size={12} />
@@ -246,17 +255,4 @@ function eccColor(ecc: number): string {
   if (ecc <= 0.5) return "text-success/80";
   if (ecc <= 0.7) return "text-warning/80";
   return "text-error/80";
-}
-
-/** Softer tones for current-frame rows (accent bg, need contrast against bg-accent) */
-function fwhmColorCurrent(fwhm: number): string {
-  if (fwhm <= 2.5) return "text-surface/90";
-  if (fwhm <= 4.0) return "text-surface/70";
-  return "text-surface/60";
-}
-
-function eccColorCurrent(ecc: number): string {
-  if (ecc <= 0.5) return "text-surface/90";
-  if (ecc <= 0.7) return "text-surface/70";
-  return "text-surface/60";
 }
