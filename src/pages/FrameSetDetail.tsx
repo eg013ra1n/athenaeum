@@ -25,6 +25,13 @@ import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFram
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'registration';
 
+// The Registration (frame alignment / stacking preparation) feature is still
+// under active development. It stays fully functional in dev builds so work can
+// continue, but is disabled in production/release builds (the tab is shown
+// greyed with an "under development" tooltip). Gated on the Vite dev flag, which
+// is true for `tauri dev` / `dev:web` and false for `tauri build` / `build:web`.
+const REGISTRATION_ENABLED = import.meta.env.DEV;
+
 export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -113,10 +120,12 @@ export default function FrameSetDetail() {
     if (tabParam === 'calibration' || tabParam === 'history' || tabParam === 'analysis' || tabParam === 'export') {
       setActiveTab(tabParam);
     } else if (tabParam === 'registration') {
-      // Only allow direct navigation to registration if it is not gated.
-      // registrationTabReady may not be resolved yet on first render (reference
-      // still loading); fall back to 'analysis' if it's clearly unavailable.
-      if (referenceFrameId !== undefined && registrationTabReady) {
+      // Only allow direct navigation to registration if it is enabled and not
+      // gated. In production REGISTRATION_ENABLED is false, so a deep link can
+      // never land on the under-development tab. registrationTabReady may not be
+      // resolved yet on first render (reference still loading); fall back to
+      // 'analysis' if it's clearly unavailable.
+      if (REGISTRATION_ENABLED && referenceFrameId !== undefined && registrationTabReady) {
         setActiveTab('registration');
       } else {
         setActiveTab('analysis');
@@ -762,16 +771,26 @@ export default function FrameSetDetail() {
         {([
           { key: 'analysis' as FrameSetTab, label: 'Lights Analysis & Stats', icon: BarChart3 },
           { key: 'calibration' as FrameSetTab, label: 'Calibration Coverage', icon: Crosshair },
-          { key: 'registration' as FrameSetTab, label: 'Stacking Preparation', icon: AlignHorizontalJustifyCenter },
+          { key: 'registration' as FrameSetTab, label: 'Registration', icon: AlignHorizontalJustifyCenter },
           { key: 'export' as FrameSetTab, label: 'Export', icon: Layers },
           { key: 'history' as FrameSetTab, label: 'History', icon: History },
         ]).map(({ key, label, icon: Icon }) => {
-          const isGated = key === 'registration' && !registrationTabReady;
-          const gateTooltip = !registrationTabReady
-            ? analysisData.size === 0
-              ? 'Analyze the lights first, then choose a reference frame in the Analysis tab'
-              : 'Choose a reference frame in the Analysis tab to enable stacking preparation'
-            : undefined;
+          // Registration is disabled in production (under development) and, in
+          // dev, additionally gated until the lights are analyzed and a
+          // reference is chosen.
+          const isUnderDev = key === 'registration' && !REGISTRATION_ENABLED;
+          const isGated =
+            key === 'registration' && (isUnderDev || !registrationTabReady);
+          const gateTooltip =
+            key === 'registration'
+              ? isUnderDev
+                ? 'Registration is under development — available in a future release.'
+                : !registrationTabReady
+                  ? analysisData.size === 0
+                    ? 'Analyze the lights first, then choose a reference frame in the Analysis tab'
+                    : 'Choose a reference frame in the Analysis tab to enable stacking preparation'
+                  : undefined
+              : undefined;
           return (
             <button
               key={key}
