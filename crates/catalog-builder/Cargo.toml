@@ -1,0 +1,23 @@
+[package]
+name = "catalog-builder"
+version = "0.2.1"
+description = "Offline tool to build & package the Gaia DR3 star catalogs (deep + hybrid bright) for the Athenaeum plate-solver"
+edition = "2021"
+license = "Apache-2.0"
+# Dev/build tooling only — never shipped in the app or Docker image.
+publish = false
+
+[[bin]]
+name = "catalog-builder"
+path = "src/main.rs"
+
+[dependencies]
+# Reused as-is: Gaia bulk download + HEALPix binning live in athenaeum-core;
+# the stars.smac format + builder + reader live in solvemyastro.
+athenaeum-core = { path = "../athenaeum-core" }
+solvemyastro = { path = "../../solvemyastro" }
+
+anyhow = "1"
+# Versions kept in lockstep with athenaeum-core to avoid duplicate crate builds.
+zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+sha2 = "0.10"

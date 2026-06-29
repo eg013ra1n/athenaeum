@@ -26,8 +26,12 @@ RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/ath
     && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs \
     && mkdir -p crates/jpeg-encode/src && echo "pub fn _dummy() {}" > crates/jpeg-encode/src/lib.rs
 
-# Exclude athenaeum-tauri from workspace during Docker build
-RUN sed -i '/"crates\/athenaeum-tauri",/d' Cargo.toml
+# Exclude athenaeum-tauri (desktop shell) and catalog-builder (offline dev
+# tooling) from the workspace during the Docker build. Their sources are not
+# copied into the image, so leaving them as members would fail workspace
+# manifest resolution for `cargo build --package athenaeum-web`.
+RUN sed -i '/"crates\/athenaeum-tauri",/d' Cargo.toml \
+    && sed -i '/"crates\/catalog-builder",/d' Cargo.toml
 
 # Fetch deps, then patch zune-jpeg NEON build for aarch64.
 # zune-jpeg 0.5.12 has safe fns calling unsafe NEON intrinsics without unsafe

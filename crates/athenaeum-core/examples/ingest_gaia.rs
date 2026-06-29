@@ -1,15 +1,21 @@
-//! One-time Gaia DR3 (G ≤ 16) catalog ingest.
+//! One-time Gaia DR3 (G < 19) catalog ingest via the ESA TAP service.
+//!
+//! NOTE: prefer the `catalog-builder` crate, which orchestrates the full
+//! download → bin → deep+bright `stars.smac` → zip pipeline. This example is
+//! just the TAP-only binning step (the slower alternative to the bulk-CDN path).
 //!
 //! Usage:
 //!   cargo run -p athenaeum-core --example ingest_gaia --release
 //!   cargo run -p athenaeum-core --example ingest_gaia --release -- <app_data_dir>
 //!
-//! Pulls all 768 HEALPix-level-3 tiles from the ESA Gaia TAP service into
-//! `<app_data_dir>/catalogs/gaia_dr3/`. **Resumable**: a completed tile is
-//! recorded in `<app_data_dir>/gaia_dr3_raw/done.manifest`; interrupt with
-//! Ctrl-C any time and re-run this command — it skips finished tiles. Runs
-//! for a few hours (overnight); ≈4 GB final. The desktop app / bench pick
-//! the catalog up automatically once present (no further steps).
+//! Pulls all 12,288 HEALPix-level-5 tiles from the ESA Gaia TAP service into
+//! `<app_data_dir>/catalogs/gaia_dr3/` (the intermediate `healpix_*.bin`).
+//! **Resumable**: a completed tile is recorded in
+//! `<app_data_dir>/gaia_dr3_raw/done.manifest`; interrupt with Ctrl-C any time
+//! and re-run — it skips finished tiles. The TAP queue can take a long while.
+//! Afterwards, build `stars.smac` from these tiles with `catalog-builder
+//! --skip-download` (or `solvemyastro build-cache`); the app reads `stars.smac`,
+//! not the `.bin` tiles.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;

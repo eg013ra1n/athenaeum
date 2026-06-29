@@ -624,6 +624,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
+name = "catalog-builder"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "athenaeum-core",
+ "sha2",
+ "solvemyastro",
+ "zip",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"

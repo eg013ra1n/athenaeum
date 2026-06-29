@@ -4,6 +4,7 @@ members = [
     "crates/athenaeum-core",
     "crates/athenaeum-tauri",
     "crates/athenaeum-web",
+    "crates/catalog-builder",
     "rustafits",
     "solvemyastro",
 ]
