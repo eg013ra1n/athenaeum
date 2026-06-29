@@ -629,6 +629,8 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "athenaeum-core",
+ "serde",
+ "serde_json",
  "sha2",
  "solvemyastro",
  "tempfile",

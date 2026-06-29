@@ -45,6 +45,7 @@ use solvemyastro::cache::{build_cache, build_cache_from_legacy_dir, BuildProgres
 use solvemyastro::{StarCache, StarRecord};
 
 mod layers;
+mod publish;
 mod tiers;
 
 /// HEALPix depth-6 pixel count (12 · 4⁶). The fixed granularity of the
