@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
+use athenaeum_core::catalog::gaia::GAIA_MAG_LIMIT;
 use athenaeum_core::catalog::gaia_bulk::{
     ingest_bulk, GaiaBulkProgress, DEFAULT_INGEST_CONCURRENCY,
 };
@@ -53,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
 
-    let total = ingest_bulk(&bulk_dir, &app_data_dir, concurrency, cancel, &|p| match p {
+    let total = ingest_bulk(&bulk_dir, &app_data_dir, GAIA_MAG_LIMIT, concurrency, cancel, &|p| match p {
         GaiaBulkProgress::IngestStarted { total_files } => {
             println!("started: {total_files} files to ingest")
         }

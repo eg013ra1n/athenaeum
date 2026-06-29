@@ -535,7 +535,7 @@ impl ColumnIndex {
 ///    cap in the TAP path doesn't exist here, so this is the local cap).
 /// - `pmra`/`pmdec` empty → 0.
 /// - `ruwe` present and `>= GAIA_RUWE_MAX` → drop. Empty/missing → keep.
-fn parse_bulk_row(row: &str, idx: ColumnIndex) -> Option<StarRecord> {
+fn parse_bulk_row(row: &str, idx: ColumnIndex, mag_limit: f32) -> Option<StarRecord> {
     let cap = idx.max() + 1;
     // Build a Vec of just the columns we care about. The bulk CSV has ~150
     // columns; we touch ~6, but `split` walks the whole row anyway — keep it
@@ -553,7 +553,7 @@ fn parse_bulk_row(row: &str, idx: ColumnIndex) -> Option<StarRecord> {
     let ra: f64 = cols[idx.ra].trim().parse().ok()?;
     let dec: f64 = cols[idx.dec].trim().parse().ok()?;
     let g: f32 = cols[idx.mag].trim().parse().ok()?;
-    if !g.is_finite() || g >= GAIA_MAG_LIMIT {
+    if !g.is_finite() || g >= mag_limit {
         return None;
     }
     let pmra: f64 = match cols[idx.pmra].trim() {
@@ -580,6 +580,7 @@ fn ingest_one_file(
     path: &Path,
     sender: &mpsc::SyncSender<(String, Vec<StarRecord>)>,
     cancel: &Arc<AtomicBool>,
+    mag_limit: f32,
 ) -> Result<usize> {
     let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let gz = GzDecoder::new(BufReader::with_capacity(1 << 20, f));
@@ -624,7 +625,7 @@ fn ingest_one_file(
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        if let Some(rec) = parse_bulk_row(&l, idx) {
+        if let Some(rec) = parse_bulk_row(&l, idx, mag_limit) {
             chunk.push(rec);
             kept += 1;
             if chunk.len() >= INGEST_CHUNK_SIZE {
@@ -652,6 +653,7 @@ fn ingest_one_file(
 pub fn ingest_bulk(
     bulk_dir: &Path,
     app_data_dir: &Path,
+    mag_limit: f32,
     concurrency: usize,
     cancel: Arc<AtomicBool>,
     progress: &(dyn Fn(GaiaBulkProgress) + Sync),
@@ -731,7 +733,7 @@ pub fn ingest_bulk(
                     .and_then(|n| n.to_str())
                     .unwrap_or("<unnamed>")
                     .to_string();
-                match ingest_one_file(path, &tx, &cancel) {
+                match ingest_one_file(path, &tx, &cancel, mag_limit) {
                     Ok(kept) => {
                         total_kept.fetch_add(kept as u64, Ordering::Relaxed);
                         let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -802,7 +804,7 @@ pub fn setup_gaia_dr3_from_bulk(
         }
     }
     download_bulk(bulk_dir, download_concurrency, Arc::clone(&cancel), progress)?;
-    ingest_bulk(bulk_dir, app_data_dir, ingest_concurrency, cancel, progress)?;
+    ingest_bulk(bulk_dir, app_data_dir, GAIA_MAG_LIMIT, ingest_concurrency, cancel, progress)?;
     Ok(catalog_dir)
 }
 
@@ -855,26 +857,35 @@ not-a-hash _disclaimer.txt
         let idx = ColumnIndex::from_header(header).unwrap();
 
         // Good row.
-        let s = parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,1.05", idx).expect("kept");
+        let s = parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,1.05", idx, 19.0).expect("kept");
         assert!((s.ra - 86.682).abs() < 1e-3);
         assert!((s.mag() - 14.231).abs() < 1e-3);
 
         // RUWE = 1.4 → dropped (>= cap).
-        assert!(parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,1.4", idx).is_none());
+        assert!(parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,1.4", idx, 19.0).is_none());
         // RUWE = 3.7 → dropped.
-        assert!(parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,3.7", idx).is_none());
+        assert!(parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,3.7", idx, 19.0).is_none());
         // Empty RUWE (2-param solution) → kept.
-        assert!(parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,", idx).is_some());
+        assert!(parse_bulk_row("86.682,0.042,14.231,12.5,-7.25,", idx, 19.0).is_some());
         // Null PM → treated as 0 (Gaia 2-param).
-        let s2 = parse_bulk_row("10,20,15.9,,,", idx).expect("null-pm kept");
+        let s2 = parse_bulk_row("10,20,15.9,,,", idx, 19.0).expect("null-pm kept");
         assert_eq!(s2.pmra_mas_yr(), 0.0);
         assert_eq!(s2.pmdec_mas_yr(), 0.0);
         // Magnitude past the cap → dropped.
-        assert!(parse_bulk_row("10,20,19.5,0,0,1.0", idx).is_none());
+        assert!(parse_bulk_row("10,20,19.5,0,0,1.0", idx, 19.0).is_none());
         // Bare-NaN mag → dropped.
-        assert!(parse_bulk_row("10,20,nan,0,0,1.0", idx).is_none());
+        assert!(parse_bulk_row("10,20,nan,0,0,1.0", idx, 19.0).is_none());
         // Garbage row → None.
-        assert!(parse_bulk_row("not,enough", idx).is_none());
+        assert!(parse_bulk_row("not,enough", idx, 19.0).is_none());
+    }
+
+    #[test]
+    fn parse_bulk_row_honours_mag_limit_arg() {
+        let header = "ra,dec,phot_g_mean_mag,pmra,pmdec,ruwe";
+        let idx = ColumnIndex::from_header(header).unwrap();
+        let row = "10.0,20.0,20.5,0,0,1.0"; // G=20.5
+        assert!(parse_bulk_row(row, idx, 19.0).is_none(), "dropped at limit 19");
+        assert!(parse_bulk_row(row, idx, 21.0).is_some(), "kept at limit 21");
     }
 
     #[test]

@@ -49,7 +49,10 @@ use super::healpix;
 /// ESA Gaia archive TAP async endpoint.
 pub const GAIA_TAP_ASYNC: &str = "https://gea.esac.esa.int/tap-server/tap/async";
 
-/// Magnitude cut (Gaia G, Vega) applied server-side.
+/// Default magnitude cut (Gaia G). The bulk ingest takes an explicit
+/// `mag_limit` (the `catalog-builder --mag-limit` flag, default 21 to fill the
+/// density-limited tiers in star-poor sky); this constant is the conservative
+/// default used by the TAP path and `setup_gaia_dr3_from_bulk`.
 pub const GAIA_MAG_LIMIT: f32 = 19.0;
 
 /// RUWE (Renormalised Unit Weight Error) ceiling, applied locally at bin

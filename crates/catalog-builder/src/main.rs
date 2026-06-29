@@ -298,6 +298,7 @@ fn ingest_gaia(cfg: &Config, cancel: &Arc<AtomicBool>) -> Result<usize> {
     let total = ingest_bulk(
         &cfg.gaia_dir,
         &cfg.work_dir,
+        21.0, // placeholder; replaced by cfg.mag_limit in the CLI rewire (Task 5)
         cfg.ingest_concurrency,
         cancel.clone(),
         &|p| match p {
