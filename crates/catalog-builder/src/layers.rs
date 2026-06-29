@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use athenaeum_core::catalog::binary_format;
-use solvemyastro::cache::build_cache;
+use solvemyastro::cache::{build_cache, BuildProgress};
 use solvemyastro::StarRecord;
 
 use crate::tiers::{cell_cum_counts, slice_select, TIER_DENSITIES};
@@ -59,8 +59,20 @@ pub fn build_layers(bins_dir: &Path, out_dir: &Path, epoch: f64) -> Result<Vec<(
             slice_select(&cell, lo, hi).iter().map(to_smac).collect::<Vec<_>>()
         });
 
-        let n = build_cache(records, &tier_dir, epoch, |_| {})
-            .with_context(|| format!("build tier_{density}"))?;
+        let n = build_cache(records, &tier_dir, epoch, |p| match p {
+            BuildProgress::Ingesting { records } => {
+                if records % 20_000_000 == 0 {
+                    println!("    tier_{density}: ingested {records} records…");
+                }
+            }
+            BuildProgress::Finalizing { shards_done, shards_total } => {
+                if shards_done == shards_total {
+                    println!("    tier_{density}: finalized {shards_total} shards");
+                }
+            }
+            BuildProgress::Complete { .. } => {}
+        })
+        .with_context(|| format!("build tier_{density}"))?;
         println!("  tier_{density}: {n} stars");
         out.push((*density, n));
     }
