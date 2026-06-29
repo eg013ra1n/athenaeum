@@ -44,6 +44,7 @@ use athenaeum_core::catalog::gaia_bulk::{
 use solvemyastro::cache::{build_cache, build_cache_from_legacy_dir, BuildProgress};
 use solvemyastro::{StarCache, StarRecord};
 
+mod layers;
 mod tiers;
 
 /// HEALPix depth-6 pixel count (12 · 4⁶). The fixed granularity of the

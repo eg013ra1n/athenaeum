@@ -631,6 +631,7 @@ dependencies = [
  "athenaeum-core",
  "sha2",
  "solvemyastro",
+ "tempfile",
  "zip",
 ]
 
