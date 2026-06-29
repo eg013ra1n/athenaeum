@@ -1,28 +1,20 @@
 //! Build the 4 density-limited tier caches by slicing the G<21 bins.
+//!
+//! Each tier is built with `solvemyastro::cache::build_cache_parallel`, which
+//! saturates all cores (parallel positioned writes, no scratch files). We read
+//! only the *prefix* of each bin (the bands are prefixes of the mag-sorted cell),
+//! so dense galactic-plane cells are never fully parsed.
 
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use athenaeum_core::catalog::binary_format;
-use solvemyastro::cache::{build_cache, BuildProgress};
+use athenaeum_core::catalog::binary_format::{self, RECORD_SIZE};
+use solvemyastro::cache::build_cache_parallel;
 use solvemyastro::StarRecord;
 
 use crate::tiers::{cell_cum_counts, slice_select, TIER_DENSITIES};
-
-/// Enumerate `healpix_*.bin` tiles in `bins_dir`, sorted for determinism.
-fn bin_paths(bins_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(bins_dir)
-        .with_context(|| format!("read bins dir {}", bins_dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("healpix_") && n.ends_with(".bin"))
-        })
-        .collect();
-    paths.sort();
-    Ok(paths)
-}
 
 fn to_smac(r: &binary_format::StarRecord) -> StarRecord {
     StarRecord {
@@ -34,47 +26,44 @@ fn to_smac(r: &binary_format::StarRecord) -> StarRecord {
     }
 }
 
-/// Build `out_dir/tier_<density>/stars.smac` for each tier. One pass over the
-/// bins per tier (bounded RAM); each pass slices that tier's rank band per cell.
-/// Returns `(density, star_count)` per tier in `TIER_DENSITIES` order.
+/// Read pixel `px`'s band `[lo, hi)` from its `healpix_<px>.bin` tile (records
+/// mag-sorted). Reads only the first `min(hi, total)` records — the bands are
+/// prefixes of the sorted cell, so dense cells are never fully parsed. Missing
+/// tiles (empty pixels) yield an empty band.
+fn read_band(bins_dir: &Path, px: u64, lo: usize, hi: usize) -> Vec<StarRecord> {
+    let path = bins_dir.join(format!("healpix_{px:06}.bin"));
+    let total = std::fs::metadata(&path)
+        .map(|m| m.len() as usize / RECORD_SIZE)
+        .unwrap_or(0);
+    let n = hi.min(total); // records to actually read (prefix)
+    if n == 0 || lo >= n {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; n * RECORD_SIZE];
+    if let Err(e) = File::open(&path).and_then(|mut f| f.read_exact(&mut buf)) {
+        eprintln!("warn: read {} failed: {e} — skipping", path.display());
+        return Vec::new();
+    }
+    // The bin is mag-sorted, so the first n records are the n brightest.
+    let cell = binary_format::read_records_until_mag(&buf, f32::MAX);
+    slice_select(&cell, lo, hi).iter().map(to_smac).collect()
+}
+
+/// Build `out_dir/tier_<density>/stars.smac` for each tier from the G<21 bins.
+/// Returns `(density, star_count)` per tier in `TIER_DENSITIES` order. Each tier
+/// build saturates all cores; tiers run sequentially.
 pub fn build_layers(bins_dir: &Path, out_dir: &Path, epoch: f64) -> Result<Vec<(u32, usize)>> {
-    let bins = bin_paths(bins_dir)?;
     let bounds = cell_cum_counts();
     let mut out = Vec::with_capacity(TIER_DENSITIES.len());
 
-    for (k, density) in TIER_DENSITIES.iter().enumerate() {
+    for (k, &density) in TIER_DENSITIES.iter().enumerate() {
         let (lo, hi) = (bounds[k], bounds[k + 1]);
         let tier_dir = out_dir.join(format!("tier_{density}"));
-
-        // Lazily stream each cell's [lo,hi) band into build_cache.
-        let records = bins.iter().flat_map(|p| {
-            let data = match std::fs::read(p) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("warn: read {} failed: {e} — skipping", p.display());
-                    Vec::new()
-                }
-            };
-            let cell = binary_format::read_records_until_mag(&data, f32::MAX);
-            slice_select(&cell, lo, hi).iter().map(to_smac).collect::<Vec<_>>()
-        });
-
-        let n = build_cache(records, &tier_dir, epoch, |p| match p {
-            BuildProgress::Ingesting { records } => {
-                if records % 20_000_000 == 0 {
-                    println!("    tier_{density}: ingested {records} records…");
-                }
-            }
-            BuildProgress::Finalizing { shards_done, shards_total } => {
-                if shards_done == shards_total {
-                    println!("    tier_{density}: finalized {shards_total} shards");
-                }
-            }
-            BuildProgress::Complete { .. } => {}
-        })
-        .with_context(|| format!("build tier_{density}"))?;
+        println!("  building tier_{density} (band [{lo},{hi}))…");
+        let n = build_cache_parallel(&tier_dir, epoch, |px| read_band(bins_dir, px, lo, hi))
+            .with_context(|| format!("build tier_{density}"))?;
         println!("  tier_{density}: {n} stars");
-        out.push((*density, n));
+        out.push((density, n));
     }
     Ok(out)
 }
