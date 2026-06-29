@@ -65,9 +65,12 @@ failure (we chose proactive-only).
   limited behaviour: dense sky is capped, star-poor sky goes as deep as Gaia has.
 - **Source depth:** built from a `G<21` Gaia ingest (Gaia's faint limit) so
   star-poor cells have faint stars to reach the higher densities.
-- **On disk:** `catalogs/smac_gaia/` holding `tier_500.smac … tier_8000.smac`,
-  each a valid `stars.smac` (64-byte header + 49 152-cell directory + 28-byte
-  records). The solver maps whichever tiers are present.
+- **On disk:** `catalogs/smac_gaia/` holding **per-tier directories**
+  `tier_500/ … tier_8000/`, each containing a `stars.smac` (64-byte header +
+  49 152-cell directory + 28-byte records). Per-tier dirs because
+  `StarCache::open(dir)` reads `<dir>/stars.smac` (`cache.rs:120`) — so each
+  layer is a cache dir, opened unchanged. The solver maps whichever tier dirs
+  are present.
 
 ## 2. Build — `catalog-builder`
 
@@ -173,18 +176,20 @@ tier_5000.zip   tier_5000.zip.sha256
 tier_8000.zip   tier_8000.zip.sha256
 ```
 
-**Each `tier_<d>.zip` contains exactly one entry — `tier_<d>.smac`** — which is
-the **delta layer** (disjoint magnitude band), *not* a cumulative catalog.
+**Each `tier_<d>.zip` contains one cache dir — `tier_<d>/stars.smac`** — the
+**delta layer** (disjoint magnitude band), *not* a cumulative catalog.
 
 **Client install (`<app-data>/catalogs/smac_gaia/`):**
 
 ```text
-tier_500.smac  tier_2000.smac  tier_5000.smac  tier_8000.smac
+tier_500/stars.smac   tier_2000/stars.smac
+tier_5000/stars.smac  tier_8000/stars.smac
 ```
 
-Extraction maps `tier_<d>.smac` → `catalogs/smac_gaia/tier_<d>.smac` (zip-slip
-safe). To reach density `D`, the app downloads **every tier with `density ≤ D`**
-(base + deltas).
+Extraction maps `tier_<d>/stars.smac` → `catalogs/smac_gaia/tier_<d>/stars.smac`
+(zip-slip safe); the solver opens each `tier_<d>/` via `StarCache::open`. To
+reach density `D`, the app downloads **every tier with `density ≤ D`** (base +
+deltas).
 
 **`manifest.json`** (filenames relative to the base URL, so mirrors / local test
 servers work; no absolute URLs baked in):
@@ -195,13 +200,13 @@ servers work; no absolute URLs baked in):
   "catalog_epoch": 2016.0,
   "tiers": [
     { "density": 500,  "zip": "tier_500.zip",  "sha256": "tier_500.zip.sha256",
-      "smac": "tier_500.smac",  "size_bytes": 0, "min_fov_deg": 0.6  },
+      "dir": "tier_500",  "size_bytes": 0, "min_fov_deg": 0.6  },
     { "density": 2000, "zip": "tier_2000.zip", "sha256": "tier_2000.zip.sha256",
-      "smac": "tier_2000.smac", "size_bytes": 0, "min_fov_deg": 0.3  },
+      "dir": "tier_2000", "size_bytes": 0, "min_fov_deg": 0.3  },
     { "density": 5000, "zip": "tier_5000.zip", "sha256": "tier_5000.zip.sha256",
-      "smac": "tier_5000.smac", "size_bytes": 0, "min_fov_deg": 0.2  },
+      "dir": "tier_5000", "size_bytes": 0, "min_fov_deg": 0.2  },
     { "density": 8000, "zip": "tier_8000.zip", "sha256": "tier_8000.zip.sha256",
-      "smac": "tier_8000.smac", "size_bytes": 0, "min_fov_deg": 0.15 }
+      "dir": "tier_8000", "size_bytes": 0, "min_fov_deg": 0.15 }
   ]
 }
 ```
