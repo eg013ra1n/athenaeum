@@ -658,8 +658,9 @@ pub async fn delete_plate_solve_for_frame(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+// Note: no `rename_all` — matches the Tauri side and the snake_case
+// `CatalogStatusInfo` TS interface (`star_count_approx`, `min_fov_deg`, …).
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CatalogStatusInfo {
     pub name: String,
     pub density: u32,
