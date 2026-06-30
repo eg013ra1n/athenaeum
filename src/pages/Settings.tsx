@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, Database, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info } from 'lucide-react';
 import { revealItemInDir } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
@@ -56,10 +56,6 @@ export default function Settings() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
-
-  // Backfill fingerprints state
-  const [backfillingFingerprints, setBackfillingFingerprints] = useState(false);
-  const [backfillSuccess, setBackfillSuccess] = useState<number | null>(null);
 
   // Content hash rescan state
   const [rescanningContentHash, setRescanningContentHash] = useState(false);
@@ -451,23 +447,6 @@ export default function Settings() {
         return value.toFixed(4);
       default:
         return 'N/A';
-    }
-  };
-
-  const handleBackfillFingerprints = async () => {
-    try {
-      setBackfillingFingerprints(true);
-      setError(null);
-      setBackfillSuccess(null);
-
-      const count = await api.invoke<number>('backfill_header_fingerprints');
-      setBackfillSuccess(count);
-      setTimeout(() => setBackfillSuccess(null), 5000);
-    } catch (err) {
-      setError(err as string);
-      console.error('Failed to backfill fingerprints:', err);
-    } finally {
-      setBackfillingFingerprints(false);
     }
   };
 
@@ -1303,35 +1282,6 @@ export default function Settings() {
           </div>
         </div>
       )}
-
-      {/* Database Maintenance Section */}
-      <div className="mt-6 bg-surface-elevated rounded-lg p-6">
-        <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
-          <Database size={20} />
-          Database Maintenance
-        </h3>
-        <div className="space-y-4">
-          <div>
-            <p className="text-sm text-content-muted mb-3">
-              Backfill header fingerprints for existing FITS files. This is required for file relinking when directories are moved.
-            </p>
-            <button
-              onClick={handleBackfillFingerprints}
-              disabled={backfillingFingerprints}
-              className="flex items-center gap-2 px-4 py-2 bg-purple hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-            >
-              <RefreshCw size={18} className={backfillingFingerprints ? 'animate-spin' : ''} />
-              {backfillingFingerprints ? 'Computing...' : 'Backfill Header Fingerprints'}
-            </button>
-            {backfillSuccess !== null && (
-              <div className="mt-2 flex items-center gap-2 text-success">
-                <CheckCircle size={18} />
-                <span>Processed {backfillSuccess} headers</span>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
 
       <div className="mt-6 bg-surface-elevated rounded-lg p-6">
         <h3 className="text-lg font-semibold mb-3">About Frame Set Grouping</h3>

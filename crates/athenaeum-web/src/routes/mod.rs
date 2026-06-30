@@ -161,7 +161,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_duplicate_folders", post(duplicates::get_duplicate_folders))
         .route("/api/set_scan_root_duplicates_flag", post(duplicates::set_scan_root_duplicates_flag))
         .route("/api/set_scan_root_unique_camera_flag", post(duplicates::set_scan_root_unique_camera_flag))
-        .route("/api/backfill_header_fingerprints", post(duplicates::backfill_header_fingerprints))
         .route("/api/verify_files_byte_identical", post(duplicates::verify_files_byte_identical))
         // Export
         .route("/api/get_wbpp_export_config", post(export::get_wbpp_export_config))

@@ -312,39 +312,6 @@ pub async fn verify_files_byte_identical(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// Backfill fingerprints for existing FITS headers that are missing them.
-pub async fn backfill_header_fingerprints(
-    State(state): State<WebAppState>,
-    Json(_): Json<serde_json::Value>,
-) -> Result<Json<usize>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let mut stmt = conn
-        .prepare("SELECT id, header FROM fits_header WHERE header_fingerprint IS NULL")
-        .map_err(db_err)?;
-
-    let headers: Vec<(i64, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)?;
-
-    let total = headers.len();
-    eprintln!("Backfilling fingerprints for {} headers", total);
-
-    for (id, header) in headers {
-        let fingerprint = athenaeum_core::fingerprint::compute_header_fingerprint(&header);
-        conn.execute(
-            "UPDATE fits_header SET header_fingerprint = ?1 WHERE id = ?2",
-            rusqlite::params![fingerprint, id],
-        )
-        .map_err(db_err)?;
-    }
-
-    Ok(Json(total))
-}
-
 /// Find directory pairs with a high proportion of duplicate files.
 ///
 /// `threshold` is a similarity percentage (0–100); defaults to 70.0 if omitted.

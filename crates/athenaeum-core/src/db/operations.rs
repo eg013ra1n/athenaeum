@@ -36,6 +36,27 @@ pub fn insert_fits_header(conn: &Connection, file_id: i64, header: &str) -> Resu
     Ok(conn.last_insert_rowid())
 }
 
+/// Fill `header_fingerprint` for any `fits_header` rows still missing it
+/// (legacy rows created before fingerprinting existed). Idempotent — a no-op
+/// once every row has a fingerprint. Returns the number of rows updated.
+pub fn backfill_null_header_fingerprints(conn: &Connection) -> Result<usize> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, header FROM fits_header WHERE header_fingerprint IS NULL")?;
+        let collected = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        collected
+    };
+    for (id, header) in &rows {
+        conn.execute(
+            "UPDATE fits_header SET header_fingerprint = ?1 WHERE id = ?2",
+            params![compute_header_fingerprint(header), id],
+        )?;
+    }
+    Ok(rows.len())
+}
+
 /// Insert a new frame record
 /// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
@@ -4212,6 +4233,90 @@ mod bulk_metadata_tests {
         // value: Some(Some(v)) → "set to v".
         let edits: FrameMetadataEdits = serde_json::from_str(r#"{"xpixsz": 3.76}"#).unwrap();
         assert_eq!(edits.xpixsz, Some(Some(3.76)), "value → Some(Some(v))");
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_backfill_tests {
+    use super::backfill_null_header_fingerprints;
+    use crate::db::schema::init_db;
+    use crate::fingerprint::compute_header_fingerprint;
+    use rusqlite::Connection;
+
+    #[test]
+    fn backfill_fills_null_fingerprints_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Seed a files row + a legacy fits_header row with a NULL fingerprint.
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES ('/x/a.fits', 'a.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let header = r#"{"SIMPLE":true,"OBJECT":"M42"}"#;
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, NULL)",
+            rusqlite::params![file_id, header],
+        )
+        .unwrap();
+
+        // First pass heals the one NULL row with the canonical fingerprint.
+        let n = backfill_null_header_fingerprints(&conn).unwrap();
+        assert_eq!(n, 1, "one legacy row should be backfilled");
+        let fp: Option<String> = conn
+            .query_row(
+                "SELECT header_fingerprint FROM fits_header WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fp.as_deref(),
+            Some(compute_header_fingerprint(header).as_str()),
+            "backfilled value must match compute_header_fingerprint",
+        );
+
+        // Second pass is a no-op (idempotent).
+        let n2 = backfill_null_header_fingerprints(&conn).unwrap();
+        assert_eq!(n2, 0, "idempotent: nothing left to backfill");
+    }
+
+    #[test]
+    fn init_db_self_heals_null_fingerprints_on_relaunch() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Seed a legacy NULL-fingerprint header row (as a pre-fingerprint DB would have).
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES ('/x/b.fits', 'b.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, ?2, NULL)",
+            rusqlite::params![file_id, r#"{"SIMPLE":true}"#],
+        )
+        .unwrap();
+
+        // A subsequent init_db (app relaunch) must self-heal the legacy NULL row.
+        init_db(&conn).unwrap();
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fits_header WHERE header_fingerprint IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0, "init_db self-heal should leave no NULL fingerprints");
     }
 }
 

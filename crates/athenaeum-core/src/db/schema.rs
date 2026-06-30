@@ -771,6 +771,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Self-heal: fill fingerprints for any legacy rows still missing them, so
+    // relinking works on databases created before fingerprinting existed.
+    // Idempotent (a no-op once all rows are fingerprinted); non-fatal so a
+    // backfill hiccup never blocks startup.
+    match super::operations::backfill_null_header_fingerprints(conn) {
+        Ok(n) if n > 0 => eprintln!("init_db: backfilled {n} legacy header fingerprints"),
+        Ok(_) => {}
+        Err(e) => eprintln!("init_db: header-fingerprint backfill skipped (non-fatal): {e}"),
+    }
+
     // Add content_hash to files table (migration for existing databases)
     let has_content_hash: Result<i64, _> = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='content_hash'",
