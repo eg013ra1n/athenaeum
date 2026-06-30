@@ -97,7 +97,26 @@ pub fn solve_frame_tiered(
     config: &PlateSolveConfig,
 ) -> Result<SolveResult> {
     let hints = extract_hints(frame, Some(conn));
-    solve_frame_with_hints(frame, file_path, &hints, cache, bright_cache, config, None)
+    let caches = match bright_cache {
+        Some(b) => solvemyastro::Caches::tiered(cache, b),
+        None => solvemyastro::Caches::deep_only(cache),
+    };
+    solve_frame_with_hints(frame, file_path, &hints, &caches, config, None)
+}
+
+/// Layered variant of [`solve_frame`] — solves against an additive density-tier
+/// stack via `Caches::layered`. `layers` is the ordered tier stack (base →
+/// deepest), typically opened from [`crate::plate_solve::discover_layers`].
+pub fn solve_frame_layered(
+    frame: &Frame,
+    file_path: &str,
+    conn: &Connection,
+    layers: &[&StarCache],
+    config: &PlateSolveConfig,
+) -> Result<SolveResult> {
+    let hints = extract_hints(frame, Some(conn));
+    let caches = solvemyastro::Caches::layered(layers);
+    solve_frame_with_hints(frame, file_path, &hints, &caches, config, None)
 }
 
 /// Solve a single frame using pre-extracted hints and the `solvemyastro`
@@ -105,16 +124,15 @@ pub fn solve_frame_tiered(
 /// worker pool — it is DB-free, fully `Send`, and shares read-only
 /// cache/config state across threads.
 ///
-/// `bright_cache` is the optional bright sub-catalog (`G<16` hybrid build).
-/// When `Some`, quad matching uses it first with auto-fallback to `cache`
-/// for sparse cones. When `None`, all queries hit `cache` (pre-bright
-/// behaviour).
+/// `caches` selects the catalog strategy: `Caches::layered(..)` for the
+/// additive density-tier stack, or `Caches::deep_only`/`tiered` for the legacy
+/// deep(+bright) path. The caller builds it (the tier stack is opened via
+/// [`crate::plate_solve::discover_layers`]).
 pub fn solve_frame_with_hints(
     frame: &Frame,
     file_path: &str,
     hints: &SolveHints,
-    cache: &StarCache,
-    bright_cache: Option<&StarCache>,
+    caches: &solvemyastro::Caches<'_>,
     config: &PlateSolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveResult> {
@@ -145,17 +163,13 @@ pub fn solve_frame_with_hints(
         ..SolveConfig::default()
     };
 
-    let caches = match bright_cache {
-        Some(b) => solvemyastro::Caches::tiered(cache, b),
-        None => solvemyastro::Caches::deep_only(cache),
-    };
     // Propagate the solver error verbatim (no lossy context wrapper) so the
     // structured `solvemyastro::SolveFailure` stays at the top of the chain
     // and `plate_solve::failure::describe_solve_failure` can downcast it.
     let solution = solvemyastro::solve(
         std::path::Path::new(file_path),
         &sma_hints,
-        &caches,
+        caches,
         &sma_cfg,
         cancel,
     )?;
@@ -249,8 +263,11 @@ pub fn solve_frame_with_hints(
         }
     };
     let bright_mag_limit = 12.0_f32; // mirrors VERIFY_MAG_LIMIT in orchestrate.rs
-    let expected_catalog_stars_in_fov = cache
-        .cone(
+    // Representative catalog for the bright-star FOV count: the legacy deep
+    // cache, or — for an additive tier stack — the base layer (all bright stars
+    // brighter than `bright_mag_limit` live in the brightest/base tier).
+    let count_bright_in_fov = |c: &StarCache| {
+        c.cone(
             solution.wcs.crval.0,
             solution.wcs.crval.1,
             fov_radius_deg,
@@ -258,7 +275,14 @@ pub fn solve_frame_with_hints(
             obs_epoch,
         )
         .map(|v| v.len())
-        .unwrap_or(0);
+        .unwrap_or(0)
+    };
+    let expected_catalog_stars_in_fov = match *caches {
+        solvemyastro::Caches::Legacy { deep, .. } => count_bright_in_fov(deep),
+        solvemyastro::Caches::Layered { layers } => {
+            layers.first().map(|&c| count_bright_in_fov(c)).unwrap_or(0)
+        }
+    };
 
     // Use solvemyastro's inlier_ratio directly: it is matched_stars /
     // total_detected (see solvemyastro `Solution::inlier_ratio`) — the

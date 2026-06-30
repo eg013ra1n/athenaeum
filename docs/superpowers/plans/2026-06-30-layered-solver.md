@@ -32,6 +32,30 @@ athenaeum-core (`plate_solve/`); rayon; `corpus_bench`.
   mag 19 regardless of tier depth.
 - Don't name ASTAP in code/comments.
 
+## Deviations applied at execution (2026-06-30)
+
+Per the maintainer's call, **only the plate-solve path is migrated to tiers;
+registration is left for a later pass.** This made the change smaller and safer
+than the original task list:
+
+- **`Caches` is an enum superset, not a slice-only struct.** `Caches::Legacy {
+  deep, bright }` (today's behaviour) + `Caches::Layered { layers: &[&StarCache] }`
+  (new). `deep_only`/`tiered` stay (→ `Legacy`), so `registration/service.rs`, both
+  `registration.rs` routes, `solvemyastro/src/main.rs`, `tests/scale_fallback.rs`,
+  the `cache.rs` tests, and the `corpus_bench` legacy path are **untouched**. Only
+  `plate_solve/service.rs` (+ Tauri/Web `plate_solve.rs`) switch to `Caches::layered`.
+- **`cone_for_quad_match` is kept** (not deleted). `SearchCtx` carries a `ConeSource`
+  enum (`Legacy{deep,deep_pc,bright,bright_pc}` / `Layered(&LayeredCones)`); the two
+  cone call sites match on it. The legacy single-cache path stays byte-identical and
+  serves as the corpus_bench baseline; the new `Caches::layered(&[&deep])` 1-layer
+  path is checked equal to it (Task 3 Step 1).
+- **Plan bug:** `Caches::single` via `std::slice::from_ref(cache)` yields `&[StarCache]`
+  but the field is `&[&StarCache]` → would not compile. The enum removes the need for
+  `single`; `deep_only` already covers the byte-identical single case.
+- **Task 5 install:** keep the existing `smac_gaia/stars.smac` alongside the new
+  `smac_gaia/tier_*/` so `discover_layers` prefers tiers (solver) while registration's
+  bare-`stars.smac` open keeps working until its own migration.
+
 ## File Structure
 
 - `solvemyastro/src/lib.rs` — `Caches` becomes a layer stack (`single`/`layered`).

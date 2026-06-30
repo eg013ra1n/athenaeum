@@ -35,69 +35,13 @@ fn get_dso_catalog(state: &WebAppState) -> Option<Arc<DsoCatalog>> {
     }
 }
 
-/// Locate and open the optional bright sub-catalog. Honours
-/// `PlateSolveConfig::bright_cache_path` if set; otherwise tries
-/// `<app-data>/catalogs/smac_gaia_bright/`. Returns `None` (logs
-/// a warning) if neither exists — never fatal; the solver falls
-/// back to the deep cache.
-fn require_bright_cache(state: &WebAppState) -> Option<Arc<solvemyastro::StarCache>> {
-    {
-        let guard = state.ctx.bright_cache.read().unwrap();
-        if let Some(ref bc) = *guard {
-            return Some(bc.clone());
-        }
-    }
-    let db = state.ctx.db.get()?;
-    let ps_config = athenaeum_core::plate_solve::config::load_config(&db.conn());
-    let cache_dir: std::path::PathBuf = match &ps_config.bright_cache_path {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            let parent = std::path::Path::new(&db.path()).parent()?.to_path_buf();
-            parent.join("catalogs").join("smac_gaia_bright")
-        }
-    };
-    if !cache_dir.exists() {
-        eprintln!(
-            "plate_solve: no bright sub-catalog at {} — using deep cache only",
-            cache_dir.display()
-        );
-        return None;
-    }
-    match solvemyastro::StarCache::open(&cache_dir) {
-        Ok(bc) => {
-            let arc = Arc::new(bc);
-            eprintln!(
-                "plate_solve: opened bright sub-catalog at {} ({} stars)",
-                cache_dir.display(),
-                arc.star_count()
-            );
-            let mut guard = state.ctx.bright_cache.write().unwrap();
-            *guard = Some(arc.clone());
-            Some(arc)
-        }
-        Err(e) => {
-            eprintln!(
-                "plate_solve: failed to open bright cache at {}: {e} — using deep only",
-                cache_dir.display()
-            );
-            None
-        }
-    }
-}
-
-/// Locate and open the solvemyastro star cache (`stars.smac`) from the
-/// app-data catalogs directory, caching the result in `state`.
-fn require_star_cache(
+/// Resolve and open the additive density-tier catalog stack under
+/// `<app-data>/catalogs/smac_gaia` (base → deepest), or a legacy single
+/// `stars.smac` there as a 1-layer fallback. Opens fresh each call (mmap is
+/// cheap); the batch path opens once and shares across workers.
+fn resolve_layer_caches(
     state: &WebAppState,
-) -> Result<Arc<solvemyastro::StarCache>, (StatusCode, String)> {
-    // Fast path: already open.
-    {
-        let guard = state.ctx.star_cache.read().unwrap();
-        if let Some(ref sc) = *guard {
-            return Ok(sc.clone());
-        }
-    }
-
+) -> Result<Vec<Arc<solvemyastro::StarCache>>, (StatusCode, String)> {
     let db = state.ctx.db.get().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "DB not initialized".into(),
@@ -107,29 +51,34 @@ fn require_star_cache(
         StatusCode::INTERNAL_SERVER_ERROR,
         "Cannot determine app data dir".into(),
     ))?;
-    let cache_dir = parent.join("catalogs").join("smac_gaia");
-    if !cache_dir.exists() {
+    let catalog_root = parent.join("catalogs").join("smac_gaia");
+    let layer_dirs = athenaeum_core::plate_solve::discover_layers(&catalog_root);
+    if layer_dirs.is_empty() {
         return Err((
             StatusCode::PRECONDITION_FAILED,
             format!(
-                "solvemyastro star cache not found at {}. \
+                "solvemyastro star catalog not found under {}. \
                  Please download the Gaia DR3 prebuilt catalog.",
-                cache_dir.display()
+                catalog_root.display()
             ),
         ));
     }
-    let sc = solvemyastro::StarCache::open(&cache_dir).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to open star cache: {e}"),
-        )
-    })?;
-    let arc = Arc::new(sc);
-    {
-        let mut guard = state.ctx.star_cache.write().unwrap();
-        *guard = Some(arc.clone());
+    let mut layers = Vec::with_capacity(layer_dirs.len());
+    for dir in &layer_dirs {
+        let sc = solvemyastro::StarCache::open(dir).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open star cache at {}: {e}", dir.display()),
+            )
+        })?;
+        layers.push(Arc::new(sc));
     }
-    Ok(arc)
+    eprintln!(
+        "plate_solve: opened {} catalog layer(s) under {}",
+        layers.len(),
+        catalog_root.display()
+    );
+    Ok(layers)
 }
 
 #[derive(Deserialize)]
@@ -205,16 +154,15 @@ pub async fn plate_solve_frame(
     let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
     let conn = db.conn();
     let ps_config = config::load_config(&conn);
-    let star_cache = require_star_cache(&state)?;
-    let bright_cache = require_bright_cache(&state);
+    let layer_caches = resolve_layer_caches(&state)?;
+    let layer_refs: Vec<&solvemyastro::StarCache> =
+        layer_caches.iter().map(|a| a.as_ref()).collect();
 
     let (frame, file_path) = load_frame_with_path(&conn, args.frame_id)?;
 
     let dso = get_dso_catalog(&state);
-    let result = service::solve_frame_tiered(
-        &frame, &file_path, &conn, &star_cache,
-        bright_cache.as_deref(),
-        &ps_config,
+    let result = service::solve_frame_layered(
+        &frame, &file_path, &conn, &layer_refs, &ps_config,
     )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, describe_solve_failure(&e).message))?;
 
@@ -245,8 +193,7 @@ pub async fn plate_solve_batch(
         .get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
     let ps_config = Arc::new(config::load_config(&db.conn()));
-    let star_cache = require_star_cache(&state)?;
-    let bright_cache = require_bright_cache(&state);
+    let layer_caches = resolve_layer_caches(&state)?;
     let dso = get_dso_catalog(&state);
     let event_tx = state.event_tx.clone();
 
@@ -342,12 +289,14 @@ pub async fn plate_solve_batch(
                                     .unwrap_or_default(),
                                 });
 
+                                let layer_refs: Vec<&solvemyastro::StarCache> =
+                                    layer_caches.iter().map(|a| a.as_ref()).collect();
+                                let caches = solvemyastro::Caches::layered(&layer_refs);
                                 match service::solve_frame_with_hints(
                                     &frame,
                                     &file_path,
                                     &hints,
-                                    star_cache.as_ref(),
-                                    bright_cache.as_deref(),
+                                    &caches,
                                     ps_config.as_ref(),
                                     Some(cancel_flag.as_ref()),
                                 ) {

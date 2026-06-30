@@ -108,6 +108,42 @@ pub(super) fn require_star_cache(state: &AppState) -> Result<Arc<solvemyastro::S
     Ok(arc)
 }
 
+/// Resolve and open the additive density-tier catalog stack under
+/// `<app-data>/catalogs/smac_gaia` (base → deepest), or a legacy single
+/// `stars.smac` there as a 1-layer fallback. Opens fresh each call (mmap is
+/// cheap); the batch path opens once and shares across workers. Errors if no
+/// catalog is installed.
+pub(super) fn resolve_layer_caches(
+    state: &AppState,
+) -> Result<Vec<Arc<solvemyastro::StarCache>>, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let db_path = db.path().to_path_buf();
+    let parent = db_path
+        .parent()
+        .ok_or("Cannot determine app data directory")?;
+    let catalog_root = parent.join("catalogs").join("smac_gaia");
+    let layer_dirs = athenaeum_core::plate_solve::discover_layers(&catalog_root);
+    if layer_dirs.is_empty() {
+        return Err(format!(
+            "solvemyastro star catalog not found under {}. \
+             Please download the Gaia DR3 prebuilt catalog from Settings → Plate Solving.",
+            catalog_root.display()
+        ));
+    }
+    let mut layers = Vec::with_capacity(layer_dirs.len());
+    for dir in &layer_dirs {
+        let sc = solvemyastro::StarCache::open(dir)
+            .map_err(|e| format!("Failed to open star cache at {}: {e}", dir.display()))?;
+        layers.push(Arc::new(sc));
+    }
+    eprintln!(
+        "plate_solve: opened {} catalog layer(s) under {}",
+        layers.len(),
+        catalog_root.display()
+    );
+    Ok(layers)
+}
+
 /// Lazy-load the DSO catalog once and cache it in the ServiceContext.
 fn get_dso_catalog(state: &AppState) -> Option<Arc<DsoCatalog>> {
     {
@@ -197,16 +233,15 @@ pub async fn plate_solve_frame(
     let conn = db.conn();
 
     let ps_config = config::load_config(&conn);
-    let star_cache = require_star_cache(&state)?;
-    let bright_cache = require_bright_cache(&state);
+    let layer_caches = resolve_layer_caches(&state)?;
+    let layer_refs: Vec<&solvemyastro::StarCache> =
+        layer_caches.iter().map(|a| a.as_ref()).collect();
     let dso = get_dso_catalog(&state);
 
     let (frame, file_path) = load_frame_with_path(&conn, frame_id)?;
 
-    let result = service::solve_frame_tiered(
-        &frame, &file_path, &conn, &star_cache,
-        bright_cache.as_deref(),
-        &ps_config,
+    let result = service::solve_frame_layered(
+        &frame, &file_path, &conn, &layer_refs, &ps_config,
     )
     .map_err(|e| describe_solve_failure(&e).message)?;
 
@@ -229,12 +264,11 @@ pub async fn plate_solve_batch(
     frame_ids: Vec<i64>,
 ) -> Result<(), String> {
     // ── Phase 1: load everything on the main thread (holds DB lock) ──
-    let (ps_config, star_cache, bright_cache, dso, cancel_flag, work_items) = {
+    let (ps_config, layer_caches, dso, cancel_flag, work_items) = {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
         let ps_config = Arc::new(config::load_config(&conn));
-        let star_cache = require_star_cache(&state)?;
-        let bright_cache = require_bright_cache(&state);
+        let layer_caches = resolve_layer_caches(&state)?;
         let dso = get_dso_catalog(&state);
         let cancel_flag = Arc::new(AtomicBool::new(false));
 
@@ -269,7 +303,7 @@ pub async fn plate_solve_batch(
             }
         }
 
-        (ps_config, star_cache, bright_cache, dso, cancel_flag, work_items)
+        (ps_config, layer_caches, dso, cancel_flag, work_items)
     };
 
     let total = work_items.len();
@@ -294,8 +328,6 @@ pub async fn plate_solve_batch(
     let app_workers = app.clone();
     let cancel_worker = Arc::clone(&cancel_flag);
     let ps_config_arc = Arc::clone(&ps_config);
-    let star_cache_arc = Arc::clone(&star_cache);
-    let bright_cache_arc = bright_cache.clone();
 
     let results: Vec<WorkResult> = tokio::task::spawn_blocking(move || {
         let work = Mutex::new(work_items.into_iter());
@@ -350,13 +382,15 @@ pub async fn plate_solve_batch(
                             // a panic into a normal per-frame failure — same
                             // pattern as operation_queue / scanner. The
                             // global panic hook still logs the full backtrace.
+                            let layer_refs: Vec<&solvemyastro::StarCache> =
+                                layer_caches.iter().map(|a| a.as_ref()).collect();
+                            let caches = solvemyastro::Caches::layered(&layer_refs);
                             let solve = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 service::solve_frame_with_hints(
                                     &frame,
                                     &file_path,
                                     &hints,
-                                    star_cache_arc.as_ref(),
-                                    bright_cache_arc.as_deref(),
+                                    &caches,
                                     ps_config_arc.as_ref(),
                                     Some(cancel_worker.as_ref()),
                                 )
