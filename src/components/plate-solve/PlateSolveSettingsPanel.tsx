@@ -96,11 +96,18 @@ export function PlateSolveSettingsPanel() {
   const [binning, setBinning] = useState(1);
 
   // Derived FOV values (not state — recomputed on each render from inputs)
-  const scale = pixelScaleArcsec(pixelUm, focalMm, binning);
-  const fov = fovDeg(scale, widthPx, heightPx);
+  const scale = pixelScaleArcsec(pixelUm, focalMm, binning); // displayed pixel scale (binned)
+  // FOV is binning-independent: NxN binning multiplies pixel scale by N but divides the
+  // effective pixel count by N, so the physical sensor FOV stays constant. Compute from
+  // unbinned scale to avoid inflating the FOV recommendation for binned setups.
+  const fov = fovDeg(pixelScaleArcsec(pixelUm, focalMm, 1), widthPx, heightPx);
   const sortedTiers = [...catalogs].sort((a, b) => a.density - b.density);
   const recommended = sortedTiers.length > 0 ? recommendTier(fov, sortedTiers) : 2000;
-  const needsDownload = catalogs.length === 0 || catalogs.some((c) => !c.installed);
+  // Gate on the recommended subset only: needs download iff any tier with
+  // density <= recommended is not installed (keep the catalogs.length === 0 offline case).
+  const needsDownload =
+    catalogs.length === 0 ||
+    catalogs.some((c) => c.density <= recommended && !c.installed);
 
   useEffect(() => {
     loadConfig();
@@ -528,7 +535,7 @@ export function PlateSolveSettingsPanel() {
             ) : (
               <p className="text-xs text-success flex items-center gap-1.5">
                 <CheckCircle size={13} />
-                All catalog tiers are installed.
+                Recommended catalog tiers installed and up to date.
               </p>
             )}
 

@@ -148,6 +148,18 @@ pub fn download_catalog_layers(
         if cancel.load(Ordering::Relaxed) {
             anyhow::bail!("cancelled");
         }
+        // Validate manifest path fields before any filesystem or network access.
+        // These strings are server-supplied and get joined into local paths; reject
+        // anything that could escape app_data via path traversal.
+        for (field, val) in [("zip", &tier.zip), ("sha256", &tier.sha256), ("dir", &tier.dir)] {
+            if !is_safe_filename(val) {
+                anyhow::bail!(
+                    "catalog: manifest tier {} has unsafe {field} field {:?} — rejected",
+                    tier.density,
+                    val
+                );
+            }
+        }
         progress(GaiaPrebuiltProgress::Tier { density: tier.density, index, n_tiers });
 
         let zip_url = format!("{base}{}", tier.zip);
@@ -188,6 +200,14 @@ pub fn download_catalog_layers(
     }
     progress(GaiaPrebuiltProgress::Complete { files });
     Ok(smac_root)
+}
+
+/// Returns `true` when `s` is safe to use as a bare filename joined into
+/// `app_data` — no directory-traversal characters (`/`, `\`, `..`, `:`).
+/// Applied to server-supplied manifest `zip`, `sha256`, and `dir` fields before
+/// touching the filesystem or making network requests.
+fn is_safe_filename(s: &str) -> bool {
+    !s.contains('/') && !s.contains('\\') && !s.contains("..") && !s.contains(':')
 }
 
 fn http_client() -> Result<reqwest::blocking::Client> {
@@ -356,36 +376,63 @@ pub struct TierStatus {
     pub min_fov_deg: f64,
 }
 
-/// Merge the declared tiers (manifest) with on-disk installed state. Returns an
-/// empty Vec when no manifest is available (offline + never fetched).
+/// Merge the declared tiers (manifest) with on-disk installed state.
+///
+/// When the manifest IS available: one entry per declared tier (installed or not).
+/// When the manifest is NOT available: falls back to `discover_layers` and returns one
+/// `TierStatus` per tier dir found on disk — `installed=true`, `size_bytes=0`,
+/// `min_fov_deg=0.0` (unknown without manifest). This ensures the plate-solve
+/// precheck never refuses to solve just because the manifest cache is absent.
 pub fn tier_status(app_data: &Path) -> Vec<TierStatus> {
-    let manifest = match load_or_fetch_manifest(app_data) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("catalog: no manifest available for status: {e}");
-            return Vec::new();
-        }
-    };
     let smac_root = app_data.join("catalogs").join("smac_gaia");
-    manifest
-        .tiers
-        .iter()
-        .map(|t| {
-            let dir = smac_root.join(&t.dir);
-            let (installed, star_count, epoch) = match solvemyastro::StarCache::open(&dir) {
-                Ok(c) => (true, c.star_count(), c.catalog_epoch()),
-                Err(_) => (false, 0, manifest.catalog_epoch),
-            };
-            TierStatus {
-                density: t.density,
-                installed,
-                epoch,
-                star_count,
-                size_bytes: t.size_bytes,
-                min_fov_deg: t.min_fov_deg,
-            }
-        })
-        .collect()
+    match load_or_fetch_manifest(app_data) {
+        Ok(manifest) => manifest
+            .tiers
+            .iter()
+            .map(|t| {
+                let dir = smac_root.join(&t.dir);
+                let (installed, star_count, epoch) = match solvemyastro::StarCache::open(&dir) {
+                    Ok(c) => (true, c.star_count(), c.catalog_epoch()),
+                    Err(_) => (false, 0, manifest.catalog_epoch),
+                };
+                TierStatus {
+                    density: t.density,
+                    installed,
+                    epoch,
+                    star_count,
+                    size_bytes: t.size_bytes,
+                    min_fov_deg: t.min_fov_deg,
+                }
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "catalog: no manifest available for status, falling back to discover_layers: {e}"
+            );
+            // Fall back to discovering installed tiers from disk.  Density and epoch
+            // come from the dir name / cache header; size_bytes / min_fov_deg are
+            // unknown without the manifest and reported as 0 / 0.0.
+            discover_layers(&smac_root)
+                .iter()
+                .filter_map(|p| {
+                    let dir_name = p.file_name()?.to_str()?;
+                    let density = dir_name.strip_prefix("tier_")?.parse::<u32>().ok()?;
+                    let (star_count, epoch) = match solvemyastro::StarCache::open(p) {
+                        Ok(c) => (c.star_count(), c.catalog_epoch()),
+                        Err(_) => return None, // dir exists but not a valid cache
+                    };
+                    Some(TierStatus {
+                        density,
+                        installed: true,
+                        epoch,
+                        star_count,
+                        size_bytes: 0,    // unknown without manifest
+                        min_fov_deg: 0.0, // unknown without manifest
+                    })
+                })
+                .collect()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -466,6 +513,60 @@ mod tests {
         extract_tier_zip(&zip_path, &dest, &Arc::new(AtomicBool::new(false)), &|_| {}).unwrap();
         assert_eq!(std::fs::read(dest.join("tier_500").join("stars.smac")).unwrap(), b"SMACDATA");
         assert!(!tmp.path().join("evil.smac").exists(), "zip-slip entry must be rejected");
+    }
+
+    #[test]
+    fn tier_status_falls_back_to_discover_when_no_manifest() {
+        use solvemyastro::{cache::build_cache, StarRecord as SmacRec};
+        let tmp = tempfile::tempdir().unwrap();
+        let smac_root = tmp.path().join("catalogs").join("smac_gaia");
+        std::fs::create_dir_all(&smac_root).unwrap();
+        // No manifest.json — only a real tier on disk.
+        build_cache(
+            vec![SmacRec {
+                ra: 15.0,
+                dec: 30.0,
+                mag: 9.0,
+                pmra_mas_yr: 0.0,
+                pmdec_mas_yr: 0.0,
+            }],
+            &smac_root.join("tier_500"),
+            2016.0,
+            |_| {},
+        )
+        .unwrap();
+
+        let st = tier_status(tmp.path());
+        assert_eq!(st.len(), 1, "should discover the installed tier even without manifest");
+        assert_eq!(st[0].density, 500);
+        assert!(st[0].installed);
+        assert!(st[0].star_count > 0);
+    }
+
+    #[test]
+    fn download_catalog_layers_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let smac_root = tmp.path().join("catalogs").join("smac_gaia");
+        std::fs::create_dir_all(&smac_root).unwrap();
+        // Manifest with a path-traversal `dir` field and a slash in `zip`.
+        std::fs::write(
+            smac_root.join("manifest.json"),
+            br#"{"version":1,"catalog_epoch":2016.0,"tiers":[
+                {"density":500,"zip":"subdir/tier_500.zip","sha256":"tier_500.zip.sha256",
+                 "dir":"../evil","size_bytes":1,"min_fov_deg":0.6}]}"#,
+        )
+        .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Path validation fires before any network or filesystem access, so the
+        // base URL is irrelevant and can be unreachable.
+        let result = download_catalog_layers(tmp.path(), 500, cancel, &|_| {});
+        assert!(result.is_err(), "path traversal tier must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unsafe") || msg.contains("..") || msg.contains('/'),
+            "error should describe the unsafe field, got: {msg}"
+        );
     }
 
     #[test]
