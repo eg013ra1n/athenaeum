@@ -18,6 +18,15 @@ athenaeum-core (`plate_solve/`); rayon; `corpus_bench`.
 
 **Spec:** `docs/superpowers/specs/2026-06-29-tiered-additive-star-catalog-design.md` §3.
 
+> **STATUS (2026-06-30): Plan 2 DONE.** Solver consumes the tier stack; the
+> real-data gate `corpus_layered_tiers` passes 14/14 truth (incl M78 + SIP),
+> 0 wrong / 0 missed / 0 panic on the 4-tier union. solvemyastro `05bf2d8`
+> (+ `bdbdb57` gate); athenaeum `45b78fe0`. **Tasks 5 Step 1–2 (install into
+> app-data + live-app solve) and the startup catalog-download flow are deferred
+> to Plan 3** (catalog delivery) — the app-data deep cache was already gone, so
+> the tier-union corpus gate replaces the deep baseline. Registration stays on
+> the legacy path (deferred). Don't upload `publish/` until Plan 3.
+
 ## Global Constraints
 
 - Solver hot path → must re-pass the **`corpus_bench` gate** (14/14 truth, 0 wrong,
