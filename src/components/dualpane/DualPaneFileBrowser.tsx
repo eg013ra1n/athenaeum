@@ -165,7 +165,8 @@ type Action =
   | { type: 'set_active'; pane: PaneId }
   | { type: 'toggle_mode'; pane: PaneId }
   | { type: 'set_filter'; pane: PaneId; filterText: string }
-  | { type: 'set_sort'; pane: PaneId; sortDir: 'asc' | 'desc' };
+  | { type: 'set_sort'; pane: PaneId; sortDir: 'asc' | 'desc' }
+  | { type: 'set_mode'; pane: PaneId; mode: 'files' | 'metadata' };
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -211,6 +212,13 @@ function reducer(state: State, action: Action): State {
       return {
         ...state,
         panes: { ...state.panes, [action.pane]: { ...current, mode: nextMode } },
+      };
+    }
+    case 'set_mode': {
+      const current = state.panes[action.pane];
+      return {
+        ...state,
+        panes: { ...state.panes, [action.pane]: { ...current, mode: action.mode } },
       };
     }
     case 'set_filter': {
@@ -1150,6 +1158,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           onSetSort={(sortDir) => dispatch({ type: 'set_sort', pane: 'left', sortDir })}
           onReload={() => reloadPane('left')}
           onMetaSaved={refreshBoth}
+          onOpenMetadata={(path) => {
+            dispatch({ type: 'set_active', pane: 'left' });
+            dispatch({ type: 'set_selection', pane: 'left', selection: new Set([path]), anchor: path });
+            dispatch({ type: 'set_mode', pane: 'right', mode: 'metadata' });
+          }}
           scanRoots={leftScanRoots}
         />
         <Pane
@@ -1175,6 +1188,11 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           onSetSort={(sortDir) => dispatch({ type: 'set_sort', pane: 'right', sortDir })}
           onReload={() => reloadPane('right')}
           onMetaSaved={refreshBoth}
+          onOpenMetadata={(path) => {
+            dispatch({ type: 'set_active', pane: 'right' });
+            dispatch({ type: 'set_selection', pane: 'right', selection: new Set([path]), anchor: path });
+            dispatch({ type: 'set_mode', pane: 'left', mode: 'metadata' });
+          }}
           scanRoots={scanRoots}
         />
       </div>
@@ -1477,6 +1495,9 @@ interface PaneProps {
   onSetSort: (sortDir: 'asc' | 'desc') => void;
   onReload: () => void;
   onMetaSaved: () => void;
+  /** Double-clicking an image file row in this pane opens the OTHER pane's
+   *  metadata editor focused on that file. */
+  onOpenMetadata: (path: string) => void;
   scanRoots: ScanRootWithAvailability[];
 }
 
@@ -1499,6 +1520,7 @@ function Pane({
   onSetSort,
   onReload,
   onMetaSaved,
+  onOpenMetadata,
   scanRoots,
 }: PaneProps) {
   // The pane is clamped to the scan root that contains its current cwd.
@@ -1647,6 +1669,7 @@ function Pane({
               onCwd={onCwd}
               onToggleSelect={onToggleSelect}
               onSetSelection={onSetSelection}
+              onOpenMetadata={onOpenMetadata}
             />
           </div>
         )}
@@ -1668,6 +1691,8 @@ interface FileListProps {
   onCwd: (cwd: string) => void;
   onToggleSelect: (path: string, multi: boolean) => void;
   onSetSelection: (selection: Set<string>, anchor?: string | null) => void;
+  /** Called when a double-click on an image file row (frame present) is detected. */
+  onOpenMetadata: (path: string) => void;
 }
 
 /** Field labels for the missing-metadata tooltip on file rows. Order matches
@@ -1695,7 +1720,7 @@ function applicableMissing(frame: Frame | null): (keyof MissingFlags)[] {
   return keys.filter((k) => flags[k]);
 }
 
-function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onToggleSelect, onSetSelection }: FileListProps) {
+function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onToggleSelect, onSetSelection, onOpenMetadata }: FileListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the focused (anchor) row visible — fires when cursor crosses the
   // viewport edge from arrow-key navigation.
@@ -1737,6 +1762,29 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
    *  clicks. The browser's native double-click recognition can race with
    *  React's reconciliation and occasionally miss the second click. A
    *  ref-based timing check is bulletproof. */
+  /** Manual double-click detector for image file rows.
+   *
+   *  Same rationale as parentClickRef: onClick mutates selection state which
+   *  causes a re-render between the two clicks, making React's native
+   *  onDoubleClick unreliable. Track (path, timestamp) and treat a second
+   *  click on the same file within 400 ms — with no modifier held — as a
+   *  double-click that opens the metadata pane on the other side. */
+  const fileClickRef = useRef<{ path: string; at: number }>({ path: '', at: 0 });
+  const onFileClick = (e: React.MouseEvent, f: { file: { path: string }; frame: Frame | null }) => {
+    // Modifier-clicks are multi-select — don't intercept as double-click.
+    if (!e.shiftKey && !e.metaKey && !e.ctrlKey && f.frame) {
+      const now = Date.now();
+      if (fileClickRef.current.path === f.file.path && now - fileClickRef.current.at < 400) {
+        // Detected double-click on an image file.
+        fileClickRef.current = { path: '', at: 0 };
+        onOpenMetadata(f.file.path);
+        return;
+      }
+      fileClickRef.current = { path: f.file.path, at: now };
+    }
+    handleClick(e, f.file.path);
+  };
+
   const parentClickRef = useRef<number>(0);
   const onParentClick = () => {
     if (!parentPath) return;
@@ -1796,7 +1844,7 @@ function FileList({ paneId, listing, selection, anchor, parentPath, onCwd, onTog
           <button
             key={f.file.path}
             data-row-key={f.file.path}
-            onClick={(e) => handleClick(e, f.file.path)}
+            onClick={(e) => onFileClick(e, f)}
             className={`w-full flex items-center gap-2 px-2 py-1 text-left ${
               isSel ? 'bg-accent/30 text-accent' : 'hover:bg-surface-hover text-content'
             }`}
