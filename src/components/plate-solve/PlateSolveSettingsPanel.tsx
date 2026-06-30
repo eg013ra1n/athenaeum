@@ -126,6 +126,45 @@ export function PlateSolveSettingsPanel() {
     return () => clearInterval(id);
   }, [downloading]);
 
+  // Reflect ANY catalog download for the panel's whole lifetime — including one
+  // kicked off elsewhere (e.g. PlateSolveIndexMissingModal's "Download now",
+  // which fires download_catalog_layers then navigates here). A single
+  // persistent listener also gives us proper unmount cleanup. StrictMode-safe
+  // cancelled-flag form (see CLAUDE.md).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<CatalogDownloadProgress>('catalog-download-progress', (payload) => {
+        if (cancelled) return;
+        if (payload.phase === 'complete') {
+          setDownloading(false);
+          setDownloadProgress(null);
+          setDownloadStartedAt(null);
+          loadCatalogStatus();
+        } else if (payload.phase === 'error') {
+          setDownloading(false);
+          setDownloadProgress(null);
+          setDownloadStartedAt(null);
+          setDownloadError('Download failed. Please check your connection and try again.');
+        } else {
+          setDownloading(true);
+          setDownloadError(null);
+          setDownloadProgress(payload);
+          setDownloadStartedAt((prev) => prev ?? Date.now());
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[PlateSolveSettingsPanel] catalog-download listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const loadConfig = async () => {
     try {
       setLoading(true);
@@ -193,54 +232,28 @@ export function PlateSolveSettingsPanel() {
     }
   };
 
-  // Download catalog tiers up to targetDensity. Emits the shared
-  // `catalog-download-progress` event; the invoke resolves when the whole
-  // command finishes (already-present tiers are skipped).
+  // Kick off a tier download up to targetDensity. Live progress + terminal
+  // completion are handled by the persistent catalog-download-progress listener
+  // above; the awaited invoke is the authoritative "finished" signal and also
+  // covers the no-event case (e.g. every requested tier already installed).
   const downloadStarCatalog = useCallback(async (targetDensity: number) => {
     setDownloading(true);
     setDownloadError(null);
     setDownloadProgress(null);
     setDownloadStartedAt(Date.now());
     setNowTs(Date.now());
-
-    let resolvedViaEvent = false;
-    let unlisten: (() => void) | null = null;
     try {
-      unlisten = await api.listen<CatalogDownloadProgress>('catalog-download-progress', (payload) => {
-        setDownloadProgress(payload);
-        if (payload.phase === 'complete') {
-          resolvedViaEvent = true;
-          setDownloading(false);
-          setDownloadProgress(null);
-          setDownloadStartedAt(null);
-          unlisten?.();
-          loadCatalogStatus();
-        } else if (payload.phase === 'error') {
-          resolvedViaEvent = true;
-          setDownloading(false);
-          setDownloadProgress(null);
-          setDownloadStartedAt(null);
-          setDownloadError('Download failed. Please check your connection and try again.');
-          unlisten?.();
-        }
-      });
       await api.invoke('download_catalog_layers', { targetDensity });
-      if (!resolvedViaEvent) {
-        setDownloading(false);
-        setDownloadProgress(null);
-        setDownloadStartedAt(null);
-        unlisten?.();
-        loadCatalogStatus();
-      }
+      setDownloading(false);
+      setDownloadProgress(null);
+      setDownloadStartedAt(null);
+      loadCatalogStatus();
     } catch (err) {
       console.error('Failed to start star catalog download:', err);
       setDownloadError(String(err));
       setDownloading(false);
       setDownloadProgress(null);
       setDownloadStartedAt(null);
-      if (!resolvedViaEvent) {
-        unlisten?.();
-      }
     }
   }, []);
 
@@ -318,7 +331,7 @@ export function PlateSolveSettingsPanel() {
                     onClick={() => downloadStarCatalog(recommended)}
                     disabled={downloading}
                     title="Download the recommended tier set (every tier up to the recommended density)"
-                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded text-xs font-medium transition-colors text-white flex-shrink-0"
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded text-xs font-medium transition-colors text-surface flex-shrink-0"
                   >
                     <Download size={12} />
                     Download
@@ -536,7 +549,7 @@ export function PlateSolveSettingsPanel() {
         <button
           onClick={handleSave}
           disabled={saving}
-          className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded-lg text-sm font-medium transition-colors text-white"
+          className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded-lg text-sm font-medium transition-colors text-surface"
         >
           <Save size={16} />
           {saving ? 'Saving...' : 'Save'}

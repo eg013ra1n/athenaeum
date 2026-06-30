@@ -95,7 +95,7 @@ export function PlateSolveIndexMissingModal() {
               </button>
               <button
                 onClick={downloadNow}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
+                className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-surface rounded-lg transition"
                 autoFocus
               >
                 <Download size={16} />
@@ -105,7 +105,7 @@ export function PlateSolveIndexMissingModal() {
           ) : (
             <button
               onClick={goToSettings}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
+              className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-surface rounded-lg transition"
               autoFocus
             >
               <SettingsIcon size={16} />
