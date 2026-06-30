@@ -487,6 +487,48 @@ fn extract_tier_zip(
     Ok(())
 }
 
+/// Per-tier installed status for the UI (one entry per declared tier).
+pub struct TierStatus {
+    pub density: u32,
+    pub installed: bool,
+    pub epoch: f64,
+    pub star_count: u64,
+    pub size_bytes: u64,
+    pub min_fov_deg: f64,
+}
+
+/// Merge the declared tiers (manifest) with on-disk installed state. Returns an
+/// empty Vec when no manifest is available (offline + never fetched).
+pub fn tier_status(app_data: &Path) -> Vec<TierStatus> {
+    let manifest = match load_or_fetch_manifest(app_data) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("catalog: no manifest available for status: {e}");
+            return Vec::new();
+        }
+    };
+    let smac_root = app_data.join("catalogs").join("smac_gaia");
+    manifest
+        .tiers
+        .iter()
+        .map(|t| {
+            let dir = smac_root.join(&t.dir);
+            let (installed, star_count, epoch) = match solvemyastro::StarCache::open(&dir) {
+                Ok(c) => (true, c.star_count(), c.catalog_epoch()),
+                Err(_) => (false, 0, manifest.catalog_epoch),
+            };
+            TierStatus {
+                density: t.density,
+                installed,
+                epoch,
+                star_count,
+                size_bytes: t.size_bytes,
+                min_fov_deg: t.min_fov_deg,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +677,32 @@ mod tests {
         extract_tier_zip(&zip_path, &dest, &Arc::new(AtomicBool::new(false)), &|_| {}).unwrap();
         assert_eq!(std::fs::read(dest.join("tier_500").join("stars.smac")).unwrap(), b"SMACDATA");
         assert!(!tmp.path().join("evil.smac").exists(), "zip-slip entry must be rejected");
+    }
+
+    #[test]
+    fn tier_status_merges_manifest_with_installed() {
+        use solvemyastro::{cache::build_cache, StarRecord as SmacRec};
+        let tmp = tempfile::tempdir().unwrap();
+        let smac_root = tmp.path().join("catalogs").join("smac_gaia");
+        std::fs::create_dir_all(&smac_root).unwrap();
+        // Cached manifest with two tiers.
+        std::fs::write(smac_root.join("manifest.json"),
+            br#"{"version":1,"catalog_epoch":2016.0,"tiers":[
+                {"density":500,"zip":"tier_500.zip","sha256":"x","dir":"tier_500","size_bytes":10,"min_fov_deg":0.6},
+                {"density":2000,"zip":"tier_2000.zip","sha256":"x","dir":"tier_2000","size_bytes":20,"min_fov_deg":0.3}]}"#).unwrap();
+        // Install only tier_500 (one real star).
+        build_cache(
+            vec![SmacRec { ra: 10.0, dec: 20.0, mag: 8.0, pmra_mas_yr: 0.0, pmdec_mas_yr: 0.0 }],
+            &smac_root.join("tier_500"), 2016.0, |_| {},
+        ).unwrap();
+
+        let st = tier_status(tmp.path());
+        assert_eq!(st.len(), 2);
+        assert_eq!(st[0].density, 500);
+        assert!(st[0].installed);
+        assert_eq!(st[0].star_count, 1);
+        assert_eq!(st[1].density, 2000);
+        assert!(!st[1].installed);
+        assert_eq!(st[1].min_fov_deg, 0.3);
     }
 }
