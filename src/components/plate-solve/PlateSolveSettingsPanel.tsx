@@ -293,30 +293,35 @@ export function PlateSolveSettingsPanel() {
 
             {/* Auto recommendation banner — driven by scanned light-frame FOV data */}
             {fovSummary && fovSummary.computable_count > 0 ? (
-              <div className="flex flex-wrap items-start gap-3 px-3 py-2.5 bg-accent/5 border border-accent/20 rounded-lg">
-                <p className="flex-1 min-w-0 text-xs text-content-secondary leading-relaxed">
-                  From your{' '}
-                  <span className="font-medium text-content">{fovSummary.computable_count}</span>{' '}
-                  light frame{fovSummary.computable_count === 1 ? '' : 's'} — narrowest field{' '}
-                  <span className="font-medium text-content">
-                    {fovSummary.min_fov_deg!.toFixed(2)}&deg;
+              <div className="flex items-center gap-3 px-3 py-2.5 bg-accent/5 border border-accent/20 rounded-lg">
+                <div className="flex-1 min-w-0 flex items-baseline gap-1 text-xs text-content-secondary">
+                  {/* Lead-in truncates (long INSTRUME) so the whole banner stays one line… */}
+                  <span className="min-w-0 truncate">
+                    From your{' '}
+                    <span className="font-medium text-content">{fovSummary.computable_count}</span>{' '}
+                    light frame{fovSummary.computable_count === 1 ? '' : 's'} — narrowest field{' '}
+                    <span className="font-medium text-content">
+                      {fovSummary.min_fov_deg!.toFixed(2)}&deg;
+                    </span>
+                    {fovSummary.narrowest_instrume ? ` (${fovSummary.narrowest_instrume})` : ''}
                   </span>
-                  {fovSummary.narrowest_instrume
-                    ? ` (${fovSummary.narrowest_instrume})`
-                    : ''}{' '}
-                  &rarr; recommended:{' '}
-                  <span className="font-medium text-content">
-                    {recommended.toLocaleString()} stars/deg&sup2;
+                  {/* …while the recommendation itself is always fully shown. */}
+                  <span className="flex-shrink-0 whitespace-nowrap">
+                    &rarr; recommended:{' '}
+                    <span className="font-medium text-content">
+                      {recommended.toLocaleString()} stars/deg&sup2;
+                    </span>
                   </span>
-                </p>
+                </div>
                 {needsDownload ? (
                   <button
                     onClick={() => downloadStarCatalog(recommended)}
                     disabled={downloading}
+                    title="Download the recommended tier set (every tier up to the recommended density)"
                     className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded text-xs font-medium transition-colors text-white flex-shrink-0"
                   >
                     <Download size={12} />
-                    Download recommended set
+                    Download
                   </button>
                 ) : (
                   <span className="inline-flex items-center gap-1.5 text-xs text-success flex-shrink-0">
@@ -343,7 +348,7 @@ export function PlateSolveSettingsPanel() {
                   <thead>
                     <tr className="text-content-muted border-b border-border">
                       <th className="text-left pb-1.5 pr-4 font-medium">Tier</th>
-                      <th className="text-left pb-1.5 pr-4 font-medium">Status</th>
+                      <th className="text-center pb-1.5 px-4 font-medium">Status</th>
                       <th className="text-right pb-1.5 pr-4 font-medium">Stars</th>
                       <th className="text-right pb-1.5 font-medium">Size</th>
                     </tr>
@@ -356,7 +361,7 @@ export function PlateSolveSettingsPanel() {
                           key={tier.density}
                           className={`border-b border-border/40 ${isRecommended ? 'bg-accent/5' : ''}`}
                         >
-                          <td className="py-2 pr-4">
+                          <td className="py-2 pr-4 align-top">
                             <span
                               className={`font-medium ${isRecommended ? 'text-accent' : 'text-content'}`}
                             >
@@ -365,16 +370,16 @@ export function PlateSolveSettingsPanel() {
                                 stars/deg&sup2;
                               </span>
                             </span>
+                            <span className="ml-2 text-content-muted">
+                              &middot; min FOV {tier.min_fov_deg.toFixed(2)}&deg;
+                            </span>
                             {isRecommended && (
                               <span className="ml-2 text-[10px] font-semibold text-accent uppercase tracking-wide">
                                 recommended
                               </span>
                             )}
-                            <div className="text-content-muted mt-0.5">
-                              min FOV {tier.min_fov_deg.toFixed(2)}&deg;
-                            </div>
                           </td>
-                          <td className="py-2 pr-4">
+                          <td className="py-2 px-4 align-top text-center">
                             {tier.installed ? (
                               <span className="inline-flex items-center gap-1 text-success">
                                 <CheckCircle size={12} />
@@ -388,16 +393,16 @@ export function PlateSolveSettingsPanel() {
                                 className="inline-flex items-center gap-1 font-medium text-accent hover:text-accent-hover disabled:opacity-50 transition-colors"
                               >
                                 <Download size={11} />
-                                Download to here
+                                Download
                               </button>
                             )}
                           </td>
-                          <td className="py-2 pr-4 text-right text-content-muted font-mono">
+                          <td className="py-2 pr-4 text-right text-content-muted tabular-nums align-top">
                             {tier.star_count_approx > 0
                               ? formatStarCount(tier.star_count_approx)
                               : '—'}
                           </td>
-                          <td className="py-2 text-right text-content-muted font-mono">
+                          <td className="py-2 text-right text-content-muted tabular-nums align-top">
                             {tier.size_bytes != null ? formatSize(tier.size_bytes) : '—'}
                           </td>
                         </tr>
