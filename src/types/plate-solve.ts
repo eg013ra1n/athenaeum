@@ -85,6 +85,13 @@ export interface CatalogStatusInfo {
   mag_limit: number;
 }
 
+export interface FovSummary {
+  light_count: number;
+  computable_count: number;
+  min_fov_deg: number | null;
+  narrowest_instrume: string | null;
+}
+
 export interface CatalogDownloadProgress {
   phase: 'tier' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error';
   current: number;

@@ -795,6 +795,15 @@ pub async fn get_catalog_status(
     }).collect())
 }
 
+#[tauri::command]
+pub async fn get_frame_fov_summary(
+    state: State<'_, AppState>,
+) -> Result<athenaeum_core::plate_solve::FovSummary, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+    athenaeum_core::plate_solve::frame_fov_summary(&conn).map_err(|e| e.to_string())
+}
+
 // ========== Catalog Download ==========
 
 #[derive(Clone, Serialize)]

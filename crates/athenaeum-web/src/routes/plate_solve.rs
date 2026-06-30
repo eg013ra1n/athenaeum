@@ -713,6 +713,20 @@ pub async fn get_catalog_status(
     }).collect()))
 }
 
+pub async fn get_frame_fov_summary(
+    State(state): State<WebAppState>,
+) -> Result<Json<athenaeum_core::plate_solve::FovSummary>, (StatusCode, String)> {
+    let db = state
+        .ctx
+        .db
+        .get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".to_string()))?;
+    let conn = db.conn();
+    athenaeum_core::plate_solve::frame_fov_summary(&conn)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TargetDensityArgs {

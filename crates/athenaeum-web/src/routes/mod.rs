@@ -203,6 +203,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_plate_solve_result", post(plate_solve::get_plate_solve_result))
         .route("/api/delete_plate_solve_for_frame", post(plate_solve::delete_plate_solve_for_frame))
         .route("/api/get_catalog_status", post(plate_solve::get_catalog_status))
+        .route("/api/get_frame_fov_summary", post(plate_solve::get_frame_fov_summary))
         .route("/api/download_catalog_layers", post(plate_solve::download_catalog_layers))
         // Registration (stacking preparation)
         .route("/api/register_frame_set", post(registration::register_frame_set))

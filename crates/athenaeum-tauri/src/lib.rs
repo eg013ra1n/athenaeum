@@ -326,6 +326,7 @@ pub fn run() {
             commands::get_plate_solve_result,
             commands::delete_plate_solve_for_frame,
             commands::get_catalog_status,
+            commands::get_frame_fov_summary,
             commands::download_catalog_layers,
             commands_rustafits::read_fits_image_rustafits,
             // Archive commands
