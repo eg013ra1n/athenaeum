@@ -1,15 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Save, RotateCw, CheckCircle, AlertCircle, Download, Maximize2 } from 'lucide-react';
+import { Save, RotateCw, CheckCircle, AlertCircle, Download, Info } from 'lucide-react';
 import { api } from '../../api';
 import type {
   PlateSolveConfig,
   CatalogStatusInfo,
   CatalogDownloadProgress,
+  FovSummary,
 } from '../../types/plate-solve';
 import {
-  CAMERA_PRESETS,
-  pixelScaleArcsec,
-  fovDeg,
   recommendTier,
   TIER_POLICY,
 } from './cameraPresets';
@@ -88,26 +86,19 @@ export function PlateSolveSettingsPanel() {
   const [downloadStartedAt, setDownloadStartedAt] = useState<number | null>(null);
   const [nowTs, setNowTs] = useState<number>(() => Date.now());
 
-  // FOV helper state — seeded from first camera preset
-  const [focalMm, setFocalMm] = useState(600);
-  const [presetIdx, setPresetIdx] = useState(0);
-  const [pixelUm, setPixelUm] = useState(CAMERA_PRESETS[0].pixelUm);
-  const [widthPx, setWidthPx] = useState(CAMERA_PRESETS[0].widthPx);
-  const [heightPx, setHeightPx] = useState(CAMERA_PRESETS[0].heightPx);
-  const [binning, setBinning] = useState(1);
+  // FOV summary from scanned light frames — drives auto tier recommendation.
+  const [fovSummary, setFovSummary] = useState<FovSummary | null>(null);
 
-  // Derived FOV values (not state — recomputed on each render from inputs)
-  const scale = pixelScaleArcsec(pixelUm, focalMm, binning); // displayed pixel scale (binned)
-  // FOV is binning-independent: NxN binning multiplies pixel scale by N but divides the
-  // effective pixel count by N, so the physical sensor FOV stays constant. Compute from
-  // unbinned scale to avoid inflating the FOV recommendation for binned setups.
-  const fov = fovDeg(pixelScaleArcsec(pixelUm, focalMm, 1), widthPx, heightPx);
+  // Derived values (not state — recomputed on each render from inputs).
   // The density→FOV mapping is fixed policy (TIER_POLICY), so the recommendation
   // and the tier list always work — even before the catalog server/manifest is
   // reachable. Live install state (and authoritative byte sizes) are merged in
   // from get_catalog_status when available; tier_status reports installed tiers
   // via discover_layers even with no manifest, so "Installed" still shows offline.
-  const recommended = recommendTier(fov, TIER_POLICY);
+  const recommended =
+    fovSummary?.min_fov_deg != null
+      ? recommendTier(fovSummary.min_fov_deg, TIER_POLICY)
+      : 2000;
   const tierRows = TIER_POLICY.map((p) => {
     const live = catalogs.find((c) => c.density === p.density);
     return {
@@ -118,12 +109,13 @@ export function PlateSolveSettingsPanel() {
       size_bytes: live?.size_bytes,
     };
   });
-  // Needs download iff any tier at/below the recommended depth is not installed.
+  // True iff any tier at/below the recommended depth is not yet installed.
   const needsDownload = tierRows.some((t) => t.density <= recommended && !t.installed);
 
   useEffect(() => {
     loadConfig();
     loadCatalogStatus();
+    loadFovSummary();
   }, []);
 
   // Tick once a second while a catalog download is active so the elapsed
@@ -188,6 +180,16 @@ export function PlateSolveSettingsPanel() {
       setCatalogs([]);
     } finally {
       setCatalogsLoading(false);
+    }
+  };
+
+  const loadFovSummary = async () => {
+    try {
+      const s = await api.invoke<FovSummary>('get_frame_fov_summary');
+      setFovSummary(s);
+    } catch (err) {
+      console.error('[PlateSolveSettingsPanel] Failed to load FOV summary:', err);
+      setFovSummary(null);
     }
   };
 
@@ -289,144 +291,39 @@ export function PlateSolveSettingsPanel() {
         ) : (
           <div className="rounded-lg border border-border bg-surface px-4 py-4 space-y-5">
 
-            {/* FOV Helper */}
-            <div>
-              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-content-muted mb-3">
-                <Maximize2 size={12} />
-                Field of View Helper
+            {/* Auto recommendation banner — driven by scanned light-frame FOV data */}
+            {fovSummary && fovSummary.computable_count > 0 ? (
+              <div className="flex flex-wrap items-start gap-3 px-3 py-2.5 bg-accent/5 border border-accent/20 rounded-lg">
+                <p className="flex-1 min-w-0 text-xs text-content-secondary leading-relaxed">
+                  From your{' '}
+                  <span className="font-medium text-content">{fovSummary.computable_count}</span>{' '}
+                  light frame{fovSummary.computable_count === 1 ? '' : 's'} — narrowest field{' '}
+                  <span className="font-medium text-content">
+                    {fovSummary.min_fov_deg!.toFixed(2)}&deg;
+                  </span>
+                  {fovSummary.narrowest_instrume
+                    ? ` (${fovSummary.narrowest_instrume})`
+                    : ''}{' '}
+                  &rarr; recommended:{' '}
+                  <span className="font-medium text-content">
+                    {recommended.toLocaleString()} stars/deg&sup2;
+                  </span>
+                </p>
+                <button
+                  onClick={() => downloadStarCatalog(recommended)}
+                  disabled={downloading}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded text-xs font-medium transition-colors text-white flex-shrink-0"
+                >
+                  <Download size={12} />
+                  Download recommended set
+                </button>
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3">
-                <div>
-                  <label className="block text-xs font-medium text-content-secondary mb-1">
-                    Focal length (mm)
-                  </label>
-                  <input
-                    type="number"
-                    min={50}
-                    max={10000}
-                    step={10}
-                    value={focalMm}
-                    onChange={(e) => setFocalMm(parseFloat(e.target.value) || 0)}
-                    className="w-full bg-surface-hover border border-border rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent"
-                  />
-                </div>
-
-                <div className="sm:col-span-2">
-                  <label className="block text-xs font-medium text-content-secondary mb-1">
-                    Camera preset
-                  </label>
-                  <select
-                    value={presetIdx}
-                    onChange={(e) => {
-                      const idx = parseInt(e.target.value, 10);
-                      setPresetIdx(idx);
-                      if (idx >= 0 && idx < CAMERA_PRESETS.length) {
-                        const p = CAMERA_PRESETS[idx];
-                        setPixelUm(p.pixelUm);
-                        setWidthPx(p.widthPx);
-                        setHeightPx(p.heightPx);
-                      }
-                    }}
-                    className="w-full bg-surface-hover border border-border rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent"
-                  >
-                    {CAMERA_PRESETS.map((p, i) => (
-                      <option key={i} value={i}>{p.label}</option>
-                    ))}
-                    <option value={-1}>Custom</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-content-secondary mb-1">
-                    Pixel size (&micro;m)
-                  </label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={20}
-                    step={0.01}
-                    value={pixelUm}
-                    onChange={(e) => {
-                      setPixelUm(parseFloat(e.target.value) || 0);
-                      setPresetIdx(-1);
-                    }}
-                    className="w-full bg-surface-hover border border-border rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-content-secondary mb-1">
-                    Width (px)
-                  </label>
-                  <input
-                    type="number"
-                    min={100}
-                    max={20000}
-                    step={1}
-                    value={widthPx}
-                    onChange={(e) => {
-                      setWidthPx(parseInt(e.target.value, 10) || 0);
-                      setPresetIdx(-1);
-                    }}
-                    className="w-full bg-surface-hover border border-border rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-content-secondary mb-1">
-                    Height (px)
-                  </label>
-                  <input
-                    type="number"
-                    min={100}
-                    max={20000}
-                    step={1}
-                    value={heightPx}
-                    onChange={(e) => {
-                      setHeightPx(parseInt(e.target.value, 10) || 0);
-                      setPresetIdx(-1);
-                    }}
-                    className="w-full bg-surface-hover border border-border rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-content-secondary mb-1">
-                    Binning
-                  </label>
-                  <select
-                    value={binning}
-                    onChange={(e) => setBinning(parseInt(e.target.value, 10))}
-                    className="w-full bg-surface-hover border border-border rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-accent"
-                  >
-                    <option value={1}>1&times;1</option>
-                    <option value={2}>2&times;2</option>
-                    <option value={3}>3&times;3</option>
-                    <option value={4}>4&times;4</option>
-                  </select>
-                </div>
-              </div>
-
-              {focalMm > 0 && pixelUm > 0 && (
-                <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs bg-surface-hover rounded-md px-3 py-2">
-                  <span className="text-content-muted">
-                    Scale:{' '}
-                    <span className="text-content font-medium">{scale.toFixed(2)}&Prime;</span>
-                    /px
-                  </span>
-                  <span className="text-content-muted">
-                    FOV:{' '}
-                    <span className="text-content font-medium">{fov.toFixed(2)}&deg;</span>
-                  </span>
-                  <span className="text-content-muted">
-                    Recommended tier:{' '}
-                    <span className="text-content font-medium">
-                      {recommended.toLocaleString()} stars/deg&sup2;
-                    </span>
-                  </span>
-                </div>
-              )}
-            </div>
+            ) : (
+              <p className="flex items-center gap-1.5 text-xs text-content-muted">
+                <Info size={13} className="flex-shrink-0" />
+                No frames with usable optics yet — pick a tier below.
+              </p>
+            )}
 
             {/* Per-tier table — always shown (built from the fixed tier policy;
                 live install state + byte sizes merged in from get_catalog_status). */}
@@ -477,7 +374,14 @@ export function PlateSolveSettingsPanel() {
                                 Installed
                               </span>
                             ) : (
-                              <span className="text-content-muted">Needed</span>
+                              <button
+                                onClick={() => downloadStarCatalog(tier.density)}
+                                disabled={downloading}
+                                className="inline-flex items-center gap-1 font-medium text-accent hover:text-accent-hover disabled:opacity-50 transition-colors"
+                              >
+                                <Download size={11} />
+                                Download
+                              </button>
                             )}
                           </td>
                           <td className="py-2 pr-4 text-right text-content-muted font-mono">
@@ -497,12 +401,13 @@ export function PlateSolveSettingsPanel() {
               {!catalogsLoading && catalogs.length === 0 && (
                 <p className="text-xs text-content-muted mt-2">
                   Couldn&apos;t read installed-catalog status (catalog server unreachable) — install
-                  state shown as &ldquo;Needed&rdquo;; the recommendation is computed from your rig&apos;s FOV.
+                  state shown as &ldquo;Needed&rdquo;; the recommendation is computed from your light
+                  frames&apos; FOV.
                 </p>
               )}
             </div>
 
-            {/* Download controls */}
+            {/* Download status — progress bar or all-good confirmation */}
             {downloadError && (
               <p className="text-xs text-error">{downloadError}</p>
             )}
@@ -529,28 +434,12 @@ export function PlateSolveSettingsPanel() {
                   )}
                 </p>
               </div>
-            ) : needsDownload ? (
-              <div className="flex items-start gap-3">
-                <button
-                  onClick={() => downloadStarCatalog(recommended)}
-                  disabled={downloading}
-                  className="flex items-center gap-2 px-3 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded-lg text-xs font-medium transition-colors text-white flex-shrink-0"
-                >
-                  <Download size={13} />
-                  Download needed set
-                </button>
-                <p className="text-xs text-content-muted leading-relaxed pt-0.5">
-                  Downloads all tiers up to{' '}
-                  {recommended.toLocaleString()} stars/deg&sup2; for your rig&apos;s FOV.
-                  Resumable — safe to leave running.
-                </p>
-              </div>
-            ) : (
+            ) : !needsDownload && !downloadError ? (
               <p className="text-xs text-success flex items-center gap-1.5">
                 <CheckCircle size={13} />
                 Recommended catalog tiers installed and up to date.
               </p>
-            )}
+            ) : null}
 
           </div>
         )}
