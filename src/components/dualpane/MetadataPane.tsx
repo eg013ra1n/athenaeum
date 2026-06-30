@@ -6,7 +6,7 @@
 // CLAUDE.md and the file_op extension docs.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Save, Loader2, AlertTriangle, ExternalLink, RotateCcw, Crosshair } from 'lucide-react';
+import { Save, Loader2, AlertTriangle, ExternalLink, RotateCcw, Crosshair, CheckCircle } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../../api';
 import type {
@@ -205,6 +205,13 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
   const [edits, setEdits] = useState<Record<string, EditState>>(initialEdits);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  // Auto-hide the "Saved" confirmation a couple of seconds after a save —
+  // without a timer it only vanishes on the next unrelated re-render.
+  useEffect(() => {
+    if (savedAt == null) return;
+    const id = setTimeout(() => setSavedAt(null), 2500);
+    return () => clearTimeout(id);
+  }, [savedAt]);
   const [pendingPayload, setPendingPayload] = useState<Record<string, unknown> | null>(null);
   const [pendingRelations, setPendingRelations] = useState<FrameMetadataRelations | null>(null);
   const [memberships, setMemberships] = useState<FrameMembershipsSummary | null>(null);
@@ -1288,15 +1295,18 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
 
       <div className="border-t border-border p-3 flex items-center justify-between">
         <div className="text-xs text-content-muted">
-          {savedAt && Date.now() - savedAt < 4000 && (
-            <span className="text-green-500">Saved.</span>
+          {savedAt && (
+            <span className="inline-flex items-center gap-1 text-success">
+              <CheckCircle size={13} />
+              Saved
+            </span>
           )}
         </div>
         <button
           onClick={onSave}
           disabled={saving || frameIds.length === 0 || !hasPendingChanges}
           title={!hasPendingChanges ? 'Tick a field checkbox to enable an edit first' : undefined}
-          className="flex items-center gap-2 px-3 py-1.5 rounded bg-accent text-white hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-accent text-sm"
+          className="flex items-center gap-2 px-3 py-1.5 rounded bg-accent text-surface hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-accent text-sm"
         >
           {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
           Apply changes
@@ -1306,10 +1316,10 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
       {pendingRelations && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/50" onClick={onCancelUnlink}>
           <div
-            className="bg-surface-elevated border border-amber-600 rounded-md p-5 max-w-md w-full shadow-xl"
+            className="bg-surface-elevated border border-warning/50 rounded-md p-5 max-w-md w-full shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center gap-2 mb-3 text-amber-400 font-semibold">
+            <div className="flex items-center gap-2 mb-3 text-warning font-semibold">
               <AlertTriangle size={18} />
               Editing will unlink these frames
             </div>
@@ -1351,7 +1361,7 @@ export default function MetadataPane({ otherListing, otherSelection, onSaved }: 
               </button>
               <button
                 onClick={onConfirmUnlink}
-                className="px-3 py-1.5 rounded bg-amber-600 text-white hover:bg-amber-700 text-sm"
+                className="px-3 py-1.5 rounded bg-warning text-surface hover:brightness-90 text-sm"
               >
                 Apply and unlink
               </button>
