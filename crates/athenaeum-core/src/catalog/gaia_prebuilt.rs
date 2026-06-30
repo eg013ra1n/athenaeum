@@ -68,7 +68,14 @@ pub fn load_or_fetch_manifest(app_data: &Path) -> Result<Manifest> {
         }
     }
     let url = format!("{}manifest.json", catalog_base_url());
-    let client = http_client()?;
+    // The manifest is tiny; use short timeouts so status checks fail fast when the
+    // catalog host is unreachable (big tier downloads keep `http_client()`).
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .user_agent("athenaeum-catalog-ingest (astrophotography catalog builder)")
+        .build()
+        .context("build manifest HTTP client")?;
     let bytes = client
         .get(&url)
         .send()

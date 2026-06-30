@@ -776,7 +776,13 @@ pub async fn get_catalog_status(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let app_data = db.path().to_path_buf().parent()
         .ok_or("Cannot determine app data directory")?.to_path_buf();
-    let rows = athenaeum_core::catalog::gaia_prebuilt::tier_status(&app_data);
+    // tier_status does blocking file I/O + (first run) a blocking manifest fetch;
+    // run it off the async runtime so the IPC call returns instead of stalling.
+    let rows = tokio::task::spawn_blocking(move || {
+        athenaeum_core::catalog::gaia_prebuilt::tier_status(&app_data)
+    })
+    .await
+    .map_err(|e| format!("catalog status task failed: {e}"))?;
     Ok(rows.into_iter().map(|t| CatalogStatusInfo {
         name: format!("Gaia tier {} (≤{:.2}° FOV)", t.density, t.min_fov_deg),
         density: t.density,

@@ -696,7 +696,11 @@ pub async fn get_catalog_status(
     let app_data = db.path().to_path_buf().parent()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".to_string()))?
         .to_path_buf();
-    let rows = athenaeum_core::catalog::gaia_prebuilt::tier_status(&app_data);
+    let rows = tokio::task::spawn_blocking(move || {
+        athenaeum_core::catalog::gaia_prebuilt::tier_status(&app_data)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("catalog status task failed: {e}")))?;
     Ok(Json(rows.into_iter().map(|t| CatalogStatusInfo {
         name: format!("Gaia tier {} (≤{:.2}° FOV)", t.density, t.min_fov_deg),
         density: t.density,
