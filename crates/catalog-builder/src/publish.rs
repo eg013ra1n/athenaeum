@@ -5,26 +5,10 @@ use std::io::{self, BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
-#[derive(Serialize)]
-struct ManifestTier {
-    density: u32,
-    zip: String,
-    sha256: String,
-    dir: String,
-    size_bytes: u64,
-    min_fov_deg: f64,
-}
-
-#[derive(Serialize)]
-struct Manifest {
-    version: u32,
-    catalog_epoch: f64,
-    tiers: Vec<ManifestTier>,
-}
+use athenaeum_core::catalog::manifest::{Manifest, ManifestTier};
 
 fn min_fov_for(density: u32) -> f64 {
     match density {
