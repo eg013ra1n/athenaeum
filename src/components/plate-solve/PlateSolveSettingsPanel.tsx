@@ -309,14 +309,21 @@ export function PlateSolveSettingsPanel() {
                     {recommended.toLocaleString()} stars/deg&sup2;
                   </span>
                 </p>
-                <button
-                  onClick={() => downloadStarCatalog(recommended)}
-                  disabled={downloading}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded text-xs font-medium transition-colors text-white flex-shrink-0"
-                >
-                  <Download size={12} />
-                  Download recommended set
-                </button>
+                {needsDownload ? (
+                  <button
+                    onClick={() => downloadStarCatalog(recommended)}
+                    disabled={downloading}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent hover:bg-accent-hover disabled:opacity-50 rounded text-xs font-medium transition-colors text-white flex-shrink-0"
+                  >
+                    <Download size={12} />
+                    Download recommended set
+                  </button>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-success flex-shrink-0">
+                    <CheckCircle size={13} />
+                    Installed
+                  </span>
+                )}
               </div>
             ) : (
               <p className="flex items-center gap-1.5 text-xs text-content-muted">
@@ -377,10 +384,11 @@ export function PlateSolveSettingsPanel() {
                               <button
                                 onClick={() => downloadStarCatalog(tier.density)}
                                 disabled={downloading}
+                                title={`Downloads every tier up to ${tier.density.toLocaleString()} stars/deg² (additive — includes lower tiers)`}
                                 className="inline-flex items-center gap-1 font-medium text-accent hover:text-accent-hover disabled:opacity-50 transition-colors"
                               >
                                 <Download size={11} />
-                                Download
+                                Download to here
                               </button>
                             )}
                           </td>
