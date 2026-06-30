@@ -596,8 +596,8 @@ export default function Settings() {
           <h3 className="text-xl font-semibold mb-4">Plate Solving Configuration</h3>
           <p className="text-content-muted mb-6">
             Configure the astrometric plate solver used to determine sky coordinates for frames
-            that are missing RA/Dec metadata. The solver matches detected stars against the bundled
-            Tycho-2 catalog to compute a full WCS solution.
+            that are missing RA/Dec metadata. The solver matches detected stars against the
+            downloadable Gaia DR3 density-tier catalog to compute a full WCS solution.
           </p>
           <PlateSolveSettingsPanel />
         </div>
