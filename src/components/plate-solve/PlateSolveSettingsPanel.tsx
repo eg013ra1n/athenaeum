@@ -95,10 +95,10 @@ export function PlateSolveSettingsPanel() {
   // reachable. Live install state (and authoritative byte sizes) are merged in
   // from get_catalog_status when available; tier_status reports installed tiers
   // via discover_layers even with no manifest, so "Installed" still shows offline.
-  const recommended =
-    fovSummary?.min_fov_deg != null
-      ? recommendTier(fovSummary.min_fov_deg, TIER_POLICY)
-      : 2000;
+  const hasRecommendation = fovSummary?.min_fov_deg != null;
+  const recommended = hasRecommendation
+    ? recommendTier(fovSummary!.min_fov_deg!, TIER_POLICY)
+    : 2000;
   const tierRows = TIER_POLICY.map((p) => {
     const live = catalogs.find((c) => c.density === p.density);
     return {
@@ -350,7 +350,7 @@ export function PlateSolveSettingsPanel() {
                   </thead>
                   <tbody>
                     {tierRows.map((tier) => {
-                      const isRecommended = tier.density === recommended;
+                      const isRecommended = hasRecommendation && tier.density === recommended;
                       return (
                         <tr
                           key={tier.density}
