@@ -1,12 +1,14 @@
 import { useNavigate } from 'react-router-dom';
-import { AlertCircle, Settings as SettingsIcon, X } from 'lucide-react';
+import { AlertCircle, Download, Settings as SettingsIcon, X } from 'lucide-react';
+import { api } from '../../api';
 import { usePlateSolveProgressContext } from '../../contexts/PlateSolveProgressContext';
 
 /**
  * Renders when the queue refused to enqueue a plate-solve batch — most often
- * because the solver star catalog (`stars.smac`) hasn't been downloaded yet.
- * Provides a single CTA that deep-links into Settings → Plate Solving so the
- * user can download it without hunting through the Settings page.
+ * because the solver star-catalog tiers haven't been downloaded yet.
+ * Provides two CTAs: a one-click "Download now" that kicks off the base tier
+ * set and takes the user to the progress view in Settings, and an "Open
+ * Settings" shortcut to browse and choose tiers manually.
  *
  * Mounted once at the Layout level so every plate-solve entry point benefits
  * without per-page wiring.
@@ -27,6 +29,16 @@ export function PlateSolveIndexMissingModal() {
     navigate('/settings?tab=plate_solving');
   };
 
+  // Fire the recommended base tier download (targetDensity 2000 = base + Δ1)
+  // and navigate to Settings so the user can watch progress and choose more tiers.
+  const downloadNow = () => {
+    api.invoke('download_catalog_layers', { targetDensity: 2000 }).catch((err) => {
+      console.error('[PlateSolveIndexMissingModal] download_catalog_layers failed:', err);
+    });
+    dismissPrecheckError();
+    navigate('/settings?tab=plate_solving');
+  };
+
   return (
     <div
       className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
@@ -43,12 +55,13 @@ export function PlateSolveIndexMissingModal() {
             <p className="text-sm text-content-muted mt-2 leading-relaxed">
               {isCatalogMissing ? (
                 <>
-                  Plate solving needs the star catalog (Gaia DR3,{' '}
-                  <code>stars.smac</code>) on disk. Open{' '}
+                  Plate solving needs the star-catalog tiers (Gaia DR3,{' '}
+                  <code>stars.smac</code>) on disk. Download the recommended
+                  star-catalog set now, or open{' '}
                   <span className="text-content-secondary">
                     Settings &rarr; Plate Solving
                   </span>{' '}
-                  to download it — a one-time prebuilt download.
+                  to choose which tiers to install.
                 </>
               ) : (
                 precheckError.message
@@ -71,14 +84,34 @@ export function PlateSolveIndexMissingModal() {
           >
             Not now
           </button>
-          <button
-            onClick={goToSettings}
-            className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
-            autoFocus
-          >
-            <SettingsIcon size={16} />
-            Open Plate-Solve Settings
-          </button>
+          {isCatalogMissing ? (
+            <>
+              <button
+                onClick={goToSettings}
+                className="inline-flex items-center gap-2 px-4 py-2 border border-border hover:bg-surface-hover text-content-secondary rounded-lg transition"
+              >
+                <SettingsIcon size={16} />
+                Open Settings
+              </button>
+              <button
+                onClick={downloadNow}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
+                autoFocus
+              >
+                <Download size={16} />
+                Download now
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={goToSettings}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover text-white rounded-lg transition"
+              autoFocus
+            >
+              <SettingsIcon size={16} />
+              Open Plate-Solve Settings
+            </button>
+          )}
         </div>
       </div>
     </div>
