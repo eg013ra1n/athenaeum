@@ -11,6 +11,7 @@ import {
   pixelScaleArcsec,
   fovDeg,
   recommendTier,
+  TIER_POLICY,
 } from './cameraPresets';
 
 // Fallback default shown while loading, matching backend defaults. The full
@@ -101,13 +102,24 @@ export function PlateSolveSettingsPanel() {
   // effective pixel count by N, so the physical sensor FOV stays constant. Compute from
   // unbinned scale to avoid inflating the FOV recommendation for binned setups.
   const fov = fovDeg(pixelScaleArcsec(pixelUm, focalMm, 1), widthPx, heightPx);
-  const sortedTiers = [...catalogs].sort((a, b) => a.density - b.density);
-  const recommended = sortedTiers.length > 0 ? recommendTier(fov, sortedTiers) : 2000;
-  // Gate on the recommended subset only: needs download iff any tier with
-  // density <= recommended is not installed (keep the catalogs.length === 0 offline case).
-  const needsDownload =
-    catalogs.length === 0 ||
-    catalogs.some((c) => c.density <= recommended && !c.installed);
+  // The density→FOV mapping is fixed policy (TIER_POLICY), so the recommendation
+  // and the tier list always work — even before the catalog server/manifest is
+  // reachable. Live install state (and authoritative byte sizes) are merged in
+  // from get_catalog_status when available; tier_status reports installed tiers
+  // via discover_layers even with no manifest, so "Installed" still shows offline.
+  const recommended = recommendTier(fov, TIER_POLICY);
+  const tierRows = TIER_POLICY.map((p) => {
+    const live = catalogs.find((c) => c.density === p.density);
+    return {
+      density: p.density,
+      min_fov_deg: p.min_fov_deg,
+      installed: live?.installed ?? false,
+      star_count_approx: live?.star_count_approx ?? 0,
+      size_bytes: live?.size_bytes,
+    };
+  });
+  // Needs download iff any tier at/below the recommended depth is not installed.
+  const needsDownload = tierRows.some((t) => t.density <= recommended && !t.installed);
 
   useEffect(() => {
     loadConfig();
@@ -416,78 +428,79 @@ export function PlateSolveSettingsPanel() {
               )}
             </div>
 
-            {/* Per-tier table */}
-            {sortedTiers.length > 0 ? (
-              <div>
-                <div className="text-xs font-semibold uppercase tracking-wide text-content-muted mb-2">
-                  Catalog Tiers
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="text-content-muted border-b border-border">
-                        <th className="text-left pb-1.5 pr-4 font-medium">Tier</th>
-                        <th className="text-left pb-1.5 pr-4 font-medium">Status</th>
-                        <th className="text-right pb-1.5 pr-4 font-medium">Stars</th>
-                        <th className="text-right pb-1.5 font-medium">Size</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {sortedTiers.map((tier) => {
-                        const isRecommended = tier.density === recommended;
-                        return (
-                          <tr
-                            key={tier.density}
-                            className={`border-b border-border/40 ${isRecommended ? 'bg-accent/5' : ''}`}
-                          >
-                            <td className="py-2 pr-4">
-                              <span
-                                className={`font-medium ${isRecommended ? 'text-accent' : 'text-content'}`}
-                              >
-                                {tier.density.toLocaleString()}{' '}
-                                <span className="font-normal text-content-muted">
-                                  stars/deg&sup2;
-                                </span>
-                              </span>
-                              {isRecommended && (
-                                <span className="ml-2 text-[10px] font-semibold text-accent uppercase tracking-wide">
-                                  recommended
-                                </span>
-                              )}
-                              <div className="text-content-muted mt-0.5">
-                                min FOV {tier.min_fov_deg.toFixed(1)}&deg;
-                              </div>
-                            </td>
-                            <td className="py-2 pr-4">
-                              {tier.installed ? (
-                                <span className="inline-flex items-center gap-1 text-success">
-                                  <CheckCircle size={12} />
-                                  Installed
-                                </span>
-                              ) : (
-                                <span className="text-content-muted">Needed</span>
-                              )}
-                            </td>
-                            <td className="py-2 pr-4 text-right text-content-muted font-mono">
-                              {tier.star_count_approx > 0
-                                ? formatStarCount(tier.star_count_approx)
-                                : '—'}
-                            </td>
-                            <td className="py-2 text-right text-content-muted font-mono">
-                              {formatSize(tier.size_bytes)}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+            {/* Per-tier table — always shown (built from the fixed tier policy;
+                live install state + byte sizes merged in from get_catalog_status). */}
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-content-muted mb-2">
+                Catalog Tiers
               </div>
-            ) : (
-              <p className="text-xs text-content-muted">
-                Catalog status unavailable. You can still attempt a download below.
-              </p>
-            )}
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-content-muted border-b border-border">
+                      <th className="text-left pb-1.5 pr-4 font-medium">Tier</th>
+                      <th className="text-left pb-1.5 pr-4 font-medium">Status</th>
+                      <th className="text-right pb-1.5 pr-4 font-medium">Stars</th>
+                      <th className="text-right pb-1.5 font-medium">Size</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tierRows.map((tier) => {
+                      const isRecommended = tier.density === recommended;
+                      return (
+                        <tr
+                          key={tier.density}
+                          className={`border-b border-border/40 ${isRecommended ? 'bg-accent/5' : ''}`}
+                        >
+                          <td className="py-2 pr-4">
+                            <span
+                              className={`font-medium ${isRecommended ? 'text-accent' : 'text-content'}`}
+                            >
+                              {tier.density.toLocaleString()}{' '}
+                              <span className="font-normal text-content-muted">
+                                stars/deg&sup2;
+                              </span>
+                            </span>
+                            {isRecommended && (
+                              <span className="ml-2 text-[10px] font-semibold text-accent uppercase tracking-wide">
+                                recommended
+                              </span>
+                            )}
+                            <div className="text-content-muted mt-0.5">
+                              min FOV {tier.min_fov_deg.toFixed(2)}&deg;
+                            </div>
+                          </td>
+                          <td className="py-2 pr-4">
+                            {tier.installed ? (
+                              <span className="inline-flex items-center gap-1 text-success">
+                                <CheckCircle size={12} />
+                                Installed
+                              </span>
+                            ) : (
+                              <span className="text-content-muted">Needed</span>
+                            )}
+                          </td>
+                          <td className="py-2 pr-4 text-right text-content-muted font-mono">
+                            {tier.star_count_approx > 0
+                              ? formatStarCount(tier.star_count_approx)
+                              : '—'}
+                          </td>
+                          <td className="py-2 text-right text-content-muted font-mono">
+                            {tier.size_bytes != null ? formatSize(tier.size_bytes) : '—'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {!catalogsLoading && catalogs.length === 0 && (
+                <p className="text-xs text-content-muted mt-2">
+                  Couldn&apos;t read installed-catalog status (catalog server unreachable) — install
+                  state shown as &ldquo;Needed&rdquo;; the recommendation is computed from your rig&apos;s FOV.
+                </p>
+              )}
+            </div>
 
             {/* Download controls */}
             {downloadError && (
