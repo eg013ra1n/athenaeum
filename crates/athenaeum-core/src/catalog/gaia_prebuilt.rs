@@ -29,6 +29,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::catalog::manifest::Manifest;
+
 /// Default location of the prebuilt archive + its sidecar checksum.
 /// Override with `ATHENAEUM_STAR_CATALOG_URL` (full URL to the `.zip`; the
 /// checksum is that URL + `.sha256`). The legacy `ATHENAEUM_GAIA_PREBUILT_URL`
@@ -41,6 +43,65 @@ fn prebuilt_urls() -> (String, String) {
         .unwrap_or_else(|_| STAR_CATALOG_URL.to_string());
     let sha = format!("{zip}.sha256");
     (zip, sha)
+}
+
+/// Resolve the catalog base URL (always ends in `/`).
+///
+/// `ATHENAEUM_CATALOG_BASE_URL` wins; the legacy `ATHENAEUM_STAR_CATALOG_URL` /
+/// `ATHENAEUM_GAIA_PREBUILT_URL` (full `.zip` URLs) are accepted by stripping the
+/// trailing filename to a base. Default `https://artfrom.space/catalogs/`.
+pub fn catalog_base_url() -> String {
+    fn with_slash(mut s: String) -> String {
+        if !s.ends_with('/') {
+            s.push('/');
+        }
+        s
+    }
+    if let Ok(b) = std::env::var("ATHENAEUM_CATALOG_BASE_URL") {
+        return with_slash(b);
+    }
+    if let Ok(zip) = std::env::var("ATHENAEUM_STAR_CATALOG_URL")
+        .or_else(|_| std::env::var("ATHENAEUM_GAIA_PREBUILT_URL"))
+    {
+        // Strip the trailing `<file>.zip` to its containing directory.
+        if let Some(slash) = zip.rfind('/') {
+            return zip[..=slash].to_string();
+        }
+    }
+    "https://artfrom.space/catalogs/".to_string()
+}
+
+fn manifest_cache_path(app_data: &Path) -> PathBuf {
+    app_data.join("catalogs").join("smac_gaia").join("manifest.json")
+}
+
+/// Read the cached `smac_gaia/manifest.json` if present, else fetch
+/// `<base>/manifest.json` and cache it. The cache lets status + the FOV helper
+/// work offline after the first fetch.
+pub fn load_or_fetch_manifest(app_data: &Path) -> Result<Manifest> {
+    let cache = manifest_cache_path(app_data);
+    if let Ok(bytes) = std::fs::read(&cache) {
+        if let Ok(m) = Manifest::from_json_slice(&bytes) {
+            return Ok(m);
+        }
+    }
+    let url = format!("{}manifest.json", catalog_base_url());
+    let client = http_client()?;
+    let bytes = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("fetch manifest {url}"))?
+        .error_for_status()
+        .with_context(|| format!("manifest HTTP error {url}"))?
+        .bytes()
+        .context("read manifest body")?;
+    let manifest = Manifest::from_json_slice(&bytes)
+        .with_context(|| format!("parse manifest from {url}"))?;
+    if let Some(parent) = cache.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&cache, &bytes); // best-effort cache
+    Ok(manifest)
 }
 
 /// Progress for the prebuilt path.
@@ -354,5 +415,37 @@ mod tests {
         assert_eq!(std::fs::read(bright.join("stars.smac")).unwrap(), b"bright");
         // zip-slip target must not be created anywhere outside dest dirs.
         assert!(!tmp.path().join("evil").exists());
+    }
+
+    #[test]
+    fn base_url_default_and_overrides() {
+        std::env::remove_var("ATHENAEUM_CATALOG_BASE_URL");
+        std::env::remove_var("ATHENAEUM_STAR_CATALOG_URL");
+        std::env::remove_var("ATHENAEUM_GAIA_PREBUILT_URL");
+        assert_eq!(catalog_base_url(), "https://artfrom.space/catalogs/");
+
+        std::env::set_var("ATHENAEUM_CATALOG_BASE_URL", "http://localhost:8000/cat");
+        assert_eq!(catalog_base_url(), "http://localhost:8000/cat/"); // trailing slash added
+        std::env::remove_var("ATHENAEUM_CATALOG_BASE_URL");
+
+        // legacy var points at a .zip → strip filename to a base
+        std::env::set_var("ATHENAEUM_STAR_CATALOG_URL", "https://x.example/c/smac_gaia.zip");
+        assert_eq!(catalog_base_url(), "https://x.example/c/");
+        std::env::remove_var("ATHENAEUM_STAR_CATALOG_URL");
+    }
+
+    #[test]
+    fn load_manifest_prefers_local_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("catalogs").join("smac_gaia");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"),
+            br#"{"version":1,"catalog_epoch":2016.0,"tiers":[
+                {"density":500,"zip":"tier_500.zip","sha256":"tier_500.zip.sha256",
+                 "dir":"tier_500","size_bytes":1,"min_fov_deg":0.6}]}"#).unwrap();
+        // No network used because the cache exists.
+        let m = load_or_fetch_manifest(tmp.path()).unwrap();
+        assert_eq!(m.tiers.len(), 1);
+        assert_eq!(m.tiers[0].density, 500);
     }
 }
