@@ -29,9 +29,8 @@ use crate::plate_solve::layers::discover_layers;
 
 /// Resolve the catalog base URL (always ends in `/`).
 ///
-/// `ATHENAEUM_CATALOG_BASE_URL` wins; the legacy `ATHENAEUM_STAR_CATALOG_URL` /
-/// `ATHENAEUM_GAIA_PREBUILT_URL` (full `.zip` URLs) are accepted by stripping the
-/// trailing filename to a base. Default `https://artfrom.space/catalogs/`.
+/// `ATHENAEUM_CATALOG_BASE_URL` overrides the default
+/// `https://artfrom.space/catalogs/`.
 pub fn catalog_base_url() -> String {
     fn with_slash(mut s: String) -> String {
         if !s.ends_with('/') {
@@ -41,14 +40,6 @@ pub fn catalog_base_url() -> String {
     }
     if let Ok(b) = std::env::var("ATHENAEUM_CATALOG_BASE_URL") {
         return with_slash(b);
-    }
-    if let Ok(zip) = std::env::var("ATHENAEUM_STAR_CATALOG_URL")
-        .or_else(|_| std::env::var("ATHENAEUM_GAIA_PREBUILT_URL"))
-    {
-        // Strip the trailing `<file>.zip` to its containing directory.
-        if let Some(slash) = zip.rfind('/') {
-            return zip[..=slash].to_string();
-        }
     }
     "https://artfrom.space/catalogs/".to_string()
 }
@@ -446,21 +437,20 @@ pub fn tier_status(app_data: &Path) -> Vec<TierStatus> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global `ATHENAEUM_CATALOG_BASE_URL`,
+    /// which would otherwise race under cargo's parallel test threads. Ignore
+    /// poisoning from an unrelated panicking test — we only need exclusion.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn base_url_default_and_overrides() {
+    fn base_url_default_and_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("ATHENAEUM_CATALOG_BASE_URL");
-        std::env::remove_var("ATHENAEUM_STAR_CATALOG_URL");
-        std::env::remove_var("ATHENAEUM_GAIA_PREBUILT_URL");
         assert_eq!(catalog_base_url(), "https://artfrom.space/catalogs/");
 
         std::env::set_var("ATHENAEUM_CATALOG_BASE_URL", "http://localhost:8000/cat");
         assert_eq!(catalog_base_url(), "http://localhost:8000/cat/"); // trailing slash added
         std::env::remove_var("ATHENAEUM_CATALOG_BASE_URL");
-
-        // legacy var points at a .zip → strip filename to a base
-        std::env::set_var("ATHENAEUM_STAR_CATALOG_URL", "https://x.example/c/smac_gaia.zip");
-        assert_eq!(catalog_base_url(), "https://x.example/c/");
-        std::env::remove_var("ATHENAEUM_STAR_CATALOG_URL");
     }
 
     #[test]
@@ -525,10 +515,17 @@ mod tests {
     #[test]
     fn tier_status_falls_back_to_discover_when_no_manifest() {
         use solvemyastro::{cache::build_cache, StarRecord as SmacRec};
+        // Force the remote manifest fetch to fail (RFC 2606 `.invalid` never
+        // resolves) so the "no manifest → discover from disk" fallback is what's
+        // under test — otherwise this would hit the live catalog host and see its
+        // full tier list. Hold the env lock for the whole fetch.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ATHENAEUM_CATALOG_BASE_URL", "http://catalog.invalid/");
+
         let tmp = tempfile::tempdir().unwrap();
         let smac_root = tmp.path().join("catalogs").join("smac_gaia");
         std::fs::create_dir_all(&smac_root).unwrap();
-        // No manifest.json — only a real tier on disk.
+        // No manifest.json (local or remote) — only a real tier on disk.
         build_cache(
             vec![SmacRec {
                 ra: 15.0,
@@ -544,6 +541,7 @@ mod tests {
         .unwrap();
 
         let st = tier_status(tmp.path());
+        std::env::remove_var("ATHENAEUM_CATALOG_BASE_URL");
         assert_eq!(st.len(), 1, "should discover the installed tier even without manifest");
         assert_eq!(st[0].density, 500);
         assert!(st[0].installed);
