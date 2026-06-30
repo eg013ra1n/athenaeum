@@ -867,6 +867,12 @@ pub async fn download_gaia_dr3_prebuilt_catalog(
                         total: 0,
                         percent: 0.0,
                     },
+                    P::Tier { density: _, index, n_tiers } => CatalogDownloadProgress {
+                        phase: "tier".into(),
+                        current: index,
+                        total: n_tiers,
+                        percent: 0.0,
+                    },
                 };
                 let _ = app_clone.emit("catalog-download-progress", event);
             },

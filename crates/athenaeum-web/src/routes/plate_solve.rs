@@ -725,6 +725,7 @@ pub async fn download_gaia_dr3_prebuilt_catalog(
                     P::Extracting { done, total } => ("extracting", done, total),
                     P::Complete { files } => ("complete", files, files),
                     P::Error(_) => ("error", 0, 0),
+                    P::Tier { index, n_tiers, .. } => ("tier", index, n_tiers),
                 };
                 let _ = event_tx.send(SseEvent {
                     event_name: "catalog-download-progress".into(),

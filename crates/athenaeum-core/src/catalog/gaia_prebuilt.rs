@@ -29,7 +29,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::manifest::Manifest;
+use crate::catalog::manifest::{Manifest, ManifestTier};
+use crate::plate_solve::layers::discover_layers;
 
 /// Default location of the prebuilt archive + its sidecar checksum.
 /// Override with `ATHENAEUM_STAR_CATALOG_URL` (full URL to the `.zip`; the
@@ -111,6 +112,101 @@ pub enum GaiaPrebuiltProgress {
     Extracting { done: usize, total: usize },
     Complete { files: usize },
     Error(String),
+    /// Starting tier `index+1` of `n_tiers` (density label for the UI).
+    Tier { density: u32, index: usize, n_tiers: usize },
+}
+
+/// Tiers with `density <= target_density` that are not already installed,
+/// ascending by density (base first). `installed_dirs` are the `tier_<d>` dir
+/// names already on disk.
+fn tiers_to_fetch(
+    manifest: &Manifest,
+    installed_dirs: &[String],
+    target_density: u32,
+) -> Vec<ManifestTier> {
+    let mut tiers: Vec<ManifestTier> = manifest
+        .tiers
+        .iter()
+        .filter(|t| t.density <= target_density && !installed_dirs.iter().any(|d| d == &t.dir))
+        .cloned()
+        .collect();
+    tiers.sort_by_key(|t| t.density);
+    tiers
+}
+
+/// Download the additive density tiers up to `target_density` into
+/// `catalogs/smac_gaia/tier_<d>/`. Fetches the manifest, skips already-installed
+/// tiers, and per tier: resumable download → SHA-256 verify → extract. Idempotent.
+pub fn download_catalog_layers(
+    app_data: &Path,
+    target_density: u32,
+    cancel: Arc<AtomicBool>,
+    progress: &dyn Fn(GaiaPrebuiltProgress),
+) -> Result<PathBuf> {
+    let smac_root = app_data.join("catalogs").join("smac_gaia");
+    std::fs::create_dir_all(&smac_root)?;
+
+    let manifest = load_or_fetch_manifest(app_data)?;
+    // Installed tier dir names (each `tier_<d>/` that holds a real stars.smac).
+    let installed: Vec<String> = discover_layers(&smac_root)
+        .iter()
+        .filter_map(|p| p.file_name()?.to_str().map(|s| s.to_string()))
+        .collect();
+    let wanted = tiers_to_fetch(&manifest, &installed, target_density);
+    if wanted.is_empty() {
+        eprintln!("catalog: all tiers up to density {target_density} already installed");
+        progress(GaiaPrebuiltProgress::Complete { files: 0 });
+        return Ok(smac_root);
+    }
+
+    let base = catalog_base_url();
+    let client = http_client()?;
+    let n_tiers = wanted.len();
+    let mut files = 0usize;
+    for (index, tier) in wanted.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        progress(GaiaPrebuiltProgress::Tier { density: tier.density, index, n_tiers });
+
+        let zip_url = format!("{base}{}", tier.zip);
+        let sha_url = format!("{base}{}", tier.sha256);
+        let zip_path = app_data.join(&tier.zip);
+        let part_path = app_data.join(format!("{}.part", tier.zip));
+
+        let expected_sha: Option<String> = client
+            .get(&sha_url)
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())
+            .and_then(|r| r.text().ok())
+            .map(|s| s.split_whitespace().next().unwrap_or("").to_lowercase())
+            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+        if expected_sha.is_none() {
+            eprintln!("catalog: no .sha256 sidecar at {sha_url} — skipping integrity check");
+        }
+
+        if !zip_path.exists() {
+            download_resumable(&client, &zip_url, &part_path, &cancel, progress)?;
+            std::fs::rename(&part_path, &zip_path).context("finalize tier archive")?;
+        }
+        if let Some(want) = &expected_sha {
+            progress(GaiaPrebuiltProgress::Verifying);
+            let got = sha256_file(&zip_path, &cancel)?;
+            if &got != want {
+                let _ = std::fs::remove_file(&zip_path);
+                anyhow::bail!("tier {} checksum mismatch (expected {want}, got {got})", tier.density);
+            }
+        }
+        extract_tier_zip(&zip_path, &smac_root, &cancel, progress)?;
+        let _ = std::fs::remove_file(&zip_path);
+        if !smac_present(&smac_root.join(&tier.dir)) {
+            anyhow::bail!("tier {} archive did not contain {}/stars.smac", tier.density, tier.dir);
+        }
+        files += 1;
+    }
+    progress(GaiaPrebuiltProgress::Complete { files });
+    Ok(smac_root)
 }
 
 fn http_client() -> Result<reqwest::blocking::Client> {
@@ -495,6 +591,28 @@ mod tests {
         let m = load_or_fetch_manifest(tmp.path()).unwrap();
         assert_eq!(m.tiers.len(), 1);
         assert_eq!(m.tiers[0].density, 500);
+    }
+
+    fn mtier(density: u32) -> crate::catalog::manifest::ManifestTier {
+        crate::catalog::manifest::ManifestTier {
+            density, zip: format!("tier_{density}.zip"), sha256: format!("tier_{density}.zip.sha256"),
+            dir: format!("tier_{density}"), size_bytes: 1, min_fov_deg: 0.5,
+        }
+    }
+
+    #[test]
+    fn tiers_to_fetch_selects_le_target_minus_installed() {
+        let m = Manifest { version: 1, catalog_epoch: 2016.0,
+            tiers: vec![mtier(500), mtier(2000), mtier(5000), mtier(8000)] };
+        // target 5000, tier_500 already installed → fetch 2000 + 5000 (not 8000, not 500).
+        let got = tiers_to_fetch(&m, &["tier_500".to_string()], 5000);
+        let densities: Vec<u32> = got.iter().map(|t| t.density).collect();
+        assert_eq!(densities, vec![2000, 5000]);
+        // target 500, nothing installed → just the base.
+        assert_eq!(tiers_to_fetch(&m, &[], 500).iter().map(|t| t.density).collect::<Vec<_>>(), vec![500]);
+        // everything installed → nothing to fetch.
+        let all: Vec<String> = (["tier_500","tier_2000","tier_5000","tier_8000"]).iter().map(|s| s.to_string()).collect();
+        assert!(tiers_to_fetch(&m, &all, 8000).is_empty());
     }
 
     #[test]
