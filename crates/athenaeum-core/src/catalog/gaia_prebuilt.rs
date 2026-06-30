@@ -343,6 +343,54 @@ fn extract_zip(
     Ok(done)
 }
 
+/// Extract a `tier_<d>/stars.smac` entry from `zip_path` into
+/// `dest_root/tier_<d>/stars.smac`, preserving the `tier_<d>/` prefix.
+/// Zip-slip-safe: rejects `..`, absolute, or drive-prefixed components.
+fn extract_tier_zip(
+    zip_path: &Path,
+    dest_root: &Path,
+    cancel: &Arc<AtomicBool>,
+    progress: &dyn Fn(GaiaPrebuiltProgress),
+) -> Result<()> {
+    let file = File::open(zip_path).context("open tier archive")?;
+    let mut zip = zip::ZipArchive::new(BufReader::new(file)).context("read tier zip")?;
+    let total = zip.len();
+    let mut done = 0usize;
+    for i in 0..total {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        let mut entry = zip.by_index(i).context("zip entry")?;
+        if !entry.is_file() {
+            continue;
+        }
+        let raw = entry.name().replace('\\', "/");
+        let comps: Vec<&str> = raw.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        if comps.is_empty()
+            || comps.iter().any(|c| *c == ".." || c.contains(':'))
+            || raw.starts_with('/')
+            || comps.last() != Some(&"stars.smac")
+            || comps.len() < 2
+        {
+            continue;
+        }
+        // dest_root / tier_<d> / stars.smac  (join only the safe components)
+        let mut dest = dest_root.to_path_buf();
+        for c in &comps {
+            dest.push(c);
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).context("create tier dir")?;
+        }
+        let mut out = File::create(&dest).context("create stars.smac")?;
+        std::io::copy(&mut entry, &mut out).context("extract stars.smac")?;
+        done += 1;
+        progress(GaiaPrebuiltProgress::Extracting { done, total });
+    }
+    progress(GaiaPrebuiltProgress::Extracting { done, total });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +495,27 @@ mod tests {
         let m = load_or_fetch_manifest(tmp.path()).unwrap();
         assert_eq!(m.tiers.len(), 1);
         assert_eq!(m.tiers[0].density, 500);
+    }
+
+    #[test]
+    fn extract_tier_zip_preserves_prefix_and_is_zipslip_safe() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("tier_500.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let o = SimpleFileOptions::default();
+            zw.start_file("tier_500/stars.smac", o).unwrap();
+            zw.write_all(b"SMACDATA").unwrap();
+            zw.start_file("../evil.smac", o).unwrap(); // zip-slip attempt
+            zw.write_all(b"nope").unwrap();
+            zw.finish().unwrap();
+        }
+        let dest = tmp.path().join("smac_gaia");
+        extract_tier_zip(&zip_path, &dest, &Arc::new(AtomicBool::new(false)), &|_| {}).unwrap();
+        assert_eq!(std::fs::read(dest.join("tier_500").join("stars.smac")).unwrap(), b"SMACDATA");
+        assert!(!tmp.path().join("evil.smac").exists(), "zip-slip entry must be rejected");
     }
 }
