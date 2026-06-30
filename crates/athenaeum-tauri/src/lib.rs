@@ -326,7 +326,7 @@ pub fn run() {
             commands::get_plate_solve_result,
             commands::delete_plate_solve_for_frame,
             commands::get_catalog_status,
-            commands::download_gaia_dr3_prebuilt_catalog,
+            commands::download_catalog_layers,
             commands_rustafits::read_fits_image_rustafits,
             // Archive commands
             commands::get_archive_settings,

@@ -755,45 +755,38 @@ pub async fn delete_plate_solve_for_frame(
     storage::delete_plate_solve(&conn, frame_id).map_err(|e| e.to_string())
 }
 
-/// Report the installed solver star catalog (the solvemyastro `stars.smac`
-/// deep cache). The shape is unchanged so the frontend keeps working; only the
-/// data source moved from the legacy `CatalogEngine` to the smac cache.
+#[derive(Clone, Serialize)]
+pub struct CatalogStatusInfo {
+    pub name: String,
+    pub density: u32,
+    pub installed: bool,
+    pub epoch: f64,
+    pub star_count_approx: u64,
+    pub size_bytes: u64,
+    pub min_fov_deg: f64,
+    pub mag_limit: f32,
+}
+
+/// Return one `CatalogStatusInfo` per declared density tier, merged with
+/// on-disk installed state. Returns an empty Vec when no manifest is available.
 #[tauri::command]
 pub async fn get_catalog_status(
     state: State<'_, AppState>,
 ) -> Result<Vec<CatalogStatusInfo>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let db_path = db.path().to_path_buf();
-    let parent = db_path
-        .parent()
-        .ok_or("Cannot determine app data directory")?;
-    let smac_dir = parent.join("catalogs").join("smac_gaia");
-
-    // Opening the cache memory-maps the header; if `stars.smac` is absent the
-    // catalog is simply not installed yet (the download command provides it).
-    let (installed, star_count_approx, epoch) = match solvemyastro::StarCache::open(&smac_dir) {
-        Ok(cache) => (true, cache.star_count(), cache.catalog_epoch()),
-        Err(_) => (false, 0, 2016.0),
-    };
-
-    Ok(vec![CatalogStatusInfo {
-        name: "Gaia DR3 (stars.smac)".to_string(),
-        installed,
-        epoch,
-        star_count_approx,
-        // Nominal solver depth (SolveConfig::catalog_mag_limit); the on-disk
-        // cache carries no explicit limit in its header.
+    let app_data = db.path().to_path_buf().parent()
+        .ok_or("Cannot determine app data directory")?.to_path_buf();
+    let rows = athenaeum_core::catalog::gaia_prebuilt::tier_status(&app_data);
+    Ok(rows.into_iter().map(|t| CatalogStatusInfo {
+        name: format!("Gaia tier {} (≤{:.2}° FOV)", t.density, t.min_fov_deg),
+        density: t.density,
+        installed: t.installed,
+        epoch: t.epoch,
+        star_count_approx: t.star_count,
+        size_bytes: t.size_bytes,
+        min_fov_deg: t.min_fov_deg,
         mag_limit: 19.0,
-    }])
-}
-
-#[derive(Clone, Serialize)]
-pub struct CatalogStatusInfo {
-    pub name: String,
-    pub installed: bool,
-    pub epoch: f64,
-    pub star_count_approx: u64,
-    pub mag_limit: f32,
+    }).collect())
 }
 
 // ========== Catalog Download ==========
@@ -805,73 +798,60 @@ struct CatalogDownloadProgress {
     current: usize,
     total: usize,
     percent: f64,
+    tier_density: u32,
+    tier_index: usize,
+    n_tiers: usize,
 }
 
 #[tauri::command]
-pub async fn download_gaia_dr3_prebuilt_catalog(
+pub async fn download_catalog_layers(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    target_density: u32,
 ) -> Result<String, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let db_path = db.path().to_path_buf();
-    let app_data_dir = db_path
-        .parent()
-        .ok_or("Cannot determine app data directory")?
-        .to_path_buf();
-
+    let app_data_dir = db.path().to_path_buf().parent()
+        .ok_or("Cannot determine app data directory")?.to_path_buf();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let app_clone = app.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        athenaeum_core::catalog::gaia_prebuilt::download_gaia_dr3_prebuilt(
+        use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
+        let cur = std::sync::Mutex::new((0u32, 0usize, 0usize)); // (density, index, n_tiers)
+        athenaeum_core::catalog::gaia_prebuilt::download_catalog_layers(
             &app_data_dir,
+            target_density,
             cancel_flag,
             &|progress| {
-                use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
+                let (td, ti, nt) = *cur.lock().unwrap();
                 let event = match progress {
+                    P::Tier { density, index, n_tiers } => {
+                        *cur.lock().unwrap() = (density, index, n_tiers);
+                        CatalogDownloadProgress {
+                            phase: "tier".into(), current: index, total: n_tiers,
+                            percent: 0.0, tier_density: density, tier_index: index, n_tiers,
+                        }
+                    }
                     P::Downloading { received, total } => CatalogDownloadProgress {
-                        phase: "downloading".into(),
-                        current: received as usize,
-                        total: total as usize,
-                        percent: if total > 0 {
-                            received as f64 / total as f64 * 100.0
-                        } else {
-                            0.0
-                        },
+                        phase: "downloading".into(), current: received as usize, total: total as usize,
+                        percent: if total > 0 { received as f64 / total as f64 * 100.0 } else { 0.0 },
+                        tier_density: td, tier_index: ti, n_tiers: nt,
                     },
                     P::Verifying => CatalogDownloadProgress {
-                        phase: "verifying".into(),
-                        current: 0,
-                        total: 0,
-                        percent: 0.0,
+                        phase: "verifying".into(), current: 0, total: 0,
+                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
                     },
                     P::Extracting { done, total } => CatalogDownloadProgress {
-                        phase: "extracting".into(),
-                        current: done,
-                        total,
-                        percent: if total > 0 {
-                            done as f64 / total as f64 * 100.0
-                        } else {
-                            0.0
-                        },
+                        phase: "extracting".into(), current: done, total,
+                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
                     },
                     P::Complete { files } => CatalogDownloadProgress {
-                        phase: "complete".into(),
-                        current: files,
-                        total: files,
-                        percent: 100.0,
+                        phase: "complete".into(), current: files, total: files,
+                        percent: 100.0, tier_density: td, tier_index: ti, n_tiers: nt,
                     },
-                    P::Error(ref _msg) => CatalogDownloadProgress {
-                        phase: "error".into(),
-                        current: 0,
-                        total: 0,
-                        percent: 0.0,
-                    },
-                    P::Tier { density: _, index, n_tiers } => CatalogDownloadProgress {
-                        phase: "tier".into(),
-                        current: index,
-                        total: n_tiers,
-                        percent: 0.0,
+                    P::Error(_) => CatalogDownloadProgress {
+                        phase: "error".into(), current: 0, total: 0,
+                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
                     },
                 };
                 let _ = app_clone.emit("catalog-download-progress", event);
@@ -879,10 +859,9 @@ pub async fn download_gaia_dr3_prebuilt_catalog(
         )
     })
     .await
-    .map_err(|e| format!("Download task failed: {e}"))?
-    .map_err(|e| format!("Gaia DR3 prebuilt download failed: {e:#}"))?;
+    .map_err(|e| format!("download task panicked: {e}"))?;
 
-    Ok(result.to_string_lossy().to_string())
+    result.map(|p| p.display().to_string()).map_err(|e| e.to_string())
 }
 
 // ========== Helpers ==========

@@ -662,50 +662,64 @@ pub async fn delete_plate_solve_for_frame(
 #[serde(rename_all = "camelCase")]
 pub struct CatalogStatusInfo {
     pub name: String,
+    pub density: u32,
     pub installed: bool,
     pub epoch: f64,
     pub star_count_approx: u64,
+    pub size_bytes: u64,
+    pub min_fov_deg: f64,
     pub mag_limit: f32,
 }
 
-/// Report the installed solver star catalog (the solvemyastro `stars.smac`
-/// deep cache). Shape unchanged; only the data source moved from the legacy
-/// `CatalogEngine` to the smac cache.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogDownloadProgress {
+    phase: String,
+    current: usize,
+    total: usize,
+    percent: f64,
+    tier_density: u32,
+    tier_index: usize,
+    n_tiers: usize,
+}
+
+/// Return one `CatalogStatusInfo` per declared density tier, merged with
+/// on-disk installed state. Returns an empty Vec when no manifest is available.
 pub async fn get_catalog_status(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<CatalogStatusInfo>>, (StatusCode, String)> {
-    let db = state
-        .ctx
-        .db
-        .get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".to_string()))?;
-    let db_path = db.path().to_path_buf();
-    let parent = db_path.parent().ok_or((
+    let db = state.ctx.db.get().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
-        "Cannot determine app data dir".to_string(),
+        "DB not initialized".to_string(),
     ))?;
-    let smac_dir = parent.join("catalogs").join("smac_gaia");
-
-    let (installed, star_count_approx, epoch) = match solvemyastro::StarCache::open(&smac_dir) {
-        Ok(cache) => (true, cache.star_count(), cache.catalog_epoch()),
-        Err(_) => (false, 0, 2016.0),
-    };
-
-    Ok(Json(vec![CatalogStatusInfo {
-        name: "Gaia DR3 (stars.smac)".to_string(),
-        installed,
-        epoch,
-        star_count_approx,
+    let app_data = db.path().to_path_buf().parent()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".to_string()))?
+        .to_path_buf();
+    let rows = athenaeum_core::catalog::gaia_prebuilt::tier_status(&app_data);
+    Ok(Json(rows.into_iter().map(|t| CatalogStatusInfo {
+        name: format!("Gaia tier {} (≤{:.2}° FOV)", t.density, t.min_fov_deg),
+        density: t.density,
+        installed: t.installed,
+        epoch: t.epoch,
+        star_count_approx: t.star_count,
+        size_bytes: t.size_bytes,
+        min_fov_deg: t.min_fov_deg,
         mag_limit: 19.0,
-    }]))
+    }).collect()))
 }
 
-pub async fn download_gaia_dr3_prebuilt_catalog(
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetDensityArgs {
+    target_density: u32,
+}
+
+pub async fn download_catalog_layers(
     State(state): State<WebAppState>,
+    Json(args): Json<TargetDensityArgs>,
 ) -> Result<Json<String>, (StatusCode, String)> {
     let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let db_path = db.path().to_path_buf();
-    let app_data_dir = db_path.parent()
+    let app_data_dir = db.path().to_path_buf().parent()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Cannot determine app data dir".into()))?
         .to_path_buf();
 
@@ -713,33 +727,56 @@ pub async fn download_gaia_dr3_prebuilt_catalog(
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let result = tokio::task::spawn_blocking(move || {
-        athenaeum_core::catalog::gaia_prebuilt::download_gaia_dr3_prebuilt(
+        use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
+        let cur = std::sync::Mutex::new((0u32, 0usize, 0usize)); // (density, index, n_tiers)
+        athenaeum_core::catalog::gaia_prebuilt::download_catalog_layers(
             &app_data_dir,
+            args.target_density,
             cancel_flag,
             &|progress| {
-                use athenaeum_core::catalog::gaia_prebuilt::GaiaPrebuiltProgress as P;
-                let (phase, current, total) = match progress {
-                    P::Downloading { received, total } =>
-                        ("downloading", received as usize, total as usize),
-                    P::Verifying => ("verifying", 0, 0),
-                    P::Extracting { done, total } => ("extracting", done, total),
-                    P::Complete { files } => ("complete", files, files),
-                    P::Error(_) => ("error", 0, 0),
-                    P::Tier { index, n_tiers, .. } => ("tier", index, n_tiers),
+                let (td, ti, nt) = *cur.lock().unwrap();
+                let event = match progress {
+                    P::Tier { density, index, n_tiers } => {
+                        *cur.lock().unwrap() = (density, index, n_tiers);
+                        CatalogDownloadProgress {
+                            phase: "tier".into(), current: index, total: n_tiers,
+                            percent: 0.0, tier_density: density, tier_index: index, n_tiers,
+                        }
+                    }
+                    P::Downloading { received, total } => CatalogDownloadProgress {
+                        phase: "downloading".into(), current: received as usize, total: total as usize,
+                        percent: if total > 0 { received as f64 / total as f64 * 100.0 } else { 0.0 },
+                        tier_density: td, tier_index: ti, n_tiers: nt,
+                    },
+                    P::Verifying => CatalogDownloadProgress {
+                        phase: "verifying".into(), current: 0, total: 0,
+                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
+                    },
+                    P::Extracting { done, total } => CatalogDownloadProgress {
+                        phase: "extracting".into(), current: done, total,
+                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
+                    },
+                    P::Complete { files } => CatalogDownloadProgress {
+                        phase: "complete".into(), current: files, total: files,
+                        percent: 100.0, tier_density: td, tier_index: ti, n_tiers: nt,
+                    },
+                    P::Error(_) => CatalogDownloadProgress {
+                        phase: "error".into(), current: 0, total: 0,
+                        percent: 0.0, tier_density: td, tier_index: ti, n_tiers: nt,
+                    },
                 };
                 let _ = event_tx.send(SseEvent {
                     event_name: "catalog-download-progress".into(),
-                    data: serde_json::json!({ "phase": phase, "current": current, "total": total,
-                        "percent": if total > 0 { current as f64 / total as f64 * 100.0 } else { 0.0 } }),
+                    data: serde_json::to_value(event).unwrap_or_default(),
                 });
             },
         )
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {e}")))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Prebuilt download failed: {e:#}")))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("download task panicked: {e}")))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(result.to_string_lossy().to_string()))
+    Ok(Json(result.display().to_string()))
 }
 
 fn load_frame_with_path(

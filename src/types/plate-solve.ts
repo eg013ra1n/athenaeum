@@ -76,23 +76,23 @@ export interface PlateSolveCompleteEvent {
 
 export interface CatalogStatusInfo {
   name: string;
+  density: number;
   installed: boolean;
   epoch: number;
   star_count_approx: number;
+  size_bytes: number;
+  min_fov_deg: number;
   mag_limit: number;
 }
 
 export interface CatalogDownloadProgress {
-  phase:
-    | "downloading"
-    | "verifying"
-    | "extracting"
-    | "converting"
-    | "complete"
-    | "error";
+  phase: 'tier' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error';
   current: number;
   total: number;
   percent: number;
+  tierDensity: number;
+  tierIndex: number;
+  nTiers: number;
 }
 
 // Autofind object from coordinates — snake_case wire format, no rename_all on the Rust side.
