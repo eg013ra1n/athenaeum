@@ -1,10 +1,84 @@
 use chrono::Datelike;
 use rusqlite::Connection;
+use serde::Serialize;
 
 use astroimage::platesolving::SolveHints;
 
 use crate::coordinates::{parse_dec_sexagesimal, parse_ra_sexagesimal};
 use crate::models::Frame;
+
+/// Field of view (degrees) from optics. `XPIXSZ` is the effective saved-pixel
+/// pitch (binning already folded in), so it is used directly — never multiplied
+/// by binning. `FOV = 2·atan(sensor_mm / (2·focallen))`, sensor_mm = naxis1·(xpixsz/1000).
+pub fn fov_from_optics(
+    focallen: Option<f64>,
+    xpixsz: Option<f64>,
+    naxis1: Option<i32>,
+) -> Option<f64> {
+    let (focallen, xpixsz, naxis1) = (focallen?, xpixsz?, naxis1?);
+    if focallen <= 0.0 || xpixsz <= 0.0 || naxis1 <= 0 {
+        return None;
+    }
+    let pixel_size_mm = xpixsz / 1000.0;
+    let sensor_mm = naxis1 as f64 * pixel_size_mm;
+    Some(2.0 * (sensor_mm / (2.0 * focallen)).atan().to_degrees())
+}
+
+/// FOV (degrees) of a frame from its optics, or `None` if optics are missing.
+pub fn frame_fov_deg(frame: &Frame) -> Option<f64> {
+    fov_from_optics(frame.focallen, frame.xpixsz, frame.naxis1)
+}
+
+/// Field-of-view summary across a set of LIGHT frames (the catalog-tier
+/// recommendation input).
+#[derive(Clone, Debug, Serialize)]
+pub struct FovSummary {
+    pub light_count: u32,
+    pub computable_count: u32,
+    pub min_fov_deg: Option<f64>,
+    pub narrowest_instrume: Option<String>,
+}
+
+/// Aggregate `(focallen, xpixsz, naxis1, instrume)` rows into an `FovSummary`,
+/// keeping the globally narrowest computable field.
+pub fn fov_summary<I>(rows: I) -> FovSummary
+where
+    I: IntoIterator<Item = (Option<f64>, Option<f64>, Option<i32>, Option<String>)>,
+{
+    let mut light_count = 0u32;
+    let mut computable_count = 0u32;
+    let mut min_fov_deg: Option<f64> = None;
+    let mut narrowest_instrume: Option<String> = None;
+    for (focallen, xpixsz, naxis1, instrume) in rows {
+        light_count += 1;
+        if let Some(fov) = fov_from_optics(focallen, xpixsz, naxis1) {
+            computable_count += 1;
+            if min_fov_deg.map_or(true, |m| fov < m) {
+                min_fov_deg = Some(fov);
+                narrowest_instrume = instrume;
+            }
+        }
+    }
+    FovSummary { light_count, computable_count, min_fov_deg, narrowest_instrume }
+}
+
+/// Query LIGHT frames and summarise their fields of view.
+pub fn frame_fov_summary(conn: &Connection) -> rusqlite::Result<FovSummary> {
+    let mut stmt = conn.prepare(
+        "SELECT focallen, xpixsz, naxis1, instrume FROM frames WHERE imagetyp LIKE 'LIGHT%'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, Option<f64>>(0)?,
+                r.get::<_, Option<f64>>(1)?,
+                r.get::<_, Option<i32>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(fov_summary(rows))
+}
 
 /// Extract plate-solving hints from a frame's metadata.
 ///
@@ -95,17 +169,11 @@ pub fn extract_hints(frame: &Frame, conn: Option<&Connection>) -> SolveHints {
     if let (Some(focallen), Some(xpixsz)) = (frame.focallen, frame.xpixsz) {
         if focallen > 0.0 && xpixsz > 0.0 {
             let pixel_size_mm = xpixsz / 1000.0;
-            let arcsec_per_px = (pixel_size_mm / focallen).atan().to_degrees() * 3600.0;
-            hints.pixel_scale_arcsec = Some(arcsec_per_px);
-
-            if let Some(naxis1) = frame.naxis1 {
-                // FOV = 2 * atan(sensor_size / (2 * focal_length))
-                let sensor_mm = naxis1 as f64 * pixel_size_mm;
-                let fov_deg = 2.0 * (sensor_mm / (2.0 * focallen)).atan().to_degrees();
-                hints.fov_deg = Some(fov_deg);
-            }
+            hints.pixel_scale_arcsec =
+                Some((pixel_size_mm / focallen).atan().to_degrees() * 3600.0);
         }
     }
+    hints.fov_deg = frame_fov_deg(frame);
 
     hints.rotation = frame.rotation;
 
@@ -326,5 +394,39 @@ mod tests {
         let hints = extract_hints(&frame, None);
         assert_eq!(hints.ra, None);
         assert_eq!(hints.dec, None);
+    }
+
+    #[test]
+    fn fov_from_optics_matches_formula_and_guards() {
+        // 270mm, 3.76µm, 6248px → ~4.98° (ASI2600 at a short focal length).
+        let fov = fov_from_optics(Some(270.0), Some(3.76), Some(6248)).unwrap();
+        assert!((fov - 4.98).abs() < 0.02, "got {fov}");
+        // Missing or non-positive inputs → None.
+        assert_eq!(fov_from_optics(None, Some(3.76), Some(6248)), None);
+        assert_eq!(fov_from_optics(Some(0.0), Some(3.76), Some(6248)), None);
+        assert_eq!(fov_from_optics(Some(270.0), Some(3.76), Some(0)), None);
+    }
+
+    #[test]
+    fn fov_summary_takes_global_narrowest_and_counts() {
+        let rows = vec![
+            (Some(270.0), Some(3.76), Some(6248), Some("ASI2600".to_string())),   // ~4.98°
+            (Some(2491.0), Some(3.76), Some(2048), Some("SG_32".to_string())),    // ~0.18° narrowest
+            (None, None, None, Some("NoOptics".to_string())),                     // not computable
+        ];
+        let s = fov_summary(rows);
+        assert_eq!(s.light_count, 3);
+        assert_eq!(s.computable_count, 2);
+        assert!((s.min_fov_deg.unwrap() - 0.18).abs() < 0.02, "{:?}", s.min_fov_deg);
+        assert_eq!(s.narrowest_instrume.as_deref(), Some("SG_32"));
+    }
+
+    #[test]
+    fn fov_summary_none_when_nothing_computable() {
+        let s = fov_summary(vec![(None, None, None, Some("x".to_string()))]);
+        assert_eq!(s.light_count, 1);
+        assert_eq!(s.computable_count, 0);
+        assert_eq!(s.min_fov_deg, None);
+        assert_eq!(s.narrowest_instrume, None);
     }
 }

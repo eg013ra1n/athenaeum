@@ -17,6 +17,7 @@ pub use service::{
 };
 
 pub use astroimage::platesolving::SolveHints;
+pub use hints::{frame_fov_summary, FovSummary};
 pub use storage::{
     delete_plate_solve, get_plate_solve, insert_plate_solve, update_frame_from_solve,
     PlateSolveRecord,
