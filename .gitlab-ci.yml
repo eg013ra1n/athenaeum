@@ -142,6 +142,16 @@ build:macos:
     - security set-keychain-settings -t 21600 -u "$KEYCHAIN_PATH"   # 6h timeout; survives notarization waits
     - security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
     - security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security
+    # Apple's Developer ID intermediate CAs: the leaf must build a FULL chain
+    # inside search-visible keychains or codesign reports "no identity found"
+    # (invalid identities are invisible to it). On a dev Mac the intermediates
+    # live in the login keychain, which a runner (daemon) session may not see —
+    # so import them into OUR keychain.
+    - curl -fsSLo "$HOME/AppleDevIDCA-${CI_JOB_ID}.cer" https://www.apple.com/certificateauthority/DeveloperIDCA.cer
+    - curl -fsSLo "$HOME/AppleDevIDG2CA-${CI_JOB_ID}.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+    - security import "$HOME/AppleDevIDCA-${CI_JOB_ID}.cer" -k "$KEYCHAIN_PATH" || true
+    - security import "$HOME/AppleDevIDG2CA-${CI_JOB_ID}.cer" -k "$KEYCHAIN_PATH" || true
+    - rm -f "$HOME/AppleDevIDCA-${CI_JOB_ID}.cer" "$HOME/AppleDevIDG2CA-${CI_JOB_ID}.cer"
     # Mandatory on a self-hosted runner: lets codesign use the private key non-interactively.
     # Block scalar: the `codesign:` in the partition list contains a colon+space
     # that YAML would otherwise parse as a mapping.
@@ -149,7 +159,13 @@ build:macos:
       security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
     # Add our keychain to the user search list WITHOUT dropping the login keychain.
     - security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+    # Some runner sessions resolve identities only via the DEFAULT keychain, not
+    # the user search list — make ours the default (restored in after_script).
+    - security default-keychain -d user -s "$KEYCHAIN_PATH"
+    # Diagnostics: identity scoped to our keychain AND session-wide (the second
+    # is what codesign actually sees). Expect 1 valid identity in BOTH.
     - security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+    - security find-identity -v -p codesigning
     - rm -f "$CERT_PATH"
   script:
     # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
@@ -183,6 +199,8 @@ build:macos:
       done
   after_script:
     # Fresh shell: recompute the same paths and clean up unconditionally.
+    # Restore the login keychain as default FIRST, then delete ours.
+    - security default-keychain -d user -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
     - KEYCHAIN_PATH="$HOME/athenaeum-signing-${CI_JOB_ID}.keychain-db"
     - security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
     - rm -f "$KEYCHAIN_PATH" "$HOME/athenaeum-cert-${CI_JOB_ID}.p12" "$HOME/athenaeum-api-key-${CI_JOB_ID}.p8"
