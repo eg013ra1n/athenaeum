@@ -162,6 +162,12 @@ build:macos:
     - rm -rf target/aarch64-apple-darwin/release/bundle/
     - rm -rf target/x86_64-apple-darwin/release/bundle/
     - npm install
+    # Unset APPLE_CERTIFICATE so Tauri does NOT create its own keychain: it would
+    # import the cert WITHOUT a key-partition-list, and codesign then fails with
+    # "Developer ID Application: … no identity found". Signing instead uses
+    # APPLE_SIGNING_IDENTITY against the keychain set up in before_script (which
+    # DOES have the partition-list). Notarization still uses APPLE_API_* (untouched).
+    - unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
     # With APPLE_SIGNING_IDENTITY + APPLE_API_* present, these sign + notarize +
     # staple the .app for each arch automatically.
     - npm run tauri build -- --target aarch64-apple-darwin
