@@ -51,6 +51,10 @@
     "resources": {
       "scripts/uninstall-macos.sh": "scripts/uninstall-macos.sh",
       "scripts/uninstall-linux.sh": "scripts/uninstall-linux.sh"
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true
     }
   }
 }

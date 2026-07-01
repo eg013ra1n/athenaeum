@@ -102,7 +102,9 @@ build:linux:
       - target/release/bundle/deb/*.deb
     expire_in: 30 days
 
-# --- macOS Build (Apple Silicon + Intel) ---
+# --- macOS Build (Apple Silicon + Intel) — signed + notarized (Developer ID) ---
+# Secrets come from Protected CI/CD variables; the .p12/.p8 are decoded at
+# runtime into a throwaway per-job keychain and removed in after_script.
 build:macos:
   stage: build
   tags:
@@ -117,6 +119,35 @@ build:macos:
       - .cargo/git/
       - target/
       - .npm/
+  before_script:
+    # Fail loudly if a signing variable is missing (e.g. the tag is not a
+    # Protected tag) instead of silently producing an UNSIGNED dmg.
+    - |
+      for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD \
+               APPLE_SIGNING_IDENTITY APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8_BASE64; do
+        if [ -z "${!v}" ]; then
+          echo "FATAL: signing variable '$v' is empty — is the tag a Protected tag?"; exit 1
+        fi
+      done
+    # Deterministic per-job paths (recomputed identically in after_script).
+    - export KEYCHAIN_PATH="$HOME/athenaeum-signing-${CI_JOB_ID}.keychain-db"
+    - export CERT_PATH="$HOME/athenaeum-cert-${CI_JOB_ID}.p12"
+    - export APPLE_API_KEY_PATH="$HOME/athenaeum-api-key-${CI_JOB_ID}.p8"
+    # Materialize the .p12 cert and the .p8 notarization key from base64 vars.
+    - echo "$APPLE_CERTIFICATE"       | base64 --decode > "$CERT_PATH"
+    - echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$APPLE_API_KEY_PATH"
+    - chmod 600 "$APPLE_API_KEY_PATH"
+    # Fresh, isolated keychain for THIS job only; import the cert.
+    - security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+    - security set-keychain-settings -t 21600 -u "$KEYCHAIN_PATH"   # 6h timeout; survives notarization waits
+    - security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+    - security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign -T /usr/bin/security
+    # Mandatory on a self-hosted runner: lets codesign use the private key non-interactively.
+    - security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+    # Add our keychain to the user search list WITHOUT dropping the login keychain.
+    - security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+    - security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+    - rm -f "$CERT_PATH"
   script:
     # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
     # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
@@ -128,8 +159,24 @@ build:macos:
     - rm -rf target/aarch64-apple-darwin/release/bundle/
     - rm -rf target/x86_64-apple-darwin/release/bundle/
     - npm install
+    # With APPLE_SIGNING_IDENTITY + APPLE_API_* present, these sign + notarize +
+    # staple the .app for each arch automatically.
     - npm run tauri build -- --target aarch64-apple-darwin
     - npm run tauri build -- --target x86_64-apple-darwin
+    # Notarize + staple the DMGs themselves (robust on macOS Sequoia, where a
+    # downloaded non-notarized dmg can still trigger Gatekeeper).
+    - |
+      for DMG in target/aarch64-apple-darwin/release/bundle/dmg/*.dmg \
+                 target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do
+        echo "Notarizing $DMG ..."
+        xcrun notarytool submit "$DMG" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+        xcrun stapler staple "$DMG" && xcrun stapler validate "$DMG"
+      done
+  after_script:
+    # Fresh shell: recompute the same paths and clean up unconditionally.
+    - KEYCHAIN_PATH="$HOME/athenaeum-signing-${CI_JOB_ID}.keychain-db"
+    - security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+    - rm -f "$KEYCHAIN_PATH" "$HOME/athenaeum-cert-${CI_JOB_ID}.p12" "$HOME/athenaeum-api-key-${CI_JOB_ID}.p8"
   artifacts:
     name: "athenaeum-macos-${CI_COMMIT_SHORT_SHA}"
     paths:
