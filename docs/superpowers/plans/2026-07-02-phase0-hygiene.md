@@ -4,6 +4,8 @@ Expansion of Phase 0 from `2026-07-02-roadmap.md` into implementable tasks. Four
 
 Verified against `main` v0.2.1 on 2026-07-02; all line refs re-checked today.
 
+> **Audit addendum (2026-07-02, `0.2.2` branch):** independently re-verified every claim against the current tree. T1/T2/T3/T3b/T4/T7/T8/T9/T12/T13/T14 confirmed as written (zero line drift). **Three corrections applied in place below:** T5 (the scanner already guards move-detection with an exists-check — problem statement and change rewritten), T6 (37 dead commands, not ~13), T11 (13 path-fed LIKE sites, not 9, incl. three SQL-side concatenations that need a different rewrite shape). Delivery plan: `2026-07-02-phase0-delivery-roadmap.md`.
+
 ---
 
 ## T1 — R1: detect meridian-flip (negative determinant) in `register()`
@@ -45,7 +47,7 @@ Verified against `main` v0.2.1 on 2026-07-02; all line refs re-checked today.
 
 **Change:**
 - Replace all three with `cells_mutex.lock().unwrap_or_else(|e| e.into_inner())` — the guarded data is a diagnostics `Vec<CellTrace>` push; recovering a poisoned lock is strictly better than cascading panics across the rayon pool. Grep the rest of the crate for `.lock().unwrap()` while there (`rg '\.lock\(\)\.unwrap\(\)' src/`) and apply the same treatment to any diagnostics-path hit.
-- Reword the two doc lines to "quad-based pattern matching (nearest-neighbour quad descriptors)" — no behavioural change. Grep both submodules case-insensitively for the name to catch stragglers.
+- Reword the two doc lines to "quad-based pattern matching (nearest-neighbour quad descriptors)" — no behavioural change. Grep both submodules case-insensitively for the name to catch stragglers — **audit found one more: `solvemyastro/README.md:12` ("tycho dir")**; `solvemyastro/docs/astap-comparison.html` is local-only/gitignored and out of scope.
 
 **Optional rider (T3b) — rustafits S3 input hardening:** `formats/fits.rs:99` accepts `NAXIS3 > 3` while downstream assumes 1 or 3 channels (June audit S3, the only malformed-input item among S3–S7). While in the file: reject `NAXIS3 ∉ {1, 3}` with a clear error. The remaining June rustafits items stay deferred by design: S4 (`detection.rs:38` saturation gate dead for float domain) and S5 (`analysis/mod.rs:1211` fixed `init_sigma`) belong with the stacking-era analysis precision work; S7 (fast-detect coverage on dense fields) with the centroid-refinement work.
 
@@ -76,20 +78,29 @@ Also emit a `notify`-able summary through `archive-finished` (`outcome` already 
 
 **Where:** `crates/athenaeum-core/src/file_op/executor.rs` — `run_cross_volume_commit_step` (line ~499): after copy+verify+catalog-sync succeed, `fs::remove_file(source)` failure marks the step `Failed` and bails, leaving BOTH copies on disk with the catalog pointing at dest.
 
-**Problem chain (verified):** scanner move-detection (`scanner/mod.rs:369-385` and `1309-1346`) matches the leftover *source* by header fingerprint against the row whose `path` = dest and **flips `files.path` back to source** — the verified dest copy becomes an invisible disk orphan.
+**Problem chain — CORRECTED BY AUDIT (2026-07-02):** the originally claimed scanner corruption does **not** exist in the common case: both move-detection sites already guard with an exists-check on the row's current path (`scanner/mod.rs:382` — exists ⇒ logged as duplicate, no flip; `:1322` — flips only when the old path is gone). What remains real:
 
-**Change — two complementary halves:**
+- **Executor half (confirmed):** the abandoned `CommitMove` leaves both copies on disk with the catalog at dest and the step `Failed` (`executor.rs:499-528`) — the leftover source is never cleaned up.
+- **Unmounted-volume edge:** if the *dest* volume is disconnected when the scanner sees the leftover source, `exists()` is false ⇒ the guard mistakes the duplicate for a move and flips `files.path` back — the verified dest copy becomes an orphan when the volume remounts. Narrow, but matches exactly the cross-volume scenario this task is about.
+- **Silent error swallowing at the same sites (project-rule violation):** `scanner/mod.rs:1319` `.optional().unwrap_or(None)` and the `let _ = conn.execute(…)` pairs at `:1324`/`:1341` discard DB errors.
 
-1. **Scanner guard (cheap, closes the corruption):** in both move-detection sites, before updating `files.path`, `stat` the row's current path (`old_path`). If the file at `old_path` still exists, this is a *duplicate*, not a move — do NOT flip the path; log `"duplicate content at '{}' and '{}' — keeping catalog at existing path"` and let the normal duplicate machinery see it.
-2. **Retry on resume (fixes the orphan):** `list_unfinished_file_operations` / resume already exist for file ops. Extend resume handling for a `CommitMove` step in `Failed` state where dest exists, hash matches (`compute_xxhash` vs the step's recorded hash from the verify step), and catalog points at dest: re-attempt `fs::remove_file(source)`; on success mark step `Done`. Surface remaining failures in the unfinished-operations UI instead of silently abandoning.
+**Change — revised:**
 
-**Tests:** (1) simulate both-copies-exist + scan of source → path stays at dest, no flip; (2) resume a fabricated failed CommitMove → source removed, step Done. Use a real FITS fixture for the fingerprint path (real-data-first rule).
+1. **Auto-reconcile failed CommitMove (the substantive half):** on operation-queue startup (or before the next enqueued file op), scan `file_operation_steps` for `CommitMove` in `Failed` state where dest exists, hash matches (`compute_xxhash` vs the verify step's recorded hash), and the catalog points at dest: re-attempt `fs::remove_file(source)`; on success mark the step `Done` and the operation completed. **Note (T6 finding):** the file-op resume commands (`list_unfinished_file_operations`, `cancel_file_operation`) exist on the backend but are wired to NO frontend — so reconciliation must be automatic, with a `notify()`-style summary, not UI-driven.
+2. **Volume-aware move guard (cheap hardening):** before treating a missing `old_path` as a move, check whether `old_path` falls under a currently-*unavailable* scan root (availability logic already exists in core — see the dead `check_scan_root_availability`); if the root is offline, skip the flip and log. Aligns with the "files on disconnected storage are not orphans" project rule.
+3. **Fix the three swallowed-error spots** at `scanner/mod.rs:1319/1324/1341` (log + propagate per the never-swallow rule).
 
-**Effort:** 1–1.5 days. The scanner guard is the priority half if time-boxed.
+**Tests:** (1) fabricated failed CommitMove with matching hash → startup reconcile removes source, step `Done`; hash mismatch → left `Failed` + notified. (2) move-detection with old_path under an unavailable root → no flip. Use a real FITS fixture for the fingerprint path (real-data-first rule).
+
+**Effort:** 1–1.5 days (reconcile half is the priority).
 
 ## T6 — Dead-command detection & cleanup
 
-**Problem (verified 2026-07-02):** ~13 `#[tauri::command]` functions have **0 frontend references and no web route** — dead or lost features. Known examples: `greet` (template leftover; also delete the stale `#greet-input` CSS in `src/App.css:94`), a cluster of superseded calibration commands in `commands/calibration.rs`, `get_orphaned_files`/`delete_orphaned_files`, `check_scan_root_availability`.
+**Problem (re-verified 2026-07-02 audit — count corrected):** **37 of 162** `#[tauri::command]` functions have **0 frontend references** (all still registered in `invoke_handler`) — dead or lost features. Full list (quote-agnostic grep across `src/`):
+
+`analyze_single_frame, can_split, cancel_file_operation, check_scan_root_availability, cleanup_duplicate_flat_subcalibrations, clear_calibration_links, clear_frame_set_reference, clear_image_cache, clear_manual_calibration_override, create_custom_frames_set, create_dark_library, create_frame_set_from_excluded, delete_analysis_for_frame_set, delete_dark_library, delete_orphaned_files, enqueue_delete_operation, get_active_scans, get_all_settings, get_app_version, get_calibration_set_originals, get_calibration_status, get_excluded_frames, get_flat_group_options_for_frame_set, get_frame_calibration_hierarchy, get_frame_calibration_links, get_frame_set_calibration_groups, get_frame_status, get_grouping_threshold_deg, get_orphaned_files, greet, list_unfinished_file_operations, plate_solve_frame, recalculate_frame_set_metadata, reclassify_excluded_frames, send_all_to_void, unarchive_frame_set, update_frame_set_flat_pattern`
+
+Notable clusters: the **entire file_op delete/cancel/resume trio** (`enqueue_delete_operation`, `cancel_file_operation`, `list_unfinished_file_operations`) — the dual-pane Delete actually routes to Black Hole (`bulk_move_to_black_hole`), so the file_op Delete pipeline is unwired (affects T5's resume half); the dark-library pair; several superseded calibration commands. Also delete the stale `#greet-input` CSS in `src/App.css:94`.
 
 **Task — re-detect, don't trust this list:** extract all `#[tauri::command]` fn names, cross-check each against (a) frontend usage (`rg "'<name>'" src/`), (b) web routes (`crates/athenaeum-web/src/routes/`, including stubs in `routes/mod.rs`), (c) `invoke_handler` registration. For each command with zero frontend refs, classify:
 
@@ -98,7 +109,7 @@ Also emit a `notify`-able summary through `archive-finished` (`outcome` already 
 
 Also: verify `MissingFilesPanel` handles the web-mode 501 from `relocate_missing_file` gracefully (the stub at `routes/mod.rs:313` is intentional).
 
-**Effort:** half a day.
+**Effort:** 1–1.5 days (audit tripled the triage surface: 37 commands, several plausibly lost features needing owner decisions).
 
 ## T7 — Migrate 3 raw BEGIN/COMMIT pairs to savepoints
 
@@ -128,7 +139,9 @@ Folded into T6 last bullet — listed separately in the roadmap; keep as one che
 
 ## T11 — Fix path-prefix `LIKE` queries (case sensitivity + wildcard escaping)
 
-**Where:** `crates/athenaeum-core/src/db/operations.rs:227, 274, 310, 324, 350, 404, 659, 766, 1427` (see `2026-07-02-platform-parity-audit.md` §1 for the full analysis).
+**Where (audit-corrected: 13 sites, not 9):** `crates/athenaeum-core/src/db/operations.rs:227, 274, 310, 324, 350, 404, 659, 766, 1427, 1580, 1614, 3372` **plus `file_op/executor.rs:741`** (see `2026-07-02-platform-parity-audit.md` §1 for the analysis).
+
+**Design wrinkle (audit):** three of the sites (`1427, 1580, 1614`) build the prefix **inside SQL** (`f.path LIKE sr.path || '%'` against the `scan_roots` join) — the Rust-side "prefix + incremented last byte" helper can't precompute the upper bound there. For those, either restructure the query to iterate scan roots from Rust (bind precomputed bounds per root) or use a SQL-side range expression; pick per call site.
 
 **Problem:** SQLite `LIKE` is ASCII-case-insensitive by default (no `case_sensitive_like` pragma anywhere) and `%`/`_` in the prefix argument are live, unescaped wildcards. On Linux, paths differing only by case cross-match; `_` (ubiquitous in astro paths, `M31_Ha/`) matches any character. Both cause silent wrong-row updates in the directory-rename hot-sync and scan-root cascades.
 
@@ -140,7 +153,7 @@ Folded into T6 last bullet — listed separately in the roadmap; keep as one che
 
 ## T12 — Rewrite stale `docs/export/README.md`
 
-The Siril script pipeline it documents (script generator, cli_runner, execution modes) **no longer exists in the codebase** (`export/` = data_collector, file_organizer, models only). Rewrite around the current WBPP folder/keyword export (`WbppExportConfig`, `export/models.rs:691-741`). Doc-only; prevents future work being planned against removed code.
+The Siril script pipeline it documents (script generator, cli_runner, execution modes) **does not exist in the codebase** — audit note: it appears to have never been implemented (aspirational doc; zero code hits for `cli_runner`/`script_generator`, `export/` = data_collector, file_organizer, models only). Rewrite around the current WBPP folder/keyword export (`WbppExportConfig`, `export/models.rs:701`). Doc-only; prevents future work being planned against nonexistent code.
 
 **Effort:** ~1 hour.
 
