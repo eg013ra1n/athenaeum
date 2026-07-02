@@ -68,9 +68,10 @@ Full checklist from the plan + update the two audit docs' open-findings tables
    through Black Hole by design — never directly.** `enqueue_delete_operation`
    + `FileOpDelete` plumbing are deleted in Wave 5; `cancel_file_operation` /
    `list_unfinished_file_operations` commands go too (T5's reconciliation is
-   queue-internal via the core functions). Sub-question folded into #4:
-   `send_all_to_void` (bulk "empty black hole") is dead — UI uses per-file
-   `send_to_void`; keep-and-wire a bulk-empty button, or delete?
+   queue-internal via the core functions). **Sub-question RESOLVED (owner,
+   2026-07-02): keep `send_all_to_void` and wire an "Empty Black Hole" button**
+   on the Black Hole page (confirm dialog with count/bytes; both backends —
+   web route exists) — added to Wave 5 scope.
 2. **`clear_manual_calibration_override`** — documented in `docs/masters/masters.md:120`
    as part of manual linking; likely a lost feature, and Phase 2 (master library)
    touches the same area. Resurrect in Phase 2 or delete now?
