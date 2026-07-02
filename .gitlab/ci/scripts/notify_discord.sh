@@ -21,10 +21,13 @@ fi
 
 NOTES_PATH="${RELEASE_NOTES_PATH:-RELEASE_NOTES.md}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Public release-notes URL on the docs site (artfrom.space/blog/v0.2.0/, etc.)
+# Public release-notes URL on the docs site (artfrom.space/blog/v021/, etc.)
 # instead of CI_PROJECT_URL which leaks the local GitLab host to public chats.
+# Starlight slugifies the post filename by DROPPING dots (v0.2.1.md -> /blog/v021/),
+# so the tag must be de-dotted or the link 404s.
 RELEASE_NOTES_BASE_URL="${RELEASE_NOTES_BASE_URL:-https://artfrom.space/blog}"
-RELEASE_URL="${RELEASE_NOTES_BASE_URL}/${CI_COMMIT_TAG}/"
+RELEASE_SLUG="$(printf '%s' "$CI_COMMIT_TAG" | tr -d '.')"
+RELEASE_URL="${RELEASE_NOTES_BASE_URL}/${RELEASE_SLUG}/"
 
 RESP_TMP=$(mktemp -t discord_response.XXXXXX)
 trap 'rm -f "$RESP_TMP"' EXIT

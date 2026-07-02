@@ -141,7 +141,7 @@ out=$(
 )
 assert_contains "dry-run prints title" "Athenaeum v0.2.0 released" "$out"
 assert_contains "dry-run prints stable color" "3066993" "$out"
-assert_contains "dry-run prints release URL" "https://example.com/blog/v0.2.0/" "$out"
+assert_contains "dry-run prints release URL" "https://example.com/blog/v020/" "$out"
 assert_contains "dry-run includes download field" "artfrom.space/releases/download" "$out"
 assert_not_contains "stable title omits beta marker" "(beta)" "$out"
 
@@ -207,7 +207,7 @@ assert_contains "dry-run prints chat id" "@athenaeum_releases" "$out"
 assert_contains "dry-run uses HTML parse mode" "HTML" "$out"
 assert_contains "dry-run wraps title in bold" "<b>Athenaeum v0.2.0 released</b>" "$out"
 assert_contains "dry-run converts inline code in body" "<code>inline code</code>" "$out"
-assert_contains "dry-run includes release URL" "https://example.com/blog/v0.2.0/" "$out"
+assert_contains "dry-run includes release URL" "https://example.com/blog/v020/" "$out"
 assert_not_contains "stable title omits beta marker" "(beta)" "$out"
 
 # Beta tag.
@@ -232,7 +232,7 @@ out=$(
   RELEASE_NOTES_PATH="$FIXTURES_DIR/long.md" \
   "$HELPERS_DIR/notify_telegram.sh"
 )
-assert_contains "long telegram body has truncation tail" "Full notes: https://example.com/blog/v0.2.0-beta.10/" "$out"
+assert_contains "long telegram body has truncation tail" "Full notes: https://example.com/blog/v020-beta10/" "$out"
 
 # Missing RELEASE_NOTES.md falls back to a one-liner.
 out=$(
