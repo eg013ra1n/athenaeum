@@ -1183,6 +1183,7 @@ export type FrameRegistrationStatus =
   | 'pending'
   | 'aligning'
   | 'aligned'
+  | 'aligned_flipped'
   | 'reference'
   | 'failed';
 
@@ -1211,7 +1212,7 @@ export interface RegistrationRecord {
   matchedStars: number;
   rmsResidualPx: number;
   rmsResidualArcsec?: number;
-  status: 'aligned' | 'reference' | 'failed';
+  status: 'aligned' | 'aligned_flipped' | 'reference' | 'failed';
   error?: string;
   computeTimeMs: number;
   registeredAt: string;

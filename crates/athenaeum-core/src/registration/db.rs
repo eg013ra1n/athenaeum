@@ -43,7 +43,9 @@ pub struct RegistrationRecord {
     /// reference pixel scale is unavailable (rare).
     pub rms_residual_arcsec: Option<f64>,
 
-    /// `"aligned"` | `"reference"` | `"failed"`.
+    /// `"aligned"` | `"aligned_flipped"` | `"reference"` | `"failed"`.
+    /// `"aligned_flipped"` is an aligned variant (not a distinct outcome): the
+    /// fitted transform includes a reflection (meridian-flipped sub).
     pub status: String,
     /// Error message for failed rows.
     pub error: Option<String>,

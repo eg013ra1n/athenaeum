@@ -9,6 +9,7 @@ import {
   Star,
   Info,
   RefreshCw,
+  FlipHorizontal,
 } from 'lucide-react';
 import { api } from '../api';
 import { useRegistrationProgressContext } from '../contexts/RegistrationProgressContext';
@@ -24,7 +25,7 @@ interface StackingPrepTabProps {
 // ── Status badge ─────────────────────────────────────────────────────────────
 
 interface StatusBadgeProps {
-  status: FrameRegistrationStatus | 'aligned' | 'reference' | 'failed';
+  status: FrameRegistrationStatus | 'aligned' | 'aligned_flipped' | 'reference' | 'failed';
 }
 
 function StatusBadge({ status }: StatusBadgeProps) {
@@ -41,6 +42,16 @@ function StatusBadge({ status }: StatusBadgeProps) {
         <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border text-xs bg-success-muted text-success border-success">
           <CheckCircle2 size={11} />
           Aligned
+        </span>
+      );
+    case 'aligned_flipped':
+      return (
+        <span
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded border text-xs bg-info-muted text-info border-info/40"
+          title="Meridian-flipped: the transform includes a reflection. Registration is valid; stacking will mirror this frame at resample time."
+        >
+          <FlipHorizontal size={11} />
+          Flipped
         </span>
       );
     case 'aligning':
@@ -144,8 +155,10 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
     referenceFrameId != null &&
     referenceRecord.referenceFrameId !== referenceFrameId;
 
-  // Median RMS from persisted records (aligned frames only).
-  const alignedRecords = records?.filter((r) => r.status === 'aligned') ?? [];
+  // Median RMS from persisted records (aligned frames only — includes
+  // meridian-flipped subs, which are still validly aligned).
+  const alignedRecords =
+    records?.filter((r) => r.status === 'aligned' || r.status === 'aligned_flipped') ?? [];
   const medianRms = (() => {
     const vals = alignedRecords
       .map((r) => r.rmsResidualArcsec ?? null)

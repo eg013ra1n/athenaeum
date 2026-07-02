@@ -435,6 +435,15 @@ pub fn register_frame_set(
                 } else {
                     None
                 };
+                let status = aligned_status(reg.flipped);
+                if reg.flipped {
+                    eprintln!(
+                        "registration: frame {} ({}) is meridian-flipped (fitted transform \
+                         includes a reflection) — persisting status={status}",
+                        m.frame_id,
+                        filename_from_path(&m.path).unwrap_or_else(|| "<unknown>".to_string())
+                    );
+                }
 
                 let rec = RegistrationRecord {
                     id: None,
@@ -459,7 +468,7 @@ pub fn register_frame_set(
                     matched_stars: reg.matched as i64,
                     rms_residual_px: reg.rms_px,
                     rms_residual_arcsec: rms_arcsec,
-                    status: "aligned".to_string(),
+                    status: status.to_string(),
                     error: None,
                     compute_time_ms: elapsed_ms,
                     registered_at: registered_at.clone(),
@@ -474,7 +483,7 @@ pub fn register_frame_set(
                         frame_id: m.frame_id,
                         current: progress_current,
                         total,
-                        status: "aligned".to_string(),
+                        status: status.to_string(),
                         matched_stars: Some(reg.matched),
                         rms_px: Some(reg.rms_px),
                         error: None,
@@ -590,6 +599,22 @@ fn filename_from_path(path: &str) -> Option<String> {
         .map(|n| n.to_string_lossy().into_owned())
 }
 
+/// Map a completed alignment's `flipped` flag to the persisted/live status
+/// string.
+///
+/// `"aligned_flipped"` stays inside the existing `status` vocabulary (an
+/// aligned variant, not a new column/state) — the registration is still
+/// valid; only the fitted transform's determinant is negative (a reflection,
+/// i.e. a meridian-flipped sub). Consumers (UI, stacking) treat it as aligned
+/// but know to mirror the frame at resample time.
+fn aligned_status(flipped: bool) -> &'static str {
+    if flipped {
+        "aligned_flipped"
+    } else {
+        "aligned"
+    }
+}
+
 /// Load a `Frame` and its on-disk path from the DB for a given `frame_id`.
 ///
 /// Mirrors the helper used by `plate_solve::commands::plate_solve.rs`.
@@ -660,4 +685,202 @@ fn load_frame_with_path(
         Ok((frame, path))
     })
     .map_err(|e| anyhow::anyhow!("Frame {frame_id} not found: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use crate::registration::db::get_registration_for_frame_set;
+    use solvemyastro::WcsSolution;
+
+    // ── synthetic fixture helpers ───────────────────────────────────────────
+    //
+    // Mirrors solvemyastro's own `register()` test fixtures (see
+    // `solvemyastro/src/register.rs::tests`) so this test exercises the real
+    // `solvemyastro::register` primitive — not a mock — with a hand-built
+    // star field, rather than requiring a real on-disk mirrored FITS frame.
+
+    /// Deterministic irregular pseudo-random star field (LCG). Grids are
+    /// pathological for quad matching — every 4-subset shares the same ratio
+    /// fingerprint — so an irregular field is required for `register` to
+    /// converge reliably.
+    fn irregular_stars(n: usize, seed: u64, width: f64, height: f64) -> Vec<(f64, f64)> {
+        let mut state = seed;
+        let mut next = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64)
+        };
+        (0..n).map(|_| (next() * width, next() * height)).collect()
+    }
+
+    /// 1"/px, no rotation, centred at (ra0, dec0).
+    fn test_wcs(ra0: f64, dec0: f64) -> WcsSolution {
+        let s = 1.0 / 3600.0;
+        WcsSolution {
+            crpix: (2000.0, 1500.0),
+            crval: (ra0, dec0),
+            cd: [[-s, 0.0], [0.0, s]],
+            sip_forward: None,
+            sip_reverse: None,
+        }
+    }
+
+    /// Invert a similarity transform `(a1,b1,c1,a2,b2,c2)` mapping sub→ref:
+    /// given `ref_pts`, return the sub-frame coordinates that map to them.
+    fn invert_similarity(
+        a1: f64,
+        b1: f64,
+        c1: f64,
+        a2: f64,
+        b2: f64,
+        c2: f64,
+        ref_pts: &[(f64, f64)],
+    ) -> Vec<(f64, f64)> {
+        let det = a1 * b2 - b1 * a2;
+        let inv = 1.0 / det;
+        ref_pts
+            .iter()
+            .map(|&(rx, ry)| {
+                let dx = rx - c1;
+                let dy = ry - c2;
+                let sx = inv * (b2 * dx - b1 * dy);
+                let sy = inv * (-a2 * dx + a1 * dy);
+                (sx, sy)
+            })
+            .collect()
+    }
+
+    /// Build a (ref_wcs, ref_pts, sub_pts) fixture: 40-star irregular field,
+    /// a known 2°-rotation + 0.3%-scale + small-translation sub→ref
+    /// transform. `mirror` additionally reflects the sub detections about
+    /// the frame width to simulate a meridian-flipped sub, exactly like
+    /// solvemyastro's `mirrored_frame_sets_flipped_flag` test.
+    fn build_fixture(mirror: bool) -> (WcsSolution, Vec<(f64, f64)>, Vec<(f64, f64)>) {
+        let width = 4096.0;
+        let height = 3072.0;
+        let ref_wcs = test_wcs(83.0, -5.0);
+        let ref_pts = irregular_stars(40, 0x1234_5678_9ABC_DEF0, width, height);
+
+        let theta = 2.0_f64.to_radians();
+        let s = 1.003_f64;
+        let (sin_t, cos_t) = (theta.sin(), theta.cos());
+        let sub_pts = invert_similarity(
+            s * cos_t,
+            -s * sin_t,
+            5.0,
+            s * sin_t,
+            s * cos_t,
+            -3.0,
+            &ref_pts,
+        );
+
+        let sub_pts = if mirror {
+            sub_pts.iter().map(|&(x, y)| (width - 1.0 - x, y)).collect()
+        } else {
+            sub_pts
+        };
+
+        (ref_wcs, ref_pts, sub_pts)
+    }
+
+    #[test]
+    fn aligned_status_maps_flip_flag() {
+        assert_eq!(aligned_status(false), "aligned");
+        assert_eq!(aligned_status(true), "aligned_flipped");
+    }
+
+    /// A meridian-flipped sub (mirrored detections, real `solvemyastro::register`
+    /// call) must persist `status = "aligned_flipped"` through the exact
+    /// `RegistrationRecord` / `upsert_registration` path used by
+    /// `register_frame_set`'s two "aligned" sites.
+    #[test]
+    fn flipped_registration_persists_aligned_flipped_status() {
+        let (ref_wcs, ref_pts, mirrored_sub_pts) = build_fixture(true);
+
+        let cfg = SolveConfig::default();
+        let reg = solvemyastro::register(&ref_wcs, &ref_pts, &mirrored_sub_pts, &cfg)
+            .expect("register should succeed on a mirrored (meridian-flipped) synthetic field");
+        assert!(reg.flipped, "fixture must produce a flipped registration");
+
+        let status = aligned_status(reg.flipped);
+        assert_eq!(status, "aligned_flipped");
+
+        // Persist through the real DB helper, exactly like the service does
+        // at its "aligned" sites, and read it back.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, created_at)
+             VALUES (1, '/x/ref.fits', 'ref.fits', 0, '2025-01-01', 'FITS', '2025-01-01'),
+                    (2, '/x/sub.fits', 'sub.fits', 0, '2025-01-01', 'FITS', '2025-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp) VALUES (1, 1, 'LIGHT'), (2, 2, 'LIGHT')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (10, 'TestSet')",
+            [],
+        )
+        .unwrap();
+
+        let rec = RegistrationRecord {
+            id: None,
+            frames_set_id: 10,
+            frame_id: 2,
+            reference_frame_id: 1,
+            is_reference: false,
+            crpix1: Some(reg.refined_wcs.crpix.0),
+            crpix2: Some(reg.refined_wcs.crpix.1),
+            crval1: Some(reg.refined_wcs.crval.0),
+            crval2: Some(reg.refined_wcs.crval.1),
+            cd1_1: Some(reg.refined_wcs.cd[0][0]),
+            cd1_2: Some(reg.refined_wcs.cd[0][1]),
+            cd2_1: Some(reg.refined_wcs.cd[1][0]),
+            cd2_2: Some(reg.refined_wcs.cd[1][1]),
+            affine_a1: Some(reg.transform.a1),
+            affine_b1: Some(reg.transform.b1),
+            affine_c1: Some(reg.transform.c1),
+            affine_a2: Some(reg.transform.a2),
+            affine_b2: Some(reg.transform.b2),
+            affine_c2: Some(reg.transform.c2),
+            matched_stars: reg.matched as i64,
+            rms_residual_px: reg.rms_px,
+            rms_residual_arcsec: None,
+            status: status.to_string(),
+            error: None,
+            compute_time_ms: 0,
+            registered_at: "2026-01-01 00:00:00".to_string(),
+        };
+        upsert_registration(&conn, &rec).unwrap();
+
+        let rows = get_registration_for_frame_set(&conn, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "aligned_flipped",
+            "persisted status must be aligned_flipped for a flipped registration"
+        );
+    }
+
+    /// The unmodified (non-mirrored) fixture must still map to plain
+    /// "aligned" — the flip flag must not fire spuriously.
+    #[test]
+    fn non_flipped_registration_maps_to_aligned_status() {
+        let (ref_wcs, ref_pts, sub_pts) = build_fixture(false);
+
+        let cfg = SolveConfig::default();
+        let reg = solvemyastro::register(&ref_wcs, &ref_pts, &sub_pts, &cfg)
+            .expect("register should succeed on the non-mirrored synthetic field");
+        assert!(
+            !reg.flipped,
+            "non-mirrored fixture must not be flagged as flipped"
+        );
+        assert_eq!(aligned_status(reg.flipped), "aligned");
+    }
 }
