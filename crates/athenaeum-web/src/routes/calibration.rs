@@ -7,7 +7,6 @@ use athenaeum_core::calibration::scan_integration::{
     create_calibration_sets_from_scan_with_masters, MasterFrameIds,
 };
 use athenaeum_core::db;
-use athenaeum_core::db::calibration_links;
 use athenaeum_core::calibration::CalibrationMatchingConfig;
 use athenaeum_core::models::CalibrationTolerance;
 use axum::{extract::State, http::StatusCode, Json};
@@ -78,34 +77,6 @@ pub async fn get_equipment_cameras(
     Ok(Json(cameras))
 }
 
-/// POST /api/create_dark_library
-///
-/// Build calibration sets for a camera's dark frames using configured thresholds.
-pub async fn create_dark_library(
-    State(state): State<WebAppState>,
-    Json(args): Json<InstrumeArgs>,
-) -> Result<Json<athenaeum_core::models::DarkLibraryResult>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let date_threshold = state.ctx.settings
-        .get_dark_library_date_threshold(&conn)
-        .map_err(db_err)?;
-
-    let temp_threshold = state.ctx.settings
-        .get_dark_library_temp_threshold(&conn)
-        .map_err(db_err)?;
-
-    let result = calibration::create_dark_library(
-        &conn,
-        &args.instrume,
-        date_threshold,
-        temp_threshold,
-    ).map_err(db_err)?;
-
-    Ok(Json(result))
-}
-
 /// POST /api/get_dark_library
 ///
 /// Retrieve existing dark calibration sets for a camera.
@@ -118,20 +89,6 @@ pub async fn get_dark_library(
 
     let sets = db::get_camera_dark_library(&conn, &args.instrume).map_err(db_err)?;
     Ok(Json(sets))
-}
-
-/// POST /api/delete_dark_library
-///
-/// Delete all dark calibration sets for a camera.
-pub async fn delete_dark_library(
-    State(state): State<WebAppState>,
-    Json(args): Json<InstrumeArgs>,
-) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    db::delete_camera_dark_library(&conn, &args.instrume).map_err(db_err)?;
-    Ok(Json(()))
 }
 
 /// POST /api/has_dark_library
@@ -476,22 +433,6 @@ pub async fn find_calibration_for_frame_set(
         "Calibration processing complete: {} frames, {} with full calibration",
         stats.total_frames, stats.frames_with_full_calibration,
     );
-
-    Ok(Json(stats))
-}
-
-/// POST /api/get_calibration_status
-///
-/// Return calibration link statistics for a frame set.
-pub async fn get_calibration_status(
-    State(state): State<WebAppState>,
-    Json(args): Json<FrameSetIdArgs>,
-) -> Result<Json<athenaeum_core::models::CalibrationStats>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db.conn();
-
-    let stats = calibration_links::get_calibration_statistics(&conn, args.frame_set_id)
-        .map_err(db_err)?;
 
     Ok(Json(stats))
 }

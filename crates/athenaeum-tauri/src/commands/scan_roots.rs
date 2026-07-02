@@ -279,28 +279,6 @@ pub async fn relink_scan_root(
     Ok(result)
 }
 
-/// Check if a scan root directory is available/accessible
-#[tauri::command]
-pub async fn check_scan_root_availability(
-    root_id: i64,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Get scan root path
-    let path: String = conn
-        .query_row(
-            "SELECT path FROM scan_roots WHERE id = ?1",
-            rusqlite::params![root_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Failed to get scan root: {}", e))?;
-
-    // Check if path exists
-    Ok(std::path::Path::new(&path).exists())
-}
-
 /// Check availability of all scan roots
 #[tauri::command]
 pub async fn check_all_scan_roots_availability(
@@ -618,13 +596,4 @@ pub async fn cancel_scan(
     } else {
         Err("No active scan for this root".to_string())
     }
-}
-
-/// Get list of active scan root IDs
-#[tauri::command]
-pub async fn get_active_scans(
-    state: State<'_, AppState>,
-) -> Result<Vec<i64>, String> {
-    let scans = state.ctx.active_scans.lock().unwrap();
-    Ok(scans.keys().cloned().collect())
 }

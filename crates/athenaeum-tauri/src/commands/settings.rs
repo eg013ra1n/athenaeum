@@ -1,7 +1,6 @@
 // Settings commands - application configuration
 
 use crate::db;
-use crate::models::Setting;
 use crate::settings;
 use std::sync::Arc;
 use tauri::State;
@@ -56,15 +55,6 @@ pub async fn set_setting(
     Ok(())
 }
 
-/// Get all settings from database
-#[tauri::command]
-pub async fn get_all_settings(state: State<'_, AppState>) -> Result<Vec<Setting>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::get_all_settings(&conn).map_err(|e| e.to_string())
-}
-
 /// Delete a setting by key
 #[tauri::command]
 pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(), String> {
@@ -72,17 +62,6 @@ pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(
     let conn = db.conn();
 
     db::delete_setting(&conn, &key).map_err(|e| e.to_string())
-}
-
-/// Get the grouping threshold in degrees (with unit conversion)
-#[tauri::command]
-pub async fn get_grouping_threshold_deg(state: State<'_, AppState>) -> Result<f64, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    state.ctx.settings
-        .get_grouping_threshold_deg(&conn)
-        .map_err(|e| e.to_string())
 }
 
 /// Set the number of concurrent blink image processing threads.

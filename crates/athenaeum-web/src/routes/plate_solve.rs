@@ -147,41 +147,6 @@ pub async fn reset_plate_solve_config(
     Ok(Json(default_config))
 }
 
-pub async fn plate_solve_frame(
-    State(state): State<WebAppState>,
-    Json(args): Json<FrameIdArgs>,
-) -> Result<Json<storage::PlateSolveRecord>, (StatusCode, String)> {
-    let db = state.ctx.db.get().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let conn = db.conn();
-    let ps_config = config::load_config(&conn);
-    let layer_caches = resolve_layer_caches(&state)?;
-    let layer_refs: Vec<&solvemyastro::StarCache> =
-        layer_caches.iter().map(|a| a.as_ref()).collect();
-
-    let (frame, file_path) = load_frame_with_path(&conn, args.frame_id)?;
-
-    let dso = get_dso_catalog(&state);
-    let result = service::solve_frame_layered(
-        &frame, &file_path, &conn, &layer_refs, &ps_config,
-    )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, describe_solve_failure(&e).message))?;
-
-    match service::store_result(&conn, args.frame_id, &result, dso.as_deref(), &ps_config)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    {
-        StoreOutcome::Persisted => {}
-        StoreOutcome::RejectedLowConfidence { reason } => {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, reason));
-        }
-    }
-
-    let record = storage::get_plate_solve(&conn, args.frame_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Failed to read back result".into()))?;
-
-    Ok(Json(record))
-}
-
 pub async fn plate_solve_batch(
     State(state): State<WebAppState>,
     Json(args): Json<BatchArgs>,

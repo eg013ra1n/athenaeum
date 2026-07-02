@@ -225,39 +225,6 @@ struct PlateSolveCompleteEvent {
 }
 
 #[tauri::command]
-pub async fn plate_solve_frame(
-    state: State<'_, AppState>,
-    frame_id: i64,
-) -> Result<storage::PlateSolveRecord, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    let ps_config = config::load_config(&conn);
-    let layer_caches = resolve_layer_caches(&state)?;
-    let layer_refs: Vec<&solvemyastro::StarCache> =
-        layer_caches.iter().map(|a| a.as_ref()).collect();
-    let dso = get_dso_catalog(&state);
-
-    let (frame, file_path) = load_frame_with_path(&conn, frame_id)?;
-
-    let result = service::solve_frame_layered(
-        &frame, &file_path, &conn, &layer_refs, &ps_config,
-    )
-    .map_err(|e| describe_solve_failure(&e).message)?;
-
-    match service::store_result(&conn, frame_id, &result, dso.as_deref(), &ps_config)
-        .map_err(|e| e.to_string())?
-    {
-        StoreOutcome::Persisted => {}
-        StoreOutcome::RejectedLowConfidence { reason } => return Err(reason),
-    }
-
-    storage::get_plate_solve(&conn, frame_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Failed to read back plate solve result".to_string())
-}
-
-#[tauri::command]
 pub async fn plate_solve_batch(
     app: tauri::AppHandle,
     state: State<'_, AppState>,

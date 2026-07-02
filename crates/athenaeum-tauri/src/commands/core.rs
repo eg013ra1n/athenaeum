@@ -46,11 +46,6 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
 use super::AppState;
 
 #[tauri::command]
-pub fn greet(name: &str) -> String {
-    format!("Hello, {}! Welcome to Athenaeum!", name)
-}
-
-#[tauri::command]
 pub async fn initialize_database(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -97,11 +92,6 @@ pub async fn initialize_database(
 }
 
 // ── Version / update commands ─────────────────────────────────────────────────
-
-#[tauri::command]
-pub fn get_app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
-}
 
 /// Fetch a version.json file and return parsed info, or None on failure.
 async fn fetch_version_json(

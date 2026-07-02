@@ -219,32 +219,6 @@ pub async fn get_directory_contents(
     })
 }
 
-/// Get details about orphaned files for user review
-#[tauri::command]
-pub async fn get_orphaned_files(
-    file_ids: Vec<i64>,
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::models::OrphanedFile>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    crate::relinking::get_orphaned_file_details(&conn, &file_ids)
-        .map_err(|e| format!("Failed to get orphaned file details: {}", e))
-}
-
-/// Delete orphaned files from database
-#[tauri::command]
-pub async fn delete_orphaned_files(
-    file_ids: Vec<i64>,
-    state: State<'_, AppState>,
-) -> Result<usize, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    crate::relinking::delete_orphaned_files(&conn, &file_ids)
-        .map_err(|e| format!("Failed to delete orphaned files: {}", e))
-}
-
 /// Get frame preview image as base64-encoded JPEG
 #[tauri::command]
 pub async fn get_frame_preview(
@@ -425,22 +399,6 @@ pub struct CatalogSearchHit {
     pub date_obs: Option<String>,
 }
 
-/// Lightweight summary of a queued/running file operation. Returned by
-/// `list_unfinished_file_operations`.
-#[derive(serde::Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct FileOperationSummary {
-    pub id: i64,
-    pub kind: String,
-    pub status: String,
-    pub source_root: Option<String>,
-    pub dest_dir: Option<String>,
-    pub total_files: i64,
-    pub total_bytes: i64,
-    pub created_at: String,
-    pub started_at: Option<String>,
-}
-
 /// Plan + immediately enqueue a Move operation. Returns the operation_id
 /// once the plan is committed. The actual move runs on the global queue.
 #[tauri::command]
@@ -534,110 +492,6 @@ pub async fn enqueue_move_operation(
     }
 
     Ok(op_id)
-}
-
-/// Plan + immediately enqueue a Delete operation. Permanent — no undo.
-#[tauri::command]
-pub async fn enqueue_delete_operation(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    targets: Vec<String>,
-) -> Result<i64, String> {
-    let ctx = state.ctx.clone();
-    let db = ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    let target_paths: Vec<PathBuf> = targets.iter().map(PathBuf::from).collect();
-    let plan = fplan::build_delete_plan(&conn, target_paths)
-        .map_err(|e| {
-            eprintln!("build_delete_plan failed: {:#}", e);
-            format!("{:#}", e)
-        })?;
-    let op_id = plan.operation_id;
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-
-    let ctx_for_worker = ctx.clone();
-    let app_for_emitter = app.clone();
-    let cancel_for_worker = cancel_flag.clone();
-    ctx.operation_queue.enqueue(QueuedJob {
-        kind: OperationKind::FileOpDelete,
-        operation_id: op_id,
-        run: Box::new(move || {
-            let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
-            let db = ctx_for_worker.db.get().expect("db");
-            let conn = db.conn();
-            let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
-            let outcome = match result {
-                Ok(()) => "completed",
-                Err(e) => {
-                    if fexec::was_cancelled(&e) {
-                        let _ = fdb::update_operation_status(
-                            &conn, op_id, FileOpStatus::Cancelled, None,
-                        );
-                        "cancelled"
-                    } else {
-                        eprintln!("file_op {} failed: {:#}", op_id, e);
-                        let msg = format!("{:#}", e);
-                        let _ = fdb::update_operation_status(
-                            &conn, op_id, FileOpStatus::Failed, Some(&msg),
-                        );
-                        "failed"
-                    }
-                }
-            };
-            athenaeum_core::events::emit_event(
-                &emitter,
-                "file-op-finished",
-                &serde_json::json!({ "operation_id": op_id, "outcome": outcome, "kind": "delete" }),
-            );
-        }),
-    });
-
-    {
-        use athenaeum_core::services::ArchiveHandle;
-        let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag });
-    }
-
-    Ok(op_id)
-}
-
-#[tauri::command]
-pub async fn cancel_file_operation(
-    state: State<'_, AppState>,
-    operation_id: i64,
-) -> Result<(), String> {
-    let map = state.ctx.active_archives.lock().unwrap();
-    if let Some(handle) = map.get(&operation_id) {
-        handle.cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    } else {
-        Err(format!("no active file operation with id {}", operation_id))
-    }
-}
-
-#[tauri::command]
-pub async fn list_unfinished_file_operations(
-    state: State<'_, AppState>,
-) -> Result<Vec<FileOperationSummary>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    let ops = fdb::list_unfinished_operations(&conn).map_err(|e| e.to_string())?;
-    Ok(ops
-        .into_iter()
-        .map(|o| FileOperationSummary {
-            id: o.id,
-            kind: o.kind,
-            status: o.status,
-            source_root: o.source_root,
-            dest_dir: o.dest_dir,
-            total_files: o.total_files,
-            total_bytes: o.total_bytes,
-            created_at: o.created_at,
-            started_at: o.started_at,
-        })
-        .collect())
 }
 
 /// Free-text catalog search across all scan roots. Returns up to `limit`

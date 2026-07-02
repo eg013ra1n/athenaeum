@@ -53,7 +53,6 @@ pub use frame_sets::*;
 pub use calibration::*;
 pub use duplicates::*;
 pub use missing_files::*;
-pub use cache::*;
 pub use spatial::*;
 pub use calendar::*;
 pub use export::*;

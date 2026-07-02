@@ -304,56 +304,6 @@ pub async fn cancel_analysis(
     }
 }
 
-/// Analyze a single frame.
-#[tauri::command]
-pub async fn analyze_single_frame(
-    state: State<'_, AppState>,
-    frame_id: i64,
-) -> Result<FrameAnalysis, String> {
-    let (analysis_config, file_id, path) = {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        let conn = db.conn();
-
-        let analysis_config = config::load_config(&conn);
-
-        let (file_id, path): (i64, String) = conn.query_row(
-            "SELECT fi.id, fi.path FROM frames f
-             INNER JOIN files fi ON fi.id = f.file_id
-             WHERE f.id = ?1",
-            rusqlite::params![frame_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).map_err(|e| format!("Frame not found: {}", e))?;
-
-        (analysis_config, file_id, path)
-    };
-
-    let pool = Arc::clone(&state.ctx.image_pool);
-    let img_analyzer = analyzer::build_analyzer(&analysis_config, Some(Arc::clone(&pool)));
-    let config_hash = analysis_config.config_hash();
-    let path_owned = path.clone();
-
-    let (mut analysis, stars, _) = tokio::task::spawn_blocking(move || {
-        analyzer::analyze_frame(&path_owned, &img_analyzer, &config_hash)
-    }).await
-        .map_err(|e| format!("Analysis panicked: {}", e))?
-        .map_err(|e| format!("Analysis failed: {}", e))?;
-
-    analysis.frame_id = frame_id;
-    analysis.file_id = file_id;
-
-    // Persist analysis + stars
-    {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        let conn = db.conn();
-        let analysis_id = db_analysis::upsert_frame_analysis(&conn, &analysis)
-            .map_err(|e| e.to_string())?;
-        db_analysis::upsert_star_metrics(&conn, analysis_id, &stars)
-            .map_err(|e| e.to_string())?;
-    }
-
-    Ok(analysis)
-}
-
 /// Get all stored analysis results for a frame set.
 #[tauri::command]
 pub async fn get_analysis_for_frame_set(
@@ -363,18 +313,6 @@ pub async fn get_analysis_for_frame_set(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
     db_analysis::get_frame_analyses_for_frame_set(&conn, frame_set_id)
-        .map_err(|e| e.to_string())
-}
-
-/// Delete all analysis results for a frame set.
-#[tauri::command]
-pub async fn delete_analysis_for_frame_set(
-    state: State<'_, AppState>,
-    frame_set_id: i64,
-) -> Result<usize, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    db_analysis::delete_analyses_for_frame_set(&conn, frame_set_id)
         .map_err(|e| e.to_string())
 }
 

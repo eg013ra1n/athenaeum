@@ -15,7 +15,6 @@ use athenaeum_core::registration::db::{
     get_registration_for_frame_set, RegistrationRecord,
 };
 use athenaeum_core::registration::{
-    clear_frame_set_reference as core_clear_frame_set_reference,
     get_frame_set_reference as core_get_frame_set_reference,
     set_frame_set_reference as core_set_frame_set_reference,
     FrameSetReference,
@@ -157,14 +156,3 @@ pub async fn get_frame_set_reference(
         .map_err(|e| e.to_string())
 }
 
-/// Remove the persisted user-chosen reference for a frame set.
-#[tauri::command]
-pub async fn clear_frame_set_reference(
-    state: State<'_, AppState>,
-    frames_set_id: i64,
-) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-    core_clear_frame_set_reference(&conn, frames_set_id)
-        .map_err(|e| e.to_string())
-}

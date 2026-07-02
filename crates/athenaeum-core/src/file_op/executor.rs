@@ -20,7 +20,7 @@ use crate::duplicates::compute_xxhash;
 use crate::events::{emit_event, ProgressEmitter};
 use crate::file_op::db as fdb;
 use crate::file_op::models::{
-    FileDisposition, FileOpKind, FileOpProgress, FileOpStage, FileOpStatus, FileOperationFile,
+    FileDisposition, FileOpProgress, FileOpStage, FileOpStatus, FileOperationFile,
     MoveStrategy, StepStatus,
 };
 use anyhow::{Context, Result};
@@ -47,6 +47,12 @@ pub fn was_cancelled(err: &anyhow::Error) -> bool {
 }
 
 /// Run a planned operation. Caller must have already persisted it via the planner.
+///
+/// Only `"move"` is executable — user-facing Delete goes through Black Hole
+/// (`send_to_void`/`bulk_move_to_black_hole`), which never constructs a
+/// `file_operations` row of kind `"delete"`. A historical `"delete"` row
+/// (from before that cutover) fails loudly here instead of silently running
+/// a deleted code path.
 pub fn run_operation(
     conn: &Connection,
     operation_id: i64,
@@ -54,24 +60,22 @@ pub fn run_operation(
     emitter: &dyn ProgressEmitter,
 ) -> Result<()> {
     let op = fdb::get_operation(conn, operation_id)?;
-    let kind = match op.kind.as_str() {
-        "move" => FileOpKind::Move,
-        "delete" => FileOpKind::Delete,
+    match op.kind.as_str() {
+        "move" => {}
+        "delete" => {
+            return Err(anyhow::anyhow!(
+                "file_operations.kind 'delete' is no longer executable (operation_id={}); user-facing Delete goes through Black Hole",
+                operation_id
+            ));
+        }
         other => return Err(anyhow::anyhow!("unknown file_operations.kind: {}", other)),
-    };
+    }
 
     fdb::update_operation_status(conn, operation_id, FileOpStatus::Running, None)?;
     let files = fdb::list_operation_files(conn, operation_id)?;
     let total = files.len();
 
-    match kind {
-        FileOpKind::Move => {
-            run_move(conn, operation_id, &files, total, cancel, emitter)?;
-        }
-        FileOpKind::Delete => {
-            run_delete(conn, operation_id, &files, total, cancel, emitter)?;
-        }
-    }
+    run_move(conn, operation_id, &files, total, cancel, emitter)?;
 
     fdb::update_operation_status(conn, operation_id, FileOpStatus::Completed, None)?;
     Ok(())
@@ -171,112 +175,6 @@ fn run_move(
     Ok(())
 }
 
-/// Permanent delete. For each row: remove the catalog row (if any) and
-/// delete the file on disk. Empty target directories are removed at the end.
-/// No undo, no trash; this is invoked only after the UI has confirmed.
-fn run_delete(
-    conn: &Connection,
-    operation_id: i64,
-    files: &[FileOperationFile],
-    total: usize,
-    cancel: &CancelFlag,
-    emitter: &dyn ProgressEmitter,
-) -> Result<()> {
-    let commit_done = fdb::done_file_ids_for_stage(conn, operation_id, FileOpStage::CommitDelete)?;
-
-    // Two-pass: delete files first, then directories (in reverse path order
-    // so deeper dirs are removed before their parents).
-    let mut file_rows: Vec<&FileOperationFile> = Vec::new();
-    let mut dir_rows: Vec<&FileOperationFile> = Vec::new();
-    for f in files {
-        let p = std::path::Path::new(&f.source_path);
-        if p.is_dir() {
-            dir_rows.push(f);
-        } else {
-            // is_file or already-deleted
-            file_rows.push(f);
-        }
-    }
-
-    for (idx, f) in file_rows.iter().enumerate() {
-        check_cancel(cancel)?;
-        if commit_done.contains(&f.id) {
-            continue;
-        }
-        emit_progress_kind(
-            emitter,
-            "delete",
-            operation_id,
-            "commit_delete",
-            idx + 1,
-            total,
-            &format!("Deleting {}/{}", idx + 1, total),
-        );
-        fdb::update_file_disposition(conn, f.id, FileDisposition::InProgress)?;
-        let step_id = fdb::insert_step(conn, operation_id, Some(f.id), FileOpStage::CommitDelete)?;
-        fdb::update_step(conn, step_id, StepStatus::InProgress, None, None)?;
-
-        // Remove catalog row first (cascades to junction tables). Then rm file.
-        if let Some(file_id) = f.catalog_file_id {
-            if let Err(e) = conn.execute("DELETE FROM files WHERE id = ?1", [file_id]) {
-                let msg = format!("DB delete failed for file_id={}: {}", file_id, e);
-                fdb::update_step(conn, step_id, StepStatus::Failed, None, Some(&msg))?;
-                fdb::update_file_disposition(conn, f.id, FileDisposition::Failed)?;
-                anyhow::bail!(msg);
-            }
-        }
-        let p = std::path::Path::new(&f.source_path);
-        if p.exists() {
-            if let Err(e) = fs::remove_file(p) {
-                let msg = format!("rm {} failed: {}", p.display(), e);
-                fdb::update_step(conn, step_id, StepStatus::Failed, None, Some(&msg))?;
-                fdb::update_file_disposition(conn, f.id, FileDisposition::Failed)?;
-                anyhow::bail!(msg);
-            }
-        }
-        fdb::update_step(conn, step_id, StepStatus::Done, None, None)?;
-        fdb::update_file_disposition(conn, f.id, FileDisposition::Done)?;
-    }
-
-    // Sort dirs deepest-first so children are removed before parents.
-    dir_rows.sort_by(|a, b| b.source_path.len().cmp(&a.source_path.len()));
-    for f in &dir_rows {
-        check_cancel(cancel)?;
-        if commit_done.contains(&f.id) {
-            continue;
-        }
-        let step_id = fdb::insert_step(conn, operation_id, Some(f.id), FileOpStage::CommitDelete)?;
-        fdb::update_step(conn, step_id, StepStatus::InProgress, None, None)?;
-        let p = std::path::Path::new(&f.source_path);
-        if p.exists() {
-            // remove_dir succeeds only if the dir is empty — exactly what we
-            // want, since the file pass above already cleaned it.
-            if let Err(e) = fs::remove_dir(p) {
-                // Some dirs may legitimately have non-deleted siblings (e.g.
-                // user only selected some files inside). Treat dir-removal
-                // failures as warnings, not hard errors.
-                eprintln!(
-                    "skipping rmdir {} (likely non-empty): {}",
-                    p.display(),
-                    e
-                );
-                fdb::update_step(
-                    conn,
-                    step_id,
-                    StepStatus::Done,
-                    None,
-                    Some(&format!("dir not empty: {}", e)),
-                )?;
-                fdb::update_file_disposition(conn, f.id, FileDisposition::Skipped)?;
-                continue;
-            }
-        }
-        fdb::update_step(conn, step_id, StepStatus::Done, None, None)?;
-        fdb::update_file_disposition(conn, f.id, FileDisposition::Done)?;
-    }
-    Ok(())
-}
-
 /// Has this (operation, file) already had a step recorded for `stage`?
 /// Used by the cross-volume copy to distinguish a resumption (we can claim
 /// the existing dest as our partial) from a fresh op hitting a foreign file.
@@ -293,29 +191,6 @@ fn prior_step_exists(
         |r| r.get(0),
     )?;
     Ok(n > 0)
-}
-
-fn emit_progress_kind(
-    emitter: &dyn ProgressEmitter,
-    kind: &str,
-    operation_id: i64,
-    stage: &str,
-    current: usize,
-    total: usize,
-    message: &str,
-) {
-    crate::events::emit_event(
-        emitter,
-        "file-op-progress",
-        &FileOpProgress {
-            operation_id,
-            kind: kind.to_string(),
-            stage: stage.to_string(),
-            current,
-            total,
-            message: message.to_string(),
-        },
-    );
 }
 
 /// Same-volume rename + DB path update. Idempotent on resume.
@@ -681,72 +556,25 @@ mod tests {
     }
 
     #[test]
-    fn deletes_full_directory_hierarchy_including_subdirs() {
-        // /root/group/{a.fit, sub/{b.fit, deeper/{c.fit, leaf_empty/}}}
-        // After delete-by-folder, the entire tree should be gone.
-        use crate::file_op::planner::build_delete_plan;
+    fn historical_delete_kind_row_fails_loudly() {
+        // Owner decision: user-facing Delete goes through Black Hole, so the
+        // executor's delete path was removed. A `file_operations` row with
+        // kind='delete' can still exist from before that cutover (or a
+        // resumed historical op) — it must fail loudly, not silently no-op
+        // or panic.
+        use crate::file_op::models::FileOpKind;
 
         let scan_root = TempDir::new().unwrap();
         let conn = setup_with_scan_root(scan_root.path());
 
-        let group = scan_root.path().join("group");
-        let sub = group.join("sub");
-        let deeper = sub.join("deeper");
-        let leaf_empty = deeper.join("leaf_empty");
-        fs::create_dir_all(&leaf_empty).unwrap();
-        File::create(group.join("a.fit")).unwrap();
-        File::create(sub.join("b.fit")).unwrap();
-        File::create(deeper.join("c.fit")).unwrap();
-
-        let plan = build_delete_plan(&conn, vec![group.clone()]).unwrap();
+        let operation_id = fdb::insert_operation(&conn, FileOpKind::Delete, None, None).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        run_operation(&conn, plan.operation_id, &cancel, &NullEmitter).unwrap();
-
-        assert!(!group.exists(), "top-level dir should be removed");
-        assert!(!sub.exists(), "sub dir should be removed");
-        assert!(!deeper.exists(), "deeper dir should be removed");
-        assert!(!leaf_empty.exists(), "empty leaf dir should be removed");
-    }
-
-    #[test]
-    fn deletes_files_and_empty_dirs_with_catalog_sync() {
-        use crate::file_op::planner::build_delete_plan;
-
-        let scan_root = TempDir::new().unwrap();
-        let conn = setup_with_scan_root(scan_root.path());
-
-        let dir = scan_root.path().join("group");
-        fs::create_dir(&dir).unwrap();
-        let f1 = dir.join("a.fit");
-        let f2 = dir.join("b.fit");
-        File::create(&f1).unwrap();
-        File::create(&f2).unwrap();
-        // Catalog rows for both.
-        for p in [&f1, &f2] {
-            conn.execute(
-                "INSERT INTO files (path, filename, size, modified_at, format, created_at)
-                 VALUES (?1, ?2, 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
-                [&p.to_string_lossy().to_string(), &p.file_name().unwrap().to_string_lossy().to_string()],
-            ).unwrap();
-        }
-
-        let plan = build_delete_plan(&conn, vec![dir.clone()]).unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
-        run_operation(&conn, plan.operation_id, &cancel, &NullEmitter).unwrap();
-
-        assert!(!f1.exists() && !f2.exists(), "files should be gone");
-        assert!(!dir.exists(), "empty directory should be removed");
-
-        let dir_prefix = format!("{}/", dir.to_string_lossy());
-        let dir_hi = crate::db::path_prefix_upper(&dir_prefix);
-        let row_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)",
-                rusqlite::params![dir_prefix, dir_hi],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(row_count, 0, "catalog rows should be removed");
+        let err = run_operation(&conn, operation_id, &cancel, &NullEmitter).unwrap_err();
+        assert!(
+            format!("{}", err).contains("no longer executable"),
+            "expected explicit 'no longer executable' error, got: {}",
+            err
+        );
     }
 
     #[test]

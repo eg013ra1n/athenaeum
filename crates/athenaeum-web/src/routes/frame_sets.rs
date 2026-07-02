@@ -47,13 +47,6 @@ pub struct MergeFrameSetsArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CanSplitArgs {
-    pub source_set_id: i64,
-    pub selection: athenaeum_core::models::SplitSelection,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SplitFrameSetArgs {
     pub source_set_id: i64,
     pub selection: athenaeum_core::models::SplitSelection,
@@ -61,30 +54,9 @@ pub struct SplitFrameSetArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateCustomFramesSetArgs {
-    pub name: String,
-    pub session_ids: Vec<i64>,
-}
-
-#[derive(Deserialize)]
 pub struct CreateFrameSetFromSelectionArgs {
     pub name: String,
     pub frame_ids: Vec<i64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateFrameSetFromExcludedArgs {
-    pub file_ids: Vec<i64>,
-    pub name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateFrameSetFlatPatternArgs {
-    pub frames_set_id: i64,
-    pub flat_pattern: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -492,47 +464,6 @@ pub async fn mark_frame_set_custom(
     Ok(Json(frames_set))
 }
 
-/// Recalculate and persist frame set metadata from its current member frames.
-pub async fn recalculate_frame_set_metadata(
-    State(state): State<WebAppState>,
-    Json(args): Json<FrameSetIdArgs>,
-) -> Result<Json<athenaeum_core::models::FramesSet>, (StatusCode, String)> {
-    use athenaeum_core::db;
-
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_for_frame_set(
-        args.frames_set_id,
-        &conn,
-    )
-    .map_err(|e| db_err(format!("Failed to calculate metadata: {}", e)))?;
-
-    db::update_frames_set_metadata(
-        &conn,
-        args.frames_set_id,
-        metadata.date_obs_start.as_deref(),
-        metadata.date_obs_end.as_deref(),
-        metadata.objctra.as_deref(),
-        metadata.objctdec.as_deref(),
-        metadata.total_exp_time,
-        true, // mark as custom after manual recalculation
-        metadata.avg_rotation,
-        metadata.min_rotation,
-        metadata.max_rotation,
-    )
-    .map_err(db_err)?;
-
-    let sets = db::get_frames_sets_by_project(&conn, 1).map_err(db_err)?;
-    let frames_set = sets
-        .into_iter()
-        .find(|(set, _)| set.id == Some(args.frames_set_id))
-        .ok_or_else(|| db_err("Frame set not found"))?
-        .0;
-
-    Ok(Json(frames_set))
-}
-
 /// Merge source frame set into target frame set; source is deleted afterwards.
 pub async fn merge_frame_sets(
     State(state): State<WebAppState>,
@@ -625,51 +556,6 @@ pub async fn merge_frame_sets(
     let conn = db_ref.conn();
     let detail = load_frame_set_detail(&conn, args.target_id).map_err(db_err)?;
     Ok(Json(detail))
-}
-
-/// Check whether the given selection can be split out of its source set
-/// (i.e. the split would not leave the source empty).
-pub async fn can_split(
-    State(state): State<WebAppState>,
-    Json(args): Json<CanSplitArgs>,
-) -> Result<Json<bool>, (StatusCode, String)> {
-    use athenaeum_core::db;
-    use athenaeum_core::models::SplitSelection;
-
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let all_nights = db::get_imaging_nights_for_set(&conn, args.source_set_id).map_err(db_err)?;
-
-    let result = match args.selection {
-        SplitSelection::Nights { ref ids } => ids.len() < all_nights.len(),
-        SplitSelection::Sessions { ref ids } => {
-            let mut total = 0;
-            for night in &all_nights {
-                if let Some(night_id) = night.id {
-                    let sessions = db::get_sessions_for_night(&conn, night_id).map_err(db_err)?;
-                    total += sessions.len();
-                }
-            }
-            ids.len() < total
-        }
-        SplitSelection::Frames { ref ids } => {
-            let total: i64 = conn
-                .query_row(
-                    "SELECT COUNT(DISTINCT sm.frame_id)
-                     FROM session_members sm
-                     JOIN sessions s ON sm.session_id = s.id
-                     JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
-                     WHERE in_tbl.frames_set_id = ?1",
-                    [args.source_set_id],
-                    |row| row.get(0),
-                )
-                .map_err(db_err)?;
-            ids.len() < total as usize
-        }
-    };
-
-    Ok(Json(result))
 }
 
 /// Split the selected items out of a frame set into a new frame set.
@@ -876,116 +762,6 @@ pub async fn split_frame_set(
     Ok(Json(detail))
 }
 
-/// Create a custom frame set from a list of existing sessions (by cloning them).
-pub async fn create_custom_frames_set(
-    State(state): State<WebAppState>,
-    Json(args): Json<CreateCustomFramesSetArgs>,
-) -> Result<Json<i64>, (StatusCode, String)> {
-    use athenaeum_core::db;
-
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    // Collect frames for each selected session.
-    let mut all_session_frames: Vec<(i64, Vec<(i64, athenaeum_core::models::File, athenaeum_core::models::Frame)>)> = Vec::new();
-    for &session_id in &args.session_ids {
-        let frame_ids = db::get_frame_ids_for_session(&conn, session_id).map_err(db_err)?;
-        if !frame_ids.is_empty() {
-            let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids).map_err(db_err)?;
-            all_session_frames.push((session_id, frames));
-        }
-    }
-
-    if all_session_frames.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "No frames found in selected sessions".to_string(),
-        ));
-    }
-
-    let gap_threshold_hours: f64 = state
-        .ctx
-        .settings
-        .get_session_gap_threshold_hours(&conn)
-        .unwrap_or(6.0);
-
-    let mut session_frame_map: std::collections::HashMap<
-        i64,
-        Vec<(i64, athenaeum_core::models::File, athenaeum_core::models::Frame)>,
-    > = std::collections::HashMap::new();
-    let mut all_frames = Vec::new();
-    let mut all_frame_ids = Vec::new();
-
-    for (session_id, frames) in all_session_frames {
-        for (_, _, frame) in &frames {
-            if let Some(frame_id) = frame.id {
-                all_frame_ids.push(frame_id);
-            }
-        }
-        session_frame_map.insert(session_id, frames.clone());
-        all_frames.extend(frames);
-    }
-
-    let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_from_frame_ids(
-        &all_frame_ids,
-        &conn,
-    )
-    .map_err(db_err)?;
-
-    let detected_nights = athenaeum_core::sessions::detect_sessions(all_frames, gap_threshold_hours)
-        .map_err(db_err)?;
-
-    if detected_nights.is_empty() {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "No imaging nights could be detected from the selected sessions. Frames may be missing date/time information.".to_string(),
-        ));
-    }
-
-    let set_id = db::create_frames_set(
-        &conn,
-        Some(&args.name),
-        true, // is_custom
-        metadata.date_obs_start.as_deref(),
-        metadata.date_obs_end.as_deref(),
-        metadata.objctra.as_deref(),
-        metadata.objctdec.as_deref(),
-        metadata.total_exp_time,
-        metadata.avg_rotation,
-        metadata.min_rotation,
-        metadata.max_rotation,
-    )
-    .map_err(db_err)?;
-
-    for night in &detected_nights {
-        let night_id = db::create_imaging_night(&conn, set_id, &night.start_time, &night.end_time)
-            .map_err(db_err)?;
-
-        for &session_id in &args.session_ids {
-            if let Some(session_frames) = session_frame_map.get(&session_id) {
-                let session_frame_ids: std::collections::HashSet<i64> =
-                    session_frames.iter().map(|(_, _, frame)| frame.id.unwrap()).collect();
-
-                let night_frame_ids: std::collections::HashSet<i64> = night
-                    .sessions
-                    .iter()
-                    .flat_map(|s| &s.frame_ids)
-                    .copied()
-                    .collect();
-
-                let intersection: Vec<i64> =
-                    session_frame_ids.intersection(&night_frame_ids).copied().collect();
-
-                if !intersection.is_empty() {
-                    db::clone_session(&conn, session_id, night_id).map_err(db_err)?;
-                }
-            }
-        }
-    }
-
-    Ok(Json(set_id))
-}
-
 /// Create a custom frame set from a direct list of frame IDs.
 pub async fn create_frame_set_from_selection(
     State(state): State<WebAppState>,
@@ -1000,74 +776,7 @@ pub async fn create_frame_set_from_selection(
     Ok(Json(set_id))
 }
 
-/// Create a custom frame set from the excluded-frames list, then remove those
-/// entries from the excluded table.
-pub async fn create_frame_set_from_excluded(
-    State(state): State<WebAppState>,
-    Json(args): Json<CreateFrameSetFromExcludedArgs>,
-) -> Result<Json<i64>, (StatusCode, String)> {
-    use athenaeum_core::db;
-
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let frame_ids = db::get_frame_ids_for_file_ids(&conn, &args.file_ids).map_err(db_err)?;
-
-    if frame_ids.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "No frames found for the selected files".to_string(),
-        ));
-    }
-
-    // Ensure every frame has an imagetyp so session detection works.
-    let placeholders: String = args.file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "UPDATE frames SET imagetyp = 'Light' WHERE file_id IN ({}) AND (imagetyp IS NULL OR imagetyp = '')",
-        placeholders
-    );
-    let params: Vec<rusqlite::types::Value> = args
-        .file_ids
-        .iter()
-        .map(|id| rusqlite::types::Value::Integer(*id))
-        .collect();
-    conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
-        .map_err(db_err)?;
-
-    let set_id = create_frame_set_inner(&conn, &args.name, &frame_ids, &state.ctx.settings)
-        .map_err(db_err)?;
-
-    db::delete_excluded_frames_by_file_ids(&conn, &args.file_ids).map_err(db_err)?;
-
-    Ok(Json(set_id))
-}
-
 // ── Excluded frames ───────────────────────────────────────────────────────────
-
-#[derive(serde::Serialize)]
-pub struct ReclassifyResult {
-    pub frames_updated: usize,
-    pub cameras_refreshed: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReclassifyExcludedFramesArgs {
-    pub file_ids: Vec<i64>,
-    pub new_imagetyp: String,
-}
-
-/// Get all excluded frames with file paths.
-pub async fn get_excluded_frames(
-    State(state): State<WebAppState>,
-    Json(_): Json<serde_json::Value>,
-) -> Result<Json<Vec<athenaeum_core::models::ExcludedFrameEntry>>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let entries = athenaeum_core::db::get_excluded_frames(&conn).map_err(db_err)?;
-    Ok(Json(entries))
-}
 
 /// Get all excluded frames with full file + frame metadata. Drives the
 /// Excluded Frames page's Missing-Metadata-style repair toolbar.
@@ -1114,123 +823,6 @@ pub async fn get_excluded_frames_count(
     Ok(Json(count))
 }
 
-/// Reclassify excluded frames to a new image type, remove from excluded list,
-/// and refresh calibration libraries.
-pub async fn reclassify_excluded_frames(
-    State(state): State<WebAppState>,
-    Json(args): Json<ReclassifyExcludedFramesArgs>,
-) -> Result<Json<ReclassifyResult>, (StatusCode, String)> {
-    use athenaeum_core::db;
-
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    let (frames_updated, cameras) =
-        db::reclassify_excluded_frames(&conn, &args.file_ids, &args.new_imagetyp)
-            .map_err(|e| db_err(format!("Failed to reclassify frames: {}", e)))?;
-
-    eprintln!(
-        "Reclassified {} frames, affected cameras: {:?}",
-        frames_updated, cameras
-    );
-
-    // Refresh calibration library for each affected camera using the same
-    // inline logic from calibration.rs (clear memberships, re-cluster, prune)
-    for camera in &cameras {
-        if let Err(e) = refresh_calibration_for_camera(&conn, camera) {
-            eprintln!(
-                "Warning: failed to refresh calibration library for {}: {}",
-                camera, e
-            );
-        }
-    }
-
-    Ok(Json(ReclassifyResult {
-        frames_updated,
-        cameras_refreshed: cameras,
-    }))
-}
-
-/// Refresh calibration library for a single camera (same logic as calibration.rs handler).
-fn refresh_calibration_for_camera(
-    conn: &rusqlite::Connection,
-    instrume: &str,
-) -> Result<(), String> {
-    use athenaeum_core::calibration::scan_integration::{
-        create_calibration_sets_from_scan_with_masters, MasterFrameIds,
-    };
-
-    conn.execute(
-        "DELETE FROM calibration_set_frames
-         WHERE set_id IN (
-             SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0
-         )",
-        rusqlite::params![instrume],
-    )
-    .map_err(|e| format!("Failed to clear frame memberships: {}", e))?;
-
-    conn.execute(
-        "UPDATE calibration_set SET frame_count = 0
-         WHERE instrume = ?1 AND is_master_library = 0",
-        rusqlite::params![instrume],
-    )
-    .map_err(|e| format!("Failed to reset frame counts: {}", e))?;
-
-    let query_ids = |imagetyp: &str| -> Result<Vec<i64>, String> {
-        let mut stmt = conn
-            .prepare("SELECT id FROM frames WHERE instrume = ?1 AND UPPER(imagetyp) = UPPER(?2)")
-            .map_err(|e| e.to_string())?;
-        let ids = stmt.query_map([instrume, imagetyp], |row| row.get(0))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok(ids)
-    };
-
-    let flat_ids = query_ids("FLAT")?;
-    let dark_ids = query_ids("DARK")?;
-    let bias_ids = query_ids("BIAS")?;
-    let darkflat_ids = query_ids("DARKFLAT")?;
-    let master_frame_ids = MasterFrameIds {
-        master_dark_ids: query_ids("MASTERDARK")?,
-        master_flat_ids: query_ids("MASTERFLAT")?,
-        master_bias_ids: query_ids("MASTERBIAS")?,
-        master_darkflat_ids: query_ids("MASTERDARKFLAT")?,
-    };
-
-    create_calibration_sets_from_scan_with_masters(
-        conn, flat_ids, dark_ids, bias_ids, darkflat_ids, master_frame_ids,
-    )
-    .map_err(|e| format!("Failed to create calibration sets: {}", e))?;
-
-    conn.execute(
-        "DELETE FROM calibration_set
-         WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0",
-        rusqlite::params![instrume],
-    )
-    .map_err(|e| format!("Failed to delete orphaned sets: {}", e))?;
-
-    Ok(())
-}
-
-/// Store the flat_pattern preference for a frame set.
-pub async fn update_frame_set_flat_pattern(
-    State(state): State<WebAppState>,
-    Json(args): Json<UpdateFrameSetFlatPatternArgs>,
-) -> Result<Json<()>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    athenaeum_core::db::update_frames_set_flat_pattern(
-        &conn,
-        args.frames_set_id,
-        args.flat_pattern.as_deref(),
-    )
-    .map_err(db_err)?;
-
-    Ok(Json(()))
-}
-
 /// Archive a frame set.
 pub async fn archive_frame_set(
     State(state): State<WebAppState>,
@@ -1240,18 +832,6 @@ pub async fn archive_frame_set(
     let conn = db_ref.conn();
 
     athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, true).map_err(db_err)?;
-    Ok(Json(()))
-}
-
-/// Unarchive a frame set.
-pub async fn unarchive_frame_set(
-    State(state): State<WebAppState>,
-    Json(args): Json<FrameSetIdArgs>,
-) -> Result<Json<()>, (StatusCode, String)> {
-    let db_ref = state.ctx.db.get().ok_or_else(no_db)?;
-    let conn = db_ref.conn();
-
-    athenaeum_core::db::set_frame_set_archived(&conn, args.frames_set_id, false).map_err(db_err)?;
     Ok(Json(()))
 }
 

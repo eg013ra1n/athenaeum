@@ -26,7 +26,6 @@ use std::thread;
 pub enum OperationKind {
     ZipArchive,
     FileOpMove,
-    FileOpDelete,
     /// Auto-reconcile abandoned cross-volume Move commits
     /// (`file_op::reconcile::reconcile_abandoned_commit_moves`). Enqueued
     /// once at startup and does not correspond to a `file_operations` row —
@@ -39,7 +38,6 @@ impl OperationKind {
         match self {
             OperationKind::ZipArchive => "zip_archive",
             OperationKind::FileOpMove => "file_op_move",
-            OperationKind::FileOpDelete => "file_op_delete",
             OperationKind::FileOpReconcile => "file_op_reconcile",
         }
     }

@@ -542,36 +542,11 @@ pub struct CatalogSearchHit {
     pub date_obs: Option<String>,
 }
 
-#[derive(serde::Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct FileOperationSummary {
-    pub id: i64,
-    pub kind: String,
-    pub status: String,
-    pub source_root: Option<String>,
-    pub dest_dir: Option<String>,
-    pub total_files: i64,
-    pub total_bytes: i64,
-    pub created_at: String,
-    pub started_at: Option<String>,
-}
-
 #[derive(serde::Deserialize)]
 pub struct EnqueueMoveArgs {
     pub sources: Vec<String>,
     #[serde(rename = "destDir")]
     pub dest_dir: String,
-}
-
-#[derive(serde::Deserialize)]
-pub struct EnqueueDeleteArgs {
-    pub targets: Vec<String>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct OperationIdArgs {
-    #[serde(rename = "operationId")]
-    pub operation_id: i64,
 }
 
 #[derive(serde::Deserialize)]
@@ -697,110 +672,6 @@ pub async fn enqueue_move_operation(
     });
 
     Ok(Json(op_id))
-}
-
-pub async fn enqueue_delete_operation(
-    State(state): State<WebAppState>,
-    Json(args): Json<EnqueueDeleteArgs>,
-) -> Result<Json<i64>, (StatusCode, String)> {
-    let allowed = &state.allowed_paths;
-    if !allowed.is_empty() {
-        for t in &args.targets {
-            let tp = PathBuf::from(t);
-            if !path_inside_allowed(&tp, allowed) {
-                return Err((StatusCode::FORBIDDEN, format!("target '{}' not allowed", t)));
-            }
-        }
-    }
-
-    let ctx = state.ctx.clone();
-    let db = ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
-    let conn = db.conn();
-
-    let target_paths: Vec<PathBuf> = args.targets.iter().map(PathBuf::from).collect();
-    let plan = fplan::build_delete_plan(&conn, target_paths)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{:#}", e)))?;
-    let op_id = plan.operation_id;
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
-    }
-
-    let event_tx = state.event_tx.clone();
-    let ctx_for_worker = ctx.clone();
-    let cancel_for_worker = cancel_flag.clone();
-    ctx.operation_queue.enqueue(QueuedJob {
-        kind: OperationKind::FileOpDelete,
-        operation_id: op_id,
-        run: Box::new(move || {
-            let emitter = SseProgressEmitter::new(event_tx);
-            let db = ctx_for_worker.db.get().expect("db");
-            let conn = db.conn();
-            let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
-            match result {
-                Ok(()) => {}
-                Err(e) => {
-                    if fexec::was_cancelled(&e) {
-                        let _ = fdb::update_operation_status(
-                            &conn, op_id, FileOpStatus::Cancelled, None,
-                        );
-                    } else {
-                        eprintln!("file_op {} failed: {:#}", op_id, e);
-                        let msg = format!("{:#}", e);
-                        let _ = fdb::update_operation_status(
-                            &conn, op_id, FileOpStatus::Failed, Some(&msg),
-                        );
-                    }
-                }
-            }
-        }),
-    });
-
-    Ok(Json(op_id))
-}
-
-pub async fn cancel_file_operation(
-    State(state): State<WebAppState>,
-    Json(args): Json<OperationIdArgs>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let map = state.ctx.active_archives.lock().unwrap();
-    if let Some(handle) = map.get(&args.operation_id) {
-        handle.cancel_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(StatusCode::OK)
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            format!("no active file operation with id {}", args.operation_id),
-        ))
-    }
-}
-
-pub async fn list_unfinished_file_operations(
-    State(state): State<WebAppState>,
-) -> Result<Json<Vec<FileOperationSummary>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
-    let conn = db.conn();
-    let ops = fdb::list_unfinished_operations(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(
-        ops.into_iter()
-            .map(|o| FileOperationSummary {
-                id: o.id,
-                kind: o.kind,
-                status: o.status,
-                source_root: o.source_root,
-                dest_dir: o.dest_dir,
-                total_files: o.total_files,
-                total_bytes: o.total_bytes,
-                created_at: o.created_at,
-                started_at: o.started_at,
-            })
-            .collect(),
-    ))
 }
 
 pub async fn search_catalog(

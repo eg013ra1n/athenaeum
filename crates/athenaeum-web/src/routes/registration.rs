@@ -15,7 +15,6 @@ use athenaeum_core::registration::db::{
     get_registration_for_frame_set, RegistrationRecord,
 };
 use athenaeum_core::registration::{
-    clear_frame_set_reference as core_clear_frame_set_reference,
     get_frame_set_reference as core_get_frame_set_reference,
     set_frame_set_reference as core_set_frame_set_reference,
     FrameSetReference,
@@ -264,20 +263,3 @@ pub async fn get_frame_set_reference(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// POST /api/clear_frame_set_reference
-///
-/// Remove the persisted user-chosen reference for a frame set.
-pub async fn clear_frame_set_reference(
-    State(state): State<WebAppState>,
-    Json(args): Json<FrameSetIdArgs>,
-) -> Result<Json<()>, (StatusCode, String)> {
-    let db = state
-        .ctx
-        .db
-        .get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "DB not initialized".into()))?;
-    let conn = db.conn();
-    core_clear_frame_set_reference(&conn, args.frames_set_id)
-        .map(|()| Json(()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}

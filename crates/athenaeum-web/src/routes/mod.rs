@@ -44,7 +44,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/start_scan", post(scan_roots::start_scan))
         .route("/api/start_scan_with_progress", post(scan_roots::start_scan_with_progress))
         .route("/api/cancel_scan", post(scan_roots::cancel_scan))
-        .route("/api/get_active_scans", post(scan_roots::get_active_scans))
         .route("/api/check_all_scan_roots_availability", post(scan_roots::check_all_scan_roots_availability))
         .route("/api/get_missing_files_counts", post(scan_roots::get_missing_files_counts))
         .route("/api/rescan_all_for_content_hash", post(scan_roots::rescan_all_for_content_hash))
@@ -75,21 +74,15 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/browse_directories", post(files::browse_directories))
         // Dual-pane file browser
         .route("/api/enqueue_move_operation", post(files::enqueue_move_operation))
-        .route("/api/enqueue_delete_operation", post(files::enqueue_delete_operation))
-        .route("/api/cancel_file_operation", post(files::cancel_file_operation))
-        .route("/api/list_unfinished_file_operations", post(files::list_unfinished_file_operations))
         .route("/api/search_catalog", post(files::search_catalog))
         .route("/api/mkdir_in_scan_root", post(files::mkdir_in_scan_root))
         .route("/api/rename_path", post(files::rename_path))
         // Settings
         .route("/api/get_setting", post(settings::get_setting))
         .route("/api/set_setting", post(settings::set_setting))
-        .route("/api/get_all_settings", post(settings::get_all_settings))
         .route("/api/delete_setting", post(settings::delete_setting))
-        .route("/api/get_grouping_threshold_deg", post(settings::get_grouping_threshold_deg))
         // Cache & blink (Category C — modified behavior in web mode)
         .route("/api/get_cache_stats", post(settings::get_cache_stats))
-        .route("/api/clear_image_cache", post(settings::clear_image_cache))
         .route("/api/get_blink_threads_max", post(settings::get_blink_threads_max))
         .route("/api/set_blink_threads", post(settings::set_blink_threads))
         // Frame sets
@@ -100,30 +93,20 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/delete_auto_generated_frame_sets", post(frame_sets::delete_auto_generated_frame_sets))
         .route("/api/rename_frames_set", post(frame_sets::rename_frames_set))
         .route("/api/mark_frame_set_custom", post(frame_sets::mark_frame_set_custom))
-        .route("/api/recalculate_frame_set_metadata", post(frame_sets::recalculate_frame_set_metadata))
         .route("/api/merge_frame_sets", post(frame_sets::merge_frame_sets))
-        .route("/api/can_split", post(frame_sets::can_split))
         .route("/api/split_frame_set", post(frame_sets::split_frame_set))
-        .route("/api/create_custom_frames_set", post(frame_sets::create_custom_frames_set))
         .route("/api/create_frame_set_from_selection", post(frame_sets::create_frame_set_from_selection))
-        .route("/api/create_frame_set_from_excluded", post(frame_sets::create_frame_set_from_excluded))
-        .route("/api/update_frame_set_flat_pattern", post(frame_sets::update_frame_set_flat_pattern))
         .route("/api/archive_frame_set", post(frame_sets::archive_frame_set))
-        .route("/api/unarchive_frame_set", post(frame_sets::unarchive_frame_set))
         .route("/api/find_new_frames_for_set", post(frame_sets::find_new_frames_for_set))
         .route("/api/auto_merge_new_frames_for_set", post(frame_sets::auto_merge_new_frames_for_set))
         .route("/api/get_frame_set_merge_log", post(frame_sets::get_frame_set_merge_log))
         // Excluded frames
-        .route("/api/get_excluded_frames", post(frame_sets::get_excluded_frames))
         .route("/api/get_excluded_frames_with_metadata", post(frame_sets::get_excluded_frames_with_metadata))
         .route("/api/remove_files_from_excluded", post(frame_sets::remove_files_from_excluded))
         .route("/api/get_excluded_frames_count", post(frame_sets::get_excluded_frames_count))
-        .route("/api/reclassify_excluded_frames", post(frame_sets::reclassify_excluded_frames))
         // Calibration
         .route("/api/get_equipment_cameras", post(calibration::get_equipment_cameras))
-        .route("/api/create_dark_library", post(calibration::create_dark_library))
         .route("/api/get_dark_library", post(calibration::get_dark_library))
-        .route("/api/delete_dark_library", post(calibration::delete_dark_library))
         .route("/api/has_dark_library", post(calibration::has_dark_library))
         .route("/api/create_master_dark_library", post(calibration::create_master_dark_library))
         .route("/api/get_master_dark_library", post(calibration::get_master_dark_library))
@@ -135,7 +118,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_calibration_set_frames", post(calibration::get_calibration_set_frames))
         .route("/api/get_calibration_set_consumers", post(calibration::get_calibration_set_consumers))
         .route("/api/find_calibration_for_frame_set", post(calibration::find_calibration_for_frame_set))
-        .route("/api/get_calibration_status", post(calibration::get_calibration_status))
         .route("/api/get_calibration_matching_config", post(calibration::get_calibration_matching_config))
         .route("/api/set_calibration_matching_config", post(calibration::set_calibration_matching_config))
         .route("/api/reset_calibration_matching_config", post(calibration::reset_calibration_matching_config))
@@ -186,8 +168,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_analysis_config", post(analysis::set_analysis_config))
         .route("/api/reset_analysis_config", post(analysis::reset_analysis_config))
         .route("/api/get_analysis_for_frame_set", post(analysis::get_analysis_for_frame_set))
-        .route("/api/delete_analysis_for_frame_set", post(analysis::delete_analysis_for_frame_set))
-        .route("/api/analyze_single_frame", post(analysis::analyze_single_frame))
         .route("/api/analyze_frame_set", post(analysis::analyze_frame_set))
         .route("/api/cancel_analysis", post(analysis::cancel_analysis))
         .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))
@@ -196,7 +176,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_plate_solve_config", post(plate_solve::get_plate_solve_config))
         .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))
         .route("/api/reset_plate_solve_config", post(plate_solve::reset_plate_solve_config))
-        .route("/api/plate_solve_frame", post(plate_solve::plate_solve_frame))
         .route("/api/plate_solve_batch", post(plate_solve::plate_solve_batch))
         .route("/api/cancel_plate_solve", post(plate_solve::cancel_plate_solve))
         .route("/api/autofind_objects_from_coordinates", post(plate_solve::autofind_objects_from_coordinates))
@@ -212,7 +191,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/cancel_frame_set_registration", post(registration::cancel_frame_set_registration))
         .route("/api/set_frame_set_reference", post(registration::set_frame_set_reference))
         .route("/api/get_frame_set_reference", post(registration::get_frame_set_reference))
-        .route("/api/clear_frame_set_reference", post(registration::clear_frame_set_reference))
         // Archive feature
         .route("/api/get_archive_settings", post(archive::get_archive_settings))
         .route("/api/set_archive_root_path", post(archive::set_archive_root_path))
@@ -234,7 +212,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_default_archive_root", post(archive::set_default_archive_root))
         // Core
         .route("/api/initialize_database", post(initialize_database))
-        .route("/api/get_app_version", post(get_app_version))
         .route("/api/get_log_path", post(get_log_path))
         .route("/api/get_database_path", post(get_database_path))
         // Category A — Desktop-only stubs
@@ -291,10 +268,6 @@ async fn initialize_database(
     }
     // In web mode, DB is initialized at server start — this is a no-op
     Ok(Json("Database initialized at server start".to_string()))
-}
-
-async fn get_app_version() -> Json<String> {
-    Json(env!("CARGO_PKG_VERSION").to_string())
 }
 
 async fn get_log_path() -> Json<Option<String>> {

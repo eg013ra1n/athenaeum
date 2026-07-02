@@ -1,7 +1,6 @@
 // Settings route handlers — mirrors athenaeum-tauri/src/commands/settings.rs
 
 use athenaeum_core::db;
-use athenaeum_core::models::Setting;
 use athenaeum_core::settings;
 use axum::{extract::State, http::StatusCode, Json};
 
@@ -88,23 +87,6 @@ pub async fn set_setting(
     Ok(Json(()))
 }
 
-/// POST /api/get_all_settings
-///
-/// Returns every row in the `settings` table, ordered alphabetically by key.
-pub async fn get_all_settings(
-    State(state): State<WebAppState>,
-    _body: Json<serde_json::Value>,
-) -> Result<Json<Vec<Setting>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let settings = db::get_all_settings(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(settings))
-}
-
 /// POST /api/delete_setting
 ///
 /// Removes the setting row for the given key. A no-op if the key does not
@@ -148,20 +130,6 @@ pub async fn get_cache_stats(
         total_size_bytes: 0,
         total_size_human: "In-memory cache (stats not tracked)".to_string(),
     }))
-}
-
-/// POST /api/clear_image_cache
-///
-/// In web mode, clears the in-memory image cache.
-pub async fn clear_image_cache(
-    State(state): State<WebAppState>,
-    Json(_): Json<serde_json::Value>,
-) -> Result<Json<String>, (StatusCode, String)> {
-    let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
-    mem_cache.clear();
-    let msg = "Memory image cache cleared".to_string();
-    eprintln!("{}", msg);
-    Ok(Json(msg))
 }
 
 /// POST /api/get_blink_threads_max
@@ -208,24 +176,3 @@ pub async fn set_blink_threads(
     Ok(Json(()))
 }
 
-/// POST /api/get_grouping_threshold_deg
-///
-/// Returns the frame-set clustering threshold in decimal degrees. Reads the
-/// `grouping_threshold_arcmin` setting (with runtime and database precedence)
-/// and converts it to degrees.
-pub async fn get_grouping_threshold_deg(
-    State(state): State<WebAppState>,
-    _body: Json<serde_json::Value>,
-) -> Result<Json<f64>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let threshold = state
-        .ctx
-        .settings
-        .get_grouping_threshold_deg(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(threshold))
-}

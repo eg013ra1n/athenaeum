@@ -496,17 +496,6 @@ pub async fn relink_scan_root(
     Ok(Json(result))
 }
 
-/// POST /api/get_active_scans
-///
-/// Returns the list of root IDs that currently have an active scan running.
-pub async fn get_active_scans(
-    State(state): State<WebAppState>,
-    _body: Json<serde_json::Value>,
-) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
-    let scans = state.ctx.active_scans.lock().unwrap();
-    Ok(Json(scans.keys().cloned().collect()))
-}
-
 #[derive(serde::Deserialize)]
 pub struct SetMonitorEnabledArgs {
     pub id: i64,
