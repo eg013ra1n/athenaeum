@@ -395,16 +395,40 @@ fn run_restore_inner(
     }
 
     // Even when nothing was restored (everything was already on disk), the
-    // frame set's archived_at must still be cleared so it returns to active view.
-    adb::unmark_frame_set_archived(conn, op.frames_set_id)?;
-    catalog_done += 1;
-    emit(
-        emitter,
-        "update_catalog",
-        catalog_done,
-        catalog_total,
-        "Frame set unarchived".into(),
-    );
+    // frame set's archived_at must still be cleared so it returns to active
+    // view — but ONLY when every file reconciled cleanly. If any file has an
+    // unresolved conflict, the frame set must stay in its archived/zipped
+    // state: clearing archived_at here would (a) drop it out of
+    // `list_archived_frame_sets`, hiding the "Unarchive" button that is the
+    // only UI path back into restore, and (b) make it look like an ordinary
+    // active frame set eligible for "Move to Archive" again — re-archiving
+    // would zip the conflicted file's unverified on-disk bytes and overwrite
+    // the still-intact markers, orphaning the zip that holds the only
+    // correct copy. See module docs (CONFLICT handling).
+    if conflicts.is_empty() {
+        adb::unmark_frame_set_archived(conn, op.frames_set_id)?;
+        catalog_done += 1;
+        emit(
+            emitter,
+            "update_catalog",
+            catalog_done,
+            catalog_total,
+            "Frame set unarchived".into(),
+        );
+    } else {
+        eprintln!(
+            "[archive::restore] operation {} finished with {} conflict(s) — frame set {} stays archived pending resolution",
+            operation_id, conflicts.len(), op.frames_set_id,
+        );
+        catalog_done += 1;
+        emit(
+            emitter,
+            "update_catalog",
+            catalog_done,
+            catalog_total,
+            format!("Frame set stays archived — {} conflict(s) unresolved", conflicts.len()),
+        );
+    }
 
     // For files that weren't restored (skipped because already on disk), still
     // clear any leftover archive markers. Also reconcile modified_at/size with
@@ -850,7 +874,24 @@ pub(crate) mod tests {
             .collect();
         assert!(!zips_after_conflict.is_empty(), "zip(s) must be kept while a conflict is unresolved");
 
+        // (e) the frame set itself must stay archived/zipped while a conflict
+        // is unresolved. If `archived_at`/`is_archived` got cleared here, the
+        // set would vanish from `list_archived_frame_sets` — which is the
+        // ONLY place the "Unarchive" button (the sole UI path back into
+        // restore) is rendered — making the documented remedy ("remove the
+        // impostor, re-run restore") unreachable from the app. Worse, an
+        // un-marked set looks like an ordinary active set eligible for
+        // "Move to Archive" again, which would zip the impostor's bytes and
+        // orphan the zip holding the real ones.
+        let (archived_at_conflicted, is_archived_conflicted): (Option<String>, i64) = conn.query_row(
+            "SELECT archived_at, is_archived FROM frames_set WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(archived_at_conflicted.is_some(), "frame set must stay archived (zipped) while a conflict is unresolved");
+        assert_eq!(is_archived_conflicted, 1, "frame set must stay in the Archive section while a conflict is unresolved");
+
         // --- Restore #2 (re-run heals): remove the impostor, restore again.
+        // The conflicted run above must leave the operation re-runnable
+        // through the same public entry point used for restore #1.
         std::fs::remove_file(&l1).unwrap();
         let outcome2 = run_restore(
             &conn, op_id, scan.path(),
@@ -867,6 +908,14 @@ pub(crate) mod tests {
         ).unwrap();
         assert!(light_row_after.0.is_none(), "markers must clear once healed");
         assert!(light_row_after.1.is_none());
+
+        // Now that every file reconciled cleanly, the frame set must be
+        // unmarked exactly as before this fix.
+        let (archived_at_after, is_archived_after): (Option<String>, i64) = conn.query_row(
+            "SELECT archived_at, is_archived FROM frames_set WHERE id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(archived_at_after.is_none(), "frame set must be unarchived once the healing run has zero conflicts");
+        assert_eq!(is_archived_after, 0, "frame set must leave the Archive section once healed");
     }
 
     /// Pre-flight check fires when a zip file referenced by the plan no longer
