@@ -1,363 +1,262 @@
-# Athenaeum Export System Documentation
+# Athenaeum Export (WBPP folder export)
 
 ## Overview
 
-The export system prepares astrophotography data for processing in Siril or PixInsight WBPP. It handles:
-- Calibration frame matching and hierarchy building
-- File organization into processing-ready folder structures
-- Siril script generation for automated preprocessing
-- Pipeline execution with progress tracking
+The export feature organizes a frame set's light frames and their **already-linked**
+calibration frames (flat/dark/bias/darkflat) into a nested folder tree on disk, sized
+for PixInsight's WBPP (Weighted Batch Preprocessing) process to consume via its
+"Grouping Keywords with Pre" option. Athenaeum copies or symlinks files into the
+right folders and stops there — it does **not** create master calibration frames,
+does not run PixInsight, and does not generate any external tool's scripts. All of
+that (master creation, registration, stacking) is done in PixInsight after export.
 
----
+This is the entire feature. There is no script generator, no CLI runner, no
+execution-mode selector, and no template-token engine (`{OBJECT}`, `{FRAME_FOLDER}`,
+`:slug`, etc. do not exist in this module — see "What this doc replaces" below).
 
-## Export Workflow (High-Level)
+Module: `crates/athenaeum-core/src/export/` — exactly three files:
+`models.rs`, `data_collector.rs`, `file_organizer.rs` (re-exported by `mod.rs`).
+Nothing else exists under `export/`.
 
-```
-1. User selects Frame Set
-       ↓
-2. Data Collection (collect_export_data_v3)
-   ├─ Query light frames from frame set
-   ├─ Get calibration chain for each light (flat → dark → bias)
-   ├─ Group into "branches" (camera × calibration × filter)
-   └─ Build master creation plan (topological sort) including the steps of calibration of branches, how many files will be registered with each other (osc and mono separetely) and what masters will be exported in the end
-       ↓
-3. User Reviews Calibration Tree
-   ├─ See lights grouped by filter/camera
-   ├─ Review calibration completeness
-   └─ Check warnings (missing cals, temp mismatches)
-       ↓
-4. Export Execution
-   ├─ Step 1: Organize files into folder structure
-   ├─ Step 2: Generate Siril scripts 
-   └─ Step 3: Execute scripts (DirectExecution mode)
-       ↓
-5. Results
-   ├─ Master calibration frames
-   ├─ Calibrated light frames
-   └─ Stacked images per filter and camera type (osc and mono separetly)
-```
+## What this doc replaces
 
----
+The previous version of this file described a Siril script pipeline (branch
+folders, `00_create_masters.ssf` / `01_calibrate_lights.ssf` / `02_register_and_stack.ssf`,
+`generate_scripts` / `direct_execution` modes, an `AtheneumScoring` reference-frame
+mode, a Siril CLI runner with a 30-second timeout workaround, exposure-time
+clustering with absolute/relative tolerance, etc.). None of that exists in the
+codebase — zero hits for `script_generator`, `cli_runner`, `folder_structures`,
+or any Siril invocation anywhere in `crates/`. It described a feature that was
+planned but never built. This rewrite documents only what `crates/athenaeum-core/src/export/`,
+`commands/export.rs`, `routes/export.rs`, and `ExportTab.tsx` actually do.
 
-## Key Concepts
+## How it works (data flow)
 
-### What is a "Branch"?
+1. **`collect_export_data`** (`data_collector.rs:21`) takes a `frame_set_id` and:
+   - Loads every LIGHT frame reachable through
+     `session_members → sessions → imaging_nights → frames_set` (`get_light_frames_for_frame_set`, `data_collector.rs:192`).
+   - Groups them by `(filter, camera_type)` into `ExportGroup`s (`build_export_groups`, `data_collector.rs:734`).
+     `camera_type` is `Osc` if `BAYERPAT` is a non-empty string, else `Mono`
+     (`CameraType::from_bayerpat`, `models.rs:22`).
+   - Within each group, further splits frames into `CalibrationSubgroup`s by the
+     **combination of calibration-set IDs already linked to each frame**
+     (`build_calibration_subgroups`, `data_collector.rs:791`).
+   - Builds a `MasterCreationPlan` — a topologically-sorted, informational list of
+     which master calibration files *would* need to be created and in what order
+     (`build_master_creation_plan`, `data_collector.rs:881`).
+2. **Calibration links are read, not computed.** `get_frame_calibration_links`
+   (`data_collector.rs:485`) and friends query the `calibration_set_to_frames`
+   table directly. Export does **not** call `calibration/configurable_matcher.rs`
+   or `calibration/hierarchy.rs` — those run earlier, when the user runs
+   calibration matching from the Calibration page, and persist rows into
+   `calibration_set_to_frames`. If a frame set has no calibration links yet,
+   export will show it with missing-calibration warnings but will not try to
+   find or create matches itself.
+3. **`organize_files_wbpp`** (`file_organizer.rs:112`) walks the same groups/subgroups
+   and copies or symlinks files into the folder tree described below.
 
-A **CalibrationBranch** represents a unique path through the calibration hierarchy:
-
-```
-Branch = Camera + Bias Set + Dark Set + Flat Set + Filter
-
-Example branches in a typical export:
-- QHY268M → Bias#23 → Dark#56 → Flat#38 → Ha filter (10 lights)
-- QHY268M → Bias#23 → Dark#56 → Flat#39 → OIII filter (8 lights)
-- ASI2600 → Bias#45 → Dark#67 → Flat#50 → L filter (15 lights)
-```
-
-Each branch gets its own folder and calibration workflow.
-
-### Camera Type Detection
-
-```
-OSC (One-Shot Color): Has Bayer pattern (RGGB, BGGR, etc.)
-Mono: No Bayer pattern or empty BAYERPAT field
-```
-
-**Critical**: OSC and Mono frames cannot be stacked together (different layer counts). The system creates separate pipelines.
-
-### Master Creation Plan
-
-Masters are created in dependency order:
-```
-1. Bias (no dependencies)
-2. Dark (optionally uses Bias)
-3. DarkFlat (optionally uses Bias)
-4. Flat (uses DarkFlat OR Dark OR Bias - see fallback chain)
-```
-
----
-
-## Calibration Hierarchy & Fallback Chains
-
-### For Light Frames
-```
-Light
-├─ Flat (matched by: camera, filter, gain, offset, binning)
-└─ Dark (matched by: camera, exptime, gain, offset, binning, temp)
-```
-
-### For Flat Masters (Complex!)
-```
-Flat calibration priority:
-1. DarkFlat (same exposure as flat) ← BEST
-2. Dark with exposure match (±30%) ← GOOD
-3. Bias only ← FALLBACK (prevents over-subtraction)
-4. No calibration ← LAST RESORT
-```
-
-### For Dark Masters
-```
-Dark calibration:
-1. Bias (for dark current optimization)
-2. No calibration (acceptable - darks are stable)
-```
-
----
-
-## Generated Siril Scripts
-
-### Script 1: `00_create_masters.ssf`
-
-Creates all master calibration frames in dependency order.
-
-```bash
-# For each master in topological order:
-cd biases/set_23/
-convert bias
-stack bias rej sigma 2.5 2.5 -nonorm -out=../masters/master_bias_23.fit
-
-cd ../darks/set_56/
-convert dark
-calibrate dark -bias=../masters/master_bias_23.fit
-stack pp_dark rej sigma 2.5 2.5 -nonorm -out=../masters/master_dark_56.fit
-
-cd ../flats/set_38_ha/
-convert flat
-calibrate flat -dark=../masters/master_dark_56.fit  # Or -bias if no matching dark
-stack pp_flat rej sigma 2.5 2.5 -norm=mul -out=../masters/master_flat_38.fit
-```
-
-### Script 2: `01_calibrate_lights.ssf`
-
-Calibrates all light frames using created masters.
-
-```bash
-# For each branch:
-cd lights/branch_01_ha/
-convert lights
-calibrate lights -flat=../masters/master_flat_38.fit -dark=../masters/master_dark_56.fit -cc=dark
-# Produces: pp_lights_00001.fit, pp_lights_00002.fit, ...
-```
-
-**OSC-specific flags:**
-- `-cfa` for cosmetic correction (preserves Bayer pattern)
-- `-debayer` (unless drizzle enabled)
-
-### Script 3: `02_register_and_stack.ssf`
-
-Registers all lights globally, then stacks per filter.
-
-**Dual Pipeline Architecture** (when both OSC and Mono present):
-```bash
-# MONO PIPELINE
-cd process/all_lights_mono/
-convert pp_lights -out=. -fitseq
-seqplatesolve pp_lights -focal=500.0 -pixelsize=3.76
-register pp_lights -2pass
-convert r_pp_lights -out=. -fitseq
-# Stack per filter using frame selection
-unselect r_pp_lights 1 30
-select r_pp_lights 1 10        # Ha frames
-stack r_pp_lights rej sigma 2.5 2.5 -filter-included -norm=addscale -out=../masters/ha_mono_stacked
-
-# OSC PIPELINE
-cd process/all_lights_osc/
-# Same steps but with -rgb_equal for stacking
-```
-
----
-
-## Folder Structure
-
-### Siril Export Structure
-```
-export_root/
-├── biases/
-│   └── set_23/           # Bias frames for set #23
-├── darks/
-│   └── set_56/           # Dark frames for set #56
-├── flats/
-│   ├── set_38_ha/        # Flat frames for set #38, Ha filter
-│   └── set_39_oiii/      # Flat frames for set #39, OIII filter
-├── lights/
-│   ├── branch_01_ha/     # Light frames: branch 1, Ha
-│   └── branch_02_oiii/   # Light frames: branch 2, OIII
-├── masters/              # Output: master_bias_23.fit, etc.
-└── process/
-    ├── all_lights_mono/  # Collected calibrated mono frames
-    └── all_lights_osc/   # Collected calibrated OSC frames
-```
-
-### WBPP Export Structure
-```
-export_root/
-└── camera QHY268M/
-    ├── darks/            # All dark-type frames (bias, dark, darkflat)
-    └── flats_38/
-        ├── flat_*.fit    # Flat frames
-        └── lights/
-            └── light_*.fit
-```
-
----
-
-## Exposure Time Grouping
-
-When enabled, frames are grouped by similar exposure times before stacking:
+## Camera type detection
 
 ```
-Mode: Absolute (tolerance: 30s)
-Frames: 60s, 60s, 65s, 300s, 300s, 305s
-Result:
-  - Group 1: 60/60/65 → "60s_stacked"
-  - Group 2: 300/300/305 → "300s_stacked"
-
-Mode: Relative (tolerance: 10%)
-Frames: 30s, 33s, 300s, 330s
-Result:
-  - Group 1: 30/33 (within 10%) → "30s_stacked"
-  - Group 2: 300/330 (within 10%) → "300s_stacked"
+OSC (One-Shot Color): BAYERPAT is a non-empty string (e.g. RGGB, BGGR)
+Mono: BAYERPAT is NULL or empty
 ```
+Source: `CameraType::from_bayerpat`, `crates/athenaeum-core/src/export/models.rs:22`.
+OSC and Mono frames land in different `ExportGroup`s (different `group_key`,
+`models.rs:165`) because they can't be stacked together in PixInsight.
 
----
+## Folder structure it produces
 
-## Edge Cases & Failure Modes
-
-### 1. Insufficient Frames (< 2)
-**Behavior**: Branch skipped in script with comment
-```bash
-# SKIPPED: Siril requires at least 2 frames
-```
-**Impact**: Incomplete results, user must add more frames
-
-### 2. Missing Calibrations
-| Missing | Behavior | Impact |
-|---------|----------|--------|
-| Flat | Continue with Dark/Bias only | Vignetting not corrected |
-| Dark | Continue with Flat/Bias only | Hot pixels not removed |
-| Bias | Continue without | Acceptable for most sensors |
-| All | Uncalibrated export | Poor quality |
-
-### 3. Mixed Camera Types (OSC + Mono)
-**Behavior**: Separate pipelines created automatically
-**Impact**: Correct results but more complex scripts
-
-### 4. Flat→Dark Exposure Mismatch
-**Scenario**: 2s flats, only 300s darks available
-**Behavior**: Falls back to Bias calibration
-**Impact**: Better than over-subtraction (bright edges)
-
-### 5. Missing FITS Keywords
-| Keyword | Fallback | Impact |
-|---------|----------|--------|
-| INSTRUME | "unknown" | All frames grouped together |
-| FOCALLEN | 500mm | Plate solving may fail |
-| BAYERPAT | Assume Mono | OSC treated as Mono (wrong!) |
-| FILTER | "Unfiltered" | Generic naming |
-
-### 6. Temperature Mismatch
-**Threshold**: Typically 2°C (configurable)
-**Behavior**: Warning shown, export continues
-**Impact**: Potential calibration artifacts
-
-### 7. Date Mismatch
-**Behavior**: Warning shown, export continues
-**Impact**: Calibrations may not match current sensor state
-
----
-
-## Known Weak Points
-
-### 1. No Quality Scoring for Reference Frame
-Currently uses Siril's `-2pass` auto-selection. The `AtheneumScoring` and `Manual` modes fall back to `-2pass`.
-
-**Planned**: Quality scoring based on FWHM, star count, background level.
-
-### 2. Pixel Size Not Stored
-Defaults to 3.76μm (common for ASI/QHY). Incorrect pixel size breaks plate solving.
-
-**Recommendation**: Store XPIXSZ/PIXSIZE from FITS headers.
-
-### 3. Exposure Tolerance Clustering
-Tolerance is checked against **first cluster member only**, not all members.
+`organize_files_wbpp` and `build_folder_preview` (used for the UI's folder-tree
+preview) both build the same shape — verified they use identical set-ID-keyed
+logic (`file_organizer.rs:186-328` vs. `data_collector.rs:1503-1747`):
 
 ```
-Example: 30s, 33s, 36s (each 10% from previous)
-Result: Single cluster (36s is 20% from 30s!)
+<output_dir>/
+└── <frame set name, sanitized>/
+    └── camera_<instrume, sanitized>/
+        └── BIAS_<set_id>/           # bias frames — omitted if none linked
+            └── DARKS_<set_id>/      # dark + darkflat frames — omitted if none linked
+                └── FLAT_<set_id>/   # flat frames — omitted if none linked
+                    └── lights/      # light frames — always present
 ```
 
-**Recommendation**: Check against cluster centroid or all members.
+- The frame-set folder name uses `sanitize_display_folder_name` (`models.rs:242`) —
+  keeps spaces/case, replaces `: / \ * ? " < > |` with `_`, collapses repeats.
+- The `camera_` folder name uses `sanitize_folder_name` (`models.rs:229`) — lowercases
+  and strips everything but alphanumerics (e.g. `"ZWO ASI2600MM Pro"` → `zwoasi2600mmpro`).
+- **Missing calibration levels collapse.** If a subgroup has no dark and no
+  darkflat linked, there is no `DARKS_*` folder at all — the tree goes straight
+  from `BIAS_*` (or `camera_*` if no bias either) to `FLAT_*`/`lights/`
+  (`file_organizer.rs:253-288`).
+- A flat's *own* dark/darkflat/bias (`flat.dark`, `flat.dark_flat`, `flat.bias` on
+  `CalibrationSetInfo`) are folded into the same `BIAS_*`/`DARKS_*` folders as the
+  light's own bias/dark, deduplicated by set ID via a shared `HashSet<i64>`
+  (`organized_set_ids` in `file_organizer.rs`, `counted_sets` in `data_collector.rs`)
+  so a calibration set already placed once isn't copied twice.
+- `copy_or_link` skips a file if the destination path already exists
+  (`file_organizer.rs:356-359`) — re-running an export into the same output
+  directory does not overwrite or duplicate files already placed there.
 
-### 4. No Validation of Calibration Links
-Database links are trusted without verifying files still exist.
+## Copy vs. symlink, and the platform caveat
 
-**Failure mode**: Deleted calibration files → script fails at runtime.
+`export_to_wbpp` / `organize_files_wbpp` take a `use_symlinks: bool` supplied by
+the caller — there is no config default; the frontend decides it per platform:
 
-### 5. Siril Process Timeout
-macOS Siril can hang after "closing pipes". Current workaround: 30-second timeout.
+| Platform (in `ExportTab.tsx`) | Symlink toggle shown? | What actually happens |
+| ---- | ---- | ---- |
+| Tauri desktop, macOS/Linux | Yes | User's choice; unchecked = copy |
+| Tauri desktop, Windows | No (hidden) | Always copies — `useSymlinks` state stays `false`, there's no UI path to set it `true` |
+| Web/Docker | No (hidden) | Always copies — output dir is also constrained to `ATHENAEUM_EXPORT_DIR` (`crates/athenaeum-web/src/main.rs`) |
 
-**Impact**: May incorrectly report failures for long-running scripts.
+Source: `symlinksAvailable = isTauri && !isWindows` and the two
+`symlinkUnavailableReason` strings, `src/components/export/ExportTab.tsx:176-185`.
 
-### 6. No Resume/Retry Logic
-If script fails mid-execution, must restart from beginning.
+**The Rust side does have a Windows symlink branch** — `copy_or_link`
+(`file_organizer.rs:356-379`) has both `#[cfg(unix)]` (`std::os::unix::fs::symlink`)
+and `#[cfg(windows)]` (`std::os::windows::fs::symlink_file`) arms. But because the
+frontend never surfaces the toggle on Windows, that branch is currently
+unreachable except by calling `export_to_wbpp` (Tauri) / `POST /api/export_to_wbpp`
+(web) directly with `use_symlinks: true`. If it were exercised, note the standard OS caveat: creating
+a file symlink on Windows requires either Developer Mode enabled or admin
+privileges (`SeCreateSymbolicLinkPrivilege`) — not an Athenaeum-specific
+restriction, just how `symlink_file` behaves.
 
-**Recommendation**: Track completed steps, allow resuming.
+**Known caveat with symlinked exports (documented, not yet solved):** because a
+symlinked export is a set of links back into the catalog's original file
+locations, moving the export root to a different volume, or sharing it via a
+sync tool (e.g. Syncthing) or a Docker bind mount, breaks the links — the target
+paths travel with the machine that created them, not with the export folder. A
+"materialize copies" option (turning a symlinked export into real files after the
+fact) is **planned** for a later pillar (pillar C, per the 2026-07-02 platform
+parity audit); it does not exist today. Until then, use copy mode (the default)
+for anything that will be moved or shared, and only use symlinks when the export
+stays in place next to the catalog's original files.
 
-### 7. Frame Index Assumptions
-Assumes Siril assigns sequence indices in filename sort order. If pp_lights files have gaps or unusual naming, frame selection may be wrong.
+## WBPP keyword-order config — stored, but not applied to the layout
 
----
+`WbppExportConfig` (`models.rs:701`) has one field, `keyword_order: Vec<String>`,
+default `["CAMERA", "BIAS", "DARKS", "FLAT"]`. It's persisted under the
+`export.wbpp_config` settings key via `get_wbpp_export_config` /
+`set_wbpp_export_config` / `reset_wbpp_export_config`.
 
-## Configuration Options
+**It does not currently change what `organize_files_wbpp` does.** Both consumers
+of `WbppExportConfig` take it as `_config` (`file_organizer.rs:116`) or
+`_config` (`data_collector.rs:1503`) — the parameter is accepted but unused; the
+nesting order (`CAMERA` → `BIAS` → `DARKS` → `FLAT` → `lights`) is hardcoded.
+The only place `keywordOrder` is actually read is the frontend's "WBPP Setup
+Guide" (`ExportTab.tsx:66-110`), which uses it to render the setup instructions
+and the example-structure text shown to the user. There's also no UI to edit
+`keyword_order` today — `useWbppConfig`'s `save`/`reset` (`useExportData.ts:212-230`)
+are exported but unused; `ExportTab.tsx` only reads the config, it never calls
+`save`/`reset`. In practice this means: the setting exists and round-trips
+through the DB, but changing it (via a raw API call) would make the on-screen
+setup guide describe an order the folder organizer doesn't actually build.
 
-### Export Modes
-- `generate_scripts` - Scripts only, no file organization
-- `organize_files` - File organization only
-- `organize_and_script` - Both (default)
-- `direct_execution` - Full pipeline with Siril execution
+## Master creation plan — informational only
 
-### Siril Options
-| Option | Values | Default |
-|--------|--------|---------|
-| Rejection Algorithm | sigma, percentile, linear_fit, gesd, mad | sigma |
-| Rejection Thresholds | 0.0 - 10.0 | 2.5 / 2.5 |
-| Image Weighting | none, wfwhm, stars, noise, exptime | wfwhm |
-| Reference Frame | siril_auto, athenaeum_scoring, manual | siril_auto |
-| Drizzle | disabled, x2, x3 | disabled |
+`MasterCreationPlan` / `MasterInfo` (`models.rs:184-224`) are built by
+`build_master_creation_plan` (`data_collector.rs:881`): a topological sort over
+the unique calibration sets referenced by the export, with a suggested
+`output_name` (e.g. `master_flat_38.fit`) and which sub-calibrations to apply
+(`apply_bias` / `apply_dark` / `apply_darkflat`). For flats, `apply_dark` is only
+set if the dark's average exposure time is within 30% of the flat's
+(`FLAT_DARK_EXPOSURE_TOLERANCE = 0.30`, `data_collector.rs:1047`); otherwise the
+flat falls back to bias-only, matching the calibration hierarchy's normal
+Flat → DarkFlat → Dark(±30%) → Bias fallback chain.
 
-### Exposure Time Grouping
-| Option | Description |
-|--------|-------------|
-| disabled | Stack all same-filter frames together |
-| absolute | Group frames within N seconds |
-| relative | Group frames within N percent |
+Athenaeum never acts on this plan — no code creates master files. The plan is
+exposed through `ExportData.master_plan` (from `get_export_preview` /
+`get_calibration_route`) purely as data; the only field the shipped UI currently
+renders from it is a count (`masters_to_create` in `CalibrationRouteSummary`,
+`commands/export.rs:394`). PixInsight/WBPP creates the actual masters after the
+files are organized on disk.
 
----
+## Commands
 
-## Database Tables Involved
+Mirrored 1:1 in `crates/athenaeum-tauri/src/commands/export.rs` and
+`crates/athenaeum-web/src/routes/export.rs`. "Used by current UI" reflects what
+`ExportTab.tsx` actually calls today (via `useExportSummary` / `useWbppConfig` /
+`useExportProgress`) — a couple of commands have hooks (`useExportData.ts`) that
+aren't imported by any page.
 
-- `frames_set` - Frame set metadata
-- `imaging_nights` - Nights within frame set
-- `sessions` - Camera sessions within nights
-- `session_members` - Frame membership in sessions
-- `frames` - Individual frame metadata
-- `files` - File paths
-- `calibration_set` - Calibration set definitions
-- `calibration_set_frames` - Frames in calibration sets
-- `calibration_set_to_frames` - Calibration links (frame→set, set→set)
+| Command | Purpose | Used by current UI |
+| ---- | ---- | ---- |
+| `get_wbpp_export_config` | Read `WbppExportConfig` (default if unset) | Yes — setup-guide text |
+| `set_wbpp_export_config` | Persist a `WbppExportConfig` | No (hook exists, unused) |
+| `reset_wbpp_export_config` | Delete the stored config, revert to default | No (hook exists, unused) |
+| `get_export_preview` | Full `ExportData` (groups/subgroups/master plan) for a frame set | No (hook exists, unused) |
+| `get_exportable_frame_sets` | List frame sets with light-frame counts, for a picker | No (hook exists, unused) — `ExportTab` gets `frameSetId` as a prop from the frame set detail page, it doesn't pick from a list |
+| `get_calibration_route` | `ExportData` reshaped into a UI calibration tree | No (hook exists, unused) |
+| `get_export_summary` | The enhanced summary `ExportTab` actually renders (equipment, filter groups, folder preview, warnings) | Yes |
+| `export_to_wbpp` | Run the organizer: copy/symlink files into the WBPP tree, emit progress | Yes |
+| `cancel_export` | Set the cooperative cancel flag for a running export | Yes (via `useExportProgress`) |
+| `get_export_dir` (web only, no Tauri equivalent) | Return the server-configured `ATHENAEUM_EXPORT_DIR`, or null | Yes, web mode only — desktop uses a native folder picker instead |
 
----
+Progress/completion events (both backends emit the same names — Tauri via
+`app_handle.emit`, web via `SseProgressEmitter` over SSE): `export-progress`
+(`phase: "collecting" | "copying"`, with `current`/`total`/`percent`/`current_file`)
+and `export-complete` (`ExportCompleteEvent`, final outcome). `useExportProgress`
+(`src/hooks/useExportProgress.ts`) listens for both and calls `notify()` on
+`export-complete` with `kind: 'export'`.
 
-## Key Files
+## Frontend
+
+- `src/components/export/ExportTab.tsx` — the live export UI, embedded as a tab
+  on the frame set detail page (`src/pages/FrameSetDetail.tsx`, reached from the
+  Objects list; frame set is passed in as a prop, not picked from a list). Shows
+  warnings, the export summary (equipment, filter groups, folder
+  preview), the output-directory picker, the symlink toggle (platform-gated, see
+  above), the collapsible WBPP Setup Guide, and the Export button.
+- `src/components/export/ExportSummary.tsx` — renders the `ExportSummary` payload
+  (`get_export_summary`): cameras/telescopes/date range, per-filter-group
+  breakdown (exposure groups from `build_exposure_groups`, `data_collector.rs:1323`
+  — an exact/rounded-to-0.1s tally for display, not a configurable clustering
+  tolerance), calibration detail, and the folder-structure preview tree.
+- `src/components/export/WarningsPanel.tsx` — renders `DetailedWarning`s
+  (temperature mismatch >2°C/>5°C, missing flat/dark, calibration age) with a
+  clickable set-ID chip that jumps to the Calibration Coverage tab.
+- `src/hooks/useExportData.ts` — `useExportData`, `useExportableFrameSets`,
+  `useCalibrationRoute`, `useExportSummary`, `useWbppConfig`.
+- `src/hooks/useExportProgress.ts` + `src/contexts/ExportProgressContext.tsx` +
+  `src/components/ExportProgressIndicator.tsx` — progress/cancel state and the
+  global progress banner.
+
+## Known limitations (as of this writing)
+
+- Symlinked exports break if the export root is moved cross-device, or shared
+  via a sync tool or container volume — see "Copy vs. symlink" above. No
+  materialize-copies fallback exists yet (planned).
+- `keyword_order` in `WbppExportConfig` is stored and round-trips through the
+  settings table, but the folder organizer ignores it — the nesting order is
+  hardcoded to CAMERA → BIAS → DARKS → FLAT → lights. There's also no UI to
+  edit it, so this only matters if something calls the config commands directly.
+- Export depends entirely on calibration links already existing in
+  `calibration_set_to_frames`. It does not run calibration matching itself —
+  if a frame set hasn't been matched yet, export runs with missing-calibration
+  warnings instead of finding matches.
+- `get_export_preview` and `get_calibration_route` (and their React hooks) are
+  live commands with no current caller in the shipped UI — they were used by an
+  earlier `ExportWizard` (see `ExportTab.tsx`'s own doc comment) that has since
+  been replaced by the current tab.
+
+## Key files
 
 | File | Purpose |
-|------|---------|
-| `commands/export.rs` | Tauri commands (entry points) |
-| `export/data_collector.rs` | Data collection & hierarchy building |
-| `export/models.rs` | Data structures |
-| `export/file_organizer.rs` | File organization |
-| `export/folder_structures.rs` | Folder path utilities |
-| `export/siril/script_generator.rs` | Siril script generation |
-| `export/siril/cli_runner.rs` | Siril execution & progress |
-| `calibration/configurable_matcher.rs` | Calibration matching logic |
-| `calibration/hierarchy.rs` | Hierarchy building |
+| ---- | ---- |
+| `crates/athenaeum-core/src/export/mod.rs` | Re-exports `data_collector` and `file_organizer` |
+| `crates/athenaeum-core/src/export/models.rs` | All export data structures, incl. `WbppExportConfig` |
+| `crates/athenaeum-core/src/export/data_collector.rs` | Reads the catalog + existing calibration links, builds `ExportData`/`ExportSummary` |
+| `crates/athenaeum-core/src/export/file_organizer.rs` | Builds the folder tree, copies or symlinks files, emits progress |
+| `crates/athenaeum-tauri/src/commands/export.rs` | Tauri commands (desktop) |
+| `crates/athenaeum-web/src/routes/export.rs` | Axum routes (web/Docker), same surface + `get_export_dir` |
+| `src/components/export/ExportTab.tsx` | The live export UI |
+| `src/components/export/ExportSummary.tsx` | Renders the export summary payload |
+| `src/components/export/WarningsPanel.tsx` | Renders detailed warnings |
+| `src/hooks/useExportData.ts`, `src/hooks/useExportProgress.ts` | Data-fetching + progress hooks |
+| `src/types/export.ts` | TS mirror of the Rust export models |
+
+Calibration matching itself (which populates the links this feature reads) lives
+in `crates/athenaeum-core/src/calibration/configurable_matcher.rs` and
+`crates/athenaeum-core/src/calibration/hierarchy.rs` — not part of this module,
+but the data this feature depends on.
