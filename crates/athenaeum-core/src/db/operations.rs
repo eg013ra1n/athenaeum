@@ -94,6 +94,57 @@ pub(crate) fn scan_root_prefix_predicate(
     (clauses.join(" OR "), values)
 }
 
+/// RAII savepoint: nest-safe transaction scope over a shared `&Connection`.
+/// `rusqlite::Connection::savepoint()` needs `&mut Connection`, which the
+/// pool only ever lends out as `&Connection` — so nest-safety here is done
+/// by hand with `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (same reasoning as
+/// `scanner::reparse_and_update_in_place`, see `scanner/mod.rs:619-630`).
+/// Unlike raw `BEGIN`, `SAVEPOINT` nests inside an already-open transaction
+/// instead of erroring with "cannot start a transaction within a
+/// transaction", and behaves like a normal transaction when none is open.
+///
+/// Drop without calling `commit()` ⇒ `ROLLBACK TO` + `RELEASE`, so the
+/// savepoint's changes are undone on any early return (`?`) or panic-unwind,
+/// not just the explicit error paths.
+pub(crate) struct SavepointGuard<'c> {
+    conn: &'c Connection,
+    name: &'static str,
+    done: bool,
+}
+
+impl<'c> SavepointGuard<'c> {
+    pub(crate) fn new(conn: &'c Connection, name: &'static str) -> rusqlite::Result<Self> {
+        conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+        Ok(Self { conn, name, done: false })
+    }
+
+    /// Persist the savepoint's changes (`RELEASE`). Consumes `self` so the
+    /// subsequent `Drop` sees `done == true` and is a no-op.
+    pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(&format!("RELEASE {}", self.name))?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl Drop for SavepointGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            // Never swallow errors: if the rollback itself fails, log it
+            // rather than silently leaving the savepoint open.
+            if let Err(e) = self
+                .conn
+                .execute_batch(&format!("ROLLBACK TO {0}; RELEASE {0}", self.name))
+            {
+                eprintln!(
+                    "[db] SavepointGuard: rollback failed for savepoint {:?}: {}",
+                    self.name, e
+                );
+            }
+        }
+    }
+}
+
 /// Insert a new file record
 /// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
@@ -384,7 +435,7 @@ pub fn reconcile_unique_camera_instrume(
     let suffix = format!(" N{}", root_id);
     let path_hi = path_prefix_upper(&root_path);
 
-    conn.execute("BEGIN TRANSACTION", [])?;
+    let sp = SavepointGuard::new(conn, "reconcile_unique_camera")?;
 
     // Update frames.instrume based on flag state
     // (the `instrume LIKE '%' || ?` checks below match a literal suffix, not
@@ -444,7 +495,7 @@ pub fn reconcile_unique_camera_instrume(
         )?;
     }
 
-    conn.execute("COMMIT", [])?;
+    sp.commit()?;
 
     Ok(ReconcileResult {
         frames_renamed,
@@ -488,7 +539,7 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
     )?;
 
     // Start transaction for atomicity and performance
-    conn.execute("BEGIN TRANSACTION", [])?;
+    let sp = SavepointGuard::new(conn, "delete_scan_root")?;
 
     // Pre-compute file IDs to delete (single byte-range query)
     let file_ids: Vec<i64> = {
@@ -587,7 +638,7 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("DELETE FROM scan_roots WHERE id = ?1", params![id])?;
 
     // Commit transaction
-    conn.execute("COMMIT", [])?;
+    sp.commit()?;
 
     Ok(())
 }
@@ -1657,7 +1708,7 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
     let hash_column = if use_content_hash { "content_hash" } else { "metadata_hash" };
 
     // Start transaction
-    conn.execute("BEGIN TRANSACTION", [])?;
+    let sp = SavepointGuard::new(conn, "rebuild_dup_groups_cache")?;
 
     // Clear existing cache for this hash type
     conn.execute(
@@ -1751,7 +1802,7 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
         groups_created += 1;
     }
 
-    conn.execute("COMMIT", [])?;
+    sp.commit()?;
     Ok(groups_created)
 }
 
@@ -4830,6 +4881,227 @@ mod fingerprint_backfill_tests {
             )
             .unwrap();
         assert_eq!(nulls, 0, "init_db self-heal should leave no NULL fingerprints");
+    }
+}
+
+/// Coverage for W2-T7 (v0.2.2 hygiene): the three raw `BEGIN`/`COMMIT` sites
+/// migrated to `SavepointGuard` — `reconcile_unique_camera_instrume`,
+/// `delete_scan_root`, `rebuild_duplicate_groups_cache`. Raw `BEGIN` errors
+/// with "cannot start a transaction within a transaction" whenever a
+/// transaction is already open on the connection; `SAVEPOINT` doesn't.
+#[cfg(test)]
+mod savepoint_migration_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::Connection;
+
+    // -- category 1: each migrated function nests inside an outer transaction ---
+
+    #[test]
+    fn reconcile_unique_camera_instrume_nests_inside_outer_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO scan_roots (path, unique_camera) VALUES ('/data/Root', 1)",
+            [],
+        )
+        .unwrap();
+        let root_id: i64 = conn
+            .query_row("SELECT id FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES ('/data/Root/a.fits', 'a.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, instrume) VALUES (?1, 'CamA')",
+            [file_id],
+        )
+        .unwrap();
+
+        // Mirrors the real call pattern: scan_directory_parallel (and friends)
+        // hold an outer transaction open while calling into per-row helpers.
+        let outer = conn.unchecked_transaction().unwrap();
+        let result = reconcile_unique_camera_instrume(&conn, root_id);
+        result
+            .as_ref()
+            .expect("SAVEPOINT must nest inside an already-open outer transaction, not error with 'cannot start a transaction within a transaction'");
+        outer.commit().unwrap();
+
+        let instrume: String = conn
+            .query_row("SELECT instrume FROM frames WHERE file_id = ?1", [file_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            instrume,
+            format!("CamA N{}", root_id),
+            "the unique-camera suffix must have landed"
+        );
+    }
+
+    #[test]
+    fn delete_scan_root_nests_inside_outer_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/Root')", [])
+            .unwrap();
+        let root_id: i64 = conn
+            .query_row("SELECT id FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES ('/data/Root/a.fits', 'a.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let outer = conn.unchecked_transaction().unwrap();
+        let result = delete_scan_root(&conn, root_id);
+        result
+            .as_ref()
+            .expect("SAVEPOINT must nest inside an already-open outer transaction, not error with 'cannot start a transaction within a transaction'");
+        outer.commit().unwrap();
+
+        let root_count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
+        assert_eq!(root_count, 0, "the scan root row must have been deleted");
+        let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        assert_eq!(file_count, 0, "files under the deleted root must have cascaded away");
+    }
+
+    #[test]
+    fn rebuild_duplicate_groups_cache_nests_inside_outer_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/Root', 1)", [])
+            .unwrap();
+        for (p, fname) in [("/data/Root/a.fits", "a.fits"), ("/data/Root/b.fits", "b.fits")] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                 VALUES (?1, ?2, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', 'HASH1')",
+                rusqlite::params![p, fname],
+            )
+            .unwrap();
+        }
+
+        let outer = conn.unchecked_transaction().unwrap();
+        let result = rebuild_duplicate_groups_cache(&conn, true);
+        result
+            .as_ref()
+            .expect("SAVEPOINT must nest inside an already-open outer transaction, not error with 'cannot start a transaction within a transaction'");
+        outer.commit().unwrap();
+
+        assert_eq!(result.unwrap(), 1, "the one duplicate pair should have produced one cached group");
+        let cached = get_cached_duplicates(&conn, true).unwrap();
+        assert_eq!(cached.len(), 1);
+    }
+
+    // -- category 2: rollback-on-error leaves DB state unchanged ---------------
+
+    #[test]
+    fn rebuild_duplicate_groups_cache_rolls_back_partial_writes_on_constraint_violation() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/Root', 1)", [])
+            .unwrap();
+
+        // Pre-existing cache row (same hash_type the call below will target)
+        // so we can prove the guard's rollback restores it after the
+        // function's own DELETE-then-INSERT sequence fails partway through.
+        conn.execute(
+            "INSERT INTO duplicate_groups (hash, hash_type, size, file_count, created_at, updated_at)
+             VALUES ('PREEXISTING', 'content', 999, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Two duplicate pairs sharing the SAME content_hash but different
+        // sizes. The dedup query groups by (hash, size), so both pairs are
+        // found as separate duplicate groups — but duplicate_groups' unique
+        // index is on (hash, hash_type) only (no size), so inserting the
+        // second group's row deterministically violates it, failing the
+        // function mid-loop, after the savepoint has already performed a
+        // real DELETE plus one successful INSERT.
+        for (p, fname, size) in [
+            ("/data/Root/a.fits", "a.fits", 100),
+            ("/data/Root/b.fits", "b.fits", 100),
+            ("/data/Root/c.fits", "c.fits", 200),
+            ("/data/Root/d.fits", "d.fits", 200),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                 VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', 'SAMEHASH')",
+                rusqlite::params![p, fname, size],
+            )
+            .unwrap();
+        }
+
+        let result = rebuild_duplicate_groups_cache(&conn, true);
+        assert!(
+            result.is_err(),
+            "the crafted (hash, hash_type) collision must surface as an Err, not silently succeed"
+        );
+
+        let groups: Vec<(String, i64)> = {
+            let mut stmt = conn.prepare("SELECT hash, size FROM duplicate_groups").unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            groups,
+            vec![("PREEXISTING".to_string(), 999)],
+            "savepoint rollback must undo the DELETE + partial INSERTs and restore the prior cache state exactly"
+        );
+
+        let link_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM duplicate_group_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(link_count, 0, "no duplicate_group_files rows from the failed pass should remain");
+    }
+
+    // -- category 3: guard unit test — drop-without-commit vs. commit ----------
+
+    #[test]
+    fn savepoint_guard_drop_without_commit_rolls_back() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/Root')", [])
+            .unwrap();
+
+        {
+            let sp = SavepointGuard::new(&conn, "test_guard_drop").unwrap();
+            conn.execute("DELETE FROM scan_roots", []).unwrap();
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 0, "the delete should be visible inside the open savepoint");
+            drop(sp); // no commit() — Drop must ROLLBACK TO + RELEASE
+        }
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "dropping the guard without commit() must roll back the delete");
+    }
+
+    #[test]
+    fn savepoint_guard_commit_persists() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/Root')", [])
+            .unwrap();
+
+        let sp = SavepointGuard::new(&conn, "test_guard_commit").unwrap();
+        conn.execute("DELETE FROM scan_roots", []).unwrap();
+        sp.commit().unwrap();
+
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "commit() must persist the delete past the savepoint");
     }
 }
 
