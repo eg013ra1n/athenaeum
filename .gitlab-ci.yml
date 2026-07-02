@@ -335,6 +335,20 @@ deploy:
     - ${SCP_CMD} target/release/bundle/msi/*.msi target/release/bundle/nsis/*.exe ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/windows/
     # Upload macOS artifacts
     - ${SCP_CMD} target/aarch64-apple-darwin/release/bundle/dmg/*.dmg target/x86_64-apple-darwin/release/bundle/dmg/*.dmg ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/macos/
+    # Stable-named aliases inside the release dir so the download page can carry
+    # permanent direct links via builds/latest/... (real filenames embed the tag,
+    # which would break static links on every release).
+    - |
+      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "set -e
+        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows
+        ln -sfn Athenaeum_${CI_COMMIT_TAG}_x64_en-US.msi Athenaeum-windows-x64.msi
+        ln -sfn Athenaeum_${CI_COMMIT_TAG}_x64-setup.exe Athenaeum-windows-x64-setup.exe
+        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux
+        ln -sfn athenaeum_${CI_COMMIT_TAG}_amd64.AppImage athenaeum-linux-x86_64.AppImage
+        ln -sfn athenaeum_${CI_COMMIT_TAG}_amd64.deb athenaeum-linux-amd64.deb
+        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos
+        ln -sfn Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg Athenaeum-macos-aarch64.dmg
+        ln -sfn Athenaeum_${CI_COMMIT_TAG}_x64.dmg Athenaeum-macos-x64.dmg"
     # Update symlink: beta tags → builds/beta, stable tags → builds/latest
     - |
       if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then
