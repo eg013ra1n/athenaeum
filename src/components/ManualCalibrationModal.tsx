@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api';
+import { useNotifications } from '../contexts/NotificationContext';
 import {
   X,
   Camera,
@@ -13,6 +14,8 @@ import {
   Hash,
   AlertTriangle,
   CheckCircle,
+  RotateCcw,
+  Loader2,
 } from 'lucide-react';
 import type {
   LightFrameParameters,
@@ -29,6 +32,8 @@ interface ManualCalibrationModalProps {
   useBiasForDarkOptimization: boolean;
   onApply: (flatSetId: number | null, darkSetId: number | null, biasSetId: number | null) => void;
   onClose: () => void;
+  /** Reload the hierarchy — same refresh path the save (onApply) flow uses. */
+  onRefresh?: () => void;
 }
 
 type TabType = 'flat' | 'dark' | 'bias';
@@ -43,7 +48,9 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
   useBiasForDarkOptimization,
   onApply,
   onClose,
+  onRefresh,
 }) => {
+  const { notify } = useNotifications();
   const [activeTab, setActiveTab] = useState<TabType>('flat');
   const [lightParams, setLightParams] = useState<LightFrameParameters | null>(null);
   const [flatSets, setFlatSets] = useState<CalibrationSetWithScore[]>([]);
@@ -52,6 +59,7 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
   const [showAll, setShowAll] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [resetting, setResetting] = useState(false);
 
   // Date range filter (only used when showAll is true)
   const [filterDateFrom, setFilterDateFrom] = useState<string>('');
@@ -140,6 +148,40 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     selectedFlatId !== currentFlatFromBackend ||
     selectedDarkId !== currentDarkFromBackend ||
     selectedBiasId !== currentBiasFromBackend;
+
+  // Undo for manual_assign_calibration: clears every is_manual_override link
+  // for these frames (all types) so auto-find is free to reassign them.
+  const handleResetToAutomatic = async () => {
+    if (frameIds.length === 0 || resetting) return;
+    setResetting(true);
+    try {
+      const count = await api.invoke<number>('clear_manual_calibration_override', {
+        frameIds,
+        calibrationType: null,
+      });
+      onClose();
+      onRefresh?.();
+      notify({
+        title: 'Calibration reset to automatic',
+        detail: count === 1
+          ? '1 manual override cleared — auto-find can now reassign it.'
+          : `${count} manual overrides cleared — auto-find can now reassign them.`,
+        kind: 'generic',
+        tone: 'success',
+      });
+    } catch (e) {
+      console.error('Failed to clear manual calibration override:', e);
+      notify({
+        title: 'Failed to reset calibration',
+        detail: e instanceof Error ? e.message : String(e),
+        kind: 'generic',
+        tone: 'warning',
+        hasErrors: true,
+      });
+    } finally {
+      setResetting(false);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -638,12 +680,27 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
 
         {/* Footer */}
         <div className="flex items-center justify-between px-6 py-4 border-t border-border bg-surface">
-          <div className="text-sm text-content-muted">
-            {hasChanges ? (
-              <span className="text-warning">You have unsaved changes</span>
-            ) : (
-              'Select calibration sets to apply'
-            )}
+          <div className="flex items-center gap-4">
+            <button
+              onClick={handleResetToAutomatic}
+              disabled={frameIds.length === 0 || resetting}
+              title="Clear manual overrides for these frames so auto-find can reassign calibration"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-error hover:bg-error-muted rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {resetting ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <RotateCcw className="w-3.5 h-3.5" />
+              )}
+              Reset to automatic
+            </button>
+            <div className="text-sm text-content-muted">
+              {hasChanges ? (
+                <span className="text-warning">You have unsaved changes</span>
+              ) : (
+                'Select calibration sets to apply'
+              )}
+            </div>
           </div>
           <div className="flex gap-3">
             <button

@@ -159,6 +159,56 @@ pub fn get_manual_override_set_id(
     }
 }
 
+/// Clear manual-override calibration links for the given frames.
+///
+/// Deletes `calibration_set_to_frames` rows with `source_type = 'frame'` and
+/// `is_manual_override = 1` for the supplied frame IDs. `calibration_type`
+/// narrows the clear to a single link type ("Flat" / "Dark" / "Bias" /
+/// "DarkFlat"); `None` clears every manually-overridden link type for these
+/// frames. Returns the number of rows deleted (0 is a harmless no-op when
+/// nothing was manually overridden). This is the undo for
+/// `manual_assign_calibration` — once cleared, auto-find is free to
+/// reassign the frame's calibration (see `insert_calibration_link` above).
+pub fn clear_manual_override(
+    conn: &Connection,
+    frame_ids: &[i64],
+    calibration_type: Option<&str>,
+) -> Result<usize> {
+    if frame_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
+
+    let sql = match calibration_type {
+        Some(_) => format!(
+            "DELETE FROM calibration_set_to_frames
+             WHERE source_id IN ({}) AND source_type = 'frame'
+             AND calibration_type = ?{} AND is_manual_override = 1",
+            placeholders.join(", "),
+            frame_ids.len() + 1
+        ),
+        None => format!(
+            "DELETE FROM calibration_set_to_frames
+             WHERE source_id IN ({}) AND source_type = 'frame' AND is_manual_override = 1",
+            placeholders.join(", ")
+        ),
+    };
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = frame_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+        .collect();
+
+    if let Some(ct) = calibration_type {
+        params.push(Box::new(ct.to_string()));
+    }
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    conn.execute(&sql, param_refs.as_slice())
+}
+
 /// Get sub-calibration details for a calibration set
 /// Returns the linked sub-calibrations (e.g., Flat→Dark/Bias, Dark→Bias) with full set details
 /// Warnings are calculated dynamically based on date and temperature differences
@@ -1519,5 +1569,88 @@ mod tests {
         assert!(!link_exists(&conn, 1, "frame", "Dark").unwrap());
         insert_calibration_link(&conn, &link).unwrap();
         assert!(link_exists(&conn, 1, "frame", "Dark").unwrap());
+    }
+
+    fn insert_manual_link(conn: &Connection, frame_id: i64, set_id: i64, calibration_type: &str) {
+        let link = CalibrationLink {
+            id: None,
+            source_id: frame_id,
+            source_type: "frame".to_string(),
+            calibration_set_id: set_id,
+            calibration_type: calibration_type.to_string(),
+            matched_at: Utc::now().to_rfc3339(),
+            match_score: Some(1.0),
+            date_warning: false,
+            temp_warning: false,
+            is_manual_override: true,
+        };
+        insert_calibration_link(conn, &link).unwrap();
+    }
+
+    #[test]
+    fn test_clear_manual_override_empty_frame_ids_is_noop() {
+        let conn = create_test_db();
+        assert_eq!(clear_manual_override(&conn, &[], None).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_clear_manual_override_no_manual_links_returns_zero() {
+        let conn = create_test_db();
+        // No links at all for frame 1 — clearing should be a harmless no-op.
+        assert_eq!(clear_manual_override(&conn, &[1], None).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_clear_manual_override_all_types() {
+        let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
+        insert_test_calibration_set(&conn, 20);
+        insert_manual_link(&conn, 1, 10, "Dark");
+        insert_manual_link(&conn, 1, 20, "Bias");
+
+        let deleted = clear_manual_override(&conn, &[1], None).unwrap();
+        assert_eq!(deleted, 2);
+        assert!(get_links_for_frame(&conn, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_clear_manual_override_type_scoped() {
+        let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
+        insert_test_calibration_set(&conn, 20);
+        insert_manual_link(&conn, 1, 10, "Dark");
+        insert_manual_link(&conn, 1, 20, "Bias");
+
+        let deleted = clear_manual_override(&conn, &[1], Some("Dark")).unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining = get_links_for_frame(&conn, 1).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].calibration_type, "Bias");
+    }
+
+    #[test]
+    fn test_clear_manual_override_leaves_auto_links_alone() {
+        let conn = create_test_db();
+        insert_test_calibration_set(&conn, 10);
+
+        // Auto-matched link (is_manual_override = false) must survive.
+        let auto_link = CalibrationLink {
+            id: None,
+            source_id: 1,
+            source_type: "frame".to_string(),
+            calibration_set_id: 10,
+            calibration_type: "Flat".to_string(),
+            matched_at: Utc::now().to_rfc3339(),
+            match_score: Some(0.9),
+            date_warning: false,
+            temp_warning: false,
+            is_manual_override: false,
+        };
+        insert_calibration_link(&conn, &auto_link).unwrap();
+
+        let deleted = clear_manual_override(&conn, &[1], None).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(get_links_for_frame(&conn, 1).unwrap().len(), 1);
     }
 }

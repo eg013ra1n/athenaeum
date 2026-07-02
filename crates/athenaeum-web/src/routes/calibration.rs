@@ -549,6 +549,13 @@ pub struct ManualAssignCalibrationArgs {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClearManualCalibrationOverrideArgs {
+    pub frame_ids: Vec<i64>,
+    pub calibration_type: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetSubcalibrationSetsArgs {
     pub set_id: i64,
     pub calibration_type: String,
@@ -921,6 +928,35 @@ pub async fn manual_assign_calibration(
     );
 
     Ok(Json(assigned_count))
+}
+
+/// POST /api/clear_manual_calibration_override
+///
+/// Remove manual calibration override(s) for light frames and allow
+/// auto-find to reassign. Mirrors `athenaeum-tauri`'s command of the same
+/// name; both call `athenaeum_core::db::calibration_links::clear_manual_override`.
+pub async fn clear_manual_calibration_override(
+    State(state): State<WebAppState>,
+    Json(args): Json<ClearManualCalibrationOverrideArgs>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    use athenaeum_core::db::calibration_links::clear_manual_override;
+
+    let db = state.ctx.db.get().ok_or_else(no_db)?;
+    let conn = db.conn();
+
+    if args.frame_ids.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "No frame IDs provided".to_string()));
+    }
+
+    let deleted = clear_manual_override(&conn, &args.frame_ids, args.calibration_type.as_deref())
+        .map_err(db_err)?;
+
+    eprintln!(
+        "Cleared {} manual calibration override(s) from {} frames",
+        deleted, args.frame_ids.len()
+    );
+
+    Ok(Json(deleted))
 }
 
 /// POST /api/manual_assign_subcalibration

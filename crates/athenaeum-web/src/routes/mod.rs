@@ -128,6 +128,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_subcalibration_sets_for_manual_selection", post(calibration::get_subcalibration_sets_for_manual_selection))
         .route("/api/get_light_frame_parameters", post(calibration::get_light_frame_parameters))
         .route("/api/manual_assign_calibration", post(calibration::manual_assign_calibration))
+        .route("/api/clear_manual_calibration_override", post(calibration::clear_manual_calibration_override))
         .route("/api/manual_assign_subcalibration", post(calibration::manual_assign_subcalibration))
         .route("/api/clear_subcalibration_override", post(calibration::clear_subcalibration_override))
         .route("/api/bulk_update_calibration_metadata", post(calibration::bulk_update_calibration_metadata))

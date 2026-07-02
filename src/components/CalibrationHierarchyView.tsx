@@ -379,6 +379,7 @@ export function CalibrationHierarchyView({
         useBiasForDarkOptimization={useBiasForDarkOptimization}
         onApply={handleManualCalibrationApply}
         onClose={() => setManualModalOpen(false)}
+        onRefresh={onRefresh}
       />
     </div>
   );

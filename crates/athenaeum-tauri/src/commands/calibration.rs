@@ -618,6 +618,8 @@ pub async fn clear_manual_calibration_override(
     calibration_type: Option<String>,  // None = clear all types
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
+    use crate::db::calibration_links::clear_manual_override;
+
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -625,37 +627,11 @@ pub async fn clear_manual_calibration_override(
         return Err("No frame IDs provided".to_string());
     }
 
-    let placeholders: Vec<String> = frame_ids.iter().map(|_| "?".to_string()).collect();
-
-    let sql = match &calibration_type {
-        Some(_ct) => format!(
-            "DELETE FROM calibration_set_to_frames
-             WHERE source_id IN ({}) AND source_type = 'frame'
-             AND calibration_type = ?{} AND is_manual_override = 1",
-            placeholders.join(", "),
-            frame_ids.len() + 1
-        ),
-        None => format!(
-            "DELETE FROM calibration_set_to_frames
-             WHERE source_id IN ({}) AND source_type = 'frame' AND is_manual_override = 1",
-            placeholders.join(", ")
-        ),
-    };
-
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = frame_ids.iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
-        .collect();
-
-    if let Some(ct) = &calibration_type {
-        params.push(Box::new(ct.clone()));
-    }
-
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter()
-        .map(|p| p.as_ref())
-        .collect();
-
-    let deleted = conn.execute(&sql, param_refs.as_slice())
-        .map_err(|e| e.to_string())?;
+    let deleted = clear_manual_override(&conn, &frame_ids, calibration_type.as_deref())
+        .map_err(|e| {
+            eprintln!("Failed to clear manual calibration override: {}", e);
+            e.to_string()
+        })?;
 
     println!(
         "✅ Cleared {} manual calibration override(s) from {} frames",
