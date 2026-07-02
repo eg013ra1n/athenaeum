@@ -4,7 +4,6 @@ pub mod gaia_bulk;
 pub mod gaia_prebuilt;
 pub mod healpix;
 pub mod manifest;
-pub mod tycho2;
 
 use std::path::{Path, PathBuf};
 
@@ -28,29 +27,19 @@ pub struct CatalogInfo {
 
 /// Engine for querying HEALpix-indexed star catalogs on disk.
 pub struct CatalogEngine {
-    tycho2_path: Option<PathBuf>,
     gaia_path: Option<PathBuf>,
 }
 
 impl CatalogEngine {
     pub fn new() -> Self {
-        CatalogEngine {
-            tycho2_path: None,
-            gaia_path: None,
-        }
+        CatalogEngine { gaia_path: None }
     }
 
     /// Initialize with a catalog directory. Scans for available catalogs.
     pub fn with_catalog_dir(catalog_dir: &Path) -> Self {
-        let tycho2_path = catalog_dir.join("tycho2");
         let gaia_path = catalog_dir.join("gaia_dr3");
 
         CatalogEngine {
-            tycho2_path: if tycho2_path.exists() {
-                Some(tycho2_path)
-            } else {
-                None
-            },
             gaia_path: if gaia_path.exists() {
                 Some(gaia_path)
             } else {
@@ -59,14 +48,7 @@ impl CatalogEngine {
         }
     }
 
-    /// Set the Tycho-2 catalog path explicitly.
-    pub fn set_tycho2_path(&mut self, path: PathBuf) {
-        self.tycho2_path = Some(path);
-    }
-
     /// Query stars within a cone on the sky, epoch-corrected.
-    ///
-    /// Automatically selects the best available catalog (Gaia > Tycho-2).
     ///
     /// - `ra_deg`, `dec_deg`: cone center in degrees
     /// - `radius_deg`: search radius in degrees
@@ -80,7 +62,6 @@ impl CatalogEngine {
         mag_limit: f32,
         observation_epoch: f64,
     ) -> Result<(Vec<CatalogStar>, &str)> {
-        // Priority: Gaia DR3 > Tycho-2
         if let Some(ref gaia_path) = self.gaia_path {
             let stars = self.cone_search_catalog(
                 gaia_path,
@@ -94,21 +75,8 @@ impl CatalogEngine {
             return Ok((stars, "gaia_dr3"));
         }
 
-        if let Some(ref tycho2_path) = self.tycho2_path {
-            let stars = self.cone_search_catalog(
-                tycho2_path,
-                2000.0, // Tycho-2 epoch (J2000)
-                ra_deg,
-                dec_deg,
-                radius_deg,
-                mag_limit,
-                observation_epoch,
-            )?;
-            return Ok((stars, "tycho2"));
-        }
-
         Err(anyhow::anyhow!(
-            "No star catalog available. Install Tycho-2 or Gaia DR3."
+            "No star catalog available. Install Gaia DR3."
         ))
     }
 
@@ -165,16 +133,6 @@ impl CatalogEngine {
     pub fn available_catalogs(&self) -> Vec<CatalogInfo> {
         let mut catalogs = Vec::new();
 
-        if let Some(ref path) = self.tycho2_path {
-            catalogs.push(CatalogInfo {
-                name: "Tycho-2".to_string(),
-                path: path.clone(),
-                epoch: 2000.0,
-                star_count_approx: 2_500_000,
-                mag_limit: 11.5,
-            });
-        }
-
         if let Some(ref path) = self.gaia_path {
             catalogs.push(CatalogInfo {
                 name: "Gaia DR3".to_string(),
@@ -190,7 +148,7 @@ impl CatalogEngine {
 
     /// Check if any catalog is available.
     pub fn has_catalog(&self) -> bool {
-        self.tycho2_path.is_some() || self.gaia_path.is_some()
+        self.gaia_path.is_some()
     }
 
     /// Load catalog stars in a single HEALpix region (no neighbors).
@@ -213,10 +171,6 @@ impl CatalogEngine {
             catalog_path = gaia_path;
             catalog_epoch = 2016.0;
             catalog_name = "gaia_dr3";
-        } else if let Some(ref tycho2_path) = self.tycho2_path {
-            catalog_path = tycho2_path;
-            catalog_epoch = 2000.0;
-            catalog_name = "tycho2";
         } else {
             return Err(anyhow::anyhow!("No star catalog available"));
         }
@@ -323,7 +277,7 @@ mod tests {
     #[test]
     fn write_and_read_catalog() {
         let tmp = TempDir::new().unwrap();
-        let catalog_dir = tmp.path().join("tycho2");
+        let catalog_dir = tmp.path().join("gaia_dr3");
         make_test_catalog(&catalog_dir);
 
         let engine = CatalogEngine::with_catalog_dir(tmp.path());
@@ -333,7 +287,7 @@ mod tests {
             .cone_search(180.0, 45.0, 2.0, 12.0, 2000.0)
             .unwrap();
 
-        assert_eq!(catalog_name, "tycho2");
+        assert_eq!(catalog_name, "gaia_dr3");
         assert!(
             stars.len() >= 3,
             "Expected >=3 stars near RA=180 Dec=45, got {}",
@@ -344,7 +298,7 @@ mod tests {
     #[test]
     fn mag_limit_filtering() {
         let tmp = TempDir::new().unwrap();
-        let catalog_dir = tmp.path().join("tycho2");
+        let catalog_dir = tmp.path().join("gaia_dr3");
         make_test_catalog(&catalog_dir);
 
         let engine = CatalogEngine::with_catalog_dir(tmp.path());
@@ -361,7 +315,7 @@ mod tests {
     #[test]
     fn proper_motion_changes_positions() {
         let tmp = TempDir::new().unwrap();
-        let catalog_dir = tmp.path().join("tycho2");
+        let catalog_dir = tmp.path().join("gaia_dr3");
 
         let records = vec![
             StarRecord::from_values(180.0, 45.0, 5.0, 500.0, -300.0), // large PM

@@ -10,7 +10,7 @@
 //!       <image.fits> [expected_scale_arcsec] [out.png]
 //!
 //! `expected_scale_arcsec` (e.g. 0.48 for the 1000 mm narrowband frames)
-//! enables the ASTAP-style pre-detection binning, exactly as the solver runs
+//! enables the production pre-detection binning, exactly as the solver runs
 //! it for a frame with that header scale. Omit for the native-scale view.
 
 use std::path::PathBuf;

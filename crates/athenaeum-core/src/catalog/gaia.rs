@@ -1,6 +1,6 @@
 //! Gaia DR3 (G ≤ 19) all-sky catalog ingest.
 //!
-//! Mirrors the [`super::tycho2`] pipeline, but Gaia is far too large to bulk
+//! Mirrors the legacy HEALPix ingest pipeline, but Gaia is far too large to bulk
 //! download. Instead we extract via the ESA TAP **async** service, tiled by
 //! `source_id` range so the server filters `phot_g_mean_mag < 19` and
 //! projects `ra,dec,phot_g_mean_mag,pmra,pmdec,ruwe`. Each tile is an
@@ -30,8 +30,8 @@
 //!
 //! Output goes to `catalogs/gaia_dr3/` in the existing depth-6 HEALPix
 //! [`StarRecord`] format; [`crate::catalog::CatalogEngine::with_catalog_dir`]
-//! auto-discovers it and `cone_search` prefers it (epoch 2016.0) over
-//! Tycho-2 with no solver changes.
+//! auto-discovers it and `cone_search` uses it (epoch 2016.0) with no
+//! solver changes.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -84,8 +84,7 @@ pub const SOURCE_ID_TILE_SPAN: u64 = 1 << 49;
 /// gives a ~3× speedup over serial without abusing the service.
 pub const GAIA_CONCURRENCY: usize = 3;
 
-/// Progress callback for the query and conversion phases (mirrors
-/// [`super::tycho2::Tycho2Progress`]).
+/// Progress callback for the query and conversion phases.
 pub enum GaiaProgress {
     /// Emitted immediately when the run begins (before the first slow TAP
     /// round-trip) so the UI has instant feedback. `already_done` is the
@@ -308,8 +307,8 @@ pub fn fetch_job_csv(client: &reqwest::blocking::Client, job_url: &str) -> Resul
 /// stars are still useful for matching, so a missing PM is treated as 0.
 /// `ra`/`dec`/`phot_g_mean_mag` must be present (the server-side
 /// `phot_g_mean_mag < 16` filter already excludes null-G rows). `pmra` is
-/// Gaia μα\* (cos δ included) — stored as-is; this matches the Tycho-2 path
-/// and `cone_search`'s proper-motion expectation (asserted in Task 7).
+/// Gaia μα\* (cos δ included) — stored as-is; this matches the canonical
+/// StarRecord path and `cone_search`'s proper-motion expectation (asserted in Task 7).
 ///
 /// RUWE cut: a present 6th column parsed to a value >= [`GAIA_RUWE_MAX`]
 /// drops the row. An absent or empty RUWE keeps the row (5-column input, or
@@ -344,7 +343,7 @@ pub fn parse_gaia_csv_row(row: &str) -> Option<StarRecord> {
 }
 
 /// RAM-safe streaming binner: the full G≤16 catalog (~300 M records ≈
-/// 4.2 GB) cannot be held in memory like Tycho-2's 2.5 M, so we never
+/// 4.2 GB) cannot be held in memory like the legacy catalog's 2.5 M, so we never
 /// collect it. Each TAP tile (~390 k records ≈ 5.5 MB — bounded) is grouped
 /// by depth-6 HEALPix pixel and **appended** to per-pixel scratch files
 /// (`scratch/p_NNNNNN.raw`). [`HealpixBinner::finalize`] then makes one pass
@@ -581,8 +580,7 @@ pub fn download_gaia_dr3(
 }
 
 /// Full Gaia DR3 (G≤19) catalog setup. Idempotent (skips if
-/// `catalogs/gaia_dr3/` already populated, mirroring
-/// [`super::tycho2::setup_tycho2_catalog`]); resumable via the tile
+/// `catalogs/gaia_dr3/` already populated); resumable via the tile
 /// manifest. Returns the catalog directory, auto-discovered by
 /// [`crate::catalog::CatalogEngine::with_catalog_dir`].
 pub fn setup_gaia_dr3_catalog(
@@ -775,11 +773,11 @@ mod tests {
     }
 
     #[test]
-    fn gaia_pm_convention_matches_tycho2_path() {
+    fn gaia_pm_convention_matches_canonical_path() {
         use astroimage::platesolving::ProperMotionCorrector;
 
         // parse_gaia_csv_row must store Gaia μα* (cos δ included) verbatim in
-        // mas/yr — the SAME representation the Tycho-2 path and cone_search's
+        // mas/yr — the SAME representation the canonical StarRecord path and cone_search's
         // ProperMotionCorrector expect. Realistic PM (StarRecord stores pmra
         // as i16 ×0.01 mas/yr → ±327.67 clamp; only a handful of very-high-PM
         // stars clamp, irrelevant for plate solving).
@@ -794,7 +792,7 @@ mod tests {
         // Assumption-free guarantee: a Gaia-parsed record fed to the shared
         // corrector is bit-identical to the canonical StarRecord path with
         // the same numbers — so the Gaia route introduces zero PM distortion
-        // / cos δ double-count relative to the Tycho-2 route.
+        // / cos δ double-count relative to the canonical route.
         let direct = StarRecord::from_values(0.0, 60.0, 10.0, 300.0, -50.0);
         let g = ProperMotionCorrector::propagate(
             s.ra as f64, s.dec as f64, s.pmra_mas_yr(), s.pmdec_mas_yr(), 2016.0, 2116.0,

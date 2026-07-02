@@ -84,9 +84,9 @@ fn main() -> anyhow::Result<()> {
 
     println!("\nGaia DR3 catalog installed at: {}", result.display());
     println!(
-        "Next: re-run the solver bench — \
-         BENCH_SOLVER_BACKEND=astap BENCH_SKIP_ASTAP=1 cargo test --release \
-         -p athenaeum-core --test bench_astap_vs_athenaeum -- --ignored --nocapture"
+        "Next: run the solver corpus bench — \
+         SOLVEMYASTRO_TIER_DIR=<dir with tier_*> cargo test --release \
+         -p solvemyastro --test corpus_bench corpus_layered_tiers -- --ignored --nocapture"
     );
     Ok(())
 }

@@ -159,13 +159,14 @@ pub fn extract_hints(frame: &Frame, conn: Option<&Connection>) -> SolveHints {
     //
     // FITS `XPIXSZ` is the **effective** pixel pitch of a pixel in the *saved*
     // image: every mainstream capture program (ASIAIR, N.I.N.A., SharpCap,
-    // ZWO/ASCOM, and what ASTAP itself assumes) already folds binning into
-    // XPIXSZ, with XBINNING kept purely informational. Multiplying XPIXSZ by
-    // XBINNING double-counts binning. Empirically (ASTAP-oracle bench): a ZWO
-    // ASI294MM bin-2 frame reports XPIXSZ=4.63 with NAXIS1=4144 — already the
-    // 4.63 µm/px of the 4144-px image; ×2 yields 1.91"/px vs the true
-    // 0.955"/px, breaking the scale hint at long focal length. So use XPIXSZ
-    // directly, exactly as ASTAP does (scale ≈ 206.265·XPIXSZµm / FOCALLENmm).
+    // ZWO/ASCOM — and established external solvers assume the same) already
+    // folds binning into XPIXSZ, with XBINNING kept purely informational.
+    // Multiplying XPIXSZ by XBINNING double-counts binning. Empirically
+    // (external-oracle bench): a ZWO ASI294MM bin-2 frame reports XPIXSZ=4.63
+    // with NAXIS1=4144 — already the 4.63 µm/px of the 4144-px image; ×2
+    // yields 1.91"/px vs the true 0.955"/px, breaking the scale hint at long
+    // focal length. So use XPIXSZ directly, per the established convention
+    // (scale ≈ 206.265·XPIXSZµm / FOCALLENmm).
     if let (Some(focallen), Some(xpixsz)) = (frame.focallen, frame.xpixsz) {
         if focallen > 0.0 && xpixsz > 0.0 {
             let pixel_size_mm = xpixsz / 1000.0;

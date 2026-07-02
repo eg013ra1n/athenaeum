@@ -1,5 +1,5 @@
 //! Integration: the stricter blind gate must NOT reject a true full-blind
-//! solve. Ported from the legacy Tycho-2/QuadIndex harness to the Phase-3
+//! solve. Ported from the legacy quad-index harness to the Phase-3
 //! solvemyastro StarCache backend.
 use std::path::PathBuf;
 use athenaeum_core::db::schema::init_db;

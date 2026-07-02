@@ -581,7 +581,7 @@ mod tests {
             pixel_scale_arcsec: scale,
             field_rotation_deg: 0.0,
             solve_time_ms: 0,
-            catalog_used: "tycho2".into(),
+            catalog_used: "smac_gaia".into(),
             algorithm_used: "blind_index".into(),
             derived_focallen_mm: None,
             focallen_corrected: false,
