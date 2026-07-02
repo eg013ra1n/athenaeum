@@ -25,3 +25,7 @@ chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 base64 = "0.22"
 solvemyastro = { path = "../../solvemyastro" }
+
+[dev-dependencies]
+# ServiceExt::oneshot for router-level middleware tests (see routes/auth.rs).
+tower = { version = "0.5", features = ["util"] }

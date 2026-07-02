@@ -16,6 +16,10 @@ services:
       - ATHENAEUM_STATIC_DIR=/app/static
       - ATHENAEUM_ALLOWED_PATHS=/astro-files,/astro-main
       - ATHENAEUM_EXPORT_DIR=/exports
+      # Optional: require an API key for /api/* (header X-API-Key or
+      # Authorization: Bearer; the web UI prompts for it; SSE uses
+      # ?api_key= since EventSource can't set headers). Unset = open.
+      # - ATHENAEUM_API_KEY=changeme
     restart: unless-stopped
 
 volumes:

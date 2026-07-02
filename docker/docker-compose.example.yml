@@ -33,6 +33,14 @@ services:
       # Must match the container-side paths in your volume mounts above.
       - ATHENAEUM_ALLOWED_PATHS=/astro-files
       - ATHENAEUM_EXPORT_DIR=/exports
+      # Optional: require an API key for all /api/* requests. Unset (the
+      # default) leaves the server fully open — fine on a trusted LAN, but
+      # if you're exposing this port beyond your LAN, set a key. Clients
+      # send it as `X-API-Key: <key>` or `Authorization: Bearer <key>`; the
+      # web UI will prompt for it. The one exception is the SSE endpoint
+      # (/api/events), which browsers can't attach headers to, so it also
+      # accepts `?api_key=<key>` as a query parameter.
+      # - ATHENAEUM_API_KEY=changeme
     restart: unless-stopped
 
 volumes:

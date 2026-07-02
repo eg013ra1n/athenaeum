@@ -18,6 +18,10 @@ struct Config {
     static_dir: Option<PathBuf>,
     allowed_paths: Vec<PathBuf>,
     export_dir: Option<PathBuf>,
+    /// Opt-in shared secret for `/api/*` (see `routes::auth`). `None` means
+    /// auth is disabled — every request passes through unchanged, matching
+    /// today's fully-open behavior.
+    api_key: Option<String>,
 }
 
 impl Config {
@@ -38,6 +42,13 @@ impl Config {
                 .map(PathBuf::from)
                 .collect(),
             export_dir: std::env::var("ATHENAEUM_EXPORT_DIR").ok().map(PathBuf::from),
+            // Trim, then treat empty/whitespace-only as unset — a stray
+            // `ATHENAEUM_API_KEY=` in a compose file must not lock the app
+            // into an unusable state where an empty string "matches".
+            api_key: std::env::var("ATHENAEUM_API_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -49,6 +60,9 @@ pub struct WebAppState {
     pub event_tx: tokio::sync::broadcast::Sender<events::SseEvent>,
     pub allowed_paths: Vec<PathBuf>,
     pub export_dir: Option<PathBuf>,
+    /// Opt-in shared secret for `/api/*` auth; see `routes::auth`. `None` =
+    /// auth disabled (today's open behavior).
+    pub api_key: Option<String>,
     /// Limits concurrent image conversions; wrapped in RwLock so the semaphore
     /// can be swapped at runtime when the user changes blink.threads.
     pub image_semaphore: Arc<RwLock<Arc<tokio::sync::Semaphore>>>,
@@ -77,6 +91,11 @@ async fn main() {
     if let Some(ref dir) = config.export_dir {
         println!("  Export:   {}", dir.display());
     }
+    // Never print the key itself — only whether auth is on.
+    println!(
+        "  API key:  {}",
+        if config.api_key.is_some() { "required (ATHENAEUM_API_KEY set)" } else { "disabled (ATHENAEUM_API_KEY unset)" }
+    );
 
     // Ensure DB parent directory exists
     if let Some(parent) = config.db_path.parent() {
@@ -150,6 +169,7 @@ async fn main() {
         event_tx,
         allowed_paths: config.allowed_paths,
         export_dir: config.export_dir,
+        api_key: config.api_key,
         image_semaphore,
         max_blink_threads: max_threads,
         monitor: athenaeum_core::monitor::MonitorService::new(),

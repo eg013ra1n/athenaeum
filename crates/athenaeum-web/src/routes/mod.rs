@@ -7,6 +7,7 @@ use axum::{
     },
     routing::{get, post},
     http::StatusCode,
+    middleware,
 };
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use tokio_stream::StreamExt;
 
 use crate::WebAppState;
 
+mod auth;
 mod scan_roots;
 mod files;
 mod settings;
@@ -238,6 +240,17 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Category A — Desktop-only stubs
         .route("/api/check_for_updates", post(check_for_updates))
         .route("/api/read_fits_image_rustafits", post(read_fits_image_rustafits_stub))
+        // Opt-in ATHENAEUM_API_KEY auth (routes/auth.rs). Layered BEFORE
+        // `.with_state` below, on a self-contained key-holder state rather
+        // than the full WebAppState — see auth.rs for why. Only wraps the
+        // `/api/*` routes registered above; the static SPA fallback is
+        // attached to `api` further down, after this layer, so it is never
+        // touched by the middleware even before its own internal `/api/`
+        // path check kicks in.
+        .layer(middleware::from_fn_with_state(
+            auth::ApiKeyState { api_key: state.api_key.clone() },
+            auth::require_api_key,
+        ))
         .with_state(state);
 
     // Optionally serve static frontend files

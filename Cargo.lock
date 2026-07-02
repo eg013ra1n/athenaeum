@@ -330,6 +330,7 @@ dependencies = [
  "solvemyastro",
  "tokio",
  "tokio-stream",
+ "tower",
  "tower-http",
 ]
 
