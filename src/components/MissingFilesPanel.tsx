@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api } from '../api';
 import { pickFile } from '../api/desktop';
 import { isTauri } from '../utils/platform';
+import { useNotifications } from '../contexts/NotificationContext';
 import {
   AlertTriangle,
   RefreshCw,
@@ -21,6 +22,7 @@ interface MissingFilesPanelProps {
 }
 
 export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFilesPanelProps) {
+  const { notify } = useNotifications();
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [isRechecking, setIsRechecking] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -143,6 +145,8 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       }
     } catch (error) {
       console.error('Failed to relocate file:', error);
+      const message = typeof error === 'string' ? error : 'Failed to relocate file';
+      notify({ title: 'Relocate failed', detail: message, kind: 'files', tone: 'warning' });
       setActionInProgress(null);
     }
   };

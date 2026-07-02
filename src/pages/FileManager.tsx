@@ -6,6 +6,7 @@ import { isTauri } from '../utils/platform';
 import { api } from '../api';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
 import { useScanProgressContext } from '../contexts/ScanProgressContext';
+import { useNotifications } from '../contexts/NotificationContext';
 import { format } from 'date-fns';
 import DualPaneFileBrowser, { type DualPaneRevealRequest } from '../components/dualpane/DualPaneFileBrowser';
 import type { ScanResult, RelinkResult, MissingFileRecord } from '../types/models';
@@ -24,6 +25,7 @@ type DuplicatesViewMode = 'files' | 'folders';
 export default function FileManager() {
   const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, toggleMonitorEnabled, relinkScanRoot } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning } = useScanProgressContext();
+  const { notify } = useNotifications();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
@@ -97,6 +99,8 @@ export default function FileManager() {
 
   // Folder browser modal (web mode)
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
+  // Relink folder browser modal (web mode) — set to the scan root being relinked
+  const [relinkTargetRootId, setRelinkTargetRootId] = useState<number | null>(null);
 
   // Data file locations state
 
@@ -251,6 +255,15 @@ export default function FileManager() {
 
   // Handle relinking a scan root to a new location
   const handleRelinkScanRoot = async (rootId: number) => {
+    // Web mode has no native directory picker (`pickDirectory()` always
+    // returns null there) — open the in-app directory browser modal instead
+    // and finish the relink from its onSelect callback.
+    if (!isTauri) {
+      setRelinkResult(null);
+      setRelinkTargetRootId(rootId);
+      return;
+    }
+
     try {
       setRelinkingRootId(rootId);
       setRelinkResult(null);
@@ -266,7 +279,31 @@ export default function FileManager() {
       setRelinkResult(result);
     } catch (error) {
       console.error('Relink failed:', error);
-      showAlert('Relink Failed', typeof error === 'string' ? error : 'Relink failed', 'error');
+      const message = typeof error === 'string' ? error : 'Relink failed';
+      showAlert('Relink Failed', message, 'error');
+      notify({ title: 'Relink failed', detail: message, kind: 'files', tone: 'warning' });
+    } finally {
+      setRelinkingRootId(null);
+    }
+  };
+
+  // Web mode: directory chosen from the FolderBrowserModal for a relink in progress
+  const handleRelinkFolderBrowserSelect = async (path: string) => {
+    const rootId = relinkTargetRootId;
+    setRelinkTargetRootId(null);
+    if (rootId == null) return;
+
+    try {
+      setRelinkingRootId(rootId);
+      setRelinkResult(null);
+
+      const result = await relinkScanRoot(rootId, path);
+      setRelinkResult(result);
+    } catch (error) {
+      console.error('Relink failed:', error);
+      const message = typeof error === 'string' ? error : 'Relink failed';
+      showAlert('Relink Failed', message, 'error');
+      notify({ title: 'Relink failed', detail: message, kind: 'files', tone: 'warning' });
     } finally {
       setRelinkingRootId(null);
     }
@@ -403,16 +440,14 @@ export default function FileManager() {
                           <p className="text-sm text-warning/80 mb-2">
                             This directory is not accessible. It may have been moved, renamed, or is on an unmounted drive.
                           </p>
-                          {isTauri && (
-                            <button
-                              onClick={() => root.id && handleRelinkScanRoot(root.id)}
-                              disabled={relinkingRootId === root.id}
-                              className="flex items-center gap-2 px-3 py-1.5 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded text-sm transition"
-                            >
-                              <RefreshCw size={16} className={relinkingRootId === root.id ? 'animate-spin' : ''} />
-                              {relinkingRootId === root.id ? 'Relinking...' : 'Relink Directory'}
-                            </button>
-                          )}
+                          <button
+                            onClick={() => root.id && handleRelinkScanRoot(root.id)}
+                            disabled={relinkingRootId === root.id}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded text-sm transition"
+                          >
+                            <RefreshCw size={16} className={relinkingRootId === root.id ? 'animate-spin' : ''} />
+                            {relinkingRootId === root.id ? 'Relinking...' : 'Relink Directory'}
+                          </button>
                         </div>
                       </div>
                     )}
@@ -909,6 +944,14 @@ export default function FileManager() {
         isOpen={showFolderBrowser}
         onSelect={handleFolderBrowserSelect}
         onClose={() => setShowFolderBrowser(false)}
+      />
+
+      {/* Relink Folder Browser Modal (web mode) */}
+      <FolderBrowserModal
+        isOpen={relinkTargetRootId !== null}
+        onSelect={handleRelinkFolderBrowserSelect}
+        onClose={() => setRelinkTargetRootId(null)}
+        scope="scan"
       />
     </div>
   );
