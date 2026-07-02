@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { api } from './api';
+import { isTauri } from './utils/platform';
 import Layout from './components/Layout';
 import WelcomeScreen from './components/WelcomeScreen';
+import WebAuthGate from './components/WebAuthGate';
 import FileManager from './pages/FileManager';
 import ShootCalendar from './pages/ShootCalendar';
 import Objects from './pages/Objects';
@@ -15,6 +17,17 @@ import About from './pages/About';
 import ExcludedFrames from './pages/ExcludedFrames';
 
 function App() {
+  if (!isTauri) {
+    return (
+      <WebAuthGate>
+        <AppContent />
+      </WebAuthGate>
+    );
+  }
+  return <AppContent />;
+}
+
+function AppContent() {
   const [dbInitialized, setDbInitialized] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
 

@@ -3,11 +3,43 @@ import type { ApiBackend, UnlistenFn } from './tauri';
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
+// Opt-in API-key auth (backend: ATHENAEUM_API_KEY, see routes/auth.rs).
+// Held in memory only — a page refresh re-prompts by design, so this must
+// never be persisted to localStorage/sessionStorage.
+let apiKey: string | null = null;
+
+export function setApiKey(key: string | null): void {
+  apiKey = key;
+}
+
+/** Cheap authenticated POST used by WebAuthGate to check whether the
+ * configured key is accepted. Maps a 401 to 'unauthorized'; any other
+ * completed response (including other 4xx/5xx) proves the request got
+ * past the auth middleware, so it's treated as 'ok'. Network failures
+ * (server unreachable) are left to throw so the caller can distinguish
+ * "wrong key" from "can't reach the server". */
+export async function probeAuth(): Promise<'ok' | 'unauthorized'> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) {
+    headers['X-API-Key'] = apiKey;
+  }
+  const res = await fetch(`${BASE_URL}/api/get_scan_roots`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({}),
+  });
+  return res.status === 401 ? 'unauthorized' : 'ok';
+}
+
 export const httpApi: ApiBackend = {
   async invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey) {
+      headers['X-API-Key'] = apiKey;
+    }
     const res = await fetch(`${BASE_URL}/api/${command}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(args ?? {}),
     });
     if (!res.ok) {
@@ -23,7 +55,10 @@ export const httpApi: ApiBackend = {
   },
 
   listen<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {
-    const source = new EventSource(`${BASE_URL}/api/events`);
+    const eventsUrl = apiKey
+      ? `${BASE_URL}/api/events?api_key=${encodeURIComponent(apiKey)}`
+      : `${BASE_URL}/api/events`;
+    const source = new EventSource(eventsUrl);
 
     const onMessage = (e: MessageEvent) => {
       if (e.type === event) {
