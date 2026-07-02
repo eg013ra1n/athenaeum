@@ -40,6 +40,11 @@ services:
       # web UI will prompt for it. The one exception is the SSE endpoint
       # (/api/events), which browsers can't attach headers to, so it also
       # accepts `?api_key=<key>` as a query parameter.
+      # The web UI shares one SSE connection per browser tab. Plain HTTP/1.1
+      # allows ~6 connections per origin browser-wide, so ~6 simultaneous
+      # tabs is the ceiling. If you need more, terminate TLS in front of
+      # Athenaeum (any HTTPS reverse proxy): browsers then use HTTP/2 toward
+      # the proxy (~100 streams) while the proxy speaks HTTP/1.1 to the app.
       # - ATHENAEUM_API_KEY=changeme
     restart: unless-stopped
 
