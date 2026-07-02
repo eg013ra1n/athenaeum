@@ -1,10 +1,11 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { Trash2, RotateCcw, Loader2, Filter, ChevronDown, ChevronRight, Square, CheckSquare, XSquare, Folder } from 'lucide-react';
+import { Trash2, RotateCcw, Loader2, Filter, ChevronDown, ChevronRight, Square, CheckSquare, XSquare, Folder, AlertOctagon } from 'lucide-react';
 import { api } from '../api';
 import { format } from 'date-fns';
 import type { BlackHoleEntry } from '../types/models';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
+import { useNotifications } from '../contexts/NotificationContext';
 
 interface FolderGroup {
   path: string;
@@ -19,6 +20,7 @@ interface ProgressState {
 }
 
 export default function BlackHole() {
+  const { notify } = useNotifications();
   const [entries, setEntries] = useState<BlackHoleEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -31,6 +33,8 @@ export default function BlackHole() {
 
   // Progress state for bulk operations
   const [progress, setProgress] = useState<ProgressState | null>(null);
+  // In-flight state for the single-shot "Empty Black Hole" action
+  const [isEmptying, setIsEmptying] = useState(false);
 
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
@@ -275,6 +279,43 @@ export default function BlackHole() {
     );
   }, [selectedIds]);
 
+  // Permanently delete every entry currently in the black hole (owner-decided
+  // bulk action; wraps the existing `send_all_to_void` command).
+  const handleEmptyBlackHole = useCallback(() => {
+    const count = entries.length;
+    if (count === 0) return;
+    const sizeBytes = entries.reduce((acc, e) => acc + e.file_size, 0);
+
+    showConfirm(
+      'Empty Black Hole',
+      `Permanently delete all ${count} file${count !== 1 ? 's' : ''} (${formatSize(sizeBytes)})? This cannot be undone.`,
+      async () => {
+        setIsEmptying(true);
+        try {
+          const voided = await api.invoke<number>('send_all_to_void');
+          await loadEntries();
+          notify({
+            title: 'Black Hole emptied',
+            detail: `Permanently deleted ${voided} file${voided !== 1 ? 's' : ''}.`,
+            kind: 'fileop',
+            tone: 'success',
+          });
+        } catch (err) {
+          console.error('Failed to empty black hole:', err);
+          notify({
+            title: 'Empty Black Hole failed',
+            detail: String(err),
+            kind: 'fileop',
+            tone: 'warning',
+          });
+        } finally {
+          setIsEmptying(false);
+        }
+      },
+      true
+    );
+  }, [entries, notify]);
+
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -316,7 +357,7 @@ export default function BlackHole() {
             {/* Action Buttons */}
             <button
               onClick={handleSelectAll}
-              disabled={entries.length === 0 || progress !== null}
+              disabled={entries.length === 0 || progress !== null || isEmptying}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <CheckSquare size={16} />
@@ -324,7 +365,7 @@ export default function BlackHole() {
             </button>
             <button
               onClick={handleClearSelection}
-              disabled={selectionCount === 0 || progress !== null}
+              disabled={selectionCount === 0 || progress !== null || isEmptying}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-surface-hover hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <XSquare size={16} />
@@ -332,7 +373,7 @@ export default function BlackHole() {
             </button>
             <button
               onClick={handleRestoreSelected}
-              disabled={selectionCount === 0 || progress !== null}
+              disabled={selectionCount === 0 || progress !== null || isEmptying}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-success hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <RotateCcw size={16} />
@@ -340,12 +381,25 @@ export default function BlackHole() {
             </button>
             <button
               onClick={handleVoidSelected}
-              disabled={selectionCount === 0 || progress !== null}
+              disabled={selectionCount === 0 || progress !== null || isEmptying}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-error hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
             >
               <Trash2 size={16} />
               Send to Void
             </button>
+
+            {/* Empty Black Hole — global destructive action, independent of selection */}
+            <div className="flex items-center ml-2 pl-2 border-l border-border">
+              <button
+                onClick={handleEmptyBlackHole}
+                disabled={entries.length === 0 || progress !== null || isEmptying}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-error hover:brightness-90 rounded transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+                title="Permanently delete every file currently in the Black Hole"
+              >
+                {isEmptying ? <Loader2 className="animate-spin" size={16} /> : <AlertOctagon size={16} />}
+                Empty Black Hole
+              </button>
+            </div>
 
             {/* Filter */}
             <div className="flex items-center gap-2 ml-2 pl-2 border-l border-border">

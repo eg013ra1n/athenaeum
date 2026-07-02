@@ -56,6 +56,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       onRefresh();
     } catch (error) {
       console.error('Failed to recheck missing files:', error);
+      notify({ title: 'Recheck failed', detail: String(error), kind: 'files', tone: 'warning' });
     } finally {
       setIsRechecking(false);
     }
@@ -68,6 +69,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       onRefresh();
     } catch (error) {
       console.error('Failed to ignore file:', error);
+      notify({ title: 'Ignore failed', detail: String(error), kind: 'files', tone: 'warning' });
     } finally {
       setActionInProgress(null);
     }
@@ -80,6 +82,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       onRefresh();
     } catch (error) {
       console.error('Failed to unignore file:', error);
+      notify({ title: 'Unignore failed', detail: String(error), kind: 'files', tone: 'warning' });
     } finally {
       setActionInProgress(null);
     }
@@ -92,6 +95,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       onRefresh();
     } catch (error) {
       console.error('Failed to delete file:', error);
+      notify({ title: 'Delete failed', detail: String(error), kind: 'files', tone: 'warning' });
     } finally {
       setActionInProgress(null);
     }
@@ -106,6 +110,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       onRefresh();
     } catch (error) {
       console.error('Failed to delete files:', error);
+      notify({ title: 'Delete failed', detail: String(error), kind: 'files', tone: 'warning' });
     } finally {
       setIsDeleting(false);
     }
@@ -121,6 +126,7 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       onRefresh();
     } catch (error) {
       console.error('Failed to ignore files:', error);
+      notify({ title: 'Ignore failed', detail: String(error), kind: 'files', tone: 'warning' });
     }
   };
 

@@ -120,19 +120,6 @@ export interface FrameMetadataRelations {
   affectedFrameCount: number;
 }
 
-/** Summary returned by `list_unfinished_file_operations`. */
-export interface FileOperationSummary {
-  id: number;
-  kind: string;        // 'move' | 'delete'
-  status: string;      // 'pending' | 'running' | ...
-  sourceRoot: string | null;
-  destDir: string | null;
-  totalFiles: number;
-  totalBytes: number;
-  createdAt: string;
-  startedAt: string | null;
-}
-
 /** Payload of the `file-op-progress` event. */
 export interface FileOpProgressPayload {
   operationId: number;
