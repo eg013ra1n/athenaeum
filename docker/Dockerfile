@@ -21,6 +21,11 @@ COPY crates/jpeg-encode/Cargo.toml crates/jpeg-encode/Cargo.toml
 # rustafits changes infrequently so the cache hit rate is still acceptable.
 COPY rustafits/ rustafits/
 
+# Copy solvemyastro submodule in full for the same reason — it's a workspace
+# member AND a path dep of athenaeum-core (plate solving), with its own [[bin]]
+# target, and it path-deps ../rustafits (layout above matches).
+COPY solvemyastro/ solvemyastro/
+
 # Create dummy lib/main to cache dependency compilation
 RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/athenaeum-core/src/lib.rs \
     && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs \
