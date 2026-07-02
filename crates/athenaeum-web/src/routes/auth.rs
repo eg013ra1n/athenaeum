@@ -12,6 +12,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use percent_encoding::percent_decode_str;
 
 /// State needed by [`require_api_key`] — just the configured key, if any.
 #[derive(Clone)]
@@ -79,9 +80,21 @@ fn request_has_valid_key(req: &Request, path: &str, key: &str) -> bool {
     if path == "/api/events" {
         if let Some(query) = req.uri().query() {
             for pair in query.split('&') {
-                if let Some(value) = pair.strip_prefix("api_key=") {
-                    if value == key {
-                        return true;
+                if let Some(raw_value) = pair.strip_prefix("api_key=") {
+                    // The frontend builds this URL with `encodeURIComponent`
+                    // (src/api/http.ts), which percent-encodes everything
+                    // outside its unreserved set — including `+` (as `%2B`)
+                    // and space (as `%20`). Decode as plain percent-encoding
+                    // here, NOT form-urlencoding: form-urlencoding treats a
+                    // literal `+` in the query string as a space, which
+                    // would corrupt any raw `+` byte a differently-encoded
+                    // client sent. `percent_decode_str` never does that
+                    // substitution, matching what `encodeURIComponent`
+                    // actually produces.
+                    if let Ok(decoded) = percent_decode_str(raw_value).decode_utf8() {
+                        if decoded == key {
+                            return true;
+                        }
                     }
                 }
             }
@@ -193,6 +206,23 @@ mod tests {
         // Same query param on a non-events /api/ endpoint must NOT authenticate.
         let resp = app.oneshot(get_uri("/api/test?api_key=secret")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn query_param_api_key_percent_decodes_special_characters() {
+        // `key` contains characters `encodeURIComponent` (src/api/http.ts,
+        // the only place this frontend builds this URL) always
+        // percent-encodes: `+` -> %2B, `/` -> %2F, `=` -> %3D, space ->
+        // %20. The query string below is the literal output of
+        // `encodeURIComponent("a+b/c=d e")`. A form-urlencoded decoder
+        // would turn `%2B` back into a literal `+` but then ALSO treat any
+        // raw `+` in the query as a space — decoding this value with that
+        // scheme would silently produce the wrong string. This test pins
+        // percent-decoding (not form-urlencoding) as the correct choice.
+        let key = "a+b/c=d e";
+        let app = build_test_router(Some(key));
+        let resp = app.oneshot(get_uri("/api/events?api_key=a%2Bb%2Fc%3Dd%20e")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

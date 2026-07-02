@@ -336,3 +336,105 @@ async fn read_fits_image_rustafits_stub(
 ) -> (StatusCode, String) {
     (StatusCode::NOT_IMPLEMENTED, "read_fits_image_rustafits is not available in web mode".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::SseEvent;
+    use athenaeum_core::cache::MemoryImageCache;
+    use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
+    use athenaeum_core::settings::SettingsManager;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
+    use tower::ServiceExt; // oneshot
+
+    /// Builds a real `WebAppState` for router-level tests — unlike
+    /// `auth::tests`'s hand-rolled mini router (which only proves the
+    /// middleware fn itself is correct), this drives the REAL
+    /// `build_router()` output, so it catches a route registered AFTER the
+    /// auth `.layer()` call silently losing coverage (fail-open), which a
+    /// mini-router test structurally cannot catch.
+    ///
+    /// `ctx.db` is deliberately left unset (empty `OnceLock`) rather than
+    /// wired to a real database: no test in this crate constructs a real
+    /// `athenaeum_core::db::Database` (every DB-touching test elsewhere in
+    /// the workspace uses a raw in-memory `rusqlite::Connection` +
+    /// `init_db`, which doesn't fit `Database`'s pooled-connection shape),
+    /// and it isn't needed here — `get_scan_roots` (see below) checks
+    /// `ctx.db.get()` and returns a clean 500 rather than panicking when
+    /// it's `None`. That 500 is exactly the "request got past auth" signal
+    /// this test needs; a real DB would add setup cost without changing
+    /// what's being verified (auth middleware coverage, not handler logic).
+    fn test_state(api_key: Option<&str>) -> WebAppState {
+        let ctx = Arc::new(ServiceContext {
+            db: OnceLock::new(),
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            // Spawns one real worker thread (see operation_queue.rs — there
+            // is no lighter-weight constructor); matches that module's own
+            // tests, which accept the same one-thread-per-test-run cost.
+            operation_queue: OperationQueue::start(),
+        });
+        let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
+        WebAppState {
+            ctx,
+            event_tx,
+            allowed_paths: Vec::new(),
+            export_dir: None,
+            api_key: api_key.map(str::to_string),
+            image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
+            max_blink_threads: 1,
+            monitor: athenaeum_core::monitor::MonitorService::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_router_enforces_api_key_on_get_scan_roots() {
+        let app = build_router(test_state(Some("secret")), None);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/get_scan_roots")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/get_scan_roots")
+                    .header("content-type", "application/json")
+                    .header("X-API-Key", "secret")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The test state's DB OnceLock is intentionally unset, so the
+        // handler itself fails once it runs — but with a clean 500
+        // ("Database not initialized"), not a 401. A non-401 response here
+        // proves the request reached the handler, i.e. got past the real
+        // router's auth layer.
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}

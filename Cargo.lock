@@ -323,6 +323,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "percent-encoding",
  "rayon",
  "rusqlite",
  "serde",
