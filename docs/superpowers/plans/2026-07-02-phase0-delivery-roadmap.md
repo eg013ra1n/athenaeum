@@ -64,10 +64,13 @@ Full checklist from the plan + update the two audit docs' open-findings tables
 
 ## Owner decisions needed (block Wave 5 only)
 
-1. **File-op Delete pipeline** (`enqueue_delete_operation` + `cancel_file_operation`
-   + `list_unfinished_file_operations`): dual-pane Delete routes to Black Hole
-   instead. Wire the real pipeline into the UI, or delete it and commit to
-   Black-Hole-as-delete? (T5's reconcile works either way — it's queue-internal.)
+1. ~~File-op Delete pipeline~~ **RESOLVED (owner, 2026-07-02): Delete flows
+   through Black Hole by design — never directly.** `enqueue_delete_operation`
+   + `FileOpDelete` plumbing are deleted in Wave 5; `cancel_file_operation` /
+   `list_unfinished_file_operations` commands go too (T5's reconciliation is
+   queue-internal via the core functions). Sub-question folded into #4:
+   `send_all_to_void` (bulk "empty black hole") is dead — UI uses per-file
+   `send_to_void`; keep-and-wire a bulk-empty button, or delete?
 2. **`clear_manual_calibration_override`** — documented in `docs/masters/masters.md:120`
    as part of manual linking; likely a lost feature, and Phase 2 (master library)
    touches the same area. Resurrect in Phase 2 or delete now?

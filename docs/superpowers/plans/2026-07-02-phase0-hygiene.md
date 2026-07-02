@@ -100,7 +100,13 @@ Also emit a `notify`-able summary through `archive-finished` (`outcome` already 
 
 `analyze_single_frame, can_split, cancel_file_operation, check_scan_root_availability, cleanup_duplicate_flat_subcalibrations, clear_calibration_links, clear_frame_set_reference, clear_image_cache, clear_manual_calibration_override, create_custom_frames_set, create_dark_library, create_frame_set_from_excluded, delete_analysis_for_frame_set, delete_dark_library, delete_orphaned_files, enqueue_delete_operation, get_active_scans, get_all_settings, get_app_version, get_calibration_set_originals, get_calibration_status, get_excluded_frames, get_flat_group_options_for_frame_set, get_frame_calibration_hierarchy, get_frame_calibration_links, get_frame_set_calibration_groups, get_frame_status, get_grouping_threshold_deg, get_orphaned_files, greet, list_unfinished_file_operations, plate_solve_frame, recalculate_frame_set_metadata, reclassify_excluded_frames, send_all_to_void, unarchive_frame_set, update_frame_set_flat_pattern`
 
-Notable clusters: the **entire file_op delete/cancel/resume trio** (`enqueue_delete_operation`, `cancel_file_operation`, `list_unfinished_file_operations`) — the dual-pane Delete actually routes to Black Hole (`bulk_move_to_black_hole`), so the file_op Delete pipeline is unwired (affects T5's resume half); the dark-library pair; several superseded calibration commands. Also delete the stale `#greet-input` CSS in `src/App.css:94`.
+Notable clusters:
+
+- **file_op Delete pipeline is superseded BY DESIGN (owner-confirmed 2026-07-02):** user-facing Delete intentionally flows through Black Hole (`bulk_move_to_black_hole` → review → `send_to_void`), never directly. `enqueue_delete_operation` + the `OperationKind::FileOpDelete` plumbing are constructed by nothing → **delete them**. `cancel_file_operation`/`list_unfinished_file_operations` concern file ops generally (incl. the live Move path) but have no UI; T5's reconciliation is queue-internal and uses the core functions, not these commands → the *commands* can go too (core fns stay).
+- `send_all_to_void` (bulk "empty black hole", `operations_blackhole.rs:233`) is dead — UI only calls per-file `send_to_void`; triage whether a bulk-empty button is wanted or the command goes.
+- The dark-library pair; several superseded calibration commands.
+
+Also delete the stale `#greet-input` CSS in `src/App.css:94`.
 
 **Task — re-detect, don't trust this list:** extract all `#[tauri::command]` fn names, cross-check each against (a) frontend usage (`rg "'<name>'" src/`), (b) web routes (`crates/athenaeum-web/src/routes/`, including stubs in `routes/mod.rs`), (c) `invoke_handler` registration. For each command with zero frontend refs, classify:
 
@@ -196,7 +202,7 @@ The Siril script pipeline it documents (script generator, cli_runner, execution 
 
 ## Sequencing
 
-```
+```text
 T1 ─┐
 T3 ─┼─ one solvemyastro branch/bump ── T8 (same bump)
     │
