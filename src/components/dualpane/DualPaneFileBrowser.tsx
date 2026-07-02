@@ -58,6 +58,7 @@ import {
   type DirectoryListing,
   type FileOpFinishedPayload,
   type FileOpProgressPayload,
+  type FileOpReconciledPayload,
   type PaneId,
   type PaneState,
   PARENT_ROW,
@@ -495,6 +496,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     let cancelled = false;
     let unlistenProgress: (() => void) | null = null;
     let unlistenFinished: (() => void) | null = null;
+    let unlistenReconciled: (() => void) | null = null;
     api.listen<FileOpProgressPayload>('file-op-progress', (p) => {
       if (cancelled) return;
       setActiveOps(prev => ({
@@ -547,10 +549,35 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
       .then(fn => { if (cancelled) fn(); else unlistenFinished = fn; })
       .catch(err => console.error('[DualPaneFileBrowser] listen failed:', err));
 
+    // Abandoned cross-volume moves (a leftover source copy from a prior
+    // crash/interruption) get auto-healed at startup and before every
+    // enqueue — see athenaeum_core::file_op::reconcile. The startup
+    // emission can be missed if this component wasn't mounted yet; the
+    // pre-enqueue trigger is what reliably reaches this listener.
+    api.listen<FileOpReconciledPayload>('file-op-reconciled', (p) => {
+      if (cancelled) return;
+      const onlySkips = p.healed === 0 && p.skipped > 0;
+      notify({
+        title: onlySkips
+          ? `${p.skipped} move(s) need attention`
+          : `Reconciled ${p.healed} interrupted move(s)`,
+        detail:
+          `${p.healed} leftover source copy(ies) removed` +
+          (p.skipped > 0 ? `, ${p.skipped} skipped — see logs` : ''),
+        kind: 'fileop',
+        hasErrors: onlySkips,
+        tone: p.healed > 0 && p.skipped === 0 ? 'success' : 'warning',
+        dedupeKey: `file-op-reconciled-${p.operationIds.join('-')}`,
+      });
+    })
+      .then(fn => { if (cancelled) fn(); else unlistenReconciled = fn; })
+      .catch(err => console.error('[DualPaneFileBrowser] listen failed:', err));
+
     return () => {
       cancelled = true;
       unlistenProgress?.();
       unlistenFinished?.();
+      unlistenReconciled?.();
     };
   }, [refreshBoth]);
 

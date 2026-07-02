@@ -150,6 +150,15 @@ export interface FileOpFinishedPayload {
   kind: string;
 }
 
+/** Payload of the `file-op-reconciled` event — fired when the backend's
+ *  startup or pre-enqueue auto-reconcile heals or flags abandoned
+ *  cross-volume moves left over from a prior crash/interruption. */
+export interface FileOpReconciledPayload {
+  healed: number;
+  skipped: number;
+  operationIds: number[];
+}
+
 /** Split a path on / or \ separators. */
 export function splitPath(p: string): string[] {
   return p.split(/[/\\]/).filter(Boolean);

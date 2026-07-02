@@ -155,6 +155,46 @@ async fn main() {
         monitor: athenaeum_core::monitor::MonitorService::new(),
     };
 
+    // Auto-reconcile abandoned cross-volume moves — enqueue this as the
+    // FIRST job on the operation queue so it serializes ahead of any file op
+    // a client triggers. Unlike the desktop app, the DB is already
+    // initialized by this point (set above before the queue was created),
+    // so this reliably runs; the pre-enqueue trigger in
+    // `enqueue_move_operation` covers requests that race the startup job.
+    // See `athenaeum_core::file_op::reconcile`.
+    {
+        use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
+        let ctx_for_reconcile = Arc::clone(&state.ctx);
+        let event_tx_for_reconcile = state.event_tx.clone();
+        state.ctx.operation_queue.enqueue(QueuedJob {
+            kind: OperationKind::FileOpReconcile,
+            operation_id: 0,
+            run: Box::new(move || {
+                let Some(db) = ctx_for_reconcile.db.get() else {
+                    eprintln!("file_op reconcile (startup): database not yet initialized, skipping");
+                    return;
+                };
+                let conn = db.conn();
+                match athenaeum_core::file_op::reconcile::reconcile_abandoned_commit_moves(&conn) {
+                    Ok(summary) if summary.healed > 0 || !summary.skipped.is_empty() => {
+                        let emitter = events::SseProgressEmitter::new(event_tx_for_reconcile);
+                        athenaeum_core::events::emit_event(
+                            &emitter,
+                            "file-op-reconciled",
+                            &athenaeum_core::file_op::models::FileOpReconciled {
+                                healed: summary.healed,
+                                skipped: summary.skipped.len(),
+                                operation_ids: summary.touched_operation_ids(),
+                            },
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("file_op reconcile (startup) failed: {:#}", e),
+                }
+            }),
+        });
+    }
+
     // Spawn background sweeper for stale memory-cache entries (every 60s)
     {
         let memory_cache = Arc::clone(&state.ctx.memory_cache);

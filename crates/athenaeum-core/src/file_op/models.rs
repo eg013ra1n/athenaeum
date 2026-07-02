@@ -250,3 +250,15 @@ pub struct FileOpProgress {
     pub total: usize,
     pub message: String,
 }
+
+/// Payload emitted on the `file-op-reconciled` Tauri/SSE event channel when
+/// `file_op::reconcile::reconcile_abandoned_commit_moves` heals or skips at
+/// least one abandoned cross-volume move. See `file_op::reconcile` for what
+/// "healed" / "skipped" mean.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOpReconciled {
+    pub healed: usize,
+    pub skipped: usize,
+    pub operation_ids: Vec<i64>,
+}

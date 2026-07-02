@@ -95,6 +95,50 @@ pub fn run() {
             let app_handle = app.handle();
             let state: State<AppState> = app.state();
 
+            // Auto-reconcile abandoned cross-volume moves — enqueue this as
+            // the FIRST job on the operation queue so it serializes ahead of
+            // any file op the user triggers. The desktop app initializes its
+            // DB handle lazily (frontend calls `initialize_database` after
+            // this closure returns), so the DB is not guaranteed to be ready
+            // yet when this job actually runs; it checks at run time and
+            // no-ops with a stderr line rather than failing. The pre-enqueue
+            // trigger in `enqueue_move_operation` is what does the real work
+            // in practice — see `athenaeum_core::file_op::reconcile`.
+            {
+                use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
+                let ctx_for_reconcile = state.ctx.clone();
+                let app_for_reconcile = app_handle.clone();
+                state.ctx.operation_queue.enqueue(QueuedJob {
+                    kind: OperationKind::FileOpReconcile,
+                    operation_id: 0,
+                    run: Box::new(move || {
+                        let Some(db) = ctx_for_reconcile.db.get() else {
+                            eprintln!(
+                                "file_op reconcile (startup): database not yet initialized, skipping"
+                            );
+                            return;
+                        };
+                        let conn = db.conn();
+                        match athenaeum_core::file_op::reconcile::reconcile_abandoned_commit_moves(&conn) {
+                            Ok(summary) if summary.healed > 0 || !summary.skipped.is_empty() => {
+                                let emitter = tauri_events::TauriProgressEmitter(app_for_reconcile);
+                                athenaeum_core::events::emit_event(
+                                    &emitter,
+                                    "file-op-reconciled",
+                                    &athenaeum_core::file_op::models::FileOpReconciled {
+                                        healed: summary.healed,
+                                        skipped: summary.skipped.len(),
+                                        operation_ids: summary.touched_operation_ids(),
+                                    },
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("file_op reconcile (startup) failed: {:#}", e),
+                        }
+                    }),
+                });
+            }
+
             // Clean up old file-based cache directory if it exists (one-time migration)
             if let Ok(app_dir) = app_handle.path().app_data_dir() {
                 let old_cache_dir = app_dir.join("cache");

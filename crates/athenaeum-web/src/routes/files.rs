@@ -653,6 +653,26 @@ pub async fn enqueue_move_operation(
             let emitter = SseProgressEmitter::new(event_tx);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
+
+            // Heal any abandoned cross-volume moves left over from a prior
+            // crash before running this one. Cheap no-op when there's
+            // nothing to heal; errors here must not fail this user's move.
+            match athenaeum_core::file_op::reconcile::reconcile_abandoned_commit_moves(&conn) {
+                Ok(summary) if summary.healed > 0 || !summary.skipped.is_empty() => {
+                    athenaeum_core::events::emit_event(
+                        &emitter,
+                        "file-op-reconciled",
+                        &athenaeum_core::file_op::models::FileOpReconciled {
+                            healed: summary.healed,
+                            skipped: summary.skipped.len(),
+                            operation_ids: summary.touched_operation_ids(),
+                        },
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("file_op reconcile (pre-enqueue) failed: {:#}", e),
+            }
+
             let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
             match result {
                 Ok(()) => {}
