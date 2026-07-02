@@ -5,6 +5,67 @@ use crate::fingerprint::compute_header_fingerprint;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Result};
 
+/// Upper bound of the byte range that matches exactly the strings with
+/// `prefix` as a literal prefix: `[prefix, upper)`. Returns `None` when no
+/// finite upper bound exists — the caller then filters on the lower bound
+/// alone (`path >= prefix`). That happens when:
+/// - `prefix` is empty (no upper bound can express "everything");
+/// - `prefix` is entirely `0xFF` bytes (all bytes get popped, none left to
+///   increment) — unreachable for a real `&str` since `0xFF` is never a
+///   valid UTF-8 byte, but handled for defensive correctness;
+/// - incrementing the final byte produces a sequence that is no longer
+///   valid UTF-8 (e.g. it lands on a bare continuation byte). rusqlite binds
+///   Rust `String`s as TEXT, so an invalid byte sequence can't be bound at
+///   all — we fall back to lower-bound-only rather than error.
+///
+/// SQLite's default `TEXT` collation (`BINARY`) compares by `memcmp` on the
+/// UTF-8 bytes, so incrementing the final byte of the prefix is the correct
+/// exclusive upper bound for "starts with `prefix`" — and unlike `LIKE`, it
+/// is exact-case and treats every character (including `%`/`_`) literally.
+pub(crate) fn path_prefix_upper(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    // Trailing 0xFF bytes can't be incremented in place — drop them and
+    // increment the byte before instead (standard prefix-range idiom).
+    while let Some(&last) = bytes.last() {
+        if last == 0xFF {
+            bytes.pop();
+        } else {
+            break;
+        }
+    }
+    let last = bytes.last_mut()?;
+    *last += 1;
+    String::from_utf8(bytes).ok()
+}
+
+/// Build a `(col >= ? AND (? IS NULL OR col < ?)) OR ...` SQL fragment that
+/// matches any row whose `column` falls under one of `roots` as an
+/// exact-case byte-range prefix, plus the values to bind (three per root, in
+/// placeholder order — pass them to `rusqlite::params_from_iter`).
+///
+/// An empty `roots` list produces the always-false fragment `"0"` with no
+/// params: "under one of zero eligible roots" matches nothing, mirroring the
+/// original `EXISTS (SELECT 1 FROM scan_roots sr WHERE ...)` semantics when
+/// no scan root satisfies the caller's filter.
+pub(crate) fn scan_root_prefix_predicate(
+    column: &str,
+    roots: &[String],
+) -> (String, Vec<rusqlite::types::Value>) {
+    if roots.is_empty() {
+        return ("0".to_string(), Vec::new());
+    }
+    let mut clauses = Vec::with_capacity(roots.len());
+    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3);
+    for root in roots {
+        clauses.push(format!("({col} >= ? AND (? IS NULL OR {col} < ?))", col = column));
+        values.push(rusqlite::types::Value::Text(root.clone()));
+        let hi = path_prefix_upper(root).map(rusqlite::types::Value::Text).unwrap_or(rusqlite::types::Value::Null);
+        values.push(hi.clone());
+        values.push(hi);
+    }
+    (clauses.join(" OR "), values)
+}
+
 /// Insert a new file record
 /// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
@@ -215,7 +276,7 @@ pub fn delete_calibration_sets_for_root(
         |row| row.get(0),
     )?;
 
-    let like_pattern = format!("{}%", root_path);
+    let path_hi = path_prefix_upper(&root_path);
 
     // Find affected calibration set IDs (sets containing frames under this root)
     let affected_set_ids: Vec<i64> = {
@@ -224,9 +285,9 @@ pub fn delete_calibration_sets_for_root(
              FROM calibration_set_frames csf
              JOIN frames fr ON csf.frame_id = fr.id
              JOIN files f ON fr.file_id = f.id
-             WHERE f.path LIKE ?1"
+             WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)"
         )?;
-        let rows = stmt.query_map(params![like_pattern], |row| row.get(0))?;
+        let rows = stmt.query_map(params![root_path, path_hi], |row| row.get(0))?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
@@ -271,9 +332,9 @@ pub fn delete_calibration_sets_for_root(
            AND source_id IN (
              SELECT fr.id FROM frames fr
              JOIN files f ON fr.file_id = f.id
-             WHERE f.path LIKE ?1
+             WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
            )",
-        params![like_pattern],
+        params![root_path, path_hi],
     )?;
 
     Ok(calibration_sets_deleted)
@@ -293,11 +354,13 @@ pub fn reconcile_unique_camera_instrume(
     )?;
 
     let suffix = format!(" N{}", root_id);
-    let like_pattern = format!("{}%", root_path);
+    let path_hi = path_prefix_upper(&root_path);
 
     conn.execute("BEGIN TRANSACTION", [])?;
 
     // Update frames.instrume based on flag state
+    // (the `instrume LIKE '%' || ?` checks below match a literal suffix, not
+    // a path prefix — out of scope for this fix, left untouched)
     let frames_renamed = if unique_camera {
         // Add suffix — skip NULL instrume and already-suffixed
         conn.execute(
@@ -307,9 +370,9 @@ pub fn reconcile_unique_camera_instrume(
                AND id IN (
                  SELECT fr.id FROM frames fr
                  JOIN files f ON fr.file_id = f.id
-                 WHERE f.path LIKE ?2
+                 WHERE f.path >= ?2 AND (?3 IS NULL OR f.path < ?3)
                )",
-            params![suffix, like_pattern],
+            params![suffix, root_path, path_hi],
         )?
     } else {
         // Strip suffix — only from frames that have it
@@ -321,9 +384,9 @@ pub fn reconcile_unique_camera_instrume(
                AND id IN (
                  SELECT fr.id FROM frames fr
                  JOIN files f ON fr.file_id = f.id
-                 WHERE f.path LIKE ?3
+                 WHERE f.path >= ?3 AND (?4 IS NULL OR f.path < ?4)
                )",
-            params![suffix_len, suffix, like_pattern],
+            params![suffix_len, suffix, root_path, path_hi],
         )?
     };
 
@@ -347,9 +410,9 @@ pub fn reconcile_unique_camera_instrume(
                SELECT DISTINCT sm.session_id FROM session_members sm
                JOIN frames fr ON sm.frame_id = fr.id
                JOIN files f ON fr.file_id = f.id
-               WHERE f.path LIKE ?1
+               WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
              )",
-            params![like_pattern],
+            params![root_path, path_hi],
         )?;
     }
 
@@ -399,10 +462,11 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
     // Start transaction for atomicity and performance
     conn.execute("BEGIN TRANSACTION", [])?;
 
-    // Pre-compute file IDs to delete (single LIKE query)
+    // Pre-compute file IDs to delete (single byte-range query)
     let file_ids: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT id FROM files WHERE path LIKE ?1 || '%'")?;
-        let rows = stmt.query_map(params![path], |row| row.get(0))?;
+        let path_hi = path_prefix_upper(&path);
+        let mut stmt = conn.prepare("SELECT id FROM files WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)")?;
+        let rows = stmt.query_map(params![path, path_hi], |row| row.get(0))?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
@@ -644,7 +708,8 @@ pub fn get_files_by_directory(
     // Find files that are directly in this directory (not in subdirectories)
     // Use OS path separator for cross-platform compatibility (/ on macOS/Linux, \ on Windows)
     let sep = std::path::MAIN_SEPARATOR.to_string();
-    let like_pattern = format!("{}{}%", directory_path, sep);
+    let path_prefix = format!("{}{}", directory_path, sep);
+    let path_hi = path_prefix_upper(&path_prefix);
     let expected_depth = directory_path.matches(sep.as_str()).count() as i64 + 1;
 
     let query = format!(
@@ -656,8 +721,8 @@ pub fn get_files_by_directory(
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
-         WHERE f.path LIKE ?1
-           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?2, ''))) = ?3
+         WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
+           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?3, ''))) = ?4
          ORDER BY f.filename
          {}",
         limit_clause
@@ -665,7 +730,7 @@ pub fn get_files_by_directory(
 
     let mut stmt = conn.prepare(&query)?;
 
-    let results = stmt.query_map(params![like_pattern, sep, expected_depth], |row| {
+    let results = stmt.query_map(params![path_prefix, path_hi, sep, expected_depth], |row| {
         let file = File {
             id: Some(row.get(0)?),
             path: row.get(1)?,
@@ -751,7 +816,8 @@ pub fn get_files_by_directory_for_camera(
     };
 
     let sep = std::path::MAIN_SEPARATOR.to_string();
-    let like_pattern = format!("{}{}%", directory_path, sep);
+    let path_prefix = format!("{}{}", directory_path, sep);
+    let path_hi = path_prefix_upper(&path_prefix);
     let expected_depth = directory_path.matches(sep.as_str()).count() as i64 + 1;
 
     let query = format!(
@@ -763,9 +829,9 @@ pub fn get_files_by_directory_for_camera(
                 fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
          FROM files f
          JOIN frames fr ON f.id = fr.file_id
-         WHERE f.path LIKE ?1
-           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?2, ''))) = ?3
-           AND fr.instrume = ?4
+         WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
+           AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?3, ''))) = ?4
+           AND fr.instrume = ?5
          ORDER BY f.filename
          {}",
         limit_clause
@@ -773,7 +839,7 @@ pub fn get_files_by_directory_for_camera(
 
     let mut stmt = conn.prepare(&query)?;
 
-    let results = stmt.query_map(params![like_pattern, sep, expected_depth, instrume], |row| {
+    let results = stmt.query_map(params![path_prefix, path_hi, sep, expected_depth, instrume], |row| {
         let file = File {
             id: Some(row.get(0)?),
             path: row.get(1)?,
@@ -1414,6 +1480,19 @@ pub fn get_distinct_instrumes(conn: &Connection) -> Result<Vec<String>> {
 pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
     let hash_column = if use_content_hash { "content_hash" } else { "metadata_hash" };
 
+    // Scan roots eligible for duplicate detection, fetched once in Rust so
+    // the path predicate can be bound as byte-range params per root instead
+    // of a per-row SQL-side `LIKE .. || '%'` concat. The original query also
+    // OR'd in `sr.path || '/%'` as a second alternative, but that's redundant
+    // — `X%` is already a superset of `X/%` — so only the plain-prefix
+    // alternative is preserved here.
+    let roots: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT path FROM scan_roots WHERE find_duplicates = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let (root_predicate, root_values) = scan_root_prefix_predicate("f.path", &roots);
+
     let query = format!(
         "SELECT f.{}, f.size, COUNT(*) as count, GROUP_CONCAT(f.path, '|') as paths, GROUP_CONCAT(f.id, '|') as ids
          FROM files f
@@ -1421,20 +1500,16 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
          AND NOT EXISTS (
              SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
          )
-         AND EXISTS (
-             SELECT 1 FROM scan_roots sr
-             WHERE sr.find_duplicates = 1
-             AND (f.path LIKE sr.path || '%' OR f.path LIKE sr.path || '/%')
-         )
+         AND ({})
          GROUP BY f.{}, f.size
          HAVING count > 1
          ORDER BY count DESC, f.size DESC",
-        hash_column, hash_column, hash_column
+        hash_column, hash_column, root_predicate, hash_column
     );
 
     let mut stmt = conn.prepare(&query)?;
 
-    let mut groups: Vec<DuplicateGroup> = stmt.query_map([], |row| {
+    let mut groups: Vec<DuplicateGroup> = stmt.query_map(rusqlite::params_from_iter(root_values.iter()), |row| {
         let paths_str: String = row.get(3)?;
         let file_paths: Vec<String> = paths_str.split('|').map(|s| s.to_string()).collect();
 
@@ -1566,6 +1641,16 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
         params![hash_type],
     )?;
 
+    // Scan roots eligible for duplicate detection, fetched once in Rust
+    // (shared by both queries below) so path matching becomes byte-range
+    // binds per root instead of a per-row SQL-side `LIKE .. || '%'` concat.
+    let roots: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT path FROM scan_roots WHERE find_duplicates = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let (root_predicate, root_values) = scan_root_prefix_predicate("f.path", &roots);
+
     // Find duplicate files (groups with count > 1)
     let query = format!(
         "SELECT f.{}, f.size, COUNT(*) as count
@@ -1574,19 +1659,15 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
          AND NOT EXISTS (
              SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id
          )
-         AND EXISTS (
-             SELECT 1 FROM scan_roots sr
-             WHERE sr.find_duplicates = 1
-             AND f.path LIKE sr.path || '%'
-         )
+         AND ({})
          GROUP BY f.{}, f.size
          HAVING count > 1",
-        hash_column, hash_column, hash_column
+        hash_column, hash_column, root_predicate, hash_column
     );
 
     let mut stmt = conn.prepare(&query)?;
     let rows: Vec<(String, i64, i64)> = stmt
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(root_values.iter()), |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .filter_map(|r| r.ok())
@@ -1594,6 +1675,22 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut groups_created = 0;
+
+    // Same root list, rebound against `files.path` (the loop body's table
+    // alias) — the predicate text and its values are loop-invariant, so
+    // build them once and just prepend the per-group hash/size each pass.
+    // All-unnumbered placeholders throughout this statement (deliberately —
+    // mixing `?1`/`?2` with the predicate's unnumbered `?`s would rely on
+    // SQLite's left-to-right auto-numbering continuing past the explicit
+    // indices, which is correct but easy to get subtly wrong; one scheme
+    // keeps every bind position unambiguous by construction).
+    let (files_root_predicate, files_root_values) = scan_root_prefix_predicate("files.path", &roots);
+    let files_query = format!(
+        "SELECT id FROM files WHERE {} = ? AND size = ?
+         AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)
+         AND ({})",
+        hash_column, files_root_predicate
+    );
 
     for (hash, size, file_count) in rows {
         // Insert the group
@@ -1605,19 +1702,14 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
         let group_id = conn.last_insert_rowid();
 
         // Find and insert all files in this group
-        let files_query = format!(
-            "SELECT id FROM files WHERE {} = ?1 AND size = ?2
-             AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)
-             AND EXISTS (
-                 SELECT 1 FROM scan_roots sr
-                 WHERE sr.find_duplicates = 1
-                 AND files.path LIKE sr.path || '%'
-             )",
-            hash_column
-        );
         let mut files_stmt = conn.prepare(&files_query)?;
+        let mut bind_values: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(hash.clone()),
+            rusqlite::types::Value::Integer(size),
+        ];
+        bind_values.extend(files_root_values.iter().cloned());
         let file_ids: Vec<i64> = files_stmt
-            .query_map(params![hash, size], |row| row.get(0))?
+            .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -3358,19 +3450,22 @@ pub fn count_frame_metadata_relations(
 /// prefix swap only touches the leading prefix and is safe regardless of
 /// repetition.
 ///
-/// Both `old_prefix` and `new_prefix` MUST end with a path separator so
-/// `WHERE path LIKE old_prefix || '%'` only matches descendants and not
-/// sibling folders sharing the same name root.
+/// Both `old_prefix` and `new_prefix` MUST end with a path separator so the
+/// `[old_prefix, upper)` byte-range predicate only matches descendants and
+/// not sibling folders sharing the same name root. The range predicate is
+/// also exact-case and treats `old_prefix` literally — unlike `LIKE`, it
+/// can't cross-match a differently-cased sibling or one containing `%`/`_`.
 pub fn rename_files_path_prefix(
     conn: &Connection,
     old_prefix: &str,
     new_prefix: &str,
 ) -> Result<usize> {
+    let old_hi = path_prefix_upper(old_prefix);
     let n = conn.execute(
         "UPDATE files
          SET path = ?1 || SUBSTR(path, LENGTH(?2) + 1)
-         WHERE path LIKE ?2 || '%'",
-        rusqlite::params![new_prefix, old_prefix],
+         WHERE path >= ?2 AND (?3 IS NULL OR path < ?3)",
+        rusqlite::params![new_prefix, old_prefix, old_hi],
     )?;
     Ok(n)
 }
@@ -4233,6 +4328,239 @@ mod bulk_metadata_tests {
         // value: Some(Some(v)) → "set to v".
         let edits: FrameMetadataEdits = serde_json::from_str(r#"{"xpixsz": 3.76}"#).unwrap();
         assert_eq!(edits.xpixsz, Some(Some(3.76)), "value → Some(Some(v))");
+    }
+}
+
+/// W2-T11: byte-range path-prefix matching (replaces `LIKE`). Covers the
+/// `path_prefix_upper` helper directly, plus the case-exactness and
+/// literal-wildcard semantics it's meant to fix at the query call sites.
+#[cfg(test)]
+mod path_prefix_range_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::Connection;
+
+    // -- path_prefix_upper -------------------------------------------------
+
+    #[test]
+    fn upper_bound_of_normal_prefix_increments_last_byte() {
+        // '/' (0x2F) + 1 = '0' (0x30).
+        assert_eq!(
+            path_prefix_upper("/data/Astro/"),
+            Some("/data/Astro0".to_string())
+        );
+    }
+
+    #[test]
+    fn upper_bound_of_non_ascii_prefix_increments_last_byte() {
+        // 'é' = U+00E9 = bytes [0xC3, 0xA9]; incrementing the trailing byte
+        // yields [0xC3, 0xAA] = U+00EA ('ê') — still valid UTF-8, and no
+        // 0xFF byte is involved so the pop-trailing-0xFF loop never fires.
+        let prefix = "/data/caf\u{e9}";
+        let upper = path_prefix_upper(prefix).expect("increment should stay valid UTF-8");
+        assert_eq!(upper, "/data/caf\u{ea}");
+    }
+
+    #[test]
+    fn upper_bound_of_empty_prefix_is_none() {
+        assert_eq!(path_prefix_upper(""), None);
+    }
+
+    #[test]
+    fn upper_bound_none_when_increment_produces_invalid_utf8() {
+        // Trailing DEL (0x7F) increments to 0x80, a bare continuation byte
+        // that cannot stand alone as valid UTF-8 — the caller must fall back
+        // to a lower-bound-only filter rather than bind an invalid TEXT.
+        let prefix = "/data/x\u{7f}";
+        assert_eq!(path_prefix_upper(prefix), None);
+    }
+
+    // -- semantic scenarios (Step 3 of the brief) ---------------------------
+
+    fn insert_file(conn: &Connection, path: &str) {
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES (?1, 'x.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [path],
+        )
+        .unwrap();
+    }
+
+    fn all_paths(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path").unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    #[test]
+    fn dir_rename_prefix_is_case_exact() {
+        // Old LIKE was ASCII-case-insensitive by default: `/data/Astro%`
+        // would have also matched `/data/astro/y.fits`. The byte-range
+        // predicate must not.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_file(&conn, "/data/Astro/x.fits");
+        insert_file(&conn, "/data/astro/y.fits");
+
+        let n = rename_files_path_prefix(&conn, "/data/Astro/", "/data/AstroRenamed/").unwrap();
+        assert_eq!(n, 1, "only the exact-case row should be renamed");
+
+        assert_eq!(
+            all_paths(&conn),
+            vec![
+                "/data/AstroRenamed/x.fits".to_string(),
+                "/data/astro/y.fits".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_rename_prefix_treats_underscore_literally() {
+        // Old LIKE treats '_' as a single-char wildcard, so the pattern
+        // `/data/M31_Ha%` would have also matched `/data/M31XHa/...`. The
+        // byte-range predicate must treat '_' as a literal character.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_file(&conn, "/data/M31_Ha/a.fits");
+        insert_file(&conn, "/data/M31XHa/b.fits");
+
+        let n = rename_files_path_prefix(&conn, "/data/M31_Ha/", "/data/M31_Ha_renamed/").unwrap();
+        assert_eq!(n, 1, "only the literal-underscore row should be renamed");
+
+        assert_eq!(
+            all_paths(&conn),
+            vec![
+                "/data/M31XHa/b.fits".to_string(),
+                "/data/M31_Ha_renamed/a.fits".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_scan_root_cascade_does_not_cross_match_wildcard_siblings() {
+        // Same literal-wildcard hazard as above, exercised through the
+        // scan-root delete cascade (site 404) instead of the dir-rename.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/M31_Ha')", [])
+            .unwrap();
+        let root_id: i64 = conn
+            .query_row("SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        insert_file(&conn, "/data/M31_Ha/a.fits");
+        insert_file(&conn, "/data/M31XHa/b.fits");
+
+        delete_scan_root(&conn, root_id).unwrap();
+
+        assert_eq!(
+            all_paths(&conn),
+            vec!["/data/M31XHa/b.fits".to_string()],
+            "only the row under the literal /data/M31_Ha prefix should be deleted"
+        );
+    }
+
+    /// The three scan-root-join sites (`find_duplicate_groups` and the two
+    /// queries inside `rebuild_duplicate_groups_cache`) were restructured
+    /// from a per-row SQL-side `LIKE sr.path || '%'` join into: fetch
+    /// eligible roots in Rust, then OR together per-root `[lo, hi)` binds.
+    /// Assert result parity against a hand-computed expectation: a duplicate
+    /// pair under an eligible root is found; an equally-duplicated pair
+    /// under a `find_duplicates = 0` root is not.
+    #[test]
+    fn scan_root_restructured_queries_match_only_eligible_roots() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/RootA', 1)", [])
+            .unwrap();
+        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/RootB', 0)", [])
+            .unwrap();
+
+        // Duplicate pair under the eligible root.
+        for (p, fname) in [
+            ("/data/RootA/dup1.fits", "dup1.fits"),
+            ("/data/RootA/dup2.fits", "dup2.fits"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                 VALUES (?1, ?2, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', 'HASH1')",
+                rusqlite::params![p, fname],
+            ).unwrap();
+        }
+        // Equally-duplicated pair under the non-eligible root — must be excluded.
+        for (p, fname) in [
+            ("/data/RootB/dup1.fits", "dup1.fits"),
+            ("/data/RootB/dup2.fits", "dup2.fits"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                 VALUES (?1, ?2, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', 'HASH2')",
+                rusqlite::params![p, fname],
+            ).unwrap();
+        }
+
+        // Site 1427 (find_duplicate_groups).
+        let groups = find_duplicate_groups(&conn, true).unwrap();
+        assert_eq!(groups.len(), 1, "only the RootA duplicate pair should be found");
+        assert_eq!(groups[0].content_hash, "HASH1");
+        let mut found_paths = groups[0].file_paths.clone();
+        found_paths.sort();
+        assert_eq!(
+            found_paths,
+            vec!["/data/RootA/dup1.fits".to_string(), "/data/RootA/dup2.fits".to_string()]
+        );
+
+        // Sites 1580 + 1614 (rebuild_duplicate_groups_cache, main query + per-group files query).
+        let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
+        assert_eq!(created, 1, "cache rebuild should also find exactly the RootA group");
+        let cached = get_cached_duplicates(&conn, true).unwrap();
+        assert_eq!(cached.len(), 1);
+        let mut cached_paths = cached[0].file_paths.clone();
+        cached_paths.sort();
+        assert_eq!(
+            cached_paths,
+            vec!["/data/RootA/dup1.fits".to_string(), "/data/RootA/dup2.fits".to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_root_prefix_predicate_with_no_roots_is_always_false() {
+        // Pure-function check: zero roots must produce the always-false
+        // fragment with no bind values, not an empty OR-chain (which would
+        // be a SQL syntax error) or a fragment that accidentally matches
+        // everything.
+        let (predicate, values) = scan_root_prefix_predicate("f.path", &[]);
+        assert_eq!(predicate, "0");
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn scan_root_restructured_queries_match_nothing_when_no_root_is_eligible() {
+        // Same duplicate pair as above, but with zero scan_roots rows at
+        // all (not even a `find_duplicates = 0` one) — mirrors the original
+        // `EXISTS (SELECT 1 FROM scan_roots sr WHERE ...)` being
+        // unconditionally false when the table has nothing to match.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (p, fname) in [
+            ("/data/Orphan/dup1.fits", "dup1.fits"),
+            ("/data/Orphan/dup2.fits", "dup2.fits"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                 VALUES (?1, ?2, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', 'HASH1')",
+                rusqlite::params![p, fname],
+            ).unwrap();
+        }
+
+        let groups = find_duplicate_groups(&conn, true).unwrap();
+        assert!(groups.is_empty(), "no scan root is eligible, so nothing should match");
+
+        let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
+        assert_eq!(created, 0, "cache rebuild should likewise find no groups");
     }
 }
 

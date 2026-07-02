@@ -737,8 +737,14 @@ mod tests {
         assert!(!f1.exists() && !f2.exists(), "files should be gone");
         assert!(!dir.exists(), "empty directory should be removed");
 
+        let dir_prefix = format!("{}/", dir.to_string_lossy());
+        let dir_hi = crate::db::path_prefix_upper(&dir_prefix);
         let row_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM files WHERE path LIKE ?1", [&format!("{}/%", dir.to_string_lossy())], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)",
+                rusqlite::params![dir_prefix, dir_hi],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(row_count, 0, "catalog rows should be removed");
     }
