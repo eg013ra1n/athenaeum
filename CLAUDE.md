@@ -156,7 +156,7 @@ Key tables:
 - `scan_roots` — monitored directories.
 - `frames_set` + `imaging_nights` + `sessions` + `session_members` — frame-set/session lifecycle. **Frame sets are global, not project-scoped** (the `projects` table is vestigial; `project_id` parameters are accepted but ignored).
 - `calibration_set` + `calibration_set_frames` + `calibration_set_to_frames` — grouped calibration frames + consumer links.
-- `tags` + `frame_tags`, `export_templates`, `settings`.
+- `tags` + `frame_tags`, `settings` (the `export_templates` table is vestigial — created by the schema, referenced by no code).
 - Archive: `archive_roots`, `archive_operations`, `archive_operation_files`, `archive_operation_steps`; `frames_set.archived_at` + `archive_operation_id`; `files.archived_in_operation` + `archive_zip_path` + `archive_path_in_zip`.
 - File-op: `file_operations`, `file_operation_files`, `file_operation_steps`.
 
@@ -173,7 +173,7 @@ Indexes on `filename`, `date_obs`, `object`, `instrume`, `ra`, `dec`, `objctra`,
 - **XISF parsing**: XML header per XISF 1.0 spec.
 - **Frame-set clustering** (`clustering/`) is seed-and-grow single-link on RA/Dec for LIGHT frames, great-circle distance, recomputed center on each member add. Frames already in any set are excluded by `auto_generate_frame_sets`.
 - **Duplicate detection**: xxHash XXH3_64 in `duplicates/`.
-- **Export templating**: tokens like `{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`, `{TELESCOP}`, `{INSTRUME}`, `{EXPTIME}`, `{FILTER}`, `{IMAGETYP}`, `{FRAME_FOLDER}`, with fallbacks (`{OBJECT|Unknown}`) and transforms (`:slug`). `IMAGETYP → FRAME_FOLDER`: `LIGHT→Lights`, `DARK→Calibration/Darks`, `FLAT→Calibration/Flats`, `BIAS→Calibration/Bias`, `DARKFLAT→Calibration/DarkFlats`.
+- **Export**: WBPP folder/keyword export only (`WbppExportConfig` in `crates/athenaeum-core/src/export/models.rs`; modules `data_collector`, `file_organizer`). Symlinks on unix; the Windows symlink branch exists but is unreachable from the UI. There is NO token-templating engine (`{OBJECT}`-style tokens and the `export_templates` table are doc/schema leftovers — see `docs/export/README.md`).
 
 ## Calibration Matching
 
