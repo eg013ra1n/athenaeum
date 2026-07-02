@@ -1,12 +1,13 @@
 // Scan root route handlers — mirrors athenaeum-tauri/src/commands/scan_roots.rs
 
 use athenaeum_core::db;
-use athenaeum_core::models::ScanRoot;
+use athenaeum_core::models::{RelinkResult, ScanRoot};
 use axum::{extract::State, http::StatusCode, Json};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use crate::events::SseProgressEmitter;
+use crate::routes::files::path_inside_allowed;
 use crate::WebAppState;
 
 // ── Response DTO ─────────────────────────────────────────────────────────────
@@ -53,6 +54,13 @@ pub struct StartScanArgs {
 pub struct CancelScanArgs {
     #[serde(rename = "rootId")]
     pub root_id: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelinkScanRootArgs {
+    pub root_id: i64,
+    pub new_path: String,
 }
 
 #[derive(serde::Serialize)]
@@ -408,11 +416,84 @@ pub async fn rescan_all_for_content_hash(
     }))
 }
 
-/// POST /api/relink_scan_root — 501 in web mode (needs native dir picker)
+/// POST /api/relink_scan_root
+///
+/// Path-input variant of the desktop `relink_scan_root` Tauri command
+/// (`crates/athenaeum-tauri/src/commands/scan_roots.rs`) — web mode has no
+/// native folder picker, so the caller supplies `new_path` directly and this
+/// handler validates it server-side before mirroring the desktop command's
+/// logic exactly: fetch the scan root's current path, delegate to
+/// `athenaeum_core::relinking::relink_files` for the actual fingerprint-based
+/// matching, then conditionally persist the new path.
 pub async fn relink_scan_root(
-    Json(_): Json<serde_json::Value>,
-) -> (StatusCode, String) {
-    (StatusCode::NOT_IMPLEMENTED, "relink_scan_root is not available in web mode".to_string())
+    State(state): State<WebAppState>,
+    Json(args): Json<RelinkScanRootArgs>,
+) -> Result<Json<RelinkResult>, (StatusCode, String)> {
+    let new_path_buf = Path::new(&args.new_path).to_path_buf();
+
+    if !new_path_buf.exists() {
+        return Err((StatusCode::BAD_REQUEST, "Directory does not exist".to_string()));
+    }
+    if !new_path_buf.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "Path is not a directory".to_string()));
+    }
+
+    let canonical = new_path_buf.canonicalize().map_err(|e| {
+        eprintln!("Failed to resolve relink target path '{}': {}", args.new_path, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve path: {}", e))
+    })?;
+
+    // Security: validate path is within allowed_paths (web mode sandboxing) —
+    // same convention as add_scan_root above.
+    if !state.allowed_paths.is_empty() && !path_inside_allowed(&canonical, &state.allowed_paths) {
+        return Err((StatusCode::FORBIDDEN, "Path is outside allowed directories".to_string()));
+    }
+
+    let new_path = canonical.to_string_lossy().to_string();
+
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    // Get old root path (mirrors the desktop command exactly).
+    let old_path: String = conn
+        .query_row(
+            "SELECT path FROM scan_roots WHERE id = ?1",
+            rusqlite::params![args.root_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            eprintln!("Failed to get scan root {}: {}", args.root_id, e);
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                (StatusCode::NOT_FOUND, format!("Scan root {} not found", args.root_id))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get scan root: {}", e))
+            }
+        })?;
+
+    println!("Relinking root {} from '{}' to '{}'", args.root_id, old_path, new_path);
+
+    // Perform relinking (real logic in athenaeum-core, shared by both backends).
+    let result = athenaeum_core::relinking::relink_files(&conn, &old_path, &new_path)
+        .map_err(|e| {
+            eprintln!("Relinking failed for root {}: {}", args.root_id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Relinking failed: {}", e))
+        })?;
+
+    // Update scan root path if all files were matched (mirrors desktop condition exactly).
+    if result.files_orphaned == 0 || result.files_matched > 0 {
+        conn.execute(
+            "UPDATE scan_roots SET path = ?1 WHERE id = ?2",
+            rusqlite::params![new_path, args.root_id],
+        )
+        .map_err(|e| {
+            eprintln!("Failed to update scan root path for root {}: {}", args.root_id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update scan root path: {}", e))
+        })?;
+        println!("Updated scan root path to '{}'", new_path);
+    }
+
+    Ok(Json(result))
 }
 
 /// POST /api/get_active_scans
@@ -527,4 +608,191 @@ fn recreate_calibration_sets_for_root(
     ).map_err(|e| e.to_string())?;
 
     Ok(scan_result.sets_created as usize)
+}
+
+#[cfg(test)]
+mod relink_tests {
+    use super::*;
+    use athenaeum_core::cache::MemoryImageCache;
+    use athenaeum_core::db::Database;
+    use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
+    use athenaeum_core::settings::SettingsManager;
+    use crate::events::SseEvent;
+    use rusqlite::{params, Connection};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
+    use tempfile::TempDir;
+
+    /// Real `mono.fits` fixture from the rustafits submodule (not a
+    /// synthetic minimal FITS) so `relink_files`'s header-fingerprint
+    /// matching runs against genuine header content — same fixture and
+    /// rationale as `scanner::moved_file_guard_tests`.
+    const MONO_FIXTURE: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../rustafits/tests/mono.fits");
+
+    /// Builds a `WebAppState` backed by a real (file-based, temp) database —
+    /// unlike `routes::tests::test_state` in `routes/mod.rs` (which
+    /// deliberately leaves `ctx.db` unset to test only the auth layer),
+    /// these tests exercise `relink_scan_root`'s actual
+    /// `scan_roots`/`files`/`fits_header` reads and writes, so a real
+    /// connection pool is required.
+    fn test_state(db: Database, allowed_paths: Vec<PathBuf>) -> WebAppState {
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+        });
+        let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
+        WebAppState {
+            ctx,
+            event_tx,
+            allowed_paths,
+            export_dir: None,
+            api_key: None,
+            image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
+            max_blink_threads: 1,
+            monitor: athenaeum_core::monitor::MonitorService::new(),
+        }
+    }
+
+    /// Insert a fake `files` + `fits_header` row carrying the real
+    /// fingerprint of `MONO_FIXTURE`, standing in for a "previously scanned"
+    /// file at `path` (which is never actually written to disk — only the
+    /// header content, hashed into the fingerprint, needs to match).
+    fn seed_old_file_row(conn: &Connection, file_id: i64, path: &str, header_text: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, 'old.fits', 100, '2025-01-01T00:00:00Z', 'FITS')",
+            params![file_id, path],
+        )
+        .unwrap();
+        athenaeum_core::db::insert_fits_header(conn, file_id, header_text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn relink_matches_file_by_fingerprint_and_updates_scan_root_path() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let conn = db.conn();
+
+        let old_root = tmp.path().join("old-root"); // never created — it "moved away"
+        let new_root = tmp.path().join("new-root");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [old_root.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let (_frame, header_text) = athenaeum_core::fits_parser::parse_fits_with_header(
+            &PathBuf::from(MONO_FIXTURE), 0,
+        ).unwrap();
+        let old_path = old_root.join("L_001.fits");
+        seed_old_file_row(&conn, 900, old_path.to_str().unwrap(), &header_text);
+
+        // Same bytes at the new location -> same header -> same fingerprint.
+        std::fs::copy(MONO_FIXTURE, new_root.join("L_001.fits")).unwrap();
+        drop(conn);
+
+        let state = test_state(db, Vec::new());
+        let args = RelinkScanRootArgs { root_id: 1, new_path: new_root.to_string_lossy().to_string() };
+
+        let result = relink_scan_root(State(state.clone()), Json(args)).await.unwrap().0;
+        assert_eq!(result.files_matched, 1, "the copied fixture must match the seeded fingerprint");
+        assert_eq!(result.files_orphaned, 0);
+
+        let updated_path: String = state.ctx.db.get().unwrap().conn().query_row(
+            "SELECT path FROM scan_roots WHERE id = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        let expected = new_root.canonicalize().unwrap().to_string_lossy().to_string();
+        assert_eq!(updated_path, expected, "scan_roots.path must be updated on a full match");
+    }
+
+    #[tokio::test]
+    async fn relink_outside_allowed_paths_is_403_and_db_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let conn = db.conn();
+
+        let old_root = tmp.path().join("old-root");
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [old_root.to_str().unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let allowed_root = TempDir::new().unwrap();
+        let outside_root = TempDir::new().unwrap(); // sibling temp dir, not under allowed_root
+
+        let state = test_state(db, vec![allowed_root.path().to_path_buf()]);
+        let args = RelinkScanRootArgs {
+            root_id: 1,
+            new_path: outside_root.path().to_string_lossy().to_string(),
+        };
+
+        let err = relink_scan_root(State(state.clone()), Json(args)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "Path is outside allowed directories");
+
+        let path_after: String = state.ctx.db.get().unwrap().conn().query_row(
+            "SELECT path FROM scan_roots WHERE id = 1",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(path_after, old_root.to_str().unwrap(), "DB must be untouched on 403");
+    }
+
+    #[tokio::test]
+    async fn relink_nonexistent_new_path_is_400() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [tmp.path().join("old-root").to_str().unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let state = test_state(db, Vec::new());
+        let missing = tmp.path().join("does-not-exist");
+        let args = RelinkScanRootArgs { root_id: 1, new_path: missing.to_string_lossy().to_string() };
+
+        let err = relink_scan_root(State(state), Json(args)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn relink_unknown_root_id_is_404() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        // No scan_roots rows inserted — root_id 999 does not exist.
+
+        let new_root = tmp.path().join("new-root");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let state = test_state(db, Vec::new());
+        let args = RelinkScanRootArgs { root_id: 999, new_path: new_root.to_string_lossy().to_string() };
+
+        let err = relink_scan_root(State(state), Json(args)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
 }

@@ -599,7 +599,10 @@ pub struct RenamePathArgs {
     pub new_name: String,
 }
 
-fn path_inside_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
+/// `pub(crate)` (not private) so other route modules — e.g.
+/// `scan_roots::relink_scan_root` — can reuse the same allowed-paths check
+/// instead of copy-pasting another inline variant.
+pub(crate) fn path_inside_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     allowed.iter().any(|root| {
         let rc = fs::canonicalize(root).unwrap_or_else(|_| root.clone());

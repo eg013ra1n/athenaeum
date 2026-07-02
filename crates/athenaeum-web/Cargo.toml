@@ -34,3 +34,6 @@ percent-encoding = "2.1"
 [dev-dependencies]
 # ServiceExt::oneshot for router-level middleware tests (see routes/auth.rs).
 tower = { version = "0.5", features = ["util"] }
+# Temp DB + temp allowed-dir fixtures for route-level tests (see
+# routes/scan_roots.rs). Same version as athenaeum-core's dev-dependency.
+tempfile = "3"
