@@ -30,6 +30,47 @@ fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
         ))
 }
 
+/// True when `path` is `root` itself, or a descendant of `root` at a
+/// path-separator boundary. Root `/a/b` matches `/a/b/x.fits` but NOT the
+/// sibling `/a/bc/x.fits` (a plain string-prefix check would wrongly match
+/// the sibling).
+fn path_has_root_prefix(path: &str, root: &str) -> bool {
+    if path == root {
+        return true;
+    }
+    path.strip_prefix(root)
+        .map(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+        .unwrap_or(false)
+}
+
+/// True when `path` falls under a scan root whose root directory is
+/// currently missing on disk (volume unmounted / disconnected). Used to
+/// stop the header-fingerprint move-detection from mistaking a duplicate/
+/// copy on offline storage for a move: flipping `files.path` away from a
+/// still-valid-but-offline original would silently orphan it once the
+/// volume remounts (project rule: files on disconnected storage are not
+/// orphans).
+///
+/// When multiple configured scan roots match `path` by prefix (nested
+/// roots), the longest (most specific) match wins. Not under any known
+/// scan root -> `Ok(false)` (today's behavior, unaffected by this guard).
+fn path_under_unavailable_scan_root(conn: &Connection, path: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare("SELECT path FROM scan_roots")?;
+    let root_paths: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let owning_root = root_paths
+        .into_iter()
+        .filter(|root| path_has_root_prefix(path, root))
+        .max_by_key(|root| root.len());
+
+    Ok(match owning_root {
+        Some(root) => !std::path::Path::new(&root).exists(),
+        None => false,
+    })
+}
+
 /// Result from processing a single file (for collecting before batch insert)
 #[derive(Clone)]
 pub struct FileProcessResult {
@@ -381,6 +422,16 @@ fn process_file(
         if let Some((file_id, old_path)) = existing_file {
             if std::path::Path::new(&old_path).exists() {
                 println!("Detected duplicate file: '{}' and '{}' have identical headers", old_path, current_path);
+            } else if path_under_unavailable_scan_root(conn, &old_path)? {
+                // Old path is missing, but that's because its owning scan
+                // root is currently offline (unmounted volume), not because
+                // the file was moved. Fall through to duplicate/new-file
+                // handling below instead of flipping the still-valid
+                // original's path.
+                println!(
+                    "Skipping move-detection for '{}' -> '{}': old path's scan root is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
+                    old_path, current_path, file_id
+                );
             } else {
                 println!("Detected moved file: '{}' -> '{}' (file_id={})", old_path, current_path, file_id);
 
@@ -408,10 +459,16 @@ fn process_file(
                 } else {
                     base_instrume
                 };
-                let _ = conn.execute(
+                conn.execute(
                     "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
                     rusqlite::params![new_instrume, file_id],
-                );
+                ).map_err(|e| {
+                    eprintln!(
+                        "[scanner] failed to update frames.instrume for file_id={} (move '{}' -> '{}'): {}",
+                        file_id, old_path, current_path, e
+                    );
+                    e
+                })?;
 
                 return Ok(None);
             }
@@ -1310,25 +1367,75 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         if let Some(ref header) = file_result.header {
             let fingerprint = crate::fingerprint::compute_header_fingerprint(header);
 
-            let existing_file: Option<(i64, String)> = conn.query_row(
+            let existing_file: Option<(i64, String)> = match conn.query_row(
                 "SELECT f.id, f.path FROM files f
                  INNER JOIN fits_header fh ON f.id = fh.file_id
                  WHERE fh.header_fingerprint = ?1 AND f.path != ?2",
                 rusqlite::params![fingerprint, file_result.file.path],
                 |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional().unwrap_or(None);
+            ).optional() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[scanner] move-detection fingerprint lookup failed for '{}': {}",
+                        file_result.file.path, e
+                    );
+                    result.errors.push(format!(
+                        "{}: move-detection fingerprint lookup failed: {}",
+                        file_result.file.path, e
+                    ));
+                    None
+                }
+            };
 
             if let Some((file_id, old_path)) = existing_file {
-                if !std::path::Path::new(&old_path).exists() {
+                let old_path_missing = !std::path::Path::new(&old_path).exists();
+                // Only consult the volume guard when we'd otherwise treat
+                // this as a move — same "old path missing" branch as before.
+                let guard_blocks_move = old_path_missing
+                    && match path_under_unavailable_scan_root(conn, &old_path) {
+                        Ok(blocked) => blocked,
+                        Err(e) => {
+                            eprintln!(
+                                "[scanner] move-detection volume guard check failed for '{}': {}",
+                                old_path, e
+                            );
+                            result.errors.push(format!(
+                                "{}: move-detection volume guard check failed: {}",
+                                old_path, e
+                            ));
+                            false
+                        }
+                    };
+
+                if old_path_missing && guard_blocks_move {
+                    // Old path is missing, but only because its owning scan
+                    // root is currently offline (unmounted volume). Fall
+                    // through to the normal insert/reparse handling below
+                    // instead of flipping the still-valid original's path.
+                    println!(
+                        "Skipping move-detection for '{}' -> '{}': old path's scan root is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
+                        old_path, file_result.file.path, file_id
+                    );
+                } else if old_path_missing {
                     // Old file no longer exists - this is a MOVE, update path
-                    let _ = conn.execute(
+                    if let Err(e) = conn.execute(
                         "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
                         rusqlite::params![
                             file_result.file.path,
                             file_result.file.modified_at.to_rfc3339(),
                             file_id
                         ],
-                    );
+                    ) {
+                        eprintln!(
+                            "[scanner] failed to update files.path for file_id={} (move '{}' -> '{}'): {}",
+                            file_id, old_path, file_result.file.path, e
+                        );
+                        result.errors.push(format!(
+                            "file_id={}: failed to update path for moved file '{}' -> '{}': {}",
+                            file_id, old_path, file_result.file.path, e
+                        ));
+                    }
 
                     // Update INSTRUME based on destination root's unique_camera setting
                     // file_result.frame.instrume has the raw FITS header value (no suffix)
@@ -1338,10 +1445,19 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                     } else {
                         file_result.frame.instrume.clone()
                     };
-                    let _ = conn.execute(
+                    if let Err(e) = conn.execute(
                         "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
                         rusqlite::params![new_instrume, file_id],
-                    );
+                    ) {
+                        eprintln!(
+                            "[scanner] failed to update frames.instrume for file_id={} (move '{}' -> '{}'): {}",
+                            file_id, old_path, file_result.file.path, e
+                        );
+                        result.errors.push(format!(
+                            "file_id={}: failed to update instrume for moved file '{}' -> '{}': {}",
+                            file_id, old_path, file_result.file.path, e
+                        ));
+                    }
 
                     continue; // Skip insert, file was moved
                 }
@@ -1955,5 +2071,251 @@ mod inplace_tests {
         .to_rfc3339();
         assert_eq!(db_mtime, on_disk_mtime,
             "files.modified_at must be refreshed even when override = 1");
+    }
+}
+
+/// Volume-aware move-detection guard + its two-site wiring. Uses the real
+/// `mono.fits` fixture from the rustafits submodule (not a synthetic
+/// minimal FITS) so `compute_header_fingerprint` runs against genuine
+/// header content, per the project's real-data-first rule.
+#[cfg(test)]
+mod moved_file_guard_tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use rusqlite::params;
+    use tempfile::TempDir;
+
+    const MONO_FIXTURE: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../rustafits/tests/mono.fits");
+
+    /// Insert a fake `files` + `fits_header` row carrying the real
+    /// fingerprint of the fixture, standing in for a "previously scanned"
+    /// file at `path` (which is never actually written to disk).
+    fn seed_fake_old_row(conn: &Connection, file_id: i64, path: &str, header_text: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, 'old.fits', 100, '2025-01-01T00:00:00Z', 'FITS')",
+            params![file_id, path],
+        )
+        .unwrap();
+        insert_fits_header(conn, file_id, header_text).unwrap();
+    }
+
+    /// Site 1 (`process_file`): the old row's path lives under a scan root
+    /// whose directory is missing (simulated unmounted volume). The guard
+    /// must block the flip so the still-valid-but-offline original is left
+    /// alone, and the real fixture at the new path is inserted as a new row.
+    #[test]
+    fn site1_guard_blocks_flip_when_old_scan_root_is_unavailable() {
+        let tmp = TempDir::new().unwrap();
+
+        // Offline root: registered in scan_roots but never created on disk.
+        let offline_root = tmp.path().join("offline-volume/astro");
+        // Online root: real, existing directory for the "new" file.
+        let online_root = tmp.path().join("online-volume");
+        std::fs::create_dir_all(&online_root).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [offline_root.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (2, ?1)",
+            [online_root.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let (_frame, header_text) =
+            parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+
+        let old_path = offline_root.join("L_001.fits");
+        let old_path_str = old_path.to_str().unwrap().to_string();
+        seed_fake_old_row(&conn, 900, &old_path_str, &header_text);
+
+        let new_path = online_root.join("L_001.fits");
+        std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
+
+        let mut hash_errors = Vec::new();
+        let result = process_file(&new_path, &conn, false, false, 2, &mut hash_errors).unwrap();
+        assert!(
+            result.is_some(),
+            "guard must let the new file insert instead of silently treating it as a move"
+        );
+
+        let old_path_after: String = conn
+            .query_row("SELECT path FROM files WHERE id = 900", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            old_path_after, old_path_str,
+            "guard must block the flip: the offline original's path must stay put"
+        );
+
+        let total_files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            total_files, 2,
+            "both the offline original and the new file must exist — no orphaning"
+        );
+    }
+
+    /// Control: same fingerprint match, but the old row's scan root
+    /// directory DOES exist on disk (only the file itself is gone) — a
+    /// genuine move. Current flip behavior must be preserved.
+    #[test]
+    fn site1_flip_still_works_when_old_scan_root_is_available() {
+        let tmp = TempDir::new().unwrap();
+
+        let old_root = tmp.path().join("root-a");
+        let new_root = tmp.path().join("root-b");
+        std::fs::create_dir_all(&old_root).unwrap();
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [old_root.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (2, ?1)",
+            [new_root.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let (_frame, header_text) =
+            parse_fits_with_header(&PathBuf::from(MONO_FIXTURE), 0).unwrap();
+
+        // Old row's path is under an existing root directory, but the file
+        // itself was never written there (it "moved away").
+        let old_path = old_root.join("L_001.fits");
+        let old_path_str = old_path.to_str().unwrap().to_string();
+        seed_fake_old_row(&conn, 901, &old_path_str, &header_text);
+
+        let new_path = new_root.join("L_001.fits");
+        std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
+
+        let mut hash_errors = Vec::new();
+        let result = process_file(&new_path, &conn, false, false, 2, &mut hash_errors).unwrap();
+        assert!(
+            result.is_none(),
+            "a genuine move must short-circuit with Ok(None), not insert a new row"
+        );
+
+        let path_after: String = conn
+            .query_row("SELECT path FROM files WHERE id = 901", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            path_after,
+            new_path.to_str().unwrap(),
+            "flip must update files.path to the new location"
+        );
+
+        let total_files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_files, 1, "no duplicate row should be inserted for a genuine move");
+    }
+
+    // -- helper unit tests (also cover Site 2, which isn't independently
+    // testable without standing up the full parallel scan pipeline; see
+    // the report for that gap) --
+
+    #[test]
+    fn path_has_root_prefix_boundary_cases() {
+        assert!(
+            path_has_root_prefix("/a/b", "/a/b"),
+            "the root path itself counts as under the root"
+        );
+        assert!(
+            path_has_root_prefix("/a/b/x.fits", "/a/b"),
+            "a child path is under the root"
+        );
+        assert!(
+            !path_has_root_prefix("/a/bc/x.fits", "/a/b"),
+            "a sibling directory sharing a string prefix must NOT match"
+        );
+        assert!(
+            !path_has_root_prefix("/x/y/z.fits", "/a/b"),
+            "an unrelated path must not match"
+        );
+    }
+
+    #[test]
+    fn path_under_unavailable_scan_root_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let missing_root = tmp.path().join("missing");
+        let existing_root = tmp.path().join("existing");
+        std::fs::create_dir_all(&existing_root).unwrap();
+
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [missing_root.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (2, ?1)",
+            [existing_root.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let under_missing = missing_root.join("a/b.fits");
+        assert!(
+            path_under_unavailable_scan_root(&conn, under_missing.to_str().unwrap()).unwrap(),
+            "a path under a missing scan root must report unavailable"
+        );
+
+        let under_existing = existing_root.join("a/b.fits");
+        assert!(
+            !path_under_unavailable_scan_root(&conn, under_existing.to_str().unwrap()).unwrap(),
+            "a path under an existing scan root must report available"
+        );
+
+        let elsewhere = tmp.path().join("elsewhere/c.fits");
+        assert!(
+            !path_under_unavailable_scan_root(&conn, elsewhere.to_str().unwrap()).unwrap(),
+            "a path under no known scan root must behave as today (available)"
+        );
+    }
+
+    /// Nested scan roots (a more specific root registered inside a broader
+    /// one — e.g. removable media mounted under an always-present host
+    /// path) must resolve ownership to the longest (most specific) match,
+    /// not the first/shortest one.
+    #[test]
+    fn path_under_unavailable_scan_root_longest_match_wins() {
+        let tmp = TempDir::new().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let outer_root = tmp.path().join("host-mount");
+        std::fs::create_dir_all(&outer_root).unwrap();
+        // Inner root is nested under the outer root but never created on
+        // disk (e.g. removable media currently unmounted).
+        let inner_root = outer_root.join("removable-drive");
+
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [outer_root.to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (2, ?1)",
+            [inner_root.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let p = inner_root.join("x.fits");
+        assert!(
+            path_under_unavailable_scan_root(&conn, p.to_str().unwrap()).unwrap(),
+            "the more specific (offline) inner root must win over the online outer root"
+        );
     }
 }
