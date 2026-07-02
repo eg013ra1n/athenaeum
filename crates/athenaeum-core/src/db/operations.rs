@@ -8,34 +8,62 @@ use rusqlite::{params, Connection, Result};
 /// Upper bound of the byte range that matches exactly the strings with
 /// `prefix` as a literal prefix: `[prefix, upper)`. Returns `None` when no
 /// finite upper bound exists — the caller then filters on the lower bound
-/// alone (`path >= prefix`). That happens when:
+/// alone (`path >= prefix`). That happens only when:
 /// - `prefix` is empty (no upper bound can express "everything");
-/// - `prefix` is entirely `0xFF` bytes (all bytes get popped, none left to
-///   increment) — unreachable for a real `&str` since `0xFF` is never a
-///   valid UTF-8 byte, but handled for defensive correctness;
-/// - incrementing the final byte produces a sequence that is no longer
-///   valid UTF-8 (e.g. it lands on a bare continuation byte). rusqlite binds
-///   Rust `String`s as TEXT, so an invalid byte sequence can't be bound at
-///   all — we fall back to lower-bound-only rather than error.
+/// - every char in `prefix` is `char::MAX` (the carry runs off the front) —
+///   unreachable for a real filesystem path, but handled for defensive
+///   correctness. When this fires for a non-empty prefix, it's logged via
+///   `eprintln!` so the (lower-bound-only) fallback is observable rather
+///   than silently swallowed.
 ///
+/// All stored paths are valid UTF-8 (they come from Rust `String`s), and
 /// SQLite's default `TEXT` collation (`BINARY`) compares by `memcmp` on the
-/// UTF-8 bytes, so incrementing the final byte of the prefix is the correct
-/// exclusive upper bound for "starts with `prefix`" — and unlike `LIKE`, it
-/// is exact-case and treats every character (including `%`/`_`) literally.
+/// UTF-8 bytes. For a prefix `P` ending in char `c`, replacing the last char
+/// with `succ(c)` (its Unicode scalar successor, skipping the UTF-16
+/// surrogate gap `D800..=DFFF` — `char` can never itself be a surrogate, so
+/// skipping keeps `succ` total over all `char`s below `char::MAX`) yields a
+/// string that is byte-wise greater than every valid-UTF-8 string with
+/// prefix `P`, and no valid-UTF-8 string sorts strictly between them: any
+/// such string would need to differ from `P` before `succ(c)`'s position
+/// while still comparing above `P ++ c`, which requires an invalid
+/// continuation-byte sequence. This is why the fix operates on `char`s (via
+/// `prefix.chars()`), not raw bytes — incrementing the *last byte* of a
+/// multi-byte UTF-8 char (the previous implementation) can land on an
+/// invalid byte sequence (any char whose last encoded byte is `0xBF`, e.g.
+/// `ÿ`/`¿`/Cyrillic `п`) and silently degrade to the unbounded
+/// lower-bound-only fallback.
+///
+/// Unlike `LIKE`, this predicate is exact-case and treats every character
+/// (including `%`/`_`) literally.
 pub(crate) fn path_prefix_upper(prefix: &str) -> Option<String> {
-    let mut bytes = prefix.as_bytes().to_vec();
-    // Trailing 0xFF bytes can't be incremented in place — drop them and
-    // increment the byte before instead (standard prefix-range idiom).
-    while let Some(&last) = bytes.last() {
-        if last == 0xFF {
-            bytes.pop();
-        } else {
-            break;
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(&last) = chars.last() {
+        // Successor of the last char, skipping the surrogate gap (chars
+        // themselves are never surrogates, but the scalar value right after
+        // 0xD7FF is, so jump straight to 0xE000).
+        let mut next = last as u32 + 1;
+        if (0xD800..=0xDFFF).contains(&next) {
+            next = 0xE000;
+        }
+        match char::from_u32(next) {
+            Some(c) => {
+                *chars.last_mut().unwrap() = c;
+                return Some(chars.into_iter().collect());
+            }
+            None => {
+                // last char was char::MAX — no successor; carry into the
+                // previous char instead (drop this one and retry).
+                chars.pop();
+            }
         }
     }
-    let last = bytes.last_mut()?;
-    *last += 1;
-    String::from_utf8(bytes).ok()
+    if !prefix.is_empty() {
+        eprintln!(
+            "path_prefix_upper: no finite upper bound for prefix {:?} (all chars are char::MAX) — falling back to lower-bound-only match",
+            prefix
+        );
+    }
+    None
 }
 
 /// Build a `(col >= ? AND (? IS NULL OR col < ?)) OR ...` SQL fragment that
@@ -4343,22 +4371,68 @@ mod path_prefix_range_tests {
     // -- path_prefix_upper -------------------------------------------------
 
     #[test]
-    fn upper_bound_of_normal_prefix_increments_last_byte() {
-        // '/' (0x2F) + 1 = '0' (0x30).
+    fn upper_bound_of_ascii_prefix_is_unchanged_behaviour() {
+        // 'x' (U+0078) successor is 'y' (U+0079) — same result the old
+        // byte-increment algorithm gave for plain ASCII.
+        assert_eq!(path_prefix_upper("/data/x"), Some("/data/y".to_string()));
+    }
+
+    #[test]
+    fn upper_bound_of_0xbf_terminated_prefix_is_some() {
+        // 'ÿ' = U+00FF encodes as bytes [0xC3, 0xBF]. The OLD byte-increment
+        // algorithm incremented the trailing 0xBF to 0xC0, a bare
+        // continuation byte — invalid UTF-8 — and returned None, silently
+        // degrading every one of these queries to an unbounded
+        // lower-bound-only match. The char-successor algorithm instead
+        // advances the whole scalar value: succ('\u{FF}') = '\u{100}'.
         assert_eq!(
-            path_prefix_upper("/data/Astro/"),
-            Some("/data/Astro0".to_string())
+            path_prefix_upper("/data/test\u{ff}"),
+            Some("/data/test\u{100}".to_string()),
+            "0xBF-class trailing byte must no longer fall back to None"
         );
     }
 
     #[test]
-    fn upper_bound_of_non_ascii_prefix_increments_last_byte() {
-        // 'é' = U+00E9 = bytes [0xC3, 0xA9]; incrementing the trailing byte
-        // yields [0xC3, 0xAA] = U+00EA ('ê') — still valid UTF-8, and no
-        // 0xFF byte is involved so the pop-trailing-0xFF loop never fires.
-        let prefix = "/data/caf\u{e9}";
-        let upper = path_prefix_upper(prefix).expect("increment should stay valid UTF-8");
-        assert_eq!(upper, "/data/caf\u{ea}");
+    fn upper_bound_of_other_0xbf_class_prefixes_is_some_and_byte_ordered() {
+        // '¿' = U+00BF (bytes [0xC2, 0xBF]) and Cyrillic 'п' = U+043F (bytes
+        // [0xD0, 0xBF]) both end in a 0xBF byte — the same failure class as
+        // 'ÿ' above, exercised on two more codepoints named in the finding.
+        for prefix in ["\u{bf}", "\u{43f}"] {
+            let upper = path_prefix_upper(prefix)
+                .unwrap_or_else(|| panic!("expected Some upper bound for {:?}", prefix));
+            assert!(
+                upper.as_bytes() > prefix.as_bytes(),
+                "upper bound {:?} must sort after prefix {:?} under BINARY/memcmp collation",
+                upper,
+                prefix
+            );
+        }
+    }
+
+    #[test]
+    fn upper_bound_skips_the_utf16_surrogate_gap() {
+        // U+D7FF is the last scalar value before the surrogate gap
+        // (D800..=DFFF, which are not valid `char`s). The successor must
+        // jump straight to U+E000, the first scalar value after the gap.
+        let prefix = "/data/x\u{d7ff}";
+        assert_eq!(
+            path_prefix_upper(prefix),
+            Some("/data/x\u{e000}".to_string())
+        );
+    }
+
+    #[test]
+    fn upper_bound_carries_into_previous_char_when_last_is_char_max() {
+        // char::MAX (U+10FFFF) has no successor scalar value, so the
+        // algorithm must drop it and increment the char before it instead —
+        // the same "carry" idiom the old byte-based version used for
+        // trailing 0xFF bytes.
+        let prefix = format!("/data/x{}", char::MAX);
+        assert_eq!(
+            path_prefix_upper(&prefix),
+            Some("/data/y".to_string()),
+            "trailing char::MAX must carry into the previous char"
+        );
     }
 
     #[test]
@@ -4367,12 +4441,52 @@ mod path_prefix_range_tests {
     }
 
     #[test]
-    fn upper_bound_none_when_increment_produces_invalid_utf8() {
-        // Trailing DEL (0x7F) increments to 0x80, a bare continuation byte
-        // that cannot stand alone as valid UTF-8 — the caller must fall back
-        // to a lower-bound-only filter rather than bind an invalid TEXT.
-        let prefix = "/data/x\u{7f}";
-        assert_eq!(path_prefix_upper(prefix), None);
+    fn upper_bound_of_all_char_max_prefix_is_none() {
+        // Every char is char::MAX, so the carry runs off the front of the
+        // string with nothing left to increment — the one remaining `None`
+        // case for a non-empty prefix, unreachable for a real filesystem
+        // path but handled defensively (and logged via eprintln! at the
+        // call site, per the never-swallow-errors rule).
+        let prefix: String = std::iter::repeat(char::MAX).take(2).collect();
+        assert_eq!(path_prefix_upper(&prefix), None);
+    }
+
+    // -- query-level regression: the 0xBF fallback-gap scenario ------------
+
+    #[test]
+    fn rename_prefix_ending_in_0xbf_class_char_does_not_unbound_match() {
+        // The reviewer's exact scenario. `/data/x\u{ff}` ('ÿ', bytes
+        // [0xC3, 0xBF]) is the failure class from the finding: under the OLD
+        // byte-increment algorithm, incrementing the trailing 0xBF produced
+        // invalid UTF-8 → `path_prefix_upper` returned `None` → the caller
+        // fell back to a lower-bound-only filter (`path >= prefix`), which
+        // matches every path sorting after the prefix — including sibling
+        // directory `/data/x\u{450}` ('ѐ', bytes [0xD1, 0x90], which sorts
+        // after 'ÿ' byte-wise since 0xD1 > 0xC3). That would make an
+        // unrelated sibling get swept into the rename/delete cascade.
+        //
+        // With the fixed char-successor algorithm, the upper bound is
+        // `/data/x\u{100}` (bytes [..., 0xC4, 0x80]), which correctly
+        // excludes the 'ѐ' sibling (0xD1 > 0xC4) while still including
+        // everything actually nested under `/data/x\u{ff}`.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_file(&conn, "/data/x\u{ff}/f.fits");
+        insert_file(&conn, "/data/x\u{450}/g.fits");
+
+        let n = rename_files_path_prefix(&conn, "/data/x\u{ff}", "/data/RENAMED").unwrap();
+        assert_eq!(n, 1, "only the file under the /data/x\\u{{ff}} prefix should be renamed");
+
+        let mut paths = all_paths(&conn);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "/data/RENAMED/f.fits".to_string(),
+                "/data/x\u{450}/g.fits".to_string(),
+            ],
+            "the \\u{{450}} sibling must be left untouched, not swept in by an unbounded fallback"
+        );
     }
 
     // -- semantic scenarios (Step 3 of the brief) ---------------------------
@@ -4561,6 +4675,77 @@ mod path_prefix_range_tests {
 
         let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
         assert_eq!(created, 0, "cache rebuild should likewise find no groups");
+    }
+
+    // -- Finding 2: coverage for the two untested migrated sites -----------
+    // (`get_files_by_directory` old site 659, `get_files_by_directory_for_camera`
+    // old site 766) — same case-exactness / literal-wildcard hazards as the
+    // `LIKE`-based sites above, exercised through the user-visible listing
+    // queries directly.
+
+    fn insert_file_with_instrume(conn: &Connection, path: &str, instrume: &str) {
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES (?1, 'x.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [path],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = ?1", [path], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, instrume) VALUES (?1, ?2)",
+            rusqlite::params![file_id, instrume],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn get_files_by_directory_is_case_exact_and_wildcard_literal() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_file(&conn, "/data/Astro/a.fits");
+        insert_file(&conn, "/data/astro/b.fits");
+        insert_file(&conn, "/data/M31_Ha/c.fits");
+        insert_file(&conn, "/data/M31XHa/d.fits");
+
+        let astro = get_files_by_directory(&conn, "/data/Astro", None).unwrap();
+        assert_eq!(
+            astro.iter().map(|(f, _)| f.path.clone()).collect::<Vec<_>>(),
+            vec!["/data/Astro/a.fits".to_string()],
+            "case-differing sibling /data/astro must not be swept in"
+        );
+
+        let m31 = get_files_by_directory(&conn, "/data/M31_Ha", None).unwrap();
+        assert_eq!(
+            m31.iter().map(|(f, _)| f.path.clone()).collect::<Vec<_>>(),
+            vec!["/data/M31_Ha/c.fits".to_string()],
+            "'_' must be treated literally, not as a single-char LIKE wildcard"
+        );
+    }
+
+    #[test]
+    fn get_files_by_directory_for_camera_is_case_exact_and_wildcard_literal() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_file_with_instrume(&conn, "/data/Astro/a.fits", "CamA");
+        insert_file_with_instrume(&conn, "/data/astro/b.fits", "CamA");
+        insert_file_with_instrume(&conn, "/data/M31_Ha/c.fits", "CamA");
+        insert_file_with_instrume(&conn, "/data/M31XHa/d.fits", "CamA");
+
+        let astro = get_files_by_directory_for_camera(&conn, "/data/Astro", "CamA", None).unwrap();
+        assert_eq!(
+            astro.iter().map(|(f, _)| f.path.clone()).collect::<Vec<_>>(),
+            vec!["/data/Astro/a.fits".to_string()],
+            "case-differing sibling /data/astro must not be swept in"
+        );
+
+        let m31 = get_files_by_directory_for_camera(&conn, "/data/M31_Ha", "CamA", None).unwrap();
+        assert_eq!(
+            m31.iter().map(|(f, _)| f.path.clone()).collect::<Vec<_>>(),
+            vec!["/data/M31_Ha/c.fits".to_string()],
+            "'_' must be treated literally, not as a single-char LIKE wildcard"
+        );
     }
 }
 
