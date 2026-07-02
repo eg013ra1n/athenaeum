@@ -34,7 +34,17 @@ fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
 /// path-separator boundary. Root `/a/b` matches `/a/b/x.fits` but NOT the
 /// sibling `/a/bc/x.fits` (a plain string-prefix check would wrongly match
 /// the sibling).
+///
+/// `root` is normalized by trimming trailing `/`/`\` before comparing —
+/// without this, a root stored with a trailing separator (Windows drive
+/// roots like `D:\`, or a legacy/manually-edited `scan_roots` row ending in
+/// `/`) would never match any of its own descendants: `strip_prefix` would
+/// consume the separator as part of the literal prefix, leaving a `rest`
+/// that doesn't itself start with a separator. Degenerate case: root `/`
+/// trims to `""`, so every absolute unix path matches it — a root of `/`
+/// legitimately owns the whole filesystem.
 fn path_has_root_prefix(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches(['/', '\\']);
     if path == root {
         return true;
     }
@@ -43,18 +53,22 @@ fn path_has_root_prefix(path: &str, root: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// True when `path` falls under a scan root whose root directory is
-/// currently missing on disk (volume unmounted / disconnected). Used to
-/// stop the header-fingerprint move-detection from mistaking a duplicate/
-/// copy on offline storage for a move: flipping `files.path` away from a
-/// still-valid-but-offline original would silently orphan it once the
-/// volume remounts (project rule: files on disconnected storage are not
-/// orphans).
+/// If `path` falls under a scan root whose root directory is currently
+/// missing on disk (volume unmounted / disconnected), returns that root's
+/// path. Used to stop the header-fingerprint move-detection from mistaking
+/// a duplicate/copy on offline storage for a move: flipping `files.path`
+/// away from a still-valid-but-offline original would silently orphan it
+/// once the volume remounts (project rule: files on disconnected storage
+/// are not orphans).
 ///
 /// When multiple configured scan roots match `path` by prefix (nested
 /// roots), the longest (most specific) match wins. Not under any known
-/// scan root -> `Ok(false)` (today's behavior, unaffected by this guard).
-fn path_under_unavailable_scan_root(conn: &Connection, path: &str) -> anyhow::Result<bool> {
+/// scan root, or under one that's available -> `Ok(None)` (today's
+/// behavior, unaffected by this guard).
+fn path_under_unavailable_scan_root(
+    conn: &Connection,
+    path: &str,
+) -> anyhow::Result<Option<String>> {
     let mut stmt = conn.prepare("SELECT path FROM scan_roots")?;
     let root_paths: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -65,10 +79,7 @@ fn path_under_unavailable_scan_root(conn: &Connection, path: &str) -> anyhow::Re
         .filter(|root| path_has_root_prefix(path, root))
         .max_by_key(|root| root.len());
 
-    Ok(match owning_root {
-        Some(root) => !std::path::Path::new(&root).exists(),
-        None => false,
-    })
+    Ok(owning_root.filter(|root| !std::path::Path::new(root).exists()))
 }
 
 /// Result from processing a single file (for collecting before batch insert)
@@ -422,15 +433,15 @@ fn process_file(
         if let Some((file_id, old_path)) = existing_file {
             if std::path::Path::new(&old_path).exists() {
                 println!("Detected duplicate file: '{}' and '{}' have identical headers", old_path, current_path);
-            } else if path_under_unavailable_scan_root(conn, &old_path)? {
+            } else if let Some(offline_root) = path_under_unavailable_scan_root(conn, &old_path)? {
                 // Old path is missing, but that's because its owning scan
                 // root is currently offline (unmounted volume), not because
                 // the file was moved. Fall through to duplicate/new-file
                 // handling below instead of flipping the still-valid
                 // original's path.
                 println!(
-                    "Skipping move-detection for '{}' -> '{}': old path's scan root is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
-                    old_path, current_path, file_id
+                    "Skipping move-detection for '{}' -> '{}': old path's scan root '{}' is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
+                    old_path, current_path, offline_root, file_id
                 );
             } else {
                 println!("Detected moved file: '{}' -> '{}' (file_id={})", old_path, current_path, file_id);
@@ -1392,9 +1403,9 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 let old_path_missing = !std::path::Path::new(&old_path).exists();
                 // Only consult the volume guard when we'd otherwise treat
                 // this as a move — same "old path missing" branch as before.
-                let guard_blocks_move = old_path_missing
-                    && match path_under_unavailable_scan_root(conn, &old_path) {
-                        Ok(blocked) => blocked,
+                let guard_blocking_root: Option<String> = if old_path_missing {
+                    match path_under_unavailable_scan_root(conn, &old_path) {
+                        Ok(root) => root,
                         Err(e) => {
                             eprintln!(
                                 "[scanner] move-detection volume guard check failed for '{}': {}",
@@ -1404,18 +1415,21 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                                 "{}: move-detection volume guard check failed: {}",
                                 old_path, e
                             ));
-                            false
+                            None
                         }
-                    };
+                    }
+                } else {
+                    None
+                };
 
-                if old_path_missing && guard_blocks_move {
+                if let Some(offline_root) = guard_blocking_root {
                     // Old path is missing, but only because its owning scan
                     // root is currently offline (unmounted volume). Fall
                     // through to the normal insert/reparse handling below
                     // instead of flipping the still-valid original's path.
                     println!(
-                        "Skipping move-detection for '{}' -> '{}': old path's scan root is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
-                        old_path, file_result.file.path, file_id
+                        "Skipping move-detection for '{}' -> '{}': old path's scan root '{}' is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
+                        old_path, file_result.file.path, offline_root, file_id
                     );
                 } else if old_path_missing {
                     // Old file no longer exists - this is a MOVE, update path
@@ -2245,6 +2259,44 @@ mod moved_file_guard_tests {
         );
     }
 
+    /// A `scan_roots.path` value with a trailing separator (Windows drive
+    /// roots, or a legacy/manually-edited row) must still match its own
+    /// descendants — the naive `strip_prefix` would otherwise consume the
+    /// separator as part of the literal prefix and never match.
+    #[test]
+    fn path_has_root_prefix_trailing_separator_cases() {
+        assert!(
+            path_has_root_prefix("/a/b/x.fits", "/a/b/"),
+            "a root stored with a trailing slash must match its direct children"
+        );
+        assert!(
+            path_has_root_prefix("/a/b/c/x.fits", "/a/b/"),
+            "a root stored with a trailing slash must match nested descendants"
+        );
+        assert!(
+            !path_has_root_prefix("/a/bc/x.fits", "/a/b/"),
+            "a sibling directory sharing a string prefix must still NOT match"
+        );
+    }
+
+    /// Degenerate cases, pinned deliberately rather than left as accidental
+    /// fallout of the trailing-separator trim.
+    #[test]
+    fn path_has_root_prefix_degenerate_cases() {
+        // Root "/" trims to "" — every absolute unix path is a descendant
+        // of the filesystem root. This is semantically correct, not a bug.
+        assert!(
+            path_has_root_prefix("/anything/at/all.fits", "/"),
+            "a root of '/' legitimately owns every absolute unix path"
+        );
+
+        // Windows drive root "D:\" trims to "D:".
+        assert!(
+            path_has_root_prefix("D:\\x.fits", "D:\\"),
+            "a Windows drive root stored with its trailing backslash must match its children"
+        );
+    }
+
     #[test]
     fn path_under_unavailable_scan_root_resolution() {
         let tmp = TempDir::new().unwrap();
@@ -2267,20 +2319,23 @@ mod moved_file_guard_tests {
         .unwrap();
 
         let under_missing = missing_root.join("a/b.fits");
-        assert!(
+        assert_eq!(
             path_under_unavailable_scan_root(&conn, under_missing.to_str().unwrap()).unwrap(),
-            "a path under a missing scan root must report unavailable"
+            Some(missing_root.to_str().unwrap().to_string()),
+            "a path under a missing scan root must report unavailable, naming that root"
         );
 
         let under_existing = existing_root.join("a/b.fits");
-        assert!(
-            !path_under_unavailable_scan_root(&conn, under_existing.to_str().unwrap()).unwrap(),
+        assert_eq!(
+            path_under_unavailable_scan_root(&conn, under_existing.to_str().unwrap()).unwrap(),
+            None,
             "a path under an existing scan root must report available"
         );
 
         let elsewhere = tmp.path().join("elsewhere/c.fits");
-        assert!(
-            !path_under_unavailable_scan_root(&conn, elsewhere.to_str().unwrap()).unwrap(),
+        assert_eq!(
+            path_under_unavailable_scan_root(&conn, elsewhere.to_str().unwrap()).unwrap(),
+            None,
             "a path under no known scan root must behave as today (available)"
         );
     }
@@ -2313,8 +2368,9 @@ mod moved_file_guard_tests {
         .unwrap();
 
         let p = inner_root.join("x.fits");
-        assert!(
+        assert_eq!(
             path_under_unavailable_scan_root(&conn, p.to_str().unwrap()).unwrap(),
+            Some(inner_root.to_str().unwrap().to_string()),
             "the more specific (offline) inner root must win over the online outer root"
         );
     }
