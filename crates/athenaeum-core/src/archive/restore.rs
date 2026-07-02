@@ -8,15 +8,31 @@
 //! - extract:        every entry of every zip → temp dir, hash-verified
 //!                   against the plan's expected_hash.
 //! - reconcile:      per-file decide whether to skip (already on disk) or
-//!                   restore (copy temp → target). Target is either the
-//!                   original source_path (preserves layout) or
+//!                   restore (copy temp → target). "Already on disk" is
+//!                   hash-verified against the same expected_hash before
+//!                   being trusted — see CONFLICT handling below. Target is
+//!                   either the original source_path (preserves layout) or
 //!                   `<picked>/<path-in-zip>` for an alternate target.
 //! - update_catalog: clear archive markers for restored files; rewrite
 //!                   `files.path` only when the restore target differs from
 //!                   the original.
 //! - cleanup:        delete temp dir, optionally delete zips.
+//!
+//! CONFLICT handling: a file sitting at `source_path` is only ever trusted
+//! as "already restored" if it hashes to the plan's `expected_hash`. Any
+//! mismatch (wrong version, different frame, half-written copy) or hash
+//! failure is recorded as a conflict — the file is left completely
+//! untouched (not overwritten, markers not cleared) and the loop continues
+//! so one impostor can't abort the rest of the restore. The zip(s) for an
+//! operation that finished with conflicts are kept regardless of
+//! `keep_zip_after_restore`, since they're still the only place the correct
+//! bytes exist; deleting them would be exactly the data loss this check
+//! exists to prevent. The documented remedy is to rename/remove the
+//! impostor and re-run restore — reconcile is idempotent and will fill
+//! exactly the remaining gaps.
 
 use crate::archive::db as adb;
+use crate::archive::models::{ArchiveOperationFile, ArchiveStage, RestoreConflict, RestoreOutcome, StepStatus};
 use crate::duplicates::compute_xxhash;
 use crate::events::{emit_event, ProgressEmitter};
 use anyhow::{Context, Result};
@@ -82,12 +98,12 @@ pub fn run_restore(
     keep_zip_after_restore: bool,
     cancel: &CancelFlag,
     emitter: &dyn ProgressEmitter,
-) -> Result<()> {
+) -> Result<RestoreOutcome> {
     let op = adb::get_operation(conn, operation_id)?;
     let files = adb::list_operation_files(conn, operation_id)?;
     let total = files.len();
     if total == 0 {
-        return Ok(());
+        return Ok(RestoreOutcome::default());
     }
 
     // Pre-flight: every zip referenced in the plan must exist on disk before
@@ -126,7 +142,7 @@ pub fn run_restore(
         run_restore_inner(conn, operation_id, &op, &files, total, &temp_dir, mode,
                           overwrite_existing, keep_zip_after_restore, cancel, emitter);
     match result {
-        Ok(()) => Ok(()),
+        Ok(outcome) => Ok(outcome),
         Err(e) => {
             cleanup_temp(&temp_dir);
             Err(e)
@@ -147,7 +163,7 @@ fn run_restore_inner(
     keep_zip_after_restore: bool,
     cancel: &CancelFlag,
     emitter: &dyn ProgressEmitter,
-) -> Result<()> {
+) -> Result<RestoreOutcome> {
 
     let emit = |emitter: &dyn ProgressEmitter, stage: &str, current: usize, total: usize, msg: String| {
         let prog = RestoreProgress {
@@ -226,6 +242,7 @@ fn run_restore_inner(
     // touches those rows.
     let mut restored: Vec<(&crate::archive::models::ArchiveOperationFile, PathBuf)> =
         Vec::with_capacity(total);
+    let mut conflicts: Vec<RestoreConflict> = Vec::new();
 
     for (idx, (f, temp_path)) in files.iter().zip(temp_paths.iter()).enumerate() {
         if cancel.load(Ordering::SeqCst) {
@@ -237,13 +254,66 @@ fn run_restore_inner(
         let already_in_place = original.is_file() && !overwrite_existing;
 
         if already_in_place {
-            emit(
-                emitter,
-                "reconcile",
-                idx + 1,
-                total,
-                format!("Skipping (already on disk): {}", f.source_path),
-            );
+            // Don't just trust whatever is sitting at source_path — hash it
+            // with the SAME function that produced the plan's expected_hash
+            // and compare. Anything else (wrong version, different frame,
+            // half-written copy) is a conflict: leave it alone, don't clear
+            // its markers, and keep going — see module docs.
+            match compute_xxhash(original) {
+                Ok(actual) if actual == f.expected_hash => {
+                    emit(
+                        emitter,
+                        "reconcile",
+                        idx + 1,
+                        total,
+                        format!("Already on disk, hash-verified — skipping: {}", f.source_path),
+                    );
+                }
+                Ok(actual) => {
+                    let msg = format!(
+                        "restore conflict: on-disk file does not match archived hash for {} (expected {}, got {})",
+                        f.source_path, f.expected_hash, actual,
+                    );
+                    eprintln!("[archive::restore] {}", msg);
+                    record_conflict_step(conn, operation_id, f, Some(&actual), &msg)?;
+                    conflicts.push(RestoreConflict {
+                        file_id: f.file_id,
+                        source_path: f.source_path.clone(),
+                        expected_hash: f.expected_hash.clone(),
+                        actual_hash: Some(actual),
+                    });
+                    emit(
+                        emitter,
+                        "reconcile",
+                        idx + 1,
+                        total,
+                        format!("CONFLICT — on-disk file doesn't match the archive, left untouched: {}", f.source_path),
+                    );
+                }
+                Err(e) => {
+                    // Unreadable is treated exactly like a mismatch: never
+                    // panic, never fall through to skip-and-clear.
+                    let msg = format!(
+                        "restore conflict: could not hash on-disk file at {}: {:#}",
+                        f.source_path, e,
+                    );
+                    eprintln!("[archive::restore] {}", msg);
+                    record_conflict_step(conn, operation_id, f, None, &msg)?;
+                    conflicts.push(RestoreConflict {
+                        file_id: f.file_id,
+                        source_path: f.source_path.clone(),
+                        expected_hash: f.expected_hash.clone(),
+                        actual_hash: None,
+                    });
+                    emit(
+                        emitter,
+                        "reconcile",
+                        idx + 1,
+                        total,
+                        format!("CONFLICT — could not verify on-disk file, left untouched: {}", f.source_path),
+                    );
+                }
+            }
             continue;
         }
 
@@ -340,13 +410,22 @@ fn run_restore_inner(
     // clear any leftover archive markers. Also reconcile modified_at/size with
     // disk if they drifted — this is the recovery path for catalogs that were
     // previously corrupted by an older restore cycle.
+    //
+    // Conflicted files are excluded from this: their archive markers
+    // (archived_in_operation / archive_zip_path / archive_path_in_zip) MUST
+    // stay intact so a re-run still sees them as needing reconcile, and we
+    // must never bless an unverified on-disk file as "restored".
     let restored_ids: HashSet<i64> = restored
         .iter()
         .filter_map(|(f, _)| f.file_id)
         .collect();
+    let conflicted_ids: HashSet<i64> = conflicts
+        .iter()
+        .filter_map(|c| c.file_id)
+        .collect();
     for f in files {
         if let Some(fid) = f.file_id {
-            if !restored_ids.contains(&fid) {
+            if !restored_ids.contains(&fid) && !conflicted_ids.contains(&fid) {
                 // Stat the on-disk file at source_path. If it doesn't exist
                 // (file genuinely missing) we still clear markers so the row
                 // doesn't keep pointing at an orphaned zip.
@@ -373,7 +452,26 @@ fn run_restore_inner(
     // Stage: cleanup -----------------------------------------------------------
     cleanup_temp(temp_dir);
 
-    if !keep_zip_after_restore {
+    if keep_zip_after_restore {
+        // Caller explicitly asked to keep the zip(s); nothing to do.
+    } else if !conflicts.is_empty() {
+        // At least one file's only verified-correct copy still lives inside
+        // a zip from this operation (its on-disk copy failed hash
+        // verification). Deleting any zip here could destroy the sole
+        // correct copy of a conflicted file before the user has a chance to
+        // resolve the conflict and re-run restore. Keep everything.
+        eprintln!(
+            "[archive::restore] operation {} finished with {} conflict(s) — keeping archive zip(s) so a re-run can fill the gap(s)",
+            operation_id, conflicts.len(),
+        );
+        emit(
+            emitter,
+            "cleanup",
+            0,
+            0,
+            format!("Keeping archive zip(s) — {} conflict(s) unresolved", conflicts.len()),
+        );
+    } else {
         let zip_paths: Vec<String> = {
             let mut seen: HashSet<String> = HashSet::new();
             files
@@ -400,6 +498,23 @@ fn run_restore_inner(
         }
     }
 
+    Ok(RestoreOutcome { conflicts })
+}
+
+/// Record a restore reconcile conflict as a Failed step, reusing the same
+/// `archive_operation_steps` machinery the forward archive path uses to
+/// record per-file failures. Purely an audit trail — restore itself never
+/// consults these rows (its idempotency comes from re-checking disk state
+/// on every run), so writing one can never block or alter a re-run.
+fn record_conflict_step(
+    conn: &Connection,
+    operation_id: i64,
+    f: &ArchiveOperationFile,
+    actual_hash: Option<&str>,
+    message: &str,
+) -> Result<()> {
+    let step_id = adb::insert_step(conn, operation_id, Some(f.id), ArchiveStage::VerifyRestore)?;
+    adb::update_step(conn, step_id, StepStatus::Failed, actual_hash, Some(message))?;
     Ok(())
 }
 
@@ -574,10 +689,15 @@ pub(crate) mod tests {
         assert!(d1.exists());
 
         // Restore to original locations.
-        run_restore(
+        let outcome = run_restore(
             &conn, op_id, scan.path(),
             false, false, &cancel, &NullEmitter,
         ).unwrap();
+
+        // Verified-skip path preserves current behavior: the on-disk dark
+        // hashes to exactly what the plan recorded, so it's a clean skip —
+        // zero conflicts.
+        assert!(!outcome.has_conflicts(), "matching on-disk file must not be a conflict: {:?}", outcome.conflicts);
 
         // Light is back at its original path (was the only one missing).
         assert!(l1.exists());
@@ -604,6 +724,149 @@ pub(crate) mod tests {
             "SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0),
         ).unwrap();
         assert!(archived_at.is_none());
+    }
+
+    /// The hash-verify fix (W2-T4): a file already sitting at source_path is
+    /// only trusted as "already restored" if it hashes to the plan's
+    /// expected_hash. An impostor (present, but wrong bytes) must be
+    /// reported as a CONFLICT — never silently blessed as restored while the
+    /// only correct copy waits inside a zip that could later be deleted.
+    /// Also pins the documented remedy: rename/remove the impostor and
+    /// re-run — reconcile is idempotent and fills exactly the gap.
+    #[test]
+    fn restore_reconcile_conflict_then_heals_on_rerun() {
+        let arch = TempDir::new().unwrap();
+        let scan = TempDir::new().unwrap();
+
+        let l1 = scan.path().join("M31/L_001.fits");
+        let d1 = scan.path().join("Cal/MasterDark.fits");
+        std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(d1.parent().unwrap()).unwrap();
+        std::fs::write(&l1, b"original-light-content").unwrap();
+        std::fs::write(&d1, b"dark-content-original").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M31', 1)", []).unwrap();
+        conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1000, ?1, 'L_001.fits', 22, '2025-10-12', 'FITS'),
+                    (2000, ?2, 'MasterDark.fits', 21, '2025-10-10', 'FITS')",
+            params![l1.to_str().unwrap(), d1.to_str().unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, telescop, instrume, imagetyp, is_master)
+             VALUES (10000, 1000, 'M31', 'T', 'C', 'Light', 0),
+                    (20000, 2000, NULL, 'T', 'C', 'Dark', 1)",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, 10000)", []).unwrap();
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date) VALUES (500, 'Dark', '2025-10-10')", []).unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, 20000)", []).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (10000, 'frame', 500, 'Dark', '2025-10-12')",
+            [],
+        ).unwrap();
+
+        let plan = build_plan(
+            &conn, 1, arch.path(),
+            &Dispositions {
+                flats: None,
+                darks: Some(crate::archive::models::ArchiveDisposition::Copy),
+                bias: None,
+                darkflats: None,
+            },
+            ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+
+        // Light is move-disposition (always, for LIGHT frames) → deleted from
+        // disk and archive markers set on `files`. Copy-disposition dark
+        // stays on disk and is never marked (matches
+        // `restore_skips_copy_disposition_files_already_on_disk`).
+        assert!(!l1.exists(), "light should have been moved into the zip");
+        assert!(d1.exists(), "copy-disposition dark stays on disk");
+        let light_marker_before: Option<i64> = conn.query_row(
+            "SELECT archived_in_operation FROM files WHERE id = 1000", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(light_marker_before, Some(op_id), "forward archive must mark the move-disposition light");
+
+        // Plant an impostor at the light's original path: different bytes
+        // than what's in the zip. Simulates a wrong version / different
+        // frame / half-written copy sitting where the archived file used to
+        // be — e.g. something else wrote there between archive and restore.
+        std::fs::write(&l1, b"IMPOSTOR-BYTES-NOT-THE-REAL-LIGHT").unwrap();
+
+        // --- Restore #1: must detect the conflict, not bless the impostor.
+        let outcome = run_restore(
+            &conn, op_id, scan.path(),
+            false, false, &cancel, &NullEmitter,
+        ).unwrap();
+
+        assert_eq!(outcome.conflicts.len(), 1, "expected exactly 1 conflict, got: {:?}", outcome.conflicts);
+        let conflict = &outcome.conflicts[0];
+        assert_eq!(conflict.source_path, l1.to_str().unwrap());
+        assert_eq!(conflict.file_id, Some(1000));
+        assert_ne!(conflict.actual_hash.as_deref(), Some(conflict.expected_hash.as_str()));
+
+        // (a) the on-disk impostor is byte-identical to what we planted — NOT overwritten.
+        let l1_content = std::fs::read(&l1).unwrap();
+        assert_eq!(l1_content, b"IMPOSTOR-BYTES-NOT-THE-REAL-LIGHT");
+
+        // (c) archive markers for the conflicted file are NOT cleared.
+        let light_row: (Option<i64>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT archived_in_operation, archive_zip_path, archive_path_in_zip FROM files WHERE id = 1000",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(light_row.0, Some(op_id), "archived_in_operation must stay intact on conflict");
+        assert!(light_row.1.is_some(), "archive_zip_path must stay intact on conflict");
+        assert!(light_row.2.is_some(), "archive_path_in_zip must stay intact on conflict");
+
+        // (d) the OTHER file (copy-disposition dark, already correct on disk)
+        // restored/skipped normally despite the light's conflict — one
+        // impostor must not abort the rest of the restore.
+        assert!(d1.exists());
+        assert_eq!(std::fs::read(&d1).unwrap(), b"dark-content-original");
+        let dark_marker: Option<i64> = conn.query_row(
+            "SELECT archived_in_operation FROM files WHERE id = 2000", [], |r| r.get(0),
+        ).unwrap();
+        assert!(dark_marker.is_none(), "copy-disposition dark was never marked; unaffected either way");
+
+        // The zip(s) must survive a conflicted restore even with
+        // keep_zip_after_restore=false — the Lights zip is still the only
+        // place the real light bytes exist right now.
+        let zips_after_conflict: Vec<_> = std::fs::read_dir(arch.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "zip").unwrap_or(false))
+            .collect();
+        assert!(!zips_after_conflict.is_empty(), "zip(s) must be kept while a conflict is unresolved");
+
+        // --- Restore #2 (re-run heals): remove the impostor, restore again.
+        std::fs::remove_file(&l1).unwrap();
+        let outcome2 = run_restore(
+            &conn, op_id, scan.path(),
+            false, false, &cancel, &NullEmitter,
+        ).unwrap();
+
+        assert!(!outcome2.has_conflicts(), "conflict must be resolved once the impostor is gone: {:?}", outcome2.conflicts);
+        assert!(l1.exists(), "light must be extracted from the zip on the healing run");
+        assert_eq!(std::fs::read(&l1).unwrap(), b"original-light-content");
+
+        let light_row_after: (Option<i64>, Option<String>) = conn.query_row(
+            "SELECT archived_in_operation, archive_zip_path FROM files WHERE id = 1000",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(light_row_after.0.is_none(), "markers must clear once healed");
+        assert!(light_row_after.1.is_none());
     }
 
     /// Pre-flight check fires when a zip file referenced by the plan no longer

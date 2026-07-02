@@ -591,7 +591,7 @@ pub async fn start_restore_operation(
             let emitter = SseProgressEmitter::new(event_tx);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            let outcome = match restore::run_restore(
+            let (outcome, conflicts) = match restore::run_restore(
                 &conn,
                 op_id,
                 Path::new(&target_root_path),
@@ -600,16 +600,31 @@ pub async fn start_restore_operation(
                 &cancel_flag,
                 &emitter,
             ) {
-                Ok(()) => "completed",
+                Ok(result) if result.has_conflicts() => {
+                    eprintln!(
+                        "restore {} completed with {} conflict(s): {:?}",
+                        op_id,
+                        result.conflicts.len(),
+                        result.conflicts.iter().map(|c| c.source_path.as_str()).collect::<Vec<_>>(),
+                    );
+                    ("completed_with_conflicts", result.conflicts.len())
+                }
+                Ok(_) => ("completed", 0),
                 Err(e) => {
                     eprintln!("restore {} failed: {:#}", op_id, e);
-                    if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
+                    let outcome = if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" };
+                    (outcome, 0)
                 }
             };
             athenaeum_core::events::emit_event(
                 &emitter,
                 "archive-finished",
-                &serde_json::json!({ "operation_id": op_id, "outcome": outcome, "kind": "restore" }),
+                &serde_json::json!({
+                    "operation_id": op_id,
+                    "outcome": outcome,
+                    "kind": "restore",
+                    "conflicts": conflicts,
+                }),
             );
             ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
         }),

@@ -68,6 +68,10 @@ pub enum ArchiveStage {
     // Rollback-only stages
     DeleteStaging,
     RestoreSource,
+    // Restore-only stage: hash-verifying a file that's already on disk at
+    // source_path before trusting it as "restored" (the reconcile
+    // skip-if-exists check in archive::restore).
+    VerifyRestore,
 }
 
 impl ArchiveStage {
@@ -81,6 +85,7 @@ impl ArchiveStage {
             ArchiveStage::Finalize => "finalize",
             ArchiveStage::DeleteStaging => "delete_staging",
             ArchiveStage::RestoreSource => "restore_source",
+            ArchiveStage::VerifyRestore => "verify_restore",
         }
     }
 }
@@ -319,6 +324,38 @@ pub struct ArchiveOperationSummary {
     pub error_message: Option<String>,
 }
 
+/// A file whose on-disk contents at `source_path` did not match the
+/// archived hash during a restore reconcile (the "already on disk, skip"
+/// check). The file is left exactly as found — never overwritten from the
+/// zip, never have its archive markers cleared — so a re-run can still
+/// process it once the user has resolved the conflict (rename/remove the
+/// impostor). `actual_hash` is `None` when the file couldn't even be hashed
+/// (e.g. permission error, or it vanished mid-check); that case is treated
+/// the same as a mismatch, never as a pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreConflict {
+    pub file_id: Option<i64>,
+    pub source_path: String,
+    pub expected_hash: String,
+    pub actual_hash: Option<String>,
+}
+
+/// Outcome of a `run_restore` call. A restore never aborts the whole
+/// operation over a single conflicted file — every other file still gets
+/// reconciled — so the caller inspects `conflicts` after a successful call
+/// to know whether the operation was a clean restore or "completed with
+/// conflicts".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RestoreOutcome {
+    pub conflicts: Vec<RestoreConflict>,
+}
+
+impl RestoreOutcome {
+    pub fn has_conflicts(&self) -> bool {
+        !self.conflicts.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +382,22 @@ mod tests {
         assert!(!ArchiveStatus::Cancelled.is_unfinished());
         assert!(!ArchiveStatus::RolledBack.is_unfinished());
         assert!(!ArchiveStatus::Failed.is_unfinished());
+    }
+
+    #[test]
+    fn restore_outcome_has_conflicts() {
+        let clean = RestoreOutcome::default();
+        assert!(!clean.has_conflicts());
+
+        let dirty = RestoreOutcome {
+            conflicts: vec![RestoreConflict {
+                file_id: Some(1),
+                source_path: "/a.fits".into(),
+                expected_hash: "aaaa".into(),
+                actual_hash: Some("bbbb".into()),
+            }],
+        };
+        assert!(dirty.has_conflicts());
     }
 
     #[test]

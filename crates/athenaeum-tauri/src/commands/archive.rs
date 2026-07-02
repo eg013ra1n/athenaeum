@@ -554,20 +554,35 @@ pub async fn start_restore_operation(
             let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            let outcome = match restore::run_restore(
+            let (outcome, conflicts) = match restore::run_restore(
                 &conn, operation_id, Path::new(&target_root_path),
                 overwrite_existing, keep_zip_after_restore, &cancel_flag, &emitter,
             ) {
-                Ok(()) => "completed",
+                Ok(result) if result.has_conflicts() => {
+                    eprintln!(
+                        "restore {} completed with {} conflict(s): {:?}",
+                        operation_id,
+                        result.conflicts.len(),
+                        result.conflicts.iter().map(|c| c.source_path.as_str()).collect::<Vec<_>>(),
+                    );
+                    ("completed_with_conflicts", result.conflicts.len())
+                }
+                Ok(_) => ("completed", 0),
                 Err(e) => {
                     eprintln!("restore {} failed: {:#}", operation_id, e);
-                    if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" }
+                    let outcome = if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" };
+                    (outcome, 0)
                 }
             };
             athenaeum_core::events::emit_event(
                 &emitter,
                 "archive-finished",
-                &serde_json::json!({ "operation_id": operation_id, "outcome": outcome, "kind": "restore" }),
+                &serde_json::json!({
+                    "operation_id": operation_id,
+                    "outcome": outcome,
+                    "kind": "restore",
+                    "conflicts": conflicts,
+                }),
             );
             ctx_for_worker.active_archives.lock().unwrap().remove(&operation_id);
         }),

@@ -12,10 +12,15 @@ interface Props {
 
 interface FinishedEvent {
   operation_id: number;
-  outcome: 'completed' | 'cancelled' | 'failed' | string;
+  outcome: 'completed' | 'completed_with_conflicts' | 'cancelled' | 'failed' | string;
   /** Optional discriminator: when set to "restore", the worker was running a
    *  restore (Unarchive). The widget tweaks its title accordingly. */
   kind?: 'restore' | string;
+  /** Restore only: number of files left in conflict — an on-disk file at the
+   *  original path didn't hash-verify against the archived copy, so it was
+   *  left untouched (not overwritten, archive markers not cleared). The
+   *  remedy is to rename/remove the file and re-run restore. */
+  conflicts?: number;
 }
 
 // Restore-stage labels emitted by the Rust restore module.
@@ -42,8 +47,12 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
       setFinished(payload);
       onFinished?.(payload.outcome);
       const verb = payload.kind === 'restore' ? 'Restore' : 'Archive';
+      const conflictCount = payload.conflicts ?? 0;
+      const hasConflicts = payload.outcome === 'completed_with_conflicts' || conflictCount > 0;
       notify({
-        title: `${verb} ${payload.outcome}`,
+        title: hasConflicts
+          ? `${verb} completed with ${conflictCount} conflict${conflictCount === 1 ? '' : 's'}`
+          : `${verb} ${payload.outcome}`,
         detail: `Operation #${payload.operation_id}`,
         kind: 'archive',
         hasErrors: payload.outcome === 'failed',
@@ -52,7 +61,9 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
             ? 'warning'
             : payload.outcome === 'cancelled'
               ? 'info'
-              : 'success',
+              : hasConflicts
+                ? 'warning'
+                : 'success',
         dedupeKey: `archive-finished-${payload.operation_id}`,
       });
       // Brief pause so the user sees the final state, then dismiss.
@@ -80,15 +91,17 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
   const statusLabel = finished
     ? finished.outcome === 'completed'
       ? 'Completed'
-      : finished.outcome === 'cancelled'
-        ? isRestoreFinish ? 'Cancelled' : 'Cancelled — rolled back'
-        : isRestoreFinish ? 'Failed' : 'Failed — rolled back'
+      : finished.outcome === 'completed_with_conflicts'
+        ? `Completed — ${finished.conflicts ?? 0} conflict${(finished.conflicts ?? 0) === 1 ? '' : 's'}`
+        : finished.outcome === 'cancelled'
+          ? isRestoreFinish ? 'Cancelled' : 'Cancelled — rolled back'
+          : isRestoreFinish ? 'Failed' : 'Failed — rolled back'
     : progress?.message ?? 'Starting…';
 
   const barColor = finished
     ? finished.outcome === 'completed'
       ? 'bg-success'
-      : finished.outcome === 'cancelled'
+      : finished.outcome === 'completed_with_conflicts' || finished.outcome === 'cancelled'
         ? 'bg-warning'
         : 'bg-error'
     : 'bg-accent';
