@@ -72,15 +72,18 @@ Full checklist from the plan + update the two audit docs' open-findings tables
    2026-07-02): keep `send_all_to_void` and wire an "Empty Black Hole" button**
    on the Black Hole page (confirm dialog with count/bytes; both backends —
    web route exists) — added to Wave 5 scope.
-2. **`clear_manual_calibration_override`** — documented in `docs/masters/masters.md:120`
-   as part of manual linking; likely a lost feature, and Phase 2 (master library)
-   touches the same area. Resurrect in Phase 2 or delete now?
-3. **Dark-library pair** (`create_dark_library`/`delete_dark_library`) — superseded
-   by calibration sets, or wanted for the Phase 2 master library?
+2. **RESOLVED (owner, 2026-07-02): resurrect now.** `clear_manual_calibration_override`
+   is the missing "undo" half of manual linking (UI can SET overrides via the live
+   `manual_assign_calibration`, but a manual link is a one-way door today). Wave 5:
+   wire a "Reset to automatic" action into the manual-assignment modal + both backends.
+3. **RESOLVED (owner, 2026-07-02): delete.** `create_dark_library`/`delete_dark_library`
+   are the superseded predecessor of the live `*_master_dark_library` family
+   (which `MasterDarkLibrary.tsx` uses and which stays).
 4. The remaining ~30 dead commands: default = delete (list preserved in the PR
    description per the plan's rule). Objections per-name welcome.
-5. **Release shape for v0.2.2:** straight stable (like v0.2.1) or a beta first?
-   Content is guards/hygiene — low UI risk; straight stable is defensible.
+5. **RESOLVED (owner, 2026-07-02): beta first.** `v0.2.2-beta.1` after Waves 1-3
+   (data-integrity hot paths deserve real-catalog soak time), promote to stable
+   after a few days on the owner's catalog.
 
 ## Standing constraints
 
