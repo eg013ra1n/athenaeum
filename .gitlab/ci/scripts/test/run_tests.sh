@@ -247,5 +247,122 @@ out=$(
 assert_contains "fallback body when notes missing" "is out" "$out"
 
 echo
+echo "-- update_dockerhub_description.sh --"
+
+# Mock `curl` (fixtures/mock_bin/curl) so no test hits the real Docker Hub
+# API. It's steered by MOCK_CURL_* env vars — see that file's header comment.
+MOCK_BIN="$FIXTURES_DIR/mock_bin"
+DOCKERHUB_SCRIPT="$HELPERS_DIR/update_dockerhub_description.sh"
+
+# Skip cleanly when a required env var is unset — DOCKERHUB_USERNAME here.
+out=$(
+  DOCKERHUB_USERNAME="" \
+  DOCKERHUB_TOKEN="dummy" \
+  DOCKERHUB_REPO="vsharifov/athenaeum" \
+  CHANNEL_TAG="latest" \
+  VERSION="0.2.3" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$DOCKERHUB_SCRIPT" < /dev/null 2>&1
+)
+assert_contains "skip when DOCKERHUB_USERNAME unset" "Skipping Docker Hub description update" "$out"
+assert_contains "skip message names the missing var" "DOCKERHUB_USERNAME not set" "$out"
+
+# Skip cleanly on an unexpected CHANNEL_TAG value too (defensive; the caller
+# only ever passes latest|beta, but the script must not silently corrupt the
+# description if that ever drifts).
+out=$(
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  DOCKERHUB_REPO="vsharifov/athenaeum" \
+  CHANNEL_TAG="nightly" \
+  VERSION="0.2.3" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$DOCKERHUB_SCRIPT" < /dev/null 2>&1
+)
+assert_contains "skip on unexpected CHANNEL_TAG" "unexpected CHANNEL_TAG" "$out"
+
+# Fresh description (no managed block yet) -> block is appended, original
+# content preserved.
+PATCH_TMP=$(mktemp -t dockerhub_patch_body.XXXXXX)
+trap 'rm -f "$PATCH_TMP"' EXIT
+out=$(
+  PATH="$MOCK_BIN:$PATH" \
+  MOCK_CURL_GET_BODY_FILE="$FIXTURES_DIR/dockerhub_fresh_description.json" \
+  MOCK_CURL_CAPTURE_PATCH_BODY="$PATCH_TMP" \
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  DOCKERHUB_REPO="vsharifov/athenaeum" \
+  CHANNEL_TAG="latest" \
+  VERSION="0.2.3" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$DOCKERHUB_SCRIPT" < /dev/null 2>&1
+)
+assert_contains "fresh-description run reports success" "Docker Hub description updated" "$out"
+patch_body=$(cat "$PATCH_TMP")
+assert_contains "fresh description preserved" "FITS/XISF catalog manager" "$patch_body"
+assert_contains "block appended with start marker" "athenaeum:versions:start" "$patch_body"
+assert_contains "block appended with end marker" "athenaeum:versions:end" "$patch_body"
+assert_contains "new latest row present" "| latest | 0.2.3 | v0.2.3 |" "$patch_body"
+assert_contains "static help line present" "and in the About page." "$patch_body"
+
+# Existing block with both rows -> only the CHANNEL_TAG row is replaced, the
+# other channel's row and any trailing content are preserved verbatim.
+out=$(
+  PATH="$MOCK_BIN:$PATH" \
+  MOCK_CURL_GET_BODY_FILE="$FIXTURES_DIR/dockerhub_existing_versions.json" \
+  MOCK_CURL_CAPTURE_PATCH_BODY="$PATCH_TMP" \
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  DOCKERHUB_REPO="vsharifov/athenaeum" \
+  CHANNEL_TAG="latest" \
+  VERSION="0.2.3" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$DOCKERHUB_SCRIPT" < /dev/null 2>&1
+)
+assert_contains "existing-block run reports success" "Docker Hub description updated" "$out"
+patch_body=$(cat "$PATCH_TMP")
+assert_contains "latest row replaced with new version" "| latest | 0.2.3 | v0.2.3 |" "$patch_body"
+assert_not_contains "stale latest row is gone" "| latest | 0.2.2 | v0.2.2 |" "$patch_body"
+assert_contains "beta row preserved untouched" "| beta | 0.2.3-beta.1 | v0.2.3-beta.1 | 2026-06-30T08:00:00Z |" "$patch_body"
+assert_contains "trailing content preserved" "Some trailing content that must survive." "$patch_body"
+assert_contains "leading content preserved" "Athenaeum Docker image." "$patch_body"
+
+# API failure (login rejected) -> warning logged, script still exits 0 so the
+# release pipeline is never failed by a Docker Hub outage.
+rc=0
+out=$(
+  PATH="$MOCK_BIN:$PATH" \
+  MOCK_CURL_LOGIN_HTTP=500 \
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  DOCKERHUB_REPO="vsharifov/athenaeum" \
+  CHANNEL_TAG="latest" \
+  VERSION="0.2.3" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$DOCKERHUB_SCRIPT" < /dev/null 2>&1
+) || rc=$?
+assert_contains "login failure logs a warning" "WARNING: Docker Hub login failed" "$out"
+assert_eq "login failure still exits 0" "0" "$rc"
+
+# API failure (PATCH rejected after a good login/GET) -> same soft-fail.
+rc=0
+out=$(
+  PATH="$MOCK_BIN:$PATH" \
+  MOCK_CURL_GET_BODY_FILE="$FIXTURES_DIR/dockerhub_fresh_description.json" \
+  MOCK_CURL_PATCH_HTTP=503 \
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  DOCKERHUB_REPO="vsharifov/athenaeum" \
+  CHANNEL_TAG="beta" \
+  VERSION="0.2.3-beta.2" \
+  CI_COMMIT_TAG="v0.2.3-beta.2" \
+  "$DOCKERHUB_SCRIPT" < /dev/null 2>&1
+) || rc=$?
+assert_contains "patch failure logs a warning" "WARNING: Docker Hub description update failed" "$out"
+assert_eq "patch failure still exits 0" "0" "$rc"
+
+rm -f "$PATCH_TMP"
+
+echo
 echo "Passed: $PASS  Failed: $FAIL"
 [ "$FAIL" -eq 0 ]

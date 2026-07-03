@@ -476,6 +476,15 @@ notify:telegram:
 # Anything else with a non-"-beta" suffix (-rc, -alpha) routes to :latest;
 # tag those carefully or widen the grep below.
 #
+# The image is stamped with OCI labels (org.opencontainers.image.version /
+# .revision / .created / .source / .title) so `docker inspect` can always
+# answer "what version is this?" even for the rolling :latest/:beta tags.
+# On top of that, .gitlab/ci/scripts/update_dockerhub_description.sh rewrites
+# a managed table in the Hub repo's description mapping :latest/:beta to the
+# version/git-tag/timestamp just published — hub.docker.com has no built-in
+# way to show what a rolling tag currently points at otherwise. That script
+# soft-fails (warns + exits 0) on any Docker Hub API error; see its header.
+#
 # Required CI/CD variables (Settings -> CI/CD -> Variables; Masked, Protected):
 #   - DOCKERHUB_USERNAME  (Docker Hub username, e.g. vsharifov)
 #   - DOCKERHUB_TOKEN     (Docker Hub access token; Read, Write, Delete)
@@ -538,8 +547,13 @@ publish:dockerhub:
         --label "org.opencontainers.image.title=Athenaeum" \
         --label "org.opencontainers.image.description=Astrophotography image management and FITS/XISF catalog" \
         --label "org.opencontainers.image.version=${VERSION}" \
+        --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}" \
+        --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --label "org.opencontainers.image.source=${CI_PROJECT_URL}" \
         --push \
         .
+    - |
+      DOCKERHUB_REPO="${IMAGE#docker.io/}" VERSION="${VERSION}" CHANNEL_TAG="${CHANNEL_TAG}" \
+        .gitlab/ci/scripts/update_dockerhub_description.sh
   after_script:
     - docker logout docker.io 2>/dev/null || true

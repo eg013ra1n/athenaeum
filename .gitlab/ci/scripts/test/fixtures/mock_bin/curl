@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Mock `curl` for testing update_dockerhub_description.sh without hitting the
+# real Docker Hub API. Prepend this file's directory to PATH so it shadows
+# the real curl.
+#
+# Understands only the flags update_dockerhub_description.sh actually passes:
+#   --output FILE --write-out '%{http_code}' --request METHOD --header ...
+#   --data @- (body read from stdin) <url>
+#
+# Behaviour is steered entirely by env vars (all optional, sane defaults):
+#   MOCK_CURL_LOGIN_HTTP          HTTP status for the /users/login call (200)
+#   MOCK_CURL_JWT                 token value returned by /users/login (fake.jwt.token)
+#   MOCK_CURL_GET_HTTP            HTTP status for the repository GET (200)
+#   MOCK_CURL_GET_BODY_FILE       path to a file whose contents become the GET
+#                                 response body verbatim (default: {"full_description": null})
+#   MOCK_CURL_PATCH_HTTP          HTTP status for the repository PATCH (200)
+#   MOCK_CURL_CAPTURE_PATCH_BODY  path to write the raw PATCH request body to,
+#                                 so a test can inspect what would have been sent
+set -euo pipefail
+
+output_file=""
+method="GET"
+url=""
+has_data=0
+
+args=("$@")
+i=0
+n=${#args[@]}
+while [ "$i" -lt "$n" ]; do
+  arg="${args[$i]}"
+  case "$arg" in
+    --output)
+      i=$((i + 1))
+      output_file="${args[$i]}"
+      ;;
+    --request)
+      i=$((i + 1))
+      method="${args[$i]}"
+      ;;
+    --data)
+      has_data=1
+      i=$((i + 1))
+      ;;
+    --write-out | --header | --max-time)
+      # Options that take one argument we don't otherwise need.
+      i=$((i + 1))
+      ;;
+    --silent | --show-error)
+      ;;
+    *)
+      url="$arg"
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+# Only real curl calls that pass --data (e.g. --data @-) read the request
+# body from stdin; mirror that exactly so a plain GET (no --data) never
+# blocks waiting on stdin that nothing is piping into.
+body=""
+if [ "$has_data" -eq 1 ]; then
+  body="$(cat)"
+fi
+
+case "$url" in
+  *users/login*)
+    http_code="${MOCK_CURL_LOGIN_HTTP:-200}"
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+      printf '{"token": "%s"}' "${MOCK_CURL_JWT:-fake.jwt.token}" > "$output_file"
+    else
+      printf '{"detail": "mock login failure"}' > "$output_file"
+    fi
+    ;;
+  *repositories/*)
+    if [ "$method" = "PATCH" ]; then
+      http_code="${MOCK_CURL_PATCH_HTTP:-200}"
+      if [ -n "${MOCK_CURL_CAPTURE_PATCH_BODY:-}" ]; then
+        printf '%s' "$body" > "${MOCK_CURL_CAPTURE_PATCH_BODY}"
+      fi
+      printf '{}' > "$output_file"
+    else
+      http_code="${MOCK_CURL_GET_HTTP:-200}"
+      if [ -n "${MOCK_CURL_GET_BODY_FILE:-}" ] && [ -f "${MOCK_CURL_GET_BODY_FILE}" ]; then
+        cp "${MOCK_CURL_GET_BODY_FILE}" "$output_file"
+      else
+        printf '{"full_description": null}' > "$output_file"
+      fi
+    fi
+    ;;
+  *)
+    echo "mock curl: unrecognised URL: $url" >&2
+    http_code="000"
+    ;;
+esac
+
+printf '%s' "$http_code"
