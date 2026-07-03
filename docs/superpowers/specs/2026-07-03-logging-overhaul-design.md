@@ -73,7 +73,7 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 | file op / archive | `operation_id`, `src`, `dest`, `strategy`/`stage`, hash-verify outcome |
 | db maintenance | affected table, `count`, `duration_ms` |
 
-**Spans**: every long-running operation (scan, solve, archive op, file op, registration run) opens a span named for the operation kind carrying its `operation_id`; all nested events inherit it. This is the correlation mechanism for "give me everything about operation X".
+**Spans**: every long-running operation opens a span named for the operation kind, carrying that kind's id field; all nested events inherit it. This is the correlation mechanism for "give me everything about operation X" (`log-mcp`'s `list_operations`/`get_operation`). As-built, six kinds: `scan` (`root_id`), `archive_op` (`operation_id`), `file_op` (`operation_id`), `solve` (`frame_id`), `export` (`frame_set_id`), `registration` (`frame_set_id`).
 
 ## Runtime level control
 
@@ -84,7 +84,7 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 
 ## Command-boundary instrumentation
 
-A small wrapper/macro in each backend's shared layer runs every command/route inside a span (`command`, `duration_ms`, `outcome`) and logs boundary errors at `error` level — structurally enforcing never-swallow for all ~157 commands in one place. Applied mechanically across the 16 command modules and their web mirrors.
+As-built (T4): each command/route function carries `#[tracing::instrument(skip_all, err)]` (Tauri) or `#[tracing::instrument(skip_all, err(Debug))]` (Axum, whose error type isn't `Display`) directly on the function — no separate wrapper/macro layer. The span is named for the function; its close event (`FmtSpan::CLOSE`, built into the subscriber stack) carries `time.busy`/`time.idle` as the duration record, superseding the literal `duration_ms`/`outcome` fields floated at design time. A failing command surfaces as the `err`-emitted `ERROR`-level event inside the span, not as an attribute on the close event — this is what structurally enforces never-swallow. Applied mechanically across all ~157 commands in both backends' command/route modules (323 annotated functions total: 160 Tauri + 163 web); a handful of high-frequency, low-value commands (`get_setting`/`set_setting`, per-frame preview/metrics fetches driven by UI index changes) are additionally marked `level = "debug"` so they don't spam the default `info` tier.
 
 ## The audit sweep
 

@@ -121,6 +121,41 @@ fn malformed_line_does_not_abort_the_scan() {
 }
 
 #[test]
+fn list_operations_includes_registration_span_close() {
+    // Registration is a sync-fn span opened in `athenaeum_core::registration::
+    // service::register_frame_set` (`info_span!("registration", frame_set_id
+    // = frames_set_id)`), entered — not `.instrument()`-attached to a future —
+    // so its close event has the same shape as any other operation span.
+    // Own fixture file/dir (not the shared `FIXTURE_LINES`) so this doesn't
+    // perturb the other tests' fixed operation counts.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("athenaeum-desktop.2026-07-03.jsonl");
+    let mut f = std::fs::File::create(&path).expect("create fixture file");
+    writeln!(
+        f,
+        r#"{{"timestamp":"2026-07-03T11:00:00.000000Z","level":"INFO","target":"athenaeum_core::registration::service","fields":{{"message":"close","time.busy":"842ms","time.idle":"1.02µs"}},"span":{{"frame_set_id":7,"name":"registration"}},"spans":[]}}"#
+    )
+    .expect("write fixture line");
+
+    let ops = query::list_operations(
+        dir.path(),
+        Some("registration"),
+        None,
+        query::clamp_limit(None),
+    )
+    .expect("list_operations");
+    assert_eq!(
+        ops.len(),
+        1,
+        "expected the registration span-close to be listed"
+    );
+    let op = &ops[0];
+    assert_eq!(op.kind, "registration");
+    assert_eq!(op.id, "7");
+    assert_eq!(op.duration.as_deref(), Some("842ms"));
+}
+
+#[test]
 fn tail_logs_truncates_to_last_n() {
     // Regression test: tail must return the LAST N lines, not the FIRST N.
     let dir = tempfile::TempDir::new().expect("tempdir");

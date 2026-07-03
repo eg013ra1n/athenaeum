@@ -105,6 +105,14 @@ pub fn register_frame_set(
     emitter: &dyn ProgressEmitter,
     cancel: Option<&AtomicBool>,
 ) -> Result<RegistrationSummary> {
+    // Sync fn, called via `spawn_blocking` from both hosts (see
+    // `commands/registration.rs` / `routes/registration.rs`) — a sync
+    // `enter()` guard is correct here (no `.await` anywhere in this function
+    // body). Both hosts' spawn_blocking closures inherit this span without
+    // either needing to open it themselves.
+    let span = tracing::info_span!("registration", frame_set_id = frames_set_id);
+    let _g = span.enter();
+
     // ── Step 1: load LIGHT members ────────────────────────────────────────────
     let frame_ids = get_light_frame_ids_for_frame_set(conn, frames_set_id)?;
     if frame_ids.is_empty() {
