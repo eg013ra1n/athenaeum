@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Mock `docker` for testing dockerhub_merge_manifest.sh without touching a
+# real Docker daemon or registry. Prepend this file's directory to PATH so
+# it shadows the real docker (same pattern as the `curl` mock in this dir —
+# see its header for the general approach).
+#
+# Understands only the subset dockerhub_merge_manifest.sh actually calls:
+#   docker login -u USER --password-stdin HOST          (reads stdin, no-op)
+#   docker buildx imagetools inspect IMAGE:TAG           (existence check)
+#   docker buildx imagetools create -t T1 -t T2 SRC...   (manifest merge)
+#
+# Behaviour is steered entirely by env vars (all optional, sane defaults):
+#   MOCK_DOCKER_AMD64_EXISTS         1|0 — imagetools inspect result for any
+#                                     *-amd64 tag (default 1 / exists)
+#   MOCK_DOCKER_ARM64_EXISTS         1|0 — same for any *-arm64 tag (default 1)
+#   MOCK_DOCKER_CAPTURE_CREATE_ARGS  path to write the `imagetools create`
+#                                     argv (one arg per line, tags + sources,
+#                                     "-t" flags stripped) to, so a test can
+#                                     inspect exactly what was merged
+set -euo pipefail
+
+case "${1:-}" in
+  login)
+    # --password-stdin: consume stdin like the real command would, so the
+    # `echo "$TOKEN" | docker login ...` pipeline in the caller never blocks.
+    cat >/dev/null || true
+    exit 0
+    ;;
+  buildx)
+    case "${2:-}" in
+      imagetools)
+        case "${3:-}" in
+          inspect)
+            tag="${4:-}"
+            case "$tag" in
+              *-amd64)
+                [ "${MOCK_DOCKER_AMD64_EXISTS:-1}" = "1" ] && exit 0 || exit 1
+                ;;
+              *-arm64)
+                [ "${MOCK_DOCKER_ARM64_EXISTS:-1}" = "1" ] && exit 0 || exit 1
+                ;;
+              *)
+                echo "mock docker: unrecognised imagetools inspect target: $tag" >&2
+                exit 1
+                ;;
+            esac
+            ;;
+          create)
+            shift 3
+            if [ -n "${MOCK_DOCKER_CAPTURE_CREATE_ARGS:-}" ]; then
+              # Strip the "-t" flag tokens themselves so the capture file is
+              # just the tag values + source refs, one per line.
+              captured=()
+              for arg in "$@"; do
+                [ "$arg" = "-t" ] && continue
+                captured+=("$arg")
+              done
+              printf '%s\n' "${captured[@]}" > "${MOCK_DOCKER_CAPTURE_CREATE_ARGS}"
+            fi
+            exit 0
+            ;;
+          *)
+            echo "mock docker: unrecognised imagetools subcommand: ${3:-}" >&2
+            exit 1
+            ;;
+        esac
+        ;;
+      *)
+        echo "mock docker: unrecognised buildx subcommand: ${2:-}" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "mock docker: unrecognised command: ${1:-}" >&2
+    exit 1
+    ;;
+esac

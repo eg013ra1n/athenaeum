@@ -466,36 +466,63 @@ notify:telegram:
     - .gitlab/ci/scripts/notify_telegram.sh
 
 # --- Docker Hub Publish (only on tags) ---
-# Build the docker/Dockerfile image multi-arch (linux/amd64 + linux/arm64)
-# and push to Docker Hub. Sibling under `needs: [release]` so a Docker Hub
-# outage cannot fail the GitLab Release itself.
+# Build the docker/Dockerfile image and push to Docker Hub via NATIVE
+# single-arch builds on each architecture's own runner, then merge into one
+# multi-arch manifest — replaces the old single qemu-emulated
+# `docker buildx build --platform linux/amd64,linux/arm64` job (42-61 min,
+# dominated by emulated arm64 Rust compilation):
+#   - publish:dockerhub:amd64    (linux runner)  -> pushes ${IMAGE}:${VERSION}-amd64
+#   - publish:dockerhub:arm64    (macOS runner)  -> pushes ${IMAGE}:${VERSION}-arm64
+#   - publish:dockerhub:manifest (linux runner)  -> merges both arch tags into
+#     ${IMAGE}:${VERSION} + ${IMAGE}:${CHANNEL_TAG} via
+#     `docker buildx imagetools create` (index-only, no rebuild/re-push of
+#     image layers).
+# All three are siblings under `needs: [release]` (`artifacts: false`) so a
+# Docker Hub outage cannot fail the GitLab Release itself; the manifest job
+# additionally `needs` both arch jobs, with arm64 `optional: true` so a
+# failed/absent arm64 build never blocks an amd64-only publish.
 #
 # Tag derivation (mirrors the retired .github/workflows/docker.yml):
 #   v0.2.0           -> :0.2.0 + :latest
 #   v0.2.1-beta.1    -> :0.2.1-beta.1 + :beta
 # Anything else with a non-"-beta" suffix (-rc, -alpha) routes to :latest;
-# tag those carefully or widen the grep below.
+# tag those carefully or widen the grep in publish:dockerhub:manifest.
 #
 # The image is stamped with OCI labels (org.opencontainers.image.version /
 # .revision / .created / .source / .title) so `docker inspect` can always
 # answer "what version is this?" even for the rolling :latest/:beta tags.
-# On top of that, .gitlab/ci/scripts/update_dockerhub_description.sh rewrites
-# a managed table in the Hub repo's description mapping :latest/:beta to the
+# On top of that, publish:dockerhub:manifest calls
+# .gitlab/ci/scripts/update_dockerhub_description.sh, which rewrites a
+# managed table in the Hub repo's description mapping :latest/:beta to the
 # version/git-tag/timestamp just published — hub.docker.com has no built-in
 # way to show what a rolling tag currently points at otherwise. That script
 # soft-fails (warns + exits 0) on any Docker Hub API error; see its header.
+# The arch-tag-check + imagetools-create + description-call logic all lives
+# in .gitlab/ci/scripts/dockerhub_merge_manifest.sh so it's independently
+# testable (see .gitlab/ci/scripts/test/run_tests.sh).
 #
 # Required CI/CD variables (Settings -> CI/CD -> Variables; Masked, Protected):
 #   - DOCKERHUB_USERNAME  (Docker Hub username, e.g. vsharifov)
 #   - DOCKERHUB_TOKEN     (Docker Hub access token; Read, Write, Delete)
-# Skips cleanly with a log message if either is unset.
+# All three jobs skip cleanly with a log message if either is unset.
 #
-# Runner host prereqs (one-time, requires sudo on the linux runner):
-#   sudo apt-get install -y docker.io docker-buildx qemu-user-static
-#   sudo usermod -aG docker gitlab-runner && sudo systemctl restart gitlab-runner
-#   sudo -u gitlab-runner docker run --rm --privileged tonistiigi/binfmt --install arm64
+# Runner host prereqs:
+#   linux (amd64 + manifest jobs, one-time, requires sudo):
+#     sudo apt-get install -y docker.io docker-buildx
+#     sudo usermod -aG docker gitlab-runner && sudo systemctl restart gitlab-runner
+#   macOS (arm64 job): Docker Desktop must be installed AND RUNNING — this is
+#     a GUI-session runner (see MEMORY.md project_macos_signing for the
+#     LaunchAgent setup it shares with the notarization runner); buildx ships
+#     with Docker Desktop, no separate install. If Docker Desktop is closed,
+#     the job's preflight fails loudly (allow_failure keeps it a soft/yellow
+#     failure, but it must never silently no-op).
+#   qemu-user-static / tonistiigi/binfmt is NOT needed by any of the three
+#     jobs above — each builds natively for its own runner's architecture.
+#     It's only relevant to the legacy single-job multi-platform
+#     `docker buildx build --platform linux/amd64,linux/arm64` path this
+#     replaces, which required emulation for the non-native arch.
 
-publish:dockerhub:
+publish:dockerhub:amd64:
   stage: release
   tags:
     - linux
@@ -516,7 +543,7 @@ publish:dockerhub:
       if [ ${#missing[@]} -gt 0 ]; then
         echo "ERROR: missing build deps on runner: ${missing[*]}"
         echo "Run on the runner host:"
-        echo "  sudo apt-get install -y docker.io docker-buildx qemu-user-static"
+        echo "  sudo apt-get install -y docker.io docker-buildx"
         echo "  sudo usermod -aG docker gitlab-runner && sudo systemctl restart gitlab-runner"
         exit 1
       fi
@@ -527,23 +554,16 @@ publish:dockerhub:
         exit 0
       fi
     - VERSION="${CI_COMMIT_TAG#v}"
-    - |
-      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then
-        CHANNEL_TAG="beta"
-      else
-        CHANNEL_TAG="latest"
-      fi
-    - echo "Publishing ${IMAGE}:${VERSION} and ${IMAGE}:${CHANNEL_TAG}"
+    - echo "Publishing ${IMAGE}:${VERSION}-amd64 (native linux/amd64 build)"
     - echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin docker.io
     # Idempotent buildx builder bootstrap.
     - docker buildx inspect athenaeum-builder >/dev/null 2>&1 || docker buildx create --name athenaeum-builder --use
     - docker buildx use athenaeum-builder
     - |
       docker buildx build \
-        --platform linux/amd64,linux/arm64 \
+        --platform linux/amd64 \
         --file docker/Dockerfile \
-        --tag "${IMAGE}:${VERSION}" \
-        --tag "${IMAGE}:${CHANNEL_TAG}" \
+        --tag "${IMAGE}:${VERSION}-amd64" \
         --label "org.opencontainers.image.title=Athenaeum" \
         --label "org.opencontainers.image.description=Astrophotography image management and FITS/XISF catalog" \
         --label "org.opencontainers.image.version=${VERSION}" \
@@ -552,8 +572,111 @@ publish:dockerhub:
         --label "org.opencontainers.image.source=${CI_PROJECT_URL}" \
         --push \
         .
+  after_script:
+    - docker logout docker.io 2>/dev/null || true
+
+publish:dockerhub:arm64:
+  stage: release
+  tags:
+    - macos
+  only:
+    - tags
+  needs:
+    - job: release
+      artifacts: false
+  allow_failure: true
+  variables:
+    IMAGE: "docker.io/vsharifov/athenaeum"
+  before_script:
+    # Native arm64 build on Apple Silicon Docker Desktop. Unlike the linux
+    # job, absence of docker/buildx OR a stopped daemon (Docker Desktop
+    # closed on this GUI-session runner) must surface as a visible failed
+    # (yellow, allow_failure) job — NEVER exit 0 here, or a missing arm64
+    # build silently degrades every release to amd64-only with no signal.
     - |
-      DOCKERHUB_REPO="${IMAGE#docker.io/}" VERSION="${VERSION}" CHANNEL_TAG="${CHANNEL_TAG}" \
-        .gitlab/ci/scripts/update_dockerhub_description.sh
+      if ! command -v docker >/dev/null 2>&1; then
+        echo "ERROR: docker CLI not found on this runner host."
+        exit 1
+      fi
+      if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: Docker daemon not reachable — is Docker Desktop running on this runner host?"
+        exit 1
+      fi
+      if ! docker buildx version >/dev/null 2>&1; then
+        echo "ERROR: docker buildx not available."
+        exit 1
+      fi
+  script:
+    - |
+      if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+        echo "DOCKERHUB_USERNAME / DOCKERHUB_TOKEN not set; skipping Docker Hub publish."
+        exit 0
+      fi
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - echo "Publishing ${IMAGE}:${VERSION}-arm64 (native linux/arm64 build)"
+    - echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin docker.io
+    # Idempotent buildx builder bootstrap.
+    - docker buildx inspect athenaeum-builder >/dev/null 2>&1 || docker buildx create --name athenaeum-builder --use
+    - docker buildx use athenaeum-builder
+    - |
+      docker buildx build \
+        --platform linux/arm64 \
+        --file docker/Dockerfile \
+        --tag "${IMAGE}:${VERSION}-arm64" \
+        --label "org.opencontainers.image.title=Athenaeum" \
+        --label "org.opencontainers.image.description=Astrophotography image management and FITS/XISF catalog" \
+        --label "org.opencontainers.image.version=${VERSION}" \
+        --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}" \
+        --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --label "org.opencontainers.image.source=${CI_PROJECT_URL}" \
+        --push \
+        .
+  after_script:
+    - docker logout docker.io 2>/dev/null || true
+
+publish:dockerhub:manifest:
+  stage: release
+  tags:
+    - linux
+  only:
+    - tags
+  needs:
+    - job: release
+      artifacts: false
+    - job: publish:dockerhub:amd64
+      artifacts: false
+    - job: publish:dockerhub:arm64
+      artifacts: false
+      optional: true
+  allow_failure: true
+  variables:
+    IMAGE: "docker.io/vsharifov/athenaeum"
+  before_script:
+    # buildx must be pre-installed on the runner host (see header above).
+    - |
+      missing=()
+      command -v docker >/dev/null || missing+=(docker)
+      docker buildx version >/dev/null 2>&1 || missing+=(docker-buildx)
+      if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: missing build deps on runner: ${missing[*]}"
+        echo "Run on the runner host:"
+        echo "  sudo apt-get install -y docker.io docker-buildx"
+        echo "  sudo usermod -aG docker gitlab-runner && sudo systemctl restart gitlab-runner"
+        exit 1
+      fi
+  script:
+    - |
+      if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+        echo "DOCKERHUB_USERNAME / DOCKERHUB_TOKEN not set; skipping Docker Hub manifest merge."
+        exit 0
+      fi
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - |
+      if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then
+        CHANNEL_TAG="beta"
+      else
+        CHANNEL_TAG="latest"
+      fi
+    - IMAGE="${IMAGE}" VERSION="${VERSION}" CHANNEL_TAG="${CHANNEL_TAG}" .gitlab/ci/scripts/dockerhub_merge_manifest.sh
   after_script:
     - docker logout docker.io 2>/dev/null || true

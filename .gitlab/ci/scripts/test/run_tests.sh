@@ -52,6 +52,22 @@ assert_not_contains() {
   fi
 }
 
+# Exact-line match (unlike assert_contains' substring match, this doesn't
+# false-positive on e.g. "IMAGE:0.2.3" being a substring of "IMAGE:0.2.3-amd64").
+assert_file_has_line() {
+  local label="$1" needle="$2" file="$3"
+  if grep -qFx -- "$needle" "$file"; then
+    echo "  ok: $label"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $label"
+    echo "    line missing: $needle"
+    echo "    in file ($file):"
+    sed 's/^/      /' "$file"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 echo "== CI notification helper tests =="
 
 echo
@@ -362,6 +378,108 @@ assert_contains "patch failure logs a warning" "WARNING: Docker Hub description 
 assert_eq "patch failure still exits 0" "0" "$rc"
 
 rm -f "$PATCH_TMP"
+
+echo
+echo "-- dockerhub_merge_manifest.sh --"
+
+# Mocks `docker` (fixtures/mock_bin/docker) and reuses the `curl` mock above
+# (update_dockerhub_description.sh, which this script calls on success, hits
+# the same mocked registry HTTP calls) so no test touches a real Docker
+# daemon, registry, or the Docker Hub API.
+MERGE_SCRIPT="$HELPERS_DIR/dockerhub_merge_manifest.sh"
+CREATE_ARGS_TMP=$(mktemp -t dockerhub_create_args.XXXXXX)
+trap 'rm -f "$CREATE_ARGS_TMP"' EXIT
+
+# Skip cleanly when Docker Hub credentials are unset — same soft-fail
+# semantics as the arch build jobs and the other CI helpers in this dir.
+rc=0
+out=$(
+  DOCKERHUB_USERNAME="" \
+  DOCKERHUB_TOKEN="tok" \
+  IMAGE="docker.io/vsharifov/athenaeum" \
+  VERSION="0.2.3" \
+  CHANNEL_TAG="latest" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$MERGE_SCRIPT" 2>&1
+) || rc=$?
+assert_contains "skip when DOCKERHUB_USERNAME unset" "skipping Docker Hub manifest merge" "$out"
+assert_eq "skip still exits 0" "0" "$rc"
+
+# Both arch tags present -> imagetools create merges both into the version
+# tag + channel tag, then update_dockerhub_description.sh is invoked.
+: > "$CREATE_ARGS_TMP"
+rc=0
+out=$(
+  PATH="$MOCK_BIN:$PATH" \
+  MOCK_DOCKER_AMD64_EXISTS=1 \
+  MOCK_DOCKER_ARM64_EXISTS=1 \
+  MOCK_DOCKER_CAPTURE_CREATE_ARGS="$CREATE_ARGS_TMP" \
+  MOCK_CURL_GET_BODY_FILE="$FIXTURES_DIR/dockerhub_fresh_description.json" \
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  IMAGE="docker.io/vsharifov/athenaeum" \
+  VERSION="0.2.3" \
+  CHANNEL_TAG="latest" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$MERGE_SCRIPT" 2>&1
+) || rc=$?
+assert_eq "both-arch run exits 0" "0" "$rc"
+assert_contains "both-arch run finds amd64 tag" "Found docker.io/vsharifov/athenaeum:0.2.3-amd64" "$out"
+assert_contains "both-arch run finds arm64 tag" "Found docker.io/vsharifov/athenaeum:0.2.3-arm64" "$out"
+assert_contains "both-arch run calls description script" "Docker Hub description updated" "$out"
+assert_file_has_line "create includes plain version tag"  "docker.io/vsharifov/athenaeum:0.2.3"       "$CREATE_ARGS_TMP"
+assert_file_has_line "create includes channel tag"         "docker.io/vsharifov/athenaeum:latest"      "$CREATE_ARGS_TMP"
+assert_file_has_line "create includes amd64 source"        "docker.io/vsharifov/athenaeum:0.2.3-amd64" "$CREATE_ARGS_TMP"
+assert_file_has_line "create includes arm64 source"        "docker.io/vsharifov/athenaeum:0.2.3-arm64" "$CREATE_ARGS_TMP"
+
+# arm64 tag absent (e.g. the macOS job failed / Docker Desktop was closed) ->
+# LOUD warning, manifest still created amd64-only, description script still
+# runs.
+: > "$CREATE_ARGS_TMP"
+rc=0
+out=$(
+  PATH="$MOCK_BIN:$PATH" \
+  MOCK_DOCKER_AMD64_EXISTS=1 \
+  MOCK_DOCKER_ARM64_EXISTS=0 \
+  MOCK_DOCKER_CAPTURE_CREATE_ARGS="$CREATE_ARGS_TMP" \
+  MOCK_CURL_GET_BODY_FILE="$FIXTURES_DIR/dockerhub_fresh_description.json" \
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  IMAGE="docker.io/vsharifov/athenaeum" \
+  VERSION="0.2.3" \
+  CHANNEL_TAG="latest" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$MERGE_SCRIPT" 2>&1
+) || rc=$?
+assert_eq "arm64-absent run exits 0" "0" "$rc"
+assert_contains "arm64-absent run warns" "WARNING: docker.io/vsharifov/athenaeum:0.2.3-arm64 not found on Docker Hub" "$out"
+assert_contains "arm64-absent run still calls description script" "Docker Hub description updated" "$out"
+assert_file_has_line "amd64-only create includes plain version tag" "docker.io/vsharifov/athenaeum:0.2.3"       "$CREATE_ARGS_TMP"
+assert_file_has_line "amd64-only create includes amd64 source"      "docker.io/vsharifov/athenaeum:0.2.3-amd64" "$CREATE_ARGS_TMP"
+arm64_lines=$(grep -Fxc "docker.io/vsharifov/athenaeum:0.2.3-arm64" "$CREATE_ARGS_TMP" || true)
+assert_eq "amd64-only create excludes arm64 source" "0" "$arm64_lines"
+
+# amd64 tag absent -> hard error, exit 1 (nothing to publish without it),
+# imagetools create must never run.
+: > "$CREATE_ARGS_TMP"
+rc=0
+out=$(
+  PATH="$MOCK_BIN:$PATH" \
+  MOCK_DOCKER_AMD64_EXISTS=0 \
+  MOCK_DOCKER_CAPTURE_CREATE_ARGS="$CREATE_ARGS_TMP" \
+  DOCKERHUB_USERNAME="user" \
+  DOCKERHUB_TOKEN="tok" \
+  IMAGE="docker.io/vsharifov/athenaeum" \
+  VERSION="0.2.3" \
+  CHANNEL_TAG="latest" \
+  CI_COMMIT_TAG="v0.2.3" \
+  "$MERGE_SCRIPT" 2>&1
+) || rc=$?
+assert_eq "amd64-absent run exits 1" "1" "$rc"
+assert_contains "amd64-absent run reports error" "ERROR: docker.io/vsharifov/athenaeum:0.2.3-amd64 not found on Docker Hub" "$out"
+assert_eq "amd64-absent run never calls imagetools create" "" "$(cat "$CREATE_ARGS_TMP")"
+
+rm -f "$CREATE_ARGS_TMP"
 
 echo
 echo "Passed: $PASS  Failed: $FAIL"
