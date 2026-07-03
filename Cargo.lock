@@ -4187,6 +4187,7 @@ dependencies = [
  "quick-xml 0.37.5",
  "rayon",
  "ruzstd",
+ "tracing",
  "turbojpeg",
 ]
 
