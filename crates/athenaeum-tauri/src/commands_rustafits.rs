@@ -11,6 +11,7 @@ use tauri::State;
 /// Cache hits bypass the semaphore entirely (<1ms).
 /// The semaphore is only acquired for cache misses (actual image processing).
 #[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn read_fits_image_rustafits(
     path: String,
     resolution: Option<String>,
