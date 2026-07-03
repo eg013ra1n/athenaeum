@@ -4735,6 +4735,7 @@ dependencies = [
  "rustafits",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
