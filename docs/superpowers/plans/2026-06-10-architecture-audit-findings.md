@@ -22,16 +22,20 @@ Lesson recorded: an "errors are empty" assertion is worthless if the code can dr
 
 ## Open findings — worth fixing (ordered)
 
-| ID | Severity | Location | Finding |
-| ---- | ---- | ---- | ---- |
-| R1 | High (future stacking) | `solvemyastro/src/register.rs` (~line 323) | Meridian-flipped frames register successfully with `det(M) < 0` — a mirror transform. Only `abs(det) < 1e-12` is checked. Silent data corruption once pixels are resampled. Add a negative-determinant check: either flag `flipped: true` in the result or reject with a clear message. |
-| R2 | High (future stacking) | `solvemyastro/src/register.rs` + `athenaeum-core/src/registration/` | Mixed binning / pixel scale within a frame set composes a scale-wrong WCS (`CD' = CD_ref · M` assumes a shared reference CD). Add a scale-consistency gate on the frame set before registration. |
-| M2 | Medium | `athenaeum-core/src/archive/restore.rs:236-248` | Restore skip-if-exists accepts whatever file sits at `source_path` without comparing to the stored `expected_hash`; archive markers are then cleared. A wrong file is silently blessed as "restored". Compare hashes; on mismatch surface a conflict (don't overwrite silently either). |
-| M4 | Medium | `athenaeum-core/src/file_op/executor.rs:499-532` | Cross-volume move: copy+verify+catalog-update succeed, then source-delete fails and the operation is abandoned → next scan's fingerprint-based move detection flips `files.path` back to source, leaving the dest copy as an invisible disk orphan. Needs a reconciliation path (re-list unfinished ops, or make move-back also remove the dest copy). |
-| R3 | Low | `solvemyastro/src/register.rs` (~line 207) | `INLIER_TOL_PX = 4` hardcoded regardless of pixel scale (too loose at 0.5"/px, too tight at 2"/px). Parameterize via config. |
-| R4 | Low | `solvemyastro/src/sip.rs` | No coordinate normalization to [-1, 1] before SIP least-squares (standard practice in TWEAK/SCAMP). Conditioning floor for order ≥ 3 on large sensors. Not urgent at order ≤ 3. |
-| S1 | Low | `athenaeum-core/src/clustering/mod.rs:279-334` | Greedy O(n²) clustering with the full frame list in memory. Fine at current catalog sizes; revisit past ~20k lights. |
-| S2 | Low | `athenaeum-core/src/db/calibration_links.rs:1031+`, `db/operations.rs:517+` | Unbounded list queries materialize full result sets (no pagination). Same trigger: revisit at scale. |
+Status column added 2026-07-03 (T10 doc reconciliation) once R1/R2/M2/M4/R3 were
+fixed on `0.2.2`; rows kept in place per this doc's ID-anchor contract — see
+"Fixed in this audit" above for the same FIXED-marker convention.
+
+| ID | Status | Severity | Location | Finding |
+| ---- | ---- | ---- | ---- | ---- |
+| R1 | **FIXED** (v0.2.2 / Wave 1) | High (future stacking) | `solvemyastro/src/register.rs` (~line 323) | Meridian-flipped frames register successfully with `det(M) < 0` — a mirror transform. Only `abs(det) < 1e-12` is checked. Silent data corruption once pixels are resampled. Fix: solvemyastro `98b39c6` (`Registration.flipped` derived from refit `det(M)`), surfaced in athenaeum `255d9717` (persist `ok_flipped` + UI badge). |
+| R2 | **FIXED** (v0.2.2 / Wave 6) | High (future stacking) | `solvemyastro/src/register.rs` + `athenaeum-core/src/registration/` | Mixed binning / pixel scale within a frame set composes a scale-wrong WCS (`CD' = CD_ref · M` assumes a shared reference CD). Fix: athenaeum `38615d55` — pre-registration consistency gate (binning groups + focallen ±1%) bailing through the `stacking-prep-progress` error path. |
+| M2 | **FIXED** (v0.2.2 / Wave 2) | Medium | `athenaeum-core/src/archive/restore.rs:236-248` | Restore skip-if-exists accepts whatever file sits at `source_path` without comparing to the stored `expected_hash`; archive markers are then cleared. A wrong file is silently blessed as "restored". Fix: athenaeum `49f77f66` + `594a0e76` — hash-verified skip path, conflict disposition (markers intact, `CompletedWithErrors`, frame set stays archived so retry is reachable). |
+| M4 | **FIXED** (v0.2.2 / Wave 3) | Medium | `athenaeum-core/src/file_op/executor.rs:499-532` | Cross-volume move: copy+verify+catalog-update succeed, then source-delete fails and the operation is abandoned → next scan's fingerprint-based move detection flips `files.path` back to source, leaving the dest copy as an invisible disk orphan. Fix: athenaeum `48e0fa80` (`file_op::reconcile` auto-heal at queue startup + pre-enqueue) and `020acdda` + `f8cdd174` (volume-aware move-detection guard at both fingerprint sites). |
+| R3 | **FIXED** (v0.2.2 / Wave 1) | Low | `solvemyastro/src/register.rs` (~line 207) | `INLIER_TOL_PX = 4` hardcoded regardless of pixel scale (too loose at 0.5"/px, too tight at 2"/px). Fix: solvemyastro `f850406` — `register_with_config` + `register_inlier_tol_arcsec` in `SolveConfig` (clamp [1,12] px, degenerate-CD fallback). |
+| R4 | Open | Low | `solvemyastro/src/sip.rs` | No coordinate normalization to [-1, 1] before SIP least-squares (standard practice in TWEAK/SCAMP). Conditioning floor for order ≥ 3 on large sensors. Not urgent at order ≤ 3. |
+| S1 | Open | Low | `athenaeum-core/src/clustering/mod.rs:279-334` | Greedy O(n²) clustering with the full frame list in memory. Fine at current catalog sizes; revisit past ~20k lights. |
+| S2 | Open | Low | `athenaeum-core/src/db/calibration_links.rs:1031+`, `db/operations.rs:517+` | Unbounded list queries materialize full result sets (no pagination). Same trigger: revisit at scale. |
 
 ## Confirmed-intentional (do NOT re-flag)
 
@@ -49,7 +53,7 @@ Lesson recorded: an "errors are empty" assertion is worthless if the code can dr
 - ~120 hand-duplicated Tauri-command / Axum-route pairs; no shared helper, drift caught only by discipline.
 - Hand-maintained TS mirrors of Rust models (`src/types/models.ts`); serde/enum drift fails silently at runtime. → ts-rs codegen, see collaboration plan.
 - Schema has no portable IDs / change tracking. → collaboration plan.
-- Two raw `BEGIN`/`COMMIT` sites remain in `db/operations.rs` (the reason for the defensive checkout rollback); migrate to savepoints/`unchecked_transaction` when touched.
+- ~~Two raw `BEGIN`/`COMMIT` sites remain in `db/operations.rs` (the reason for the defensive checkout rollback); migrate to savepoints/`unchecked_transaction` when touched.~~ **FIXED** (v0.2.2 / Wave 2, 2026-07-03): the July recount found three raw pairs, not two — fixed in athenaeum `1c0d5108` (`SavepointGuard` RAII); zero raw `BEGIN`s remain in `db/operations.rs`.
 - SSE broadcast channel (1024) drops events for slow clients with no resync mechanism — relevant only if web mode gains real concurrent users.
 
 ---

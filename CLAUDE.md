@@ -52,9 +52,9 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 **`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`.
 
-**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — ~180 functions across 16 modules. Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — ~157 functions across 17 modules (measured 2026-07-03, post-T6 dead-command cleanup `618959d6`; `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
-`core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `export` `missing_files` `calendar` `utils`
+`core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar` `utils`
 
 Frontend pages live in `src/pages/`; routing in `src/App.tsx` (React Router v7, `/` → `/files`).
 
