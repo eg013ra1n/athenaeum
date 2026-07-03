@@ -29,9 +29,9 @@
 //! `WHERE` clause makes the cached CSVs a full superset.
 //!
 //! Output goes to `catalogs/gaia_dr3/` in the existing depth-6 HEALPix
-//! [`StarRecord`] format; [`crate::catalog::CatalogEngine::with_catalog_dir`]
-//! auto-discovers it and `cone_search` uses it (epoch 2016.0) with no
-//! solver changes.
+//! [`StarRecord`] format, written via [`super::write_catalog_to_healpix`];
+//! the live solver reads the resulting `healpix_NNNNNN.bin` tiles directly
+//! with no solver changes.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -581,8 +581,8 @@ pub fn download_gaia_dr3(
 
 /// Full Gaia DR3 (G≤19) catalog setup. Idempotent (skips if
 /// `catalogs/gaia_dr3/` already populated); resumable via the tile
-/// manifest. Returns the catalog directory, auto-discovered by
-/// [`crate::catalog::CatalogEngine::with_catalog_dir`].
+/// manifest. Returns the catalog directory, holding the depth-6
+/// HEALPix-binned `healpix_NNNNNN.bin` files the live solver reads directly.
 pub fn setup_gaia_dr3_catalog(
     app_data_dir: &Path,
     cancel_flag: Arc<AtomicBool>,
