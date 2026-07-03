@@ -13,7 +13,7 @@ use rusqlite::{params, Connection, Result};
 /// - every char in `prefix` is `char::MAX` (the carry runs off the front) —
 ///   unreachable for a real filesystem path, but handled for defensive
 ///   correctness. When this fires for a non-empty prefix, it's logged via
-///   `eprintln!` so the (lower-bound-only) fallback is observable rather
+///   `tracing::warn!` so the (lower-bound-only) fallback is observable rather
 ///   than silently swallowed.
 ///
 /// All stored paths are valid UTF-8 (they come from Rust `String`s), and
@@ -58,9 +58,9 @@ pub(crate) fn path_prefix_upper(prefix: &str) -> Option<String> {
         }
     }
     if !prefix.is_empty() {
-        eprintln!(
-            "path_prefix_upper: no finite upper bound for prefix {:?} (all chars are char::MAX) — falling back to lower-bound-only match",
-            prefix
+        tracing::warn!(
+            prefix = %prefix,
+            "no finite upper bound for prefix (all chars are char::MAX), falling back to lower-bound-only match"
         );
     }
     None
@@ -136,10 +136,7 @@ impl Drop for SavepointGuard<'_> {
                 .conn
                 .execute_batch(&format!("ROLLBACK TO {0}; RELEASE {0}", self.name))
             {
-                eprintln!(
-                    "[db] SavepointGuard: rollback failed for savepoint {:?}: {}",
-                    self.name, e
-                );
+                tracing::error!(savepoint = self.name, error = %e, "SavepointGuard rollback failed");
             }
         }
     }
@@ -204,9 +201,12 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
     let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
     let override_int = if frame.override_ { 1 } else { 0 };
 
-    // Debug: Log what we're about to insert
-    println!("insert_frame: file_id={}, object={:?}, date_obs={:?}",
-        frame.file_id, frame.object, date_obs_str);
+    tracing::debug!(
+        file_id = frame.file_id,
+        object = ?frame.object,
+        date_obs = ?date_obs_str,
+        "inserting frame"
+    );
 
     let is_master_int = if frame.is_master { 1 } else { 0 };
 
@@ -1420,7 +1420,7 @@ pub fn bulk_update_frame_metadata(
     let count = conn
         .execute(&sql, rusqlite::params_from_iter(values.iter()))
         .map_err(|e| {
-            eprintln!("bulk_update_frame_metadata failed: {} (sql={})", e, sql);
+            tracing::error!(table = "frames", count = frame_ids.len(), error = %e, "bulk_update_frame_metadata failed");
             e
         })?;
 
@@ -1464,10 +1464,7 @@ pub fn bulk_update_frame_metadata(
         );
         conn.execute(&sql_csf, rusqlite::params_from_iter(frame_id_params.iter()))
             .map_err(|e| {
-                eprintln!(
-                    "bulk_update_frame_metadata cascade calibration_set_frames failed: {}",
-                    e
-                );
+                tracing::error!(table = "calibration_set_frames", error = %e, "bulk_update_frame_metadata cascade delete failed");
                 e
             })?;
 
@@ -1478,10 +1475,7 @@ pub fn bulk_update_frame_metadata(
         );
         conn.execute(&sql_cstf, rusqlite::params_from_iter(frame_id_params.iter()))
             .map_err(|e| {
-                eprintln!(
-                    "bulk_update_frame_metadata cascade calibration_set_to_frames failed: {}",
-                    e
-                );
+                tracing::error!(table = "calibration_set_to_frames", error = %e, "bulk_update_frame_metadata cascade delete failed");
                 e
             })?;
 
@@ -1492,10 +1486,7 @@ pub fn bulk_update_frame_metadata(
         );
         conn.execute(&sql_sm, rusqlite::params_from_iter(frame_id_params.iter()))
             .map_err(|e| {
-                eprintln!(
-                    "bulk_update_frame_metadata cascade session_members failed: {}",
-                    e
-                );
+                tracing::error!(table = "session_members", error = %e, "bulk_update_frame_metadata cascade delete failed");
                 e
             })?;
 
@@ -1515,10 +1506,7 @@ pub fn bulk_update_frame_metadata(
             if remaining == 0 {
                 conn.execute("DELETE FROM calibration_set WHERE id = ?1", [set_id])
                     .map_err(|e| {
-                        eprintln!(
-                            "bulk_update_frame_metadata prune empty calibration_set #{} failed: {}",
-                            set_id, e
-                        );
+                        tracing::error!(table = "calibration_set", set_id, error = %e, "bulk_update_frame_metadata prune of empty set failed");
                         e
                     })?;
             }
@@ -1530,10 +1518,7 @@ pub fn bulk_update_frame_metadata(
     // file-header values, drop the flag so the row stops looking edited.
     // Errors here aren't fatal — the edits themselves succeeded already.
     if let Err(e) = recompute_override_flag_for_frames(conn, frame_ids) {
-        eprintln!(
-            "recompute_override_flag_for_frames after bulk_update failed: {}",
-            e
-        );
+        tracing::warn!(count = frame_ids.len(), error = %e, "recompute_override_flag_for_frames after bulk_update failed, edits already committed");
     }
 
     Ok(count)
@@ -4496,7 +4481,7 @@ mod path_prefix_range_tests {
         // Every char is char::MAX, so the carry runs off the front of the
         // string with nothing left to increment — the one remaining `None`
         // case for a non-empty prefix, unreachable for a real filesystem
-        // path but handled defensively (and logged via eprintln! at the
+        // path but handled defensively (and logged via tracing::warn! at the
         // call site, per the never-swallow-errors rule).
         let prefix: String = std::iter::repeat(char::MAX).take(2).collect();
         assert_eq!(path_prefix_upper(&prefix), None);

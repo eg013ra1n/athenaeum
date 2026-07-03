@@ -251,9 +251,12 @@ pub fn process_frame_set(
 
         // For now, just log progress (in future, this could call a progress callback)
         if (index + 1) % 10 == 0 || index + 1 == total_frames {
-            println!(
-                "Progress: {}/{} frames ({:.1}%)",
-                progress.processed_frames, progress.total_frames, progress.percent_complete
+            tracing::debug!(
+                frame_set_id,
+                processed = progress.processed_frames,
+                total = progress.total_frames,
+                percent_complete = progress.percent_complete,
+                "processing frame set: progress"
             );
         }
     }
@@ -418,9 +421,9 @@ pub fn clear_calibration_links_for_frame_set_with_options(
     }
 
     if preserve_manual_overrides {
-        println!("✅ Cleared {} auto-find links (manual overrides preserved)", total_deleted);
+        tracing::info!(frame_set_id, count = total_deleted, "cleared auto-find calibration links, manual overrides preserved");
     } else {
-        println!("✅ Cleared {} calibration links (including manual)", total_deleted);
+        tracing::info!(frame_set_id, count = total_deleted, "cleared all calibration links, including manual");
     }
 
     Ok(total_deleted)

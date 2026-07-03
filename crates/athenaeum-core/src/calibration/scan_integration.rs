@@ -122,17 +122,18 @@ pub fn create_calibration_sets_from_scan_with_masters(
     darkflat_frame_ids: Vec<i64>,
     master_frame_ids: MasterFrameIds,
 ) -> Result<CalibrationScanResult> {
-    println!("🔧 Creating calibration sets from scan:");
-    println!("   Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
-        flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
-    if !master_frame_ids.is_empty() {
-        println!("   Masters: {} total (Dark: {}, Flat: {}, Bias: {}, DarkFlat: {})",
-            master_frame_ids.total_count(),
-            master_frame_ids.master_dark_ids.len(),
-            master_frame_ids.master_flat_ids.len(),
-            master_frame_ids.master_bias_ids.len(),
-            master_frame_ids.master_darkflat_ids.len());
-    }
+    tracing::info!(
+        flats = flat_frame_ids.len(),
+        darks = dark_frame_ids.len(),
+        bias = bias_frame_ids.len(),
+        darkflats = darkflat_frame_ids.len(),
+        master_total = master_frame_ids.total_count(),
+        master_dark = master_frame_ids.master_dark_ids.len(),
+        master_flat = master_frame_ids.master_flat_ids.len(),
+        master_bias = master_frame_ids.master_bias_ids.len(),
+        master_darkflat = master_frame_ids.master_darkflat_ids.len(),
+        "creating calibration sets from scan"
+    );
 
     // Load clustering settings from user config
     let config = load_config(conn);
@@ -175,10 +176,18 @@ pub fn create_calibration_sets_from_scan_with_masters(
         })
         .unwrap_or(None);
 
-    println!("   Clustering thresholds: flat={}min/{}°C, dark={}min/{}°C, bias={}min/{}°C, darkflat={}min/{}°C",
-        flat_cluster_mins, flat_temp_threshold, dark_cluster_mins, dark_temp_threshold,
-        bias_cluster_mins, bias_temp_threshold, darkflat_cluster_mins, darkflat_temp_threshold);
-    println!("   Focallen tolerance: {:?}", focallen_tolerance);
+    tracing::debug!(
+        flat_cluster_mins,
+        flat_temp_threshold,
+        dark_cluster_mins,
+        dark_temp_threshold,
+        bias_cluster_mins,
+        bias_temp_threshold,
+        darkflat_cluster_mins,
+        darkflat_temp_threshold,
+        focallen_tolerance = ?focallen_tolerance,
+        "clustering thresholds for scan-triggered calibration set creation"
+    );
 
     let mut result = CalibrationScanResult {
         sets_created: 0,
@@ -227,7 +236,7 @@ pub fn create_calibration_sets_from_scan_with_masters(
         result.sets_created += total_master_sets;
     }
 
-    println!("✅ Created {} total calibration sets", result.sets_created);
+    tracing::info!(count = result.sets_created, "created total calibration sets from scan");
 
     Ok(result)
 }
@@ -291,7 +300,7 @@ fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
         return Ok(0);
     }
 
-    println!("   📸 Processing {} flat frames (focallen_tolerance={:?})", frames.len(), focallen_tolerance);
+    tracing::debug!(count = frames.len(), focallen_tolerance = ?focallen_tolerance, "processing flat frames from scan");
 
     // Group by exact match parameters
     let mut groups: HashMap<FlatGroupKey, Vec<CalibrationFrameData>> = HashMap::new();
@@ -334,13 +343,13 @@ fn create_flat_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
                     sets_created += 1;
                 }
                 Err(e) => {
-                    println!("   ⚠️  Failed to create flat set: {}", e);
+                    tracing::error!(error = %e, "failed to create flat calibration set from scan");
                 }
             }
         }
     }
 
-    println!("   ✅ Created {} flat calibration sets", sets_created);
+    tracing::debug!(count = sets_created, "created flat calibration sets from scan");
     Ok(sets_created)
 }
 
@@ -351,7 +360,7 @@ fn create_dark_sets_from_frames(conn: &Connection, frame_ids: &[i64], imagetyp: 
         return Ok(0);
     }
 
-    println!("   🌑 Processing {} {} frames", frames.len(), imagetyp.to_lowercase());
+    tracing::debug!(count = frames.len(), imagetyp = %imagetyp.to_lowercase(), "processing dark/darkflat frames from scan");
 
     // Group by exact match parameters
     let mut groups: HashMap<DarkGroupKey, Vec<CalibrationFrameData>> = HashMap::new();
@@ -385,13 +394,13 @@ fn create_dark_sets_from_frames(conn: &Connection, frame_ids: &[i64], imagetyp: 
                     sets_created += 1;
                 }
                 Err(e) => {
-                    println!("   ⚠️  Failed to create {} set: {}", imagetyp.to_lowercase(), e);
+                    tracing::error!(imagetyp = %imagetyp.to_lowercase(), error = %e, "failed to create calibration set from scan");
                 }
             }
         }
     }
 
-    println!("   ✅ Created {} {} calibration sets", sets_created, imagetyp.to_lowercase());
+    tracing::debug!(count = sets_created, imagetyp = %imagetyp.to_lowercase(), "created calibration sets from scan");
     Ok(sets_created)
 }
 
@@ -402,7 +411,7 @@ fn create_bias_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
         return Ok(0);
     }
 
-    println!("   ⚡ Processing {} bias frames", frames.len());
+    tracing::debug!(count = frames.len(), "processing bias frames from scan");
 
     // Group by exact match parameters
     let mut groups: HashMap<BiasGroupKey, Vec<CalibrationFrameData>> = HashMap::new();
@@ -435,13 +444,13 @@ fn create_bias_sets_from_frames(conn: &Connection, frame_ids: &[i64], time_clust
                     sets_created += 1;
                 }
                 Err(e) => {
-                    println!("   ⚠️  Failed to create bias set: {}", e);
+                    tracing::error!(error = %e, "failed to create bias calibration set from scan");
                 }
             }
         }
     }
 
-    println!("   ✅ Created {} bias calibration sets", sets_created);
+    tracing::debug!(count = sets_created, "created bias calibration sets from scan");
     Ok(sets_created)
 }
 
@@ -786,7 +795,7 @@ fn create_dark_calibration_set_with_type(
     };
 
     if let Some(set_id) = existing_set_id {
-        println!("    ♻️  Reusing existing {} calibration set ID: {}", imagetyp.to_lowercase(), set_id);
+        tracing::debug!(set_id, imagetyp = %imagetyp.to_lowercase(), "reusing existing calibration set");
 
         // Link new frames to existing set (using INSERT OR IGNORE to avoid duplicates)
         for frame_id in &dark_group.frame_ids {
@@ -866,7 +875,7 @@ fn create_master_sets_from_frames(
         return Ok(0);
     }
 
-    println!("   ⭐ Processing {} {} frames", frame_ids.len(), imagetyp);
+    tracing::debug!(count = frame_ids.len(), imagetyp, "processing master frames from scan");
 
     let frames = query_frame_data(conn, frame_ids)?;
     let mut sets_created = 0i64;
@@ -933,6 +942,6 @@ fn create_master_sets_from_frames(
         sets_created += 1;
     }
 
-    println!("   ✅ Created {} {} calibration sets", sets_created, imagetyp);
+    tracing::debug!(count = sets_created, imagetyp, "created master calibration sets from scan");
     Ok(sets_created)
 }

@@ -147,13 +147,17 @@ pub fn detect_flat_groups(
 
     query.push_str(" ORDER BY date_obs ASC");
 
-    // Log the complete SQL query
-    println!("    🔍 Executing SQL query:");
-    println!("       instrume={}, binning={}, filter={:?}, gain={:?}, focallen={:?} (threshold={:?})",
-        instrume, binning, filter, gain, focal_length, focallen_threshold);
-    if let Some((start, end)) = date_range {
-        println!("       date_range: {} to {}", start, end);
-    }
+    tracing::debug!(
+        instrume,
+        binning,
+        filter = ?filter,
+        gain = ?gain,
+        focal_length = ?focal_length,
+        focallen_threshold = ?focallen_threshold,
+        date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
+        date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
+        "executing flat search query"
+    );
 
     // Execute query
     let mut stmt = conn.prepare(&query)?;
@@ -256,8 +260,7 @@ pub fn detect_flat_groups(
         frames.push(frame);
     }
 
-    // Diagnostic logging
-    println!("    📊 SQL query found {} flat frames", frames.len());
+    tracing::debug!(count = frames.len(), "flat search query found frames");
 
     // Cluster frames by time proximity
     let groups = cluster_frames_by_time(
@@ -270,7 +273,7 @@ pub fn detect_flat_groups(
         focal_length,
     );
 
-    println!("    🗂️  Clustered into {} groups", groups.len());
+    tracing::debug!(count = groups.len(), "clustered flat frames into groups");
 
     Ok(groups)
 }
@@ -437,12 +440,12 @@ pub fn create_flat_calibration_set(
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_flat_set(conn, flat_group, focallen_tolerance)?;
-    println!("    🔍 Existing set check: {:?}", existing_set_id);
+    tracing::debug!(existing_set_id = ?existing_set_id, "existing flat set check");
 
     if let Some(set_id) = existing_set_id {
         if allow_modify {
             // Scanning context: link new frames to existing set
-            println!("    ♻️  Reusing existing calibration set ID: {}", set_id);
+            tracing::debug!(set_id, "reusing existing flat calibration set");
             for frame_id in &flat_group.frame_ids {
                 conn.execute(
                     "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
@@ -458,7 +461,7 @@ pub fn create_flat_calibration_set(
             )?;
         } else {
             // Find calibration context: just return existing set ID without modification
-            println!("    ♻️  Found existing calibration set ID: {}", set_id);
+            tracing::debug!(set_id, "found existing flat calibration set");
         }
         return Ok(set_id);
     }
@@ -475,10 +478,19 @@ pub fn create_flat_calibration_set(
     let temp_min = flat_group.temp_min.or(flat_group.avg_temp);
     let temp_max = flat_group.temp_max.or(flat_group.avg_temp);
 
-    println!("    📝 Creating new flat calibration set:");
-    println!("       date={}, filter={:?}, gain={:?}, offset={:?}, exptime={:?}, binning={:?}, instrume={:?}",
-        date, flat_group.filter, flat_group.gain, flat_group.offset, flat_group.exptime, flat_group.binning, flat_group.instrume);
-    println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
+    tracing::debug!(
+        date,
+        filter = ?flat_group.filter,
+        gain = ?flat_group.gain,
+        offset = ?flat_group.offset,
+        exptime = ?flat_group.exptime,
+        binning = ?flat_group.binning,
+        instrume = ?flat_group.instrume,
+        frame_count,
+        date_start,
+        date_end,
+        "creating new flat calibration set"
+    );
 
     conn.execute(
         "INSERT INTO calibration_set
@@ -504,21 +516,27 @@ pub fn create_flat_calibration_set(
     )?;
 
     let set_id = conn.last_insert_rowid();
-    println!("    ✅ Created calibration set with ID: {}", set_id);
+    tracing::info!(set_id, frame_count, "created flat calibration set");
 
     // Link frames to set
-    println!("    🔗 Linking {} frames to set {}", flat_group.frame_ids.len(), set_id);
+    tracing::debug!(set_id, count = flat_group.frame_ids.len(), "linking frames to flat calibration set");
     for (idx, frame_id) in flat_group.frame_ids.iter().enumerate() {
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             (set_id, frame_id),
         ).map_err(|e| {
-            eprintln!("    ❌ Failed to link frame {} (index {}/{}): {}",
-                frame_id, idx + 1, flat_group.frame_ids.len(), e);
+            tracing::error!(
+                frame_id,
+                set_id,
+                index = idx + 1,
+                total = flat_group.frame_ids.len(),
+                error = %e,
+                "failed to link frame to flat calibration set"
+            );
             e
         })?;
     }
-    println!("    ✅ Linked all {} frames successfully", flat_group.frame_ids.len());
+    tracing::debug!(set_id, count = flat_group.frame_ids.len(), "linked all frames to flat calibration set");
 
     Ok(set_id)
 }

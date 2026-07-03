@@ -776,9 +776,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // Idempotent (a no-op once all rows are fingerprinted); non-fatal so a
     // backfill hiccup never blocks startup.
     match super::operations::backfill_null_header_fingerprints(conn) {
-        Ok(n) if n > 0 => eprintln!("init_db: backfilled {n} legacy header fingerprints"),
+        Ok(n) if n > 0 => tracing::info!(table = "fits_header", count = n, "backfilled legacy header fingerprints"),
         Ok(_) => {}
-        Err(e) => eprintln!("init_db: header-fingerprint backfill skipped (non-fatal): {e}"),
+        Err(e) => tracing::warn!(table = "fits_header", error = %e, "header-fingerprint backfill skipped (non-fatal)"),
     }
 
     // Add content_hash to files table (migration for existing databases)

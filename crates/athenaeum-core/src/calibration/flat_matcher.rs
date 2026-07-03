@@ -112,19 +112,17 @@ pub fn find_flat_groups_for_light_frame(
     // window) and skip date-based scoring/timing later.
     let frame_date_opt: Option<DateTime<Utc>> = light_frame.date_obs;
 
-    // Diagnostic logging
-    println!("🔍 Finding flats for light frame ID {}",
-        light_frame.id.map(|id| id.to_string()).unwrap_or_else(|| "None".to_string()));
-    println!("  📷 instrume: {}", instrume);
-    println!("  🎨 filter: {:?}", filter);
-    println!("  📐 binning: {}", binning);
-    println!("  ⚡ gain: {:?}", gain);
-    println!("  🔭 focallen: {:?}", focal_length);
-    match frame_date_opt {
-        Some(d) => println!("  📅 date: {}", d),
-        None => println!("  📅 date: <missing — searching across full date range>"),
-    }
-    println!("  ⏰ max_age_days: {}", max_age_days);
+    tracing::debug!(
+        frame_id = ?light_frame.id,
+        instrume,
+        filter = ?filter,
+        binning,
+        gain = ?gain,
+        focal_length = ?focal_length,
+        date = ?frame_date_opt,
+        max_age_days,
+        "finding flats for light frame"
+    );
 
     // A7: warn when the light is "filter-ambiguous mono" — no Bayer pattern
     // (i.e., a mono sensor) AND a missing FILTER keyword. Auto-link can't tell
@@ -133,10 +131,9 @@ pub fn find_flat_groups_for_light_frame(
     // here so it shows up in stderr / app logs; behavior is unchanged so a
     // pure-mono single-filter setup doesn't silently regress.
     if crate::models::is_mono_with_ambiguous_filter(&light_frame.bayerpat, &light_frame.filter) {
-        eprintln!(
-            "  ⚠️  filter-ambiguous mono frame (id={:?}): bayerpat=NULL and filter=NULL. \
-             Auto-link will match against any flat with FILTER=NULL — verify the result manually.",
-            light_frame.id
+        tracing::warn!(
+            frame_id = ?light_frame.id,
+            "filter-ambiguous mono frame: bayerpat and filter both NULL, auto-link will match any flat with FILTER=NULL, verify manually"
         );
     }
 
@@ -154,7 +151,7 @@ pub fn find_flat_groups_for_light_frame(
         .as_ref()
         .and_then(|f| f.focallen.matching_threshold);
 
-    println!("  🔧 focallen_threshold from config: {:?}", focallen_threshold);
+    tracing::debug!(focallen_threshold = ?focallen_threshold, "focallen_threshold from config");
 
     // Detect flat groups matching parameters
     let flat_groups = detect_flat_groups(
@@ -168,17 +165,22 @@ pub fn find_flat_groups_for_light_frame(
         time_cluster_minutes,
         date_range,
     ).map_err(|e| {
-        eprintln!("  ❌ detect_flat_groups failed: {}", e);
-        eprintln!("  📋 Search params - instrume: {}, filter: {:?}, binning: {}, gain: {:?}, focallen: {:?}",
-            instrume, filter, binning, gain, focal_length);
-        match date_range {
-            Some((s, e_)) => eprintln!("  📅 Date range: {} to {}", s, e_),
-            None => eprintln!("  📅 Date range: <none — light frame missing date_obs>"),
-        }
+        tracing::error!(
+            frame_id = ?light_frame.id,
+            instrume,
+            filter = ?filter,
+            binning,
+            gain = ?gain,
+            focal_length = ?focal_length,
+            date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
+            date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
+            error = %e,
+            "detect_flat_groups failed"
+        );
         e
     })?;
 
-    println!("  🎯 detect_flat_groups found {} groups", flat_groups.len());
+    tracing::debug!(count = flat_groups.len(), "detect_flat_groups found groups");
 
     // Calculate match scores for each group. When the light frame has no
     // date_obs, we can't compute proximity — fall back to a neutral date

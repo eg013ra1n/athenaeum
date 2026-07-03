@@ -130,14 +130,14 @@ pub fn detect_dark_groups(
     let gain_val = match gain {
         Some(g) => g,
         None => {
-            println!("    ⚠️  Dark detection skipped: gain is required but not provided");
+            tracing::warn!(instrume, binning, "dark detection skipped, gain is required but not provided");
             return Ok(Vec::new());
         }
     };
     let offset_val = match offset {
         Some(o) => o,
         None => {
-            println!("    ⚠️  Dark detection skipped: offset is required but not provided");
+            tracing::warn!(instrume, binning, "dark detection skipped, offset is required but not provided");
             return Ok(Vec::new());
         }
     };
@@ -174,18 +174,21 @@ pub fn detect_dark_groups(
 
     query.push_str(" ORDER BY date_obs ASC");
 
-    // Log the complete SQL query
-    println!("    🔍 Executing Dark SQL query:");
-    println!("       instrume={}, binning={}, gain={}, offset={}, exptime={:?}",
-        instrume, binning, gain_val, offset_val, exptime);
-    if let Some((start, end)) = date_range {
-        println!("       date_range: {} to {}", start, end);
-    }
+    tracing::debug!(
+        instrume,
+        binning,
+        gain = gain_val,
+        offset = offset_val,
+        exptime = ?exptime,
+        date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
+        date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
+        "executing dark search query"
+    );
 
     // Execute query with parameter binding
     let frames = execute_dark_query(conn, &query, instrume, binning, gain_val, offset_val, exptime, date_range)?;
 
-    println!("    📊 SQL query found {} dark frames", frames.len());
+    tracing::debug!(count = frames.len(), "dark search query found frames");
 
     // Cluster frames by time proximity, with optional temperature-drift split.
     let groups = cluster_dark_frames_by_time(
@@ -200,7 +203,7 @@ pub fn detect_dark_groups(
         temp_threshold,
     );
 
-    println!("    🗂️  Clustered into {} dark groups", groups.len());
+    tracing::debug!(count = groups.len(), "clustered dark frames into groups");
 
     Ok(groups)
 }
@@ -235,14 +238,14 @@ pub fn detect_bias_groups(
     let gain_val = match gain {
         Some(g) => g,
         None => {
-            println!("    ⚠️  Bias detection skipped: gain is required but not provided");
+            tracing::warn!(instrume, binning, "bias detection skipped, gain is required but not provided");
             return Ok(Vec::new());
         }
     };
     let offset_val = match offset {
         Some(o) => o,
         None => {
-            println!("    ⚠️  Bias detection skipped: offset is required but not provided");
+            tracing::warn!(instrume, binning, "bias detection skipped, offset is required but not provided");
             return Ok(Vec::new());
         }
     };
@@ -272,18 +275,20 @@ pub fn detect_bias_groups(
 
     query.push_str(" ORDER BY date_obs ASC");
 
-    // Log the complete SQL query
-    println!("    🔍 Executing Bias SQL query:");
-    println!("       instrume={}, binning={}, gain={}, offset={}",
-        instrume, binning, gain_val, offset_val);
-    if let Some((start, end)) = date_range {
-        println!("       date_range: {} to {}", start, end);
-    }
+    tracing::debug!(
+        instrume,
+        binning,
+        gain = gain_val,
+        offset = offset_val,
+        date_start = ?date_range.map(|(s, _)| s.to_rfc3339()),
+        date_end = ?date_range.map(|(_, e)| e.to_rfc3339()),
+        "executing bias search query"
+    );
 
     // Execute query with parameter binding
     let frames = execute_bias_query(conn, &query, instrume, binning, gain_val, offset_val, date_range)?;
 
-    println!("    📊 SQL query found {} bias frames", frames.len());
+    tracing::debug!(count = frames.len(), "bias search query found frames");
 
     // Cluster frames by time proximity, with optional temperature-drift split.
     let groups = cluster_bias_frames_by_time(
@@ -297,7 +302,7 @@ pub fn detect_bias_groups(
         temp_threshold,
     );
 
-    println!("    🗂️  Clustered into {} bias groups", groups.len());
+    tracing::debug!(count = groups.len(), "clustered bias frames into groups");
 
     Ok(groups)
 }
@@ -821,12 +826,12 @@ pub fn create_dark_calibration_set(
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_dark_set(conn, dark_group)?;
-    println!("    🔍 Existing dark set check: {:?}", existing_set_id);
+    tracing::debug!(existing_set_id = ?existing_set_id, "existing dark set check");
 
     if let Some(set_id) = existing_set_id {
         if allow_modify {
             // Scanning context: link new frames to existing set
-            println!("    ♻️  Reusing existing dark calibration set ID: {}", set_id);
+            tracing::debug!(set_id, "reusing existing dark calibration set");
             for frame_id in &dark_group.frame_ids {
                 conn.execute(
                     "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
@@ -842,7 +847,7 @@ pub fn create_dark_calibration_set(
             )?;
         } else {
             // Find calibration context: just return existing set ID without modification
-            println!("    ♻️  Found existing dark calibration set ID: {}", set_id);
+            tracing::debug!(set_id, "found existing dark calibration set");
         }
         return Ok(set_id);
     }
@@ -859,10 +864,18 @@ pub fn create_dark_calibration_set(
     let temp_min = dark_group.temp_min.or(dark_group.avg_temp);
     let temp_max = dark_group.temp_max.or(dark_group.avg_temp);
 
-    println!("    📝 Creating new dark calibration set:");
-    println!("       date={}, exptime={:?}, gain={:?}, offset={:?}, binning={:?}, instrume={:?}",
-        date, dark_group.exptime, dark_group.gain, dark_group.offset, dark_group.binning, dark_group.instrume);
-    println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
+    tracing::debug!(
+        date,
+        exptime = ?dark_group.exptime,
+        gain = ?dark_group.gain,
+        offset = ?dark_group.offset,
+        binning = ?dark_group.binning,
+        instrume = ?dark_group.instrume,
+        frame_count,
+        date_start,
+        date_end,
+        "creating new dark calibration set"
+    );
 
     conn.execute(
         "INSERT INTO calibration_set
@@ -887,21 +900,27 @@ pub fn create_dark_calibration_set(
     )?;
 
     let set_id = conn.last_insert_rowid();
-    println!("    ✅ Created dark calibration set with ID: {}", set_id);
+    tracing::info!(set_id, frame_count, "created dark calibration set");
 
     // Link frames to set
-    println!("    🔗 Linking {} frames to set {}", dark_group.frame_ids.len(), set_id);
+    tracing::debug!(set_id, count = dark_group.frame_ids.len(), "linking frames to dark calibration set");
     for (idx, frame_id) in dark_group.frame_ids.iter().enumerate() {
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             (set_id, frame_id),
         ).map_err(|e| {
-            eprintln!("    ❌ Failed to link frame {} (index {}/{}): {}",
-                frame_id, idx + 1, dark_group.frame_ids.len(), e);
+            tracing::error!(
+                frame_id,
+                set_id,
+                index = idx + 1,
+                total = dark_group.frame_ids.len(),
+                error = %e,
+                "failed to link frame to dark calibration set"
+            );
             e
         })?;
     }
-    println!("    ✅ Linked all {} frames successfully", dark_group.frame_ids.len());
+    tracing::debug!(set_id, count = dark_group.frame_ids.len(), "linked all frames to dark calibration set");
 
     Ok(set_id)
 }
@@ -923,12 +942,12 @@ pub fn create_bias_calibration_set(
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_bias_set(conn, bias_group)?;
-    println!("    🔍 Existing bias set check: {:?}", existing_set_id);
+    tracing::debug!(existing_set_id = ?existing_set_id, "existing bias set check");
 
     if let Some(set_id) = existing_set_id {
         if allow_modify {
             // Scanning context: link new frames to existing set
-            println!("    ♻️  Reusing existing bias calibration set ID: {}", set_id);
+            tracing::debug!(set_id, "reusing existing bias calibration set");
             for frame_id in &bias_group.frame_ids {
                 conn.execute(
                     "INSERT OR IGNORE INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
@@ -944,7 +963,7 @@ pub fn create_bias_calibration_set(
             )?;
         } else {
             // Find calibration context: just return existing set ID without modification
-            println!("    ♻️  Found existing bias calibration set ID: {}", set_id);
+            tracing::debug!(set_id, "found existing bias calibration set");
         }
         return Ok(set_id);
     }
@@ -960,10 +979,17 @@ pub fn create_bias_calibration_set(
     let temp_min = bias_group.temp_min.or(bias_group.avg_temp);
     let temp_max = bias_group.temp_max.or(bias_group.avg_temp);
 
-    println!("    📝 Creating new bias calibration set:");
-    println!("       date={}, gain={:?}, offset={:?}, binning={:?}, instrume={:?}",
-        date, bias_group.gain, bias_group.offset, bias_group.binning, bias_group.instrume);
-    println!("       frames={}, dates: {} to {}", frame_count, date_start, date_end);
+    tracing::debug!(
+        date,
+        gain = ?bias_group.gain,
+        offset = ?bias_group.offset,
+        binning = ?bias_group.binning,
+        instrume = ?bias_group.instrume,
+        frame_count,
+        date_start,
+        date_end,
+        "creating new bias calibration set"
+    );
 
     conn.execute(
         "INSERT INTO calibration_set
@@ -987,21 +1013,27 @@ pub fn create_bias_calibration_set(
     )?;
 
     let set_id = conn.last_insert_rowid();
-    println!("    ✅ Created bias calibration set with ID: {}", set_id);
+    tracing::info!(set_id, frame_count, "created bias calibration set");
 
     // Link frames to set
-    println!("    🔗 Linking {} frames to set {}", bias_group.frame_ids.len(), set_id);
+    tracing::debug!(set_id, count = bias_group.frame_ids.len(), "linking frames to bias calibration set");
     for (idx, frame_id) in bias_group.frame_ids.iter().enumerate() {
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             (set_id, frame_id),
         ).map_err(|e| {
-            eprintln!("    ❌ Failed to link frame {} (index {}/{}): {}",
-                frame_id, idx + 1, bias_group.frame_ids.len(), e);
+            tracing::error!(
+                frame_id,
+                set_id,
+                index = idx + 1,
+                total = bias_group.frame_ids.len(),
+                error = %e,
+                "failed to link frame to bias calibration set"
+            );
             e
         })?;
     }
-    println!("    ✅ Linked all {} frames successfully", bias_group.frame_ids.len());
+    tracing::debug!(set_id, count = bias_group.frame_ids.len(), "linked all frames to bias calibration set");
 
     Ok(set_id)
 }

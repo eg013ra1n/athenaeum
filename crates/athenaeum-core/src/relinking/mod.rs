@@ -36,11 +36,14 @@ pub fn relink_files(
     old_root_path: &str,
     new_root_path: &str,
 ) -> Result<RelinkResult> {
-    println!("Starting relink: '{}' -> '{}'", old_root_path, new_root_path);
+    tracing::info!(src = %old_root_path, dest = %new_root_path, "starting relink");
 
     // Check if paths are the same - run verification mode instead
     if old_root_path == new_root_path {
-        println!("Old and new paths are identical - performing file verification instead");
+        tracing::info!(
+            path = %old_root_path,
+            "src and dest identical, running verification instead of relink"
+        );
         return verify_files_at_location(conn, old_root_path);
     }
 
@@ -69,9 +72,10 @@ pub fn relink_files(
         fingerprint_map.insert(fingerprint, (file_id, path));
     }
 
-    println!(
-        "Found {} files with fingerprints under old root",
-        fingerprint_map.len()
+    tracing::info!(
+        src = %old_root_path,
+        count = fingerprint_map.len(),
+        "found files with fingerprints under old root"
     );
 
     // Step 2: Scan new directory for FITS/XISF files
@@ -110,14 +114,14 @@ pub fn relink_files(
             FileFormat::FITS => match extract_fits_header(path) {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("Warning: Failed to read FITS header from {:?}: {}", path, e);
+                    tracing::warn!(path = %path.display(), error = %e, "failed to read FITS header, skipping file");
                     continue;
                 }
             },
             FileFormat::XISF => match extract_xisf_header(path) {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("Warning: Failed to read XISF header from {:?}: {}", path, e);
+                    tracing::warn!(path = %path.display(), error = %e, "failed to read XISF header, skipping file");
                     continue;
                 }
             },
@@ -136,9 +140,11 @@ pub fn relink_files(
             )
             .context("Failed to update file path")?;
 
-            println!(
-                "Matched: {} (id={}) -> {}",
-                old_path, file_id, new_path_str
+            tracing::debug!(
+                file_id = *file_id,
+                src = %old_path,
+                dest = %new_path_str,
+                "matched file to new location"
             );
             files_matched += 1;
             matched_file_ids.insert(*file_id);
@@ -157,9 +163,11 @@ pub fn relink_files(
 
     let files_orphaned = orphaned_file_ids.len();
 
-    println!(
-        "Relinking complete: {} matched, {} new, {} orphaned",
-        files_matched, files_new, files_orphaned
+    tracing::info!(
+        matched = files_matched,
+        new_files = files_new,
+        orphaned = files_orphaned,
+        "relinking complete"
     );
 
     Ok(RelinkResult {
@@ -203,7 +211,7 @@ fn verify_files_at_location(
     }
 
     let total_files = fingerprint_map.len();
-    println!("Found {} files with fingerprints at location", total_files);
+    tracing::info!(path = %root_path, count = total_files, "found files with fingerprints at location");
 
     let mut files_found = 0;
     let mut missing_file_ids = Vec::new();
@@ -219,9 +227,10 @@ fn verify_files_at_location(
 
     let files_missing = missing_file_ids.len();
 
-    println!(
-        "Verification complete: {} files still exist, {} missing",
-        files_found, files_missing
+    tracing::info!(
+        found = files_found,
+        missing = files_missing,
+        "verification complete"
     );
 
     Ok(RelinkResult {

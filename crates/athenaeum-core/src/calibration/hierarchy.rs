@@ -175,7 +175,7 @@ pub fn find_calibration_for_flat_set(
 
     if is_master_library {
         // Master sets are already calibrated - no sub-calibration needed
-        println!("  ⭐ Flat set {} is a master - no sub-calibration needed", flat_set_id);
+        tracing::debug!(set_id = flat_set_id, "flat set is a master, no sub-calibration needed");
         return Ok(Vec::new());
     }
 
@@ -196,11 +196,11 @@ pub fn find_calibration_for_flat_set(
     let mut candidates = find_calibration_for_flat(conn, &frame, &config)?;
 
     if candidates.is_empty() {
-        println!("  🔍 No existing calibration sets found for Flat via config matcher, trying on-demand creation...");
+        tracing::debug!(set_id = flat_set_id, "no existing calibration sets found for flat via config matcher, trying on-demand creation");
 
         // Try to create Dark on-demand (fallback to old behavior)
         if let Some(created_dark_id) = try_create_dark_for_frame(conn, &frame)? {
-            println!("  ✅ Created Dark set {} for Flat", created_dark_id);
+            tracing::debug!(set_id = created_dark_id, flat_set_id, "created dark set for flat");
 
             // Re-query using configurable matcher
             candidates = find_calibration_for_flat(conn, &frame, &config)?;
@@ -210,7 +210,7 @@ pub fn find_calibration_for_flat_set(
     if candidates.is_empty() {
         // Try to create Bias on-demand as last resort
         if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame)? {
-            println!("  ✅ Created Bias set {} for Flat", created_bias_id);
+            tracing::debug!(set_id = created_bias_id, flat_set_id, "created bias set for flat");
 
             // Re-query using configurable matcher
             candidates = find_calibration_for_flat(conn, &frame, &config)?;
@@ -238,7 +238,7 @@ pub fn find_calibration_for_dark_set(
 
     if is_master_library {
         // Master sets are already calibrated - no sub-calibration needed
-        println!("  ⭐ Dark set {} is a master - no sub-calibration needed", dark_set_id);
+        tracing::debug!(set_id = dark_set_id, "dark set is a master, no sub-calibration needed");
         return Ok(Vec::new());
     }
 
@@ -262,11 +262,11 @@ pub fn find_calibration_for_dark_set(
         // Check if bias for dark optimization is enabled before trying on-demand creation
         if let Some(opts) = config.get_behavioral_options("darks") {
             if opts.use_bias_for_dark_optimization {
-                println!("  🔍 No existing Bias sets found for Dark, attempting on-demand creation...");
+                tracing::debug!(set_id = dark_set_id, "no existing bias sets found for dark, trying on-demand creation");
 
                 // Try to create Bias on-demand
                 if let Some(created_bias_id) = try_create_bias_for_frame(conn, &frame)? {
-                    println!("  ✅ Created Bias set {} for Dark", created_bias_id);
+                    tracing::debug!(set_id = created_bias_id, dark_set_id, "created bias set for dark");
 
                     // Re-query using configurable matcher
                     candidates = find_calibration_for_dark(conn, &frame, &config)?;
@@ -336,13 +336,20 @@ pub fn build_complete_hierarchy(
         )?;
 
         if flat_matches.is_empty() {
-            println!("  ⚠️  No flat groups found for frame {:?}", frame_id);
+            tracing::warn!(frame_id, "no flat groups found for light frame");
             None
         } else {
-            println!("  ✅ Found {} flat group matches", flat_matches.len());
+            tracing::debug!(frame_id, count = flat_matches.len(), "found flat group matches");
             for (i, m) in flat_matches.iter().enumerate() {
-                println!("    Match {}: score={:.3}, age={}d, timing={:?}, frames={}",
-                    i, m.match_score, m.age_days, m.timing, m.group.frame_count);
+                tracing::trace!(
+                    frame_id,
+                    index = i,
+                    score = m.match_score,
+                    age_days = m.age_days,
+                    timing = ?m.timing,
+                    count = m.group.frame_count,
+                    "flat group match candidate"
+                );
             }
 
             // Apply pattern-based selection
@@ -350,7 +357,7 @@ pub fn build_complete_hierarchy(
                 .and_then(|p| FlatPattern::from_str(p))
                 .unwrap_or(FlatPattern::Automatic); // Default to Automatic (nearest by time)
 
-            println!("  🎯 Applying pattern: {:?}", pattern);
+            tracing::debug!(frame_id, pattern = ?pattern, "applying flat pattern selection");
 
             // Pass light frame date for temporal proximity calculation
             let light_frame_date = light_frame.date_obs;
@@ -362,8 +369,13 @@ pub fn build_complete_hierarchy(
             );
 
             if let Some(flat_match) = selected_match {
-                println!("  ✅ Pattern selected match: age={}d, timing={:?}, frames={}",
-                    flat_match.age_days, flat_match.timing, flat_match.group.frame_count);
+                tracing::debug!(
+                    frame_id,
+                    age_days = flat_match.age_days,
+                    timing = ?flat_match.timing,
+                    count = flat_match.group.frame_count,
+                    "pattern selected flat match"
+                );
 
                 // Find/reuse calibration set from the flat group (don't modify existing sets)
                 let set_id = create_flat_calibration_set(conn, &flat_match.group, false, focallen_tolerance)?;
@@ -409,7 +421,7 @@ pub fn build_complete_hierarchy(
 
                 Some(set_id)
             } else {
-                println!("  ⚠️  Pattern selection returned no match");
+                tracing::warn!(frame_id, "flat pattern selection returned no match");
                 None
             }
         }
@@ -520,10 +532,10 @@ pub fn build_complete_hierarchy(
 
         // Try to create Dark on-demand if not found
         if ranked_darks.is_empty() {
-            println!("  🔍 No existing Dark sets found for Light frame, attempting on-demand creation...");
+            tracing::debug!(frame_id, "no existing dark sets found for light frame, trying on-demand creation");
 
             if let Some(created_dark_id) = try_create_dark_for_frame(conn, light_frame)? {
-                println!("  ✅ Created Dark set {} for Light frame", created_dark_id);
+                tracing::debug!(set_id = created_dark_id, frame_id, "created dark set for light frame");
 
                 // Re-query using configurable matcher
                 ranked_darks = find_dark_for_light(conn, light_frame, &config)?;
@@ -698,7 +710,7 @@ fn try_create_dark_for_frame(
     let instrume = match &frame.instrume {
         Some(i) => i.as_str(),
         None => {
-            println!("    ⚠️  Frame missing instrume, cannot create Dark");
+            tracing::warn!(frame_id = ?frame.id, "frame missing instrume, cannot create dark on-demand");
             return Ok(None);
         }
     };
@@ -706,21 +718,21 @@ fn try_create_dark_for_frame(
     let binning = match &frame.binning {
         Some(b) => b.as_str(),
         None => {
-            println!("    ⚠️  Frame missing binning, cannot create Dark");
+            tracing::warn!(frame_id = ?frame.id, "frame missing binning, cannot create dark on-demand");
             return Ok(None);
         }
     };
 
     let exptime = frame.exptime;
     if exptime.is_none() {
-        println!("    ⚠️  Frame missing exptime, cannot create Dark");
+        tracing::warn!(frame_id = ?frame.id, "frame missing exptime, cannot create dark on-demand");
         return Ok(None);
     }
 
     let date_obs = match &frame.date_obs {
         Some(d) => d,
         None => {
-            println!("    ⚠️  Frame missing date_obs, cannot create Dark");
+            tracing::warn!(frame_id = ?frame.id, "frame missing date_obs, cannot create dark on-demand");
             return Ok(None);
         }
     };
@@ -734,14 +746,18 @@ fn try_create_dark_for_frame(
         .map(|c| c.time_cluster_minutes)
         .unwrap_or(30);
 
-    println!("    📋 Dark search parameters: max_age_days={}, time_cluster_minutes={}",
-        max_age_days, time_cluster_minutes);
+    tracing::debug!(frame_id = ?frame.id, max_age_days, time_cluster_minutes, "dark on-demand search parameters");
 
     // Calculate date range: ±max_age_days from frame date
     let start_date = *date_obs - Duration::days(max_age_days);
     let end_date = *date_obs + Duration::days(max_age_days);
 
-    println!("    📅 Dark date range: {} to {}", start_date, end_date);
+    tracing::debug!(
+        frame_id = ?frame.id,
+        date_start = %start_date,
+        date_end = %end_date,
+        "dark on-demand date range"
+    );
 
     // Detect dark groups
     // Note: focal_length is NOT used for Dark matching - Darks are sensor-only calibrations
@@ -761,14 +777,19 @@ fn try_create_dark_for_frame(
     )?;
 
     if dark_groups.is_empty() {
-        println!("    ⚠️  No dark groups found for on-demand creation");
+        tracing::warn!(frame_id = ?frame.id, "no dark groups found for on-demand creation");
         return Ok(None);
     }
 
     // Select best group (first one - they're sorted newest first)
     let best_group = &dark_groups[0];
-    println!("    🎯 Selected best dark group: {} frames, from {} to {}",
-        best_group.frame_count, best_group.start_time, best_group.end_time);
+    tracing::debug!(
+        frame_id = ?frame.id,
+        count = best_group.frame_count,
+        date_start = %best_group.start_time,
+        date_end = %best_group.end_time,
+        "selected best dark group for on-demand creation"
+    );
 
     // Find/reuse calibration set from best group (don't modify existing sets)
     let set_id = create_dark_calibration_set(conn, best_group, false)?;
@@ -786,7 +807,7 @@ fn try_create_bias_for_frame(
     let instrume = match &frame.instrume {
         Some(i) => i.as_str(),
         None => {
-            println!("    ⚠️  Frame missing instrume, cannot create Bias");
+            tracing::warn!(frame_id = ?frame.id, "frame missing instrume, cannot create bias on-demand");
             return Ok(None);
         }
     };
@@ -794,7 +815,7 @@ fn try_create_bias_for_frame(
     let binning = match &frame.binning {
         Some(b) => b.as_str(),
         None => {
-            println!("    ⚠️  Frame missing binning, cannot create Bias");
+            tracing::warn!(frame_id = ?frame.id, "frame missing binning, cannot create bias on-demand");
             return Ok(None);
         }
     };
@@ -802,7 +823,7 @@ fn try_create_bias_for_frame(
     let date_obs = match &frame.date_obs {
         Some(d) => d,
         None => {
-            println!("    ⚠️  Frame missing date_obs, cannot create Bias");
+            tracing::warn!(frame_id = ?frame.id, "frame missing date_obs, cannot create bias on-demand");
             return Ok(None);
         }
     };
@@ -816,14 +837,18 @@ fn try_create_bias_for_frame(
         .map(|c| c.time_cluster_minutes)
         .unwrap_or(30);
 
-    println!("    📋 Bias search parameters: max_age_days={}, time_cluster_minutes={}",
-        max_age_days, time_cluster_minutes);
+    tracing::debug!(frame_id = ?frame.id, max_age_days, time_cluster_minutes, "bias on-demand search parameters");
 
     // Calculate date range: ±max_age_days from frame date
     let start_date = *date_obs - Duration::days(max_age_days);
     let end_date = *date_obs + Duration::days(max_age_days);
 
-    println!("    📅 Bias date range: {} to {}", start_date, end_date);
+    tracing::debug!(
+        frame_id = ?frame.id,
+        date_start = %start_date,
+        date_end = %end_date,
+        "bias on-demand date range"
+    );
 
     // Detect bias groups
     // Note: focal_length is NOT used for Bias matching - Bias frames are sensor-only calibrations
@@ -842,14 +867,19 @@ fn try_create_bias_for_frame(
     )?;
 
     if bias_groups.is_empty() {
-        println!("    ⚠️  No bias groups found for on-demand creation");
+        tracing::warn!(frame_id = ?frame.id, "no bias groups found for on-demand creation");
         return Ok(None);
     }
 
     // Select best group (first one - they're sorted newest first)
     let best_group = &bias_groups[0];
-    println!("    🎯 Selected best bias group: {} frames, from {} to {}",
-        best_group.frame_count, best_group.start_time, best_group.end_time);
+    tracing::debug!(
+        frame_id = ?frame.id,
+        count = best_group.frame_count,
+        date_start = %best_group.start_time,
+        date_end = %best_group.end_time,
+        "selected best bias group for on-demand creation"
+    );
 
     // Find/reuse calibration set from best group (don't modify existing sets)
     let set_id = create_bias_calibration_set(conn, best_group, false)?;

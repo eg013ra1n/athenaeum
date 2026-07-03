@@ -24,7 +24,6 @@ use xxhash_rust::xxh3::xxh3_64;
 /// ```ignore
 /// let header = r#"{"SIMPLE": true, "BITPIX": -32, "NAXIS": 2}"#;
 /// let fingerprint = compute_header_fingerprint(header);
-/// println!("Fingerprint: {}", fingerprint);
 /// ```
 pub fn compute_header_fingerprint(header_json: &str) -> String {
     let hash = xxh3_64(header_json.as_bytes());

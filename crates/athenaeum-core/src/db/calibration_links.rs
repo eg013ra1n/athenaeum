@@ -41,8 +41,11 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
 
         if has_manual_override > 0 {
             // Skip - don't overwrite manual override with auto-find result
-            println!("⚠️ Skipping auto-find for frame {} {} - manual override exists",
-                link.source_id, link.calibration_type);
+            tracing::warn!(
+                frame_id = link.source_id,
+                calibration_type = %link.calibration_type,
+                "skipping auto-find, manual override exists"
+            );
             return Ok(0);
         }
     }
@@ -825,14 +828,14 @@ fn calculate_temp_warning(
     // Check if mode is "Warning" (not Ignore or Exact)
     let temp_mode_enabled = is_temp_warning_enabled(config, cal_type);
     if !temp_mode_enabled {
-        println!("  🔇 Temp warning DISABLED by config for {} (mode != Warning)", cal_type);
+        tracing::debug!(calibration_type = %cal_type, "temp warning disabled by config (mode != Warning)");
         return (false, None);
     }
 
     let frame_temp = match get_frame_temp(conn, frame_id) {
         Some(t) => t,
         None => {
-            println!("  ⚠️ Frame {} has NO ccd_temp data", frame_id);
+            tracing::debug!(frame_id, "frame has no ccd_temp data");
             return (false, None);
         }
     };
@@ -840,7 +843,7 @@ fn calculate_temp_warning(
     let set_temp = match get_calibration_set_temp(conn, set_id) {
         Some(t) => t,
         None => {
-            println!("  ⚠️ Cal set {} has NO ccd_temp data", set_id);
+            tracing::debug!(set_id, "calibration set has no ccd_temp data");
             return (false, None);
         }
     };
@@ -851,14 +854,22 @@ fn calculate_temp_warning(
     let threshold = match get_temp_warning_threshold(config, cal_type) {
         Some(t) => t,
         None => {
-            println!("  🔇 Temp warning DISABLED for {} (no threshold set)", cal_type);
+            tracing::debug!(calibration_type = %cal_type, "temp warning disabled, no threshold set");
             return (false, Some(temp_diff));
         }
     };
 
     let has_warning = temp_diff > threshold;
-    println!("  🌡️ Temp check for {} set {}: frame={:.1}°C, set={:.1}°C, diff={:.1}°C, threshold={:.1}°C -> warning={}",
-        cal_type, set_id, frame_temp, set_temp, temp_diff, threshold, has_warning);
+    tracing::debug!(
+        calibration_type = %cal_type,
+        set_id,
+        frame_temp,
+        set_temp,
+        temp_diff,
+        threshold,
+        has_warning,
+        "temp check for calibration set"
+    );
 
     (has_warning, Some(temp_diff))
 }
@@ -874,14 +885,14 @@ fn calculate_date_warning(
 ) -> (bool, Option<i64>) {
     let date_warning_enabled = is_date_warning_enabled(config, cal_type);
     if !date_warning_enabled {
-        println!("  🔇 Date warning DISABLED by config for {} (threshold=0 or >10000)", cal_type);
+        tracing::debug!(calibration_type = %cal_type, "date warning disabled by config (threshold=0 or >10000)");
         return (false, None);
     }
 
     let frame_date = match get_frame_date(conn, frame_id) {
         Some(d) => d,
         None => {
-            println!("  ⚠️ Frame {} has NO date_obs data", frame_id);
+            tracing::debug!(frame_id, "frame has no date_obs data");
             return (false, None);
         }
     };
@@ -889,7 +900,7 @@ fn calculate_date_warning(
     let set_date = match get_calibration_set_date(conn, set_id) {
         Some(d) => d,
         None => {
-            println!("  ⚠️ Cal set {} has NO date data", set_id);
+            tracing::debug!(set_id, "calibration set has no date data");
             return (false, None);
         }
     };
@@ -898,8 +909,14 @@ fn calculate_date_warning(
     let threshold = get_date_warning_threshold(config, cal_type);
 
     let has_warning = date_diff > threshold;
-    println!("  📅 Date check for {} set {}: diff={} days, threshold={} days -> warning={}",
-        cal_type, set_id, date_diff, threshold, has_warning);
+    tracing::debug!(
+        calibration_type = %cal_type,
+        set_id,
+        date_diff,
+        threshold,
+        has_warning,
+        "date check for calibration set"
+    );
 
     (has_warning, Some(date_diff))
 }
@@ -912,7 +929,7 @@ pub fn calculate_calibration_warnings(
     set_id: i64,
     cal_type: &str,
 ) -> Vec<CalibrationWarning> {
-    println!("📊 calculate_calibration_warnings: frame {} -> {} set {}", frame_id, cal_type, set_id);
+    tracing::debug!(frame_id, calibration_type = %cal_type, set_id, "calculating calibration warnings");
     let config = load_config(conn);
     let mut warnings = Vec::new();
 
@@ -943,7 +960,13 @@ pub fn calculate_calibration_warnings(
         }
     }
 
-    println!("  ✅ Generated {} warnings for frame {} -> {} set {}", warnings.len(), frame_id, cal_type, set_id);
+    tracing::debug!(
+        count = warnings.len(),
+        frame_id,
+        calibration_type = %cal_type,
+        set_id,
+        "generated calibration warnings"
+    );
     warnings
 }
 

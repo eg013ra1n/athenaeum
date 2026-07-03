@@ -59,7 +59,7 @@ pub fn run_cycle<E: ProgressEmitter>(
     let db = match ctx.db.get() {
         Some(db) => db,
         None => {
-            eprintln!("[monitor] database not initialized; skipping cycle");
+            tracing::error!(cycle_id = %cycle_id, "database not initialized, skipping monitor cycle");
             return;
         }
     };
@@ -67,7 +67,7 @@ pub fn run_cycle<E: ProgressEmitter>(
     let roots = match crate::db::get_scan_roots(&db.conn()) {
         Ok(roots) => roots,
         Err(e) => {
-            eprintln!("[monitor] failed to list scan roots: {}", e);
+            tracing::error!(cycle_id = %cycle_id, error = %e, "failed to list scan roots");
             return;
         }
     };
@@ -85,14 +85,16 @@ pub fn run_cycle<E: ProgressEmitter>(
             let mut offline = offline_roots.lock().unwrap();
             match (offline.contains(&root_id), available) {
                 (false, false) => {
-                    eprintln!(
-                        "[monitor] root {} ({}) went offline; will skip until it returns",
-                        root_id, root.path
+                    tracing::warn!(
+                        cycle_id = %cycle_id,
+                        root_id,
+                        path = %root.path,
+                        "root went offline, will skip until it returns"
                     );
                     offline.insert(root_id);
                 }
                 (true, true) => {
-                    eprintln!("[monitor] root {} ({}) back online", root_id, root.path);
+                    tracing::info!(cycle_id = %cycle_id, root_id, path = %root.path, "root back online");
                     offline.remove(&root_id);
                 }
                 _ => {}
@@ -132,7 +134,7 @@ pub fn run_cycle<E: ProgressEmitter>(
                 // "Scan already in progress" is not a real error — another
                 // path beat us to it. Anything else we log.
                 if !e.contains("already in progress") {
-                    eprintln!("[monitor] scan for root {} failed: {}", root_id, e);
+                    tracing::error!(cycle_id = %cycle_id, root_id, error = %e, "scan failed");
                 }
             }
         }
@@ -173,7 +175,7 @@ fn run_auto_merge_pass<E: ProgressEmitter>(ctx: &ServiceContext, emitter: &E) {
     let threshold_deg = match ctx.settings.get_grouping_threshold_deg(&db.conn()) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[monitor] auto-merge: failed to read threshold: {}", e);
+            tracing::error!(error = %e, "auto-merge: failed to read grouping threshold");
             return;
         }
     };
@@ -186,7 +188,7 @@ fn run_auto_merge_pass<E: ProgressEmitter>(ctx: &ServiceContext, emitter: &E) {
     let sets = match crate::db::get_frames_sets_by_project(&db.conn(), 1) {
         Ok(sets) => sets,
         Err(e) => {
-            eprintln!("[monitor] auto-merge: failed to list frame sets: {}", e);
+            tracing::error!(error = %e, "auto-merge: failed to list frame sets");
             return;
         }
     };
@@ -209,9 +211,10 @@ fn run_auto_merge_pass<E: ProgressEmitter>(ctx: &ServiceContext, emitter: &E) {
         ) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "[monitor] auto-merge: find_candidates failed for set {}: {}",
-                    set_id, e
+                tracing::warn!(
+                    set_id,
+                    error = %e,
+                    "auto-merge: failed to find candidates for set, skipping this cycle"
                 );
                 continue;
             }
@@ -244,10 +247,7 @@ fn run_auto_merge_pass<E: ProgressEmitter>(ctx: &ServiceContext, emitter: &E) {
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "[monitor] auto-merge: merge failed for set {}: {}",
-                    set_id, e
-                );
+                tracing::warn!(set_id, error = %e, "auto-merge: merge_candidates failed, will retry next cycle");
             }
         }
     }

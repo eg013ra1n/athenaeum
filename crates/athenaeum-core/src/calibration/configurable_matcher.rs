@@ -684,7 +684,7 @@ pub fn load_config(conn: &Connection) -> CalibrationMatchingConfig {
             match CalibrationMatchingConfig::from_json(&json) {
                 Ok(config) => config.migrate(),
                 Err(e) => {
-                    eprintln!("Failed to parse calibration config, using defaults: {}", e);
+                    tracing::warn!(error = %e, "failed to parse calibration matching config, using defaults");
                     CalibrationMatchingConfig::default()
                 }
             }

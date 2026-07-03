@@ -85,10 +85,7 @@ pub fn bulk_move_to_black_hole(
         let path = match path {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "bulk_move_to_black_hole: file_id {} not found: {}",
-                    file_id, e
-                );
+                tracing::error!(file_id, error = %e, "bulk_move_to_black_hole: file not found");
                 failed.push((*file_id, format!("file row not found: {}", e)));
                 continue;
             }
@@ -109,10 +106,7 @@ pub fn bulk_move_to_black_hole(
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "bulk_move_to_black_hole: failed to move file_id {} ({}): {}",
-                    file_id, path, e
-                );
+                tracing::error!(file_id, path = %path, error = %e, "bulk_move_to_black_hole: failed to move file");
                 failed.push((*file_id, e.to_string()));
             }
         }

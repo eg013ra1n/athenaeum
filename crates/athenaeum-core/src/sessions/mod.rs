@@ -50,7 +50,7 @@ pub fn detect_sessions(
             let frame_id = frame.id?;
 
             if frame.date_obs.is_none() {
-                println!("Frame {} has no date_obs", frame_id);
+                tracing::debug!(frame_id, "frame has no date_obs, excluded from session detection");
                 return None;
             }
 
@@ -65,10 +65,14 @@ pub fn detect_sessions(
         })
         .collect();
 
-    println!("Filtered: {} frames with valid timestamps out of {} total", frames_with_time.len(), total_frames);
+    tracing::info!(
+        count = frames_with_time.len(),
+        total = total_frames,
+        "filtered frames with valid timestamps"
+    );
 
     if frames_with_time.is_empty() {
-        println!("No frames with valid date_obs found!");
+        tracing::warn!("no frames with valid date_obs found, returning no sessions");
         return Ok(Vec::new());
     }
 
