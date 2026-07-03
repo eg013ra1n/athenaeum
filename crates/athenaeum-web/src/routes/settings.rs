@@ -214,6 +214,20 @@ pub async fn get_logging_config(
     Ok(Json(logging::config::LoggingConfigResponse { config, env_override_active }))
 }
 
+/// Request body for `set_logging_config`. The frontend calls
+/// `api.invoke('set_logging_config', { config })` per the Tauri named-arg
+/// convention used by every `api.invoke` call, so the HTTP body is
+/// `{ "config": { ... } }`, not a bare `LoggingConfig`. `LoggingConfig`
+/// derives `#[serde(default)]`, so a bare-struct extractor here would
+/// silently deserialize an unrecognized wrapped body to
+/// `LoggingConfig::default()` instead of erroring — 200 OK, config quietly
+/// reset. See `.superpowers/sdd/task-10-report.md`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLoggingConfigArgs {
+    pub config: logging::LoggingConfig,
+}
+
 /// POST /api/set_logging_config
 ///
 /// Validates the config (rejects an out-of-range level or per-module level,
@@ -223,8 +237,9 @@ pub async fn get_logging_config(
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_logging_config(
     State(state): State<WebAppState>,
-    Json(config): Json<logging::LoggingConfig>,
+    Json(args): Json<SetLoggingConfigArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
+    let config = args.config;
     config.validate().map_err(|e| {
         tracing::warn!(error = %e, "rejected invalid logging config");
         (StatusCode::BAD_REQUEST, e)
@@ -315,6 +330,10 @@ mod logging_config_tests {
         assert!(!resp.env_override_active);
     }
 
+    /// Regression guard for the real frontend payload: `api.invoke` sends
+    /// `{ "config": { ... } }`, per the Tauri named-arg convention — not a
+    /// bare `LoggingConfig`. Exercises the handler via the wrapped
+    /// `SetLoggingConfigArgs` struct directly.
     #[tokio::test]
     async fn set_logging_config_then_get_reflects_change() {
         let tmp = TempDir::new().unwrap();
@@ -325,7 +344,7 @@ mod logging_config_tests {
         modules.insert("scanner".to_string(), "debug".to_string());
         let cfg = logging::LoggingConfig { level: "debug".to_string(), modules };
 
-        let _ = set_logging_config(State(state.clone()), Json(cfg))
+        let _ = set_logging_config(State(state.clone()), Json(SetLoggingConfigArgs { config: cfg }))
             .await
             .expect("valid config must be accepted");
 
@@ -347,7 +366,9 @@ mod logging_config_tests {
         let state = test_state(db);
 
         let cfg = logging::LoggingConfig { level: "chatty".to_string(), modules: Default::default() };
-        let err = set_logging_config(State(state.clone()), Json(cfg)).await.unwrap_err();
+        let err = set_logging_config(State(state.clone()), Json(SetLoggingConfigArgs { config: cfg }))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
 
         // Verify the DB was untouched on rejection: get_logging_config must still return default.
@@ -356,6 +377,29 @@ mod logging_config_tests {
             .unwrap()
             .0;
         assert_eq!(resp.config, logging::LoggingConfig::default());
+    }
+
+    /// Pins the fix: the handler now requires the `{ "config": ... }`
+    /// wrapper (matching `SetLoggingConfigArgs`). Deserializing a bare
+    /// `LoggingConfig` JSON body must fail hard (serde error), not silently
+    /// fall back to `LoggingConfig::default()`. This mirrors what axum's
+    /// `Json` extractor does at the HTTP boundary — a body that doesn't
+    /// contain a `config` field fails deserialization into
+    /// `SetLoggingConfigArgs` (its field is not optional/defaulted), which
+    /// axum surfaces as a 4xx `JsonRejection` in production.
+    #[test]
+    fn bare_logging_config_body_fails_to_deserialize_into_wrapped_args() {
+        let bare = serde_json::json!({
+            "level": "debug",
+            "modules": { "scanner": "debug" }
+        });
+
+        let result: Result<SetLoggingConfigArgs, _> = serde_json::from_value(bare);
+        assert!(
+            result.is_err(),
+            "bare LoggingConfig body must NOT deserialize into SetLoggingConfigArgs — \
+             this is what closes the silent-default hole (axum returns 422/400 for this shape)"
+        );
     }
 }
 
