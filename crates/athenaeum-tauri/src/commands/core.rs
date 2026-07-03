@@ -65,7 +65,7 @@ pub async fn initialize_database(
     }
 
     let db = Database::new(db_path.clone()).map_err(|e| {
-        tracing::error!("Database init failed: {}", e);
+        tracing::error!(error = %e, "database init failed");
         e.to_string()
     })?;
 
@@ -87,7 +87,7 @@ pub async fn initialize_database(
         }
     }
 
-    tracing::info!("Database initialized: {}", db_path.display());
+    tracing::info!(path = %db_path.display(), "database initialized");
     Ok(db_path.to_string_lossy().to_string())
 }
 

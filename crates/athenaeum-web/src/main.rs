@@ -75,9 +75,10 @@ pub struct WebAppState {
 
 #[tokio::main]
 async fn main() {
-    // Task 2 stores the returned handle (for live filter reload from
-    // settings); Task 1 only wires the call site so the workspace compiles.
-    let _ = logging::init(logging::Process::Web);
+    // Retains the LoggingHandle (and its WorkerGuard) for the process
+    // lifetime via a global OnceLock; reachable later via
+    // `logging::global_handle()` for settings-driven `apply_config`.
+    logging::init_global(logging::Process::Web);
 
     let config = Config::from_env();
 

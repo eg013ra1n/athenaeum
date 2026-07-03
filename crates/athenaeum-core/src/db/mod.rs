@@ -124,7 +124,7 @@ impl Database {
         if !conn.is_autocommit() {
             tracing::warn!("[db] pooled connection had an open transaction on checkout — rolling back");
             if let Err(e) = conn.execute("ROLLBACK", []) {
-                tracing::error!("[db] defensive ROLLBACK failed: {}", e);
+                tracing::error!(error = %e, "defensive rollback failed");
             }
         }
         conn

@@ -499,7 +499,7 @@ fn process_file(
                 // Surface the failure so the user knows duplicate detection
                 // skipped this file. Previously silently dropped to None.
                 let msg = format!("hash_error: {}: failed to compute content hash: {}", current_path, e);
-                tracing::warn!("{}", msg);
+                tracing::warn!(path = %current_path, error = %e, "failed to compute content hash");
                 hash_errors_out.push(msg);
                 None
             }
@@ -719,11 +719,7 @@ fn reparse_and_update_in_place(
             if let Err(rb) = conn.execute_batch(
                 "ROLLBACK TO reparse_in_place; RELEASE reparse_in_place",
             ) {
-                tracing::error!(
-                    "[scanner] savepoint rollback failed for {}: {}",
-                    path.display(),
-                    rb
-                );
+                tracing::error!(path = %path.display(), error = %rb, "savepoint rollback failed");
             }
             Err(e)
         }
@@ -944,7 +940,7 @@ fn process_file_parallel(
     path: &PathBuf,
     use_content_hash: bool,
 ) -> Result<FileProcessResult, String> {
-    tracing::debug!("Processing: {}", path.display());
+    tracing::debug!(path = %path.display(), "processing file");
 
     // Get file metadata
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -1063,7 +1059,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     };
 
     // Phase 1a: Discovery - collect all file paths with progress updates
-    tracing::info!("Phase 1a: Starting file discovery in '{}'", root_path.display());
+    tracing::info!(path = %root_path.display(), stage = "discovery", "starting file discovery");
     emit_progress(emitter, root_id, 0, 0, None, "discovery");
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1106,7 +1102,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     }
 
     result.files_found = files.len();
-    tracing::info!("Phase 1a complete: {} files found", files.len());
+    tracing::info!(count = files.len(), stage = "discovery", "file discovery complete");
 
     // Check for cancellation before proceeding
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1150,12 +1146,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Failed to query existing files: {}", e);
+                        tracing::error!(error = %e, "failed to query existing files");
                     }
                 }
             }
             Err(e) => {
-                tracing::error!("Failed to prepare existing files query: {}", e);
+                tracing::error!(error = %e, "failed to prepare existing files query");
             }
         }
         map
@@ -1200,10 +1196,10 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     result.files_skipped = result.files_found - new_files.len();
     tracing::info!(
-        "Files to process: {} ({} unchanged, {} modified — will UPDATE in place)",
-        new_files.len(),
-        result.files_skipped,
-        modified_paths.len(),
+        count = new_files.len(),
+        unchanged = result.files_skipped,
+        modified = modified_paths.len(),
+        "files to process (modified will UPDATE in place)"
     );
 
     // Check for cancellation before processing
@@ -1231,7 +1227,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     }
 
     // Phase 1b: Parallel processing - extract metadata from all files
-    tracing::info!("Phase 1b: Starting parallel FITS parsing of {} files", new_files.len());
+    tracing::info!(count = new_files.len(), stage = "processing", "starting parallel FITS parsing");
     let progress_counter = Arc::new(AtomicUsize::new(0));
     let total_new = new_files.len();
     let errors = Arc::new(Mutex::new(Vec::new()));
@@ -1295,7 +1291,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         })
         .collect();
 
-    tracing::info!("Phase 1b complete: {} results collected", processed_results.len());
+    tracing::info!(count = processed_results.len(), stage = "processing", "parallel FITS parsing complete");
 
     // Check if cancelled during processing phase
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1331,9 +1327,9 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     let mut lights_count: usize = 0;
 
     // Begin transaction for batch insert
-    tracing::info!("Phase 2: Starting DB inserts for {} results", processed_results.len());
+    tracing::info!(count = processed_results.len(), stage = "inserting", "starting DB inserts");
     if let Err(e) = conn.execute("BEGIN TRANSACTION", []) {
-        tracing::error!("Phase 2: BEGIN TRANSACTION failed: {}", e);
+        tracing::error!(error = %e, stage = "inserting", "begin transaction failed");
         result.errors.push(format!("Failed to start DB transaction: {}", e));
         emit_scan_complete(emitter, root_id, &result);
         return result;
@@ -1567,9 +1563,9 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     // transaction. Cancellation is supposed to mean "abort," not "keep what
     // I've partially inserted so far."
     if cancelled_mid_insert {
-        tracing::info!("Phase 2: Cancelled mid-batch, rolling back transaction");
+        tracing::info!(stage = "inserting", outcome = "cancelled", "rolling back transaction after cancel");
         if let Err(rb) = conn.execute("ROLLBACK", []) {
-            tracing::error!("Phase 2: ROLLBACK after cancel failed: {}", rb);
+            tracing::error!(error = %rb, stage = "inserting", "rollback after cancel failed");
             result.errors.push(format!("DB rollback after cancel failed: {}", rb));
         }
         // No COMMIT, no WAL checkpoint — caller still gets a populated result
@@ -1589,17 +1585,17 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     // Commit transaction. If COMMIT fails, the transaction stays open on
     // the connection; ROLLBACK explicitly so it doesn't poison the pool.
     if let Err(e) = conn.execute("COMMIT", []) {
-        tracing::error!("Phase 2: COMMIT failed: {}", e);
+        tracing::error!(error = %e, stage = "inserting", "commit failed");
         result.errors.push(format!("DB commit failed: {}", e));
         if let Err(rb) = conn.execute("ROLLBACK", []) {
-            tracing::error!("Phase 2: ROLLBACK after failed COMMIT failed: {}", rb);
+            tracing::error!(error = %rb, stage = "inserting", "rollback after failed commit failed");
         }
     }
 
     // Force WAL checkpoint to consolidate writes and reduce post-scan CPU activity
     // TRUNCATE mode moves all data from WAL to main DB and truncates the WAL file
     if let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []) {
-        tracing::warn!("Phase 2: WAL checkpoint failed: {}", e);
+        tracing::warn!(error = %e, stage = "inserting", "WAL checkpoint failed");
     }
 
     // Collect Phase-1 errors. EXTEND, don't assign: result.errors already

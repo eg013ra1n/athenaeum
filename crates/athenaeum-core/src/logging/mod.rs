@@ -145,6 +145,27 @@ pub fn init(process: Process) -> Option<LoggingHandle> {
     })
 }
 
+static GLOBAL: OnceLock<LoggingHandle> = OnceLock::new();
+
+/// Initialize and retain the handle for the process lifetime.
+///
+/// `init()` returns a `LoggingHandle` whose `WorkerGuard` must stay alive for
+/// the non-blocking file writer's worker thread to keep running — dropping
+/// it (e.g. via `let _ = init(...)`) shuts the writer down right after init.
+/// This stores the handle in a process-global `OnceLock` so callers don't
+/// have to thread it through, and so it stays reachable later for
+/// settings-driven `apply_config` calls via `global_handle()`.
+pub fn init_global(process: Process) {
+    if let Some(h) = init(process) {
+        let _ = GLOBAL.set(h);
+    }
+}
+
+/// Access the process-global `LoggingHandle` set up by `init_global`.
+pub fn global_handle() -> Option<&'static LoggingHandle> {
+    GLOBAL.get()
+}
+
 impl LoggingHandle {
     pub fn env_override_active(&self) -> bool {
         self.env_override
@@ -156,10 +177,14 @@ impl LoggingHandle {
             return;
         }
         match cfg.to_directives().parse::<EnvFilter>() {
-            Ok(f) => {
-                let _ = self.reload.reload(f);
-                tracing::info!(directives = %cfg.to_directives(), "logging filter applied");
-            }
+            Ok(f) => match self.reload.reload(f) {
+                Ok(()) => {
+                    tracing::info!(directives = %cfg.to_directives(), "logging filter applied");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "logging filter reload failed; keeping previous filter");
+                }
+            },
             Err(error) => {
                 tracing::warn!(%error, "invalid logging directives; keeping previous filter")
             }

@@ -42,9 +42,10 @@ use tauri::{Manager, State};
 /// Initialize file-based logging before Tauri starts.
 /// Called from main() so panics during Tauri init are captured.
 pub fn init_logging() {
-    // Task 2 stores the returned handle (for live filter reload from
-    // settings); Task 1 only wires the call site so the workspace compiles.
-    let _ = logging::init(logging::Process::Desktop);
+    // Retains the LoggingHandle (and its WorkerGuard) for the process
+    // lifetime via a global OnceLock; reachable later via
+    // `logging::global_handle()` for settings-driven `apply_config`.
+    logging::init_global(logging::Process::Desktop);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
