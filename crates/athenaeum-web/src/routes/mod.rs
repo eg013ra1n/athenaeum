@@ -272,8 +272,10 @@ async fn initialize_database(
 }
 
 async fn get_log_path() -> Json<Option<String>> {
-    // In web mode, log path is not directly accessible to the client
-    Json(None)
+    // Mirrors the desktop command's semantics: the log directory (rolling
+    // daily JSONL files live inside it), not a single file path. `None` if
+    // logging failed to initialize (e.g. no writable log dir resolved).
+    Json(athenaeum_core::logging::get_path().map(|p| p.to_string_lossy().to_string()))
 }
 
 async fn get_database_path(
