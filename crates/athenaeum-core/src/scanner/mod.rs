@@ -1631,7 +1631,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
 
     // Force WAL checkpoint to consolidate writes and reduce post-scan CPU activity
     // TRUNCATE mode moves all data from WAL to main DB and truncates the WAL file
-    if let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []) {
+    if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(())) {
         tracing::warn!(error = %e, stage = "inserting", "WAL checkpoint failed");
     }
 

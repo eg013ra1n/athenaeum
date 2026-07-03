@@ -710,7 +710,7 @@ fn try_create_dark_for_frame(
     let instrume = match &frame.instrume {
         Some(i) => i.as_str(),
         None => {
-            tracing::warn!(frame_id = ?frame.id, "frame missing instrume, cannot create dark on-demand");
+            tracing::warn!(frame_id = frame.id.unwrap_or(-1), "frame missing instrume, cannot create dark on-demand");
             return Ok(None);
         }
     };
@@ -718,21 +718,21 @@ fn try_create_dark_for_frame(
     let binning = match &frame.binning {
         Some(b) => b.as_str(),
         None => {
-            tracing::warn!(frame_id = ?frame.id, "frame missing binning, cannot create dark on-demand");
+            tracing::warn!(frame_id = frame.id.unwrap_or(-1), "frame missing binning, cannot create dark on-demand");
             return Ok(None);
         }
     };
 
     let exptime = frame.exptime;
     if exptime.is_none() {
-        tracing::warn!(frame_id = ?frame.id, "frame missing exptime, cannot create dark on-demand");
+        tracing::warn!(frame_id = frame.id.unwrap_or(-1), "frame missing exptime, cannot create dark on-demand");
         return Ok(None);
     }
 
     let date_obs = match &frame.date_obs {
         Some(d) => d,
         None => {
-            tracing::warn!(frame_id = ?frame.id, "frame missing date_obs, cannot create dark on-demand");
+            tracing::warn!(frame_id = frame.id.unwrap_or(-1), "frame missing date_obs, cannot create dark on-demand");
             return Ok(None);
         }
     };
@@ -746,14 +746,14 @@ fn try_create_dark_for_frame(
         .map(|c| c.time_cluster_minutes)
         .unwrap_or(30);
 
-    tracing::debug!(frame_id = ?frame.id, max_age_days, time_cluster_minutes, "dark on-demand search parameters");
+    tracing::debug!(frame_id = frame.id.unwrap_or(-1), max_age_days, time_cluster_minutes, "dark on-demand search parameters");
 
     // Calculate date range: ±max_age_days from frame date
     let start_date = *date_obs - Duration::days(max_age_days);
     let end_date = *date_obs + Duration::days(max_age_days);
 
     tracing::debug!(
-        frame_id = ?frame.id,
+        frame_id = frame.id.unwrap_or(-1),
         date_start = %start_date,
         date_end = %end_date,
         "dark on-demand date range"
@@ -777,14 +777,14 @@ fn try_create_dark_for_frame(
     )?;
 
     if dark_groups.is_empty() {
-        tracing::warn!(frame_id = ?frame.id, "no dark groups found for on-demand creation");
+        tracing::warn!(frame_id = frame.id.unwrap_or(-1), "no dark groups found for on-demand creation");
         return Ok(None);
     }
 
     // Select best group (first one - they're sorted newest first)
     let best_group = &dark_groups[0];
     tracing::debug!(
-        frame_id = ?frame.id,
+        frame_id = frame.id.unwrap_or(-1),
         count = best_group.frame_count,
         date_start = %best_group.start_time,
         date_end = %best_group.end_time,
@@ -807,7 +807,7 @@ fn try_create_bias_for_frame(
     let instrume = match &frame.instrume {
         Some(i) => i.as_str(),
         None => {
-            tracing::warn!(frame_id = ?frame.id, "frame missing instrume, cannot create bias on-demand");
+            tracing::warn!(frame_id = frame.id.unwrap_or(-1), "frame missing instrume, cannot create bias on-demand");
             return Ok(None);
         }
     };
@@ -815,7 +815,7 @@ fn try_create_bias_for_frame(
     let binning = match &frame.binning {
         Some(b) => b.as_str(),
         None => {
-            tracing::warn!(frame_id = ?frame.id, "frame missing binning, cannot create bias on-demand");
+            tracing::warn!(frame_id = frame.id.unwrap_or(-1), "frame missing binning, cannot create bias on-demand");
             return Ok(None);
         }
     };
@@ -823,7 +823,7 @@ fn try_create_bias_for_frame(
     let date_obs = match &frame.date_obs {
         Some(d) => d,
         None => {
-            tracing::warn!(frame_id = ?frame.id, "frame missing date_obs, cannot create bias on-demand");
+            tracing::warn!(frame_id = frame.id.unwrap_or(-1), "frame missing date_obs, cannot create bias on-demand");
             return Ok(None);
         }
     };
@@ -837,14 +837,14 @@ fn try_create_bias_for_frame(
         .map(|c| c.time_cluster_minutes)
         .unwrap_or(30);
 
-    tracing::debug!(frame_id = ?frame.id, max_age_days, time_cluster_minutes, "bias on-demand search parameters");
+    tracing::debug!(frame_id = frame.id.unwrap_or(-1), max_age_days, time_cluster_minutes, "bias on-demand search parameters");
 
     // Calculate date range: ±max_age_days from frame date
     let start_date = *date_obs - Duration::days(max_age_days);
     let end_date = *date_obs + Duration::days(max_age_days);
 
     tracing::debug!(
-        frame_id = ?frame.id,
+        frame_id = frame.id.unwrap_or(-1),
         date_start = %start_date,
         date_end = %end_date,
         "bias on-demand date range"
@@ -867,14 +867,14 @@ fn try_create_bias_for_frame(
     )?;
 
     if bias_groups.is_empty() {
-        tracing::warn!(frame_id = ?frame.id, "no bias groups found for on-demand creation");
+        tracing::warn!(frame_id = frame.id.unwrap_or(-1), "no bias groups found for on-demand creation");
         return Ok(None);
     }
 
     // Select best group (first one - they're sorted newest first)
     let best_group = &bias_groups[0];
     tracing::debug!(
-        frame_id = ?frame.id,
+        frame_id = frame.id.unwrap_or(-1),
         count = best_group.frame_count,
         date_start = %best_group.start_time,
         date_end = %best_group.end_time,

@@ -826,7 +826,7 @@ pub fn create_dark_calibration_set(
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_dark_set(conn, dark_group)?;
-    tracing::debug!(existing_set_id = ?existing_set_id, "existing dark set check");
+    tracing::debug!(existing_set_id = existing_set_id.unwrap_or(-1), "existing dark set check");
 
     if let Some(set_id) = existing_set_id {
         if allow_modify {
@@ -942,7 +942,7 @@ pub fn create_bias_calibration_set(
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_bias_set(conn, bias_group)?;
-    tracing::debug!(existing_set_id = ?existing_set_id, "existing bias set check");
+    tracing::debug!(existing_set_id = existing_set_id.unwrap_or(-1), "existing bias set check");
 
     if let Some(set_id) = existing_set_id {
         if allow_modify {

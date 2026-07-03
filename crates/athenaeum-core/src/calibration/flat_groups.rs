@@ -440,7 +440,7 @@ pub fn create_flat_calibration_set(
 ) -> Result<i64> {
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_flat_set(conn, flat_group, focallen_tolerance)?;
-    tracing::debug!(existing_set_id = ?existing_set_id, "existing flat set check");
+    tracing::debug!(existing_set_id = existing_set_id.unwrap_or(-1), "existing flat set check");
 
     if let Some(set_id) = existing_set_id {
         if allow_modify {

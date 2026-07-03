@@ -113,7 +113,7 @@ pub fn find_flat_groups_for_light_frame(
     let frame_date_opt: Option<DateTime<Utc>> = light_frame.date_obs;
 
     tracing::debug!(
-        frame_id = ?light_frame.id,
+        frame_id = light_frame.id.unwrap_or(-1),
         instrume,
         filter = ?filter,
         binning,
@@ -132,7 +132,7 @@ pub fn find_flat_groups_for_light_frame(
     // pure-mono single-filter setup doesn't silently regress.
     if crate::models::is_mono_with_ambiguous_filter(&light_frame.bayerpat, &light_frame.filter) {
         tracing::warn!(
-            frame_id = ?light_frame.id,
+            frame_id = light_frame.id.unwrap_or(-1),
             "filter-ambiguous mono frame: bayerpat and filter both NULL, auto-link will match any flat with FILTER=NULL, verify manually"
         );
     }
@@ -166,7 +166,7 @@ pub fn find_flat_groups_for_light_frame(
         date_range,
     ).map_err(|e| {
         tracing::error!(
-            frame_id = ?light_frame.id,
+            frame_id = light_frame.id.unwrap_or(-1),
             instrume,
             filter = ?filter,
             binning,

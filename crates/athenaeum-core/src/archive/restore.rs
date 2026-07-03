@@ -276,7 +276,7 @@ fn run_restore_inner(
                     );
                     tracing::error!(
                         operation_id,
-                        file_id = ?f.file_id,
+                        file_id = f.file_id.unwrap_or(-1),
                         src = %f.source_path,
                         expected_hash = %f.expected_hash,
                         actual_hash = %actual,
@@ -306,7 +306,7 @@ fn run_restore_inner(
                     );
                     tracing::error!(
                         operation_id,
-                        file_id = ?f.file_id,
+                        file_id = f.file_id.unwrap_or(-1),
                         src = %f.source_path,
                         error = %e,
                         "restore conflict: could not verify on-disk file, leaving frame set archived pending resolution"
