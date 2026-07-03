@@ -57,6 +57,8 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 
 **Canonical field dictionary** — never ad-hoc synonyms. Core names: `frame_id`, `file_id`, `frame_set_id`, `set_id` (calibration set), `root_id`, `operation_id`, `command`, `path`, `src`, `dest`, `duration_ms`, `count`, `error`, `outcome`, `stage`. snake_case only. New fields extend the dictionary in this spec via PR — not invented inline.
 
+**Dictionary extensions (added during implementation, T1):** scan-summary counts `found`, `processed`, `skipped`, `modified` (siblings of the scan-domain counts `seen`/`new`/`updated`/`errors` and the example's `unchanged`; the Task 5 scanner sweep table reconciles final scan-count naming); `monitor_enabled` (bool, scan-root monitor toggle); `addr` (server bind address); `directives` (EnvFilter directive string on logging-filter events).
+
 **Message style rule**: the message is a short, stable human phrase; all data lives in fields. `info!(root_id, new = 12, unchanged = 4219, "scan finished")` — never `info!("scan finished — 12 new of 4231")`. This is what makes events aggregatable and MCP-queryable.
 
 **Per-domain required fields** (the catalog; enforced by the sweep tables and code review). "Required" means: present wherever the value exists at that point in the operation — an event before a value is computed omits it; the sweep tables specify exact fields per event:

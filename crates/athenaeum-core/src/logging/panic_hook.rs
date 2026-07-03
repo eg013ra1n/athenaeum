@@ -12,7 +12,7 @@ pub fn install() {
     std::panic::set_hook(Box::new(move |info| {
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC: {info}\nBacktrace:\n{bt}");
-        tracing::error!(%info, "panic");
+        tracing::error!(error = %info, "panic");
 
         if let Some(dir) = super::get_path() {
             let crash_path = dir.join("crash.log");
