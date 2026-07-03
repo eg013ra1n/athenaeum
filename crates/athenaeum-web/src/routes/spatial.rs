@@ -70,6 +70,7 @@ fn calculate_fov(
 /// Returns all imaging locations: organised frame sets and unorganised
 /// coordinate clusters, so the sky map can display targets before the user
 /// runs auto-generate.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_imaging_locations(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<ImagingLocation>>, (StatusCode, String)> {
@@ -261,6 +262,7 @@ pub async fn get_imaging_locations(
 ///
 /// Returns candidate LIGHT frames whose RA/Dec falls inside the supplied
 /// bounding box.  Handles the RA wrap-around at 0°/360°.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn query_frames_in_bounds(
     State(state): State<WebAppState>,
     Json(args): Json<SelectionBoundsArgs>,
@@ -342,6 +344,7 @@ pub struct CalendarMonthArgs {
 ///
 /// Returns all imaging activity grouped by date for the given calendar month.
 /// Includes both organised frame sets and unorganised LIGHT frames.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calendar_month_data(
     State(state): State<WebAppState>,
     Json(args): Json<CalendarMonthArgs>,

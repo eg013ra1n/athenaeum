@@ -67,6 +67,7 @@ fn no_db() -> (StatusCode, String) {
 /// Checks the settings to determine whether content hashes or metadata hashes
 /// are used.  Serves from the warm cache when available; otherwise computes
 /// on-the-fly (slow path, used before the first scan populates the cache).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_duplicates(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -97,6 +98,7 @@ pub async fn get_duplicates(
 ///
 /// Looks up the file's current path, then records it in the `black_hole` table
 /// so it can be reviewed or permanently deleted later.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn move_to_black_hole(
     State(state): State<WebAppState>,
     Json(args): Json<MoveToBlackHoleArgs>,
@@ -126,6 +128,7 @@ pub async fn move_to_black_hole(
 /// Move a batch of files to the black hole in a single transaction, emitting
 /// SSE progress events as it runs. Mirrors the Tauri `bulk_move_to_black_hole`
 /// command.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn bulk_move_to_black_hole(
     State(state): State<WebAppState>,
     Json(args): Json<BulkMoveToBlackHoleArgs>,
@@ -154,6 +157,7 @@ pub async fn bulk_move_to_black_hole(
 ///
 /// Pass `filter` to limit results to a specific `from_where` source label
 /// (e.g. `"duplicates"`).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_black_hole_files(
     State(state): State<WebAppState>,
     Json(args): Json<GetBlackHoleFilesArgs>,
@@ -166,6 +170,7 @@ pub async fn get_black_hole_files(
 }
 
 /// Given a list of file IDs, return the subset that are currently blackholed.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_blackholed_file_ids(
     State(state): State<WebAppState>,
     Json(args): Json<GetBlackholedFileIdsArgs>,
@@ -202,6 +207,7 @@ pub async fn get_blackholed_file_ids(
 
 /// Restore a file from the black hole (removes it from the `black_hole` table;
 /// does not move the file on disk).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn restore_from_black_hole(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
@@ -223,6 +229,7 @@ pub async fn restore_from_black_hole(
 ///
 /// WARNING: this is irreversible.  The file is removed from the filesystem and
 /// all related database rows (frames, black_hole, etc.) are deleted via CASCADE.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn send_to_void(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
@@ -237,6 +244,7 @@ pub async fn send_to_void(
 /// Permanently delete all files currently in the black hole.
 ///
 /// WARNING: this is irreversible.  Returns the number of files deleted.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn send_all_to_void(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -265,6 +273,7 @@ pub struct SetScanRootUniqueCameraFlagArgs {
 }
 
 /// Update the allow_duplicates flag for a scan root.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_scan_root_duplicates_flag(
     State(state): State<WebAppState>,
     Json(args): Json<SetScanRootDuplicatesFlagArgs>,
@@ -278,6 +287,7 @@ pub async fn set_scan_root_duplicates_flag(
 }
 
 /// Toggle unique_camera flag for a scan root.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_scan_root_unique_camera_flag(
     State(state): State<WebAppState>,
     Json(args): Json<SetScanRootUniqueCameraFlagArgs>,
@@ -302,6 +312,7 @@ pub struct VerifyFilesByteIdenticalArgs {
     pub path2: String,
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn verify_files_byte_identical(
     Json(args): Json<VerifyFilesByteIdenticalArgs>,
 ) -> Result<Json<bool>, (StatusCode, String)> {
@@ -317,6 +328,7 @@ pub async fn verify_files_byte_identical(
 /// `threshold` is a similarity percentage (0–100); defaults to 70.0 if omitted.
 /// Always computes fresh — the folder similarity cache cannot account for files
 /// that have since been moved to the black hole.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_duplicate_folders(
     State(state): State<WebAppState>,
     Json(args): Json<GetDuplicateFoldersArgs>,

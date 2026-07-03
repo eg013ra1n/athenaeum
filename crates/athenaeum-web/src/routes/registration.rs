@@ -124,6 +124,7 @@ fn require_bright_cache(state: &WebAppState) -> Option<Arc<solvemyastro::StarCac
 /// Begin (or re-run) registration for all LIGHT members of `framesSetId`.
 /// Runs synchronously in a blocking task; progress is broadcast via SSE on
 /// `stacking-prep-progress`, summary on `stacking-prep-complete`.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn register_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<RegisterFrameSetArgs>,
@@ -194,6 +195,7 @@ pub async fn register_frame_set(
 /// POST /api/get_frame_set_registration
 ///
 /// Return all persisted registration rows for a frame set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_set_registration(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -212,6 +214,7 @@ pub async fn get_frame_set_registration(
 /// POST /api/cancel_frame_set_registration
 ///
 /// Signal the running registration for `framesSetId` to stop cooperatively.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn cancel_frame_set_registration(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -230,6 +233,7 @@ pub async fn cancel_frame_set_registration(
 ///
 /// Persist the user-chosen reference frame for a frame set.
 /// Validates that `frame_id` is a LIGHT member of the set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_frame_set_reference(
     State(state): State<WebAppState>,
     Json(args): Json<SetFrameSetReferenceArgs>,
@@ -248,6 +252,7 @@ pub async fn set_frame_set_reference(
 /// POST /api/get_frame_set_reference
 ///
 /// Return the persisted user-chosen reference frame for a frame set, if any.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_set_reference(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,

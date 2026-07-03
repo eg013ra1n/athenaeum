@@ -100,6 +100,7 @@ pub struct ExportableFrameSet {
 // ── Config handlers ───────────────────────────────────────────────────────────
 
 /// Get WBPP export configuration (returns default if not set).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
@@ -112,6 +113,7 @@ pub async fn get_wbpp_export_config(
 }
 
 /// Save WBPP export configuration to the database.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(args): Json<SetWbppExportConfigArgs>,
@@ -130,6 +132,7 @@ pub async fn set_wbpp_export_config(
 }
 
 /// Reset WBPP export configuration to defaults.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn reset_wbpp_export_config(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
@@ -149,6 +152,7 @@ pub async fn reset_wbpp_export_config(
 // ── Data collection handlers ──────────────────────────────────────────────────
 
 /// Get export preview data for a frame set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_export_preview(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -161,6 +165,7 @@ pub async fn get_export_preview(
 }
 
 /// Get a list of available frame sets for export.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_exportable_frame_sets(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
@@ -219,6 +224,7 @@ pub async fn get_exportable_frame_sets(
 ///
 /// Builds a structured view of the export groups and their calibration trees,
 /// suitable for displaying in the UI.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_route(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -474,6 +480,7 @@ pub async fn get_calibration_route(
 }
 
 /// Get enhanced export summary for the new UI.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_export_summary(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -494,6 +501,7 @@ pub async fn get_export_summary(
 /// Emits SSE progress events via the broadcast channel while the file
 /// organizer runs.  The DB lock is released before the (potentially long)
 /// file-copy phase so other handlers can still serve requests.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn export_to_wbpp(
     State(state): State<WebAppState>,
     Json(args): Json<ExportToWbppArgs>,
@@ -638,6 +646,7 @@ pub async fn export_to_wbpp(
 }
 
 /// Returns the configured export directory path, or null if not set.
+#[tracing::instrument(skip_all)]
 pub async fn get_export_dir(
     State(state): State<WebAppState>,
     Json(_args): Json<serde_json::Value>,
@@ -646,6 +655,7 @@ pub async fn get_export_dir(
 }
 
 /// Cancel an active export operation.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn cancel_export(
     State(state): State<WebAppState>,
     Json(args): Json<CancelExportArgs>,

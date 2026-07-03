@@ -7,6 +7,7 @@ use super::AppState;
 
 /// Update the allow_duplicates flag for a scan root
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_scan_root_duplicates_flag(
     id: i64,
     enabled: bool,
@@ -24,6 +25,7 @@ pub async fn set_scan_root_duplicates_flag(
 /// Returns `BulkMoveResult { moved, failed }`. Per-file failures don't abort
 /// the batch — they're logged and reported in `failed`.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn bulk_move_to_black_hole(
     file_ids: Vec<i64>,
     from_where: String,
@@ -53,6 +55,7 @@ pub async fn bulk_move_to_black_hole(
 
 /// Move a file to the black hole (soft delete)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn move_to_black_hole(
     file_id: i64,
     from_where: String,
@@ -81,6 +84,7 @@ pub async fn move_to_black_hole(
 
 /// Get all files in the black hole
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_black_hole_files(
     filter: Option<String>,
     state: State<'_, AppState>,
@@ -93,6 +97,7 @@ pub async fn get_black_hole_files(
 
 /// Check which file IDs from a given list are in the black hole
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_blackholed_file_ids(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -130,6 +135,7 @@ pub async fn get_blackholed_file_ids(
 
 /// Restore a file from the black hole
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn restore_from_black_hole(
     file_id: i64,
     state: State<'_, AppState>,
@@ -150,6 +156,7 @@ pub async fn restore_from_black_hole(
 
 /// Permanently delete a file (send to void)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn send_to_void(file_id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -159,6 +166,7 @@ pub async fn send_to_void(file_id: i64, state: State<'_, AppState>) -> Result<()
 
 /// Permanently delete all files in black hole (send all to void)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn send_all_to_void(state: State<'_, AppState>) -> Result<usize, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -170,6 +178,7 @@ pub async fn send_all_to_void(state: State<'_, AppState>) -> Result<usize, Strin
 /// Always computes fresh since folder similarity depends on current file state
 /// and can't easily filter out black_hole files from cached data
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_duplicate_folders(
     threshold: Option<f64>,
     state: State<'_, AppState>,
@@ -189,6 +198,7 @@ pub async fn get_duplicate_folders(
 /// samples 3×512 KiB regions of a file, so two genuinely different large
 /// files can collide in the sampled hash.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn verify_files_byte_identical(
     path1: String,
     path2: String,

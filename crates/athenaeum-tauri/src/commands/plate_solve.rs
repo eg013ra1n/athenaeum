@@ -169,6 +169,7 @@ fn get_dso_catalog(state: &AppState) -> Option<Arc<DsoCatalog>> {
 // ========== Config Commands ==========
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_plate_solve_config(
     state: State<'_, AppState>,
 ) -> Result<PlateSolveConfig, String> {
@@ -178,6 +179,7 @@ pub async fn get_plate_solve_config(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_plate_solve_config(
     state: State<'_, AppState>,
     config: PlateSolveConfig,
@@ -188,6 +190,7 @@ pub async fn set_plate_solve_config(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn reset_plate_solve_config(
     state: State<'_, AppState>,
 ) -> Result<PlateSolveConfig, String> {
@@ -225,6 +228,7 @@ struct PlateSolveCompleteEvent {
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn plate_solve_batch(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -549,6 +553,7 @@ enum WorkResult {
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn cancel_plate_solve(state: State<'_, AppState>) -> Result<(), String> {
     let solves = state.ctx.active_plate_solves.lock().unwrap();
     eprintln!(
@@ -602,6 +607,7 @@ struct AutofindCompleteEvent {
 /// `autofind-objects-complete` once finished. Does NOT return a value —
 /// callers should listen for the complete event for the summary.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn autofind_objects_from_coordinates(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -690,6 +696,7 @@ pub async fn autofind_objects_from_coordinates(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn cancel_autofind_objects(state: State<'_, AppState>) -> Result<(), String> {
     let handles = state.ctx.active_plate_solves.lock().unwrap();
     if let Some(handle) = handles.get(&1) {
@@ -699,6 +706,7 @@ pub async fn cancel_autofind_objects(state: State<'_, AppState>) -> Result<(), S
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_plate_solve_result(
     state: State<'_, AppState>,
     frame_id: i64,
@@ -713,6 +721,7 @@ pub async fn get_plate_solve_result(
 /// `frames.ra/dec/rotation/objctra/objctdec` columns that were just cleared
 /// — otherwise the pane's Plate-solve result card would render stale data.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_plate_solve_for_frame(
     state: State<'_, AppState>,
     frame_id: i64,
@@ -737,6 +746,7 @@ pub struct CatalogStatusInfo {
 /// Return one `CatalogStatusInfo` per declared density tier, merged with
 /// on-disk installed state. Returns an empty Vec when no manifest is available.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_catalog_status(
     state: State<'_, AppState>,
 ) -> Result<Vec<CatalogStatusInfo>, String> {
@@ -763,6 +773,7 @@ pub async fn get_catalog_status(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_fov_summary(
     state: State<'_, AppState>,
 ) -> Result<athenaeum_core::plate_solve::FovSummary, String> {
@@ -786,6 +797,7 @@ struct CatalogDownloadProgress {
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn download_catalog_layers(
     app: tauri::AppHandle,
     state: State<'_, AppState>,

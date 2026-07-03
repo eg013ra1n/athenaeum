@@ -28,6 +28,7 @@ pub struct MissingFileRecord {
 /// Sync missing files to the database after a rescan
 /// This updates the missing_files table with the current state
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn sync_missing_files(
     root_id: i64,
     file_ids: Vec<i64>,
@@ -104,6 +105,7 @@ pub async fn sync_missing_files(
 
 /// Get missing files for a specific scan root with full details
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_missing_files(
     root_id: i64,
     state: State<'_, AppState>,
@@ -163,6 +165,7 @@ pub async fn get_missing_files(
 /// Get missing files counts for all scan roots (for indicators)
 /// Returns a map of scan_root_id -> count (only 'missing' status, not 'ignored')
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_missing_files_counts(
     state: State<'_, AppState>,
 ) -> Result<HashMap<i64, i64>, String> {
@@ -194,6 +197,7 @@ pub async fn get_missing_files_counts(
 /// Recheck missing files for a scan root and update their status
 /// Returns the list of files that are still missing
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn recheck_missing_files(
     root_id: i64,
     state: State<'_, AppState>,
@@ -269,6 +273,7 @@ pub async fn recheck_missing_files(
 
 /// Mark a missing file as ignored
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn ignore_missing_file(
     file_id: i64,
     state: State<'_, AppState>,
@@ -287,6 +292,7 @@ pub async fn ignore_missing_file(
 
 /// Remove ignored status from a missing file
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn unignore_missing_file(
     file_id: i64,
     state: State<'_, AppState>,
@@ -305,6 +311,7 @@ pub async fn unignore_missing_file(
 
 /// Delete files from the database entirely (removes from files, frames, missing_files tables)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_missing_files(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -330,6 +337,7 @@ pub async fn delete_missing_files(
 /// Relocate a missing file to a new path
 /// Updates the file path in the database and removes from missing_files
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn relocate_missing_file(
     file_id: i64,
     new_path: String,

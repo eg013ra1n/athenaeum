@@ -46,6 +46,7 @@ impl athenaeum_core::events::ProgressEmitter for TauriEmitter {
 /// are emitted on `stacking-prep-progress`; the completion summary on
 /// `stacking-prep-complete`.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn register_frame_set(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -103,6 +104,7 @@ pub async fn register_frame_set(
 
 /// Retrieve all persisted registration rows for a frame set.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_set_registration(
     state: State<'_, AppState>,
     frames_set_id: i64,
@@ -115,6 +117,7 @@ pub async fn get_frame_set_registration(
 
 /// Signal the running registration for `frames_set_id` to stop cooperatively.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn cancel_frame_set_registration(
     state: State<'_, AppState>,
     frames_set_id: i64,
@@ -133,6 +136,7 @@ pub async fn cancel_frame_set_registration(
 ///
 /// Validates that `frame_id` is a LIGHT member of the set before writing.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_frame_set_reference(
     state: State<'_, AppState>,
     frames_set_id: i64,
@@ -146,6 +150,7 @@ pub async fn set_frame_set_reference(
 
 /// Return the persisted user-chosen reference frame for a frame set, if any.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_set_reference(
     state: State<'_, AppState>,
     frames_set_id: i64,

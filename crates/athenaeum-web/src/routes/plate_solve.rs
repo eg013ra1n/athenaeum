@@ -119,6 +119,7 @@ struct PlateSolveCompleteEvent {
     total_time_ms: u64,
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_plate_solve_config(
     State(state): State<WebAppState>,
 ) -> Result<Json<PlateSolveConfig>, (StatusCode, String)> {
@@ -127,6 +128,7 @@ pub async fn get_plate_solve_config(
     Ok(Json(config::load_config(&conn)))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_plate_solve_config(
     State(state): State<WebAppState>,
     Json(cfg): Json<PlateSolveConfig>,
@@ -137,6 +139,7 @@ pub async fn set_plate_solve_config(
     Ok(Json(()))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn reset_plate_solve_config(
     State(state): State<WebAppState>,
 ) -> Result<Json<PlateSolveConfig>, (StatusCode, String)> {
@@ -147,6 +150,7 @@ pub async fn reset_plate_solve_config(
     Ok(Json(default_config))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn plate_solve_batch(
     State(state): State<WebAppState>,
     Json(args): Json<BatchArgs>,
@@ -438,6 +442,7 @@ enum WorkResult {
     },
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn cancel_plate_solve(
     State(state): State<WebAppState>,
 ) -> Json<()> {
@@ -488,6 +493,7 @@ struct AutofindCompleteEvent {
 ///
 /// Returns immediately; progress is streamed via SSE on event names
 /// `autofind-objects-progress` and `autofind-objects-complete`.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn autofind_objects_from_coordinates(
     State(state): State<WebAppState>,
     Json(args): Json<BatchArgs>,
@@ -587,6 +593,7 @@ pub async fn autofind_objects_from_coordinates(
     Ok(Json(()))
 }
 
+#[tracing::instrument(skip_all)]
 pub async fn cancel_autofind_objects(
     State(state): State<WebAppState>,
 ) -> Json<()> {
@@ -597,6 +604,7 @@ pub async fn cancel_autofind_objects(
     Json(())
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_plate_solve_result(
     State(state): State<WebAppState>,
     Json(args): Json<FrameIdArgs>,
@@ -612,6 +620,7 @@ pub async fn get_plate_solve_result(
 /// used by the metadata pane's "Revert WCS to FITS header" flow so the
 /// stored WCS doesn't outlive the cleared ra/dec/rotation/objctra/objctdec
 /// columns.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_plate_solve_for_frame(
     State(state): State<WebAppState>,
     Json(args): Json<FrameIdArgs>,
@@ -651,6 +660,7 @@ struct CatalogDownloadProgress {
 
 /// Return one `CatalogStatusInfo` per declared density tier, merged with
 /// on-disk installed state. Returns an empty Vec when no manifest is available.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_catalog_status(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<CatalogStatusInfo>>, (StatusCode, String)> {
@@ -678,6 +688,7 @@ pub async fn get_catalog_status(
     }).collect()))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_fov_summary(
     State(state): State<WebAppState>,
 ) -> Result<Json<athenaeum_core::plate_solve::FovSummary>, (StatusCode, String)> {
@@ -698,6 +709,7 @@ pub struct TargetDensityArgs {
     target_density: u32,
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn download_catalog_layers(
     State(state): State<WebAppState>,
     Json(args): Json<TargetDensityArgs>,

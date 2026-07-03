@@ -141,6 +141,7 @@ fn resolve_archive_root(
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_archive_settings(
     State(state): State<WebAppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -163,6 +164,7 @@ pub async fn get_archive_settings(
     Ok(Json(serde_json::json!({ "rootPath": root, "compression": compression })))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_archive_root_path(
     State(state): State<WebAppState>,
     Json(req): Json<SetRootRequest>,
@@ -180,6 +182,7 @@ pub async fn set_archive_root_path(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_archive_compression(
     State(state): State<WebAppState>,
     Json(req): Json<SetCompressionRequest>,
@@ -203,6 +206,7 @@ pub async fn set_archive_compression(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn plan_archive_operation(
     State(state): State<WebAppState>,
     Json(req): Json<PlanRequest>,
@@ -226,6 +230,7 @@ pub async fn plan_archive_operation(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", e)))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn start_archive_operation(
     State(state): State<WebAppState>,
     Json(req): Json<StartRequest>,
@@ -315,6 +320,7 @@ pub async fn start_archive_operation(
     Ok(Json(op_id))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn cancel_archive_operation(
     State(state): State<WebAppState>,
     Json(req): Json<OperationIdRequest>,
@@ -333,6 +339,7 @@ pub async fn cancel_archive_operation(
     }
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_restore_suggestions(
     State(state): State<WebAppState>,
     Json(req): Json<OperationIdRequest>,
@@ -385,6 +392,7 @@ pub async fn get_restore_suggestions(
     })))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_unfinished_archive_operations(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<ArchiveOperationSummary>>, (StatusCode, String)> {
@@ -398,6 +406,7 @@ pub async fn list_unfinished_archive_operations(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn resume_archive_operation(
     State(state): State<WebAppState>,
     Json(req): Json<OperationIdRequest>,
@@ -433,6 +442,7 @@ pub async fn resume_archive_operation(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn rollback_archive_operation(
     State(state): State<WebAppState>,
     Json(req): Json<OperationIdRequest>,
@@ -456,6 +466,7 @@ pub async fn rollback_archive_operation(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_archive_zips(
     State(state): State<WebAppState>,
     Json(req): Json<OperationIdRequest>,
@@ -505,6 +516,7 @@ pub async fn list_archive_zips(
     Ok(Json(rows))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_archived_frame_sets(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
@@ -556,6 +568,7 @@ pub async fn list_archived_frame_sets(
     Ok(Json(rows))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn start_restore_operation(
     State(state): State<WebAppState>,
     Json(req): Json<StartRestoreRequest>,
@@ -632,6 +645,7 @@ pub async fn start_restore_operation(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_archive(
     State(state): State<WebAppState>,
     Json(req): Json<OperationIdRequest>,
@@ -669,6 +683,7 @@ pub async fn delete_archive(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_archive_roots(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
@@ -698,6 +713,7 @@ pub async fn list_archive_roots(
     Ok(Json(rows))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn add_archive_root(
     State(state): State<WebAppState>,
     Json(req): Json<AddArchiveRootRequest>,
@@ -725,6 +741,7 @@ pub async fn add_archive_root(
     Ok(Json(conn.last_insert_rowid()))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_archive_root(
     State(state): State<WebAppState>,
     Json(req): Json<ArchiveRootIdRequest>,
@@ -756,6 +773,7 @@ pub async fn delete_archive_root(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_default_archive_root(
     State(state): State<WebAppState>,
     Json(req): Json<ArchiveRootIdRequest>,

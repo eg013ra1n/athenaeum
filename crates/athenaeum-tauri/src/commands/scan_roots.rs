@@ -13,6 +13,7 @@ use super::AppState;
 use super::utils::normalize_path;
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<ScanRoot, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -87,6 +88,7 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -95,6 +97,7 @@ pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>,
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -103,6 +106,7 @@ pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(),
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<ScanResultDto, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -162,6 +166,7 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<RescanResultDto, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -243,6 +248,7 @@ pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<R
 
 /// Relink files from old scan root to new location
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn relink_scan_root(
     root_id: i64,
     new_path: String,
@@ -281,6 +287,7 @@ pub async fn relink_scan_root(
 
 /// Check availability of all scan roots
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn check_all_scan_roots_availability(
     state: State<'_, AppState>,
 ) -> Result<Vec<(i64, bool)>, String> {
@@ -302,6 +309,7 @@ pub async fn check_all_scan_roots_availability(
 
 /// Check for missing files within a scan root
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn check_missing_files_in_scan_root(
     root_id: i64,
     app_handle: tauri::AppHandle,
@@ -413,6 +421,7 @@ pub struct RescanResultDto {
 
 /// Toggle unique_camera flag (flag-only, cascade happens on re-scan)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_scan_root_unique_camera_flag(
     id: i64,
     enabled: bool,
@@ -433,6 +442,7 @@ pub async fn set_scan_root_unique_camera_flag(
 /// polls only roots with this flag set. Persists immediately; the next monitor
 /// tick respects the new value.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_scan_root_monitor_enabled(
     id: i64,
     enabled: bool,
@@ -529,6 +539,7 @@ fn recreate_calibration_sets_for_root(
 /// Start a scan with progress events - runs synchronously but emits progress events
 /// The frontend should call this and listen to scan-progress/scan-complete events
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn start_scan_with_progress(
     root_id: i64,
     app_handle: tauri::AppHandle,
@@ -586,6 +597,7 @@ pub async fn start_scan_with_progress(
 
 /// Cancel an active scan
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn cancel_scan(
     root_id: i64,
     state: State<'_, AppState>,

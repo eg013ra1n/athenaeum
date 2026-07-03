@@ -46,6 +46,7 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
 use super::AppState;
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn initialize_database(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -141,6 +142,7 @@ async fn fetch_version_json(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn check_for_updates(state: State<'_, super::AppState>) -> Result<UpdateInfo, String> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
 

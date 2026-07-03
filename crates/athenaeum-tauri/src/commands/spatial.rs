@@ -12,6 +12,7 @@ use super::AppState;
 /// - Organized locations: Frames that are part of frame sets
 /// - Unorganized locations: Frames not in any set, clustered by sky coordinates
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<ImagingLocation>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -204,6 +205,7 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
 /// # Returns
 /// SelectionCandidates with frame IDs, coordinates, and exposure times
 #[tauri::command(rename_all = "snake_case")]
+#[tracing::instrument(skip_all, err)]
 pub async fn query_frames_in_bounds(
     state: State<'_, AppState>,
     bounds: SelectionBounds,

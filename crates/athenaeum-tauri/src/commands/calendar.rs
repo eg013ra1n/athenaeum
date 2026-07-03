@@ -12,6 +12,7 @@ use super::AppState;
 /// Returns all imaging activity grouped by date for calendar rendering.
 /// Includes both organized frame sets and unorganized LIGHT frames.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calendar_month_data(
     year: i32,
     month: i32,

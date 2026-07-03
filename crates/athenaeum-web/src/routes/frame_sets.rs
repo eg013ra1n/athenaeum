@@ -220,6 +220,7 @@ fn create_frame_set_inner(
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 /// Auto-generate frame sets by clustering light frames on sky coordinates.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn auto_generate_frame_sets(
     State(state): State<WebAppState>,
     Json(args): Json<AutoGenerateFrameSetsArgs>,
@@ -356,6 +357,7 @@ pub async fn auto_generate_frame_sets(
 }
 
 /// Get all frame sets (project_id is accepted for API compatibility but ignored).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frames_sets(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramesSetsArgs>,
@@ -378,6 +380,7 @@ pub async fn get_frames_sets(
 }
 
 /// Get detailed structure for a single frame set (nights and sessions).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_set_detail(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -390,6 +393,7 @@ pub async fn get_frame_set_detail(
 }
 
 /// Delete a frame set by ID (cascade removes nights/sessions/members).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_frames_set(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteFramesSetArgs>,
@@ -402,6 +406,7 @@ pub async fn delete_frames_set(
 }
 
 /// Delete all auto-generated frame sets (is_custom = false).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_auto_generated_frame_sets(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -414,6 +419,7 @@ pub async fn delete_auto_generated_frame_sets(
 }
 
 /// Rename a frame set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn rename_frames_set(
     State(state): State<WebAppState>,
     Json(args): Json<RenameFramesSetArgs>,
@@ -426,6 +432,7 @@ pub async fn rename_frames_set(
 }
 
 /// Mark a frame set as custom (one-way; also recalculates metadata).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn mark_frame_set_custom(
     State(state): State<WebAppState>,
     Json(args): Json<MarkFrameSetCustomArgs>,
@@ -465,6 +472,7 @@ pub async fn mark_frame_set_custom(
 }
 
 /// Merge source frame set into target frame set; source is deleted afterwards.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn merge_frame_sets(
     State(state): State<WebAppState>,
     Json(args): Json<MergeFrameSetsArgs>,
@@ -559,6 +567,7 @@ pub async fn merge_frame_sets(
 }
 
 /// Split the selected items out of a frame set into a new frame set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn split_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<SplitFrameSetArgs>,
@@ -763,6 +772,7 @@ pub async fn split_frame_set(
 }
 
 /// Create a custom frame set from a direct list of frame IDs.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn create_frame_set_from_selection(
     State(state): State<WebAppState>,
     Json(args): Json<CreateFrameSetFromSelectionArgs>,
@@ -780,6 +790,7 @@ pub async fn create_frame_set_from_selection(
 
 /// Get all excluded frames with full file + frame metadata. Drives the
 /// Excluded Frames page's Missing-Metadata-style repair toolbar.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_excluded_frames_with_metadata(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -799,6 +810,7 @@ pub struct RemoveFromExcludedArgs {
 
 /// Remove the given file IDs from the `excluded_frames` table. Returns the
 /// number of rows actually deleted.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn remove_files_from_excluded(
     State(state): State<WebAppState>,
     Json(args): Json<RemoveFromExcludedArgs>,
@@ -812,6 +824,7 @@ pub async fn remove_files_from_excluded(
 }
 
 /// Get count of excluded frames (lightweight check).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_excluded_frames_count(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -824,6 +837,7 @@ pub async fn get_excluded_frames_count(
 }
 
 /// Archive a frame set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn archive_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -852,6 +866,7 @@ pub struct FindNewFramesArgs {
 /// existing /api/start_scan_with_progress route for that explicitly. This
 /// keeps the request bounded (a fresh scan over many NAS roots would tie up
 /// an Axum worker for minutes).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn find_new_frames_for_set(
     State(state): State<WebAppState>,
     Json(args): Json<FindNewFramesArgs>,
@@ -914,6 +929,7 @@ pub struct AutoMergeArgs {
 }
 
 /// POST /api/auto_merge_new_frames_for_set
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn auto_merge_new_frames_for_set(
     State(state): State<WebAppState>,
     Json(args): Json<AutoMergeArgs>,
@@ -1003,6 +1019,7 @@ pub struct GetMergeLogArgs {
 }
 
 /// POST /api/get_frame_set_merge_log
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_set_merge_log(
     State(state): State<WebAppState>,
     Json(args): Json<GetMergeLogArgs>,

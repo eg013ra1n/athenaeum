@@ -13,6 +13,7 @@ use super::AppState;
 // ========== Config Commands ==========
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_analysis_config(
     state: State<'_, AppState>,
 ) -> Result<AnalysisConfig, String> {
@@ -22,6 +23,7 @@ pub async fn get_analysis_config(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_analysis_config(
     state: State<'_, AppState>,
     config: AnalysisConfig,
@@ -32,6 +34,7 @@ pub async fn set_analysis_config(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn reset_analysis_config(
     state: State<'_, AppState>,
 ) -> Result<AnalysisConfig, String> {
@@ -76,6 +79,7 @@ pub struct AnalyzeFrameSetResult {
 /// Uses rayon par_iter inside pool.install() for natural work-stealing across frames.
 /// Emits "analysis-progress" events during processing.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn analyze_frame_set(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
@@ -291,6 +295,7 @@ pub async fn analyze_frame_set(
 
 /// Cancel an active analysis.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn cancel_analysis(
     frame_set_id: i64,
     state: State<'_, AppState>,
@@ -306,6 +311,7 @@ pub async fn cancel_analysis(
 
 /// Get all stored analysis results for a frame set.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_analysis_for_frame_set(
     state: State<'_, AppState>,
     frame_set_id: i64,
@@ -328,6 +334,7 @@ fn detect_flip_vertical(path: &str) -> bool {
 
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_star_metrics(
     state: State<'_, AppState>,
     frame_id: i64,
@@ -432,6 +439,7 @@ pub struct FlatContourPlotResponse {
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn compute_flat_contour_plot(
     state: State<'_, AppState>,
     file_id: i64,

@@ -83,6 +83,7 @@ pub struct DeleteMissingFilesArgs {
 ///
 /// Check for files in the DB under this root that no longer exist on disk.
 /// Emits SSE progress events during the filesystem check.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn check_missing_files_in_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<RootIdArgs>,
@@ -148,6 +149,7 @@ pub async fn check_missing_files_in_scan_root(
 ///
 /// Sync the missing_files table after a rescan. Inserts new missing entries,
 /// removes entries for files that now exist, preserves 'ignored' entries.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn sync_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<SyncMissingFilesArgs>,
@@ -210,6 +212,7 @@ pub async fn sync_missing_files(
 /// POST /api/get_missing_files
 ///
 /// Return all missing file records for a scan root with full details.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<RootIdArgs>,
@@ -224,6 +227,7 @@ pub async fn get_missing_files(
 ///
 /// Re-verify all missing files for a root on disk, removing entries for files
 /// that have reappeared, then return the updated list.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn recheck_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<RootIdArgs>,
@@ -291,6 +295,7 @@ pub async fn recheck_missing_files(
 }
 
 /// POST /api/ignore_missing_file
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn ignore_missing_file(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
@@ -308,6 +313,7 @@ pub async fn ignore_missing_file(
 }
 
 /// POST /api/unignore_missing_file
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn unignore_missing_file(
     State(state): State<WebAppState>,
     Json(args): Json<FileIdArgs>,
@@ -327,6 +333,7 @@ pub async fn unignore_missing_file(
 /// POST /api/delete_missing_files
 ///
 /// Delete files from the database entirely (CASCADE handles frames, missing_files, etc.)
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_missing_files(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteMissingFilesArgs>,

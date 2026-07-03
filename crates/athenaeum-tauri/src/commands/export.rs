@@ -24,6 +24,7 @@ const WBPP_CONFIG_KEY: &str = "export.wbpp_config";
 
 /// Get WBPP export configuration (returns default if not set)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_wbpp_export_config(
     state: State<'_, AppState>,
 ) -> Result<WbppExportConfig, String> {
@@ -35,6 +36,7 @@ pub async fn get_wbpp_export_config(
 
 /// Save WBPP export configuration to database
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_wbpp_export_config(
     state: State<'_, AppState>,
     config: WbppExportConfig,
@@ -54,6 +56,7 @@ pub async fn set_wbpp_export_config(
 
 /// Reset WBPP export configuration to defaults
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn reset_wbpp_export_config(
     state: State<'_, AppState>,
 ) -> Result<WbppExportConfig, String> {
@@ -96,6 +99,7 @@ fn load_wbpp_config(conn: &rusqlite::Connection) -> Result<WbppExportConfig, Str
 ///
 /// Collects all light frames and their calibrations for preview before export.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_export_preview(
     state: State<'_, AppState>,
     frame_set_id: i64,
@@ -108,6 +112,7 @@ pub async fn get_export_preview(
 
 /// Get a list of available frame sets for export
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_exportable_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<Vec<ExportableFrameSet>, String> {
@@ -178,6 +183,7 @@ pub struct ExportableFrameSet {
 /// Returns a structured view of the export groups and their calibration trees,
 /// suitable for displaying in the UI.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_route(
     state: State<'_, AppState>,
     frame_set_id: i64,
@@ -417,6 +423,7 @@ pub async fn get_calibration_route(
 ///             └── (light frames)
 /// ```
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn export_to_wbpp(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
@@ -536,6 +543,7 @@ pub async fn export_to_wbpp(
 
 /// Cancel an active export
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn cancel_export(
     frame_set_id: i64,
     state: State<'_, AppState>,
@@ -558,6 +566,7 @@ pub async fn cancel_export(
 /// - Folder structure preview
 /// - Detailed warnings with context
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_export_summary(
     state: State<'_, AppState>,
     frame_set_id: i64,

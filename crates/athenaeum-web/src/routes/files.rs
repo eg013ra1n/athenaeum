@@ -74,6 +74,7 @@ pub struct GetFilesWithFramesByIdsArgs {
 /// POST /api/get_files
 ///
 /// Returns files with their frame metadata, most recently created first.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_files(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesArgs>,
@@ -97,6 +98,7 @@ pub async fn get_files(
 ///
 /// Returns files directly inside the given directory (non-recursive), with
 /// their frame metadata. The `directoryPath` must be an absolute path.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_files_by_directory(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesByDirectoryArgs>,
@@ -120,6 +122,7 @@ pub async fn get_files_by_directory(
 ///
 /// Returns the immediate subdirectories of `path` (via the filesystem) and the
 /// files directly inside it (from the database).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_directory_contents(
     State(state): State<WebAppState>,
     Json(args): Json<GetDirectoryContentsArgs>,
@@ -172,6 +175,7 @@ pub async fn get_directory_contents(
 ///
 /// Returns all distinct directory paths that contain files from the given
 /// camera (`instrume`), ordered alphabetically.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_camera_directories(
     State(state): State<WebAppState>,
     Json(args): Json<GetCameraDirectoriesArgs>,
@@ -191,6 +195,7 @@ pub async fn get_camera_directories(
 /// Returns the immediate subdirectories of `directoryPath` that are ancestors
 /// of (or equal to) a camera directory, plus the files directly inside it
 /// that belong to the given camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_camera_directory_contents(
     State(state): State<WebAppState>,
     Json(args): Json<GetCameraDirectoryContentsArgs>,
@@ -250,6 +255,7 @@ pub async fn get_camera_directory_contents(
 /// incomplete metadata. The `category` field controls which metadata gap to
 /// filter on: "all", "coordinates", "object", "datetime", "instrument", or
 /// "frametype".
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frames_with_missing_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramesWithMissingMetadataArgs>,
@@ -286,6 +292,7 @@ pub struct CountFrameMetadataRelationsArgs {
 ///
 /// Re-decode the originally-scanned header values for given frames so the
 /// UI can compare against current edits and revert per field.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_metadata_originals(
     State(state): State<WebAppState>,
     Json(args): Json<CountFrameMetadataRelationsArgs>,
@@ -301,6 +308,7 @@ pub async fn get_frame_metadata_originals(
 /// POST /api/get_frame_memberships
 ///
 /// Aggregate which framesets / calibration sets the given frames belong to.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_memberships(
     State(state): State<WebAppState>,
     Json(args): Json<CountFrameMetadataRelationsArgs>,
@@ -318,6 +326,7 @@ pub async fn get_frame_memberships(
 /// Counts the calibration-set / session relations for the given frames so
 /// the metadata editor can warn the user before applying edits that will
 /// unlink them.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn count_frame_metadata_relations(
     State(state): State<WebAppState>,
     Json(args): Json<CountFrameMetadataRelationsArgs>,
@@ -335,6 +344,7 @@ pub async fn count_frame_metadata_relations(
 /// DB-only bulk update of camera / date_obs / imagetyp / is_master on the given
 /// frames. Used by the Missing Metadata page's Set Camera / Set Date / Set
 /// Frame Type actions. Returns the number of rows updated.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn bulk_update_frame_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<BulkUpdateFrameMetadataArgs>,
@@ -356,6 +366,7 @@ pub async fn bulk_update_frame_metadata(
 ///
 /// Returns the distinct non-empty INSTRUME values from the frames table,
 /// alphabetically sorted. Feeds the Set Camera modal dropdown.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_distinct_instrumes(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
@@ -377,6 +388,7 @@ pub async fn get_distinct_instrumes(
 /// Bulk-loads full file and frame records for the given list of frame IDs.
 /// Useful when you have frame IDs from a frame set and need the complete
 /// metadata for display.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_files_with_frames_by_ids(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesWithFramesByIdsArgs>,
@@ -429,6 +441,7 @@ pub struct BrowseDirectoriesResponse {
 ///
 /// `scope = "scan"` (default): validates against `state.allowed_paths`.
 /// `scope = "export"`: validates against the configured export directory.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn browse_directories(
     State(state): State<WebAppState>,
     Json(args): Json<BrowseDirectoriesArgs>,
@@ -586,6 +599,7 @@ pub(crate) fn path_inside_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
 }
 
 /// POST /api/enqueue_move_operation
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn enqueue_move_operation(
     State(state): State<WebAppState>,
     Json(args): Json<EnqueueMoveArgs>,
@@ -674,6 +688,7 @@ pub async fn enqueue_move_operation(
     Ok(Json(op_id))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn search_catalog(
     State(state): State<WebAppState>,
     Json(args): Json<SearchCatalogArgs>,
@@ -760,6 +775,7 @@ pub async fn search_catalog(
     Ok(Json(rows))
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn mkdir_in_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<MkdirArgs>,
@@ -793,6 +809,7 @@ pub async fn mkdir_in_scan_root(
     Ok(StatusCode::OK)
 }
 
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn rename_path(
     State(state): State<WebAppState>,
     Json(args): Json<RenamePathArgs>,

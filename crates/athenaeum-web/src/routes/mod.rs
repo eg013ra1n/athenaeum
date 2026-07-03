@@ -263,6 +263,7 @@ async fn sse_handler(
 
 // ── Core routes ──────────────────────────────────────────────────────────────
 
+#[tracing::instrument(skip_all, err(Debug))]
 async fn initialize_database(
     State(state): State<WebAppState>,
 ) -> Result<Json<String>, (StatusCode, Json<serde_json::Value>)> {
@@ -273,6 +274,7 @@ async fn initialize_database(
     Ok(Json("Database initialized at server start".to_string()))
 }
 
+#[tracing::instrument(skip_all)]
 async fn get_log_path() -> Json<Option<String>> {
     // Mirrors the desktop command's semantics: the log directory (rolling
     // daily JSONL files live inside it), not a single file path. `None` if
@@ -280,6 +282,7 @@ async fn get_log_path() -> Json<Option<String>> {
     Json(athenaeum_core::logging::get_path().map(|p| p.to_string_lossy().to_string()))
 }
 
+#[tracing::instrument(skip_all)]
 async fn get_database_path(
     State(state): State<WebAppState>,
 ) -> Json<Option<String>> {
@@ -290,6 +293,7 @@ async fn get_database_path(
 // ── Category A — Desktop-only stubs ──────────────────────────────────────────
 
 /// POST /api/check_for_updates — returns static no-update response
+#[tracing::instrument(skip_all)]
 async fn check_for_updates(
     Json(_): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -302,6 +306,7 @@ async fn check_for_updates(
 }
 
 /// POST /api/relocate_missing_file — 501 in web mode (needs native file picker)
+#[tracing::instrument(skip_all)]
 async fn relocate_missing_file_stub(
     Json(_): Json<serde_json::Value>,
 ) -> (StatusCode, String) {
@@ -309,6 +314,7 @@ async fn relocate_missing_file_stub(
 }
 
 /// POST /api/read_fits_image_rustafits — 501 in web mode (web uses get_frame_preview)
+#[tracing::instrument(skip_all)]
 async fn read_fits_image_rustafits_stub(
     Json(_): Json<serde_json::Value>,
 ) -> (StatusCode, String) {

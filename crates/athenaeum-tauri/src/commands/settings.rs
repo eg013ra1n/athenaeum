@@ -10,6 +10,7 @@ use super::AppState;
 
 /// Get a setting value by key (with precedence: runtime > DB > default)
 #[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn get_setting(
     key: String,
     default_value: Option<String>,
@@ -26,6 +27,7 @@ pub async fn get_setting(
 
 /// Set a setting value (persists to database)
 #[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn set_setting(
     key: String,
     value: String,
@@ -58,6 +60,7 @@ pub async fn set_setting(
 
 /// Delete a setting by key
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -69,6 +72,7 @@ pub async fn delete_setting(key: String, state: State<'_, AppState>) -> Result<(
 /// Validates 0..=max_blink_threads (0 = auto, use all cores), persists to DB,
 /// and rebuilds the semaphore.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_blink_threads(
     threads: u32,
     state: State<'_, AppState>,
@@ -98,6 +102,7 @@ pub async fn set_blink_threads(
 
 /// Returns the CPU-based max so the frontend can set the slider/input max dynamically.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_blink_threads_max(state: State<'_, AppState>) -> Result<u32, String> {
     Ok(state.max_blink_threads as u32)
 }
@@ -107,6 +112,7 @@ pub async fn get_blink_threads_max(state: State<'_, AppState>) -> Result<u32, St
 /// Returns the effective logging config (persisted, or the default if
 /// unset) plus whether the `ATHENAEUM_LOG` env override is currently active.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_logging_config(
     state: State<'_, AppState>,
 ) -> Result<logging::config::LoggingConfigResponse, String> {
@@ -132,6 +138,7 @@ pub async fn get_logging_config(
 /// then live-applies it via the process-global `LoggingHandle`. Validation
 /// happens before the DB write; the live-apply happens after.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_logging_config(
     config: logging::LoggingConfig,
     state: State<'_, AppState>,

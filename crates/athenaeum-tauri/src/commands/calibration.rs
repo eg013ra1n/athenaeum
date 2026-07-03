@@ -11,6 +11,7 @@ use super::AppState;
 // ========== Equipment & Dark Library Commands ==========
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_equipment_cameras(
     state: State<'_, AppState>
 ) -> Result<Vec<CameraStats>, String> {
@@ -21,6 +22,7 @@ pub async fn get_equipment_cameras(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_dark_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -32,6 +34,7 @@ pub async fn get_dark_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn has_dark_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -43,6 +46,7 @@ pub async fn has_dark_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn create_master_dark_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -69,6 +73,7 @@ pub async fn create_master_dark_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_master_dark_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -80,6 +85,7 @@ pub async fn get_master_dark_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn has_master_dark_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -91,6 +97,7 @@ pub async fn has_master_dark_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn create_master_flat_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -117,6 +124,7 @@ pub async fn create_master_flat_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_master_flat_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -128,6 +136,7 @@ pub async fn get_master_flat_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn has_master_flat_library(
     state: State<'_, AppState>,
     instrume: String,
@@ -139,6 +148,7 @@ pub async fn has_master_flat_library(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_set_frames(
     state: State<'_, AppState>,
     set_id: i64,
@@ -150,6 +160,7 @@ pub async fn get_calibration_set_frames(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_set_consumers(
     state: State<'_, AppState>,
     set_id: i64,
@@ -165,6 +176,7 @@ pub async fn get_calibration_set_consumers(
 
 /// Find and link calibration for all light frames in a frame set
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn find_calibration_for_frame_set(
     frame_set_id: i64,
     flat_date_warning_days: Option<i64>,
@@ -242,6 +254,7 @@ pub async fn find_calibration_for_frame_set(
 
 /// Get calibration hierarchy organized by Date → Camera → Filter for a frame set
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_hierarchy_for_frame_set(
     frame_set_id: i64,
     state: State<'_, AppState>,
@@ -260,6 +273,7 @@ const CALIBRATION_CONFIG_KEY: &str = "calibration.matching_config";
 
 /// Get the current calibration matching configuration
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_matching_config(
     state: State<'_, AppState>,
 ) -> Result<crate::calibration::CalibrationMatchingConfig, String> {
@@ -285,6 +299,7 @@ pub async fn get_calibration_matching_config(
 
 /// Set the calibration matching configuration
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_calibration_matching_config(
     config: crate::calibration::CalibrationMatchingConfig,
     state: State<'_, AppState>,
@@ -304,6 +319,7 @@ pub async fn set_calibration_matching_config(
 
 /// Reset calibration matching configuration to defaults
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn reset_calibration_matching_config(
     state: State<'_, AppState>,
 ) -> Result<crate::calibration::CalibrationMatchingConfig, String> {
@@ -324,6 +340,7 @@ pub async fn reset_calibration_matching_config(
 
 /// Get average parameters of light frames for manual selection display
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_light_frame_parameters(
     frame_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -449,6 +466,7 @@ pub async fn get_light_frame_parameters(
 /// (every set returned, with `passed_hard_filter = false` flagged via the
 /// MatchDetails fields).
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_sets_for_manual_selection(
     frame_ids: Vec<i64>,
     calibration_type: String,  // "flat", "dark", "bias"
@@ -557,6 +575,7 @@ pub async fn get_calibration_sets_for_manual_selection(
 
 /// Manually assign a calibration set to light frames
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn manual_assign_calibration(
     frame_ids: Vec<i64>,
     calibration_set_id: i64,
@@ -613,6 +632,7 @@ pub async fn manual_assign_calibration(
 
 /// Remove manual calibration override and allow auto-find to reassign
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn clear_manual_calibration_override(
     frame_ids: Vec<i64>,
     calibration_type: Option<String>,  // None = clear all types
@@ -773,6 +793,7 @@ pub(crate) fn refresh_calibration_library_inner(
 /// 3. Reclusters and assigns frames to sets - sets are matched by params + date overlap
 /// 4. Deletes orphaned sets (sets with 0 frames after reclustering)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn refresh_calibration_library_for_camera(
     state: State<'_, AppState>,
     instrume: String,
@@ -805,6 +826,7 @@ fn query_frame_ids_by_type(
 
 /// Get parameters of a calibration set for sub-calibration selection display
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_set_parameters(
     set_id: i64,
     state: State<'_, AppState>,
@@ -878,6 +900,7 @@ pub async fn get_calibration_set_parameters(
 /// uses, with the parent set's parameters synthesized as a "frame" so the
 /// engine's `flats→{darkflat,dark,bias}` and `darks→bias` configs apply.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_subcalibration_sets_for_manual_selection(
     set_id: i64,
     calibration_type: String,  // "dark", "darkflat", "bias"
@@ -978,6 +1001,7 @@ pub async fn get_subcalibration_sets_for_manual_selection(
 
 /// Manually assign a sub-calibration set to a calibration set
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn manual_assign_subcalibration(
     source_set_id: i64,
     calibration_set_id: i64,
@@ -1022,6 +1046,7 @@ pub async fn manual_assign_subcalibration(
 
 /// Clear sub-calibration override for a calibration set
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn clear_subcalibration_override(
     source_set_id: i64,
     calibration_type: Option<String>,  // None = clear all sub-calibrations
@@ -1060,6 +1085,7 @@ pub async fn clear_subcalibration_override(
 /// Bulk update calibration set metadata
 /// Saves original values to calibration_set_originals table before updating
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn bulk_update_calibration_metadata(
     set_ids: Vec<i64>,
     edits: crate::models::CalibrationMetadataEdits,
@@ -1215,6 +1241,7 @@ pub async fn bulk_update_calibration_metadata(
 
 /// Bulk restore calibration set metadata from originals
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn bulk_restore_calibration_metadata(
     set_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -1264,6 +1291,7 @@ pub async fn bulk_restore_calibration_metadata(
 
 /// Get all set IDs that have custom metadata edits for a given camera
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_custom_metadata_set_ids(
     instrume: String,
     state: State<'_, AppState>,

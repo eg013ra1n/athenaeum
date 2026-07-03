@@ -66,6 +66,7 @@ pub struct FrameSetIdArgs {
 /// POST /api/get_equipment_cameras
 ///
 /// Returns all cameras (instrume) that have frames in the catalog.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_equipment_cameras(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -80,6 +81,7 @@ pub async fn get_equipment_cameras(
 /// POST /api/get_dark_library
 ///
 /// Retrieve existing dark calibration sets for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -94,6 +96,7 @@ pub async fn get_dark_library(
 /// POST /api/has_dark_library
 ///
 /// Check whether a dark library exists for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn has_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -110,6 +113,7 @@ pub async fn has_dark_library(
 /// POST /api/create_master_dark_library
 ///
 /// Build calibration sets from master dark frames for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn create_master_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -138,6 +142,7 @@ pub async fn create_master_dark_library(
 /// POST /api/get_master_dark_library
 ///
 /// Retrieve master dark calibration sets for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_master_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -152,6 +157,7 @@ pub async fn get_master_dark_library(
 /// POST /api/has_master_dark_library
 ///
 /// Check whether a master dark library exists for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn has_master_dark_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -168,6 +174,7 @@ pub async fn has_master_dark_library(
 /// POST /api/create_master_flat_library
 ///
 /// Build calibration sets from master flat frames for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn create_master_flat_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -196,6 +203,7 @@ pub async fn create_master_flat_library(
 /// POST /api/get_master_flat_library
 ///
 /// Retrieve master flat calibration sets for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_master_flat_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -210,6 +218,7 @@ pub async fn get_master_flat_library(
 /// POST /api/has_master_flat_library
 ///
 /// Check whether a master flat library exists for a camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn has_master_flat_library(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -231,6 +240,7 @@ pub async fn has_master_flat_library(
 ///   2. Re-query all calibration frame IDs for this camera
 ///   3. Re-cluster and assign frames to sets
 ///   4. Delete orphaned sets (sets with 0 frames)
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn refresh_calibration_library_for_camera(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,
@@ -319,6 +329,7 @@ pub async fn refresh_calibration_library_for_camera(
 /// POST /api/get_calibration_set_frames
 ///
 /// List the files/frames belonging to a calibration set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_set_frames(
     State(state): State<WebAppState>,
     Json(args): Json<SetIdArgs>,
@@ -334,6 +345,7 @@ pub async fn get_calibration_set_frames(
 ///
 /// List the frame sets (objects) that ultimately consume a calibration set,
 /// including transitive consumers via the sub-cal chain.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_set_consumers(
     State(state): State<WebAppState>,
     Json(args): Json<SetIdArgs>,
@@ -353,6 +365,7 @@ pub async fn get_calibration_set_consumers(
 /// Match and link calibration frames to all light frames in a frame set.
 /// Loads config for tolerance defaults, then delegates to
 /// `athenaeum_core::calibration::processor::process_frame_set`.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn find_calibration_for_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FindCalibrationArgs>,
@@ -443,6 +456,7 @@ pub async fn find_calibration_for_frame_set(
 ///
 /// Load the configurable calibration matching rules.
 /// Returns defaults if the setting has not been persisted yet.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_matching_config(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -465,6 +479,7 @@ pub async fn get_calibration_matching_config(
 /// POST /api/set_calibration_matching_config
 ///
 /// Validate and persist updated calibration matching rules.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_calibration_matching_config(
     State(state): State<WebAppState>,
     Json(config): Json<CalibrationMatchingConfig>,
@@ -487,6 +502,7 @@ pub async fn set_calibration_matching_config(
 /// POST /api/reset_calibration_matching_config
 ///
 /// Reset calibration matching rules to built-in defaults and persist them.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn reset_calibration_matching_config(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -510,6 +526,7 @@ pub async fn reset_calibration_matching_config(
 /// POST /api/get_calibration_hierarchy_for_frame_set
 ///
 /// Get calibration hierarchy organized by Date → Camera → Filter for a frame set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_hierarchy_for_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -593,6 +610,7 @@ pub struct BulkRestoreCalibrationMetadataArgs {
 /// POST /api/get_calibration_set_parameters
 ///
 /// Get parameters of a calibration set for sub-calibration selection display.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_set_parameters(
     State(state): State<WebAppState>,
     Json(args): Json<SetIdArgs>,
@@ -654,6 +672,7 @@ pub async fn get_calibration_set_parameters(
 /// POST /api/get_light_frame_parameters
 ///
 /// Get average parameters of light frames for manual selection display.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_light_frame_parameters(
     State(state): State<WebAppState>,
     Json(args): Json<GetLightFrameParametersArgs>,
@@ -697,6 +716,7 @@ pub async fn get_light_frame_parameters(
 /// the same `find_calibration_candidates` engine that auto-link uses, so the
 /// modal's score and "compatible" decision agree with what "Find Calibration"
 /// will actually pick.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_sets_for_manual_selection(
     State(state): State<WebAppState>,
     Json(args): Json<GetCalibrationSetsForManualSelectionArgs>,
@@ -784,6 +804,7 @@ pub async fn get_calibration_sets_for_manual_selection(
 /// `find_calibration_candidates` with the parent set's parameters synthesized
 /// as a frame so the engine's `flats→{darkflat,dark,bias}` and `darks→bias`
 /// configs apply.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_subcalibration_sets_for_manual_selection(
     State(state): State<WebAppState>,
     Json(args): Json<GetSubcalibrationSetsArgs>,
@@ -878,6 +899,7 @@ fn internal_err<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
 /// POST /api/manual_assign_calibration
 ///
 /// Manually assign a calibration set to light frames.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn manual_assign_calibration(
     State(state): State<WebAppState>,
     Json(args): Json<ManualAssignCalibrationArgs>,
@@ -935,6 +957,7 @@ pub async fn manual_assign_calibration(
 /// Remove manual calibration override(s) for light frames and allow
 /// auto-find to reassign. Mirrors `athenaeum-tauri`'s command of the same
 /// name; both call `athenaeum_core::db::calibration_links::clear_manual_override`.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn clear_manual_calibration_override(
     State(state): State<WebAppState>,
     Json(args): Json<ClearManualCalibrationOverrideArgs>,
@@ -962,6 +985,7 @@ pub async fn clear_manual_calibration_override(
 /// POST /api/manual_assign_subcalibration
 ///
 /// Manually assign a sub-calibration set to a calibration set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn manual_assign_subcalibration(
     State(state): State<WebAppState>,
     Json(args): Json<ManualAssignSubcalibrationArgs>,
@@ -1005,6 +1029,7 @@ pub async fn manual_assign_subcalibration(
 /// POST /api/clear_subcalibration_override
 ///
 /// Clear sub-calibration override for a calibration set.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn clear_subcalibration_override(
     State(state): State<WebAppState>,
     Json(args): Json<ClearSubcalibrationOverrideArgs>,
@@ -1040,6 +1065,7 @@ pub async fn clear_subcalibration_override(
 /// POST /api/bulk_update_calibration_metadata
 ///
 /// Bulk update calibration set metadata. Saves originals before updating.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn bulk_update_calibration_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<BulkUpdateCalibrationMetadataArgs>,
@@ -1169,6 +1195,7 @@ pub async fn bulk_update_calibration_metadata(
 /// POST /api/bulk_restore_calibration_metadata
 ///
 /// Restore calibration set metadata from originals.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn bulk_restore_calibration_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<BulkRestoreCalibrationMetadataArgs>,
@@ -1212,6 +1239,7 @@ pub async fn bulk_restore_calibration_metadata(
 /// POST /api/get_custom_metadata_set_ids
 ///
 /// Get all set IDs that have custom metadata edits for a given camera.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_custom_metadata_set_ids(
     State(state): State<WebAppState>,
     Json(args): Json<InstrumeArgs>,

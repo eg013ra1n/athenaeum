@@ -43,6 +43,7 @@ fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
 /// Optional `resolution` controls quality: "thumbnail", "preview" (default), or "full".
 ///
 /// Returns raw JPEG bytes with `Content-Type: image/jpeg`.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_frame_preview(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramePreviewArgs>,

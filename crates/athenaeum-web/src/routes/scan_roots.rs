@@ -78,6 +78,7 @@ pub struct RescanResultDto {
 ///
 /// Validates the path exists, checks for overlaps with existing roots, then
 /// inserts via `db::upsert_scan_root`. Returns the newly created `ScanRoot`.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn add_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<AddScanRootArgs>,
@@ -161,6 +162,7 @@ pub async fn add_scan_root(
 /// POST /api/get_scan_roots
 ///
 /// Returns all monitored directory paths from the database.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_scan_roots(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
@@ -178,6 +180,7 @@ pub async fn get_scan_roots(
 /// POST /api/delete_scan_root
 ///
 /// Removes a scan root by ID. Does not delete files from disk.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteScanRootArgs>,
@@ -198,6 +201,7 @@ pub async fn delete_scan_root(
 /// SSE events. The scan runs inside `spawn_blocking` since it is CPU-intensive.
 /// SSE clients should listen on `GET /api/events` for `scan-progress` and
 /// `scan-complete` events emitted by `SseProgressEmitter`.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn start_scan_with_progress(
     State(state): State<WebAppState>,
     Json(args): Json<StartScanArgs>,
@@ -257,6 +261,7 @@ pub async fn start_scan_with_progress(
 ///
 /// Sets the cancellation flag on an active scan. The scan will stop at its
 /// next checkpoint and return a result with `cancelled: true`.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn cancel_scan(
     State(state): State<WebAppState>,
     Json(args): Json<CancelScanArgs>,
@@ -274,6 +279,7 @@ pub async fn cancel_scan(
 ///
 /// Returns a list of (root_id, exists) pairs indicating whether each scan root
 /// directory is currently accessible on the filesystem.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn check_all_scan_roots_availability(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
@@ -299,6 +305,7 @@ pub async fn check_all_scan_roots_availability(
 /// POST /api/get_missing_files_counts
 ///
 /// Returns a map of scan_root_id -> count of files with 'missing' status.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_missing_files_counts(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
@@ -332,6 +339,7 @@ pub async fn get_missing_files_counts(
 /// POST /api/start_scan
 ///
 /// Non-progress scan variant. In web mode, delegates to start_scan_with_progress.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn start_scan(
     State(state): State<WebAppState>,
     Json(args): Json<StartScanArgs>,
@@ -342,6 +350,7 @@ pub async fn start_scan(
 /// POST /api/rescan_all_for_content_hash
 ///
 /// Iterate all files and compute xxHash for those missing a content_hash.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn rescan_all_for_content_hash(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -425,6 +434,7 @@ pub async fn rescan_all_for_content_hash(
 /// logic exactly: fetch the scan root's current path, delegate to
 /// `athenaeum_core::relinking::relink_files` for the actual fingerprint-based
 /// matching, then conditionally persist the new path.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn relink_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<RelinkScanRootArgs>,
@@ -506,6 +516,7 @@ pub struct SetMonitorEnabledArgs {
 ///
 /// Toggle the background-monitoring flag for a scan root. The monitor service
 /// picks up the new value on its next tick.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_scan_root_monitor_enabled(
     State(state): State<WebAppState>,
     Json(args): Json<SetMonitorEnabledArgs>,

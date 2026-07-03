@@ -34,6 +34,7 @@ pub struct DeleteSettingArgs {
 /// Returns the value for `key` using three-tier precedence:
 /// runtime override → database → `defaultValue`. If the key is absent from the
 /// database and no `defaultValue` was provided, an empty string is returned.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_setting(
     State(state): State<WebAppState>,
     Json(args): Json<GetSettingArgs>,
@@ -56,6 +57,7 @@ pub async fn get_setting(
 ///
 /// Persists a key-value pair to the `settings` table. If the key already
 /// exists it is updated; otherwise it is inserted.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn set_setting(
     State(state): State<WebAppState>,
     Json(args): Json<SetSettingArgs>,
@@ -92,6 +94,7 @@ pub async fn set_setting(
 ///
 /// Removes the setting row for the given key. A no-op if the key does not
 /// exist.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_setting(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteSettingArgs>,
@@ -119,6 +122,7 @@ pub struct WebCacheStats {
 /// POST /api/get_cache_stats
 ///
 /// In web mode, returns memory cache stats (entry count).
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_cache_stats(
     State(_state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -136,6 +140,7 @@ pub async fn get_cache_stats(
 /// POST /api/get_blink_threads_max
 ///
 /// Returns the CPU-based max so the frontend can set the slider/input max dynamically.
+#[tracing::instrument(skip_all)]
 pub async fn get_blink_threads_max(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -152,6 +157,7 @@ pub struct SetBlinkThreadsArgs {
 ///
 /// Persists the thread count to DB and rebuilds the image processing semaphore.
 /// In-flight permits on the old semaphore complete naturally.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_blink_threads(
     State(state): State<WebAppState>,
     Json(args): Json<SetBlinkThreadsArgs>,
@@ -183,6 +189,7 @@ pub async fn set_blink_threads(
 ///
 /// Returns the effective logging config (persisted, or the default if unset)
 /// plus whether the `ATHENAEUM_LOG` env override is currently active.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_logging_config(
     State(state): State<WebAppState>,
     Json(_): Json<serde_json::Value>,
@@ -213,6 +220,7 @@ pub async fn get_logging_config(
 /// or directives that fail to parse), persists it under `logging.config`,
 /// then live-applies it via the process-global `LoggingHandle`. Validation
 /// happens before the DB write; the live-apply happens after.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_logging_config(
     State(state): State<WebAppState>,
     Json(config): Json<logging::LoggingConfig>,

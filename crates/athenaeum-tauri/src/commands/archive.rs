@@ -75,6 +75,7 @@ fn resolve_archive_root(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn list_archive_roots(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -98,6 +99,7 @@ pub async fn list_archive_roots(state: State<'_, AppState>) -> Result<Vec<serde_
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn add_archive_root(
     state: State<'_, AppState>,
     path: String,
@@ -123,6 +125,7 @@ pub async fn add_archive_root(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_archive_root(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -149,6 +152,7 @@ pub async fn delete_archive_root(state: State<'_, AppState>, id: i64) -> Result<
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_default_archive_root(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -164,6 +168,7 @@ pub async fn set_default_archive_root(state: State<'_, AppState>, id: i64) -> Re
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_archive_settings(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let ctx = state.ctx.clone();
     let db = ctx.db.get().ok_or("Database not initialized")?;
@@ -177,6 +182,7 @@ pub async fn get_archive_settings(state: State<'_, AppState>) -> Result<serde_js
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_archive_root_path(
     state: State<'_, AppState>,
     path: String,
@@ -187,6 +193,7 @@ pub async fn set_archive_root_path(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn set_archive_compression(
     state: State<'_, AppState>,
     compression: String,
@@ -200,6 +207,7 @@ pub async fn set_archive_compression(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn plan_archive_operation(
     state: State<'_, AppState>,
     frames_set_id: i64,
@@ -216,6 +224,7 @@ pub async fn plan_archive_operation(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn start_archive_operation(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -296,6 +305,7 @@ pub async fn start_archive_operation(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn cancel_archive_operation(
     state: State<'_, AppState>,
     operation_id: i64,
@@ -310,6 +320,7 @@ pub async fn cancel_archive_operation(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn list_unfinished_archive_operations(
     state: State<'_, AppState>,
 ) -> Result<Vec<ArchiveOperationSummary>, String> {
@@ -318,6 +329,7 @@ pub async fn list_unfinished_archive_operations(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn resume_archive_operation(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -352,6 +364,7 @@ pub async fn resume_archive_operation(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_restore_suggestions(
     state: State<'_, AppState>,
     operation_id: i64,
@@ -407,6 +420,7 @@ pub async fn get_restore_suggestions(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn rollback_archive_operation(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -431,6 +445,7 @@ pub async fn rollback_archive_operation(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn list_archive_zips(
     state: State<'_, AppState>,
     operation_id: i64,
@@ -482,6 +497,7 @@ pub async fn list_archive_zips(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn list_archived_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -526,6 +542,7 @@ pub async fn list_archived_frame_sets(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn start_restore_operation(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -591,6 +608,7 @@ pub async fn start_restore_operation(
 }
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_archive(
     state: State<'_, AppState>,
     operation_id: i64,

@@ -81,6 +81,7 @@ fn err(msg: impl std::fmt::Display) -> (StatusCode, String) {
 // ── Config routes ────────────────────────────────────────────────────────────
 
 /// POST /api/get_analysis_config
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_analysis_config(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
@@ -91,6 +92,7 @@ pub async fn get_analysis_config(
 }
 
 /// POST /api/set_analysis_config
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_analysis_config(
     State(state): State<WebAppState>,
     Json(config): Json<AnalysisConfig>,
@@ -102,6 +104,7 @@ pub async fn set_analysis_config(
 }
 
 /// POST /api/reset_analysis_config
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn reset_analysis_config(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
@@ -116,6 +119,7 @@ pub async fn reset_analysis_config(
 // ── Query / Delete routes ────────────────────────────────────────────────────
 
 /// POST /api/get_analysis_for_frame_set
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_analysis_for_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<FrameSetIdArgs>,
@@ -134,6 +138,7 @@ pub async fn get_analysis_for_frame_set(
 /// Analyzes all LIGHT frames in a frame set.
 /// Uses rayon par_iter inside pool.install() for natural work-stealing across frames.
 /// Emits `analysis-progress` SSE events during processing.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn analyze_frame_set(
     State(state): State<WebAppState>,
     Json(args): Json<AnalyzeFrameSetArgs>,
@@ -359,6 +364,7 @@ pub async fn analyze_frame_set(
 // ── Cancel analysis ──────────────────────────────────────────────────────────
 
 /// POST /api/cancel_analysis
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn cancel_analysis(
     State(state): State<WebAppState>,
     Json(args): Json<CancelAnalysisArgs>,
@@ -384,6 +390,7 @@ fn detect_flip_vertical(path: &str) -> bool {
 /// POST /api/get_frame_star_metrics
 ///
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_frame_star_metrics(
     State(state): State<WebAppState>,
     Json(args): Json<FrameIdArgs>,
@@ -489,6 +496,7 @@ pub struct FlatContourPlotResponse {
 }
 
 /// POST /api/compute_flat_contour_plot
+#[tracing::instrument(skip_all, err(Debug))]
 pub async fn compute_flat_contour_plot(
     State(state): State<WebAppState>,
     Json(args): Json<FlatContourPlotArgs>,

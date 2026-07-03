@@ -13,6 +13,7 @@ use super::AppState;
 
 /// Get files from the database with optional limit
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_files(
     limit: Option<usize>,
     state: State<'_, AppState>,
@@ -30,6 +31,7 @@ pub async fn get_files(
 
 /// Get files from a specific directory
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_files_by_directory(
     directory_path: String,
     limit: Option<usize>,
@@ -49,6 +51,7 @@ pub async fn get_files_by_directory(
 /// Get frames with missing metadata
 /// category: "all", "coordinates", "object", "datetime", "instrument", "frametype"
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frames_with_missing_metadata(
     category: String,
     state: State<'_, AppState>,
@@ -66,6 +69,7 @@ pub async fn get_frames_with_missing_metadata(
 /// a set of frames. DB-only — the FITS files on disk are NOT rewritten.
 /// Returns the number of rows updated.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn bulk_update_frame_metadata(
     frame_ids: Vec<i64>,
     edits: FrameMetadataEdits,
@@ -84,6 +88,7 @@ pub async fn bulk_update_frame_metadata(
 /// out of `fits_header` so the UI can show "what the file said before
 /// you edited it" and offer per-field revert.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_metadata_originals(
     frame_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -100,6 +105,7 @@ pub async fn get_frame_metadata_originals(
 /// frames belong to (member of) or use (consumer of). Drives the metadata
 /// pane's "Memberships" panel.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_memberships(
     frame_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -116,6 +122,7 @@ pub async fn get_frame_memberships(
 /// have. The dual-pane metadata editor calls this before applying edits so
 /// the user can see how many links the cascade will sever.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn count_frame_metadata_relations(
     frame_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -131,6 +138,7 @@ pub async fn count_frame_metadata_relations(
 /// Return the distinct non-empty INSTRUME values from the `frames` table,
 /// alphabetically sorted. Feeds the Set Camera modal's existing-cameras list.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_distinct_instrumes(
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
@@ -145,6 +153,7 @@ pub async fn get_distinct_instrumes(
 
 /// Get duplicate file groups (from cache)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateGroup>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -165,6 +174,7 @@ pub async fn get_duplicates(state: State<'_, AppState>) -> Result<Vec<DuplicateG
 
 /// Get directory contents (subdirectories and files)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_directory_contents(
     directory_path: String,
     state: State<'_, AppState>,
@@ -221,6 +231,7 @@ pub async fn get_directory_contents(
 
 /// Get frame preview image as base64-encoded JPEG
 #[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn get_frame_preview(
     state: State<'_, AppState>,
     frame_id: i64,
@@ -260,6 +271,7 @@ pub async fn get_frame_preview(
 /// Get files with frames by frame IDs
 /// Useful for loading full file data when you only have frame IDs
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_files_with_frames_by_ids(
     frame_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -281,6 +293,7 @@ pub async fn get_files_with_frames_by_ids(
 
 /// Get the path to the log directory (rolling daily JSONL files live inside it).
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_log_path() -> Result<String, String> {
     crate::logging::get_path()
         .map(|p| p.to_string_lossy().to_string())
@@ -289,6 +302,7 @@ pub async fn get_log_path() -> Result<String, String> {
 
 /// Get the path to the database file
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_database_path(
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
@@ -301,6 +315,7 @@ pub async fn get_database_path(
 
 /// Get all distinct directory paths containing files for a given camera
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_camera_directories(
     instrume: String,
     state: State<'_, AppState>,
@@ -313,6 +328,7 @@ pub async fn get_camera_directories(
 
 /// Get directory contents filtered to only files from a specific camera
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_camera_directory_contents(
     directory_path: String,
     instrume: String,
@@ -402,6 +418,7 @@ pub struct CatalogSearchHit {
 /// Plan + immediately enqueue a Move operation. Returns the operation_id
 /// once the plan is committed. The actual move runs on the global queue.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn enqueue_move_operation(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -502,6 +519,7 @@ pub async fn enqueue_move_operation(
 /// equality). Used by the per-camera dual-pane file browser so a camera-
 /// scoped view's search bar can't surface frames from other cameras.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn search_catalog(
     state: State<'_, AppState>,
     query: String,
@@ -594,6 +612,7 @@ fn map_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogSearchHit>
 /// Create a directory inside a scan root. Validated to refuse paths that
 /// would land outside any configured scan root.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn mkdir_in_scan_root(
     state: State<'_, AppState>,
     path: String,
@@ -623,6 +642,7 @@ pub async fn mkdir_in_scan_root(
 /// and `files.filename`; for a directory, updates every `files.path` whose
 /// path begins with the old directory path.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn rename_path(
     state: State<'_, AppState>,
     old_path: String,

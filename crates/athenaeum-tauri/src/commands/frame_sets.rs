@@ -7,6 +7,7 @@ use tauri::State;
 use super::AppState;
 
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn auto_generate_frame_sets(
     project_id: i64,
     threshold_deg: Option<f64>,
@@ -145,6 +146,7 @@ pub async fn auto_generate_frame_sets(
 
 /// Get all frame sets for a project
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frames_sets(
     project_id: i64,
     state: State<'_, AppState>,
@@ -166,6 +168,7 @@ pub async fn get_frames_sets(
 
 /// Delete a frames_set
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_frames_set(
     frames_set_id: i64,
     state: State<'_, AppState>,
@@ -178,6 +181,7 @@ pub async fn delete_frames_set(
 
 /// Delete all auto-generated frames_sets (is_custom = false)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn delete_auto_generated_frame_sets(
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
@@ -189,6 +193,7 @@ pub async fn delete_auto_generated_frame_sets(
 
 /// Rename a frames_set
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn rename_frames_set(
     frames_set_id: i64,
     new_name: String,
@@ -202,6 +207,7 @@ pub async fn rename_frames_set(
 
 /// Mark a frames_set as custom (one-way conversion from auto-generated to custom)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn mark_frame_set_custom(
     frames_set_id: i64,
     state: State<'_, AppState>,
@@ -245,6 +251,7 @@ pub async fn mark_frame_set_custom(
 /// Dragged frame set (source) is merged into drop target (target)
 /// Source frame set is deleted after merge
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn merge_frame_sets(
     source_id: i64,
     target_id: i64,
@@ -378,6 +385,7 @@ pub async fn merge_frame_sets(
 
 /// Split selected items from a frame set into a new frame set
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn split_frame_set(
     source_set_id: i64,
     selection: crate::models::SplitSelection,
@@ -610,6 +618,7 @@ pub async fn split_frame_set(
 
 /// Get frame set detail with imaging nights and sessions
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_set_detail(
     frames_set_id: i64,
     state: State<'_, AppState>,
@@ -748,6 +757,7 @@ fn create_frame_set_inner(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+#[tracing::instrument(skip_all, err)]
 pub async fn create_frame_set_from_selection(
     state: State<'_, AppState>,
     name: String,
@@ -768,6 +778,7 @@ pub async fn create_frame_set_from_selection(
 
 /// Get count of excluded frames (lightweight check)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_excluded_frames_count(
     state: State<'_, AppState>,
 ) -> Result<i64, String> {
@@ -780,6 +791,7 @@ pub async fn get_excluded_frames_count(
 /// Get all excluded frames with full file + frame metadata. Drives the
 /// Excluded Frames page's Missing-Metadata-style repair toolbar.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_excluded_frames_with_metadata(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::ExcludedFrameRow>, String> {
@@ -800,6 +812,7 @@ pub async fn get_excluded_frames_with_metadata(
 /// auto-generate pass — the user has explicitly told us the metadata is
 /// now correct. Returns the number of rows actually deleted.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn remove_files_from_excluded(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
@@ -829,6 +842,7 @@ pub struct FramesSetWithCount {
 
 /// Archive a frame set (move to Archive tab)
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn archive_frame_set(
     frames_set_id: i64,
     state: State<'_, AppState>,
@@ -857,6 +871,7 @@ pub async fn archive_frame_set(
 /// triggered a fresh scan, so the "Waiting for running scan…" banner can be
 /// shown accurately.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn find_new_frames_for_set(
     frames_set_id: i64,
     scan_first: bool,
@@ -939,6 +954,7 @@ pub async fn find_new_frames_for_set(
 /// Frames are re-resolved from `frame_ids` so the backend can't be tricked
 /// by a stale client-supplied `CandidateFrame` payload.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn auto_merge_new_frames_for_set(
     frames_set_id: i64,
     frame_ids: Vec<i64>,
@@ -1030,6 +1046,7 @@ pub async fn auto_merge_new_frames_for_set(
 
 /// Read the auto-merge audit log for a frame set, newest first.
 #[tauri::command]
+#[tracing::instrument(skip_all, err)]
 pub async fn get_frame_set_merge_log(
     frames_set_id: i64,
     limit: Option<i64>,
