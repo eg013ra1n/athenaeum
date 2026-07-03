@@ -57,7 +57,7 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 
 **Canonical field dictionary** — never ad-hoc synonyms. Core names: `frame_id`, `file_id`, `frame_set_id`, `set_id` (calibration set), `root_id`, `operation_id`, `command`, `path`, `src`, `dest`, `duration_ms`, `count`, `error`, `outcome`, `stage`. snake_case only. New fields extend the dictionary in this spec via PR — not invented inline.
 
-**Dictionary extensions (added during implementation, T1):** scan-summary counts `found`, `processed`, `skipped`, `modified` (siblings of the scan-domain counts `seen`/`new`/`updated`/`errors` and the example's `unchanged`; the Task 5 scanner sweep table reconciles final scan-count naming); `monitor_enabled` (bool, scan-root monitor toggle); `addr` (server bind address); `directives` (EnvFilter directive string on logging-filter events).
+**Dictionary extensions (added during implementation, T1):** scan-summary counts `found`, `processed`, `skipped`, `modified` (siblings of the scan-domain counts `seen`/`new`/`updated`/`errors` and the example's `unchanged`; the Task 5 scanner sweep table reconciles final scan-count naming); `monitor_enabled` (bool, scan-root monitor toggle); `addr` (server bind address); `directives` (EnvFilter directive string on logging-filter events); `frame` (string; source frame filename in solver-submodule contexts, which have no DB row id — deliberately distinct from core's numeric `frame_id` so MCP queries never mix the two); T8.
 
 **Message style rule**: the message is a short, stable human phrase; all data lives in fields. `info!(root_id, new = 12, unchanged = 4219, "scan finished")` — never `info!("scan finished — 12 new of 4231")`. This is what makes events aggregatable and MCP-queryable.
 
