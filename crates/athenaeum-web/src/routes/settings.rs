@@ -195,7 +195,7 @@ pub async fn get_logging_config(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
         Some(raw) => serde_json::from_str::<logging::LoggingConfig>(&raw).unwrap_or_else(|e| {
-            eprintln!("get_logging_config: invalid stored logging config, using default: {e}");
+            tracing::warn!(error = %e, "invalid stored logging config; using default");
             logging::LoggingConfig::default()
         }),
         None => logging::LoggingConfig::default(),
@@ -218,7 +218,7 @@ pub async fn set_logging_config(
     Json(config): Json<logging::LoggingConfig>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     config.validate().map_err(|e| {
-        eprintln!("set_logging_config: rejected invalid config: {e}");
+        tracing::warn!(error = %e, "rejected invalid logging config");
         (StatusCode::BAD_REQUEST, e)
     })?;
 
@@ -339,8 +339,15 @@ mod logging_config_tests {
         let state = test_state(db);
 
         let cfg = logging::LoggingConfig { level: "chatty".to_string(), modules: Default::default() };
-        let err = set_logging_config(State(state), Json(cfg)).await.unwrap_err();
+        let err = set_logging_config(State(state.clone()), Json(cfg)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Verify the DB was untouched on rejection: get_logging_config must still return default.
+        let resp = get_logging_config(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.config, logging::LoggingConfig::default());
     }
 }
 

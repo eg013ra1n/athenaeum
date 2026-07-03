@@ -15,7 +15,7 @@ const MODULE_TARGETS: [(&str, &[&str]); 4] = [
     ),
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LoggingConfig {
     pub level: String,
@@ -77,6 +77,7 @@ impl LoggingConfig {
                 ));
             }
         }
+        // Defense-in-depth only: unreachable as a distinct rejection once the LEVELS checks pass.
         self.to_directives()
             .parse::<tracing_subscriber::EnvFilter>()
             .map_err(|e| format!("invalid logging directives: {e}"))?;
@@ -161,5 +162,15 @@ mod tests {
         let mut cfg = LoggingConfig::default();
         cfg.modules.insert("bogus".into(), "debug".into());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_trace_level() {
+        let mut cfg = LoggingConfig::default();
+        cfg.level = "trace".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg2 = LoggingConfig::default();
+        cfg2.modules.insert("scanner".into(), "trace".into());
+        assert!(cfg2.validate().is_err());
     }
 }
