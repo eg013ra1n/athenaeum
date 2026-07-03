@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS master_provenance (
 
 **Stage B4 — UI**: "Create Master" action on a calibration set (Equipment page) → recipe dialog → queue; library browser can grow out of the existing `MasterDarkLibrary.tsx` patterns (audit says it's ready).
 
-**Stage B5 (later, optional) — in-app light calibration** ("calibrate lights inside objects"): apply library masters to lights producing calibrated f32 FITS. This is exactly stacking-roadmap Phase A; B1+B2 build most of its machinery, so the stacking engine gets cheaper as a side effect.
+**Stage B5 (core deliverable — promoted from "later, optional" by owner decision 2026-07-04) — in-app light calibration** ("calibrate lights inside objects"). Explicitly two-staged per the owner's model: **stage 1** = master creation via B2 (flats, darks, and optionally biases — the bias recipe stays first-class so both dark-based and bias-based calibration paths work); **stage 2** = apply master flats + darks/biases to lights producing calibrated f32 FITS, exported so WBPP receives frames ready for registration + normalization with its calibration step skipped. **Prerequisite: a research spike** on correct calibration paths, algorithms and mechanisms incl. the math — bias vs dark(+bias) workflows, dark optimization/scaling, flat normalization, order of operations, output pedestal / negative clipping, OSC/CFA handling — producing a short spec both B2 and B5 follow. This is exactly stacking-roadmap Phase A; B1+B2 build most of its machinery, so the stacking engine gets cheaper as a side effect.
 
 ---
 
