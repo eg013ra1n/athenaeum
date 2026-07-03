@@ -86,8 +86,23 @@ pub fn init(process: Process) -> Option<LoggingHandle> {
     let _ = std::fs::create_dir_all(&dir);
     // Legacy cleanup: best-effort delete of the old (pre-tracing) single-file logs,
     // which lived directly in the app-data dir (the parent of the new `logs/` dir).
-    for old in ["athenaeum.log", "athenaeum.log.1"] {
-        let _ = std::fs::remove_file(dir.parent().unwrap_or(&dir).join(old));
+    // Two candidate parents: the RESOLVED log dir's parent (correct when nothing
+    // overrides the default), and the platform app-data dir (correct when
+    // `ATHENAEUM_LOG_DIR`/`ATHENAEUM_DB_PATH` point the resolved dir elsewhere,
+    // e.g. web/Docker) — without this second attempt the old app-data copies
+    // are never touched and survive forever. Both are best-effort; a missing
+    // file or permission error is silently ignored (this is cleanup, not a
+    // correctness path).
+    let mut legacy_parents = vec![dir.parent().unwrap_or(&dir).to_path_buf()];
+    if let Some(app_data) = resolve_app_data_dir() {
+        if !legacy_parents.contains(&app_data) {
+            legacy_parents.push(app_data);
+        }
+    }
+    for parent in &legacy_parents {
+        for old in ["athenaeum.log", "athenaeum.log.1"] {
+            let _ = std::fs::remove_file(parent.join(old));
+        }
     }
 
     let file_appender = tracing_appender::rolling::Builder::new()
@@ -200,9 +215,18 @@ pub fn get_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::Mutex;
+
+    // Tests in this module mutate process-wide env vars (`ATHENAEUM_LOG_DIR`,
+    // `ATHENAEUM_LOG`) to drive `resolve_log_dir()`/`init()`. `cargo test` runs
+    // tests in the same binary concurrently by default, so two such tests
+    // racing would step on each other's env state. Every test that touches
+    // these env vars must hold this lock for its full set/use/restore window.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn jsonl_line_parses_with_expected_fields() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let tmp = tempfile::TempDir::new().expect("tempdir");
         // Test-only injection hook: resolve_log_dir() checks this first.
         std::env::set_var("ATHENAEUM_LOG_DIR", tmp.path());

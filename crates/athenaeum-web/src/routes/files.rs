@@ -854,12 +854,26 @@ pub async fn rename_path(
     if is_dir {
         let prefix_old = format!("{}/", old_str);
         let prefix_new = format!("{}/", new_str);
-        let _ = athenaeum_core::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new);
+        match athenaeum_core::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new) {
+            Ok(updated) => {
+                tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
+            }
+            Err(error) => {
+                tracing::error!(src = %old_str, path = %new_str, %error, "rename hot-sync failed for directory prefix update");
+            }
+        }
     } else {
-        let _ = conn.execute(
+        match conn.execute(
             "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
             rusqlite::params![&new_str, &args.new_name, &old_str],
-        );
+        ) {
+            Ok(updated) => {
+                tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
+            }
+            Err(error) => {
+                tracing::error!(src = %old_str, path = %new_str, %error, "rename hot-sync failed");
+            }
+        }
     }
     Ok(StatusCode::OK)
 }
