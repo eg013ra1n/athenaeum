@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText } from 'lucide-react';
 import { revealItemInDir, openPath } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
+import LoggingSettings from '../components/settings/LoggingSettings';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
@@ -1283,6 +1284,19 @@ export default function Settings() {
           </div>
         </div>
       )}
+
+      {/* Logging — base level + per-module overrides, live-applied by the backend. */}
+      <div className="mt-6 bg-surface-elevated rounded-lg p-6">
+        <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+          <ScrollText size={20} />
+          Logging
+        </h3>
+        <p className="text-xs text-content-muted mb-4">
+          Controls what gets written to the JSONL log file{isTauri ? ' shown above' : ''}. Debug is
+          verbose — useful while diagnosing an issue, not recommended to leave on permanently.
+        </p>
+        <LoggingSettings />
+      </div>
 
       <div className="mt-6 bg-surface-elevated rounded-lg p-6">
         <h3 className="text-lg font-semibold mb-3">About Frame Set Grouping</h3>
