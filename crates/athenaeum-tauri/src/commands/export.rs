@@ -84,7 +84,7 @@ fn load_wbpp_config(conn: &rusqlite::Connection) -> Result<WbppExportConfig, Str
 
     match result {
         Some(json) => serde_json::from_str(&json).map_err(|e| {
-            eprintln!("Failed to parse WBPP config, using default: {}", e);
+            tracing::warn!(error = %e, "failed to parse WBPP config");
             e.to_string()
         }),
         None => Ok(WbppExportConfig::default()),

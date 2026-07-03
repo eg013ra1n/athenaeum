@@ -87,7 +87,7 @@ pub fn read_records_until_mag(data: &[u8], mag_limit: f32) -> Vec<StarRecord> {
                 records.push(record);
             }
             Err(e) => {
-                eprintln!("catalog: error reading record at offset {offset}: {e}");
+                tracing::warn!(offset, error = %e, "star record decode failed, truncating read");
                 break;
             }
         }

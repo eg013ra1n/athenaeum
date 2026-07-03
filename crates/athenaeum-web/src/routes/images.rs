@@ -29,9 +29,11 @@ pub struct GetFramePreviewArgs {
 
 // ── Error helper ──────────────────────────────────────────────────────────────
 
+// Deleted: the raw stderr print here duplicated the `#[tracing::instrument(err(Debug))]`
+// attribute on `get_frame_preview` below, which already logs every returned
+// Err at the command boundary — see the T7 sweep report.
 fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     let s = msg.to_string();
-    eprintln!("images error: {}", s);
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 

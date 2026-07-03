@@ -179,7 +179,7 @@ pub async fn set_blink_threads(
     *state.image_semaphore.write().unwrap() =
         std::sync::Arc::new(tokio::sync::Semaphore::new(effective));
 
-    eprintln!("Blink semaphore rebuilt with {} permits (requested {}, 0=auto)", effective, threads);
+    tracing::info!(permits = effective, requested = threads, "blink semaphore rebuilt");
     Ok(Json(()))
 }
 

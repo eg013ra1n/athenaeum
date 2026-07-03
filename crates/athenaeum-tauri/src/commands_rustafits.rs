@@ -72,16 +72,14 @@ pub async fn read_fits_image_rustafits(
     let cache_key = match crate::cache::preview_cache_key(&path_buf, &resolution_str) {
         Ok(key) => key,
         Err(e) => {
-            let error_msg = format!("File not found: {} ({})", path_buf.display(), e);
-            eprintln!("ERROR: {}", error_msg);
-            return Err(error_msg);
+            return Err(format!("File not found: {} ({})", path_buf.display(), e));
         }
     };
 
     {
         let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
         if let Some(cached) = mem_cache.get(&cache_key) {
-            println!("⚡ Memory cache hit (fast path, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
+            tracing::trace!(bytes = cached.data.len(), duration = ?t_start.elapsed(), "memory cache hit (fast path)");
             return Ok(cached.data.clone());
         }
     }
@@ -95,7 +93,7 @@ pub async fn read_fits_image_rustafits(
     {
         let mut mem_cache = state.ctx.memory_cache.lock().unwrap();
         if let Some(cached) = mem_cache.get(&cache_key) {
-            println!("⚡ Memory cache hit (after semaphore, {} bytes) in {:?}", cached.data.len(), t_start.elapsed());
+            tracing::trace!(bytes = cached.data.len(), duration = ?t_start.elapsed(), "memory cache hit (after semaphore)");
             return Ok(cached.data.clone());
         }
     }
@@ -104,11 +102,7 @@ pub async fn read_fits_image_rustafits(
     let result = tokio::task::block_in_place(|| {
         rustafits_processor::process_fits_to_jpeg(&path_buf, res, quality, &state.ctx.image_pool)
     })
-        .map_err(|e| {
-            let error_msg = format!("Failed to process FITS image: {}", e);
-            eprintln!("ERROR: {}", error_msg);
-            error_msg
-        })?;
+        .map_err(|e| format!("Failed to process FITS image: {}", e))?;
 
     let jpeg_data = result.image_data;
 
@@ -119,7 +113,7 @@ pub async fn read_fits_image_rustafits(
     }
 
     let wait = t_process.duration_since(t_start);
-    println!("✅ Memory cache: {} bytes in {:?} (waited {:?})", jpeg_data.len(), t_process.elapsed(), wait);
+    tracing::trace!(bytes = jpeg_data.len(), duration = ?t_process.elapsed(), waited = ?wait, "memory cache: processed and stored");
     Ok(jpeg_data)
 }
 

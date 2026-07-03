@@ -59,10 +59,7 @@ pub async fn get_frames_with_missing_metadata(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    db::get_frames_with_missing_metadata(&conn, &category).map_err(|e| {
-        eprintln!("get_frames_with_missing_metadata failed: {}", e);
-        e.to_string()
-    })
+    db::get_frames_with_missing_metadata(&conn, &category).map_err(|e| e.to_string())
 }
 
 /// Bulk-update metadata fields (camera / date_obs / imagetyp / is_master) on
@@ -78,10 +75,7 @@ pub async fn bulk_update_frame_metadata(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    db::bulk_update_frame_metadata(&conn, &frame_ids, &edits).map_err(|e| {
-        eprintln!("bulk_update_frame_metadata command failed: {}", e);
-        e.to_string()
-    })
+    db::bulk_update_frame_metadata(&conn, &frame_ids, &edits).map_err(|e| e.to_string())
 }
 
 /// Re-decode the originally-scanned header values for the given frames
@@ -95,10 +89,7 @@ pub async fn get_frame_metadata_originals(
 ) -> Result<Vec<athenaeum_core::fits_parser::stored_header::FrameOriginalSnapshot>, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    athenaeum_core::db::get_frame_metadata_originals(&conn, &frame_ids).map_err(|e| {
-        eprintln!("get_frame_metadata_originals failed: {}", e);
-        e.to_string()
-    })
+    athenaeum_core::db::get_frame_metadata_originals(&conn, &frame_ids).map_err(|e| e.to_string())
 }
 
 /// Aggregate a summary of which framesets / calibration sets the given
@@ -112,10 +103,7 @@ pub async fn get_frame_memberships(
 ) -> Result<athenaeum_core::db::FrameMembershipsSummary, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    athenaeum_core::db::get_frame_memberships_summary(&conn, &frame_ids).map_err(|e| {
-        eprintln!("get_frame_memberships failed: {}", e);
-        e.to_string()
-    })
+    athenaeum_core::db::get_frame_memberships_summary(&conn, &frame_ids).map_err(|e| e.to_string())
 }
 
 /// Count the calibration-set / session relations the given frames currently
@@ -129,10 +117,7 @@ pub async fn count_frame_metadata_relations(
 ) -> Result<athenaeum_core::db::FrameMetadataRelations, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    athenaeum_core::db::count_frame_metadata_relations(&conn, &frame_ids).map_err(|e| {
-        eprintln!("count_frame_metadata_relations failed: {}", e);
-        e.to_string()
-    })
+    athenaeum_core::db::count_frame_metadata_relations(&conn, &frame_ids).map_err(|e| e.to_string())
 }
 
 /// Return the distinct non-empty INSTRUME values from the `frames` table,
@@ -145,10 +130,7 @@ pub async fn get_distinct_instrumes(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    db::get_distinct_instrumes(&conn).map_err(|e| {
-        eprintln!("get_distinct_instrumes command failed: {}", e);
-        e.to_string()
-    })
+    db::get_distinct_instrumes(&conn).map_err(|e| e.to_string())
 }
 
 /// Get duplicate file groups (from cache)
@@ -194,7 +176,6 @@ pub async fn get_directory_contents(
             return Err("Directory does not exist".to_string());
         }
         Err(e) => {
-            eprintln!("read_dir({}) failed: {}", directory_path, e);
             return Err(format!("Could not read directory: {}", e));
         }
     };
@@ -346,7 +327,6 @@ pub async fn get_camera_directory_contents(
             return Err("Directory does not exist".to_string());
         }
         Err(e) => {
-            eprintln!("read_dir({}) failed: {}", directory_path, e);
             return Err(format!("Could not read directory: {}", e));
         }
     };
@@ -431,10 +411,7 @@ pub async fn enqueue_move_operation(
 
     let source_paths: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
     let plan = fplan::build_move_plan(&conn, source_paths, PathBuf::from(&dest_dir))
-        .map_err(|e| {
-            eprintln!("build_move_plan failed: {:#}", e);
-            format!("{:#}", e)
-        })?;
+        .map_err(|e| format!("{:#}", e))?;
     let op_id = plan.operation_id;
 
     // Cancel flag — stored in active_archives map until file_op gets its own
@@ -469,7 +446,7 @@ pub async fn enqueue_move_operation(
                     );
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!("file_op reconcile (pre-enqueue) failed: {:#}", e),
+                Err(e) => tracing::warn!(operation_id = op_id, error = ?e, "file_op reconcile (pre-enqueue) failed"),
             }
 
             let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
@@ -482,7 +459,7 @@ pub async fn enqueue_move_operation(
                         );
                         "cancelled"
                     } else {
-                        eprintln!("file_op {} failed: {:#}", op_id, e);
+                        tracing::error!(operation_id = op_id, error = ?e, "file_op failed");
                         let msg = format!("{:#}", e);
                         let _ = fdb::update_operation_status(
                             &conn, op_id, FileOpStatus::Failed, Some(&msg),
@@ -631,10 +608,7 @@ pub async fn mkdir_in_scan_root(
     if !inside_root {
         return Err(format!("'{}' is not inside any scan root", path));
     }
-    std::fs::create_dir_all(&target).map_err(|e| {
-        eprintln!("mkdir {} failed: {}", path, e);
-        e.to_string()
-    })
+    std::fs::create_dir_all(&target).map_err(|e| e.to_string())
 }
 
 /// Rename a file or directory in place. Same-folder rename only (i.e., no
@@ -677,10 +651,7 @@ pub async fn rename_path(
     }
 
     let is_dir = old.is_dir();
-    std::fs::rename(&old, &new).map_err(|e| {
-        eprintln!("rename {} → {} failed: {}", old.display(), new.display(), e);
-        e.to_string()
-    })?;
+    std::fs::rename(&old, &new).map_err(|e| e.to_string())?;
 
     // Hot-sync catalog rows.
     let old_str = old.to_string_lossy().to_string();
@@ -692,22 +663,16 @@ pub async fn rename_path(
         let prefix_old = format!("{}/", old_str);
         let prefix_new = format!("{}/", new_str);
         let updated = athenaeum_core::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new)
-            .map_err(|e| {
-                eprintln!("rename hot-sync (dir) failed: {}", e);
-                e.to_string()
-            })?;
-        eprintln!("rename: hot-synced {} catalog rows under {}", updated, new_str);
+            .map_err(|e| e.to_string())?;
+        tracing::info!(count = updated, path = %new_str, "rename hot-synced catalog rows under directory");
     } else {
         let updated = conn
             .execute(
                 "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
                 rusqlite::params![&new_str, &new_name, &old_str],
             )
-            .map_err(|e| {
-                eprintln!("rename hot-sync (file) failed: {}", e);
-                e.to_string()
-            })?;
-        eprintln!("rename: hot-synced {} catalog rows for {}", updated, new_str);
+            .map_err(|e| e.to_string())?;
+        tracing::info!(count = updated, path = %new_str, "rename hot-synced catalog rows");
     }
     Ok(())
 }

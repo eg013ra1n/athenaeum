@@ -184,10 +184,11 @@ pub async fn get_imaging_locations(state: State<'_, AppState>) -> Result<Vec<Ima
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to collect results: {}", e))?;
 
-    println!("Found {} imaging locations ({} framesets, {} clusters)",
-        result.len(),
-        result.iter().filter(|l| l.location_type == "frameset").count(),
-        result.iter().filter(|l| l.location_type == "cluster").count()
+    tracing::debug!(
+        count = result.len(),
+        framesets = result.iter().filter(|l| l.location_type == "frameset").count(),
+        clusters = result.iter().filter(|l| l.location_type == "cluster").count(),
+        "imaging locations queried"
     );
 
     Ok(result)
@@ -216,9 +217,13 @@ pub async fn query_frames_in_bounds(
     // Handle RA wrap-around at 0°/360° boundary
     let ra_wrap_around = bounds.crosses_meridian.unwrap_or_else(|| bounds.ra_min > bounds.ra_max);
 
-    println!(
-        "Querying frames in bounds: ra_min={}, ra_max={}, dec_min={}, dec_max={}, crosses_meridian={}",
-        bounds.ra_min, bounds.ra_max, bounds.dec_min, bounds.dec_max, ra_wrap_around
+    tracing::debug!(
+        ra_min = bounds.ra_min,
+        ra_max = bounds.ra_max,
+        dec_min = bounds.dec_min,
+        dec_max = bounds.dec_max,
+        ra_wrap_around,
+        "querying frames in bounds"
     );
 
     let query = if ra_wrap_around {
@@ -254,7 +259,7 @@ pub async fn query_frames_in_bounds(
     let total_exposure: f64 = candidates.iter().map(|c| c.exposure).sum();
     let count = candidates.len();
 
-    println!("Found {} candidate frames (ra_wrap_around={})", count, ra_wrap_around);
+    tracing::debug!(count, ra_wrap_around, "frames in bounds queried");
 
     Ok(SelectionCandidates {
         candidates,

@@ -19,15 +19,15 @@ use std::collections::{HashMap, HashSet};
 /// This traverses the frame set hierarchy to get all light frames,
 /// groups them by filter and camera type, and retrieves their calibration links.
 pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<ExportData> {
-    println!("📦 Collecting export data for frame set {}", frame_set_id);
+    tracing::debug!(frame_set_id, "collecting export data");
 
     // Get frame set info
     let (frame_set_name, object_name) = get_frame_set_info(conn, frame_set_id)?;
-    println!("  Frame set name: {}, object: {:?}", frame_set_name, object_name);
+    tracing::debug!(frame_set_id, name = %frame_set_name, object = ?object_name, "frame set info loaded");
 
     // Get all light frames from the frame set
     let light_frames = get_light_frames_for_frame_set(conn, frame_set_id)?;
-    println!("  Found {} light frames", light_frames.len());
+    tracing::debug!(frame_set_id, count = light_frames.len(), "light frames loaded");
 
     // =========================================================================
     // Phase 3: Build new export groups with subgroups
@@ -35,8 +35,12 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
     let groups = build_export_groups(conn, &light_frames)?;
     let master_plan = build_master_creation_plan(conn, &groups)?;
 
-    println!("  Built {} export groups with {} masters to create",
-             groups.len(), master_plan.masters.len());
+    tracing::debug!(
+        frame_set_id,
+        groups = groups.len(),
+        masters = master_plan.masters.len(),
+        "export groups built"
+    );
 
     // =========================================================================
     // Legacy: Build filter groups for backwards compatibility
@@ -205,7 +209,7 @@ fn get_light_frames_for_frame_set(conn: &Connection, frame_set_id: i64) -> Resul
         .filter_map(|r| r.ok())
         .collect();
 
-    println!("  Found {} frame IDs via session_members", frame_ids.len());
+    tracing::debug!(frame_set_id, count = frame_ids.len(), "frame IDs found via session_members");
 
     // Now get full frame info for each ID
     let mut frames = Vec::new();
@@ -215,7 +219,7 @@ fn get_light_frames_for_frame_set(conn: &Connection, frame_set_id: i64) -> Resul
         }
     }
 
-    println!("  Loaded {} full frame records", frames.len());
+    tracing::debug!(frame_set_id, count = frames.len(), "full frame records loaded");
     Ok(frames)
 }
 
@@ -261,7 +265,7 @@ fn collect_calibrations_for_frame(
     Vec<ExportCalibrationSet>,
     Vec<ExportCalibrationSet>,
 )> {
-    println!("  📋 Collecting calibrations for frame {}", frame_id);
+    tracing::debug!(frame_id, "collecting calibrations for frame");
     let mut flat_sets = Vec::new();
     let mut dark_sets = Vec::new();
     let mut bias_sets = Vec::new();
@@ -286,9 +290,9 @@ fn collect_calibrations_for_frame(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    println!("    Found {} calibration links", links.len());
+    tracing::debug!(frame_id, count = links.len(), "calibration links found");
     for (set_id, cal_type, match_score, date_warning, temp_warning) in links {
-        println!("    - {} set_id={} score={:?}", cal_type, set_id, match_score);
+        tracing::debug!(frame_id, set_id, calibration_type = %cal_type, score = ?match_score, "calibration link");
         let cal_set = build_calibration_set(conn, set_id, match_score, date_warning, temp_warning)?;
 
         match cal_type.as_str() {
@@ -299,7 +303,13 @@ fn collect_calibrations_for_frame(
         }
     }
 
-    println!("    Result: {} flats, {} darks, {} bias", flat_sets.len(), dark_sets.len(), bias_sets.len());
+    tracing::debug!(
+        frame_id,
+        flats = flat_sets.len(),
+        darks = dark_sets.len(),
+        bias = bias_sets.len(),
+        "calibrations collected for frame"
+    );
     Ok((flat_sets, dark_sets, bias_sets))
 }
 
@@ -732,7 +742,7 @@ fn get_calibration_set_info_for_frame(
 /// Build export groups from light frames
 /// Groups by (filter, camera_type) and creates subgroups by calibration links
 fn build_export_groups(conn: &Connection, light_frames: &[ExportFrame]) -> Result<Vec<ExportGroup>> {
-    println!("  📊 Building export groups from {} light frames", light_frames.len());
+    tracing::debug!(count = light_frames.len(), "building export groups from light frames");
 
     // Group key: (filter, camera_type)
     type GroupKey = (Option<String>, CameraType);
@@ -745,7 +755,7 @@ fn build_export_groups(conn: &Connection, light_frames: &[ExportFrame]) -> Resul
         groups_map.entry(key).or_default().push(frame);
     }
 
-    println!("  Found {} distinct (filter, camera_type) groups", groups_map.len());
+    tracing::debug!(count = groups_map.len(), "distinct (filter, camera_type) groups found");
 
     let mut export_groups = Vec::new();
 
@@ -753,7 +763,7 @@ fn build_export_groups(conn: &Connection, light_frames: &[ExportFrame]) -> Resul
         let group_key = ExportGroup::make_group_key(filter.as_deref(), &camera_type);
         let display_name = ExportGroup::make_display_name(filter.as_deref(), &camera_type);
 
-        println!("  Building group: {} with {} frames", display_name, frames.len());
+        tracing::debug!(group = %display_name, count = frames.len(), "building export group");
 
         // Build subgroups within this group
         let subgroups = build_calibration_subgroups(conn, &frames)?;
@@ -809,7 +819,7 @@ fn build_calibration_subgroups(
     }
 
     let subgroup_count = subgroup_map.len();
-    println!("    Found {} calibration subgroups", subgroup_count);
+    tracing::debug!(count = subgroup_count, "calibration subgroups found");
 
     let mut subgroups = Vec::new();
     let mut subgroup_index = 1;
@@ -882,7 +892,7 @@ fn build_master_creation_plan(
     conn: &Connection,
     groups: &[ExportGroup],
 ) -> Result<MasterCreationPlan> {
-    println!("  🔧 Building master creation plan");
+    tracing::debug!("building master creation plan");
 
     // Collect all unique calibration set IDs with their types
     let mut all_sets: HashMap<i64, String> = HashMap::new(); // set_id -> imagetyp
@@ -906,12 +916,12 @@ fn build_master_creation_plan(
         }
     }
 
-    println!("    Found {} unique calibration sets", all_sets.len());
+    tracing::debug!(count = all_sets.len(), "unique calibration sets found");
 
     // Topological sort to determine creation order
     let sorted_ids = topological_sort(&all_sets, &dependencies);
 
-    println!("    Topological sort complete, {} masters to create", sorted_ids.len());
+    tracing::debug!(count = sorted_ids.len(), "master creation plan topologically sorted");
 
     // Build MasterInfo for each set
     let mut masters = Vec::new();
@@ -1115,11 +1125,19 @@ fn get_calibration_applications(
                         if let Ok(Some(dark_exptime)) = get_calibration_set_exptime(conn, cal_id) {
                             if is_exposure_match(flat_exptime, dark_exptime, FLAT_DARK_EXPOSURE_TOLERANCE) {
                                 apply_dark = Some(cal_id);
-                                println!("    ✓ Flat→Dark exposure match: flat={:.1}s, dark={:.1}s",
-                                        flat_exptime, dark_exptime);
+                                tracing::debug!(
+                                    set_id = cal_id,
+                                    flat_exptime,
+                                    dark_exptime,
+                                    "flat-dark exposure match"
+                                );
                             } else {
-                                println!("    ✗ Flat→Dark exposure MISMATCH: flat={:.1}s, dark={:.1}s (skipping, will use bias)",
-                                        flat_exptime, dark_exptime);
+                                tracing::warn!(
+                                    set_id = cal_id,
+                                    flat_exptime,
+                                    dark_exptime,
+                                    "flat-dark exposure mismatch, falling back to bias"
+                                );
                             }
                         }
                     }
@@ -1142,29 +1160,30 @@ fn get_calibration_applications(
 
 /// Collect enhanced export summary for the new UI
 pub fn collect_export_summary(conn: &Connection, frame_set_id: i64, config: &WbppExportConfig) -> Result<ExportSummary> {
-    println!("📊 Building export summary for frame set {}", frame_set_id);
+    tracing::debug!(frame_set_id, "building export summary");
 
     // Get basic export data first
     let export_data = collect_export_data(conn, frame_set_id)?;
 
     // Collect equipment info from all frames
     let (cameras, telescopes, date_range) = collect_equipment_info(conn, frame_set_id)?;
-    println!(
-        "  Equipment: {} cameras, {} telescopes",
-        cameras.len(),
-        telescopes.len()
+    tracing::debug!(
+        frame_set_id,
+        cameras = cameras.len(),
+        telescopes = telescopes.len(),
+        "equipment info collected"
     );
 
     // Build filter group summaries
     let filter_groups = build_filter_group_summaries(conn, &export_data)?;
-    println!("  Built {} filter groups", filter_groups.len());
+    tracing::debug!(frame_set_id, count = filter_groups.len(), "filter groups built");
 
     // Build folder preview
     let folder_preview = build_folder_preview(&export_data, config)?;
 
     // Build detailed warnings
     let warnings = build_detailed_warnings(&export_data, &filter_groups)?;
-    println!("  Generated {} warnings", warnings.len());
+    tracing::debug!(frame_set_id, count = warnings.len(), "export warnings generated");
 
     // Calculate totals
     let total_files = calculate_total_files(&export_data);

@@ -108,6 +108,9 @@ pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(),
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<ScanResultDto, String> {
+    let span = tracing::info_span!("scan", root_id);
+    let _g = span.enter();
+
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
@@ -144,7 +147,7 @@ pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<Scan
 
     // Persist scan errors so they survive app restarts
     if let Err(e) = db::update_scan_root_errors(&conn, root_id, &result.errors) {
-        eprintln!("Failed to persist scan errors: {}", e);
+        tracing::error!(root_id, error = %e, "failed to persist scan errors");
     }
 
     Ok(ScanResultDto {
@@ -171,7 +174,7 @@ pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<R
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    println!("Starting content hash rescan for all files...");
+    tracing::info!("starting content hash rescan for all files");
 
     // Get all files from database
     let all_files = db::get_files(&conn, None).map_err(|e| e.to_string())?;
@@ -208,7 +211,7 @@ pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<R
                     Ok(_) => {
                         updated += 1;
                         if updated % 100 == 0 {
-                            println!("Progress: {}/{} files processed", updated + skipped + missing, total);
+                            tracing::debug!(current = updated + skipped + missing, total, "content hash rescan progress");
                         }
                     }
                     Err(e) => {
@@ -224,9 +227,14 @@ pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<R
         }
     }
 
-    println!("Content hash rescan complete!");
-    println!("Total: {}, Updated: {}, Skipped: {}, Missing: {}, Errors: {}",
-        total, updated, skipped, missing, errors.len());
+    tracing::info!(
+        total,
+        updated,
+        skipped,
+        missing,
+        errors = errors.len(),
+        "content hash rescan complete"
+    );
 
     // Mark content hash rescan as completed
     if updated > 0 || skipped > 0 {
@@ -234,7 +242,7 @@ pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<R
         state.ctx.settings
             .persist_setting(&conn, "duplicates.content_hash_rescanned", "true")
             .map_err(|e| format!("Failed to set rescan flag: {}", e))?;
-        println!("Content hash rescan flag set to true");
+        tracing::debug!("content hash rescan flag set to true");
     }
 
     Ok(RescanResultDto {
@@ -266,7 +274,7 @@ pub async fn relink_scan_root(
         )
         .map_err(|e| format!("Failed to get scan root: {}", e))?;
 
-    println!("Relinking root {} from '{}' to '{}'", root_id, old_path, new_path);
+    tracing::info!(root_id, old_path = %old_path, new_path = %new_path, "relinking scan root");
 
     // Perform relinking
     let result = crate::relinking::relink_files(&conn, &old_path, &new_path)
@@ -279,7 +287,7 @@ pub async fn relink_scan_root(
             rusqlite::params![new_path, root_id],
         )
         .map_err(|e| format!("Failed to update scan root path: {}", e))?;
-        println!("Updated scan root path to '{}'", new_path);
+        tracing::info!(root_id, new_path = %new_path, "updated scan root path");
     }
 
     Ok(result)
@@ -433,7 +441,7 @@ pub async fn set_scan_root_unique_camera_flag(
     db::set_unique_camera_flag(&conn, id, enabled)
         .map_err(|e| e.to_string())?;
 
-    println!("unique_camera flag set for root {}: enabled={}", id, enabled);
+    tracing::info!(root_id = id, enabled, "unique_camera flag set");
 
     Ok(())
 }
@@ -523,10 +531,14 @@ fn recreate_calibration_sets_for_root(
         return Ok(0);
     }
 
-    println!(
-        "Recreating calibration sets for root {}: {} flats, {} darks, {} bias, {} darkflats, {} masters",
-        root_id, flat_ids.len(), dark_ids.len(), bias_ids.len(),
-        darkflat_ids.len(), master_ids.total_count()
+    tracing::debug!(
+        root_id,
+        flats = flat_ids.len(),
+        darks = dark_ids.len(),
+        bias = bias_ids.len(),
+        darkflats = darkflat_ids.len(),
+        masters = master_ids.total_count(),
+        "recreating calibration sets for root"
     );
 
     let scan_result = create_calibration_sets_from_scan_with_masters(
@@ -545,7 +557,6 @@ pub async fn start_scan_with_progress(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanResultDto, String> {
-    println!("🔵 start_scan_with_progress called for root_id={}", root_id);
     tracing::info!(root_id = root_id, "scan started");
 
     let scan_emitter = TauriProgressEmitter(app_handle.clone());

@@ -257,7 +257,7 @@ pub async fn merge_frame_sets(
     target_id: i64,
     state: State<'_, AppState>,
 ) -> Result<FrameSetDetail, String> {
-    println!("Merging frame set {} into {}", source_id, target_id);
+    tracing::info!(source_id, target_id, "merging frame sets");
 
     if source_id == target_id {
         return Err("Cannot merge a frame set into itself".to_string());
@@ -272,13 +272,13 @@ pub async fn merge_frame_sets(
         let source_nights = db::get_imaging_nights_for_set(&conn, source_id)
             .map_err(|e| format!("Failed to get source nights: {}", e))?;
 
-        println!("Found {} nights in source frame set", source_nights.len());
+        tracing::debug!(count = source_nights.len(), "nights found in source frame set");
 
         // Get all nights from target frame set
         let target_nights = db::get_imaging_nights_for_set(&conn, target_id)
             .map_err(|e| format!("Failed to get target nights: {}", e))?;
 
-        println!("Found {} nights in target frame set", target_nights.len());
+        tracing::debug!(count = target_nights.len(), "nights found in target frame set");
 
         // Process each source night
         for source_night in source_nights {
@@ -291,7 +291,7 @@ pub async fn merge_frame_sets(
             ).map_err(|e| format!("Failed to find matching night: {}", e))?;
 
             if let Some(target_night_id) = matching_target_night_id {
-                println!("Night {} matches target night {}", source_night_id, target_night_id);
+                tracing::debug!(source_night_id, target_night_id, "night matches target night");
 
                 // Get the target night details for time range calculation
                 let target_night = target_nights
@@ -307,7 +307,7 @@ pub async fn merge_frame_sets(
                     &target_night.end_time,
                 ).map_err(|e| format!("Failed to calculate time range union: {}", e))?;
 
-                println!("Updating target night {} time range to {} - {}", target_night_id, new_start, new_end);
+                tracing::debug!(target_night_id, start = %new_start, end = %new_end, "updating target night time range");
 
                 // Update target night time range
                 db::update_imaging_night_time_range(&conn, target_night_id, &new_start, &new_end)
@@ -322,7 +322,7 @@ pub async fn merge_frame_sets(
                     .filter_map(|s| s.id)
                     .collect();
 
-                println!("Moving {} sessions from source night {} to target night {}", session_ids.len(), source_night_id, target_night_id);
+                tracing::debug!(count = session_ids.len(), source_night_id, target_night_id, "moving sessions to target night");
 
                 if !session_ids.is_empty() {
                     db::move_sessions_to_night(&conn, &session_ids, target_night_id)
@@ -337,7 +337,7 @@ pub async fn merge_frame_sets(
                 // Wait, we already moved sessions, so the night should be empty now
                 // Let's just leave it for now and let the frame set deletion handle it
             } else {
-                println!("Night {} has no match in target, reassigning to target frame set", source_night_id);
+                tracing::debug!(source_night_id, "night has no match in target, reassigning to target frame set");
 
                 // No matching night found, reassign this night to target frame set
                 db::reassign_imaging_night_to_frame_set(&conn, source_night_id, target_id)
@@ -346,14 +346,14 @@ pub async fn merge_frame_sets(
         }
 
         // Deduplicate frames in the target frame set
-        println!("Deduplicating frames in target frame set");
+        tracing::debug!(target_id, "deduplicating frames in target frame set");
         let duplicates_removed = db::deduplicate_session_members_in_set(&conn, target_id)
             .map_err(|e| format!("Failed to deduplicate: {}", e))?;
 
-        println!("Removed {} duplicate frame references", duplicates_removed);
+        tracing::debug!(count = duplicates_removed, "duplicate frame references removed");
 
         // Recalculate metadata for target frame set and mark as custom
-        println!("Recalculating metadata for target frame set");
+        tracing::debug!(target_id, "recalculating metadata for target frame set");
         let metadata = crate::frames_set_metadata::calculate_metadata_for_frame_set(target_id, &conn)
             .map_err(|e| format!("Failed to calculate metadata: {}", e))?;
 
@@ -372,11 +372,11 @@ pub async fn merge_frame_sets(
         ).map_err(|e| format!("Failed to update metadata: {}", e))?;
 
         // Delete source frame set (cascade will handle cleanup)
-        println!("Deleting source frame set {}", source_id);
+        tracing::debug!(source_id, "deleting source frame set");
         db::delete_frames_set(&conn, source_id)
             .map_err(|e| format!("Failed to delete source frame set: {}", e))?;
 
-        println!("✅ Merge completed successfully");
+        tracing::info!(source_id, target_id, "merge completed successfully");
     } // conn is dropped here
 
     // Return the updated target frame set detail
@@ -392,7 +392,7 @@ pub async fn split_frame_set(
     new_name: String,
     state: State<'_, AppState>,
 ) -> Result<FrameSetDetail, String> {
-    println!("Splitting from frame set {}: new_name='{}'", source_set_id, new_name);
+    tracing::info!(source_set_id, new_name = %new_name, "splitting frame set");
 
     // Perform all database operations in a scope
     let new_set_id = {
@@ -487,7 +487,7 @@ pub async fn split_frame_set(
             }
         };
 
-        println!("Split will move {} frames", frame_ids.len());
+        tracing::debug!(count = frame_ids.len(), "split will move frames");
 
         if frame_ids.is_empty() {
             return Err("No frames to split".to_string());
@@ -514,7 +514,7 @@ pub async fn split_frame_set(
             metadata.max_rotation,
         ).map_err(|e| format!("Failed to create frame set: {}", e))?;
 
-        println!("Created new frame set with id {}", new_set_id);
+        tracing::debug!(set_id = new_set_id, "created new frame set");
 
         // Get frames with file info for session detection
         let frames = db::get_frames_with_files_by_ids(&conn, &frame_ids)
@@ -524,7 +524,7 @@ pub async fn split_frame_set(
         let detected_nights = crate::sessions::detect_sessions(frames, gap_threshold_hours)
             .map_err(|e| format!("Failed to detect sessions: {}", e))?;
 
-        println!("Detected {} nights for new frame set", detected_nights.len());
+        tracing::debug!(count = detected_nights.len(), "detected nights for new frame set");
 
         // Create nights and sessions for new frame set
         for night in detected_nights {
@@ -587,7 +587,7 @@ pub async fn split_frame_set(
         }
 
         // Recalculate metadata for source frame set and mark as custom
-        println!("Recalculating metadata for source frame set");
+        tracing::debug!(source_set_id, "recalculating metadata for source frame set");
         let source_metadata = crate::frames_set_metadata::calculate_metadata_for_frame_set(
             source_set_id,
             &conn,
@@ -607,7 +607,7 @@ pub async fn split_frame_set(
             source_metadata.max_rotation,
         ).map_err(|e| format!("Failed to update source metadata: {}", e))?;
 
-        println!("✅ Split completed successfully");
+        tracing::info!(source_set_id, new_set_id, "split completed successfully");
 
         new_set_id
     }; // conn is dropped here
@@ -676,8 +676,14 @@ fn create_frame_set_inner(
         conn,
     ).map_err(|e| format!("Failed to calculate metadata: {}", e))?;
 
-    println!("Calculated metadata: date_obs_start={:?}, date_obs_end={:?}, coordinates={:?}/{:?}, total_exp_time={:?}",
-             metadata.date_obs_start, metadata.date_obs_end, metadata.objctra, metadata.objctdec, metadata.total_exp_time);
+    tracing::debug!(
+        date_obs_start = ?metadata.date_obs_start,
+        date_obs_end = ?metadata.date_obs_end,
+        objctra = ?metadata.objctra,
+        objctdec = ?metadata.objctdec,
+        total_exp_time = ?metadata.total_exp_time,
+        "calculated frame set metadata"
+    );
 
     // Create the custom frames_set
     let set_id = db::create_frames_set(
@@ -694,7 +700,7 @@ fn create_frame_set_inner(
         metadata.max_rotation,
     ).map_err(|e| format!("Failed to create frames_set: {}", e))?;
 
-    println!("Created frames_set with id {}", set_id);
+    tracing::debug!(set_id, "created frames_set");
 
     // Get frames with file info for session detection
     let frames = db::get_frames_with_files_by_ids(conn, frame_ids)
@@ -705,15 +711,15 @@ fn create_frame_set_inner(
         .get_session_gap_threshold_hours(conn)
         .unwrap_or(6.0);
 
-    println!("Detecting nights from {} frames with gap threshold {} hours", frames.len(), gap_threshold_hours);
+    tracing::debug!(count = frames.len(), gap_threshold_hours, "detecting nights from frames");
 
     let detected_nights = crate::sessions::detect_sessions(frames, gap_threshold_hours)
         .map_err(|e| format!("Failed to detect sessions: {}", e))?;
 
-    println!("Detected {} nights", detected_nights.len());
+    tracing::debug!(count = detected_nights.len(), "nights detected");
 
     if detected_nights.is_empty() {
-        println!("No nights detected, creating single night with all frames");
+        tracing::debug!("no nights detected, creating single night with all frames");
 
         let now = chrono::Utc::now();
         let night_start = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -728,10 +734,16 @@ fn create_frame_set_inner(
         db::insert_session_members(conn, session_id, frame_ids)
             .map_err(|e| format!("Failed to add frames to session: {}", e))?;
 
-        println!("Created custom frame set '{}' (id {}) with {} frames", name, set_id, frame_ids.len());
+        tracing::debug!(name = %name, set_id, count = frame_ids.len(), "created custom frame set");
     } else {
         for (night_idx, night) in detected_nights.iter().enumerate() {
-            println!("Processing night {}/{}: {} to {}", night_idx + 1, detected_nights.len(), night.start_time, night.end_time);
+            tracing::debug!(
+                night_index = night_idx + 1,
+                total_nights = detected_nights.len(),
+                start = %night.start_time,
+                end = %night.end_time,
+                "processing night"
+            );
 
             let night_id = db::create_imaging_night(conn, set_id, &night.start_time, &night.end_time)
                 .map_err(|e| format!("Failed to create imaging_night: {}", e))?;
@@ -750,7 +762,7 @@ fn create_frame_set_inner(
             }
         }
 
-        println!("Created custom frame set '{}' (id {}) with {} nights and {} frames", name, set_id, detected_nights.len(), frame_ids.len());
+        tracing::debug!(name = %name, set_id, nights = detected_nights.len(), frames = frame_ids.len(), "created custom frame set");
     }
 
     Ok(set_id)
@@ -764,11 +776,7 @@ pub async fn create_frame_set_from_selection(
     frame_ids: Vec<i64>,
     _description: Option<String>,
 ) -> Result<i64, String> {
-    println!(
-        "Creating frame set from selection: name='{}', frame_count={}",
-        name,
-        frame_ids.len()
-    );
+    tracing::info!(name = %name, count = frame_ids.len(), "creating frame set from selection");
 
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
@@ -798,10 +806,7 @@ pub async fn get_excluded_frames_with_metadata(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    db::get_excluded_frames_with_metadata(&conn).map_err(|e| {
-        eprintln!("get_excluded_frames_with_metadata failed: {}", e);
-        e.to_string()
-    })
+    db::get_excluded_frames_with_metadata(&conn).map_err(|e| e.to_string())
 }
 
 /// Remove the given file IDs from the `excluded_frames` table.
@@ -923,7 +928,7 @@ pub async fn find_new_frames_for_set(
             for root_id in roots {
                 if let Err(e) = crate::scanner::run_registered_scan(&state.ctx, &emitter, root_id) {
                     if !e.contains("already in progress") {
-                        eprintln!("[find_new_frames] scan of root {} failed: {}", root_id, e);
+                        tracing::warn!(root_id, error = %e, "find_new_frames: scan of root failed");
                     }
                 }
             }

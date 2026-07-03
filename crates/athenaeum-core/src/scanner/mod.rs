@@ -959,8 +959,9 @@ fn emit_scan_complete<E: ProgressEmitter>(emitter: &E, root_id: i64, result: &Sc
 fn process_file_parallel(
     path: &PathBuf,
     use_content_hash: bool,
+    root_id: i64,
 ) -> Result<FileProcessResult, String> {
-    tracing::debug!(path = %path.display(), "processing file");
+    tracing::debug!(root_id, path = %path.display(), "processing file");
 
     // Get file metadata
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -1279,7 +1280,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             // headers). Without this, rayon swallows the panic and the file
             // silently disappears from the result with no error trail.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                process_file_parallel(path, use_content_hash)
+                process_file_parallel(path, use_content_hash, root_id)
             }));
 
             match outcome {

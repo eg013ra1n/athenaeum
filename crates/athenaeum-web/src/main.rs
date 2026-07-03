@@ -82,23 +82,19 @@ async fn main() {
 
     let config = Config::from_env();
 
-    println!("Athenaeum Web Server v{}", env!("CARGO_PKG_VERSION"));
-    println!("  Database: {}", config.db_path.display());
-    println!("  Port:     {}", config.port);
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "athenaeum web server starting");
+    tracing::info!(db_path = %config.db_path.display(), port = config.port, "server config");
     if let Some(ref dir) = config.static_dir {
-        println!("  Static:   {}", dir.display());
+        tracing::info!(static_dir = %dir.display(), "server config");
     }
     if !config.allowed_paths.is_empty() {
-        println!("  Allowed:  {:?}", config.allowed_paths);
+        tracing::info!(allowed_paths = ?config.allowed_paths, "server config");
     }
     if let Some(ref dir) = config.export_dir {
-        println!("  Export:   {}", dir.display());
+        tracing::info!(export_dir = %dir.display(), "server config");
     }
-    // Never print the key itself — only whether auth is on.
-    println!(
-        "  API key:  {}",
-        if config.api_key.is_some() { "required (ATHENAEUM_API_KEY set)" } else { "disabled (ATHENAEUM_API_KEY unset)" }
-    );
+    // Never log the key itself — only whether auth is on.
+    tracing::info!(auth_enabled = config.api_key.is_some(), "server config");
 
     // Ensure DB parent directory exists
     if let Some(parent) = config.db_path.parent() {
@@ -107,7 +103,7 @@ async fn main() {
 
     // Initialize database
     let db = Database::new(config.db_path.clone()).expect("Failed to initialize database");
-    println!("Database initialized: {}", config.db_path.display());
+    tracing::info!(db_path = %config.db_path.display(), "database initialized");
 
     // Apply persisted logging config now that the DB is available. A parse
     // failure falls back to the default (info) filter rather than failing
@@ -151,7 +147,7 @@ async fn main() {
     let image_semaphore = Arc::new(RwLock::new(Arc::new(
         tokio::sync::Semaphore::new(blink_threads),
     )));
-    println!("  Blink threads: {} (semaphore permits)", blink_threads);
+    tracing::info!(permits = blink_threads, "blink semaphore initialized");
 
     // Read memory cache settings from DB
     let cache_size: usize = db::get_setting(&db.conn(), settings::keys::BLINK_MEMORY_CACHE_SIZE)
@@ -164,7 +160,7 @@ async fn main() {
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    println!("  Memory cache: {} entries, {} min retention", cache_size, retention_minutes);
+    tracing::info!(cache_size, retention_minutes, "memory cache initialized");
 
     // Build ServiceContext
     let settings_mgr = Arc::new(SettingsManager::new());
@@ -217,7 +213,7 @@ async fn main() {
             operation_id: 0,
             run: Box::new(move || {
                 let Some(db) = ctx_for_reconcile.db.get() else {
-                    eprintln!("file_op reconcile (startup): database not yet initialized, skipping");
+                    tracing::warn!("file_op reconcile (startup): database not yet initialized, skipping");
                     return;
                 };
                 let conn = db.conn();
@@ -235,7 +231,7 @@ async fn main() {
                         );
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("file_op reconcile (startup) failed: {:#}", e),
+                    Err(e) => tracing::warn!(error = ?e, "file_op reconcile (startup) failed"),
                 }
             }),
         });
@@ -274,7 +270,6 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Failed to bind to address");
-    println!("Listening on http://{}", addr);
 
     tracing::info!(%addr, "Athenaeum web server started");
 

@@ -133,7 +133,7 @@ pub fn download_catalog_layers(
         .collect();
     let wanted = tiers_to_fetch(&manifest, &installed, target_density);
     if wanted.is_empty() {
-        eprintln!("catalog: all tiers up to density {target_density} already installed");
+        tracing::info!(target_density, "all catalog tiers already installed");
         progress(GaiaPrebuiltProgress::Complete { files: 0 });
         return Ok(smac_root);
     }
@@ -174,7 +174,7 @@ pub fn download_catalog_layers(
             .map(|s| s.split_whitespace().next().unwrap_or("").to_lowercase())
             .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
         if expected_sha.is_none() {
-            eprintln!("catalog: no .sha256 sidecar at {sha_url} — skipping integrity check");
+            tracing::warn!(sha_url, "no .sha256 sidecar, skipping integrity check");
         }
 
         if !zip_path.exists() {
@@ -404,9 +404,7 @@ pub fn tier_status(app_data: &Path) -> Vec<TierStatus> {
             })
             .collect(),
         Err(e) => {
-            eprintln!(
-                "catalog: no manifest available for status, falling back to discover_layers: {e}"
-            );
+            tracing::warn!(error = %e, "no manifest available for status, falling back to disk discovery");
             // Fall back to discovering installed tiers from disk.  Density and epoch
             // come from the dir name / cache header; size_bytes / min_fov_deg are
             // unknown without the manifest and reported as 0 / 0.0.

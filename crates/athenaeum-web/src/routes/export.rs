@@ -21,14 +21,15 @@ use crate::WebAppState;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// The raw stderr prints formerly here duplicated the `#[tracing::instrument(err(Debug))]`
+// attribute on every caller below, which already logs each returned Err at
+// the command boundary — see the T7 sweep report.
 fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     let s = msg.to_string();
-    eprintln!("export error: {}", s);
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 
 fn no_db() -> (StatusCode, String) {
-    eprintln!("export error: database not initialized");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         "Database not initialized".to_string(),
@@ -48,7 +49,7 @@ fn load_wbpp_config(conn: &rusqlite::Connection) -> Result<WbppExportConfig, Str
 
     match result {
         Some(json) => serde_json::from_str(&json).map_err(|e| {
-            eprintln!("Failed to parse WBPP config, using default: {}", e);
+            tracing::warn!(error = %e, "failed to parse WBPP config");
             e.to_string()
         }),
         None => Ok(WbppExportConfig::default()),
@@ -609,7 +610,7 @@ pub async fn export_to_wbpp(
             }
             Err(e) => {
                 let msg = format!("Failed to organize files: {}", e);
-                eprintln!("export error: {}", msg);
+                tracing::error!(frame_set_id, error = %e, "export failed");
                 ExportResult {
                     success: false,
                     output_dir: args.output_dir.clone(),

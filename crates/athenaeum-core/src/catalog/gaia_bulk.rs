@@ -138,10 +138,13 @@ fn with_retry<T>(what: &str, mut op: impl FnMut() -> Result<T>) -> Result<T> {
         match op() {
             Ok(v) => return Ok(v),
             Err(e) => {
-                eprintln!(
-                    "gaia_bulk: {what} attempt {attempt}/{MAX} failed ({e:#}); \
-                     retrying in {}s",
-                    delay.as_secs()
+                tracing::warn!(
+                    stage = what,
+                    attempt,
+                    max = MAX,
+                    delay_secs = delay.as_secs(),
+                    error = %e,
+                    "gaia bulk request failed, retrying"
                 );
                 last = Some(e);
                 if attempt < MAX {
@@ -362,9 +365,10 @@ pub fn download_bulk(
     // to re-fetch the network can still ingest.
     let manifest_cache = dest_dir.join(MD5_MANIFEST_FILENAME);
     if let Err(e) = write_manifest_cache(&manifest_cache, &files) {
-        eprintln!(
-            "gaia_bulk: warning: failed to cache manifest to {}: {e:#}",
-            manifest_cache.display()
+        tracing::warn!(
+            path = %manifest_cache.display(),
+            error = %e,
+            "failed to cache gaia bulk manifest"
         );
     }
 
@@ -799,7 +803,7 @@ pub fn setup_gaia_dr3_from_bulk(
     if catalog_dir.exists() {
         let file_count = std::fs::read_dir(&catalog_dir)?.count();
         if file_count > 100 {
-            eprintln!("gaia_bulk: catalog already exists with {file_count} files");
+            tracing::info!(file_count, "gaia bulk catalog already exists, skipping setup");
             return Ok(catalog_dir);
         }
     }

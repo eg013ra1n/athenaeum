@@ -8,14 +8,15 @@ use crate::WebAppState;
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
+// The raw stderr prints formerly here duplicated the `#[tracing::instrument(err(Debug))]`
+// attribute on every caller below, which already logs each returned Err at
+// the command boundary — see the T7 sweep report.
 fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     let s = msg.to_string();
-    eprintln!("missing_files error: {}", s);
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 
 fn no_db() -> (StatusCode, String) {
-    eprintln!("missing_files error: database not initialized");
     (StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string())
 }
 

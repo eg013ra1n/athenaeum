@@ -193,7 +193,7 @@ pub async fn analyze_frame_set(
                             }
                             Err(e) => {
                                 let msg = format!("{}: {}", path, e);
-                                eprintln!("Analysis failed for {}", msg);
+                                tracing::warn!(frame_id, path = %path, error = %e, "frame analysis failed");
                                 Err(msg)
                             }
                         };
@@ -463,10 +463,7 @@ pub async fn compute_flat_contour_plot(
         flat_analysis::compute_flat_contour_plot(&path, opts)
     }).await
         .map_err(|e| format!("Flat contour analysis panicked: {}", e))?
-        .map_err(|e| {
-            eprintln!("compute_flat_contour_plot failed: {:#}", e);
-            format!("Flat contour analysis failed: {}", e)
-        })?;
+        .map_err(|e| format!("Flat contour analysis failed: {}", e))?;
 
     let pixels_b64 = STANDARD.encode(&result.pixels);
 

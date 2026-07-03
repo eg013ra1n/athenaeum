@@ -131,14 +131,11 @@ pub fn autofind_objects_from_coordinates(
         }
     };
 
-    eprintln!(
-        "autofind: starting batch — {} frames, tolerance {:.2}°",
-        s.total, tolerance_deg
-    );
+    tracing::info!(total = s.total, tolerance_deg, "autofind batch starting");
 
     for (i, frame_id) in frame_ids.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            eprintln!("autofind: cancel observed at frame {} of {}", i, s.total);
+            tracing::info!(current = i, total = s.total, "autofind cancelled");
             s.cancelled = true;
             break;
         }
@@ -156,7 +153,7 @@ pub fn autofind_objects_from_coordinates(
         let (ra, dec, existing) = match row {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("autofind: frame {frame_id} SQL load failed: {e}");
+                tracing::warn!(frame_id, error = %e, "autofind: SQL load failed");
                 s.errors += 1;
                 progress(base(*frame_id, i + 1, s.total, AutofindStatus::Error));
                 continue;
@@ -164,10 +161,7 @@ pub fn autofind_objects_from_coordinates(
         };
 
         if existing.as_deref().map(|v| !v.is_empty()).unwrap_or(false) {
-            eprintln!(
-                "autofind: frame {frame_id} skip — already_labeled ({:?})",
-                existing
-            );
+            tracing::debug!(frame_id, object = ?existing, "autofind: skip, already labeled");
             s.already_labeled += 1;
             let mut p = base(*frame_id, i + 1, s.total, AutofindStatus::AlreadyLabeled);
             p.frame_ra = ra;
@@ -177,10 +171,7 @@ pub fn autofind_objects_from_coordinates(
         }
 
         let (Some(ra), Some(dec)) = (ra, dec) else {
-            eprintln!(
-                "autofind: frame {frame_id} skip — missing_coords (ra={:?}, dec={:?})",
-                ra, dec
-            );
+            tracing::debug!(frame_id, ra = ?ra, dec = ?dec, "autofind: skip, missing coordinates");
             s.missing_coords += 1;
             let mut p = base(*frame_id, i + 1, s.total, AutofindStatus::MissingCoords);
             p.frame_ra = ra;
@@ -195,9 +186,7 @@ pub fn autofind_objects_from_coordinates(
         // images at (0h, 0°), and this prevents a cluster of bogus no_match
         // events all pointing at the same closest-to-origin DSO.
         if ra == 0.0 && dec == 0.0 {
-            eprintln!(
-                "autofind: frame {frame_id} skip — missing_coords (sentinel 0,0)"
-            );
+            tracing::debug!(frame_id, "autofind: skip, missing coordinates (sentinel 0,0)");
             s.missing_coords += 1;
             let mut p = base(*frame_id, i + 1, s.total, AutofindStatus::MissingCoords);
             p.frame_ra = Some(ra);
@@ -216,9 +205,14 @@ pub fn autofind_objects_from_coordinates(
                             DsoMatchReason::Contains => "contains",
                             DsoMatchReason::Nearest => "nearest",
                         };
-                        eprintln!(
-                            "autofind: frame {frame_id} labeled '{}' ({}, {:.3}° away) at ra={:.4} dec={:.4}",
-                            m.designation, reason, m.distance_deg, ra, dec
+                        tracing::debug!(
+                            frame_id,
+                            designation = %m.designation,
+                            reason,
+                            distance_deg = m.distance_deg,
+                            ra,
+                            dec,
+                            "autofind: frame labeled"
                         );
                         let mut p = base(*frame_id, i + 1, s.total, AutofindStatus::Labeled);
                         p.designation = Some(m.designation);
@@ -231,9 +225,7 @@ pub fn autofind_objects_from_coordinates(
                     Ok(false) => {
                         // Race: some other writer labelled the frame between
                         // our SELECT and UPDATE. Count as already-labelled.
-                        eprintln!(
-                            "autofind: frame {frame_id} skip — already_labeled (race after SELECT)"
-                        );
+                        tracing::debug!(frame_id, "autofind: skip, already labeled (race after SELECT)");
                         s.already_labeled += 1;
                         let mut p = base(
                             *frame_id,
@@ -246,7 +238,7 @@ pub fn autofind_objects_from_coordinates(
                         progress(p);
                     }
                     Err(e) => {
-                        eprintln!("autofind: frame {frame_id} UPDATE failed: {e}");
+                        tracing::warn!(frame_id, error = %e, "autofind: UPDATE failed");
                         s.errors += 1;
                         let mut p = base(*frame_id, i + 1, s.total, AutofindStatus::Error);
                         p.frame_ra = Some(ra);
@@ -262,14 +254,16 @@ pub fn autofind_objects_from_coordinates(
                 // the 0.2° cap) rather than guessing.
                 let closest = catalog.nearest_dso(ra, dec);
                 match &closest {
-                    Some((name, dist)) => eprintln!(
-                        "autofind: frame {frame_id} no_match at ra={:.4} dec={:.4} — closest '{name}' at {:.3}° (> {:.2}°)",
-                        ra, dec, dist, tolerance_deg
+                    Some((name, dist)) => tracing::debug!(
+                        frame_id,
+                        ra,
+                        dec,
+                        closest_designation = %name,
+                        closest_distance_deg = dist,
+                        tolerance_deg,
+                        "autofind: no match within tolerance"
                     ),
-                    None => eprintln!(
-                        "autofind: frame {frame_id} no_match at ra={:.4} dec={:.4} — catalog empty",
-                        ra, dec
-                    ),
+                    None => tracing::debug!(frame_id, ra, dec, "autofind: no match, catalog empty"),
                 }
                 s.no_match += 1;
                 let mut p = base(*frame_id, i + 1, s.total, AutofindStatus::NoMatch);
@@ -284,9 +278,14 @@ pub fn autofind_objects_from_coordinates(
         }
     }
 
-    eprintln!(
-        "autofind: batch done — labeled={} no_match={} already_labeled={} missing_coords={} errors={} cancelled={}",
-        s.labeled, s.no_match, s.already_labeled, s.missing_coords, s.errors, s.cancelled
+    tracing::info!(
+        labeled = s.labeled,
+        no_match = s.no_match,
+        already_labeled = s.already_labeled,
+        missing_coords = s.missing_coords,
+        errors = s.errors,
+        cancelled = s.cancelled,
+        "autofind batch done"
     );
 
     Ok(s)

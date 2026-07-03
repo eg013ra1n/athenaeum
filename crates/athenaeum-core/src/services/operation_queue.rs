@@ -152,10 +152,10 @@ fn worker_loop(inner: Arc<Inner>) {
         let run_fn = job.run;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_fn));
         if let Err(_panic) = result {
-            eprintln!(
-                "operation_queue: job kind={} op_id={} panicked",
-                job_kind.as_str(),
-                op_id
+            tracing::error!(
+                kind = job_kind.as_str(),
+                operation_id = op_id,
+                "operation queue job panicked"
             );
         }
 

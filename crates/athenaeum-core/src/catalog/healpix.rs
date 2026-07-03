@@ -70,10 +70,11 @@ pub fn cone_search_pixels(ra_deg: f64, dec_deg: f64, radius_deg: f64) -> Vec<u64
         .or_else(|| try_cover(radius_deg * 0.99));
 
     let Some(mut pixels) = pixels else {
-        eprintln!(
-            "catalog::cone_search_pixels: cdshealpix panicked at every nudged \
-             radius for ra={ra_deg:.6} dec={dec_deg:.6} radius_deg={radius_deg:.6}; \
-             returning empty cone (candidate will fail verification, not crash)"
+        tracing::warn!(
+            ra_deg,
+            dec_deg,
+            radius_deg,
+            "cdshealpix panicked at every nudged radius, returning empty cone"
         );
         return Vec::new();
     };

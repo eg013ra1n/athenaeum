@@ -264,11 +264,10 @@ pub async fn get_frames_with_missing_metadata(
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
+    // Error logged once by the `#[tracing::instrument(err(Debug))]` attribute
+    // on this handler — see the T7 sweep report.
     let rows = db::get_frames_with_missing_metadata(&conn, &args.category)
-        .map_err(|e| {
-            eprintln!("get_frames_with_missing_metadata route failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(rows))
 }
@@ -354,10 +353,7 @@ pub async fn bulk_update_frame_metadata(
     let conn = db.conn();
 
     let count = db::bulk_update_frame_metadata(&conn, &args.frame_ids, &args.edits)
-        .map_err(|e| {
-            eprintln!("bulk_update_frame_metadata route failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(count))
 }
@@ -375,10 +371,7 @@ pub async fn get_distinct_instrumes(
     let conn = db.conn();
 
     let cameras = db::get_distinct_instrumes(&conn)
-        .map_err(|e| {
-            eprintln!("get_distinct_instrumes route failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(cameras))
 }
@@ -662,7 +655,7 @@ pub async fn enqueue_move_operation(
                     );
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!("file_op reconcile (pre-enqueue) failed: {:#}", e),
+                Err(e) => tracing::warn!(operation_id = op_id, error = ?e, "file_op reconcile (pre-enqueue) failed"),
             }
 
             let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
@@ -674,7 +667,7 @@ pub async fn enqueue_move_operation(
                             &conn, op_id, FileOpStatus::Cancelled, None,
                         );
                     } else {
-                        eprintln!("file_op {} failed: {:#}", op_id, e);
+                        tracing::error!(operation_id = op_id, error = ?e, "file_op failed");
                         let msg = format!("{:#}", e);
                         let _ = fdb::update_operation_status(
                             &conn, op_id, FileOpStatus::Failed, Some(&msg),
@@ -802,10 +795,7 @@ pub async fn mkdir_in_scan_root(
             format!("'{}' is not inside any scan root", args.path),
         ));
     }
-    fs::create_dir_all(&target).map_err(|e| {
-        eprintln!("mkdir {} failed: {}", args.path, e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+    fs::create_dir_all(&target).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(StatusCode::OK)
 }
 
@@ -852,10 +842,7 @@ pub async fn rename_path(
         ));
     }
     let is_dir = old.is_dir();
-    fs::rename(&old, &new).map_err(|e| {
-        eprintln!("rename {} → {} failed: {}", old.display(), new.display(), e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+    fs::rename(&old, &new).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let old_str = old.to_string_lossy().to_string();
     let new_str = new.to_string_lossy().to_string();
     if is_dir {

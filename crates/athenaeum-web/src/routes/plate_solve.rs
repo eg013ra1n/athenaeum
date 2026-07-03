@@ -29,7 +29,7 @@ fn get_dso_catalog(state: &WebAppState) -> Option<Arc<DsoCatalog>> {
             Some(arc)
         }
         Err(e) => {
-            eprintln!("plate_solve: failed to load DSO catalog: {e}");
+            tracing::warn!(error = %e, "failed to load DSO catalog");
             None
         }
     }
@@ -73,11 +73,7 @@ fn resolve_layer_caches(
         })?;
         layers.push(Arc::new(sc));
     }
-    eprintln!(
-        "plate_solve: opened {} catalog layer(s) under {}",
-        layers.len(),
-        catalog_root.display()
-    );
+    tracing::debug!(count = layers.len(), path = %catalog_root.display(), "opened catalog layers");
     Ok(layers)
 }
 
@@ -188,7 +184,7 @@ pub async fn plate_solve_batch(
                     });
                 }
                 Err((_status, msg)) => {
-                    eprintln!("plate_solve: failed to load frame {frame_id}: {msg}");
+                    tracing::warn!(frame_id, error = %msg, "failed to load frame for plate solve");
                     work_items.push(WorkItem::LoadFailed {
                         frame_id: *frame_id,
                         error: msg,
@@ -207,10 +203,7 @@ pub async fn plate_solve_batch(
     } else {
         (ps_config.batch_concurrency as usize).clamp(1, 16)
     };
-    eprintln!(
-        "plate_solve: batch starting ({} frames, {} workers)",
-        total, concurrency
-    );
+    tracing::info!(total, workers = concurrency, "plate solve batch starting");
 
     let ctx = state.ctx.clone();
 
@@ -272,10 +265,14 @@ pub async fn plate_solve_batch(
                                     Ok(result) => WorkResult::Solved { frame_id, result, filename },
                                     Err(e) => {
                                         let info = describe_solve_failure(&e);
-                                        eprintln!(
-                                            "plate_solve: solve failed for {filename} (frame {frame_id}): {} [{}]",
-                                            info.message,
-                                            info.code.as_deref().unwrap_or("?")
+                                        tracing::warn!(
+                                            frame_id,
+                                            filename = %filename,
+                                            stage = "solve",
+                                            outcome = "failed",
+                                            code = info.code.as_deref().unwrap_or("?"),
+                                            error = %info.message,
+                                            "plate solve failed"
                                         );
                                         WorkResult::Failed {
                                             frame_id,
@@ -341,7 +338,7 @@ pub async fn plate_solve_batch(
         {
             let conn = db.conn();
             if let Err(e) = conn.execute_batch("BEGIN") {
-                eprintln!("plate_solve: BEGIN failed: {e}");
+                tracing::error!(error = %e, "plate solve persist: BEGIN failed");
             }
             for r in &results {
                 match r {
@@ -376,9 +373,7 @@ pub async fn plate_solve_batch(
                                 });
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "plate_solve: failed to store result for frame {frame_id}: {e}"
-                                );
+                                tracing::error!(frame_id, error = %e, "failed to store plate solve result, solve outcome lost");
                                 failed += 1;
                             }
                         }
@@ -389,7 +384,7 @@ pub async fn plate_solve_batch(
                 }
             }
             if let Err(e) = conn.execute_batch("COMMIT") {
-                eprintln!("plate_solve: COMMIT failed: {e}");
+                tracing::error!(error = %e, "plate solve persist: COMMIT failed");
             }
         }
 
@@ -585,7 +580,7 @@ pub async fn autofind_objects_from_coordinates(
                 });
             }
             Err(e) => {
-                eprintln!("autofind: {e}");
+                tracing::error!(error = %e, "autofind batch failed");
             }
         }
     });

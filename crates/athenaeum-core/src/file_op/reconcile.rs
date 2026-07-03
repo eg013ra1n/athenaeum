@@ -108,9 +108,11 @@ pub fn reconcile_abandoned_commit_moves(conn: &Connection) -> Result<ReconcileSu
             Err(e) => Some(format!("reconcile error: {:#}", e)),
         };
         if let Some(reason) = outcome {
-            eprintln!(
-                "file_op reconcile: skipping operation_id={} source={}: {}",
-                c.operation_id, c.source_path, reason
+            tracing::warn!(
+                operation_id = c.operation_id,
+                src = %c.source_path,
+                reason = %reason,
+                "file_op reconcile: skipping candidate"
             );
             summary.skipped.push(ReconcileOutcome {
                 operation_id: c.operation_id,
@@ -131,26 +133,28 @@ pub fn reconcile_abandoned_commit_moves(conn: &Connection) -> Result<ReconcileSu
         match fdb::all_operation_files_done(conn, *op_id) {
             Ok(true) => {
                 if let Err(e) = fdb::update_operation_status(conn, *op_id, FileOpStatus::Completed, None) {
-                    eprintln!(
-                        "file_op reconcile: failed to mark operation {} completed: {:#}",
-                        op_id, e
+                    tracing::warn!(
+                        operation_id = op_id,
+                        error = %e,
+                        "file_op reconcile: failed to mark operation completed"
                     );
                 }
             }
             Ok(false) => {}
-            Err(e) => eprintln!(
-                "file_op reconcile: checking completion for operation {} failed: {:#}",
-                op_id, e
+            Err(e) => tracing::warn!(
+                operation_id = op_id,
+                error = %e,
+                "file_op reconcile: checking operation completion failed"
             ),
         }
     }
 
     if summary.examined > 0 {
-        eprintln!(
-            "file_op reconcile: examined={} healed={} skipped={}",
-            summary.examined,
-            summary.healed,
-            summary.skipped.len()
+        tracing::info!(
+            examined = summary.examined,
+            healed = summary.healed,
+            skipped = summary.skipped.len(),
+            "file_op reconcile pass complete"
         );
     }
 

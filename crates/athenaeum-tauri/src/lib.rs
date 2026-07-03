@@ -64,7 +64,7 @@ pub fn run() {
             // each other on the pool. Half the cores gives each request ~2
             // pool threads — good balance of throughput vs per-frame speed.
             let default_permits = (max_threads / 2).max(2);
-            println!("🧵 CPU cores cap: {}, default blink semaphore permits: {}", max_threads, default_permits);
+            tracing::info!(max_threads, default_permits, "blink semaphore initialized");
             AppState {
                 ctx: Arc::new(ServiceContext {
                     db: OnceLock::new(),
@@ -116,9 +116,11 @@ pub fn run() {
                     operation_id: 0,
                     run: Box::new(move || {
                         let Some(db) = ctx_for_reconcile.db.get() else {
-                            eprintln!(
-                                "file_op reconcile (startup): database not yet initialized, skipping"
-                            );
+                            // Expected on desktop: the DB is initialized lazily by the
+                            // frontend's `initialize_database` call after this closure is
+                            // enqueued, so this job commonly races it. The pre-enqueue
+                            // trigger in `enqueue_move_operation` does the real work.
+                            tracing::debug!("file_op reconcile (startup): database not yet initialized, skipping");
                             return;
                         };
                         let conn = db.conn();
@@ -136,7 +138,7 @@ pub fn run() {
                                 );
                             }
                             Ok(_) => {}
-                            Err(e) => eprintln!("file_op reconcile (startup) failed: {:#}", e),
+                            Err(e) => tracing::warn!(error = ?e, "file_op reconcile (startup) failed"),
                         }
                     }),
                 });
@@ -147,8 +149,8 @@ pub fn run() {
                 let old_cache_dir = app_dir.join("cache");
                 if old_cache_dir.exists() {
                     match std::fs::remove_dir_all(&old_cache_dir) {
-                        Ok(()) => println!("🧹 Removed old file cache directory: {:?}", old_cache_dir),
-                        Err(e) => eprintln!("⚠️  Failed to remove old cache directory {:?}: {}", old_cache_dir, e),
+                        Ok(()) => tracing::info!(path = ?old_cache_dir, "removed old file cache directory"),
+                        Err(e) => tracing::warn!(path = ?old_cache_dir, error = %e, "failed to remove old cache directory"),
                     }
                 }
             }
@@ -170,7 +172,7 @@ pub fn run() {
                     let mut cache = state.ctx.memory_cache.lock().unwrap();
                     cache.set_max_entries(cache_size);
                     cache.set_retention(retention_minutes);
-                    println!("Memory cache: {} entries, {} min retention", cache_size, retention_minutes);
+                    tracing::info!(cache_size, retention_minutes, "memory cache initialized");
                 }
             }
 

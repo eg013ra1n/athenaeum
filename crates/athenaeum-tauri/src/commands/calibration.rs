@@ -222,15 +222,15 @@ pub async fn find_calibration_for_frame_set(
         dark_date_warning_days: dark_date_warning_days.unwrap_or(config.warnings.dark_date_warning_days),
     };
 
-    println!(
-        "Finding calibration for frame set {} with tolerance: flat_date={} days, dark_date={} days",
+    tracing::debug!(
         frame_set_id,
-        tolerance.flat_date_warning_days,
-        tolerance.dark_date_warning_days
-    );
-    println!(
-        "Flat settings: pattern={:?}, max_age={} days, time_cluster={} min, temp_weight={}",
-        final_flat_pattern, max_age_days, time_cluster_minutes, temp_weight
+        flat_date_warning_days = tolerance.flat_date_warning_days,
+        dark_date_warning_days = tolerance.dark_date_warning_days,
+        flat_pattern = ?final_flat_pattern,
+        max_age_days,
+        time_cluster_minutes,
+        temp_weight,
+        "finding calibration for frame set"
     );
 
     let stats = process_frame_set(
@@ -244,9 +244,11 @@ pub async fn find_calibration_for_frame_set(
         temp_weight,
     ).map_err(|e| format!("Failed to process frame set: {}", e))?;
 
-    println!(
-        "✅ Calibration processing complete: {} frames, {} with full calibration",
-        stats.total_frames, stats.frames_with_full_calibration
+    tracing::info!(
+        frame_set_id,
+        total_frames = stats.total_frames,
+        frames_with_full_calibration = stats.frames_with_full_calibration,
+        "calibration processing complete"
     );
 
     Ok(stats)
@@ -617,14 +619,16 @@ pub async fn manual_assign_calibration(
         match insert_calibration_link(&conn, &link) {
             Ok(_) => assigned_count += 1,
             Err(e) => {
-                eprintln!("Failed to assign calibration to frame {}: {}", frame_id, e);
+                tracing::warn!(frame_id, error = %e, "failed to assign calibration to frame");
             }
         }
     }
 
-    println!(
-        "✅ Manually assigned {} set {} to {} frames ({} of type {})",
-        calibration_type, calibration_set_id, assigned_count, frame_ids.len(), calibration_type
+    tracing::info!(
+        calibration_type = %calibration_type,
+        set_id = calibration_set_id,
+        count = assigned_count,
+        "manually assigned calibration set to frames"
     );
 
     Ok(assigned_count)
@@ -648,15 +652,9 @@ pub async fn clear_manual_calibration_override(
     }
 
     let deleted = clear_manual_override(&conn, &frame_ids, calibration_type.as_deref())
-        .map_err(|e| {
-            eprintln!("Failed to clear manual calibration override: {}", e);
-            e.to_string()
-        })?;
+        .map_err(|e| e.to_string())?;
 
-    println!(
-        "✅ Cleared {} manual calibration override(s) from {} frames",
-        deleted, frame_ids.len()
-    );
+    tracing::info!(count = deleted, frames = frame_ids.len(), "cleared manual calibration override(s)");
 
     Ok(deleted)
 }
@@ -699,7 +697,7 @@ pub(crate) fn refresh_calibration_library_inner(
     conn: &rusqlite::Connection,
     instrume: &str,
 ) -> Result<CalibrationScanResult, String> {
-    println!("🔄 Refreshing calibration library for camera: {}", instrume);
+    tracing::info!(instrume, "refreshing calibration library");
 
     // Step 1: Clear frame memberships for this camera's sets (but keep the sets)
     conn.execute(
@@ -717,7 +715,7 @@ pub(crate) fn refresh_calibration_library_inner(
         rusqlite::params![instrume],
     ).map_err(|e| format!("Failed to reset frame counts: {}", e))?;
 
-    println!("   Cleared existing frame memberships (sets preserved for ID stability)");
+    tracing::debug!(instrume, "cleared existing frame memberships (sets preserved for ID stability)");
 
     // Step 2: Query all calibration frame IDs for this camera
     let flat_frame_ids = query_frame_ids_by_type(conn, instrume, "FLAT")
@@ -749,14 +747,21 @@ pub(crate) fn refresh_calibration_library_inner(
         master_darkflat_ids,
     };
 
-    println!("   Found frames - Flats: {}, Darks: {}, Bias: {}, DarkFlats: {}",
-        flat_frame_ids.len(), dark_frame_ids.len(), bias_frame_ids.len(), darkflat_frame_ids.len());
+    tracing::debug!(
+        flats = flat_frame_ids.len(),
+        darks = dark_frame_ids.len(),
+        bias = bias_frame_ids.len(),
+        darkflats = darkflat_frame_ids.len(),
+        "calibration frames found"
+    );
     if !master_frame_ids.is_empty() {
-        println!("   Found master frames - Dark: {}, Flat: {}, Bias: {}, DarkFlat: {}",
-            master_frame_ids.master_dark_ids.len(),
-            master_frame_ids.master_flat_ids.len(),
-            master_frame_ids.master_bias_ids.len(),
-            master_frame_ids.master_darkflat_ids.len());
+        tracing::debug!(
+            master_darks = master_frame_ids.master_dark_ids.len(),
+            master_flats = master_frame_ids.master_flat_ids.len(),
+            master_bias = master_frame_ids.master_bias_ids.len(),
+            master_darkflats = master_frame_ids.master_darkflat_ids.len(),
+            "master calibration frames found"
+        );
     }
 
     // Step 3: Recreate calibration sets using the same algorithm as folder scanning
@@ -777,10 +782,10 @@ pub(crate) fn refresh_calibration_library_inner(
     ).map_err(|e| format!("Failed to delete orphaned sets: {}", e))?;
 
     if deleted_orphans > 0 {
-        println!("   Deleted {} orphaned sets", deleted_orphans);
+        tracing::debug!(count = deleted_orphans, "deleted orphaned calibration sets");
     }
 
-    println!("Refresh complete - {} calibration sets active (IDs preserved)", result.sets_created);
+    tracing::info!(instrume, sets_created = result.sets_created, "calibration library refresh complete");
 
     Ok(result)
 }
@@ -1036,9 +1041,11 @@ pub async fn manual_assign_subcalibration(
     insert_calibration_link(&conn, &link)
         .map_err(|e| format!("Failed to assign sub-calibration: {}", e))?;
 
-    println!(
-        "✅ Manually assigned {} set #{} as sub-calibration for set #{}",
-        calibration_type, calibration_set_id, source_set_id
+    tracing::info!(
+        calibration_type = %calibration_type,
+        set_id = calibration_set_id,
+        source_set_id,
+        "manually assigned sub-calibration"
     );
 
     Ok(())
@@ -1072,10 +1079,7 @@ pub async fn clear_subcalibration_override(
         }
     };
 
-    println!(
-        "✅ Cleared {} sub-calibration link(s) for set #{}",
-        deleted, source_set_id
-    );
+    tracing::info!(count = deleted, set_id = source_set_id, "cleared sub-calibration link(s)");
 
     Ok(deleted)
 }
@@ -1128,7 +1132,7 @@ pub async fn bulk_update_calibration_metadata(
                 rusqlite::params![temp, set_id],
             ).map_err(|e| format!("Failed to update temp for set {}: {}", set_id, e))?;
             any_update = true;
-            println!("📝 Updated ccd_temp to {} for set #{}", temp, set_id);
+            tracing::debug!(set_id, ccd_temp = temp, "updated calibration set field");
         }
 
         if let Some(gain) = edits.gain {
@@ -1137,7 +1141,7 @@ pub async fn bulk_update_calibration_metadata(
                 rusqlite::params![gain, set_id],
             ).map_err(|e| format!("Failed to update gain for set {}: {}", set_id, e))?;
             any_update = true;
-            println!("📝 Updated gain to {} for set #{}", gain, set_id);
+            tracing::debug!(set_id, gain, "updated calibration set field");
         }
 
         if let Some(offset) = edits.offset {
@@ -1146,7 +1150,7 @@ pub async fn bulk_update_calibration_metadata(
                 rusqlite::params![offset, set_id],
             ).map_err(|e| format!("Failed to update offset for set {}: {}", set_id, e))?;
             any_update = true;
-            println!("📝 Updated offset to {} for set #{}", offset, set_id);
+            tracing::debug!(set_id, offset, "updated calibration set field");
         }
 
         if let Some(ref binning) = edits.binning {
@@ -1155,7 +1159,7 @@ pub async fn bulk_update_calibration_metadata(
                 rusqlite::params![binning, set_id],
             ).map_err(|e| format!("Failed to update binning for set {}: {}", set_id, e))?;
             any_update = true;
-            println!("📝 Updated binning to {} for set #{}", binning, set_id);
+            tracing::debug!(set_id, binning = %binning, "updated calibration set field");
         }
 
         if let Some(exptime) = edits.exptime {
@@ -1164,7 +1168,7 @@ pub async fn bulk_update_calibration_metadata(
                 rusqlite::params![exptime, set_id],
             ).map_err(|e| format!("Failed to update exptime for set {}: {}", set_id, e))?;
             any_update = true;
-            println!("📝 Updated exptime to {} for set #{}", exptime, set_id);
+            tracing::debug!(set_id, exptime, "updated calibration set field");
         }
 
         if !any_update {
@@ -1222,19 +1226,13 @@ pub async fn bulk_update_calibration_metadata(
             let n = conn
                 .execute(&sql, rusqlite::params_from_iter(all_values.iter()))
                 .map_err(|e| format!("Failed to propagate edits to frames for set {}: {}", set_id, e))?;
-            println!(
-                "📝 Propagated edits to {} member frames of set #{}",
-                n, set_id
-            );
+            tracing::debug!(set_id, count = n, "propagated edits to member frames");
         }
 
         updated_count += 1;
     }
 
-    println!(
-        "✅ Updated metadata for {} calibration sets",
-        updated_count
-    );
+    tracing::info!(count = updated_count, "updated calibration set metadata");
 
     Ok(updated_count)
 }
@@ -1281,10 +1279,7 @@ pub async fn bulk_restore_calibration_metadata(
         }
     }
 
-    println!(
-        "✅ Restored original metadata for {} calibration sets",
-        restored_count
-    );
+    tracing::info!(count = restored_count, "restored original calibration set metadata");
 
     Ok(restored_count)
 }

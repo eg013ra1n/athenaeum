@@ -57,6 +57,9 @@ pub fn run_operation(
     cancel: &CancelFlag,
     emitter: &dyn ProgressEmitter,
 ) -> Result<()> {
+    let span = tracing::info_span!("archive_op", operation_id);
+    let _g = span.enter();
+
     let op = adb::get_operation(conn, operation_id)?;
     let archive_root = PathBuf::from(&op.archive_root_path);
     let compression = ArchiveCompression::from_str(&op.compression)

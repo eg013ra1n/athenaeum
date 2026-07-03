@@ -37,10 +37,7 @@ pub async fn bulk_move_to_black_hole(
 
     let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
     let result = db::bulk_move_to_black_hole(&conn, &file_ids, &from_where, Some(&emitter))
-        .map_err(|e| {
-            eprintln!("bulk_move_to_black_hole failed: {}", e);
-            e.to_string()
-        })?;
+        .map_err(|e| e.to_string())?;
 
     // Fire a single `blackhole-changed` event so other views (Black Hole
     // tab, file manager, missing-metadata) invalidate their caches. The

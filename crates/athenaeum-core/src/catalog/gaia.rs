@@ -173,10 +173,13 @@ fn with_retry<T>(what: &str, mut op: impl FnMut() -> Result<T>) -> Result<T> {
         match op() {
             Ok(v) => return Ok(v),
             Err(e) => {
-                eprintln!(
-                    "gaia: {what} attempt {attempt}/{MAX} failed ({e:#}); \
-                     retrying in {}s",
-                    delay.as_secs()
+                tracing::warn!(
+                    stage = what,
+                    attempt,
+                    max = MAX,
+                    delay_secs = delay.as_secs(),
+                    error = %e,
+                    "gaia TAP request failed, retrying"
                 );
                 last = Some(e);
                 if attempt < MAX {
@@ -592,7 +595,7 @@ pub fn setup_gaia_dr3_catalog(
     if catalog_dir.exists() {
         let file_count = std::fs::read_dir(&catalog_dir)?.count();
         if file_count > 100 {
-            eprintln!("gaia: catalog already exists with {file_count} files");
+            tracing::info!(file_count, "gaia catalog already exists, skipping setup");
             return Ok(catalog_dir);
         }
     }

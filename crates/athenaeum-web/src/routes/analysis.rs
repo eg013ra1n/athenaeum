@@ -72,9 +72,11 @@ struct AnalysisCompleteEvent {
 
 // ── Error helper ─────────────────────────────────────────────────────────────
 
+// The raw stderr print formerly here duplicated the `#[tracing::instrument(err(Debug))]`
+// attribute on every caller below, which already logs each returned Err at
+// the command boundary — see the T7 sweep report.
 fn err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     let s = msg.to_string();
-    eprintln!("analysis error: {}", s);
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 
@@ -256,7 +258,7 @@ pub async fn analyze_frame_set(
                             }
                             Err(e) => {
                                 let msg = format!("{}: {}", path, e);
-                                eprintln!("Analysis failed for {}", msg);
+                                tracing::warn!(frame_id, path = %path, error = %e, "frame analysis failed");
                                 Err(msg)
                             }
                         };
@@ -520,10 +522,7 @@ pub async fn compute_flat_contour_plot(
     })
     .await
     .map_err(|e| err(format!("Flat contour analysis panicked: {}", e)))?
-    .map_err(|e| {
-        eprintln!("compute_flat_contour_plot failed: {:#}", e);
-        err(format!("Flat contour analysis failed: {}", e))
-    })?;
+    .map_err(|e| err(format!("Flat contour analysis failed: {}", e)))?;
 
     let pixels_b64 = STANDARD.encode(&result.pixels);
 

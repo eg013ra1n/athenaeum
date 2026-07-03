@@ -43,29 +43,19 @@ pub(super) fn require_bright_cache(state: &AppState) -> Option<Arc<solvemyastro:
     };
 
     if !cache_dir.exists() {
-        eprintln!(
-            "plate_solve: no bright sub-catalog at {} — using deep cache only",
-            cache_dir.display()
-        );
+        tracing::warn!(path = %cache_dir.display(), "no bright sub-catalog, using deep cache only");
         return None;
     }
     match solvemyastro::StarCache::open(&cache_dir) {
         Ok(bc) => {
             let arc = Arc::new(bc);
-            eprintln!(
-                "plate_solve: opened bright sub-catalog at {} ({} stars)",
-                cache_dir.display(),
-                arc.star_count()
-            );
+            tracing::debug!(path = %cache_dir.display(), stars = arc.star_count(), "opened bright sub-catalog");
             let mut guard = state.ctx.bright_cache.write().unwrap();
             *guard = Some(arc.clone());
             Some(arc)
         }
         Err(e) => {
-            eprintln!(
-                "plate_solve: failed to open bright cache at {}: {e} — using deep only",
-                cache_dir.display()
-            );
+            tracing::warn!(path = %cache_dir.display(), error = %e, "failed to open bright cache, using deep only");
             None
         }
     }
@@ -136,11 +126,7 @@ pub(super) fn resolve_layer_caches(
             .map_err(|e| format!("Failed to open star cache at {}: {e}", dir.display()))?;
         layers.push(Arc::new(sc));
     }
-    eprintln!(
-        "plate_solve: opened {} catalog layer(s) under {}",
-        layers.len(),
-        catalog_root.display()
-    );
+    tracing::debug!(count = layers.len(), path = %catalog_root.display(), "opened catalog layers");
     Ok(layers)
 }
 
@@ -160,7 +146,7 @@ fn get_dso_catalog(state: &AppState) -> Option<Arc<DsoCatalog>> {
             Some(arc)
         }
         Err(e) => {
-            eprintln!("plate_solve: failed to load DSO catalog: {e}");
+            tracing::warn!(error = %e, "failed to load DSO catalog");
             None
         }
     }
@@ -265,7 +251,7 @@ pub async fn plate_solve_batch(
                     });
                 }
                 Err(e) => {
-                    eprintln!("plate_solve: failed to load frame {frame_id}: {e}");
+                    tracing::warn!(frame_id, error = %e, "failed to load frame for plate solve");
                     work_items.push(WorkItem::LoadFailed {
                         frame_id: *frame_id,
                         error: e,
@@ -289,10 +275,7 @@ pub async fn plate_solve_batch(
     } else {
         (ps_config.batch_concurrency as usize).clamp(1, 16)
     };
-    eprintln!(
-        "plate_solve: batch starting ({} frames, {} workers)",
-        total, concurrency
-    );
+    tracing::info!(total, workers = concurrency, "plate solve batch starting");
 
     // ── Phase 2: parallel solve on a scoped thread pool ──
     let completed = Arc::new(AtomicUsize::new(0));
@@ -308,14 +291,11 @@ pub async fn plate_solve_batch(
             for _ in 0..concurrency {
                 s.spawn(|| loop {
                     if cancel_worker.load(Ordering::Relaxed) {
-                        eprintln!("[cancel-diag] worker saw cancel flag -> breaking");
+                        tracing::debug!("plate solve worker saw cancel flag, breaking");
                         break;
                     }
                     let Some(item) = work.lock().unwrap().next() else { break };
-                    eprintln!(
-                        "[cancel-diag] worker picked a frame (cancel flag = {})",
-                        cancel_worker.load(Ordering::Relaxed)
-                    );
+                    tracing::trace!(cancelled = cancel_worker.load(Ordering::Relaxed), "plate solve worker picked a frame");
 
                     let outcome = match item {
                         WorkItem::LoadFailed { frame_id, error } => {
@@ -372,10 +352,14 @@ pub async fn plate_solve_batch(
                                     // Translate the structured solvemyastro failure
                                     // into a user-facing reason + code for the UI.
                                     let info = describe_solve_failure(&e);
-                                    eprintln!(
-                                        "plate_solve: solve failed for {filename} (frame {frame_id}): {} [{}]",
-                                        info.message,
-                                        info.code.as_deref().unwrap_or("?")
+                                    tracing::warn!(
+                                        frame_id,
+                                        filename = %filename,
+                                        stage = "solve",
+                                        outcome = "failed",
+                                        code = info.code.as_deref().unwrap_or("?"),
+                                        error = %info.message,
+                                        "plate solve failed"
                                     );
                                     WorkResult::Failed {
                                         frame_id,
@@ -390,9 +374,7 @@ pub async fn plate_solve_batch(
                                         .map(|s| s.to_string())
                                         .or_else(|| panic.downcast_ref::<String>().cloned())
                                         .unwrap_or_else(|| "unknown panic".to_string());
-                                    eprintln!(
-                                        "plate_solve: solve PANICKED for {filename} (frame {frame_id}): {msg}"
-                                    );
+                                    tracing::error!(frame_id, filename = %filename, error = %msg, "plate solve panicked");
                                     WorkResult::Failed {
                                         frame_id,
                                         error: format!("Solver crashed: {msg}"),
@@ -489,9 +471,7 @@ pub async fn plate_solve_batch(
                             );
                         }
                         Err(e) => {
-                            eprintln!(
-                                "plate_solve: failed to store result for frame {frame_id}: {e}"
-                            );
+                            tracing::error!(frame_id, error = %e, "failed to store plate solve result, solve outcome lost");
                             failed += 1;
                         }
                     }
@@ -556,15 +536,12 @@ enum WorkResult {
 #[tracing::instrument(skip_all, err)]
 pub async fn cancel_plate_solve(state: State<'_, AppState>) -> Result<(), String> {
     let solves = state.ctx.active_plate_solves.lock().unwrap();
-    eprintln!(
-        "[cancel-diag] cancel_plate_solve invoked; active handle keys = {:?}",
-        solves.keys().collect::<Vec<_>>()
-    );
+    tracing::debug!(active_keys = ?solves.keys().collect::<Vec<_>>(), "cancel_plate_solve invoked");
     if let Some(handle) = solves.get(&0) {
         handle.cancel_flag.store(true, Ordering::Relaxed);
-        eprintln!("[cancel-diag] key 0 cancel flag set TRUE");
+        tracing::info!("plate solve cancel flag set");
     } else {
-        eprintln!("[cancel-diag] NO handle at key 0 — backend not told to stop");
+        tracing::warn!("no active plate solve handle, cancel had no effect");
     }
     Ok(())
 }
@@ -674,10 +651,7 @@ pub async fn autofind_objects_from_coordinates(
         handles.remove(&1);
     }
 
-    let summary = summary_result.map_err(|e| {
-        eprintln!("autofind: {e}");
-        e.to_string()
-    })?;
+    let summary = summary_result.map_err(|e| e.to_string())?;
 
     let _ = app.emit(
         "autofind-objects-complete",

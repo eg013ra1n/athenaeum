@@ -16,14 +16,15 @@ use crate::WebAppState;
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
+// The raw stderr prints formerly here duplicated the `#[tracing::instrument(err(Debug))]`
+// attribute on every caller below, which already logs each returned Err at
+// the command boundary — see the T7 sweep report.
 fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     let s = msg.to_string();
-    eprintln!("calibration error: {}", s);
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 
 fn no_db() -> (StatusCode, String) {
-    eprintln!("calibration error: database not initialized");
     (StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string())
 }
 
@@ -250,7 +251,7 @@ pub async fn refresh_calibration_library_for_camera(
 
     let instrume = &args.instrume;
 
-    eprintln!("Refreshing calibration library for camera: {}", instrume);
+    tracing::info!(instrume, "refreshing calibration library");
 
     // Step 1: Clear frame memberships for this camera's non-master sets
     conn.execute(
@@ -315,12 +316,13 @@ pub async fn refresh_calibration_library_for_camera(
     ).map_err(|e| db_err(format!("Failed to delete orphaned sets: {}", e)))?;
 
     if deleted_orphans > 0 {
-        eprintln!("Deleted {} orphaned calibration sets", deleted_orphans);
+        tracing::debug!(count = deleted_orphans, "deleted orphaned calibration sets");
     }
 
-    eprintln!(
-        "Refresh complete - {} calibration sets active (IDs preserved)",
-        result.sets_created
+    tracing::info!(
+        instrume,
+        sets_created = result.sets_created,
+        "calibration library refresh complete"
     );
 
     Ok(Json(result))
@@ -419,15 +421,15 @@ pub async fn find_calibration_for_frame_set(
             .unwrap_or(config.warnings.dark_date_warning_days),
     };
 
-    eprintln!(
-        "Finding calibration for frame set {} with tolerance: flat_date={} days, dark_date={} days",
+    tracing::debug!(
         frame_set_id,
-        tolerance.flat_date_warning_days,
-        tolerance.dark_date_warning_days,
-    );
-    eprintln!(
-        "Flat settings: pattern={:?}, max_age={} days, time_cluster={} min, temp_weight={}",
-        final_flat_pattern, max_age_days, time_cluster_minutes, temp_weight,
+        flat_date_warning_days = tolerance.flat_date_warning_days,
+        dark_date_warning_days = tolerance.dark_date_warning_days,
+        flat_pattern = ?final_flat_pattern,
+        max_age_days,
+        time_cluster_minutes,
+        temp_weight,
+        "finding calibration for frame set"
     );
 
     let stats = processor::process_frame_set(
@@ -442,9 +444,11 @@ pub async fn find_calibration_for_frame_set(
     )
     .map_err(|e| db_err(format!("Failed to process frame set: {}", e)))?;
 
-    eprintln!(
-        "Calibration processing complete: {} frames, {} with full calibration",
-        stats.total_frames, stats.frames_with_full_calibration,
+    tracing::info!(
+        frame_set_id,
+        total_frames = stats.total_frames,
+        frames_with_full_calibration = stats.frames_with_full_calibration,
+        "calibration processing complete"
     );
 
     Ok(Json(stats))
@@ -939,14 +943,16 @@ pub async fn manual_assign_calibration(
         match insert_calibration_link(&conn, &link) {
             Ok(_) => assigned_count += 1,
             Err(e) => {
-                eprintln!("Failed to assign calibration to frame {}: {}", frame_id, e);
+                tracing::warn!(frame_id, error = %e, "failed to assign calibration to frame");
             }
         }
     }
 
-    eprintln!(
-        "Manually assigned {} set {} to {} frames",
-        args.calibration_type, args.calibration_set_id, assigned_count
+    tracing::info!(
+        calibration_type = %args.calibration_type,
+        set_id = args.calibration_set_id,
+        count = assigned_count,
+        "manually assigned calibration set to frames"
     );
 
     Ok(Json(assigned_count))
@@ -974,9 +980,10 @@ pub async fn clear_manual_calibration_override(
     let deleted = clear_manual_override(&conn, &args.frame_ids, args.calibration_type.as_deref())
         .map_err(db_err)?;
 
-    eprintln!(
-        "Cleared {} manual calibration override(s) from {} frames",
-        deleted, args.frame_ids.len()
+    tracing::info!(
+        count = deleted,
+        frames = args.frame_ids.len(),
+        "cleared manual calibration override(s)"
     );
 
     Ok(Json(deleted))
@@ -1018,9 +1025,11 @@ pub async fn manual_assign_subcalibration(
     insert_calibration_link(&conn, &link)
         .map_err(|e| db_err(format!("Failed to assign sub-calibration: {}", e)))?;
 
-    eprintln!(
-        "Manually assigned {} set #{} as sub-calibration for set #{}",
-        args.calibration_type, args.calibration_set_id, args.source_set_id
+    tracing::info!(
+        calibration_type = %args.calibration_type,
+        set_id = args.calibration_set_id,
+        source_set_id = args.source_set_id,
+        "manually assigned sub-calibration"
     );
 
     Ok(Json(()))
@@ -1054,10 +1063,7 @@ pub async fn clear_subcalibration_override(
         }
     };
 
-    eprintln!(
-        "Cleared {} sub-calibration link(s) for set #{}",
-        deleted, args.source_set_id
-    );
+    tracing::info!(count = deleted, set_id = args.source_set_id, "cleared sub-calibration link(s)");
 
     Ok(Json(deleted))
 }
@@ -1188,7 +1194,7 @@ pub async fn bulk_update_calibration_metadata(
         }
     }
 
-    eprintln!("Updated metadata for {} calibration sets", updated_count);
+    tracing::info!(count = updated_count, "updated calibration set metadata");
     Ok(Json(updated_count))
 }
 
@@ -1232,7 +1238,7 @@ pub async fn bulk_restore_calibration_metadata(
         }
     }
 
-    eprintln!("Restored original metadata for {} calibration sets", restored_count);
+    tracing::info!(count = restored_count, "restored original calibration set metadata");
     Ok(Json(restored_count))
 }
 

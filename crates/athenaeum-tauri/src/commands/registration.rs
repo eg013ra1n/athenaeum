@@ -86,10 +86,7 @@ pub async fn register_frame_set(
             Some(cancel.as_ref()),
         )
         .map(|_summary| ())
-        .map_err(|e| {
-            eprintln!("registration: register_frame_set error: {e}");
-            e.to_string()
-        })
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Registration task panicked: {e}"))?;
@@ -125,9 +122,9 @@ pub async fn cancel_frame_set_registration(
     let handles = state.ctx.active_registrations.lock().unwrap();
     if let Some(handle) = handles.get(&frames_set_id) {
         handle.cancel_flag.store(true, Ordering::Relaxed);
-        eprintln!("registration: cancel flag set for frames_set_id={frames_set_id}");
+        tracing::info!(frame_set_id = frames_set_id, "registration cancel flag set");
     } else {
-        eprintln!("registration: no active registration for frames_set_id={frames_set_id}");
+        tracing::debug!(frame_set_id = frames_set_id, "no active registration to cancel");
     }
     Ok(())
 }

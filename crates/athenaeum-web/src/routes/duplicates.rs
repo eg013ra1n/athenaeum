@@ -49,14 +49,15 @@ pub struct GetDuplicateFoldersArgs {
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
+// The raw stderr prints formerly here duplicated the `#[tracing::instrument(err(Debug))]`
+// attribute on every caller below, which already logs each returned Err at
+// the command boundary — see the T7 sweep report.
 fn db_err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     let s = msg.to_string();
-    eprintln!("duplicates error: {}", s);
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 
 fn no_db() -> (StatusCode, String) {
-    eprintln!("duplicates error: database not initialized");
     (StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string())
 }
 
@@ -298,7 +299,7 @@ pub async fn set_scan_root_unique_camera_flag(
     athenaeum_core::db::set_unique_camera_flag(&conn, args.id, args.enabled)
         .map_err(db_err)?;
 
-    eprintln!("unique_camera flag set for root {}: enabled={}", args.id, args.enabled);
+    tracing::info!(root_id = args.id, enabled = args.enabled, "unique_camera flag set");
     Ok(Json(()))
 }
 

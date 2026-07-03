@@ -231,11 +231,11 @@ pub async fn start_scan_with_progress(
         ))?;
         let conn = db.conn();
         if let Err(e) = db::delete_calibration_sets_for_root(&conn, root_id) {
-            eprintln!("Failed to delete cal sets for root {}: {}", root_id, e);
+            tracing::warn!(root_id, error = %e, "failed to delete calibration sets for root");
         }
         match recreate_calibration_sets_for_root(&conn, root_id) {
             Ok(count) => scan_result.calibration_sets_created = count,
-            Err(e) => eprintln!("Failed to recreate cal sets for root {}: {}", root_id, e),
+            Err(e) => tracing::warn!(root_id, error = %e, "failed to recreate calibration sets for root"),
         }
     }
 
@@ -359,7 +359,7 @@ pub async fn rescan_all_for_content_hash(
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
     let conn = db.conn();
 
-    eprintln!("Starting content hash rescan for all files...");
+    tracing::info!("starting content hash rescan for all files");
 
     let all_files = athenaeum_core::db::get_files(&conn, None)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -392,7 +392,7 @@ pub async fn rescan_all_for_content_hash(
                     Ok(_) => {
                         updated += 1;
                         if updated % 100 == 0 {
-                            eprintln!("Progress: {}/{} files processed", updated + skipped + missing, total);
+                            tracing::debug!(current = updated + skipped + missing, total, "content hash rescan progress");
                         }
                     }
                     Err(e) => {
@@ -406,9 +406,13 @@ pub async fn rescan_all_for_content_hash(
         }
     }
 
-    eprintln!(
-        "Content hash rescan complete! Total: {}, Updated: {}, Skipped: {}, Missing: {}, Errors: {}",
-        total, updated, skipped, missing, errors.len()
+    tracing::info!(
+        total,
+        updated,
+        skipped,
+        missing,
+        errors = errors.len(),
+        "content hash rescan complete"
     );
 
     if updated > 0 || skipped > 0 {
@@ -448,8 +452,9 @@ pub async fn relink_scan_root(
         return Err((StatusCode::BAD_REQUEST, "Path is not a directory".to_string()));
     }
 
+    // Errors below are logged once by the `#[tracing::instrument(err(Debug))]`
+    // attribute on this handler — see the T7 sweep report.
     let canonical = new_path_buf.canonicalize().map_err(|e| {
-        eprintln!("Failed to resolve relink target path '{}': {}", args.new_path, e);
         (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve path: {}", e))
     })?;
 
@@ -473,7 +478,6 @@ pub async fn relink_scan_root(
             |row| row.get(0),
         )
         .map_err(|e| {
-            eprintln!("Failed to get scan root {}: {}", args.root_id, e);
             if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
                 (StatusCode::NOT_FOUND, format!("Scan root {} not found", args.root_id))
             } else {
@@ -481,14 +485,11 @@ pub async fn relink_scan_root(
             }
         })?;
 
-    println!("Relinking root {} from '{}' to '{}'", args.root_id, old_path, new_path);
+    tracing::info!(root_id = args.root_id, old_path = %old_path, new_path = %new_path, "relinking scan root");
 
     // Perform relinking (real logic in athenaeum-core, shared by both backends).
     let result = athenaeum_core::relinking::relink_files(&conn, &old_path, &new_path)
-        .map_err(|e| {
-            eprintln!("Relinking failed for root {}: {}", args.root_id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Relinking failed: {}", e))
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Relinking failed: {}", e)))?;
 
     // Update scan root path if all files were matched (mirrors desktop condition exactly).
     if result.files_orphaned == 0 || result.files_matched > 0 {
@@ -496,11 +497,8 @@ pub async fn relink_scan_root(
             "UPDATE scan_roots SET path = ?1 WHERE id = ?2",
             rusqlite::params![new_path, args.root_id],
         )
-        .map_err(|e| {
-            eprintln!("Failed to update scan root path for root {}: {}", args.root_id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update scan root path: {}", e))
-        })?;
-        println!("Updated scan root path to '{}'", new_path);
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update scan root path: {}", e)))?;
+        tracing::info!(root_id = args.root_id, new_path = %new_path, "updated scan root path");
     }
 
     Ok(Json(result))
@@ -597,10 +595,14 @@ fn recreate_calibration_sets_for_root(
         return Ok(0);
     }
 
-    eprintln!(
-        "Recreating calibration sets for root {}: {} flats, {} darks, {} bias, {} darkflats, {} masters",
-        root_id, flat_ids.len(), dark_ids.len(), bias_ids.len(),
-        darkflat_ids.len(), master_ids.total_count()
+    tracing::debug!(
+        root_id,
+        flats = flat_ids.len(),
+        darks = dark_ids.len(),
+        bias = bias_ids.len(),
+        darkflats = darkflat_ids.len(),
+        masters = master_ids.total_count(),
+        "recreating calibration sets for root"
     );
 
     let scan_result = create_calibration_sets_from_scan_with_masters(

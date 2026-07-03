@@ -268,7 +268,7 @@ pub async fn start_archive_operation(
             let result = executor::run_operation(&conn, op_id, &cancel_flag, &emitter);
             let outcome = match result {
                 Ok(()) => {
-                    eprintln!("archive operation {} completed", op_id);
+                    tracing::info!(operation_id = op_id, "archive operation completed");
                     "completed"
                 }
                 Err(e) => {
@@ -278,7 +278,7 @@ pub async fn start_archive_operation(
                         );
                         "cancelled"
                     } else {
-                        eprintln!("archive operation {} failed: {:#}", op_id, e);
+                        tracing::error!(operation_id = op_id, error = ?e, "archive operation failed");
                         let msg = format!("{:#}", e);
                         let _ = adb::update_operation_status(
                             &conn, op_id, ArchiveStatus::Failed, Some(&msg),
@@ -286,7 +286,7 @@ pub async fn start_archive_operation(
                         "failed"
                     };
                     if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
-                        eprintln!("rollback for {} failed: {:#}", op_id, rb_err);
+                        tracing::error!(operation_id = op_id, error = ?rb_err, "rollback after failed archive operation also failed, operation may be left in an inconsistent state");
                     }
                     outcome
                 }
@@ -351,7 +351,7 @@ pub async fn resume_archive_operation(
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
             if let Err(e) = resume::resume_operation(&conn, operation_id, &cancel_flag, &emitter) {
-                eprintln!("resume {} failed: {:#}", operation_id, e);
+                tracing::error!(operation_id, error = ?e, "archive resume failed");
                 let msg = format!("{:#}", e);
                 let _ = adb::update_operation_status(&conn, operation_id, ArchiveStatus::Failed, Some(&msg));
                 let _ = rollback::rollback_operation(&conn, operation_id, &emitter);
@@ -437,7 +437,7 @@ pub async fn rollback_archive_operation(
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
             if let Err(e) = rollback::rollback_operation(&conn, operation_id, &emitter) {
-                eprintln!("rollback {} failed: {:#}", operation_id, e);
+                tracing::error!(operation_id, error = ?e, "archive rollback failed");
             }
         }),
     });
@@ -576,17 +576,17 @@ pub async fn start_restore_operation(
                 overwrite_existing, keep_zip_after_restore, &cancel_flag, &emitter,
             ) {
                 Ok(result) if result.has_conflicts() => {
-                    eprintln!(
-                        "restore {} completed with {} conflict(s): {:?}",
+                    tracing::warn!(
                         operation_id,
-                        result.conflicts.len(),
-                        result.conflicts.iter().map(|c| c.source_path.as_str()).collect::<Vec<_>>(),
+                        conflicts = result.conflicts.len(),
+                        paths = ?result.conflicts.iter().map(|c| c.source_path.as_str()).collect::<Vec<_>>(),
+                        "restore completed with conflicts"
                     );
                     ("completed_with_conflicts", result.conflicts.len())
                 }
                 Ok(_) => ("completed", 0),
                 Err(e) => {
-                    eprintln!("restore {} failed: {:#}", operation_id, e);
+                    tracing::error!(operation_id, error = ?e, "restore failed");
                     let outcome = if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" };
                     (outcome, 0)
                 }

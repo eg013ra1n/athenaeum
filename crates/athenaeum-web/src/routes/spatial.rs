@@ -156,10 +156,7 @@ pub async fn get_imaging_locations(
         LIMIT 5000
         ",
         )
-        .map_err(|e| {
-            eprintln!("get_imaging_locations: prepare failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let locations = stmt
         .query_map([], |row| {
@@ -236,23 +233,17 @@ pub async fn get_imaging_locations(
                 rotation: avg_rotation,
             })
         })
-        .map_err(|e| {
-            eprintln!("get_imaging_locations: query failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let result: Vec<ImagingLocation> = locations
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            eprintln!("get_imaging_locations: row collect failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    println!(
-        "get_imaging_locations: {} locations ({} framesets, {} clusters)",
-        result.len(),
-        result.iter().filter(|l| l.location_type == "frameset").count(),
-        result.iter().filter(|l| l.location_type == "cluster").count(),
+    tracing::debug!(
+        count = result.len(),
+        framesets = result.iter().filter(|l| l.location_type == "frameset").count(),
+        clusters = result.iter().filter(|l| l.location_type == "cluster").count(),
+        "imaging locations queried"
     );
 
     Ok(Json(result))
@@ -276,9 +267,13 @@ pub async fn query_frames_in_bounds(
         .crosses_meridian
         .unwrap_or_else(|| bounds.ra_min > bounds.ra_max);
 
-    println!(
-        "query_frames_in_bounds: ra_min={}, ra_max={}, dec_min={}, dec_max={}, wrap={}",
-        bounds.ra_min, bounds.ra_max, bounds.dec_min, bounds.dec_max, ra_wrap_around
+    tracing::debug!(
+        ra_min = bounds.ra_min,
+        ra_max = bounds.ra_max,
+        dec_min = bounds.dec_min,
+        dec_max = bounds.dec_max,
+        ra_wrap_around,
+        "querying frames in bounds"
     );
 
     let query = if ra_wrap_around {
@@ -291,10 +286,7 @@ pub async fn query_frames_in_bounds(
          AND ra BETWEEN ?1 AND ?2 AND dec BETWEEN ?3 AND ?4"
     };
 
-    let mut stmt = conn.prepare(query).map_err(|e| {
-        eprintln!("query_frames_in_bounds: prepare failed: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+    let mut stmt = conn.prepare(query).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let candidates: Vec<SelectionCandidate> = stmt
         .query_map(
@@ -308,23 +300,14 @@ pub async fn query_frames_in_bounds(
                 })
             },
         )
-        .map_err(|e| {
-            eprintln!("query_frames_in_bounds: query failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            eprintln!("query_frames_in_bounds: row collect failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let total_exposure: f64 = candidates.iter().map(|c| c.exposure).sum();
     let count = candidates.len();
 
-    println!(
-        "query_frames_in_bounds: {} candidates (wrap={})",
-        count, ra_wrap_around
-    );
+    tracing::debug!(count, ra_wrap_around, "frames in bounds queried");
 
     Ok(Json(SelectionCandidates {
         candidates,
@@ -395,10 +378,7 @@ pub async fn get_calendar_month_data(
             GROUP BY DATE(fr.date_obs), fs.id
             ORDER BY obs_date, object_name",
         )
-        .map_err(|e| {
-            eprintln!("get_calendar_month_data: prepare frame sets query failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let frame_set_rows = stmt
         .query_map(rusqlite::params![start_date, end_date], |row| {
@@ -440,16 +420,10 @@ pub async fn get_calendar_month_data(
                 },
             ))
         })
-        .map_err(|e| {
-            eprintln!("get_calendar_month_data: frame sets query failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     for row_result in frame_set_rows {
-        let (obs_date, frame_set) = row_result.map_err(|e| {
-            eprintln!("get_calendar_month_data: frame set row read failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        let (obs_date, frame_set) = row_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let event = events_by_date
             .entry(obs_date.clone())
@@ -490,10 +464,7 @@ pub async fn get_calendar_month_data(
                      CASE WHEN fr.ra IS NULL THEN 'unlocated' ELSE 'located' END
             ORDER BY obs_date",
         )
-        .map_err(|e| {
-            eprintln!("get_calendar_month_data: prepare unorganised query failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let unorganized_rows = stmt
         .query_map(rusqlite::params![start_date, end_date], |row| {
@@ -548,16 +519,10 @@ pub async fn get_calendar_month_data(
                 },
             ))
         })
-        .map_err(|e| {
-            eprintln!("get_calendar_month_data: unorganised query failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     for row_result in unorganized_rows {
-        let (obs_date, group) = row_result.map_err(|e| {
-            eprintln!("get_calendar_month_data: unorganised row read failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+        let (obs_date, group) = row_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let event = events_by_date
             .entry(obs_date.clone())

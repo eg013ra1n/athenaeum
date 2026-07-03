@@ -274,7 +274,14 @@ fn run_restore_inner(
                         "restore conflict: on-disk file does not match archived hash for {} (expected {}, got {})",
                         f.source_path, f.expected_hash, actual,
                     );
-                    eprintln!("[archive::restore] {}", msg);
+                    tracing::error!(
+                        operation_id,
+                        file_id = ?f.file_id,
+                        src = %f.source_path,
+                        expected_hash = %f.expected_hash,
+                        actual_hash = %actual,
+                        "restore conflict: on-disk file hash mismatch, leaving frame set archived pending resolution"
+                    );
                     record_conflict_step(conn, operation_id, f, Some(&actual), &msg)?;
                     conflicts.push(RestoreConflict {
                         file_id: f.file_id,
@@ -297,7 +304,13 @@ fn run_restore_inner(
                         "restore conflict: could not hash on-disk file at {}: {:#}",
                         f.source_path, e,
                     );
-                    eprintln!("[archive::restore] {}", msg);
+                    tracing::error!(
+                        operation_id,
+                        file_id = ?f.file_id,
+                        src = %f.source_path,
+                        error = %e,
+                        "restore conflict: could not verify on-disk file, leaving frame set archived pending resolution"
+                    );
                     record_conflict_step(conn, operation_id, f, None, &msg)?;
                     conflicts.push(RestoreConflict {
                         file_id: f.file_id,
@@ -416,9 +429,11 @@ fn run_restore_inner(
             "Frame set unarchived".into(),
         );
     } else {
-        eprintln!(
-            "[archive::restore] operation {} finished with {} conflict(s) — frame set {} stays archived pending resolution",
-            operation_id, conflicts.len(), op.frames_set_id,
+        tracing::warn!(
+            operation_id,
+            frame_set_id = op.frames_set_id,
+            conflicts = conflicts.len(),
+            "restore finished with conflicts, frame set stays archived pending resolution"
         );
         catalog_done += 1;
         emit(
@@ -484,9 +499,10 @@ fn run_restore_inner(
         // verification). Deleting any zip here could destroy the sole
         // correct copy of a conflicted file before the user has a chance to
         // resolve the conflict and re-run restore. Keep everything.
-        eprintln!(
-            "[archive::restore] operation {} finished with {} conflict(s) — keeping archive zip(s) so a re-run can fill the gap(s)",
-            operation_id, conflicts.len(),
+        tracing::warn!(
+            operation_id,
+            conflicts = conflicts.len(),
+            "keeping archive zip(s) after restore so a re-run can fill the gap(s)"
         );
         emit(
             emitter,

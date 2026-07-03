@@ -118,6 +118,9 @@ pub fn organize_files_wbpp(
     frame_set_id: i64,
     cancel_flag: &std::sync::atomic::AtomicBool,
 ) -> Result<OrganizeResult> {
+    let span = tracing::info_span!("export", frame_set_id);
+    let _g = span.enter();
+
     let mut files_organized = 0;
     let mut warnings = Vec::new();
     let mut organized_set_ids: HashSet<i64> = HashSet::new();

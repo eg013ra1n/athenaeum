@@ -32,9 +32,9 @@ pub fn select_reference(
         if members.iter().any(|(fid, _)| *fid == oid) {
             return oid;
         }
-        eprintln!(
-            "registration: override reference frame {oid} not in member list — \
-             falling back to max-detections selection"
+        tracing::warn!(
+            frame_id = oid,
+            "override reference frame not in member list, falling back to max-detections selection"
         );
     }
 

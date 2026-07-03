@@ -136,6 +136,9 @@ pub fn solve_frame_with_hints(
     config: &PlateSolveConfig,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SolveResult> {
+    let span = tracing::info_span!("solve", frame_id = frame.id.unwrap_or(-1));
+    let _g = span.enter();
+
     let total_start = Instant::now();
 
     // Map astroimage::platesolving::SolveHints → solvemyastro::SolveHints.
@@ -415,9 +418,14 @@ pub fn store_result(
                 "Rejected: low confidence ({} inliers, ratio {:.2}, {:.2}\"/px)",
                 result.matched_stars, result.inlier_ratio, result.pixel_scale_arcsec
             );
-            eprintln!(
-                "plate_solve: refusing to persist low-confidence solve for frame {frame_id} \
-                 ({reason}) — WCS/focal length NOT written back"
+            tracing::warn!(
+                frame_id,
+                stage = "store",
+                outcome = "rejected_low_confidence",
+                inliers = result.matched_stars,
+                inlier_ratio = result.inlier_ratio,
+                scale_arcsec_px = result.pixel_scale_arcsec,
+                "refusing to persist low-confidence solve, WCS/focal length not written back"
             );
             return Ok(StoreOutcome::RejectedLowConfidence { reason });
         }
@@ -470,15 +478,15 @@ pub fn store_result(
     if let Some(catalog) = dso_catalog {
         if let Some(m) = catalog.find_best(result.wcs.crval.0, result.wcs.crval.1) {
             match update_frame_object_if_missing(conn, frame_id, &m.designation) {
-                Ok(true) => eprintln!(
-                    "plate_solve: labelled frame {} as '{}' ({:?}, {:.2}° away)",
-                    frame_id, m.designation, m.reason, m.distance_deg
+                Ok(true) => tracing::debug!(
+                    frame_id,
+                    designation = %m.designation,
+                    reason = ?m.reason,
+                    distance_deg = m.distance_deg,
+                    "labelled frame from solved position"
                 ),
                 Ok(false) => {}
-                Err(e) => eprintln!(
-                    "plate_solve: failed to update frame.object for {}: {}",
-                    frame_id, e
-                ),
+                Err(e) => tracing::warn!(frame_id, error = %e, "failed to update frame.object after solve"),
             }
         }
     }

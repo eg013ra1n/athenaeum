@@ -32,7 +32,7 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
         match semver::Version::parse(trimmed) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("version_is_newer: failed to parse {:?}: {}", s, e);
+                tracing::warn!(input = %s, error = %e, "version_is_newer: failed to parse version");
                 None
             }
         }
@@ -84,7 +84,7 @@ pub async fn initialize_database(
             let effective = if threads == 0 { (max / 2).max(2) } else { threads.clamp(1, max) };
             *state.image_semaphore.write().unwrap() =
                 Arc::new(tokio::sync::Semaphore::new(effective));
-            println!("🧵 Blink semaphore set to {} permits (from DB, 0=auto)", effective);
+            tracing::info!(permits = effective, "blink semaphore set from DB");
         }
     }
 
@@ -193,7 +193,6 @@ pub async fn check_for_updates(state: State<'_, super::AppState>) -> Result<Upda
         (Some(s), None) => s,
         (None, Some(b)) => b,
         (None, None) => {
-            eprintln!("check_for_updates: failed to fetch any version info");
             return Err("Failed to fetch version info".to_string());
         }
     };

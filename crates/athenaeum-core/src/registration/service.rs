@@ -112,7 +112,7 @@ pub fn register_frame_set(
     }
 
     let total = frame_ids.len();
-    eprintln!("registration: frame set {frames_set_id}: {total} LIGHT members to register");
+    tracing::info!(frame_set_id = frames_set_id, total, "registration starting");
 
     // Load frame metadata + file path for every member.
     let mut members: Vec<MemberInfo> = Vec::with_capacity(total);
@@ -126,7 +126,7 @@ pub fn register_frame_set(
                 detection_count: 0,
             }),
             Err(e) => {
-                eprintln!("registration: failed to load frame {fid} — skipping: {e}");
+                tracing::warn!(frame_id = fid, error = %e, "failed to load frame, skipping");
             }
         }
     }
@@ -141,7 +141,7 @@ pub fn register_frame_set(
     // without spending any per-frame compute on a run that cannot register
     // correctly.
     if let Err(e) = check_registration_consistency(&members) {
-        eprintln!("registration: consistency gate failed for frame set {frames_set_id}: {e}");
+        tracing::error!(frame_set_id = frames_set_id, error = %e, "registration consistency gate failed");
         emit_event(
             emitter,
             "stacking-prep-progress",
@@ -194,16 +194,10 @@ pub fn register_frame_set(
                     .map(|s| (s.x as f64, s.y as f64))
                     .collect();
                 member.detection_count = member.detections.len();
-                eprintln!(
-                    "registration: frame {} — {} detections",
-                    member.frame_id, member.detection_count
-                );
+                tracing::debug!(frame_id = member.frame_id, detections = member.detection_count, "star detection complete");
             }
             Err(e) => {
-                eprintln!(
-                    "registration: detect_fast failed for frame {}: {e}",
-                    member.frame_id
-                );
+                tracing::warn!(frame_id = member.frame_id, error = %e, "star detection failed, frame deprioritised for reference selection");
                 // Zero detections; the reference selection will deprioritise this frame.
             }
         }
@@ -224,17 +218,12 @@ pub fn register_frame_set(
         // read itself errors — fall back gracefully to auto-pick.
         match get_frame_set_reference(conn, frames_set_id) {
             Ok(Some(r)) => {
-                eprintln!(
-                    "registration: using persisted user reference frame {}",
-                    r.reference_frame_id
-                );
+                tracing::debug!(frame_id = r.reference_frame_id, "using persisted user reference frame");
                 Some(r.reference_frame_id)
             }
             Ok(None) => None,
             Err(e) => {
-                eprintln!(
-                    "registration: failed to read frame_set_reference (falling back to auto): {e}"
-                );
+                tracing::warn!(error = %e, "failed to read frame_set_reference, falling back to auto-pick");
                 None
             }
         }
@@ -245,7 +234,7 @@ pub fn register_frame_set(
         .map(|m| (m.frame_id, m.detection_count))
         .collect();
     let ref_id = select_reference(&count_pairs, effective_override);
-    eprintln!("registration: reference frame selected: {ref_id}");
+    tracing::info!(frame_id = ref_id, "reference frame selected");
 
     // Build a ranked list of candidates to try as reference (reference first,
     // then others descending by detection count).
@@ -298,10 +287,14 @@ pub fn register_frame_set(
         ) {
             Ok(solution) => {
                 let elapsed_ms = t0.elapsed().as_millis() as i64;
-                eprintln!(
-                    "registration: reference solve succeeded for frame {} \
-                     ({} matched, rms={:.2}px, t={}ms)",
-                    m.frame_id, solution.matched_stars, solution.rms_residual_px, elapsed_ms
+                tracing::info!(
+                    frame_id = m.frame_id,
+                    stage = "reference",
+                    matched_stars = solution.matched_stars,
+                    rms_px = solution.rms_residual_px,
+                    duration_ms = elapsed_ms,
+                    outcome = "ok",
+                    "reference solve succeeded"
                 );
                 let pixel_scale = solution.pixel_scale_arcsec;
                 let ref_detections: Vec<(f64, f64)> = m.detections.clone();
@@ -364,9 +357,11 @@ pub fn register_frame_set(
                 break;
             }
             Err(e) => {
-                eprintln!(
-                    "registration: reference solve failed for frame {} (attempt): {e}",
-                    m.frame_id
+                tracing::warn!(
+                    frame_id = m.frame_id,
+                    stage = "reference",
+                    error = %e,
+                    "reference solve attempt failed, trying next candidate"
                 );
             }
         }
@@ -472,11 +467,11 @@ pub fn register_frame_set(
                 };
                 let status = aligned_status(reg.flipped);
                 if reg.flipped {
-                    eprintln!(
-                        "registration: frame {} ({}) is meridian-flipped (fitted transform \
-                         includes a reflection) — persisting status={status}",
-                        m.frame_id,
-                        filename_from_path(&m.path).unwrap_or_else(|| "<unknown>".to_string())
+                    tracing::debug!(
+                        frame_id = m.frame_id,
+                        filename = %filename_from_path(&m.path).unwrap_or_else(|| "<unknown>".to_string()),
+                        status,
+                        "frame is meridian-flipped (fitted transform includes a reflection)"
                     );
                 }
 
@@ -528,9 +523,11 @@ pub fn register_frame_set(
             }
             Err(e) => {
                 let elapsed_ms = t0.elapsed().as_millis() as i64;
-                eprintln!(
-                    "registration: alignment failed for frame {}: {e}",
-                    m.frame_id
+                tracing::warn!(
+                    frame_id = m.frame_id,
+                    stage = "align",
+                    error = %e,
+                    "frame alignment failed"
                 );
 
                 let rec = RegistrationRecord {
@@ -584,9 +581,12 @@ pub fn register_frame_set(
         let _ = non_ref_total; // suppress dead-code lint
     }
 
-    eprintln!(
-        "registration: frame set {frames_set_id} done — \
-         aligned={aligned}, failed={failed}, total={total}"
+    tracing::info!(
+        frame_set_id = frames_set_id,
+        aligned,
+        failed,
+        total,
+        "registration finished"
     );
 
     emit_event(
@@ -774,17 +774,11 @@ fn check_binning_consistency(members: &[MemberInfo]) -> Result<()> {
 
     for m in members {
         let x = m.frame.xbinning.unwrap_or_else(|| {
-            eprintln!(
-                "registration: frame {} has NULL xbinning — assuming 1 (unbinned)",
-                m.frame_id
-            );
+            tracing::debug!(frame_id = m.frame_id, "NULL xbinning, assuming 1 (unbinned)");
             1
         });
         let y = m.frame.ybinning.unwrap_or_else(|| {
-            eprintln!(
-                "registration: frame {} has NULL ybinning — assuming 1 (unbinned)",
-                m.frame_id
-            );
+            tracing::debug!(frame_id = m.frame_id, "NULL ybinning, assuming 1 (unbinned)");
             1
         });
         let key = (x, y);
@@ -806,12 +800,12 @@ fn check_binning_consistency(members: &[MemberInfo]) -> Result<()> {
     groups.sort_by(|a, b| b.frame_ids.len().cmp(&a.frame_ids.len()));
 
     for g in &groups {
-        eprintln!(
-            "registration: binning group {}x{} — {} frame(s), e.g. {}",
-            g.key.0,
-            g.key.1,
-            g.frame_ids.len(),
-            g.example_filename.as_deref().unwrap_or("<unknown>")
+        tracing::debug!(
+            binning_x = g.key.0,
+            binning_y = g.key.1,
+            count = g.frame_ids.len(),
+            filename = g.example_filename.as_deref().unwrap_or("<unknown>"),
+            "binning group"
         );
     }
 
@@ -835,11 +829,7 @@ fn check_focallen_consistency(members: &[MemberInfo]) -> Result<()> {
 
     for m in members {
         let Some(focallen) = m.frame.focallen else {
-            eprintln!(
-                "registration: frame {} has NULL focal length — excluded from the \
-                 focal-length consistency check",
-                m.frame_id
-            );
+            tracing::debug!(frame_id = m.frame_id, "NULL focal length, excluded from consistency check");
             continue;
         };
 
@@ -869,11 +859,11 @@ fn check_focallen_consistency(members: &[MemberInfo]) -> Result<()> {
     groups.sort_by(|a, b| b.frame_ids.len().cmp(&a.frame_ids.len()));
 
     for g in &groups {
-        eprintln!(
-            "registration: focal-length group {:.1}mm — {} frame(s), e.g. {}",
-            g.key,
-            g.frame_ids.len(),
-            g.example_filename.as_deref().unwrap_or("<unknown>")
+        tracing::debug!(
+            focallen_mm = g.key,
+            count = g.frame_ids.len(),
+            filename = g.example_filename.as_deref().unwrap_or("<unknown>"),
+            "focal-length group"
         );
     }
 

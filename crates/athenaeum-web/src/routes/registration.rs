@@ -170,10 +170,9 @@ pub async fn register_frame_set(
             Some(cancel.as_ref()),
         )
         .map(|_| ())
-        .map_err(|e| {
-            eprintln!("registration: register_frame_set error: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })
+        // Error logged once by the `#[tracing::instrument(err(Debug))]`
+        // attribute on this handler — see the T7 sweep report.
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
     })
     .await
     .map_err(|e| {
@@ -222,9 +221,9 @@ pub async fn cancel_frame_set_registration(
     let handles = state.ctx.active_registrations.lock().unwrap();
     if let Some(handle) = handles.get(&args.frames_set_id) {
         handle.cancel_flag.store(true, Ordering::Relaxed);
-        eprintln!("registration: cancel flag set for frames_set_id={}", args.frames_set_id);
+        tracing::info!(frame_set_id = args.frames_set_id, "registration cancel flag set");
     } else {
-        eprintln!("registration: no active registration for frames_set_id={}", args.frames_set_id);
+        tracing::debug!(frame_set_id = args.frames_set_id, "no active registration to cancel");
     }
     Ok(Json(()))
 }

@@ -59,6 +59,9 @@ pub fn run_operation(
     cancel: &CancelFlag,
     emitter: &dyn ProgressEmitter,
 ) -> Result<()> {
+    let span = tracing::info_span!("file_op", operation_id);
+    let _g = span.enter();
+
     let op = fdb::get_operation(conn, operation_id)?;
     match op.kind.as_str() {
         "move" => {}
