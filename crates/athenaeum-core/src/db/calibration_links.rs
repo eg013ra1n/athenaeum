@@ -41,7 +41,7 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
 
         if has_manual_override > 0 {
             // Skip - don't overwrite manual override with auto-find result
-            tracing::warn!(
+            tracing::debug!(
                 frame_id = link.source_id,
                 calibration_type = %link.calibration_type,
                 "skipping auto-find, manual override exists"
