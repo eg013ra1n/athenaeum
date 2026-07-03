@@ -65,7 +65,7 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 
 | Domain | Required fields on every event |
 | ---- | ---- |
-| command boundary | `command`, `duration_ms`, `outcome` (`ok`/`err`), `error` (on err) |
+| command boundary | span name = command name; duration = span-close `time.busy`/`time.idle` (FmtSpan::CLOSE built-ins — as-built, T4); failure = the `err`-emitted error event inside the span. The literal `duration_ms`/`outcome` names apply to hand-written events, not boundary spans. |
 | scan | `root_id`, `path` (where per-file), counts (`seen`/`new`/`updated`/`errors` on summary) |
 | solve | `frame_id`, `stage`, `scale_arcsec_px`, `inliers`, `rms_px`, `outcome`, confidence fields |
 | registration | `frame_set_id`, `frame_id`, `flipped`, tolerance fields, group counts (gate) |
