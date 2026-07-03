@@ -1,6 +1,7 @@
 // Settings route handlers — mirrors athenaeum-tauri/src/commands/settings.rs
 
 use athenaeum_core::db;
+use athenaeum_core::logging;
 use athenaeum_core::settings;
 use axum::{extract::State, http::StatusCode, Json};
 
@@ -174,5 +175,172 @@ pub async fn set_blink_threads(
 
     eprintln!("Blink semaphore rebuilt with {} permits (requested {}, 0=auto)", effective, threads);
     Ok(Json(()))
+}
+
+// ── Logging config (Task 3) ──────────────────────────────────────────────────
+
+/// POST /api/get_logging_config
+///
+/// Returns the effective logging config (persisted, or the default if unset)
+/// plus whether the `ATHENAEUM_LOG` env override is currently active.
+pub async fn get_logging_config(
+    State(state): State<WebAppState>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<Json<logging::config::LoggingConfigResponse>, (StatusCode, String)> {
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    let config = match db::get_setting(&conn, logging::config::SETTINGS_KEY)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Some(raw) => serde_json::from_str::<logging::LoggingConfig>(&raw).unwrap_or_else(|e| {
+            eprintln!("get_logging_config: invalid stored logging config, using default: {e}");
+            logging::LoggingConfig::default()
+        }),
+        None => logging::LoggingConfig::default(),
+    };
+    let env_override_active = logging::global_handle()
+        .map(|h| h.env_override_active())
+        .unwrap_or(false);
+
+    Ok(Json(logging::config::LoggingConfigResponse { config, env_override_active }))
+}
+
+/// POST /api/set_logging_config
+///
+/// Validates the config (rejects an out-of-range level or per-module level,
+/// or directives that fail to parse), persists it under `logging.config`,
+/// then live-applies it via the process-global `LoggingHandle`. Validation
+/// happens before the DB write; the live-apply happens after.
+pub async fn set_logging_config(
+    State(state): State<WebAppState>,
+    Json(config): Json<logging::LoggingConfig>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    config.validate().map_err(|e| {
+        eprintln!("set_logging_config: rejected invalid config: {e}");
+        (StatusCode::BAD_REQUEST, e)
+    })?;
+
+    let db = state.ctx.db.get()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
+    let conn = db.conn();
+
+    let json = serde_json::to_string(&config)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    db::set_setting(&conn, logging::config::SETTINGS_KEY, &json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some(handle) = logging::global_handle() {
+        handle.apply_config(&config);
+    }
+
+    Ok(Json(()))
+}
+
+#[cfg(test)]
+mod logging_config_tests {
+    use super::*;
+    use athenaeum_core::cache::MemoryImageCache;
+    use athenaeum_core::db::Database;
+    use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
+    use athenaeum_core::settings::SettingsManager;
+    use crate::events::SseEvent;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
+    use tempfile::TempDir;
+
+    /// Builds a `WebAppState` backed by a real (file-based, temp) database —
+    /// these tests exercise actual `settings` table reads/writes for the
+    /// logging config, so a real connection pool is required (unlike
+    /// `routes::tests::test_state` in `routes/mod.rs`, which leaves `ctx.db`
+    /// unset to test only the auth layer). Mirrors
+    /// `scan_roots::relink_tests::test_state`.
+    fn test_state(db: Database) -> WebAppState {
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+        });
+        let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
+        WebAppState {
+            ctx,
+            event_tx,
+            allowed_paths: Vec::new(),
+            export_dir: None,
+            api_key: None,
+            image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
+            max_blink_threads: 1,
+            monitor: athenaeum_core::monitor::MonitorService::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_logging_config_returns_default_when_unset() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let resp = get_logging_config(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(resp.config.level, "info");
+        assert!(resp.config.modules.is_empty());
+        // No `logging::init_global` call happens in this test binary, so the
+        // process-global handle is never set — env_override_active must
+        // fall back to false rather than panicking.
+        assert!(!resp.env_override_active);
+    }
+
+    #[tokio::test]
+    async fn set_logging_config_then_get_reflects_change() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut modules = std::collections::BTreeMap::new();
+        modules.insert("scanner".to_string(), "debug".to_string());
+        let cfg = logging::LoggingConfig { level: "debug".to_string(), modules };
+
+        let _ = set_logging_config(State(state.clone()), Json(cfg))
+            .await
+            .expect("valid config must be accepted");
+
+        let resp = get_logging_config(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.config.level, "debug");
+        assert_eq!(
+            resp.config.modules.get("scanner").map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_logging_config_rejects_invalid_level() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let cfg = logging::LoggingConfig { level: "chatty".to_string(), modules: Default::default() };
+        let err = set_logging_config(State(state), Json(cfg)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
 }
 

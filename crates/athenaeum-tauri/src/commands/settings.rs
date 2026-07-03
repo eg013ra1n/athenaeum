@@ -1,6 +1,7 @@
 // Settings commands - application configuration
 
 use crate::db;
+use crate::logging;
 use crate::settings;
 use std::sync::Arc;
 use tauri::State;
@@ -99,4 +100,56 @@ pub async fn set_blink_threads(
 #[tauri::command]
 pub async fn get_blink_threads_max(state: State<'_, AppState>) -> Result<u32, String> {
     Ok(state.max_blink_threads as u32)
+}
+
+// ── Logging config (Task 3) ──────────────────────────────────────────────────
+
+/// Returns the effective logging config (persisted, or the default if
+/// unset) plus whether the `ATHENAEUM_LOG` env override is currently active.
+#[tauri::command]
+pub async fn get_logging_config(
+    state: State<'_, AppState>,
+) -> Result<logging::config::LoggingConfigResponse, String> {
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let config = match db::get_setting(&conn, logging::config::SETTINGS_KEY).map_err(|e| e.to_string())? {
+        Some(raw) => serde_json::from_str::<logging::LoggingConfig>(&raw).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "invalid stored logging config; using default");
+            logging::LoggingConfig::default()
+        }),
+        None => logging::LoggingConfig::default(),
+    };
+    let env_override_active = logging::global_handle()
+        .map(|h| h.env_override_active())
+        .unwrap_or(false);
+
+    Ok(logging::config::LoggingConfigResponse { config, env_override_active })
+}
+
+/// Validates the config (rejects an out-of-range level or per-module level,
+/// or directives that fail to parse), persists it under `logging.config`,
+/// then live-applies it via the process-global `LoggingHandle`. Validation
+/// happens before the DB write; the live-apply happens after.
+#[tauri::command]
+pub async fn set_logging_config(
+    config: logging::LoggingConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    config.validate().map_err(|e| {
+        tracing::warn!(error = %e, "rejected invalid logging config");
+        e
+    })?;
+
+    let db = state.ctx.db.get().ok_or("Database not initialized")?;
+    let conn = db.conn();
+
+    let json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
+    db::set_setting(&conn, logging::config::SETTINGS_KEY, &json).map_err(|e| e.to_string())?;
+
+    if let Some(handle) = logging::global_handle() {
+        handle.apply_config(&config);
+    }
+
+    Ok(())
 }

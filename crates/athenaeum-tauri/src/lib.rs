@@ -231,6 +231,8 @@ pub fn run() {
             commands::get_setting,
             commands::set_setting,
             commands::delete_setting,
+            commands::get_logging_config,
+            commands::set_logging_config,
             commands::set_blink_threads,
             commands::get_blink_threads_max,
             commands::auto_generate_frame_sets,

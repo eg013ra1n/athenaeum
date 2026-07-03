@@ -1263,3 +1263,21 @@ export interface FlatContourPlot {
   /** Base64-encoded 8-bit grayscale buffer. */
   pixelsB64: string;
 }
+
+/** Persisted logging configuration (`get_logging_config` / `set_logging_config`).
+ *  `level` is the base tracing level; `modules` maps a UI module key
+ *  (`scanner`, `solver`, `calibration`, `archive`) to a per-module override
+ *  level. Both must be one of `error` | `warn` | `info` | `debug`. */
+export interface LoggingConfig {
+  level: string;
+  modules: Record<string, string>;
+}
+
+/** Response from `get_logging_config`. `envOverrideActive` is true when the
+ *  `ATHENAEUM_LOG` environment variable is set on the process — in that case
+ *  `set_logging_config` persists but does not live-apply (the UI should
+ *  reflect this as read-only). */
+export interface LoggingConfigResponse {
+  config: LoggingConfig;
+  envOverrideActive: boolean;
+}
