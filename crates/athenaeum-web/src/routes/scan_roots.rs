@@ -452,9 +452,11 @@ pub async fn relink_scan_root(
         return Err((StatusCode::BAD_REQUEST, "Path is not a directory".to_string()));
     }
 
-    // Errors below are logged once by the `#[tracing::instrument(err(Debug))]`
-    // attribute on this handler — see the T7 sweep report.
+    // The `#[tracing::instrument(err(Debug))]` attribute on this handler logs
+    // the returned `Err` once, but its `String` payload doesn't carry
+    // root_id/path — add that context explicitly at each branch below.
     let canonical = new_path_buf.canonicalize().map_err(|e| {
+        tracing::error!(root_id = args.root_id, path = %args.new_path, error = %e, "failed to resolve relink target path");
         (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve path: {}", e))
     })?;
 
@@ -481,6 +483,7 @@ pub async fn relink_scan_root(
             if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
                 (StatusCode::NOT_FOUND, format!("Scan root {} not found", args.root_id))
             } else {
+                tracing::error!(root_id = args.root_id, path = %args.new_path, error = %e, "failed to load scan root for relink");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get scan root: {}", e))
             }
         })?;
@@ -489,7 +492,10 @@ pub async fn relink_scan_root(
 
     // Perform relinking (real logic in athenaeum-core, shared by both backends).
     let result = athenaeum_core::relinking::relink_files(&conn, &old_path, &new_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Relinking failed: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!(root_id = args.root_id, path = %args.new_path, error = %e, "relinking failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Relinking failed: {}", e))
+        })?;
 
     // Update scan root path if all files were matched (mirrors desktop condition exactly).
     if result.files_orphaned == 0 || result.files_matched > 0 {
@@ -497,7 +503,10 @@ pub async fn relink_scan_root(
             "UPDATE scan_roots SET path = ?1 WHERE id = ?2",
             rusqlite::params![new_path, args.root_id],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update scan root path: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!(root_id = args.root_id, path = %args.new_path, error = %e, "failed to update scan root path");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update scan root path: {}", e))
+        })?;
         tracing::info!(root_id = args.root_id, new_path = %new_path, "updated scan root path");
     }
 

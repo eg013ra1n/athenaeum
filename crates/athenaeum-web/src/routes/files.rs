@@ -795,7 +795,10 @@ pub async fn mkdir_in_scan_root(
             format!("'{}' is not inside any scan root", args.path),
         ));
     }
-    fs::create_dir_all(&target).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    fs::create_dir_all(&target).map_err(|e| {
+        tracing::error!(path = %args.path, error = %e, "mkdir failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
     Ok(StatusCode::OK)
 }
 
@@ -842,7 +845,10 @@ pub async fn rename_path(
         ));
     }
     let is_dir = old.is_dir();
-    fs::rename(&old, &new).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    fs::rename(&old, &new).map_err(|e| {
+        tracing::error!(src = %old.display(), dest = %new.display(), error = %e, "rename failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
     let old_str = old.to_string_lossy().to_string();
     let new_str = new.to_string_lossy().to_string();
     if is_dir {

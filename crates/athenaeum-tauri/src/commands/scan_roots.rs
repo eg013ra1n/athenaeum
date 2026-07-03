@@ -272,13 +272,19 @@ pub async fn relink_scan_root(
             rusqlite::params![root_id],
             |row| row.get(0),
         )
-        .map_err(|e| format!("Failed to get scan root: {}", e))?;
+        .map_err(|e| {
+            tracing::error!(root_id, path = %new_path, error = %e, "failed to load scan root for relink");
+            format!("Failed to get scan root: {}", e)
+        })?;
 
     tracing::info!(root_id, old_path = %old_path, new_path = %new_path, "relinking scan root");
 
     // Perform relinking
     let result = crate::relinking::relink_files(&conn, &old_path, &new_path)
-        .map_err(|e| format!("Relinking failed: {}", e))?;
+        .map_err(|e| {
+            tracing::error!(root_id, path = %new_path, error = %e, "relinking failed");
+            format!("Relinking failed: {}", e)
+        })?;
 
     // Update scan root path if all files were matched
     if result.files_orphaned == 0 || result.files_matched > 0 {
@@ -286,7 +292,10 @@ pub async fn relink_scan_root(
             "UPDATE scan_roots SET path = ?1 WHERE id = ?2",
             rusqlite::params![new_path, root_id],
         )
-        .map_err(|e| format!("Failed to update scan root path: {}", e))?;
+        .map_err(|e| {
+            tracing::error!(root_id, path = %new_path, error = %e, "failed to update scan root path");
+            format!("Failed to update scan root path: {}", e)
+        })?;
         tracing::info!(root_id, new_path = %new_path, "updated scan root path");
     }
 

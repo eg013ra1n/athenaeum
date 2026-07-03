@@ -176,6 +176,7 @@ pub async fn get_directory_contents(
             return Err("Directory does not exist".to_string());
         }
         Err(e) => {
+            tracing::error!(path = %directory_path, error = %e, "directory read failed");
             return Err(format!("Could not read directory: {}", e));
         }
     };
@@ -327,6 +328,7 @@ pub async fn get_camera_directory_contents(
             return Err("Directory does not exist".to_string());
         }
         Err(e) => {
+            tracing::error!(path = %directory_path, error = %e, "directory read failed");
             return Err(format!("Could not read directory: {}", e));
         }
     };
@@ -608,7 +610,10 @@ pub async fn mkdir_in_scan_root(
     if !inside_root {
         return Err(format!("'{}' is not inside any scan root", path));
     }
-    std::fs::create_dir_all(&target).map_err(|e| e.to_string())
+    std::fs::create_dir_all(&target).map_err(|e| {
+        tracing::error!(path = %path, error = %e, "mkdir failed");
+        e.to_string()
+    })
 }
 
 /// Rename a file or directory in place. Same-folder rename only (i.e., no
@@ -651,7 +656,10 @@ pub async fn rename_path(
     }
 
     let is_dir = old.is_dir();
-    std::fs::rename(&old, &new).map_err(|e| e.to_string())?;
+    std::fs::rename(&old, &new).map_err(|e| {
+        tracing::error!(src = %old.display(), dest = %new.display(), error = %e, "rename failed");
+        e.to_string()
+    })?;
 
     // Hot-sync catalog rows.
     let old_str = old.to_string_lossy().to_string();
@@ -664,7 +672,7 @@ pub async fn rename_path(
         let prefix_new = format!("{}/", new_str);
         let updated = athenaeum_core::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new)
             .map_err(|e| e.to_string())?;
-        tracing::info!(count = updated, path = %new_str, "rename hot-synced catalog rows under directory");
+        tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
     } else {
         let updated = conn
             .execute(
@@ -672,7 +680,7 @@ pub async fn rename_path(
                 rusqlite::params![&new_str, &new_name, &old_str],
             )
             .map_err(|e| e.to_string())?;
-        tracing::info!(count = updated, path = %new_str, "rename hot-synced catalog rows");
+        tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
     }
     Ok(())
 }
