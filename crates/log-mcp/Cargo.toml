@@ -1,0 +1,15 @@
+[package]
+name = "log-mcp"
+version = "0.1.0"
+description = "Stdio MCP server exposing Athenaeum's rotating JSONL application logs as queryable tools"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
