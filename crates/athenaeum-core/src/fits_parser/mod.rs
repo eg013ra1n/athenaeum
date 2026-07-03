@@ -86,18 +86,18 @@ fn normalize_ra_from_fits(ra: f64, dec: Option<f64>, objctra: Option<&str>) -> f
 
             // If numeric RA already matches OBJCTRA (within 0.1°), it's in degrees
             if diff_as_degrees < 0.1 {
-                println!("  Verified RA already in degrees: {:.4}° (matches OBJCTRA)", ra);
+                tracing::debug!(ra, "RA already in degrees (verified against OBJCTRA)");
                 return crate::coordinates::normalize_ra(ra);
             }
 
             // If numeric RA * 15 matches OBJCTRA (within 0.1°), it's in hours
             if diff_as_hours < 0.1 {
-                println!("  Detected RA in hours: {:.4}h → {:.4}° (verified with OBJCTRA)", ra, ra * 15.0);
+                tracing::debug!(ra_hours = ra, ra_degrees = ra * 15.0, "RA detected in hours (verified against OBJCTRA)");
                 return crate::coordinates::normalize_ra(ra * 15.0);
             }
 
             // Neither match well - use OBJCTRA as ground truth
-            println!("  WARNING: RA={:.4} doesn't match OBJCTRA. Using OBJCTRA value: {:.4}°", ra, ra_from_objctra);
+            tracing::warn!(ra, ra_from_objctra, "RA does not match OBJCTRA; using OBJCTRA value");
             return ra_from_objctra;
         }
     }
@@ -106,13 +106,13 @@ fn normalize_ra_from_fits(ra: f64, dec: Option<f64>, objctra: Option<&str>) -> f
     if let Some(d) = dec {
         if d >= -90.0 && d <= 90.0 {
             // Valid DEC suggests these are coordinates, assume hours
-            println!("  RA={:.4} in ambiguous range [0,24). Assuming hours → {:.4}°", ra, ra * 15.0);
+            tracing::warn!(ra, ra_degrees = ra * 15.0, "RA ambiguous with no OBJCTRA; assuming hours based on valid DEC");
             return crate::coordinates::normalize_ra(ra * 15.0);
         }
     }
 
     // No context available, default to hours (astronomical convention)
-    println!("  WARNING: RA={:.4} is ambiguous. No verification available. Assuming hours.", ra);
+    tracing::warn!(ra, "RA ambiguous with no verification available; assuming hours");
     crate::coordinates::normalize_ra(ra * 15.0)
 }
 
@@ -121,7 +121,7 @@ fn validate_dec(dec: f64) -> Result<f64, String> {
     if dec < -90.0 || dec > 90.0 {
         // Clamp to valid range and warn
         let clamped = crate::coordinates::normalize_dec(dec);
-        println!("  WARNING: Invalid DEC={:.4}° (outside [-90, 90]). Clamped to {:.4}°", dec, clamped);
+        tracing::warn!(dec, clamped, "DEC out of range; clamped");
         Ok(clamped)
     } else {
         Ok(dec)
@@ -206,7 +206,12 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                println!("Error parsing XISF XML: {}", e);
+                tracing::error!(
+                    path = %path.display(),
+                    position = reader.buffer_position(),
+                    error = %e,
+                    "error parsing XISF XML header; using partial result"
+                );
                 break;
             }
             _ => {}
@@ -237,8 +242,13 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
     let date_obs_str = header.get_str("DATE-OBS");
     let time_obs = header.get_str("TIME-OBS");
 
-    println!("  DATE-OBS from FITS: {:?}", date_obs_str);
-    println!("  TIME-OBS from FITS: {:?}", time_obs);
+    tracing::debug!(
+        path = %path.display(),
+        file_id,
+        date_obs = ?date_obs_str,
+        time_obs = ?time_obs,
+        "raw DATE-OBS/TIME-OBS from FITS header"
+    );
     let telescop = header.get_str("TELESCOP");
     let instrume = header.get_str("INSTRUME");
     let exptime = header.get_f64("EXPTIME");
@@ -344,17 +354,17 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
         (Some(date), time) => {
             match parse_date_obs(&date, time.as_deref()) {
                 Ok(dt) => {
-                    println!("  Parsed date_obs successfully: {}", dt.to_rfc3339());
+                    tracing::debug!(path = %path.display(), file_id, date_obs = %dt.to_rfc3339(), "parsed DATE-OBS");
                     Some(dt)
                 },
                 Err(e) => {
-                    println!("  Failed to parse date_obs: {}", e);
+                    tracing::warn!(path = %path.display(), file_id, error = %e, "failed to parse DATE-OBS; leaving unset");
                     None
                 }
             }
         },
         _ => {
-            println!("  No DATE-OBS found in FITS header!");
+            tracing::warn!(path = %path.display(), file_id, "no DATE-OBS found in FITS header");
             None
         }
     };
@@ -520,7 +530,13 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                println!("Error parsing XISF XML at position {}: {}", reader.buffer_position(), e);
+                tracing::error!(
+                    path = %path.display(),
+                    file_id,
+                    position = reader.buffer_position(),
+                    error = %e,
+                    "error parsing XISF XML; using partial result"
+                );
                 break;
             }
             _ => {}
@@ -528,7 +544,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         buf.clear();
     }
 
-    println!("  Found {} FITS keywords in XISF", fits_keywords.len());
+    tracing::debug!(path = %path.display(), file_id, count = fits_keywords.len(), "extracted FITS keywords from XISF");
 
     // Extract metadata from FITS keywords
     let object = fits_keywords.get("OBJECT").cloned();
@@ -682,11 +698,11 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
             let time_obs = fits_keywords.get("TIME-OBS").map(|s| s.as_str());
             match parse_date_obs(date_str, time_obs) {
                 Ok(dt) => {
-                    println!("  Parsed DATE-OBS successfully: {}", dt.to_rfc3339());
+                    tracing::debug!(path = %path.display(), file_id, date_obs = %dt.to_rfc3339(), "parsed DATE-OBS");
                     Some(dt)
                 }
                 Err(e) => {
-                    println!("  Failed to parse DATE-OBS '{}': {}", date_str, e);
+                    tracing::warn!(path = %path.display(), file_id, date_str = %date_str, error = %e, "failed to parse DATE-OBS; leaving unset");
                     None
                 }
             }

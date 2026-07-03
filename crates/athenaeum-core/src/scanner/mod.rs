@@ -344,16 +344,17 @@ pub fn scan_directory(
                     + cal_result.master_flat_sets_created
                     + cal_result.master_bias_sets_created
                     + cal_result.master_darkflat_sets_created;
-                if master_total > 0 {
-                    println!("Auto-created {} calibration sets from scan ({} master)", cal_result.sets_created, master_total);
-                } else {
-                    println!("Auto-created {} calibration sets from scan", cal_result.sets_created);
-                }
+                tracing::info!(
+                    root_id,
+                    count = cal_result.sets_created,
+                    master_count = master_total,
+                    "auto-created calibration sets from scan"
+                );
             }
             Err(e) => {
                 // Surface errors to user instead of just logging
                 result.errors.push(format!("Failed to auto-create calibration sets: {}", e));
-                println!("Warning: Failed to auto-create calibration sets: {}", e);
+                tracing::error!(root_id, error = %e, "failed to auto-create calibration sets");
             }
         }
     }
@@ -432,19 +433,34 @@ fn process_file(
 
         if let Some((file_id, old_path)) = existing_file {
             if std::path::Path::new(&old_path).exists() {
-                println!("Detected duplicate file: '{}' and '{}' have identical headers", old_path, current_path);
+                tracing::debug!(
+                    root_id,
+                    old_path = %old_path,
+                    path = %current_path,
+                    "duplicate file detected (identical header)"
+                );
             } else if let Some(offline_root) = path_under_unavailable_scan_root(conn, &old_path)? {
                 // Old path is missing, but that's because its owning scan
                 // root is currently offline (unmounted volume), not because
                 // the file was moved. Fall through to duplicate/new-file
                 // handling below instead of flipping the still-valid
                 // original's path.
-                println!(
-                    "Skipping move-detection for '{}' -> '{}': old path's scan root '{}' is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
-                    old_path, current_path, offline_root, file_id
+                tracing::warn!(
+                    root_id,
+                    old_path = %old_path,
+                    path = %current_path,
+                    offline_root = %offline_root,
+                    file_id,
+                    "skipping move-detection: old path's scan root is unavailable"
                 );
             } else {
-                println!("Detected moved file: '{}' -> '{}' (file_id={})", old_path, current_path, file_id);
+                tracing::debug!(
+                    root_id,
+                    old_path = %old_path,
+                    path = %current_path,
+                    file_id,
+                    "moved file detected"
+                );
 
                 conn.execute(
                     "UPDATE files SET path = ?1, modified_at = ?2 WHERE id = ?3",
@@ -474,9 +490,13 @@ fn process_file(
                     "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
                     rusqlite::params![new_instrume, file_id],
                 ).map_err(|e| {
-                    eprintln!(
-                        "[scanner] failed to update frames.instrume for file_id={} (move '{}' -> '{}'): {}",
-                        file_id, old_path, current_path, e
+                    tracing::error!(
+                        root_id,
+                        file_id,
+                        old_path = %old_path,
+                        path = %current_path,
+                        error = %e,
+                        "failed to update frame instrume after move"
                     );
                     e
                 })?;
@@ -492,7 +512,7 @@ fn process_file(
     let content_hash = if use_content_hash {
         match crate::duplicates::compute_xxhash(path) {
             Ok(hash) => {
-                println!("Computed content hash for '{}': {}", current_path, hash);
+                tracing::debug!(root_id, path = %current_path, hash = %hash, "computed content hash");
                 Some(hash)
             }
             Err(e) => {
@@ -546,21 +566,21 @@ fn process_file(
 
     // Store header for future reference (already extracted above)
     if let Some(header) = header_text {
-        println!("Storing header for file_id={}, header length={} bytes", file_id, header.len());
+        tracing::debug!(root_id, file_id, header_len = header.len(), "storing fits header");
         if let Err(e) = insert_fits_header(conn, file_id, &header) {
-            println!("Warning: Failed to store header: {}", e);
+            tracing::error!(root_id, file_id, error = %e, "failed to store fits header");
         }
     } else if format == FileFormat::XISF {
         // XISF header extraction failed earlier, try again
         match extract_xisf_header(path) {
             Ok(header) => {
-                println!("Storing XISF header for file_id={}, header length={} bytes", file_id, header.len());
+                tracing::debug!(root_id, file_id, header_len = header.len(), "storing xisf header");
                 if let Err(e) = insert_fits_header(conn, file_id, &header) {
-                    println!("Warning: Failed to store XISF header: {}", e);
+                    tracing::error!(root_id, file_id, error = %e, "failed to store xisf header");
                 }
             }
             Err(e) => {
-                println!("Warning: Failed to extract XISF header: {}", e);
+                tracing::error!(root_id, file_id, error = %e, "failed to extract xisf header");
             }
         }
     }
@@ -1127,7 +1147,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     // for an exact-match check. The `id` is carried through so the write
     // loop below can dispatch UPDATE-in-place without a per-file
     // `SELECT id FROM files` (N+1) query.
-    tracing::info!("Building existing files map from DB...");
+    tracing::debug!(root_id, "building existing files map from DB");
     let existing_files: std::collections::HashMap<String, (i64, i64, String)> = {
         let mut map = std::collections::HashMap::new();
         match conn.prepare("SELECT path, id, size, modified_at FROM files") {
@@ -1327,7 +1347,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     let mut lights_count: usize = 0;
 
     // Begin transaction for batch insert
-    tracing::info!(count = processed_results.len(), stage = "inserting", "starting DB inserts");
+    tracing::debug!(root_id, count = processed_results.len(), stage = "inserting", "starting DB inserts");
     if let Err(e) = conn.execute("BEGIN TRANSACTION", []) {
         tracing::error!(error = %e, stage = "inserting", "begin transaction failed");
         result.errors.push(format!("Failed to start DB transaction: {}", e));
@@ -1377,9 +1397,11 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             ).optional() {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!(
-                        "[scanner] move-detection fingerprint lookup failed for '{}': {}",
-                        file_result.file.path, e
+                    tracing::error!(
+                        root_id,
+                        path = %file_result.file.path,
+                        error = %e,
+                        "move-detection fingerprint lookup failed"
                     );
                     result.errors.push(format!(
                         "{}: move-detection fingerprint lookup failed: {}",
@@ -1397,9 +1419,11 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                     match path_under_unavailable_scan_root(conn, &old_path) {
                         Ok(root) => root,
                         Err(e) => {
-                            eprintln!(
-                                "[scanner] move-detection volume guard check failed for '{}': {}",
-                                old_path, e
+                            tracing::error!(
+                                root_id,
+                                old_path = %old_path,
+                                error = %e,
+                                "move-detection volume guard check failed"
                             );
                             result.errors.push(format!(
                                 "{}: move-detection volume guard check failed: {}",
@@ -1417,9 +1441,13 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                     // root is currently offline (unmounted volume). Fall
                     // through to the normal insert/reparse handling below
                     // instead of flipping the still-valid original's path.
-                    println!(
-                        "Skipping move-detection for '{}' -> '{}': old path's scan root '{}' is currently unavailable (volume unmounted?), treating as a separate file (file_id={})",
-                        old_path, file_result.file.path, offline_root, file_id
+                    tracing::warn!(
+                        root_id,
+                        old_path = %old_path,
+                        path = %file_result.file.path,
+                        offline_root = %offline_root,
+                        file_id,
+                        "skipping move-detection: old path's scan root is unavailable"
                     );
                 } else if old_path_missing {
                     // Old file no longer exists - this is a MOVE, update path
@@ -1431,9 +1459,13 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                             file_id
                         ],
                     ) {
-                        eprintln!(
-                            "[scanner] failed to update files.path for file_id={} (move '{}' -> '{}'): {}",
-                            file_id, old_path, file_result.file.path, e
+                        tracing::error!(
+                            root_id,
+                            file_id,
+                            old_path = %old_path,
+                            path = %file_result.file.path,
+                            error = %e,
+                            "failed to update files.path after move"
                         );
                         result.errors.push(format!(
                             "file_id={}: failed to update path for moved file '{}' -> '{}': {}",
@@ -1453,9 +1485,13 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                         "UPDATE frames SET instrume = ?1 WHERE file_id = ?2",
                         rusqlite::params![new_instrume, file_id],
                     ) {
-                        eprintln!(
-                            "[scanner] failed to update frames.instrume for file_id={} (move '{}' -> '{}'): {}",
-                            file_id, old_path, file_result.file.path, e
+                        tracing::error!(
+                            root_id,
+                            file_id,
+                            old_path = %old_path,
+                            path = %file_result.file.path,
+                            error = %e,
+                            "failed to update frame instrume after move"
                         );
                         result.errors.push(format!(
                             "file_id={}: failed to update instrume for moved file '{}' -> '{}': {}",
@@ -1711,6 +1747,9 @@ pub fn run_registered_scan<E: ProgressEmitter>(
     use crate::services::ScanHandle;
     use std::sync::atomic::AtomicBool;
 
+    let span = tracing::info_span!("scan", root_id);
+    let _g = span.enter();
+
     // Atomically check-and-register so two concurrent calls cannot both
     // pass the "no scan in progress" check and both insert (previously the
     // mutex was released between contains_key and insert).
@@ -1770,12 +1809,12 @@ pub fn run_registered_scan<E: ProgressEmitter>(
 
     // Persist last_scan timestamp.
     if let Err(e) = crate::db::update_scan_root_timestamp(&conn, root_id) {
-        eprintln!("Failed to update scan timestamp for root {}: {}", root_id, e);
+        tracing::error!(root_id, error = %e, "failed to update scan timestamp");
     }
 
     // Persist scan errors so they survive app restarts.
     if let Err(e) = crate::db::update_scan_root_errors(&conn, root_id, &result.errors) {
-        eprintln!("Failed to persist scan errors: {}", e);
+        tracing::error!(root_id, error = %e, "failed to persist scan errors");
     }
 
     Ok(RegisteredScanOutcome { result, reconcile })
