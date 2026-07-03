@@ -334,7 +334,7 @@ fn detect_flip_vertical(path: &str) -> bool {
 
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn get_frame_star_metrics(
     state: State<'_, AppState>,
     frame_id: i64,
@@ -439,7 +439,7 @@ pub struct FlatContourPlotResponse {
 }
 
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn compute_flat_contour_plot(
     state: State<'_, AppState>,
     file_id: i64,

@@ -390,7 +390,7 @@ fn detect_flip_vertical(path: &str) -> bool {
 /// POST /api/get_frame_star_metrics
 ///
 /// Get star metrics for a frame. Returns from DB if fresh, otherwise analyzes on-demand.
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_frame_star_metrics(
     State(state): State<WebAppState>,
     Json(args): Json<FrameIdArgs>,
@@ -496,7 +496,7 @@ pub struct FlatContourPlotResponse {
 }
 
 /// POST /api/compute_flat_contour_plot
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn compute_flat_contour_plot(
     State(state): State<WebAppState>,
     Json(args): Json<FlatContourPlotArgs>,
