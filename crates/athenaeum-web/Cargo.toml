@@ -30,6 +30,7 @@ solvemyastro = { path = "../../solvemyastro" }
 # percent-decode the SSE ?api_key= query param without pulling in a second
 # version.
 percent-encoding = "2.1"
+tracing = "0.1"
 
 [dev-dependencies]
 # ServiceExt::oneshot for router-level middleware tests (see routes/auth.rs).

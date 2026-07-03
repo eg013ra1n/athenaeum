@@ -130,14 +130,14 @@ fn validate_dec(dec: f64) -> Result<f64, String> {
 
 /// Extract full FITS header as text (all raw cards, not just a keyword whitelist)
 pub fn extract_fits_header(path: &Path) -> Result<String> {
-    crate::logging::log("DEBUG", &format!("Reading FITS header: {}", path.display()));
+    tracing::debug!("Reading FITS header: {}", path.display());
     let header = FitsHeader::from_path(path)?;
     Ok(header.to_header_text())
 }
 
 /// Parse FITS file and return both Frame metadata and raw header text in a single read.
 pub fn parse_fits_with_header(path: &Path, file_id: i64) -> Result<(Frame, String)> {
-    crate::logging::log("DEBUG", &format!("Parsing FITS (combined): {}", path.display()));
+    tracing::debug!("Parsing FITS (combined): {}", path.display());
     let header = FitsHeader::from_path(path)?;
     let header_text = header.to_header_text();
     let frame = build_frame_from_header(&header, file_id, path)?;
@@ -149,7 +149,7 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
-    crate::logging::log("DEBUG", &format!("Opening XISF for header: {}", path.display()));
+    tracing::debug!("Opening XISF for header: {}", path.display());
     let content = read_xisf_header(path)?;
 
     // Find the XML section
@@ -225,7 +225,7 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
 /// Parse FITS file metadata (single-result variant; prefer parse_fits_with_header for scanning)
 #[allow(dead_code)]
 pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
-    crate::logging::log("DEBUG", &format!("Parsing FITS: {}", path.display()));
+    tracing::debug!("Parsing FITS: {}", path.display());
     let header = FitsHeader::from_path(path)?;
     build_frame_from_header(&header, file_id, path)
 }
@@ -430,7 +430,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     use quick_xml::Reader;
     use std::collections::HashMap;
 
-    crate::logging::log("DEBUG", &format!("Opening XISF for parsing: {}", path.display()));
+    tracing::debug!("Opening XISF for parsing: {}", path.display());
 
     let content = read_xisf_header(path)?;
 

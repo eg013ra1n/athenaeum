@@ -32,6 +32,9 @@ flate2 = "1.0"
 zip = { version = "2", default-features = false, features = ["deflate", "time"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -122,15 +122,9 @@ impl Database {
             .get()
             .expect("Failed to get DB connection from pool");
         if !conn.is_autocommit() {
-            crate::logging::log(
-                "WARN",
-                "[db] pooled connection had an open transaction on checkout — rolling back",
-            );
+            tracing::warn!("[db] pooled connection had an open transaction on checkout — rolling back");
             if let Err(e) = conn.execute("ROLLBACK", []) {
-                crate::logging::log(
-                    "ERROR",
-                    &format!("[db] defensive ROLLBACK failed: {}", e),
-                );
+                tracing::error!("[db] defensive ROLLBACK failed: {}", e);
             }
         }
         conn

@@ -42,7 +42,9 @@ use tauri::{Manager, State};
 /// Initialize file-based logging before Tauri starts.
 /// Called from main() so panics during Tauri init are captured.
 pub fn init_logging() {
-    logging::init();
+    // Task 2 stores the returned handle (for live filter reload from
+    // settings); Task 1 only wires the call site so the workspace compiles.
+    let _ = logging::init(logging::Process::Desktop);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -196,7 +198,7 @@ pub fn run() {
                 });
             }
 
-            logging::log("INFO", "Athenaeum started, Tauri setup complete");
+            tracing::info!("Athenaeum started, Tauri setup complete");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

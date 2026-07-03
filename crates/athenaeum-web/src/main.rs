@@ -75,7 +75,9 @@ pub struct WebAppState {
 
 #[tokio::main]
 async fn main() {
-    logging::init();
+    // Task 2 stores the returned handle (for live filter reload from
+    // settings); Task 1 only wires the call site so the workspace compiles.
+    let _ = logging::init(logging::Process::Web);
 
     let config = Config::from_env();
 
@@ -250,7 +252,7 @@ async fn main() {
         .expect("Failed to bind to address");
     println!("Listening on http://{}", addr);
 
-    logging::log("INFO", &format!("Athenaeum web server started on {}", addr));
+    tracing::info!(%addr, "Athenaeum web server started");
 
     axum::serve(listener, app)
         .await

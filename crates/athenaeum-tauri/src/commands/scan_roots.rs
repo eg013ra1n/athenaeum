@@ -68,9 +68,9 @@ pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<S
 
     // 4. Store the canonicalized path
     let path_str = new_path.to_string_lossy().to_string();
-    crate::logging::log("INFO", &format!("Adding scan root: {}", path_str));
+    tracing::info!("Adding scan root: {}", path_str);
     let id = db::upsert_scan_root(&conn, &path_str).map_err(|e| {
-        crate::logging::log("ERROR", &format!("Failed to add scan root '{}': {}", path_str, e));
+        tracing::error!("Failed to add scan root '{}': {}", path_str, e);
         e.to_string()
     })?;
 
@@ -444,10 +444,7 @@ pub async fn set_scan_root_monitor_enabled(
     db::set_scan_root_monitor_enabled(&conn, id, enabled)
         .map_err(|e| e.to_string())?;
 
-    crate::logging::log(
-        "INFO",
-        &format!("monitor_enabled={} for scan_root id={}", enabled, id),
-    );
+    tracing::info!("monitor_enabled={} for scan_root id={}", enabled, id);
 
     // Wake the monitor loop so the user gets an immediate scan instead of
     // waiting for the current sleep to finish. Only relevant when enabling.
@@ -538,7 +535,7 @@ pub async fn start_scan_with_progress(
     state: State<'_, AppState>,
 ) -> Result<ScanResultDto, String> {
     println!("🔵 start_scan_with_progress called for root_id={}", root_id);
-    crate::logging::log("INFO", &format!("Scan started for root_id={}", root_id));
+    tracing::info!("Scan started for root_id={}", root_id);
 
     let scan_emitter = TauriProgressEmitter(app_handle.clone());
 
@@ -560,10 +557,10 @@ pub async fn start_scan_with_progress(
         result.calibration_sets_created = cal_sets_created;
     }
 
-    crate::logging::log("INFO", &format!(
+    tracing::info!(
         "Scan complete for root_id={}: found={}, processed={}, skipped={}, errors={}",
         root_id, result.files_found, result.files_processed, result.files_skipped, result.errors.len()
-    ));
+    );
 
     Ok(ScanResultDto {
         files_found: result.files_found,

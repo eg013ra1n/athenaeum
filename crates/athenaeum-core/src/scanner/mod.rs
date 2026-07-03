@@ -499,7 +499,7 @@ fn process_file(
                 // Surface the failure so the user knows duplicate detection
                 // skipped this file. Previously silently dropped to None.
                 let msg = format!("hash_error: {}: failed to compute content hash: {}", current_path, e);
-                crate::logging::log("WARN", &msg);
+                tracing::warn!("{}", msg);
                 hash_errors_out.push(msg);
                 None
             }
@@ -719,13 +719,10 @@ fn reparse_and_update_in_place(
             if let Err(rb) = conn.execute_batch(
                 "ROLLBACK TO reparse_in_place; RELEASE reparse_in_place",
             ) {
-                crate::logging::log(
-                    "ERROR",
-                    &format!(
-                        "[scanner] savepoint rollback failed for {}: {}",
-                        path.display(),
-                        rb
-                    ),
+                tracing::error!(
+                    "[scanner] savepoint rollback failed for {}: {}",
+                    path.display(),
+                    rb
                 );
             }
             Err(e)
@@ -947,7 +944,7 @@ fn process_file_parallel(
     path: &PathBuf,
     use_content_hash: bool,
 ) -> Result<FileProcessResult, String> {
-    crate::logging::log("DEBUG", &format!("Processing: {}", path.display()));
+    tracing::debug!("Processing: {}", path.display());
 
     // Get file metadata
     let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -1066,7 +1063,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     };
 
     // Phase 1a: Discovery - collect all file paths with progress updates
-    crate::logging::log("INFO", &format!("Phase 1a: Starting file discovery in '{}'", root_path.display()));
+    tracing::info!("Phase 1a: Starting file discovery in '{}'", root_path.display());
     emit_progress(emitter, root_id, 0, 0, None, "discovery");
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1109,7 +1106,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     }
 
     result.files_found = files.len();
-    crate::logging::log("INFO", &format!("Phase 1a complete: {} files found", files.len()));
+    tracing::info!("Phase 1a complete: {} files found", files.len());
 
     // Check for cancellation before proceeding
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1134,7 +1131,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     // for an exact-match check. The `id` is carried through so the write
     // loop below can dispatch UPDATE-in-place without a per-file
     // `SELECT id FROM files` (N+1) query.
-    crate::logging::log("INFO", "Building existing files map from DB...");
+    tracing::info!("Building existing files map from DB...");
     let existing_files: std::collections::HashMap<String, (i64, i64, String)> = {
         let mut map = std::collections::HashMap::new();
         match conn.prepare("SELECT path, id, size, modified_at FROM files") {
@@ -1153,12 +1150,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                         }
                     }
                     Err(e) => {
-                        crate::logging::log("ERROR", &format!("Failed to query existing files: {}", e));
+                        tracing::error!("Failed to query existing files: {}", e);
                     }
                 }
             }
             Err(e) => {
-                crate::logging::log("ERROR", &format!("Failed to prepare existing files query: {}", e));
+                tracing::error!("Failed to prepare existing files query: {}", e);
             }
         }
         map
@@ -1202,14 +1199,11 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         .collect();
 
     result.files_skipped = result.files_found - new_files.len();
-    crate::logging::log(
-        "INFO",
-        &format!(
-            "Files to process: {} ({} unchanged, {} modified — will UPDATE in place)",
-            new_files.len(),
-            result.files_skipped,
-            modified_paths.len(),
-        ),
+    tracing::info!(
+        "Files to process: {} ({} unchanged, {} modified — will UPDATE in place)",
+        new_files.len(),
+        result.files_skipped,
+        modified_paths.len(),
     );
 
     // Check for cancellation before processing
@@ -1237,7 +1231,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     }
 
     // Phase 1b: Parallel processing - extract metadata from all files
-    crate::logging::log("INFO", &format!("Phase 1b: Starting parallel FITS parsing of {} files", new_files.len()));
+    tracing::info!("Phase 1b: Starting parallel FITS parsing of {} files", new_files.len());
     let progress_counter = Arc::new(AtomicUsize::new(0));
     let total_new = new_files.len();
     let errors = Arc::new(Mutex::new(Vec::new()));
@@ -1301,7 +1295,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         })
         .collect();
 
-    crate::logging::log("INFO", &format!("Phase 1b complete: {} results collected", processed_results.len()));
+    tracing::info!("Phase 1b complete: {} results collected", processed_results.len());
 
     // Check if cancelled during processing phase
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1337,9 +1331,9 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     let mut lights_count: usize = 0;
 
     // Begin transaction for batch insert
-    crate::logging::log("INFO", &format!("Phase 2: Starting DB inserts for {} results", processed_results.len()));
+    tracing::info!("Phase 2: Starting DB inserts for {} results", processed_results.len());
     if let Err(e) = conn.execute("BEGIN TRANSACTION", []) {
-        crate::logging::log("ERROR", &format!("Phase 2: BEGIN TRANSACTION failed: {}", e));
+        tracing::error!("Phase 2: BEGIN TRANSACTION failed: {}", e);
         result.errors.push(format!("Failed to start DB transaction: {}", e));
         emit_scan_complete(emitter, root_id, &result);
         return result;
@@ -1573,9 +1567,9 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     // transaction. Cancellation is supposed to mean "abort," not "keep what
     // I've partially inserted so far."
     if cancelled_mid_insert {
-        crate::logging::log("INFO", "Phase 2: Cancelled mid-batch, rolling back transaction");
+        tracing::info!("Phase 2: Cancelled mid-batch, rolling back transaction");
         if let Err(rb) = conn.execute("ROLLBACK", []) {
-            crate::logging::log("ERROR", &format!("Phase 2: ROLLBACK after cancel failed: {}", rb));
+            tracing::error!("Phase 2: ROLLBACK after cancel failed: {}", rb);
             result.errors.push(format!("DB rollback after cancel failed: {}", rb));
         }
         // No COMMIT, no WAL checkpoint — caller still gets a populated result
@@ -1595,17 +1589,17 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     // Commit transaction. If COMMIT fails, the transaction stays open on
     // the connection; ROLLBACK explicitly so it doesn't poison the pool.
     if let Err(e) = conn.execute("COMMIT", []) {
-        crate::logging::log("ERROR", &format!("Phase 2: COMMIT failed: {}", e));
+        tracing::error!("Phase 2: COMMIT failed: {}", e);
         result.errors.push(format!("DB commit failed: {}", e));
         if let Err(rb) = conn.execute("ROLLBACK", []) {
-            crate::logging::log("ERROR", &format!("Phase 2: ROLLBACK after failed COMMIT failed: {}", rb));
+            tracing::error!("Phase 2: ROLLBACK after failed COMMIT failed: {}", rb);
         }
     }
 
     // Force WAL checkpoint to consolidate writes and reduce post-scan CPU activity
     // TRUNCATE mode moves all data from WAL to main DB and truncates the WAL file
     if let Err(e) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", []) {
-        crate::logging::log("WARN", &format!("Phase 2: WAL checkpoint failed: {}", e));
+        tracing::warn!("Phase 2: WAL checkpoint failed: {}", e);
     }
 
     // Collect Phase-1 errors. EXTEND, don't assign: result.errors already

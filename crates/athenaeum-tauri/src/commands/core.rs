@@ -65,7 +65,7 @@ pub async fn initialize_database(
     }
 
     let db = Database::new(db_path.clone()).map_err(|e| {
-        crate::logging::log("ERROR", &format!("Database init failed: {}", e));
+        tracing::error!("Database init failed: {}", e);
         e.to_string()
     })?;
 
@@ -87,7 +87,7 @@ pub async fn initialize_database(
         }
     }
 
-    crate::logging::log("INFO", &format!("Database initialized: {}", db_path.display()));
+    tracing::info!("Database initialized: {}", db_path.display());
     Ok(db_path.to_string_lossy().to_string())
 }
 
