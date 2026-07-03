@@ -62,6 +62,17 @@ pub struct FrameSetIdArgs {
     pub frame_set_id: i64,
 }
 
+/// Request body for `set_calibration_matching_config`. The frontend calls
+/// `api.invoke("set_calibration_matching_config", { config })` per the Tauri
+/// named-arg convention used by every `api.invoke` call, so the HTTP body is
+/// `{ "config": { ... } }`, not a bare `CalibrationMatchingConfig`. See
+/// `.superpowers/sdd/task-10-report.md` (Web wrapper rider).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCalibrationMatchingConfigArgs {
+    pub config: CalibrationMatchingConfig,
+}
+
 // ── Equipment & dark library ──────────────────────────────────────────────────
 
 /// POST /api/get_equipment_cameras
@@ -486,8 +497,9 @@ pub async fn get_calibration_matching_config(
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_calibration_matching_config(
     State(state): State<WebAppState>,
-    Json(config): Json<CalibrationMatchingConfig>,
+    Json(args): Json<SetCalibrationMatchingConfigArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
+    let config = args.config;
     // Validate before acquiring the DB lock so we fail fast on bad input.
     config.validate().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
@@ -1391,4 +1403,96 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
     counts.into_iter()
         .max_by_key(|(_, (_, count))| *count)
         .map(|(_, (v, _))| v)
+}
+
+#[cfg(test)]
+mod calibration_config_tests {
+    use super::*;
+    use athenaeum_core::cache::MemoryImageCache;
+    use athenaeum_core::db::Database;
+    use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
+    use athenaeum_core::settings::SettingsManager;
+    use crate::events::SseEvent;
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
+    use tempfile::TempDir;
+
+    /// Builds a `WebAppState` backed by a real (file-based, temp) database —
+    /// these tests exercise actual `settings` table reads/writes for the
+    /// calibration matching config. Mirrors
+    /// `settings::logging_config_tests::test_state`.
+    fn test_state(db: Database) -> WebAppState {
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+        });
+        let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
+        WebAppState {
+            ctx,
+            event_tx,
+            allowed_paths: Vec::new(),
+            export_dir: None,
+            api_key: None,
+            image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
+            max_blink_threads: 1,
+            monitor: athenaeum_core::monitor::MonitorService::new(),
+        }
+    }
+
+    /// Regression guard for the real frontend payload: `api.invoke` sends
+    /// `{ "config": { ... } }`, per the Tauri named-arg convention — not a
+    /// bare `CalibrationMatchingConfig`. Exercises the handler via the
+    /// wrapped `SetCalibrationMatchingConfigArgs` struct directly.
+    #[tokio::test]
+    async fn set_calibration_matching_config_then_get_reflects_change() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = CalibrationMatchingConfig::default();
+        cfg.warnings.flat_date_warning_days = 999;
+
+        let _ = set_calibration_matching_config(
+            State(state.clone()),
+            Json(SetCalibrationMatchingConfigArgs { config: cfg }),
+        )
+        .await
+        .expect("valid config must be accepted");
+
+        let resp = get_calibration_matching_config(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.warnings.flat_date_warning_days, 999);
+    }
+
+    /// Pins the fix: the handler now requires the `{ "config": ... }`
+    /// wrapper (matching `SetCalibrationMatchingConfigArgs`). Deserializing
+    /// a bare `CalibrationMatchingConfig` JSON body must fail hard (serde
+    /// error), not silently succeed with the wrong shape.
+    #[test]
+    fn bare_calibration_matching_config_body_fails_to_deserialize_into_wrapped_args() {
+        let bare = serde_json::to_value(CalibrationMatchingConfig::default()).unwrap();
+
+        let result: Result<SetCalibrationMatchingConfigArgs, _> = serde_json::from_value(bare);
+        assert!(
+            result.is_err(),
+            "bare CalibrationMatchingConfig body must NOT deserialize into \
+             SetCalibrationMatchingConfigArgs — this is what closes the \
+             silent-mismatch hole (axum returns 422/400 for this shape)"
+        );
+    }
 }

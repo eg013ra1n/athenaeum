@@ -80,6 +80,17 @@ fn err(msg: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, s)
 }
 
+/// Request body for `set_analysis_config`. The frontend calls
+/// `api.invoke('set_analysis_config', { config })` per the Tauri named-arg
+/// convention used by every `api.invoke` call, so the HTTP body is
+/// `{ "config": { ... } }`, not a bare `AnalysisConfig`. See
+/// `.superpowers/sdd/task-10-report.md` (Web wrapper rider).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAnalysisConfigArgs {
+    pub config: AnalysisConfig,
+}
+
 // ── Config routes ────────────────────────────────────────────────────────────
 
 /// POST /api/get_analysis_config
@@ -97,11 +108,11 @@ pub async fn get_analysis_config(
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_analysis_config(
     State(state): State<WebAppState>,
-    Json(config): Json<AnalysisConfig>,
+    Json(args): Json<SetAnalysisConfigArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     let db = state.ctx.db.get().ok_or_else(|| err("Database not initialized"))?;
     let conn = db.conn();
-    config::save_config(&conn, &config).map_err(err)?;
+    config::save_config(&conn, &args.config).map_err(err)?;
     Ok(Json(()))
 }
 
@@ -537,4 +548,92 @@ pub async fn compute_flat_contour_plot(
         contours: result.contours,
         pixels_b64,
     }))
+}
+
+#[cfg(test)]
+mod analysis_config_tests {
+    use super::*;
+    use athenaeum_core::cache::MemoryImageCache;
+    use athenaeum_core::db::Database;
+    use athenaeum_core::services::{operation_queue::OperationQueue, ServiceContext};
+    use athenaeum_core::settings::SettingsManager;
+    use crate::events::SseEvent;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
+    use tempfile::TempDir;
+
+    /// Builds a `WebAppState` backed by a real (file-based, temp) database —
+    /// these tests exercise actual `settings` table reads/writes for the
+    /// analysis config. Mirrors `settings::logging_config_tests::test_state`.
+    fn test_state(db: Database) -> WebAppState {
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+        });
+        let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
+        WebAppState {
+            ctx,
+            event_tx,
+            allowed_paths: Vec::new(),
+            export_dir: None,
+            api_key: None,
+            image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
+            max_blink_threads: 1,
+            monitor: athenaeum_core::monitor::MonitorService::new(),
+        }
+    }
+
+    /// Regression guard for the real frontend payload: `api.invoke` sends
+    /// `{ "config": { ... } }`, per the Tauri named-arg convention — not a
+    /// bare `AnalysisConfig`. Exercises the handler via the wrapped
+    /// `SetAnalysisConfigArgs` struct directly.
+    #[tokio::test]
+    async fn set_analysis_config_then_get_reflects_change() {
+        let tmp = TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        let state = test_state(db);
+
+        let mut cfg = AnalysisConfig::default();
+        cfg.max_stars = 750;
+
+        let _ = set_analysis_config(State(state.clone()), Json(SetAnalysisConfigArgs { config: cfg }))
+            .await
+            .expect("valid config must be accepted");
+
+        let resp = get_analysis_config(State(state), Json(serde_json::json!({})))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.max_stars, 750);
+    }
+
+    /// Pins the fix: the handler now requires the `{ "config": ... }`
+    /// wrapper (matching `SetAnalysisConfigArgs`). Deserializing a bare
+    /// `AnalysisConfig` JSON body must fail hard (serde error), not
+    /// silently succeed with the wrong shape.
+    #[test]
+    fn bare_analysis_config_body_fails_to_deserialize_into_wrapped_args() {
+        let bare = serde_json::to_value(AnalysisConfig::default()).unwrap();
+
+        let result: Result<SetAnalysisConfigArgs, _> = serde_json::from_value(bare);
+        assert!(
+            result.is_err(),
+            "bare AnalysisConfig body must NOT deserialize into SetAnalysisConfigArgs — \
+             this is what closes the silent-mismatch hole (axum returns 422/400 for this shape)"
+        );
+    }
 }
