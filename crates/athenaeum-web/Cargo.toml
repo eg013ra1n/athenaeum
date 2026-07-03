@@ -1,6 +1,6 @@
 [package]
 name = "athenaeum-web"
-version = "0.2.2-beta.1"
+version = "0.2.3"
 description = "Athenaeum web backend - Axum server for Docker/server deployment"
 authors = ["you"]
 edition = "2021"
