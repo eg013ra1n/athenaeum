@@ -66,12 +66,12 @@ Auto-suggest, user confirms (like auto_merge today); manual "group as mosaic / a
 
 **Stage B3 — header vocabulary & provenance.** Master FITS headers carry everything the matcher scores on, copied/aggregated from the source `calibration_set` + member frames:
 
-- Standard: `IMAGETYP` (`MASTER DARK` … — parser already recognizes), `INSTRUME`, `GAIN`, `OFFSET`, `EXPTIME`, `CCD-TEMP` (mean; also `ATHM_TMIN`/`ATHM_TMAX`), `XBINNING`/`YBINNING`, `FILTER`, `FOCALLEN`, `TELESCOP`, `DATE-OBS` (midpoint), `BAYERPAT` if OSC.
-- Custom namespace `ATHM_*`: `ATHM_SRC` (source calibration_set uuid — needs collab Stage 1), `ATHM_N` (frame count), `ATHM_REJ` (algorithm+sigmas), `ATHM_VER` (app version), `ATHM_HSH` (xxh3 of member-hash list, for dedup/provenance).
+- Standard: `IMAGETYP` (`MASTER DARK` … — parser already recognizes), `INSTRUME`, `GAIN`, `OFFSET`, `EXPTIME`, `CCD-TEMP` (mean; also `ATH_TMIN`/`ATH_TMAX`), `XBINNING`/`YBINNING`, `FILTER`, `FOCALLEN`, `TELESCOP`, `DATE-OBS` (midpoint), `BAYERPAT` if OSC.
+- Custom namespace `ATH_*` (was `ATHM_*` — renamed 2026-07-04: `ATHM_TMIN`/`ATHM_TMAX` were 9 chars, over the FITS 8-char keyword limit): `ATH_SRC` (source calibration_set uuid — needs collab Stage 1), `ATH_N` (frame count), `ATH_REJ` (algorithm+sigmas), `ATH_VER` (app version), `ATH_HSH` (xxh3 of member-hash list, for dedup/provenance), `ATH_TMIN`/`ATH_TMAX` (temperature span).
 
 Because headers are self-describing, **the library is just files**: masters are written into a managed library folder (template-named via the existing token engine, e.g. `{IMAGETYP}/{INSTRUME}/{DATE-OBS:%Y-%m}/master_dark_{EXPTIME}s_{CCD-TEMP}C_g{GAIN}.fits`) that is itself a scan root — the existing scanner ingests them through the established is_master path and the matcher picks them up with zero new matching code. Sharing a master with a teammate = sending one file (pillar C synergy).
 
-DB provenance (queryable side of `ATHM_*`):
+DB provenance (queryable side of `ATH_*`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS master_provenance (
