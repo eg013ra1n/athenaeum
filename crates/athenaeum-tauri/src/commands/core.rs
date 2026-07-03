@@ -89,8 +89,9 @@ pub async fn initialize_database(
 
     // Apply persisted logging config now that the DB is available. A parse
     // failure falls back to the default (info) filter rather than failing DB
-    // init; a missing/unreadable setting also falls back to the default
-    // silently (that's the expected first-run state).
+    // init; a missing setting also falls back to the default silently
+    // (that's the expected first-run state) — but a DB read error is never
+    // swallowed silently, unlike the parse/missing cases.
     if let Some(db) = state.ctx.db.get() {
         let conn = db.conn();
         let cfg = match crate::db::get_setting(&conn, crate::logging::config::SETTINGS_KEY) {
@@ -99,7 +100,11 @@ pub async fn initialize_database(
                     tracing::warn!(error = %e, "invalid stored logging config; using default");
                     crate::logging::LoggingConfig::default()
                 }),
-            _ => crate::logging::LoggingConfig::default(),
+            Ok(None) => crate::logging::LoggingConfig::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read stored logging config; using default");
+                crate::logging::LoggingConfig::default()
+            }
         };
         if let Some(handle) = crate::logging::global_handle() {
             handle.apply_config(&cfg);

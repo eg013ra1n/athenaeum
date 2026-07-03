@@ -111,8 +111,9 @@ async fn main() {
 
     // Apply persisted logging config now that the DB is available. A parse
     // failure falls back to the default (info) filter rather than failing
-    // startup; a missing/unreadable setting also falls back to the default
-    // silently (that's the expected first-run state).
+    // startup; a missing setting also falls back to the default silently
+    // (that's the expected first-run state) — but a DB read error is never
+    // swallowed silently, unlike the parse/missing cases.
     {
         let cfg = match db::get_setting(&db.conn(), logging::config::SETTINGS_KEY) {
             Ok(Some(raw)) => serde_json::from_str::<logging::LoggingConfig>(&raw)
@@ -120,7 +121,11 @@ async fn main() {
                     tracing::warn!(error = %e, "invalid stored logging config; using default");
                     logging::LoggingConfig::default()
                 }),
-            _ => logging::LoggingConfig::default(),
+            Ok(None) => logging::LoggingConfig::default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read stored logging config; using default");
+                logging::LoggingConfig::default()
+            }
         };
         if let Some(handle) = logging::global_handle() {
             handle.apply_config(&cfg);
