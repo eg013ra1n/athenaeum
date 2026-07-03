@@ -99,6 +99,15 @@ New workspace crate `crates/log-mcp`: a stdio MCP server over the JSONL director
 
 Registered in the repo's `.mcp.json` for dev sessions. Reads the same files a beta user zips up — one code path to understand any log.
 
+## Legacy cleanup (explicit)
+
+The old logging style is removed entirely, not left beside the new one:
+
+- `logging.rs`'s single-file writer and its `log(level, msg)` free-function API are deleted in the rewrite; no call sites may remain.
+- First init of the new subscriber deletes the obsolete `<app-data>/athenaeum.log` and `athenaeum.log.1` files (crash.log stays — same mechanism, still written on panic).
+- **Zero-print exit gate**: after the sweep, `println!`/`eprintln!` in production code of all five codebases = 0 (tests, benches, examples, and build scripts exempt; CLI binaries' intentional user-facing stdout in solvemyastro exempt and listed by file in the plan). Enforced as a checklist grep like Phase 0's naming gate.
+- Frontend `console.*` sites stay (out of scope this cycle) — but the api layer's error paths touched by other work must not *add* new bare `console.log` for backend-reportable errors.
+
 ## Error handling
 
 Logging never takes the app down: file-open failure → console-only + one `warn`; writer is non-blocking (full disk stalls the log thread, not operations); filter parse errors keep the previous filter and `warn`; subscriber init failure leaves the app running unlogged rather than dead.
