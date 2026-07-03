@@ -10,16 +10,14 @@ APP_ID="com.vsharifov.athenaeum"
 APP_PATH="/Applications/Athenaeum.app"
 DATA_DIR="$HOME/Library/Application Support/$APP_ID"
 CACHE_DIR="$HOME/Library/Caches/$APP_ID"
-LOG_DIR="$HOME/Library/Logs/$APP_ID"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "Athenaeum Uninstaller for macOS"
     echo ""
     echo "Removes the Athenaeum application and all associated user data:"
     echo "  - $APP_PATH"
-    echo "  - ~/Library/Application Support/$APP_ID/"
+    echo "  - ~/Library/Application Support/$APP_ID/ (includes logs/, catalog DB)"
     echo "  - ~/Library/Caches/$APP_ID/"
-    echo "  - ~/Library/Logs/$APP_ID/"
     echo ""
     echo "Usage: $0 [--help]"
     exit 0
@@ -41,7 +39,7 @@ fi
 
 if [[ -d "$DATA_DIR" ]]; then
     size=$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)
-    echo "  User data:    $DATA_DIR ($size)"
+    echo "  User data:    $DATA_DIR ($size, includes logs/)"
     found+=("$DATA_DIR")
 fi
 
@@ -49,12 +47,6 @@ if [[ -d "$CACHE_DIR" ]]; then
     size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
     echo "  Cache:        $CACHE_DIR ($size)"
     found+=("$CACHE_DIR")
-fi
-
-if [[ -d "$LOG_DIR" ]]; then
-    size=$(du -sh "$LOG_DIR" 2>/dev/null | cut -f1)
-    echo "  Logs:         $LOG_DIR ($size)"
-    found+=("$LOG_DIR")
 fi
 
 if [[ ${#found[@]} -eq 0 ]]; then

@@ -30,7 +30,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo "  - $SYS_ICONS/*/apps/$APP_NAME.png"
     echo ""
     echo "User data:"
-    echo "  - $USER_DATA/"
+    echo "  - $USER_DATA/ (includes logs/, catalog DB)"
     echo "  - $USER_CONFIG/"
     echo "  - $USER_CACHE/"
     echo ""
@@ -64,7 +64,7 @@ done < <(find "$SYS_ICONS" -name "$APP_NAME.png" -print0 2>/dev/null || true)
 
 if [[ -d "$USER_DATA" ]]; then
     size=$(du -sh "$USER_DATA" 2>/dev/null | cut -f1)
-    echo "  User data:       $USER_DATA ($size)"
+    echo "  User data:       $USER_DATA ($size, includes logs/)"
     user_found+=("$USER_DATA")
 fi
 

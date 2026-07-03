@@ -29,6 +29,20 @@ export async function revealItemInDir(path: string): Promise<void> {
 }
 
 /**
+ * Open a directory (or file) directly with the system's default handler —
+ * for a folder this opens the folder itself, unlike `revealItemInDir` which
+ * reveals an item within its parent's explorer window.
+ * Only works in Tauri desktop mode — no-op in web mode.
+ */
+export async function openPath(path: string): Promise<void> {
+  if (isTauri) {
+    const { openPath: tauriOpenPath } = await import('@tauri-apps/plugin-opener');
+    await tauriOpenPath(path);
+  }
+  // Web: no-op — there's no system file explorer to open
+}
+
+/**
  * Open a native directory picker dialog.
  * Only works in Tauri desktop mode — returns null in web mode.
  */

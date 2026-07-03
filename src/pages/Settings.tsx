@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
 import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info } from 'lucide-react';
-import { revealItemInDir } from '../api/desktop';
+import { revealItemInDir, openPath } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
@@ -48,9 +48,9 @@ export default function Settings() {
   const [archiveCompression, setArchiveCompressionState] = useState<ArchiveCompression>('store');
   const [archiveSaving, setArchiveSaving] = useState(false);
 
-  // Data file locations (desktop only — db + log paths reported by the backend).
+  // Data file locations (desktop only — db path + log directory reported by the backend).
   const [dbPath, setDbPath] = useState<string>('');
-  const [logPath, setLogPath] = useState<string>('');
+  const [logDir, setLogDir] = useState<string>('');
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -103,7 +103,7 @@ export default function Settings() {
       .catch(console.error);
     if (isTauri) {
       api.invoke<string>('get_database_path').then(setDbPath).catch(console.error);
-      api.invoke<string>('get_log_path').then(setLogPath).catch(console.error);
+      api.invoke<string>('get_log_path').then(setLogDir).catch(console.error);
     }
   }, []);
 
@@ -1249,8 +1249,9 @@ export default function Settings() {
             Data file locations
           </h3>
           <p className="text-sm text-content-muted mb-4">
-            Where Athenaeum stores its catalog database and log file on disk. Click the
-            folder icon to reveal each in your file manager.
+            Where Athenaeum stores its catalog database and log files on disk. Click the
+            folder icon to reveal the database in your file manager, or to open the log
+            folder directly.
           </p>
           <div className="bg-surface-secondary rounded p-4 text-sm font-mono space-y-3">
             <div className="flex items-center gap-3">
@@ -1267,13 +1268,13 @@ export default function Settings() {
               )}
             </div>
             <div className="flex items-center gap-3">
-              <span className="text-content-muted min-w-[80px]">Log file:</span>
-              <span className="text-content truncate flex-1">{logPath || '—'}</span>
-              {logPath && (
+              <span className="text-content-muted min-w-[80px]">Log folder:</span>
+              <span className="text-content truncate flex-1">{logDir || '—'}</span>
+              {logDir && (
                 <button
-                  onClick={() => revealItemInDir(logPath)}
+                  onClick={() => openPath(logDir)}
                   className="text-content-muted hover:text-content transition flex-shrink-0"
-                  title="Reveal in file manager"
+                  title="Open log folder"
                 >
                   <FolderOpen size={16} />
                 </button>

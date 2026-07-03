@@ -109,6 +109,24 @@ async fn main() {
     let db = Database::new(config.db_path.clone()).expect("Failed to initialize database");
     println!("Database initialized: {}", config.db_path.display());
 
+    // Apply persisted logging config now that the DB is available. A parse
+    // failure falls back to the default (info) filter rather than failing
+    // startup; a missing/unreadable setting also falls back to the default
+    // silently (that's the expected first-run state).
+    {
+        let cfg = match db::get_setting(&db.conn(), logging::config::SETTINGS_KEY) {
+            Ok(Some(raw)) => serde_json::from_str::<logging::LoggingConfig>(&raw)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "invalid stored logging config; using default");
+                    logging::LoggingConfig::default()
+                }),
+            _ => logging::LoggingConfig::default(),
+        };
+        if let Some(handle) = logging::global_handle() {
+            handle.apply_config(&cfg);
+        }
+    }
+
     // Build thread pool
     let max_threads = std::thread::available_parallelism()
         .map(|n| n.get().min(16))

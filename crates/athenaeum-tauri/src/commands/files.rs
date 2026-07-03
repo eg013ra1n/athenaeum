@@ -279,12 +279,12 @@ pub async fn get_files_with_frames_by_ids(
         .collect())
 }
 
-/// Get the path to the log file
+/// Get the path to the log directory (rolling daily JSONL files live inside it).
 #[tauri::command]
 pub async fn get_log_path() -> Result<String, String> {
     crate::logging::get_path()
         .map(|p| p.to_string_lossy().to_string())
-        .ok_or_else(|| "Log file not initialized".to_string())
+        .ok_or_else(|| "Logging not initialized".to_string())
 }
 
 /// Get the path to the database file
