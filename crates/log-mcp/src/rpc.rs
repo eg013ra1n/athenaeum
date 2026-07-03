@@ -233,7 +233,12 @@ fn dispatch_tool_call(params: &Value, log_dir: &Path) -> Result<Value> {
             serde_json::to_value(query::scan(log_dir, &f)?)?
         }
         "tail_logs" => {
-            let n = query::clamp_limit(args.get("n").and_then(|v| v.as_u64()).map(|v| v as usize));
+            let n = query::clamp_limit(
+                args.get("n")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .or(Some(50))
+            );
             serde_json::to_value(query::tail(log_dir, n)?)?
         }
         "list_operations" => {

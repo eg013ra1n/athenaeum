@@ -119,3 +119,30 @@ fn malformed_line_does_not_abort_the_scan() {
     };
     assert!(query::scan(dir.path(), &f).is_ok());
 }
+
+#[test]
+fn tail_logs_truncates_to_last_n() {
+    // Regression test: tail must return the LAST N lines, not the FIRST N.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("athenaeum-desktop.2026-07-03.jsonl");
+    let mut f = std::fs::File::create(&path).expect("create fixture file");
+
+    // Write 5 matching lines with messages m1..m5 (same level/target for filtering).
+    for i in 1..=5 {
+        let line = format!(
+            r#"{{"timestamp":"2026-07-03T10:00:{:02}.000000Z","level":"INFO","target":"athenaeum_core::test","fields":{{"message":"m{i}"}}}}"#,
+            i - 1
+        );
+        writeln!(f, "{line}").expect("write fixture line");
+    }
+
+    // Scan with limit=2; should return the last 2 lines only.
+    let results = query::tail(dir.path(), 2).expect("tail");
+    assert_eq!(results.len(), 2, "expected exactly 2 lines");
+
+    let messages: Vec<&str> = results
+        .iter()
+        .filter_map(|v| v.pointer("/fields/message").and_then(|m| m.as_str()))
+        .collect();
+    assert_eq!(messages, vec!["m4", "m5"], "expected [m4, m5] in order");
+}
