@@ -80,15 +80,18 @@ struct MemberInfo {
 /// # Steps
 ///
 /// 1. Load LIGHT frame IDs and their metadata from the DB.
-/// 2. Detect stars in each member (ImageAnalyzer::detect_fast with
+/// 2. Pre-registration consistency gate (R2): reject the run if members mix
+///    binning or focal length beyond tolerance — see
+///    [`check_registration_consistency`]. Runs before any per-frame work.
+/// 3. Detect stars in each member (ImageAnalyzer::detect_fast with
 ///    centroid_refine = true; capped at 400 stars). Honours `cancel`.
-/// 3. Select the reference frame (most detections, tie-break smallest frame_id,
+/// 4. Select the reference frame (most detections, tie-break smallest frame_id,
 ///    or `override_reference_id` when supplied and valid).
-/// 4. Precise-solve the reference frame (centroid_refinement = Auto).
+/// 5. Precise-solve the reference frame (centroid_refinement = Auto).
 ///    Retry up to 3 distinct candidate frames if the first fails.
-/// 5. For each non-reference member: call `solvemyastro::register` and persist
+/// 6. For each non-reference member: call `solvemyastro::register` and persist
 ///    the result. Honours `cancel`.
-/// 6. Return a [`RegistrationSummary`].
+/// 7. Return a [`RegistrationSummary`].
 ///
 /// Progress is broadcast on `stacking-prep-progress` (per frame) and
 /// `stacking-prep-complete` (once at the end).
@@ -109,9 +112,7 @@ pub fn register_frame_set(
     }
 
     let total = frame_ids.len();
-    eprintln!(
-        "registration: frame set {frames_set_id}: {total} LIGHT members to register"
-    );
+    eprintln!("registration: frame set {frames_set_id}: {total} LIGHT members to register");
 
     // Load frame metadata + file path for every member.
     let mut members: Vec<MemberInfo> = Vec::with_capacity(total);
@@ -125,9 +126,7 @@ pub fn register_frame_set(
                 detection_count: 0,
             }),
             Err(e) => {
-                eprintln!(
-                    "registration: failed to load frame {fid} — skipping: {e}"
-                );
+                eprintln!("registration: failed to load frame {fid} — skipping: {e}");
             }
         }
     }
@@ -136,7 +135,31 @@ pub fn register_frame_set(
         bail!("No loadable LIGHT frames in frame set {frames_set_id}");
     }
 
-    // ── Step 2: star detection ────────────────────────────────────────────────
+    // ── Step 2: pre-registration consistency gate (R2) ───────────────────────
+    //
+    // Runs before star detection / solving so a mismatched set fails fast
+    // without spending any per-frame compute on a run that cannot register
+    // correctly.
+    if let Err(e) = check_registration_consistency(&members) {
+        eprintln!("registration: consistency gate failed for frame set {frames_set_id}: {e}");
+        emit_event(
+            emitter,
+            "stacking-prep-progress",
+            &StackingPrepProgressEvent {
+                frame_id: members[0].frame_id,
+                current: 0,
+                total,
+                status: "failed".to_string(),
+                matched_stars: None,
+                rms_px: None,
+                error: Some(e.to_string()),
+                filename: filename_from_path(&members[0].path),
+            },
+        );
+        return Err(e);
+    }
+
+    // ── Step 3: star detection ────────────────────────────────────────────────
     const MAX_STARS: usize = 400;
     let analyzer = ImageAnalyzer::new()
         .with_max_stars(MAX_STARS)
@@ -165,7 +188,11 @@ pub fn register_frame_set(
 
         match analyzer.detect_fast(&member.path) {
             Ok(result) => {
-                member.detections = result.stars.iter().map(|s| (s.x as f64, s.y as f64)).collect();
+                member.detections = result
+                    .stars
+                    .iter()
+                    .map(|s| (s.x as f64, s.y as f64))
+                    .collect();
                 member.detection_count = member.detections.len();
                 eprintln!(
                     "registration: frame {} — {} detections",
@@ -182,7 +209,7 @@ pub fn register_frame_set(
         }
     }
 
-    // ── Step 3: select reference ──────────────────────────────────────────────
+    // ── Step 4: select reference ──────────────────────────────────────────────
     //
     // Priority order:
     //   1. Caller-supplied `override_reference_id` (programmatic override, e.g.
@@ -230,17 +257,13 @@ pub fn register_frame_set(
             .unwrap_or(0);
         let mut rest: Vec<usize> = (0..members.len()).filter(|&i| i != ref_idx).collect();
         // Sort rest by descending detection count.
-        rest.sort_by(|&a, &b| {
-            members[b]
-                .detection_count
-                .cmp(&members[a].detection_count)
-        });
+        rest.sort_by(|&a, &b| members[b].detection_count.cmp(&members[a].detection_count));
         let mut candidates = vec![ref_idx];
         candidates.extend_from_slice(&rest);
         candidates
     };
 
-    // ── Step 4: precise-solve the reference (up to 3 attempts) ───────────────
+    // ── Step 5: precise-solve the reference (up to 3 attempts) ───────────────
     let sma_cfg = SolveConfig {
         quad_tolerance: 0.007,
         catalog_mag_limit: 19.0,
@@ -266,7 +289,13 @@ pub fn register_frame_set(
         let m = &members[candidate_idx];
         let hints = build_sma_hints(&m.frame);
         let t0 = Instant::now();
-        match solvemyastro::solve(&std::path::Path::new(&m.path), &hints, &caches, &sma_cfg, cancel) {
+        match solvemyastro::solve(
+            &std::path::Path::new(&m.path),
+            &hints,
+            &caches,
+            &sma_cfg,
+            cancel,
+        ) {
             Ok(solution) => {
                 let elapsed_ms = t0.elapsed().as_millis() as i64;
                 eprintln!(
@@ -327,7 +356,10 @@ pub fn register_frame_set(
 
                 ref_solve = Some((m.frame_id, solution.wcs, pixel_scale, ref_detections));
                 // Rearrange solve_candidates so the winning reference is first.
-                let winning_pos = solve_candidates.iter().position(|&i| i == candidate_idx).unwrap();
+                let winning_pos = solve_candidates
+                    .iter()
+                    .position(|&i| i == candidate_idx)
+                    .unwrap();
                 solve_candidates.swap(0, winning_pos);
                 break;
             }
@@ -358,7 +390,10 @@ pub fn register_frame_set(
     let registered_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     {
         // Find the MemberInfo for actual_ref_id.
-        let m = members.iter().find(|m| m.frame_id == actual_ref_id).unwrap();
+        let m = members
+            .iter()
+            .find(|m| m.frame_id == actual_ref_id)
+            .unwrap();
         // We already persisted above; but clear_registration just deleted it.
         // Reconstruct and re-upsert.
         upsert_registration(
@@ -395,7 +430,7 @@ pub fn register_frame_set(
         let _ = m; // silence unused warning
     }
 
-    // ── Step 5: align non-reference members ───────────────────────────────────
+    // ── Step 6: align non-reference members ───────────────────────────────────
     let mut aligned = 0usize;
     let mut failed = 0usize;
     let non_ref_indices: Vec<usize> = (0..members.len())
@@ -618,10 +653,7 @@ fn aligned_status(flipped: bool) -> &'static str {
 /// Load a `Frame` and its on-disk path from the DB for a given `frame_id`.
 ///
 /// Mirrors the helper used by `plate_solve::commands::plate_solve.rs`.
-fn load_frame_with_path(
-    conn: &Connection,
-    frame_id: i64,
-) -> Result<(Frame, String)> {
+fn load_frame_with_path(conn: &Connection, frame_id: i64) -> Result<(Frame, String)> {
     let mut stmt = conn
         .prepare(
             "SELECT f.*, fl.path
@@ -685,6 +717,176 @@ fn load_frame_with_path(
         Ok((frame, path))
     })
     .map_err(|e| anyhow::anyhow!("Frame {frame_id} not found: {e}"))
+}
+
+// ── pre-registration consistency gate (R2) ───────────────────────────────────
+//
+// `register_frame_set`'s WCS composition (`CD' = CD_ref · M`, around
+// `ref_pixel_scale` in Step 5) assumes every sub shares the reference pixel
+// scale. Mixed binning (e.g. 1×1 + 2×2) in one frame set silently composes a
+// scale-wrong WCS with no warning. This gate rejects such a set before any
+// per-frame work (star detection, solving) is spent on a run that cannot
+// register correctly.
+//
+// Deliberately NOT auto-rescaling the minority group — that is stacking
+// Phase B territory; the fix here is "detect and refuse", not "correct".
+
+/// Pure pre-registration consistency check: every member must share the same
+/// `(xbinning, ybinning)` and the same focal length (±1% relative tolerance)
+/// as every other member.
+///
+/// NULL `xbinning`/`ybinning` is treated as 1 (unbinned), logged per member.
+/// NULL `focallen` is excluded from the focal-length check entirely (also
+/// logged) — it neither joins nor breaks a group.
+///
+/// No DB, no file I/O — operates purely on the already-loaded `members`
+/// slice, so it is unit-testable with fake `Frame`s.
+fn check_registration_consistency(members: &[MemberInfo]) -> Result<()> {
+    check_binning_consistency(members)?;
+    check_focallen_consistency(members)?;
+    Ok(())
+}
+
+/// One `(key, member-ids)` group discovered while scanning for a mismatch,
+/// plus a single example filename for logging.
+struct MismatchGroup<K> {
+    key: K,
+    frame_ids: Vec<i64>,
+    example_filename: Option<String>,
+}
+
+/// Join formatted `"key (N frames)"` parts into a human sentence:
+/// `"a and b"` for two groups, `"a, b, and c"` for three or more.
+fn join_group_parts(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [only] => only.clone(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let (last, rest) = parts.split_last().expect("parts is non-empty");
+            format!("{}, and {last}", rest.join(", "))
+        }
+    }
+}
+
+fn check_binning_consistency(members: &[MemberInfo]) -> Result<()> {
+    let mut groups: Vec<MismatchGroup<(i32, i32)>> = Vec::new();
+
+    for m in members {
+        let x = m.frame.xbinning.unwrap_or_else(|| {
+            eprintln!(
+                "registration: frame {} has NULL xbinning — assuming 1 (unbinned)",
+                m.frame_id
+            );
+            1
+        });
+        let y = m.frame.ybinning.unwrap_or_else(|| {
+            eprintln!(
+                "registration: frame {} has NULL ybinning — assuming 1 (unbinned)",
+                m.frame_id
+            );
+            1
+        });
+        let key = (x, y);
+
+        match groups.iter_mut().find(|g| g.key == key) {
+            Some(g) => g.frame_ids.push(m.frame_id),
+            None => groups.push(MismatchGroup {
+                key,
+                frame_ids: vec![m.frame_id],
+                example_filename: filename_from_path(&m.path),
+            }),
+        }
+    }
+
+    if groups.len() <= 1 {
+        return Ok(());
+    }
+
+    groups.sort_by(|a, b| b.frame_ids.len().cmp(&a.frame_ids.len()));
+
+    for g in &groups {
+        eprintln!(
+            "registration: binning group {}x{} — {} frame(s), e.g. {}",
+            g.key.0,
+            g.key.1,
+            g.frame_ids.len(),
+            g.example_filename.as_deref().unwrap_or("<unknown>")
+        );
+    }
+
+    let parts: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{}x{} ({} frames)", g.key.0, g.key.1, g.frame_ids.len()))
+        .collect();
+    let joined = join_group_parts(&parts);
+
+    bail!(
+        "registration: frame set mixes binning {joined}; registration requires \
+         uniform binning — split the set or exclude the minority"
+    );
+}
+
+fn check_focallen_consistency(members: &[MemberInfo]) -> Result<()> {
+    /// Relative tolerance for focal-length grouping, per plan T2 (R2).
+    const REL_TOLERANCE: f64 = 0.01; // ±1%
+
+    let mut groups: Vec<MismatchGroup<f64>> = Vec::new();
+
+    for m in members {
+        let Some(focallen) = m.frame.focallen else {
+            eprintln!(
+                "registration: frame {} has NULL focal length — excluded from the \
+                 focal-length consistency check",
+                m.frame_id
+            );
+            continue;
+        };
+
+        let existing = groups.iter_mut().find(|g| {
+            let denom = if g.key.abs() > f64::EPSILON {
+                g.key.abs()
+            } else {
+                1.0
+            };
+            ((focallen - g.key).abs() / denom) <= REL_TOLERANCE
+        });
+
+        match existing {
+            Some(g) => g.frame_ids.push(m.frame_id),
+            None => groups.push(MismatchGroup {
+                key: focallen,
+                frame_ids: vec![m.frame_id],
+                example_filename: filename_from_path(&m.path),
+            }),
+        }
+    }
+
+    if groups.len() <= 1 {
+        return Ok(());
+    }
+
+    groups.sort_by(|a, b| b.frame_ids.len().cmp(&a.frame_ids.len()));
+
+    for g in &groups {
+        eprintln!(
+            "registration: focal-length group {:.1}mm — {} frame(s), e.g. {}",
+            g.key,
+            g.frame_ids.len(),
+            g.example_filename.as_deref().unwrap_or("<unknown>")
+        );
+    }
+
+    let parts: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{:.1}mm ({} frames)", g.key, g.frame_ids.len()))
+        .collect();
+    let joined = join_group_parts(&parts);
+
+    bail!(
+        "registration: frame set mixes focal length {joined}; registration requires \
+         uniform focal length — split the set or exclude the minority"
+    );
 }
 
 #[cfg(test)]
@@ -784,6 +986,145 @@ mod tests {
         };
 
         (ref_wcs, ref_pts, sub_pts)
+    }
+
+    // ── pre-registration consistency gate (R2) ──────────────────────────────
+
+    /// Build a fake `MemberInfo` for the consistency-gate tests — no DB, no
+    /// on-disk file; `detections`/`detection_count` are irrelevant to the
+    /// gate and left empty/zero.
+    fn fake_member(
+        frame_id: i64,
+        xbinning: Option<i32>,
+        ybinning: Option<i32>,
+        focallen: Option<f64>,
+        filename: &str,
+    ) -> MemberInfo {
+        MemberInfo {
+            frame_id,
+            frame: Frame {
+                xbinning,
+                ybinning,
+                focallen,
+                ..Frame::default()
+            },
+            path: filename.to_string(),
+            detections: Vec::new(),
+            detection_count: 0,
+        }
+    }
+
+    /// Required test #1 (plan T2): two fake members, 1×1 and 2×2 binning —
+    /// must bail and the message must mention both groups (and their sizes,
+    /// matching the plan's verbatim example: "1x1 (42 frames) and 2x2 (8
+    /// frames)").
+    #[test]
+    fn mixed_binning_bails_and_mentions_both_groups() {
+        let mut members: Vec<MemberInfo> = Vec::new();
+        for i in 0..42 {
+            members.push(fake_member(
+                i,
+                Some(1),
+                Some(1),
+                Some(600.0),
+                &format!("light_{i:03}.fits"),
+            ));
+        }
+        for i in 42..50 {
+            members.push(fake_member(
+                i,
+                Some(2),
+                Some(2),
+                Some(600.0),
+                &format!("light_{i:03}.fits"),
+            ));
+        }
+
+        let err =
+            check_registration_consistency(&members).expect_err("mixed binning must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1x1"),
+            "message must mention the 1x1 group: {msg}"
+        );
+        assert!(
+            msg.contains("2x2"),
+            "message must mention the 2x2 group: {msg}"
+        );
+        assert!(
+            msg.contains("42 frames"),
+            "message must mention the majority group size: {msg}"
+        );
+        assert!(
+            msg.contains("8 frames"),
+            "message must mention the minority group size: {msg}"
+        );
+        assert!(
+            msg.contains("uniform binning"),
+            "message must name the failing check: {msg}"
+        );
+    }
+
+    /// Required test #2 (plan T2): a uniform set (same binning, same focal
+    /// length) must pass.
+    #[test]
+    fn uniform_set_passes() {
+        let members: Vec<MemberInfo> = (0..10)
+            .map(|i| fake_member(i, Some(1), Some(1), Some(600.0), &format!("f{i}.fits")))
+            .collect();
+        assert!(check_registration_consistency(&members).is_ok());
+    }
+
+    /// Required test #3 (plan T2): NULL binning must pass under the 1×1
+    /// assumption (not be treated as its own mismatching group).
+    #[test]
+    fn null_binning_passes_with_1x1_assumption() {
+        let members = vec![
+            fake_member(1, None, None, Some(600.0), "a.fits"),
+            fake_member(2, Some(1), Some(1), Some(600.0), "b.fits"),
+        ];
+        assert!(check_registration_consistency(&members).is_ok());
+    }
+
+    /// Focal length within the ±1% tolerance must pass (600.0 vs 605.0 is
+    /// ~0.83% — inside the 1% band).
+    #[test]
+    fn focallen_within_one_percent_tolerance_passes() {
+        let members = vec![
+            fake_member(1, Some(1), Some(1), Some(600.0), "a.fits"),
+            fake_member(2, Some(1), Some(1), Some(605.0), "b.fits"),
+        ];
+        assert!(check_registration_consistency(&members).is_ok());
+    }
+
+    /// Focal length beyond the ±1% tolerance must bail with the same message
+    /// shape as the binning gate, naming "focal length".
+    #[test]
+    fn focallen_beyond_one_percent_bails() {
+        let members = vec![
+            fake_member(1, Some(1), Some(1), Some(600.0), "a.fits"),
+            fake_member(2, Some(1), Some(1), Some(750.0), "b.fits"),
+        ];
+        let err = check_registration_consistency(&members)
+            .expect_err("mismatched focal length must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("focal length"), "{msg}");
+        assert!(msg.contains("uniform focal length"), "{msg}");
+    }
+
+    /// NULL focal length must be excluded from the check entirely — it must
+    /// not itself form a mismatching singleton group.
+    #[test]
+    fn null_focallen_excluded_from_check() {
+        let members = vec![
+            fake_member(1, Some(1), Some(1), None, "a.fits"),
+            fake_member(2, Some(1), Some(1), Some(600.0), "b.fits"),
+            fake_member(3, Some(1), Some(1), Some(600.5), "c.fits"),
+        ];
+        assert!(
+            check_registration_consistency(&members).is_ok(),
+            "a NULL focal length must not itself trigger a mismatch"
+        );
     }
 
     #[test]
