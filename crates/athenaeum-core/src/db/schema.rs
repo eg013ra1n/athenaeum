@@ -1462,6 +1462,26 @@ mod identity_schema_tests {
         let ts2: String = conn.query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| r.get(0)).unwrap();
         assert_eq!(ts2, "2020-01-01T00:00:00.000Z");
     }
+
+    #[test]
+    fn insert_with_explicit_identity_is_preserved() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO tags (name, color, uuid, updated_at)
+             VALUES ('sync-import', NULL, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', '2021-06-01T12:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        let (u, ts): (String, String) = conn
+            .query_row(
+                "SELECT uuid, updated_at FROM tags WHERE name='sync-import'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(u, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "identity trigger must not clobber explicit uuid");
+        assert_eq!(ts, "2021-06-01T12:00:00.000Z", "identity trigger must preserve explicit updated_at");
+    }
 }
 
 #[cfg(test)]
