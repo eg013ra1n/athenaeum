@@ -4,7 +4,7 @@
 
 pub mod banded;
 pub mod combine;
-// engine (Task 8) lands in a later task.
+pub mod engine;
 
 #[derive(Debug)]
 pub enum IntegrationError {
