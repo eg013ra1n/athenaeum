@@ -34,6 +34,7 @@ impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self { ApiError::Internal(format!("{e:#}")) }
 }
 
+/// Transport-specific path sandboxing policy for api handlers.
 #[derive(Debug, Clone)]
 pub enum PathPolicy {
     AllowAll,
@@ -41,6 +42,12 @@ pub enum PathPolicy {
 }
 
 impl PathPolicy {
+    /// Lexical, component-wise containment check (`Path::starts_with`).
+    ///
+    /// SECURITY PRECONDITION: the caller must canonicalize BOTH `p` and the
+    /// allowed roots (resolving `..` and symlinks) before calling — this
+    /// method does no resolution, so `/root/../../etc` would lexically pass.
+    /// See athenaeum-web `add_scan_root` for the canonicalization pattern.
     pub fn check(&self, p: &Path) -> Result<(), ApiError> {
         match self {
             PathPolicy::AllowAll => Ok(()),
@@ -63,6 +70,10 @@ impl PathPolicy {
 /// `crates/athenaeum-tauri/src/commands/scan_roots.rs:94`). `ServiceContext.db`
 /// is a `OnceLock<Database>`, so `.get()` returns `Option<&Database>` — same
 /// shape here, just mapped onto `ApiError::Internal` instead of a bare string.
+///
+/// NOTE for async handlers: do not hold the returned `&Database` (or its
+/// `.conn()` guard) across an `.await` point — acquire, use, drop before
+/// awaiting, or the future may fail Send/borrow checks.
 pub fn db(ctx: &crate::services::ServiceContext) -> Result<&crate::db::Database, ApiError> {
     ctx.db.get().ok_or_else(|| ApiError::Internal("Database not initialized".into()))
 }
