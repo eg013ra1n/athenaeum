@@ -79,6 +79,33 @@ pub fn get_scan_roots(ctx: &ServiceContext) -> Result<Vec<ScanRoot>, ApiError> {
     Ok(crate::db::get_scan_roots(&conn)?)
 }
 
+/// Validate a scan-root `kind` value: `"normal"` | `"calibration_library"`,
+/// anything else is `ApiError::Invalid`. Runs at the top of `add_scan_root`,
+/// before any path/DB work.
+pub(crate) fn validate_scan_root_kind(kind: &str) -> Result<(), ApiError> {
+    if kind != "normal" && kind != "calibration_library" {
+        return Err(ApiError::Invalid(format!("unknown scan root kind: {kind}")));
+    }
+    Ok(())
+}
+
+/// Single-library-root enforcement: adding a `"calibration_library"` root
+/// when one already exists is `ApiError::Conflict`. A no-op for `"normal"`.
+/// Runs in `add_scan_root` after overlap validation, before the DB write.
+pub(crate) fn check_library_root_uniqueness(
+    conn: &rusqlite::Connection,
+    kind: &str,
+) -> Result<(), ApiError> {
+    if kind == "calibration_library"
+        && crate::db::count_scan_roots_of_kind(conn, "calibration_library")? > 0
+    {
+        return Err(ApiError::Conflict(
+            "A Calibration Library root already exists — only one is allowed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates the path exists, canonicalizes it (resolving `..`/symlinks),
 /// sandboxes it against `policy` (desktop: `AllowAll`; web: `AllowedRoots`
 /// built from the caller's *canonicalized* allowed roots — see
@@ -96,6 +123,10 @@ pub fn get_scan_roots(ctx: &ServiceContext) -> Result<Vec<ScanRoot>, ApiError> {
 /// existing scan root is rejected too. That's intentional: the library is
 /// itself just a normal scanned root, so it must live outside every other
 /// registered root rather than inside one.
+///
+/// The kind checks themselves live in `validate_scan_root_kind` /
+/// `check_library_root_uniqueness` (extracted so they're testable at the
+/// `Connection` level without a full `ServiceContext`).
 pub fn add_scan_root(
     ctx: &ServiceContext,
     path: String,
@@ -103,9 +134,7 @@ pub fn add_scan_root(
     kind: Option<String>,
 ) -> Result<ScanRoot, ApiError> {
     let kind = kind.unwrap_or_else(|| "normal".to_string());
-    if kind != "normal" && kind != "calibration_library" {
-        return Err(ApiError::Invalid(format!("unknown scan root kind: {kind}")));
-    }
+    validate_scan_root_kind(&kind)?;
 
     let db = db(ctx)?;
     let conn = db.conn();
@@ -167,13 +196,7 @@ pub fn add_scan_root(
     // 5. Single-library-root enforcement — checked after overlap validation
     //    so a doomed-anyway overlapping add doesn't get misreported as a
     //    library-uniqueness conflict.
-    if kind == "calibration_library"
-        && crate::db::count_scan_roots_of_kind(&conn, "calibration_library")? > 0
-    {
-        return Err(ApiError::Conflict(
-            "A Calibration Library root already exists — only one is allowed".to_string(),
-        ));
-    }
+    check_library_root_uniqueness(&conn, &kind)?;
 
     // 6. Store the canonicalized path
     let path_str = new_path.to_string_lossy().to_string();
@@ -763,4 +786,58 @@ pub fn get_missing_files_counts(ctx: &ServiceContext) -> Result<HashMap<i64, i64
     }
 
     Ok(counts)
+}
+
+/// Task 9 fix round — api-level coverage for `add_scan_root`'s kind checks.
+/// The two checks run at different points in `add_scan_root`'s flow (Invalid
+/// before any path/DB work; Conflict after overlap validation), so they were
+/// extracted as two conn-level functions and are pinned here directly —
+/// same pattern as Task 5's fix round (test the extracted real logic, not a
+/// local re-implementation).
+#[cfg(test)]
+mod kind_check_tests {
+    use super::*;
+
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn bogus_kind_is_invalid() {
+        assert!(matches!(
+            validate_scan_root_kind("master_stash"),
+            Err(ApiError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn known_kinds_pass_validation() {
+        assert!(validate_scan_root_kind("normal").is_ok());
+        assert!(validate_scan_root_kind("calibration_library").is_ok());
+    }
+
+    #[test]
+    fn second_library_root_is_conflict() {
+        let conn = test_conn();
+        crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
+        assert!(matches!(
+            check_library_root_uniqueness(&conn, "calibration_library"),
+            Err(ApiError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn normal_kind_is_ok_despite_existing_library_root() {
+        let conn = test_conn();
+        crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
+        assert!(check_library_root_uniqueness(&conn, "normal").is_ok());
+    }
+
+    #[test]
+    fn first_library_root_is_ok() {
+        let conn = test_conn();
+        assert!(check_library_root_uniqueness(&conn, "calibration_library").is_ok());
+    }
 }
