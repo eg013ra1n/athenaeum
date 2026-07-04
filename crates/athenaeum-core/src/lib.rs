@@ -7,6 +7,7 @@ pub mod fingerprint;
 pub mod calibration;
 pub mod db;
 pub mod fits_parser;
+pub mod fits_writer;
 pub mod clustering;
 pub mod settings;
 pub mod sessions;
