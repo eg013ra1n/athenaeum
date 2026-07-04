@@ -852,6 +852,7 @@ pub struct FrameMetadataEdits {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[ts(optional)]
     pub imagetyp: Option<Option<String>>,
+    #[ts(optional = nullable)]
     pub is_master: Option<bool>,
     /// Target name (FITS OBJECT). Common cleanup case for misnamed targets.
     #[serde(default, deserialize_with = "deserialize_double_option")]

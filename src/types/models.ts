@@ -260,7 +260,7 @@ dateObs?: string | null,
  * For master variants, pair with `is_master = Some(true)` and a base
  * type (e.g. `imagetyp = "DARK"`, `is_master = true` → master dark).
  */
-imagetyp?: string | null, isMaster: boolean | null, 
+imagetyp?: string | null, isMaster?: boolean | null, 
 /**
  * Target name (FITS OBJECT). Common cleanup case for misnamed targets.
  */
