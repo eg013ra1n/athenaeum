@@ -21,7 +21,13 @@ fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Re
     if channels != 1 && channels != 3 {
         return Err(FitsWriteError::BadChannels(channels));
     }
-    let expected = width * height * channels;
+    if width == 0 || height == 0 {
+        return Err(FitsWriteError::BadDimensions(format!("{width}x{height}")));
+    }
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(channels))
+        .ok_or_else(|| FitsWriteError::BadDimensions(format!("{width}x{height}x{channels} overflows")))?;
     if data_len != expected {
         return Err(FitsWriteError::DataSizeMismatch { expected, got: data_len });
     }
@@ -42,12 +48,20 @@ pub fn write_fits_f32(
 ) -> Result<(), FitsWriteError> {
     validate(width, height, channels, data.len())?;
 
-    let tmp = path.with_extension("fits.tmp");
+    let tmp = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        path.with_extension(format!("fits.tmp.{}.{}", std::process::id(), seq))
+    };
     let write_result = (|| -> Result<(), FitsWriteError> {
         let f = std::fs::File::create(&tmp)?;
         let mut w = std::io::BufWriter::new(f);
         write_fits_f32_to(&mut w, width, height, channels, data, cards)?;
         w.flush()?;
+        // Power-loss durability: data must be on disk before the rename
+        // makes the file visible under its final name.
+        w.get_ref().sync_all()?;
         Ok(())
     })();
 
@@ -113,4 +127,64 @@ pub fn write_fits_f32_to<W: Write>(
     let dpad = (BLOCK_SIZE - data_bytes % BLOCK_SIZE) % BLOCK_SIZE;
     w.write_all(&vec![0u8; dpad])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fits_writer::card::{Card, CardValue};
+
+    #[test]
+    fn zero_dimensions_rejected() {
+        let r = write_fits_f32_to(std::io::sink(), 0, 10, 1, &[], &[]);
+        assert!(matches!(r, Err(FitsWriteError::BadDimensions(_))), "{r:?}");
+        let r = write_fits_f32_to(std::io::sink(), 10, 0, 1, &[], &[]);
+        assert!(matches!(r, Err(FitsWriteError::BadDimensions(_))), "{r:?}");
+    }
+
+    #[test]
+    fn dimension_overflow_rejected_not_panicking() {
+        // usize::MAX * 3 would overflow the expected-length multiply
+        let r = write_fits_f32_to(std::io::sink(), usize::MAX, 2, 1, &[], &[]);
+        assert!(matches!(r, Err(FitsWriteError::BadDimensions(_))), "{r:?}");
+    }
+
+    #[test]
+    fn concurrent_same_target_writers_do_not_collide_on_tmp() {
+        // Two threads writing the same path: both must succeed (last rename
+        // wins) — with a fixed ".fits.tmp" suffix one thread unlinks the
+        // other's tmp and rename fails with NotFound.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.fits");
+        let mk = |v: f32| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let data = vec![v; 64 * 64];
+                for _ in 0..20 {
+                    write_fits_f32(&path, 64, 64, 1, &data, &[]).unwrap();
+                }
+            })
+        };
+        let (a, b) = (mk(1.0), mk(2.0));
+        a.join().unwrap();
+        b.join().unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn bypassed_card_constructor_still_validated_at_format_time() {
+        // Card fields are pub — a caller can build an invalid keyword directly.
+        let evil = Card { keyword: "BAD KEY!".into(), value: Some(CardValue::Integer(1)), comment: None, text: None };
+        let r = crate::fits_writer::card::format_card(&evil);
+        assert!(r.is_err(), "format_card must re-validate keywords: {r:?}");
+        let reserved = Card { keyword: "NAXIS1".into(), value: Some(CardValue::Integer(1)), comment: None, text: None };
+        assert!(crate::fits_writer::card::format_card(&reserved).is_err());
+    }
+
+    #[test]
+    fn text_card_with_no_value_is_error_not_panic() {
+        // value: None + text: None used to hit `expect("value card")`.
+        let broken = Card { keyword: "GAIN".into(), value: None, comment: None, text: None };
+        assert!(crate::fits_writer::card::format_card(&broken).is_err());
+    }
 }

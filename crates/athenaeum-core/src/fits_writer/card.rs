@@ -15,6 +15,7 @@ pub enum FitsWriteError {
     NonFiniteReal(String),
     DataSizeMismatch { expected: usize, got: usize },
     BadChannels(usize),
+    BadDimensions(String),
     Io(std::io::Error),
 }
 
@@ -29,6 +30,7 @@ impl std::fmt::Display for FitsWriteError {
             Self::NonFiniteReal(k) => write!(f, "non-finite real value for {k}"),
             Self::DataSizeMismatch { expected, got } => write!(f, "data length {got}, expected {expected}"),
             Self::BadChannels(c) => write!(f, "channels must be 1 or 3, got {c}"),
+            Self::BadDimensions(m) => write!(f, "bad image dimensions: {m}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
     }
@@ -140,6 +142,19 @@ fn pack(line: &str) -> [u8; 80] {
 }
 
 pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
+    // Re-validate: Card fields are pub, so constructor-only validation is
+    // bypassable. Structural keywords are writer-owned and arrive here via
+    // Card::structural — allow exactly those through the reserved check.
+    const STRUCTURAL_OK: [&str; 4] = ["SIMPLE", "BITPIX", "NAXIS", "END"];
+    let is_structural = STRUCTURAL_OK.contains(&card.keyword.as_str())
+        || (card.keyword.starts_with("NAXIS")
+            && card.keyword.len() <= 8
+            && card.keyword[5..].bytes().all(|b| b.is_ascii_digit())
+            && card.comment.is_some()); // structural cards from writer have comment set
+    let is_text_kind = card.keyword == "COMMENT" || card.keyword == "HISTORY";
+    if !is_structural && !is_text_kind {
+        validate_keyword(&card.keyword)?;
+    }
     // COMMENT / HISTORY text cards
     if let Some(text) = &card.text {
         if !is_printable_ascii(text) {
@@ -148,7 +163,11 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
         return Ok(vec![pack(&format!("{:<8}{}", card.keyword, text))]);
     }
 
-    let value = card.value.as_ref().expect("value card");
+    let Some(value) = card.value.as_ref() else {
+        return Err(FitsWriteError::InvalidKeyword(format!(
+            "{}: card has neither value nor text", card.keyword
+        )));
+    };
     let kw8 = format!("{:<8}", card.keyword);
 
     // Strings get their own path (CONTINUE support)
