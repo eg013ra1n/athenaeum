@@ -1,27 +1,27 @@
 // File route handlers — mirrors athenaeum-tauri/src/commands/files.rs
+//
+// Thin wrappers only: extraction + policy construction + handler call + error
+// mapping. Business logic lives in athenaeum_core::api::files (Task 10
+// conversion — see .superpowers/sdd/p1-task-10-report.md).
+//
+// NOTE: two Tauri commands whose bodies live in commands/files.rs have their
+// web counterpart in OTHER route modules, not here: `get_duplicates` is in
+// `routes/duplicates.rs`, and `get_frame_preview` is in `routes/images.rs`.
+// Both are out of this file's declared scope; their `api::files` handlers
+// exist (used by the Tauri side) but these two web routes still carry their
+// own (pre-conversion, unmodified) inline logic. See the Task 10 report.
 
-use athenaeum_core::db;
-use athenaeum_core::file_op::{db as fdb, executor as fexec, models::FileOpStatus, planner as fplan};
+use athenaeum_core::api::files as api;
+use athenaeum_core::api::PathPolicy;
 use athenaeum_core::models::{FileWithFrame, FrameMetadataEdits, MissingMetadataRow};
-use athenaeum_core::services::operation_queue::{OperationKind, QueuedJob};
-use athenaeum_core::services::ArchiveHandle;
 use axum::{extract::State, http::StatusCode, Json};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use crate::events::SseProgressEmitter;
+use crate::routes::api_err;
 use crate::WebAppState;
 
-// ── Response DTO ─────────────────────────────────────────────────────────────
-
-/// Mirrors the DirectoryContents DTO from the Tauri files commands.
-#[derive(serde::Serialize)]
-pub struct DirectoryContents {
-    pub subdirectories: Vec<String>,
-    pub files: Vec<FileWithFrame>,
-}
+pub use athenaeum_core::api::files::{BrowseDirectoriesResponse, CatalogSearchHit, DirectoryContents};
 
 // ── Request structs ──────────────────────────────────────────────────────────
 
@@ -79,19 +79,7 @@ pub async fn get_files(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesArgs>,
 ) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let files = db::get_files(&conn, args.limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(
-        files
-            .into_iter()
-            .map(|(file, frame)| FileWithFrame { file, frame })
-            .collect(),
-    ))
+    api::get_files(&state.ctx, args.limit).map(Json).map_err(api_err)
 }
 
 /// POST /api/get_files_by_directory
@@ -103,19 +91,9 @@ pub async fn get_files_by_directory(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesByDirectoryArgs>,
 ) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let files = db::get_files_by_directory(&conn, &args.directory_path, args.limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(
-        files
-            .into_iter()
-            .map(|(file, frame)| FileWithFrame { file, frame })
-            .collect(),
-    ))
+    api::get_files_by_directory(&state.ctx, args.directory_path, args.limit)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/get_directory_contents
@@ -127,48 +105,7 @@ pub async fn get_directory_contents(
     State(state): State<WebAppState>,
     Json(args): Json<GetDirectoryContentsArgs>,
 ) -> Result<Json<DirectoryContents>, (StatusCode, String)> {
-    let path = Path::new(&args.path);
-
-    // Use read_dir directly so we get a real ErrorKind. exists() returns
-    // false on permission flicker / transient FS state too, which would
-    // wrongly mislabel an existing directory as missing.
-    let mut subdirectories = Vec::new();
-    let entries = match fs::read_dir(path) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err((StatusCode::NOT_FOUND, "Directory does not exist".to_string()));
-        }
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let metadata = entry
-            .metadata()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if metadata.is_dir() {
-            subdirectories.push(entry.path().to_string_lossy().to_string());
-        }
-    }
-    subdirectories.sort();
-
-    // Look up files from the database for this directory
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let db_files = db::get_files_by_directory(&conn, &args.path, None)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let files: Vec<FileWithFrame> = db_files
-        .into_iter()
-        .map(|(file, frame)| FileWithFrame { file, frame })
-        .collect();
-
-    Ok(Json(DirectoryContents {
-        subdirectories,
-        files,
-    }))
+    api::get_directory_contents(&state.ctx, args.path).map(Json).map_err(api_err)
 }
 
 /// POST /api/get_camera_directories
@@ -180,14 +117,7 @@ pub async fn get_camera_directories(
     State(state): State<WebAppState>,
     Json(args): Json<GetCameraDirectoriesArgs>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let dirs = db::get_camera_directories(&conn, &args.instrume)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(dirs))
+    api::get_camera_directories(&state.ctx, args.instrume).map(Json).map_err(api_err)
 }
 
 /// POST /api/get_camera_directory_contents
@@ -200,53 +130,9 @@ pub async fn get_camera_directory_contents(
     State(state): State<WebAppState>,
     Json(args): Json<GetCameraDirectoryContentsArgs>,
 ) -> Result<Json<DirectoryContents>, (StatusCode, String)> {
-    let path = Path::new(&args.directory_path);
-
-    let mut subdirectories = Vec::new();
-    let entries = match fs::read_dir(path) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err((StatusCode::NOT_FOUND, "Directory does not exist".to_string()));
-        }
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let metadata = entry
-            .metadata()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if metadata.is_dir() {
-            let subdir_str = entry.path().to_string_lossy().to_string();
-            let is_relevant = args
-                .camera_directories
-                .iter()
-                .any(|cam_dir| cam_dir.starts_with(&subdir_str));
-            if is_relevant {
-                subdirectories.push(subdir_str);
-            }
-        }
-    }
-    subdirectories.sort();
-
-    // Look up files for this camera from the database
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let db_files =
-        db::get_files_by_directory_for_camera(&conn, &args.directory_path, &args.instrume, None)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let files: Vec<FileWithFrame> = db_files
-        .into_iter()
-        .map(|(file, frame)| FileWithFrame { file, frame })
-        .collect();
-
-    Ok(Json(DirectoryContents {
-        subdirectories,
-        files,
-    }))
+    api::get_camera_directory_contents(&state.ctx, args.directory_path, args.instrume, args.camera_directories)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/get_frames_with_missing_metadata
@@ -260,16 +146,9 @@ pub async fn get_frames_with_missing_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<GetFramesWithMissingMetadataArgs>,
 ) -> Result<Json<Vec<MissingMetadataRow>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    // Error logged once by the `#[tracing::instrument(err(Debug))]` attribute
-    // on this handler — see the T7 sweep report.
-    let rows = db::get_frames_with_missing_metadata(&conn, &args.category)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(rows))
+    api::get_frames_with_missing_metadata(&state.ctx, args.category)
+        .map(Json)
+        .map_err(api_err)
 }
 
 // ── Bulk frame metadata edits ────────────────────────────────────────────────
@@ -296,12 +175,9 @@ pub async fn get_frame_metadata_originals(
     State(state): State<WebAppState>,
     Json(args): Json<CountFrameMetadataRelationsArgs>,
 ) -> Result<Json<Vec<athenaeum_core::fits_parser::stored_header::FrameOriginalSnapshot>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-    let snaps = athenaeum_core::db::get_frame_metadata_originals(&conn, &args.frame_ids)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(snaps))
+    api::get_frame_metadata_originals(&state.ctx, args.frame_ids)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/get_frame_memberships
@@ -312,12 +188,7 @@ pub async fn get_frame_memberships(
     State(state): State<WebAppState>,
     Json(args): Json<CountFrameMetadataRelationsArgs>,
 ) -> Result<Json<athenaeum_core::db::FrameMembershipsSummary>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-    let summary = athenaeum_core::db::get_frame_memberships_summary(&conn, &args.frame_ids)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(summary))
+    api::get_frame_memberships(&state.ctx, args.frame_ids).map(Json).map_err(api_err)
 }
 
 /// POST /api/count_frame_metadata_relations
@@ -330,12 +201,9 @@ pub async fn count_frame_metadata_relations(
     State(state): State<WebAppState>,
     Json(args): Json<CountFrameMetadataRelationsArgs>,
 ) -> Result<Json<athenaeum_core::db::FrameMetadataRelations>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-    let rel = athenaeum_core::db::count_frame_metadata_relations(&conn, &args.frame_ids)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(rel))
+    api::count_frame_metadata_relations(&state.ctx, args.frame_ids)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/bulk_update_frame_metadata
@@ -348,14 +216,9 @@ pub async fn bulk_update_frame_metadata(
     State(state): State<WebAppState>,
     Json(args): Json<BulkUpdateFrameMetadataArgs>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let count = db::bulk_update_frame_metadata(&conn, &args.frame_ids, &args.edits)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(count))
+    api::bulk_update_frame_metadata(&state.ctx, args.frame_ids, args.edits)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/get_distinct_instrumes
@@ -366,14 +229,7 @@ pub async fn bulk_update_frame_metadata(
 pub async fn get_distinct_instrumes(
     State(state): State<WebAppState>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let cameras = db::get_distinct_instrumes(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(cameras))
+    api::get_distinct_instrumes(&state.ctx).map(Json).map_err(api_err)
 }
 
 /// POST /api/get_files_with_frames_by_ids
@@ -386,22 +242,9 @@ pub async fn get_files_with_frames_by_ids(
     State(state): State<WebAppState>,
     Json(args): Json<GetFilesWithFramesByIdsArgs>,
 ) -> Result<Json<Vec<FileWithFrame>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    let conn = db.conn();
-
-    let frames = db::get_frames_with_files_by_ids(&conn, &args.frame_ids)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(
-        frames
-            .into_iter()
-            .map(|(_file_id, file, frame)| FileWithFrame {
-                file,
-                frame: Some(frame),
-            })
-            .collect(),
-    ))
+    api::get_files_with_frames_by_ids(&state.ctx, args.frame_ids)
+        .map(Json)
+        .map_err(api_err)
 }
 
 // ── Browse directories (web-only) ──────────────────────────────────────────
@@ -414,19 +257,6 @@ pub struct BrowseDirectoriesArgs {
     pub scope: Option<String>,
 }
 
-#[derive(serde::Serialize)]
-pub struct BrowseDirectoryEntry {
-    pub name: String,
-    pub path: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct BrowseDirectoriesResponse {
-    pub current: String,
-    pub parent: Option<String>,
-    pub directories: Vec<BrowseDirectoryEntry>,
-}
-
 /// POST /api/browse_directories
 ///
 /// Returns subdirectories of the given path. If path is empty or omitted,
@@ -434,119 +264,31 @@ pub struct BrowseDirectoriesResponse {
 ///
 /// `scope = "scan"` (default): validates against `state.allowed_paths`.
 /// `scope = "export"`: validates against the configured export directory.
+///
+/// Scope-to-root-paths resolution stays here (not in `api::files`) because
+/// it depends on `WebAppState::allowed_paths` / `WebAppState::export_dir`,
+/// web-only fields with no `ServiceContext` equivalent.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn browse_directories(
     State(state): State<WebAppState>,
     Json(args): Json<BrowseDirectoriesArgs>,
 ) -> Result<Json<BrowseDirectoriesResponse>, (StatusCode, String)> {
-    let path_str = args.path.unwrap_or_default();
     let scope = args.scope.as_deref().unwrap_or("scan");
 
-    // Resolve the set of root paths for this scope
     let root_paths: Vec<PathBuf> = match scope {
-        "export" => {
-            match state.export_dir {
-                Some(ref dir) => vec![dir.clone()],
-                None => return Err((StatusCode::BAD_REQUEST, "No export directory configured".to_string())),
-            }
-        }
+        "export" => match state.export_dir {
+            Some(ref dir) => vec![dir.clone()],
+            None => return Err((StatusCode::BAD_REQUEST, "No export directory configured".to_string())),
+        },
         _ => state.allowed_paths.clone(),
     };
 
-    // If no path provided, return root paths as top-level entries
-    if path_str.is_empty() || path_str == "/" {
-        let directories: Vec<BrowseDirectoryEntry> = root_paths
-            .iter()
-            .filter(|p| p.is_dir())
-            .map(|p| {
-                let s = p.to_string_lossy().to_string();
-                BrowseDirectoryEntry {
-                    name: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| s.clone()),
-                    path: s,
-                }
-            })
-            .collect();
-
-        return Ok(Json(BrowseDirectoriesResponse {
-            current: "/".to_string(),
-            parent: None,
-            directories,
-        }));
-    }
-
-    let target = PathBuf::from(&path_str);
-    let canonical = target
-        .canonicalize()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)))?;
-
-    // Security: validate path is within scope roots
-    let is_allowed = root_paths.iter().any(|allowed| {
-        allowed.canonicalize().map(|a| canonical.starts_with(&a)).unwrap_or(false)
-    });
-
-    if !is_allowed {
-        return Err((StatusCode::FORBIDDEN, "Path is outside allowed directories".to_string()));
-    }
-
-    if !canonical.is_dir() {
-        return Err((StatusCode::BAD_REQUEST, "Path is not a directory".to_string()));
-    }
-
-    let mut directories = Vec::new();
-    let entries = fs::read_dir(&canonical)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read directory: {}", e)))?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let metadata = entry.metadata().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if metadata.is_dir() {
-            let entry_path = entry.path();
-            directories.push(BrowseDirectoryEntry {
-                name: entry.file_name().to_string_lossy().to_string(),
-                path: entry_path.to_string_lossy().to_string(),
-            });
-        }
-    }
-    directories.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let parent = canonical.parent().and_then(|p| {
-        let parent_str = p.to_string_lossy().to_string();
-        // Only return parent if it's still within a scope root
-        let parent_within = root_paths.iter().any(|allowed| {
-            allowed.canonicalize().map(|a| p.starts_with(&a)).unwrap_or(false)
-        });
-        if parent_within {
-            Some(parent_str)
-        } else {
-            // Parent is at or above a root — go back to root listing
-            None
-        }
-    });
-
-    Ok(Json(BrowseDirectoriesResponse {
-        current: canonical.to_string_lossy().to_string(),
-        parent,
-        directories,
-    }))
+    api::browse_directories(args.path, &root_paths).map(Json).map_err(api_err)
 }
 
 // ============================================================================
 // Dual-pane file browser routes (Phase 1: Move + catalog search)
 // ============================================================================
-
-#[derive(serde::Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct CatalogSearchHit {
-    pub file_id: i64,
-    pub path: String,
-    pub filename: String,
-    pub object: Option<String>,
-    pub filter: Option<String>,
-    pub imagetyp: Option<String>,
-    pub instrume: Option<String>,
-    pub telescop: Option<String>,
-    pub date_obs: Option<String>,
-}
 
 #[derive(serde::Deserialize)]
 pub struct EnqueueMoveArgs {
@@ -580,15 +322,23 @@ pub struct RenamePathArgs {
     pub new_name: String,
 }
 
-/// `pub(crate)` (not private) so other route modules — e.g.
-/// `scan_roots::relink_scan_root` — can reuse the same allowed-paths check
-/// instead of copy-pasting another inline variant.
-pub(crate) fn path_inside_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    allowed.iter().any(|root| {
-        let rc = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        canonical.starts_with(&rc)
-    })
+/// Builds the path-sandboxing policy from `allowed_paths`, mirroring
+/// `routes/scan_roots.rs`'s `allowed_roots_policy` helper (kept as a small
+/// per-module copy rather than a shared export — see that module's version
+/// for the canonicalization rationale). Canonicalizes each allowed root here;
+/// the candidate path is canonicalized inside the shared `api::files`
+/// handler — see `PathPolicy::check`'s doc comment for why both sides must
+/// be canonical before the lexical `starts_with` check. Empty `allowed_paths`
+/// yields `AllowAll`, matching the pre-conversion `if !allowed.is_empty()`
+/// short-circuit used by every path-validated command in this file.
+fn allowed_roots_policy(allowed_paths: &[PathBuf]) -> PathPolicy {
+    if allowed_paths.is_empty() {
+        PathPolicy::AllowAll
+    } else {
+        PathPolicy::AllowedRoots(
+            allowed_paths.iter().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone())).collect(),
+        )
+    }
 }
 
 /// POST /api/enqueue_move_operation
@@ -597,283 +347,42 @@ pub async fn enqueue_move_operation(
     State(state): State<WebAppState>,
     Json(args): Json<EnqueueMoveArgs>,
 ) -> Result<Json<i64>, (StatusCode, String)> {
-    // Path validation against ATHENAEUM_ALLOWED_PATHS.
-    let allowed = &state.allowed_paths;
-    if !allowed.is_empty() {
-        let dest = PathBuf::from(&args.dest_dir);
-        if !path_inside_allowed(&dest, allowed) {
-            return Err((StatusCode::FORBIDDEN, format!("dest '{}' not allowed", args.dest_dir)));
-        }
-        for s in &args.sources {
-            let sp = PathBuf::from(s);
-            if !path_inside_allowed(&sp, allowed) {
-                return Err((StatusCode::FORBIDDEN, format!("source '{}' not allowed", s)));
-            }
-        }
-    }
-
-    let ctx = state.ctx.clone();
-    let db = ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
-    let conn = db.conn();
-
-    let source_paths: Vec<PathBuf> = args.sources.iter().map(PathBuf::from).collect();
-    let plan = fplan::build_move_plan(&conn, source_paths, PathBuf::from(&args.dest_dir))
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{:#}", e)))?;
-    let op_id = plan.operation_id;
-
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
-    }
-
-    let event_tx = state.event_tx.clone();
-    let ctx_for_worker = ctx.clone();
-    let cancel_for_worker = cancel_flag.clone();
-    ctx.operation_queue.enqueue(QueuedJob {
-        kind: OperationKind::FileOpMove,
-        operation_id: op_id,
-        run: Box::new(move || {
-            let emitter = SseProgressEmitter::new(event_tx);
-            let db = ctx_for_worker.db.get().expect("db");
-            let conn = db.conn();
-
-            // Heal any abandoned cross-volume moves left over from a prior
-            // crash before running this one. Cheap no-op when there's
-            // nothing to heal; errors here must not fail this user's move.
-            match athenaeum_core::file_op::reconcile::reconcile_abandoned_commit_moves(&conn) {
-                Ok(summary) if summary.healed > 0 || !summary.skipped.is_empty() => {
-                    athenaeum_core::events::emit_event(
-                        &emitter,
-                        "file-op-reconciled",
-                        &athenaeum_core::file_op::models::FileOpReconciled {
-                            healed: summary.healed,
-                            skipped: summary.skipped.len(),
-                            operation_ids: summary.touched_operation_ids(),
-                        },
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(operation_id = op_id, error = ?e, "file_op reconcile (pre-enqueue) failed"),
-            }
-
-            let result = fexec::run_operation(&conn, op_id, &cancel_for_worker, &emitter);
-            match result {
-                Ok(()) => {}
-                Err(e) => {
-                    if fexec::was_cancelled(&e) {
-                        let _ = fdb::update_operation_status(
-                            &conn, op_id, FileOpStatus::Cancelled, None,
-                        );
-                    } else {
-                        tracing::error!(operation_id = op_id, error = ?e, "file_op failed");
-                        let msg = format!("{:#}", e);
-                        let _ = fdb::update_operation_status(
-                            &conn, op_id, FileOpStatus::Failed, Some(&msg),
-                        );
-                    }
-                }
-            }
-        }),
-    });
-
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    let emitter = SseProgressEmitter::new(state.event_tx.clone());
+    let op_id = api::enqueue_move_operation(&state.ctx, args.sources, args.dest_dir, &policy, emitter)
+        .map_err(api_err)?;
     Ok(Json(op_id))
 }
 
+/// POST /api/search_catalog
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn search_catalog(
     State(state): State<WebAppState>,
     Json(args): Json<SearchCatalogArgs>,
 ) -> Result<Json<Vec<CatalogSearchHit>>, (StatusCode, String)> {
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
-    let conn = db.conn();
-
-    let trimmed = args.query.trim();
-    if trimmed.is_empty() {
-        return Ok(Json(Vec::new()));
-    }
-    let limit = args.limit.unwrap_or(200).min(500) as i64;
-    let pattern = format!("%{}%", trimmed.to_lowercase());
-
-    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<CatalogSearchHit> {
-        Ok(CatalogSearchHit {
-            file_id: row.get(0)?,
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            object: row.get(3)?,
-            filter: row.get(4)?,
-            imagetyp: row.get(5)?,
-            instrume: row.get(6)?,
-            telescop: row.get(7)?,
-            date_obs: row.get(8)?,
-        })
-    };
-
-    // Two SQL branches so `instrume_filter` either pins fr.instrume or is
-    // skipped entirely. The Vec is bound to a local before the block returns
-    // so `stmt` outlives the iterator (rustc E0597).
-    let rows: Vec<CatalogSearchHit> = if let Some(cam) = args.instrume_filter.as_deref() {
-        let mut stmt = conn
-            .prepare(
-                "SELECT f.id, f.path, f.filename,
-                        fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
-                 FROM files f
-                 LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE fr.instrume = ?3
-                   AND (LOWER(f.filename) LIKE ?1
-                     OR LOWER(f.path) LIKE ?1
-                     OR LOWER(IFNULL(fr.object,''))    LIKE ?1
-                     OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
-                     OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
-                     OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
-                     OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1)
-                 ORDER BY fr.date_obs DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let hits: Vec<CatalogSearchHit> = stmt
-            .query_map(rusqlite::params![pattern, limit, cam], map_row)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        hits
-    } else {
-        let mut stmt = conn
-            .prepare(
-                "SELECT f.id, f.path, f.filename,
-                        fr.object, fr.filter, fr.imagetyp, fr.instrume, fr.telescop, fr.date_obs
-                 FROM files f
-                 LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE LOWER(f.filename) LIKE ?1
-                    OR LOWER(f.path) LIKE ?1
-                    OR LOWER(IFNULL(fr.object,''))    LIKE ?1
-                    OR LOWER(IFNULL(fr.filter,''))    LIKE ?1
-                    OR LOWER(IFNULL(fr.imagetyp,''))  LIKE ?1
-                    OR LOWER(IFNULL(fr.instrume,''))  LIKE ?1
-                    OR LOWER(IFNULL(fr.telescop,''))  LIKE ?1
-                 ORDER BY fr.date_obs DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let hits: Vec<CatalogSearchHit> = stmt
-            .query_map(rusqlite::params![pattern, limit], map_row)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        hits
-    };
-
-    Ok(Json(rows))
+    api::search_catalog(&state.ctx, args.query, args.limit, args.instrume_filter)
+        .map(Json)
+        .map_err(api_err)
 }
 
+/// POST /api/mkdir_in_scan_root
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn mkdir_in_scan_root(
     State(state): State<WebAppState>,
     Json(args): Json<MkdirArgs>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let allowed = &state.allowed_paths;
-    let target = PathBuf::from(&args.path);
-    if !allowed.is_empty() && !path_inside_allowed(&target, allowed) {
-        return Err((StatusCode::FORBIDDEN, format!("'{}' not allowed", args.path)));
-    }
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
-    let conn = db.conn();
-    let scan_roots = athenaeum_core::db::get_scan_roots(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let inside_root = scan_roots.iter().filter(|r| r.enabled).any(|r| {
-        let root = PathBuf::from(&r.path);
-        let rc = fs::canonicalize(&root).unwrap_or(root);
-        let tc = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-        tc.starts_with(&rc)
-    });
-    if !inside_root {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("'{}' is not inside any scan root", args.path),
-        ));
-    }
-    fs::create_dir_all(&target).map_err(|e| {
-        tracing::error!(path = %args.path, error = %e, "mkdir failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    api::mkdir_in_scan_root(&state.ctx, args.path, &policy).map_err(api_err)?;
     Ok(StatusCode::OK)
 }
 
+/// POST /api/rename_path
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn rename_path(
     State(state): State<WebAppState>,
     Json(args): Json<RenamePathArgs>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if args.new_name.contains('/') || args.new_name.contains('\\') || args.new_name.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "new name must be a single path component".into(),
-        ));
-    }
-    let allowed = &state.allowed_paths;
-    let old = PathBuf::from(&args.old_path);
-    if !allowed.is_empty() && !path_inside_allowed(&old, allowed) {
-        return Err((StatusCode::FORBIDDEN, format!("'{}' not allowed", args.old_path)));
-    }
-    let db = state.ctx.db.get()
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
-    let conn = db.conn();
-
-    let parent = old
-        .parent()
-        .ok_or((StatusCode::BAD_REQUEST, "source has no parent dir".into()))?
-        .to_path_buf();
-    let new = parent.join(&args.new_name);
-    if new.exists() {
-        return Err((StatusCode::CONFLICT, format!("target already exists: {}", new.display())));
-    }
-    let scan_roots = athenaeum_core::db::get_scan_roots(&conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let inside_root = scan_roots.iter().filter(|r| r.enabled).any(|r| {
-        let root = PathBuf::from(&r.path);
-        let rc = fs::canonicalize(&root).unwrap_or(root);
-        let oc = fs::canonicalize(&old).unwrap_or_else(|_| old.clone());
-        oc.starts_with(&rc)
-    });
-    if !inside_root {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("'{}' is not inside any scan root", args.old_path),
-        ));
-    }
-    let is_dir = old.is_dir();
-    fs::rename(&old, &new).map_err(|e| {
-        tracing::error!(src = %old.display(), dest = %new.display(), error = %e, "rename failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    let old_str = old.to_string_lossy().to_string();
-    let new_str = new.to_string_lossy().to_string();
-    if is_dir {
-        let prefix_old = format!("{}/", old_str);
-        let prefix_new = format!("{}/", new_str);
-        match athenaeum_core::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new) {
-            Ok(updated) => {
-                tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
-            }
-            Err(error) => {
-                tracing::error!(src = %old_str, path = %new_str, %error, "rename hot-sync failed for directory prefix update");
-            }
-        }
-    } else {
-        match conn.execute(
-            "UPDATE files SET path = ?1, filename = ?2 WHERE path = ?3",
-            rusqlite::params![&new_str, &args.new_name, &old_str],
-        ) {
-            Ok(updated) => {
-                tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows");
-            }
-            Err(error) => {
-                tracing::error!(src = %old_str, path = %new_str, %error, "rename hot-sync failed");
-            }
-        }
-    }
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    api::rename_path(&state.ctx, args.old_path, args.new_name, &policy).map_err(api_err)?;
     Ok(StatusCode::OK)
 }
