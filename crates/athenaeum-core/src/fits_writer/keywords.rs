@@ -39,22 +39,27 @@ impl Bayer {
 }
 
 pub fn ra_to_sexagesimal(ra_deg: f64) -> String {
-    let total_h = ra_deg.rem_euclid(360.0) / 15.0;
-    let h = total_h.floor();
-    let total_m = (total_h - h) * 60.0;
-    let m = total_m.floor();
-    let s = (total_m - m) * 60.0;
-    format!("{:02} {:02} {:06.3}", h as u32, m as u32, s)
+    // Round to integer milliseconds of time first, then decompose — seconds
+    // can never round to 60 and the 24h boundary wraps to 00 00 00.000.
+    const DAY_MS: u64 = 24 * 3_600_000;
+    let total_ms = ((ra_deg.rem_euclid(360.0) / 15.0) * 3_600_000.0).round() as u64 % DAY_MS;
+    let h = total_ms / 3_600_000;
+    let m = (total_ms % 3_600_000) / 60_000;
+    let s = (total_ms % 60_000) as f64 / 1000.0;
+    format!("{h:02} {m:02} {s:06.3}")
 }
 
 pub fn dec_to_sexagesimal(dec_deg: f64) -> String {
-    let sign = if dec_deg < 0.0 { '-' } else { '+' };
-    let a = dec_deg.abs();
-    let d = a.floor();
-    let total_m = (a - d) * 60.0;
-    let m = total_m.floor();
-    let s = (total_m - m) * 60.0;
-    format!("{sign}{:02} {:02} {:05.2}", d as u32, m as u32, s)
+    // Round to integer centiarcseconds first — carry propagates through
+    // minutes/degrees naturally (+90 00 00.00 at the pole is valid).
+    // Note: -0.0 formats as "-00 00 00.00" under is_sign_negative(); this is
+    // accepted as consistent with signed-zero semantics elsewhere in Rust.
+    let sign = if dec_deg.is_sign_negative() { '-' } else { '+' };
+    let total_cs = (dec_deg.abs() * 360_000.0).round() as u64;
+    let d = total_cs / 360_000;
+    let m = (total_cs % 360_000) / 6_000;
+    let s = (total_cs % 6_000) as f64 / 100.0;
+    format!("{sign}{d:02} {m:02} {s:05.2}")
 }
 
 pub struct HeaderBuilder {
@@ -136,7 +141,10 @@ impl HeaderBuilder {
         self.push("ATH_TMAX", CardValue::Real(max_c), "[degC] max member CCD-TEMP"); self
     }
 
-    pub fn custom(mut self, c: Card) -> Self { self.cards.push(c); self }
+    pub fn custom(mut self, c: Card) -> Self {
+        if self.err.is_some() { return self; }
+        self.cards.push(c); self
+    }
 
     pub fn build(self) -> Result<Vec<Card>, FitsWriteError> {
         match self.err { Some(e) => Err(e), None => Ok(self.cards) }
@@ -195,6 +203,15 @@ mod tests {
     #[test]
     fn negative_dec_sign() {
         assert!(dec_to_sexagesimal(-16.716).starts_with('-'));
+    }
+
+    #[test]
+    fn sexagesimal_wrap_boundaries() {
+        assert_eq!(ra_to_sexagesimal(359.9999999999), "00 00 00.000");
+        assert_eq!(ra_to_sexagesimal(360.0), "00 00 00.000");
+        assert_eq!(dec_to_sexagesimal(89.999999999), "+90 00 00.00");
+        assert_eq!(ra_to_sexagesimal(0.0), "00 00 00.000");
+        assert_eq!(dec_to_sexagesimal(0.0), "+00 00 00.00");
     }
 
     #[test]
