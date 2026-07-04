@@ -158,6 +158,8 @@ pub struct ScanRoot {
     pub last_scan: Option<DateTime<Utc>>,
     pub last_scan_errors: Option<Vec<String>>,
     pub monitor_enabled: bool,
+    /// 'normal' | 'calibration_library'
+    pub kind: String,
 }
 
 /// A single file inside a duplicate group, enriched with the metadata the
@@ -366,6 +368,8 @@ pub struct CalibrationSetDetail {
     pub focallen: Option<f64>,   // Focal length in mm
     pub uuid: Option<String>,
     pub updated_at: Option<String>,
+    /// Set when this raw set has been superseded by a built master.
+    pub superseded_by_set_id: Option<i64>,
 }
 
 /// Result of dark library creation

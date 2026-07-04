@@ -258,7 +258,7 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
 /// Get all scan roots
 pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
     let mut stmt = conn.prepare(
-        "SELECT id, path, enabled, find_duplicates, unique_camera, last_scan, last_scan_errors, monitor_enabled FROM scan_roots ORDER BY path"
+        "SELECT id, path, enabled, find_duplicates, unique_camera, last_scan, last_scan_errors, monitor_enabled, kind FROM scan_roots ORDER BY path"
     )?;
 
     let roots = stmt.query_map([], |row| {
@@ -280,6 +280,7 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
             last_scan,
             last_scan_errors,
             monitor_enabled: row.get::<_, i32>(7)? == 1,
+            kind: row.get(8)?,
         })
     })?;
 

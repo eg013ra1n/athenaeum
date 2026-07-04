@@ -166,6 +166,7 @@ pub fn add_scan_root(
         last_scan: None,
         last_scan_errors: None,
         monitor_enabled: false,
+        kind: "normal".into(),
     })
 }
 

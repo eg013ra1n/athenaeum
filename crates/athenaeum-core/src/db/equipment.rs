@@ -66,7 +66,8 @@ pub fn get_camera_dark_library(
             fi.format,
             cs.focallen,
             cs.uuid,
-            cs.updated_at
+            cs.updated_at,
+            cs.superseded_by_set_id
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -121,6 +122,7 @@ pub fn get_camera_dark_library(
                 focallen: row.get(21)?,
                 uuid: row.get(22)?,
                 updated_at: row.get(23)?,
+                superseded_by_set_id: row.get(24)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -196,7 +198,8 @@ pub fn get_camera_master_dark_library(
             fi.format,
             cs.focallen,
             cs.uuid,
-            cs.updated_at
+            cs.updated_at,
+            cs.superseded_by_set_id
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -251,6 +254,7 @@ pub fn get_camera_master_dark_library(
                 focallen: row.get(21)?,
                 uuid: row.get(22)?,
                 updated_at: row.get(23)?,
+                superseded_by_set_id: row.get(24)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -299,7 +303,8 @@ pub fn get_camera_master_flat_library(
             fi.format,
             cs.focallen,
             cs.uuid,
-            cs.updated_at
+            cs.updated_at,
+            cs.superseded_by_set_id
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -354,6 +359,7 @@ pub fn get_camera_master_flat_library(
                 focallen: row.get(21)?,
                 uuid: row.get(22)?,
                 updated_at: row.get(23)?,
+                superseded_by_set_id: row.get(24)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

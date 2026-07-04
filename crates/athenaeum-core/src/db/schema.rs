@@ -387,11 +387,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Archive operations - one row per archive operation (ZIP archive feature)
+    // Archive operations - one row per archive operation (ZIP archive feature).
+    // frames_set_id is nullable + calibration_set_id exists from birth on fresh
+    // DBs so the one-time rebuild in the migrations section below is skipped
+    // (it's gated on the absence of calibration_set_id).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS archive_operations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            frames_set_id INTEGER NOT NULL,
+            frames_set_id INTEGER,
+            calibration_set_id INTEGER,
             archive_root_path TEXT NOT NULL,
             flats_disposition TEXT,
             darks_disposition TEXT,
@@ -402,7 +406,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             started_at TEXT NOT NULL,
             finished_at TEXT,
             error_message TEXT,
-            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE,
+            FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE CASCADE
         )",
         [],
     )?;
@@ -634,6 +639,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_archive_ops_frames_set ON archive_operations(frames_set_id)",
         [],
     )?;
+    // idx_archive_ops_calibration_set is NOT created here: on a pre-existing
+    // (legacy) database this early section runs before the Phase 2 rebuild
+    // below has added the calibration_set_id column, and CREATE INDEX on a
+    // nonexistent column fails immediately, hard-crashing init_db() on every
+    // upgrade. It's created once, unconditionally, right after the rebuild
+    // section instead — by then the column is guaranteed to exist on both
+    // fresh and migrated databases.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_op_files_op ON file_operation_files(operation_id)",
         [],
@@ -1281,6 +1293,105 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // ---- Phase 2: calibration library ----
+
+    // scan_roots.kind: 'normal' | 'calibration_library'
+    if !column_exists(conn, "scan_roots", "kind")? {
+        conn.execute(
+            "ALTER TABLE scan_roots ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal'",
+            [],
+        )?;
+    }
+
+    // calibration_set.superseded_by_set_id: set once a master replaced this raw set
+    if !column_exists(conn, "calibration_set", "superseded_by_set_id")? {
+        conn.execute(
+            "ALTER TABLE calibration_set ADD COLUMN superseded_by_set_id INTEGER REFERENCES calibration_set(id)",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calibration_set_superseded ON calibration_set(superseded_by_set_id)",
+        [],
+    )?;
+
+    // master_provenance: row EXISTS = master built by Athenaeum
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS master_provenance (
+            master_set_id      INTEGER PRIMARY KEY REFERENCES calibration_set(id) ON DELETE CASCADE,
+            source_set_id      INTEGER REFERENCES calibration_set(id),
+            recipe_json        TEXT NOT NULL,
+            member_frame_uuids TEXT NOT NULL,
+            member_hash        TEXT NOT NULL,
+            created_at         TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    // archive_operations: frames_set_id nullable + calibration_set_id.
+    // SQLite can't drop NOT NULL via ALTER — rebuild once, detected by the
+    // absence of the calibration_set_id column.
+    if !column_exists(conn, "archive_operations", "calibration_set_id")? {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE archive_operations_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                frames_set_id INTEGER,
+                calibration_set_id INTEGER,
+                archive_root_path TEXT NOT NULL,
+                flats_disposition TEXT,
+                darks_disposition TEXT,
+                bias_disposition TEXT,
+                darkflats_disposition TEXT,
+                compression TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error_message TEXT,
+                FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE,
+                FOREIGN KEY (calibration_set_id) REFERENCES calibration_set(id) ON DELETE CASCADE
+             );
+             INSERT INTO archive_operations_new
+                (id, frames_set_id, archive_root_path, flats_disposition, darks_disposition,
+                 bias_disposition, darkflats_disposition, compression, status, started_at,
+                 finished_at, error_message)
+                SELECT id, frames_set_id, archive_root_path, flats_disposition, darks_disposition,
+                       bias_disposition, darkflats_disposition, compression, status, started_at,
+                       finished_at, error_message
+                FROM archive_operations;
+             -- Carry forward the AUTOINCREMENT high-water mark. The INSERT above
+             -- only seeds archive_operations_new's sqlite_sequence row from the
+             -- ids it actually copied — if a higher id was ever deleted from the
+             -- old table (e.g. via the frames_set(id) ON DELETE CASCADE FK, which
+             -- fires in normal use), that history lives only in the OLD table's
+             -- sqlite_sequence row and would otherwise be lost, letting a future
+             -- insert reuse a retired id. Raise the new row to match, or seed it
+             -- from scratch if the table was emptied entirely before rebuild.
+             UPDATE sqlite_sequence
+                SET seq = COALESCE((SELECT seq FROM sqlite_sequence WHERE name='archive_operations'), 0)
+              WHERE name='archive_operations_new'
+                AND seq < COALESCE((SELECT seq FROM sqlite_sequence WHERE name='archive_operations'), 0);
+             INSERT INTO sqlite_sequence (name, seq)
+                SELECT 'archive_operations_new', seq FROM sqlite_sequence
+                 WHERE name='archive_operations'
+                   AND NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='archive_operations_new');
+             DROP TABLE archive_operations;
+             ALTER TABLE archive_operations_new RENAME TO archive_operations;
+             COMMIT;",
+        )?;
+        // Recreate the two indexes the rebuild dropped
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_ops_status ON archive_operations(status)", [])?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_ops_frames_set ON archive_operations(frames_set_id)", [])?;
+    }
+    // calibration_set_id is guaranteed to exist by this point on both a
+    // freshly-created database (present in the CREATE TABLE from birth) and a
+    // migrated legacy one (just added by the rebuild above) — safe to create
+    // unconditionally here, unlike in the early index section further up.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archive_ops_calibration_set ON archive_operations(calibration_set_id)",
+        [],
+    )?;
+
     // ---- Collaboration Stage 1: catalog identity (Phase 1) ----
     conn.execute(
         "CREATE TABLE IF NOT EXISTS catalog_meta (
@@ -1771,5 +1882,186 @@ mod archive_schema_tests {
                AND source_id NOT IN (SELECT id FROM calibration_set)",
             [], |r| r.get(0)).unwrap();
         assert_eq!(orphans_after, 0, "init_db should have swept orphans away");
+    }
+
+    #[test]
+    fn scan_roots_kind_column_and_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/a')", []).unwrap();
+        let kind: String = conn
+            .query_row("SELECT kind FROM scan_roots WHERE path='/data/a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "normal");
+    }
+
+    #[test]
+    fn scan_roots_kind_migrates_existing_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a legacy scan_roots without kind
+        conn.execute(
+            "CREATE TABLE scan_roots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                find_duplicates INTEGER NOT NULL DEFAULT 1,
+                unique_camera INTEGER NOT NULL DEFAULT 0,
+                last_scan TEXT
+            )",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/old')", []).unwrap();
+        init_db(&conn).unwrap();
+        let kind: String = conn
+            .query_row("SELECT kind FROM scan_roots WHERE path='/old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kind, "normal");
+    }
+
+    #[test]
+    fn calibration_set_superseded_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')", [],
+        ).unwrap();
+        let v: Option<i64> = conn
+            .query_row("SELECT superseded_by_set_id FROM calibration_set WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn master_provenance_table_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library) VALUES ('MasterDark','2026-01-01',1)", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (1, NULL, '{}', '[]', 'abc', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM master_provenance", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn archive_operations_accepts_calibration_subject() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // calibration_set_id carries a real FK to calibration_set(id); this
+        // connection enforces foreign keys (rusqlite's bundled sqlite3 defaults
+        // `PRAGMA foreign_keys = ON`), so row 42 must exist before it can be
+        // referenced. Mirrors the frames_set fixture insert in the sibling
+        // rebuild test below.
+        insert_dummy_calibration_set(&conn, 42, "MasterDark");
+        // NULL frames_set_id + calibration_set_id must be insertable
+        conn.execute(
+            "INSERT INTO archive_operations
+             (frames_set_id, calibration_set_id, archive_root_path, compression, status, started_at)
+             VALUES (NULL, 42, '/arch', 'store', 'planning', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        let (fs, cs): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT frames_set_id, calibration_set_id FROM archive_operations WHERE id=1",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!((fs, cs), (None, Some(42)));
+    }
+
+    #[test]
+    fn archive_operations_rebuild_preserves_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (name) VALUES ('M31')", [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO archive_operations
+             (frames_set_id, archive_root_path, compression, status, started_at)
+             VALUES (1, '/arch', 'store', 'completed', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        // Re-running init_db (idempotent) must keep the row intact
+        init_db(&conn).unwrap();
+        let fs: Option<i64> = conn
+            .query_row("SELECT frames_set_id FROM archive_operations WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fs, Some(1));
+    }
+
+    // Not one of the brief's 6 given tests — added during self-review. The
+    // legacy-shape rebuild's `INSERT ... SELECT` only seeds the new table's
+    // AUTOINCREMENT counter from ids that still exist; it silently drops any
+    // higher id the OLD table's sqlite_sequence remembered from a row that
+    // was deleted before the rebuild ran (which happens in real use whenever
+    // a `frames_set` row is deleted — archive_operations.frames_set_id
+    // cascades). Without the sqlite_sequence carry-forward fix, a
+    // post-rebuild insert would silently reuse a retired id.
+    #[test]
+    fn archive_operations_rebuild_preserves_autoincrement_high_water_mark() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Manually build the pre-migration (legacy) shape so init_db must take
+        // the rebuild path rather than skip it (the guard column is absent).
+        conn.execute(
+            "CREATE TABLE frames_set (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                is_custom INTEGER NOT NULL DEFAULT 0,
+                date_obs_start TEXT,
+                date_obs_end TEXT,
+                objctra TEXT,
+                objctdec TEXT,
+                total_exp_time REAL
+            )",
+            [],
+        ).unwrap();
+        conn.execute(
+            "CREATE TABLE archive_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                frames_set_id INTEGER NOT NULL,
+                archive_root_path TEXT NOT NULL,
+                flats_disposition TEXT,
+                darks_disposition TEXT,
+                bias_disposition TEXT,
+                darkflats_disposition TEXT,
+                compression TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error_message TEXT,
+                FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+            )",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute(
+            "INSERT INTO archive_operations (id, frames_set_id, archive_root_path, compression, status, started_at)
+             VALUES (1, 1, '/arch1', 'store', 'completed', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO archive_operations (id, frames_set_id, archive_root_path, compression, status, started_at)
+             VALUES (5, 1, '/arch2', 'store', 'completed', '2026-01-02T00:00:00Z')",
+            [],
+        ).unwrap();
+        // Retire id 5 (e.g. its frames_set was deleted elsewhere, cascading
+        // here) — leaves a gap between the surviving max id (1) and the
+        // historical high-water mark (5).
+        conn.execute("DELETE FROM archive_operations WHERE id = 5", []).unwrap();
+
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO archive_operations (frames_set_id, archive_root_path, compression, status, started_at)
+             VALUES (1, '/arch3', 'store', 'planning', '2026-01-03T00:00:00Z')",
+            [],
+        ).unwrap();
+        let new_id: i64 = conn
+            .query_row("SELECT id FROM archive_operations WHERE archive_root_path='/arch3'", [], |r| r.get(0))
+            .unwrap();
+        assert!(new_id > 5, "post-rebuild insert must not reuse a retired id (got {new_id})");
     }
 }

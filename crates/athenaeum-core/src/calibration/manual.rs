@@ -228,7 +228,7 @@ pub fn load_set_with_score(
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
                 cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library,
                 f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format,
-                cs.uuid, cs.updated_at
+                cs.uuid, cs.updated_at, cs.superseded_by_set_id
          FROM calibration_set cs
          LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
          LEFT JOIN frames f ON f.id = csf.frame_id
@@ -275,6 +275,7 @@ pub fn load_set_with_score(
                 focallen: row.get(14)?,
                 uuid: row.get(22)?,
                 updated_at: row.get(23)?,
+                superseded_by_set_id: row.get(24)?,
             })
         })
         .ok();

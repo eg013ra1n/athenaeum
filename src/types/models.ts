@@ -19,7 +19,11 @@ bayerpat: string | null,
  */
 rotation: number | null, uuid: string | null, updated_at: string | null, };
 
-export type ScanRoot = { id: number | null, path: string, enabled: boolean, find_duplicates: boolean, unique_camera: boolean, last_scan: string | null, last_scan_errors: Array<string> | null, monitor_enabled: boolean, };
+export type ScanRoot = { id: number | null, path: string, enabled: boolean, find_duplicates: boolean, unique_camera: boolean, last_scan: string | null, last_scan_errors: Array<string> | null, monitor_enabled: boolean, 
+/**
+ * 'normal' | 'calibration_library'
+ */
+kind: string, };
 
 export type DuplicateFile = { fileId: number, path: string, filename: string, modifiedAt: string, 
 /**
@@ -74,7 +78,11 @@ export type FrameSetDetail = { frames_set: FramesSet, nights: Array<ImagingNight
 
 export type CameraStats = { instrume: string, frame_count: number, total_hours: number, first_use: string | null, last_use: string | null, };
 
-export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, bayerpat: string | null, swcreate: string | null, xpixsz: number | null, format: string | null, focallen: number | null, uuid: string | null, updated_at: string | null, };
+export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, bayerpat: string | null, swcreate: string | null, xpixsz: number | null, format: string | null, focallen: number | null, uuid: string | null, updated_at: string | null, 
+/**
+ * Set when this raw set has been superseded by a built master.
+ */
+superseded_by_set_id: number | null, };
 
 export type DarkLibraryResult = { sets_created: number, frames_grouped: number, frames_excluded: number, };
 
