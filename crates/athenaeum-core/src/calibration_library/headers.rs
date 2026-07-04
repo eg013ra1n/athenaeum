@@ -1,8 +1,10 @@
 //! Consolidate a master's FITS header from its source calibration set +
 //! member frames (spec §3 step 3, arch-doc B3).
 
+use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::{Bayer, FrameKind, HeaderBuilder};
 use crate::fits_writer::{Card, FitsWriteError};
+use crate::models::FileFormat;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -83,17 +85,33 @@ pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<Maste
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
     )?;
     // frames has no bayerpat column — BAYERPAT lives in the stored raw
-    // header. Fetch it from fits_header of the first member file:
-    let bayerpat: Option<String> = conn.query_row(
-        "SELECT fh.header FROM calibration_set_frames csf
-         JOIN frames f ON f.id = csf.frame_id
-         JOIN fits_header fh ON fh.file_id = f.file_id
-         WHERE csf.set_id = ?1 LIMIT 1",
-        [source_set_id],
-        |r| r.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|h| extract_header_string(&h, "BAYERPAT"));
+    // header. Fetch it from fits_header of the first member file, joining
+    // files for the format: fits_header.header stores three shapes (FITS
+    // 80-col cards, raw XISF XML, ASIAIR-style "KEY = value" dumps), and
+    // parse_stored_header_keys is the format-aware accessor that handles
+    // all of them (same call pattern as db::operations'
+    // clear_override_for_unchanged_frames / get_frame_metadata_originals).
+    let bayerpat: Option<String> = conn
+        .query_row(
+            "SELECT fi.format, fh.header FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             JOIN files fi ON fi.id = f.file_id
+             JOIN fits_header fh ON fh.file_id = f.file_id
+             WHERE csf.set_id = ?1 LIMIT 1",
+            [source_set_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+        .and_then(|(format_str, header)| {
+            let format = match format_str.as_str() {
+                "FITS" => FileFormat::FITS,
+                "XISF" => FileFormat::XISF,
+                _ => return None, // Unknown format — skip rather than guess.
+            };
+            // Returned map is keyed UPPERCASE (see parse_stored_header_keys docs).
+            parse_stored_header_keys(format, &header).remove("BAYERPAT")
+        })
+        .filter(|s| !s.trim().is_empty());
 
     let midpoint = match (parse_dt(min_dt.as_deref()), parse_dt(max_dt.as_deref())) {
         (Some(a), Some(b)) => Some(a + (b - a) / 2),
@@ -120,20 +138,6 @@ pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<Maste
 
 fn parse_dt(s: Option<&str>) -> Option<DateTime<Utc>> {
     s.and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc))
-}
-
-/// Pull `KEY     = 'VALUE'` out of a stored raw-header text blob.
-fn extract_header_string(header: &str, key: &str) -> Option<String> {
-    for line in header.lines() {
-        if line.trim_start().to_ascii_uppercase().starts_with(key) {
-            if let Some(q1) = line.find('\'') {
-                if let Some(q2) = line[q1 + 1..].find('\'') {
-                    return Some(line[q1 + 1..q1 + 1 + q2].trim().to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 pub fn build_master_cards(
@@ -282,5 +286,87 @@ mod tests {
         let f = cards.iter().find(|c| c.keyword == "ATH_FNRM").expect("ATH_FNRM");
         assert!(matches!(f.value, Some(crate::fits_writer::CardValue::Real(v)) if (v - 1234.5).abs() < 1e-9));
         assert!(cards.iter().any(|c| c.keyword == "FILTER"));
+    }
+
+    /// Attach the same stored-header blob (and format) to every member file
+    /// of the set — the BAYERPAT lookup uses `LIMIT 1` with no ORDER BY, so
+    /// seeding all members keeps the test deterministic regardless of which
+    /// row SQLite returns first.
+    fn seed_stored_headers(conn: &Connection, set_id: i64, format: &str, header: &str) {
+        conn.execute(
+            &format!(
+                "UPDATE files SET format = ?1 WHERE id IN (
+                     SELECT f.file_id FROM calibration_set_frames csf
+                     JOIN frames f ON f.id = csf.frame_id WHERE csf.set_id = {set_id})"
+            ),
+            [format],
+        ).unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO fits_header (file_id, header)
+                 SELECT f.file_id, ?1 FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id WHERE csf.set_id = {set_id}"
+            ),
+            [header],
+        ).unwrap();
+    }
+
+    fn assert_bayer_consolidated(conn: &Connection, set_id: i64) {
+        let inputs = load_header_inputs(conn, set_id).unwrap();
+        assert_eq!(inputs.bayerpat.as_deref(), Some("RGGB"));
+        let cards = build_master_cards(&inputs, "0.2.5", "winsorized(3.0,3.0) n=2", "cafe", None).unwrap();
+        let find = |k: &str| cards.iter().find(|c| c.keyword == k);
+        let bp = find("BAYERPAT").expect("BAYERPAT card");
+        assert!(
+            matches!(&bp.value, Some(crate::fits_writer::CardValue::Str(v)) if v == "RGGB"),
+            "{:?}", bp.value
+        );
+        assert!(find("XBAYROFF").is_some(), "XBAYROFF card");
+        assert!(find("YBAYROFF").is_some(), "YBAYROFF card");
+    }
+
+    #[test]
+    fn bayerpat_from_fits_card_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        // FITS shape: 80-col cards joined by \n (FitsHeader::to_header_text).
+        let header = format!(
+            "{:<80}\n{:<80}\n{:<80}",
+            "BAYERPAT= 'RGGB    '           / Bayer color pattern",
+            "EXPTIME =                300.0 / Exposure time in seconds",
+            "END",
+        );
+        seed_stored_headers(&conn, set_id, "FITS", &header);
+        assert_bayer_consolidated(&conn, set_id);
+    }
+
+    #[test]
+    fn bayerpat_from_asiair_plain_dump() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        // ASIAIR shape: plain "KEY = value" dump. parse_fits_card_text must
+        // yield NOTHING for this blob so the dispatcher falls through to
+        // parse_keyword_eq_text — that requires every keyword be 8 chars
+        // (a <=7-char key like CREATOR puts "= " at cols 8-10 and would
+        // accidentally parse as a FITS card, masking the fallback path).
+        let dump = "Captured FITS Keywords:\n=======================\n\nBAYERPAT = RGGB\nXBINNING = 1\n";
+        seed_stored_headers(&conn, set_id, "FITS", dump);
+        assert_bayer_consolidated(&conn, set_id);
+    }
+
+    #[test]
+    fn bayerpat_from_xisf_xml_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        // XISF shape: raw XML blob with FITSKeyword elements (adapted from
+        // stored_header.rs's parses_xisf_xml_fitskeyword_elements fixture).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xisf>
+  <FITSKeyword name="BAYERPAT" value="'RGGB'" comment="Bayer color pattern" />
+  <FITSKeyword name="EXPTIME" value="300.0" />
+  <FITSKeyword name="XBINNING" value="1" />
+</xisf>"#;
+        seed_stored_headers(&conn, set_id, "XISF", xml);
+        assert_bayer_consolidated(&conn, set_id);
     }
 }
