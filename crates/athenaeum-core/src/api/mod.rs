@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub mod scan_roots;
 pub mod files;
-// pub mod calibration;     // Task 11
+pub mod calibration;
 // pub mod analysis;        // Task 12
 
 #[derive(Debug)]
