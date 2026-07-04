@@ -79,8 +79,13 @@ impl Card {
         self
     }
 
-    fn text_cards(kind: &str, text: &str) -> Vec<Card> {
-        text.as_bytes()
+    fn text_cards(kind: &str, text: &str) -> Result<Vec<Card>, FitsWriteError> {
+        if !is_printable_ascii(text) {
+            return Err(FitsWriteError::NonAsciiString(kind.to_string()));
+        }
+        // Validated ASCII above, so byte-chunking is exact and lossless (one byte per char).
+        Ok(text
+            .as_bytes()
             .chunks(72)
             .map(|c| Card {
                 keyword: kind.to_string(),
@@ -88,13 +93,21 @@ impl Card {
                 comment: None,
                 text: Some(String::from_utf8_lossy(c).into_owned()),
             })
-            .collect()
+            .collect())
     }
-    pub fn comment_cards(text: &str) -> Vec<Card> { Self::text_cards("COMMENT", text) }
-    pub fn history_cards(text: &str) -> Vec<Card> { Self::text_cards("HISTORY", text) }
+    pub fn comment_cards(text: &str) -> Result<Vec<Card>, FitsWriteError> { Self::text_cards("COMMENT", text) }
+    pub fn history_cards(text: &str) -> Result<Vec<Card>, FitsWriteError> { Self::text_cards("HISTORY", text) }
 
-    /// Internal constructor for writer-owned structural cards (bypasses RESERVED).
+    /// Internal constructor for writer-owned structural cards.
+    /// Bypasses only the RESERVED-keyword check (SIMPLE/BITPIX/END/etc. are legitimate here);
+    /// charset/length validation still applies via a debug assertion.
     pub(crate) fn structural(keyword: &str, value: CardValue, comment: &str) -> Card {
+        debug_assert!(
+            !keyword.is_empty()
+                && keyword.len() <= 8
+                && keyword.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-' || b == b'_'),
+            "structural keyword {keyword:?} fails FITS charset/length rules"
+        );
         Card { keyword: keyword.to_string(), value: Some(value), comment: Some(comment.to_string()), text: None }
     }
 }
@@ -110,11 +123,8 @@ fn fmt_real(kw: &str, v: f64) -> Result<String, FitsWriteError> {
     let mut s = format!("{v}");
     if !s.contains('.') { s.push_str(".0"); }
     if s.len() > 20 {
+        // {:.10E} always contains a '.'
         s = format!("{v:.10E}");
-        if !s.contains('.') {
-            let e = s.find('E').unwrap();
-            s.insert_str(e, ".0");
-        }
     }
     if s.len() > 20 {
         return Err(FitsWriteError::ValueTooLong(kw.to_string()));
@@ -123,6 +133,7 @@ fn fmt_real(kw: &str, v: f64) -> Result<String, FitsWriteError> {
 }
 
 fn pack(line: &str) -> [u8; 80] {
+    debug_assert!(line.len() <= CARD_SIZE);
     let mut rec = [b' '; 80];
     rec[..line.len()].copy_from_slice(line.as_bytes());
     rec
@@ -150,6 +161,9 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
             // fixed format: opening quote col 11, closing quote at/after col 20 => pad to >= 8
             let mut line = format!("{kw8}= '{:<9}'", escaped);
             if let Some(c) = &card.comment {
+                if !is_printable_ascii(c) {
+                    return Err(FitsWriteError::NonAsciiString(card.keyword.clone()));
+                }
                 let candidate = format!("{line} / {c}");
                 if candidate.len() > CARD_SIZE {
                     return Err(FitsWriteError::CommentTooLong(card.keyword.clone()));
@@ -177,6 +191,9 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
             };
             if !cont {
                 if let Some(c) = &card.comment {
+                    if !is_printable_ascii(c) {
+                        return Err(FitsWriteError::NonAsciiString(card.keyword.clone()));
+                    }
                     let candidate = format!("{line} / {c}");
                     if candidate.len() > CARD_SIZE {
                         return Err(FitsWriteError::CommentTooLong(card.keyword.clone()));
@@ -290,9 +307,80 @@ mod tests {
 
     #[test]
     fn comment_and_history_cards_split_at_72() {
-        let cards = Card::comment_cards(&"y".repeat(100));
+        let cards = Card::comment_cards(&"y".repeat(100)).unwrap();
         assert_eq!(cards.len(), 2);
         let r = format_card(&cards[0]).unwrap();
         assert!(s(&r, 0).starts_with("COMMENT "));
+    }
+
+    #[test]
+    fn history_cards_split_at_72() {
+        let cards = Card::history_cards(&"z".repeat(100)).unwrap();
+        assert_eq!(cards.len(), 2);
+        let r = format_card(&cards[0]).unwrap();
+        assert!(s(&r, 0).starts_with("HISTORY "));
+    }
+
+    #[test]
+    fn non_ascii_comment_rejected_on_string_card() {
+        let c = Card::new("OBJECT", CardValue::Str("hello".into())).unwrap().with_comment("Ω-neb");
+        assert!(matches!(format_card(&c), Err(FitsWriteError::NonAsciiString(_))));
+    }
+
+    #[test]
+    fn non_ascii_comment_rejected_on_continue_card() {
+        let long = "x".repeat(100);
+        let c = Card::new("ATH_SRC", CardValue::Str(long)).unwrap().with_comment("Ω-neb");
+        assert!(matches!(format_card(&c), Err(FitsWriteError::NonAsciiString(_))));
+    }
+
+    #[test]
+    fn non_ascii_text_cards_rejected() {
+        assert!(matches!(
+            Card::comment_cards(&"Ω".repeat(80)),
+            Err(FitsWriteError::NonAsciiString(_))
+        ));
+    }
+
+    #[test]
+    fn fmt_real_negative_right_justified_with_point() {
+        let c = Card::new("KW", CardValue::Real(-123.456)).unwrap();
+        let line = s(&format_card(&c).unwrap(), 0);
+        assert!(line[10..30].ends_with("-123.456"), "got {line:?}");
+        assert!(line[10..30].contains('.'), "must have decimal point: {line:?}");
+    }
+
+    #[test]
+    fn fmt_real_small_magnitude_no_scientific() {
+        let c = Card::new("KW", CardValue::Real(1e-8)).unwrap();
+        let line = s(&format_card(&c).unwrap(), 0);
+        assert!(line[10..30].ends_with("0.00000001"), "got {line:?}");
+    }
+
+    #[test]
+    fn fmt_real_large_magnitude_uses_scientific_fallback() {
+        let c = Card::new("KW", CardValue::Real(1e20)).unwrap();
+        let line = s(&format_card(&c).unwrap(), 0);
+        let field = line[10..30].trim_start();
+        assert_eq!(field, "1.0000000000E20", "got {line:?}");
+        assert!(field.contains('.'), "fallback must have a decimal point: {line:?}");
+    }
+
+    #[test]
+    fn fmt_real_very_large_negative_fits_within_20_chars() {
+        let c = Card::new("KW", CardValue::Real(-1e300)).unwrap();
+        let r = format_card(&c);
+        assert!(r.is_ok(), "expected -1e300 to fit via scientific fallback: {r:?}");
+        let line = s(&r.unwrap(), 0);
+        let field = line[10..30].trim_start();
+        assert!(field.len() <= 20);
+        assert!(field.contains('.'));
+    }
+
+    #[test]
+    fn fmt_real_zero_has_point() {
+        let c = Card::new("KW", CardValue::Real(0.0)).unwrap();
+        let line = s(&format_card(&c).unwrap(), 0);
+        assert!(line[10..30].ends_with("0.0"), "got {line:?}");
     }
 }
