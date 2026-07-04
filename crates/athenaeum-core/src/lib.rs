@@ -35,3 +35,4 @@ pub mod registration;
 pub mod ts_export;
 pub mod api;
 pub mod integration;
+pub mod calibration_library;
