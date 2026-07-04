@@ -81,3 +81,55 @@ fn rgb_dims_and_size_validation() {
     let bad = write_fits_f32(&dir.path().join("bad.fits"), 2, 2, 1, &[0.0f32; 3], &[]);
     assert!(bad.is_err(), "data size mismatch must fail");
 }
+
+#[test]
+fn rgb_data_roundtrip_through_rustafits_bit_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rgb_rt.fits");
+    let (width, height, channels) = (4, 2, 3);
+    let plane_size = width * height;
+    // plane-major gradient: plane p, pixel i => (p*100 + i) as f32, so each
+    // plane's values are distinct from the others.
+    let data: Vec<f32> = (0..channels)
+        .flat_map(|p| (0..plane_size).map(move |i| (p * 100 + i) as f32))
+        .collect();
+
+    write_fits_f32(
+        &path,
+        width,
+        height,
+        channels,
+        &data,
+        &[Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap()],
+    )
+    .unwrap();
+
+    let (meta, pixels) = astroimage::ImageConverter::read_raw(&path).unwrap();
+    assert_eq!(meta.width, width);
+    assert_eq!(meta.height, height);
+    assert_eq!(meta.channels, channels);
+
+    let read = match pixels {
+        astroimage::PixelData::Float32(v) => v,
+        astroimage::PixelData::Uint16(_) => panic!("expected Float32, got Uint16 (PixelData has no Debug impl)"),
+    };
+    assert_eq!(read.len(), data.len());
+    for (a, b) in read.iter().zip(&data) {
+        assert_eq!(a.to_bits(), b.to_bits(), "bit-exact RGB plane-major round-trip");
+    }
+}
+
+#[test]
+fn failed_write_preserves_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keep.fits");
+    write_fits_f32(&path, 4, 3, 1, &vec![1.0f32; 12], &[]).unwrap();
+    let good_len = std::fs::metadata(&path).unwrap().len();
+    assert!(good_len > 0);
+    // mismatched data length must fail WITHOUT touching the existing file
+    let err = write_fits_f32(&path, 4, 3, 1, &vec![1.0f32; 3], &[]);
+    assert!(err.is_err());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len, "existing file must be preserved");
+    // and no stray temp file left behind
+    assert!(!path.with_extension("fits.tmp").exists());
+}

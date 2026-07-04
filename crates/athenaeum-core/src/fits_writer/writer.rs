@@ -15,6 +15,23 @@ fn push(records: &mut Vec<[u8; CARD_SIZE]>, c: Card) -> Result<(), FitsWriteErro
     Ok(())
 }
 
+/// Validate channel count and data length before any I/O happens. Shared by
+/// `write_fits_f32` and `write_fits_f32_to` so a bad call never touches disk.
+fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Result<(), FitsWriteError> {
+    if channels != 1 && channels != 3 {
+        return Err(FitsWriteError::BadChannels(channels));
+    }
+    let expected = width * height * channels;
+    if data_len != expected {
+        return Err(FitsWriteError::DataSizeMismatch { expected, got: data_len });
+    }
+    Ok(())
+}
+
+/// Write a FITS file at `path`, replacing any existing file only after the write
+/// fully succeeds. Validates first (so a bad call never touches `path`), then
+/// writes to a sibling temp file and atomically renames it into place — a
+/// pre-existing good file at `path` is never truncated by a failed write.
 pub fn write_fits_f32(
     path: &Path,
     width: usize,
@@ -23,10 +40,26 @@ pub fn write_fits_f32(
     data: &[f32],
     cards: &[Card],
 ) -> Result<(), FitsWriteError> {
-    let f = std::fs::File::create(path)?;
-    let mut w = std::io::BufWriter::new(f);
-    write_fits_f32_to(&mut w, width, height, channels, data, cards)?;
-    w.flush()?;
+    validate(width, height, channels, data.len())?;
+
+    let tmp = path.with_extension("fits.tmp");
+    let write_result = (|| -> Result<(), FitsWriteError> {
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(f);
+        write_fits_f32_to(&mut w, width, height, channels, data, cards)?;
+        w.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -38,13 +71,7 @@ pub fn write_fits_f32_to<W: Write>(
     data: &[f32],
     cards: &[Card],
 ) -> Result<(), FitsWriteError> {
-    if channels != 1 && channels != 3 {
-        return Err(FitsWriteError::BadChannels(channels));
-    }
-    let expected = width * height * channels;
-    if data.len() != expected {
-        return Err(FitsWriteError::DataSizeMismatch { expected, got: data.len() });
-    }
+    validate(width, height, channels, data.len())?;
 
     let mut records: Vec<[u8; CARD_SIZE]> = Vec::new();
     push(&mut records, Card::structural("SIMPLE", CardValue::Logical(true), "conforms to FITS standard"))?;
