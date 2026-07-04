@@ -10,6 +10,29 @@
 //! slot on Drop. Cancellation of a QUEUED job flips the same cancel flag the
 //! running job would poll; the waiting `acquire` sees it and returns
 //! `Err(QueueCancelled)` without ever running.
+//!
+//! # Locking
+//!
+//! Lock hierarchy (outermost first): `gate` → `waiting` → `registry`. Every
+//! waking state transition (admit, permit release, queued-cancel removal,
+//! cancel-flag set, max_concurrent change) mutates under `gate` and calls
+//! `cv.notify_all()` before releasing it, so a waiter parked in `acquire`'s
+//! wait loop can never miss a wakeup: the waiter only evaluates its admission
+//! condition and parks while holding `gate`, and `Condvar::wait_timeout`
+//! releases `gate` atomically. The 200 ms `wait_timeout` therefore remains
+//! ONLY as a defensive backstop — the common path (finish → next admit,
+//! cancel, concurrency change) is wake-on-notify.
+//!
+//! Enqueue is the one transition taken WITHOUT `gate`: pushing a ticket onto
+//! the back can never make another waiter admittable, and the enqueuing
+//! thread re-evaluates its own condition after taking `gate`. It drops
+//! `waiting`/`registry` before the wait loop takes `gate`, consistent with
+//! the hierarchy (never acquire `gate` while holding an inner lock).
+//!
+//! The transport notifier is always invoked OUTSIDE all queue locks; a
+//! panicking callback is caught and logged rather than poisoning the queue
+//! (notification also runs inside `ComputePermit::drop`). The callback must
+//! not call back into `set_notifier`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -59,9 +82,13 @@ struct Inner {
     max_concurrent: AtomicUsize,
     next_id: AtomicI64,
     cv: Condvar,
-    /// Guards cv waits; the actual state lives in waiting/registry/counters.
+    /// Guards cv waits AND every waking state transition (see the module
+    /// doc's lock hierarchy); the actual state lives in
+    /// waiting/registry/counters.
     gate: Mutex<()>,
-    notifier: Mutex<Option<Box<dyn Fn(Vec<ComputeQueueEntry>) + Send + Sync>>>,
+    /// `Arc` (not `Box`) so `notify()` can clone the callback under the lock
+    /// and invoke it after releasing it — outside all queue locks.
+    notifier: Mutex<Option<Arc<dyn Fn(Vec<ComputeQueueEntry>) + Send + Sync>>>,
 }
 
 #[derive(Clone)]
@@ -86,8 +113,12 @@ impl ComputeQueue {
     }
 
     pub fn set_max_concurrent(&self, n: usize) {
+        // Mutate + notify under `gate` so a waiter can't check-then-park
+        // between the store and the wakeup (lost-wakeup race).
+        let gate = self.inner.gate.lock().unwrap();
         self.inner.max_concurrent.store(n.max(1), Ordering::SeqCst);
         self.inner.cv.notify_all();
+        drop(gate);
     }
 
     pub fn max_concurrent(&self) -> usize {
@@ -95,13 +126,21 @@ impl ComputeQueue {
     }
 
     pub fn set_notifier(&self, f: Box<dyn Fn(Vec<ComputeQueueEntry>) + Send + Sync>) {
-        *self.inner.notifier.lock().unwrap() = Some(f);
+        *self.inner.notifier.lock().unwrap() = Some(Arc::from(f));
     }
 
+    /// Invoke the transport notifier with a fresh snapshot. Always called
+    /// OUTSIDE all queue locks (the callback is cloned out of the notifier
+    /// lock before invocation). A panicking callback is caught and logged so
+    /// it can never poison the queue's mutexes or abort the process by
+    /// panicking inside `ComputePermit::drop`.
     fn notify(&self) {
         let snap = self.snapshot();
-        if let Some(f) = self.inner.notifier.lock().unwrap().as_ref() {
-            f(snap);
+        let cb = self.inner.notifier.lock().unwrap().clone();
+        if let Some(f) = cb {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(snap))).is_err() {
+                tracing::error!("compute queue notifier callback panicked");
+            }
         }
     }
 
@@ -109,17 +148,31 @@ impl ComputeQueue {
         self.inner.registry.lock().unwrap().iter().map(|s| s.entry.clone()).collect()
     }
 
+    /// Sets the job's cancel flag (queued or running). Returns false if the
+    /// id is unknown. For a QUEUED job the registry removal itself happens in
+    /// the waiting thread's cancellation branch (which notifies again with
+    /// the drained snapshot); the notification here tells the transport that
+    /// a cancellation was requested.
     pub fn cancel(&self, job_id: i64) -> bool {
-        let registry = self.inner.registry.lock().unwrap();
-        match registry.iter().find(|s| s.entry.job_id == job_id) {
-            Some(slot) => {
-                slot.cancel_flag.store(true, Ordering::SeqCst);
-                drop(registry);
-                self.inner.cv.notify_all();
-                true
+        let gate = self.inner.gate.lock().unwrap();
+        let found = {
+            let registry = self.inner.registry.lock().unwrap();
+            match registry.iter().find(|s| s.entry.job_id == job_id) {
+                Some(slot) => {
+                    slot.cancel_flag.store(true, Ordering::SeqCst);
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        if found {
+            self.inner.cv.notify_all();
         }
+        drop(gate);
+        if found {
+            self.notify();
+        }
+        found
     }
 
     pub fn acquire(
@@ -150,14 +203,17 @@ impl ComputeQueue {
         let mut gate = self.inner.gate.lock().unwrap();
         loop {
             if cancel_flag.load(Ordering::SeqCst) {
-                let mut waiting = self.inner.waiting.lock().unwrap();
-                waiting.retain(|&id| id != job_id);
-                let mut registry = self.inner.registry.lock().unwrap();
-                registry.retain(|s| s.entry.job_id != job_id);
-                drop(registry);
-                drop(waiting);
-                drop(gate);
+                // Removing this ticket may make the next waiter front-of-queue,
+                // so mutate + notify under `gate` (hierarchy: gate → waiting
+                // → registry), then run the transport callback lock-free.
+                {
+                    let mut waiting = self.inner.waiting.lock().unwrap();
+                    waiting.retain(|&id| id != job_id);
+                    let mut registry = self.inner.registry.lock().unwrap();
+                    registry.retain(|s| s.entry.job_id != job_id);
+                }
                 self.inner.cv.notify_all();
+                drop(gate);
                 self.notify();
                 return Err(QueueCancelled);
             }
@@ -178,7 +234,8 @@ impl ComputeQueue {
             gate = g;
         }
 
-        // Admit: pop ticket, bump running, flip registry state.
+        // Admit: pop ticket, bump running, flip registry state — all under
+        // `gate`, notify before releasing it (see module-doc lock hierarchy).
         {
             let mut waiting = self.inner.waiting.lock().unwrap();
             waiting.pop_front();
@@ -190,8 +247,8 @@ impl ComputeQueue {
                 slot.entry.state = ComputeJobState::Running;
             }
         }
-        drop(gate);
         self.inner.cv.notify_all();
+        drop(gate);
         self.notify();
 
         Ok((ComputePermit { queue: self.clone(), job_id }, job_id))
@@ -211,12 +268,18 @@ pub struct ComputePermit {
 
 impl Drop for ComputePermit {
     fn drop(&mut self) {
+        // Mutate + notify under `gate` so the finish → next-admit handoff is
+        // wake-on-notify (a notify outside `gate` could land between a
+        // waiter's condition check and its park, and be lost). The transport
+        // callback runs after releasing all queue locks.
+        let gate = self.queue.inner.gate.lock().unwrap();
         self.queue.inner.running_count.fetch_sub(1, Ordering::SeqCst);
         {
             let mut registry = self.queue.inner.registry.lock().unwrap();
             registry.retain(|s| s.entry.job_id != self.job_id);
         }
         self.queue.inner.cv.notify_all();
+        drop(gate);
         self.queue.notify();
     }
 }
@@ -310,11 +373,27 @@ mod tests {
         let q = ComputeQueue::new();
         q.set_max_concurrent(1);
         let calls = Arc::new(AtomicUsize::new(0));
+        let snaps = Arc::new(std::sync::Mutex::new(Vec::<Vec<ComputeQueueEntry>>::new()));
         let c2 = calls.clone();
-        q.set_notifier(Box::new(move |_snap| { c2.fetch_add(1, Ordering::SeqCst); }));
-        let (p, _id) = q.acquire(ComputeJobKind::Analysis, "n", flag()).unwrap();
+        let s2 = snaps.clone();
+        q.set_notifier(Box::new(move |snap| {
+            c2.fetch_add(1, Ordering::SeqCst);
+            s2.lock().unwrap().push(snap);
+        }));
+        let (p, id) = q.acquire(ComputeJobKind::Analysis, "n", flag()).unwrap();
         drop(p);
         // enqueue -> running -> finished: at least 2 notifications
         assert!(calls.load(Ordering::SeqCst) >= 2);
+        let snaps = snaps.lock().unwrap();
+        assert!(
+            snaps.iter().any(|s| s
+                .iter()
+                .any(|e| e.job_id == id && matches!(e.state, ComputeJobState::Running))),
+            "some snapshot must show the job in Running state"
+        );
+        assert!(
+            snaps.last().expect("at least one snapshot").is_empty(),
+            "final snapshot after permit drop must be empty"
+        );
     }
 }
