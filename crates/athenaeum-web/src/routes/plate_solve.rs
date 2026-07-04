@@ -829,6 +829,8 @@ fn load_frame_with_path(
             swcreate: row.get("swcreate")?,
             bayerpat: row.get("bayerpat")?,
             rotation: row.get("rotation")?,
+            uuid: row.get("uuid")?,
+            updated_at: row.get("updated_at")?,
         };
         let path: String = row.get("path")?;
         Ok((frame, path))

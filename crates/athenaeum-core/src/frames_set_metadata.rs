@@ -43,7 +43,8 @@ pub fn calculate_metadata_from_frame_ids(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.rotation
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.rotation,
+                fr.uuid, fr.updated_at
          FROM frames fr
          WHERE fr.id IN ({})",
         placeholders
@@ -99,6 +100,8 @@ pub fn calculate_metadata_from_frame_ids(
                 swcreate: None,
                 bayerpat: None,
                 rotation: row.get(31)?,
+                uuid: row.get(32)?,
+                updated_at: row.get(33)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -294,6 +297,8 @@ mod tests {
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: None,
+            updated_at: None,
         };
 
         let result = calculate_metadata_from_frames(&[frame]).unwrap();

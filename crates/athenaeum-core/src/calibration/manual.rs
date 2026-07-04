@@ -116,6 +116,8 @@ pub fn synthesize_frame_for_lights(conn: &Connection, frame_ids: &[i64]) -> Resu
         swcreate: None,
         bayerpat: None,
         rotation: None,
+        uuid: None,
+        updated_at: None,
     })
 }
 
@@ -193,6 +195,8 @@ pub fn synthesize_frame_for_set(conn: &Connection, set_id: i64) -> Result<(Frame
         swcreate: None,
         bayerpat: None,
         rotation: None,
+        uuid: None,
+        updated_at: None,
     };
 
     Ok((frame, source_type))
@@ -223,7 +227,8 @@ pub fn load_set_with_score(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end,
                 cs.temp_min, cs.temp_max, cs.frame_count, cs.focallen, cs.is_master_library,
-                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format,
+                cs.uuid, cs.updated_at
          FROM calibration_set cs
          LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
          LEFT JOIN frames f ON f.id = csf.frame_id
@@ -268,6 +273,8 @@ pub fn load_set_with_score(
                 xpixsz: row.get(20)?,
                 format: row.get(21)?,
                 focallen: row.get(14)?,
+                uuid: row.get(22)?,
+                updated_at: row.get(23)?,
             })
         })
         .ok();

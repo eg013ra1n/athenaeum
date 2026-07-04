@@ -56,7 +56,8 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter,
                 gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp,
                 focallen, xpixsz, ypixsz, naxis1, naxis2, ra, dec, sitelat, lat_obs,
-                sitelong, long_obs, objctra, objctdec, override, imagetyp, is_master
+                sitelong, long_obs, objctra, objctdec, override, imagetyp, is_master,
+                uuid, updated_at
          FROM frames
          WHERE id = ?1"
     )?;
@@ -104,6 +105,8 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: row.get(31)?,
+            updated_at: row.get(32)?,
         })
     })?;
 
@@ -115,7 +118,8 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
     let mut stmt = conn.prepare(
         "SELECT cs.id, cs.imagetyp, cs.exptime, cs.ccd_temp, cs.temp_min, cs.temp_max, cs.gain, cs.offset,
                 cs.binning, cs.instrume, cs.filter, cs.date_start, cs.date_end, cs.date, cs.frame_count, cs.is_master_library,
-                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format, cs.focallen
+                f.naxis1, f.naxis2, f.bayerpat, f.swcreate, f.xpixsz, fi.format, cs.focallen,
+                cs.uuid, cs.updated_at
          FROM calibration_set cs
          LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
          LEFT JOIN frames f ON f.id = csf.frame_id
@@ -151,6 +155,8 @@ fn get_calibration_set_by_id(conn: &Connection, set_id: i64) -> Result<Calibrati
             xpixsz: row.get(20)?,
             format: row.get(21)?,
             focallen: row.get(22)?,
+            uuid: row.get(23)?,
+            updated_at: row.get(24)?,
         })
     })?;
 

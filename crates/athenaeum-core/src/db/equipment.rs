@@ -64,7 +64,9 @@ pub fn get_camera_dark_library(
             f.swcreate,
             f.xpixsz,
             fi.format,
-            cs.focallen
+            cs.focallen,
+            cs.uuid,
+            cs.updated_at
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -117,6 +119,8 @@ pub fn get_camera_dark_library(
                 xpixsz: row.get(19)?,
                 format: row.get(20)?,
                 focallen: row.get(21)?,
+                uuid: row.get(22)?,
+                updated_at: row.get(23)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -190,7 +194,9 @@ pub fn get_camera_master_dark_library(
             f.swcreate,
             f.xpixsz,
             fi.format,
-            cs.focallen
+            cs.focallen,
+            cs.uuid,
+            cs.updated_at
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -243,6 +249,8 @@ pub fn get_camera_master_dark_library(
                 xpixsz: row.get(19)?,
                 format: row.get(20)?,
                 focallen: row.get(21)?,
+                uuid: row.get(22)?,
+                updated_at: row.get(23)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -289,7 +297,9 @@ pub fn get_camera_master_flat_library(
             f.swcreate,
             f.xpixsz,
             fi.format,
-            cs.focallen
+            cs.focallen,
+            cs.uuid,
+            cs.updated_at
         FROM calibration_set cs
         LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
         LEFT JOIN frames f ON f.id = csf.frame_id
@@ -342,6 +352,8 @@ pub fn get_camera_master_flat_library(
                 xpixsz: row.get(19)?,
                 format: row.get(20)?,
                 focallen: row.get(21)?,
+                uuid: row.get(22)?,
+                updated_at: row.get(23)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -390,7 +402,8 @@ pub fn get_frames_for_calibration_set(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
+                f.uuid, f.updated_at, fr.uuid, fr.updated_at
          FROM calibration_set_frames csf
          JOIN frames fr ON csf.frame_id = fr.id
          JOIN files f ON fr.file_id = f.id
@@ -420,6 +433,8 @@ pub fn get_frames_for_calibration_set(
             archived_in_operation: row.get(9)?,
             archive_zip_path: row.get(10)?,
             archive_path_in_zip: row.get(11)?,
+            uuid: row.get(43)?,
+            updated_at: row.get(44)?,
         };
 
         let frame = crate::models::Frame {
@@ -459,6 +474,8 @@ pub fn get_frames_for_calibration_set(
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: row.get(45)?,
+            updated_at: row.get(46)?,
         };
 
         Ok(FileWithFrame {

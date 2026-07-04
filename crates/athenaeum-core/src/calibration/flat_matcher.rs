@@ -501,6 +501,8 @@ mod tests {
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: None,
+            updated_at: None,
         };
 
         let result = find_flat_groups_for_light_frame(&conn, &light, 30, 30, 0.5);

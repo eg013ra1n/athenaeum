@@ -97,7 +97,7 @@ pub fn detect_flat_groups(
         "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
                 is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
                 ccd_temp, set_temp, focallen, xpixsz, ypixsz, naxis1, naxis2,
-                sitelat, lat_obs, sitelong, long_obs
+                sitelat, lat_obs, sitelong, long_obs, uuid, updated_at
          FROM frames
          WHERE imagetyp = 'Flat' AND instrume = ?1 AND binning = ?2"
     );
@@ -255,6 +255,8 @@ pub fn detect_flat_groups(
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: row.get(29)?,
+            updated_at: row.get(30)?,
         };
 
         frames.push(frame);

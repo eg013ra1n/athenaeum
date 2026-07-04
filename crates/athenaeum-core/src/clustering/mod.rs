@@ -426,6 +426,8 @@ mod tests {
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: None,
+            updated_at: None,
         }
     }
 

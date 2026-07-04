@@ -118,7 +118,8 @@ pub fn get_light_frames_from_frame_set(
         "SELECT f.id, f.file_id, f.object, f.date_obs, f.telescop, f.instrume,
                 f.exptime, f.filter, f.imagetyp, f.is_master, f.ra, f.dec, f.objctra, f.objctdec,
                 f.gain, f.offset, f.xbinning, f.ybinning, f.ccd_temp, f.set_temp,
-                f.focallen, f.xpixsz, f.ypixsz, f.naxis1, f.naxis2, f.sitelat, f.lat_obs, f.sitelong, f.long_obs
+                f.focallen, f.xpixsz, f.ypixsz, f.naxis1, f.naxis2, f.sitelat, f.lat_obs, f.sitelong, f.long_obs,
+                f.uuid, f.updated_at
          FROM frames f
          JOIN session_members sm ON f.id = sm.frame_id
          JOIN sessions s ON sm.session_id = s.id
@@ -181,6 +182,8 @@ pub fn get_light_frames_from_frame_set(
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: row.get(29)?,
+            updated_at: row.get(30)?,
         })
     })?
     .collect::<Result<Vec<Frame>, _>>()?;
@@ -487,6 +490,8 @@ mod tests {
                     xpixsz: None,
                     format: None,
                     focallen: None,
+                    uuid: None,
+                    updated_at: None,
                 },
                 sub_calibration: vec![],
             }],
@@ -515,6 +520,8 @@ mod tests {
                     xpixsz: None,
                     format: None,
                     focallen: None,
+                    uuid: None,
+                    updated_at: None,
                 },
                 sub_calibration: vec![],
             }],

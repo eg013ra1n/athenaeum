@@ -647,7 +647,7 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
 pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
     conn.query_row(
         "SELECT id, path, filename, size, modified_at, format, created_at, metadata_hash, content_hash,
-                archived_in_operation, archive_zip_path, archive_path_in_zip
+                archived_in_operation, archive_zip_path, archive_path_in_zip, uuid, updated_at
          FROM files WHERE path = ?1",
         params![path],
         |row| {
@@ -672,6 +672,8 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
                 archived_in_operation: row.get(9)?,
                 archive_zip_path: row.get(10)?,
                 archive_path_in_zip: row.get(11)?,
+                uuid: row.get(12)?,
+                updated_at: row.get(13)?,
             })
         },
     )
@@ -690,7 +692,8 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
+                f.uuid, f.updated_at, fr.uuid, fr.updated_at
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          ORDER BY f.created_at DESC
@@ -722,6 +725,8 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
             archived_in_operation: row.get(9)?,
             archive_zip_path: row.get(10)?,
             archive_path_in_zip: row.get(11)?,
+            uuid: row.get(45)?,
+            updated_at: row.get(46)?,
         };
 
         let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(12) {
@@ -762,6 +767,8 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 swcreate: row.get(42).ok(),
                 bayerpat: row.get(43).ok(),
                 rotation: row.get(44).ok(),
+                uuid: row.get(47).ok(),
+                updated_at: row.get(48).ok(),
             })
         } else {
             None
@@ -797,7 +804,8 @@ pub fn get_files_by_directory(
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
+                f.uuid, f.updated_at, fr.uuid, fr.updated_at
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
@@ -831,6 +839,8 @@ pub fn get_files_by_directory(
             archived_in_operation: row.get(9)?,
             archive_zip_path: row.get(10)?,
             archive_path_in_zip: row.get(11)?,
+            uuid: row.get(45)?,
+            updated_at: row.get(46)?,
         };
 
         let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(12) {
@@ -871,6 +881,8 @@ pub fn get_files_by_directory(
                 swcreate: row.get(42).ok(),
                 bayerpat: row.get(43).ok(),
                 rotation: row.get(44).ok(),
+                uuid: row.get(47).ok(),
+                updated_at: row.get(48).ok(),
             })
         } else {
             None
@@ -905,7 +917,8 @@ pub fn get_files_by_directory_for_camera(
                 fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
                 fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
                 fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation
+                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
+                f.uuid, f.updated_at, fr.uuid, fr.updated_at
          FROM files f
          JOIN frames fr ON f.id = fr.file_id
          WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
@@ -940,6 +953,8 @@ pub fn get_files_by_directory_for_camera(
             archived_in_operation: row.get(9)?,
             archive_zip_path: row.get(10)?,
             archive_path_in_zip: row.get(11)?,
+            uuid: row.get(45)?,
+            updated_at: row.get(46)?,
         };
 
         let frame = Some(Frame {
@@ -979,6 +994,8 @@ pub fn get_files_by_directory_for_camera(
             swcreate: row.get(42).ok(),
             bayerpat: row.get(43).ok(),
             rotation: row.get(44).ok(),
+            uuid: row.get(47).ok(),
+            updated_at: row.get(48).ok(),
         });
 
         Ok((file, frame))
@@ -1003,6 +1020,7 @@ const MISSING_METADATA_SELECT: &str =
             fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
             fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
             fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
+            f.uuid, f.updated_at, fr.uuid, fr.updated_at,
             CASE WHEN dgf.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_duplicate";
 
 /// Map a row from a SELECT that uses `MISSING_METADATA_SELECT`.
@@ -1028,6 +1046,8 @@ fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Missing
         archived_in_operation: row.get(9)?,
         archive_zip_path: row.get(10)?,
         archive_path_in_zip: row.get(11)?,
+        uuid: row.get(45)?,
+        updated_at: row.get(46)?,
     };
 
     let frame = Frame {
@@ -1067,9 +1087,11 @@ fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Missing
         swcreate: row.get(42).ok(),
         bayerpat: row.get(43).ok(),
         rotation: row.get(44).ok(),
+        uuid: row.get(47).ok(),
+        updated_at: row.get(48).ok(),
     };
 
-    let has_duplicate: i32 = row.get(45)?;
+    let has_duplicate: i32 = row.get(49)?;
 
     Ok(MissingMetadataRow {
         file,
@@ -1970,7 +1992,7 @@ pub fn get_frames_sets_by_project(
     let mut stmt = conn.prepare(
         "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
                 COUNT(DISTINCT sm.frame_id) as member_count, fs.avg_rotation, fs.min_rotation, fs.max_rotation, fs.is_archived,
-                fs.archived_at, fs.archive_operation_id
+                fs.archived_at, fs.archive_operation_id, fs.uuid, fs.updated_at
          FROM frames_set fs
          LEFT JOIN imaging_nights in_tbl ON fs.id = in_tbl.frames_set_id
          LEFT JOIN sessions s ON in_tbl.id = s.imaging_night_id
@@ -1996,6 +2018,8 @@ pub fn get_frames_sets_by_project(
             is_archived: row.get::<_, i32>(13).unwrap_or(0) == 1,
             archived_at: row.get(14)?,
             archive_operation_id: row.get(15)?,
+            uuid: row.get(16)?,
+            updated_at: row.get(17)?,
         };
         let member_count: i32 = row.get(9)?;
         Ok((set, member_count as usize))
@@ -2099,7 +2123,7 @@ pub fn get_light_frames_for_project(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.uuid, fr.updated_at
          FROM files f
          INNER JOIN frames fr ON f.id = fr.file_id
          WHERE fr.imagetyp = 'Light' OR fr.imagetyp IS NULL
@@ -2152,6 +2176,8 @@ pub fn get_light_frames_for_project(
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: row.get(32)?,
+            updated_at: row.get(33)?,
         };
 
         Ok((file_id, frame))
@@ -2486,7 +2512,7 @@ pub fn get_sessions_for_night(
     night_id: i64,
 ) -> Result<Vec<crate::models::Session>> {
     let mut stmt = conn.prepare(
-        "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at
+        "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at, uuid, updated_at
          FROM sessions
          WHERE imaging_night_id = ?1
          ORDER BY created_at ASC"
@@ -2505,6 +2531,8 @@ pub fn get_sessions_for_night(
             frame_count: row.get(3)?,
             total_exp_time: row.get(4)?,
             created_at,
+            uuid: row.get(6)?,
+            updated_at: row.get(7)?,
         })
     })?;
 
@@ -2529,7 +2557,8 @@ pub fn get_frames_with_files_by_ids(
                 fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                 fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                 fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
+                f.uuid, f.updated_at, fr.uuid, fr.updated_at
          FROM frames fr
          JOIN files f ON fr.file_id = f.id
          WHERE fr.id IN ({})
@@ -2567,6 +2596,8 @@ pub fn get_frames_with_files_by_ids(
             archived_in_operation: row.get(9)?,
             archive_zip_path: row.get(10)?,
             archive_path_in_zip: row.get(11)?,
+            uuid: row.get(43)?,
+            updated_at: row.get(44)?,
         };
 
         let date_obs_raw: Option<String> = row.get(15)?;
@@ -2608,6 +2639,8 @@ pub fn get_frames_with_files_by_ids(
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: row.get(45)?,
+            updated_at: row.get(46)?,
         };
 
         let file_id: i64 = row.get(0)?;
@@ -2650,7 +2683,7 @@ pub fn get_imaging_nights_with_sessions(
 
         // Get sessions for this night
         let mut sessions_stmt = conn.prepare(
-            "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at
+            "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at, uuid, updated_at
              FROM sessions
              WHERE imaging_night_id = ?1
              ORDER BY instrume ASC",
@@ -2666,6 +2699,8 @@ pub fn get_imaging_nights_with_sessions(
                 created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
                     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                 }),
+                uuid: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })?;
 
@@ -2683,7 +2718,8 @@ pub fn get_imaging_nights_with_sessions(
                         fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
                         fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
                         fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                        fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override
+                        fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
+                        f.uuid, f.updated_at, fr.uuid, fr.updated_at
                  FROM session_members sm
                  JOIN frames fr ON sm.frame_id = fr.id
                  JOIN files f ON fr.file_id = f.id
@@ -2713,6 +2749,8 @@ pub fn get_imaging_nights_with_sessions(
                     archived_in_operation: row.get(9)?,
                     archive_zip_path: row.get(10)?,
                     archive_path_in_zip: row.get(11)?,
+                    uuid: row.get(43)?,
+                    updated_at: row.get(44)?,
                 };
 
                 let frame = crate::models::Frame {
@@ -2752,6 +2790,8 @@ pub fn get_imaging_nights_with_sessions(
                     swcreate: None,
                     bayerpat: None,
                     rotation: None,
+                    uuid: row.get(45)?,
+                    updated_at: row.get(46)?,
                 };
 
                 Ok(crate::models::FileWithFrame {
@@ -2799,7 +2839,7 @@ pub fn clone_session(
 ) -> Result<i64> {
     // Get original session data
     let session: crate::models::Session = conn.query_row(
-        "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at
+        "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at, uuid, updated_at
          FROM sessions WHERE id = ?1",
         params![original_session_id],
         |row| {
@@ -2812,6 +2852,8 @@ pub fn clone_session(
                 created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
                     DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
                 }),
+                uuid: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         },
     )?;
@@ -3582,9 +3624,9 @@ pub fn get_excluded_frames_with_metadata(
     let rows = stmt.query_map([], |row| {
         let base = map_missing_metadata_row(row)?;
         // Trailing two columns appended after the MISSING_METADATA_SELECT
-        // 46-column block (indices 0..=45).
-        let reason: String = row.get(46)?;
-        let excluded_at: String = row.get(47)?;
+        // 50-column block (indices 0..=49).
+        let reason: String = row.get(50)?;
+        let excluded_at: String = row.get(51)?;
         Ok(crate::models::ExcludedFrameRow {
             file: base.file,
             frame: base.frame,
@@ -4406,6 +4448,49 @@ mod bulk_metadata_tests {
         // value: Some(Some(v)) → "set to v".
         let edits: FrameMetadataEdits = serde_json::from_str(r#"{"xpixsz": 3.76}"#).unwrap();
         assert_eq!(edits.xpixsz, Some(Some(3.76)), "value → Some(Some(v))");
+    }
+
+    /// Regression test for the hand-maintained column indices in
+    /// `MISSING_METADATA_SELECT` / `map_missing_metadata_row` /
+    /// `get_excluded_frames_with_metadata`. Appending `uuid`/`updated_at` to
+    /// the shared SELECT constant shifted `has_duplicate` (45→49) and the
+    /// trailing `reason`/`excluded_at` columns (46,47→50,51) — a mismatch
+    /// here would be a silent runtime bug, not a compile error.
+    #[test]
+    fn missing_metadata_and_excluded_frames_carry_uuid_and_shifted_indices() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // insert_frame leaves `object` NULL, which the "object" category treats
+        // as missing metadata for LIGHT frames.
+        let frame_id = insert_frame(&conn, "/x/missing_obj.fits", Some("Light"));
+        let file_id: i64 = conn
+            .query_row("SELECT file_id FROM frames WHERE id = ?1", [frame_id], |r| r.get(0))
+            .unwrap();
+
+        let rows = get_frames_with_missing_metadata(&conn, "object").unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one missing-object row");
+        let row = &rows[0];
+        assert!(row.file.uuid.is_some(), "file.uuid must be populated by the identity trigger");
+        assert!(row.file.updated_at.is_some(), "file.updated_at must be populated by the identity trigger");
+        assert!(row.frame.uuid.is_some(), "frame.uuid must be populated by the identity trigger");
+        assert!(row.frame.updated_at.is_some(), "frame.updated_at must be populated by the identity trigger");
+        assert!(!row.has_duplicate, "no duplicate_group_files row exists for this file");
+        assert_eq!(row.file.id, Some(file_id));
+        assert_eq!(row.frame.id, Some(frame_id));
+
+        // Now exclude the frame and check get_excluded_frames_with_metadata's
+        // trailing reason/excluded_at columns land correctly after the shift.
+        insert_excluded_frames(&conn, &[(file_id, "test-reason".to_string())]).unwrap();
+
+        let excluded = get_excluded_frames_with_metadata(&conn).unwrap();
+        assert_eq!(excluded.len(), 1);
+        let ex = &excluded[0];
+        assert_eq!(ex.reason, "test-reason", "reason must read from its shifted index");
+        assert!(!ex.excluded_at.is_empty(), "excluded_at must read from its shifted index");
+        assert!(ex.file.uuid.is_some());
+        assert!(ex.frame.uuid.is_some());
+        assert!(!ex.has_duplicate);
     }
 }
 

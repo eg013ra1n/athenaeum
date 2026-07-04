@@ -431,6 +431,8 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
         swcreate,
         bayerpat,
         rotation,
+        uuid: None,
+        updated_at: None,
     })
 }
 
@@ -769,6 +771,8 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         swcreate,
         bayerpat,
         rotation,
+        uuid: None,
+        updated_at: None,
     })
 }
 

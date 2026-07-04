@@ -18,6 +18,8 @@ pub struct File {
     pub archived_in_operation: Option<i64>,
     pub archive_zip_path: Option<String>,
     pub archive_path_in_zip: Option<String>,
+    pub uuid: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -91,6 +93,8 @@ pub struct Frame {
     /// Image position angle in degrees (North through East)
     /// Extracted from CROTA2 or computed from CD matrix
     pub rotation: Option<f64>,
+    pub uuid: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -248,6 +252,8 @@ pub struct FramesSet {
     // ZIP archive feature — populated when this frame set has been ZIP-archived
     pub archived_at: Option<String>,          // ISO 8601 timestamp string
     pub archive_operation_id: Option<i64>,
+    pub uuid: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 /// Application settings
@@ -277,6 +283,8 @@ pub struct Session {
     pub frame_count: i32,
     pub total_exp_time: Option<f64>,
     pub created_at: Option<DateTime<Utc>>,
+    pub uuid: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 /// DTO: File with optional frame metadata
@@ -356,6 +364,8 @@ pub struct CalibrationSetDetail {
     pub xpixsz: Option<f64>,     // Pixel size in microns
     pub format: Option<String>,  // File format (FITS, XISF)
     pub focallen: Option<f64>,   // Focal length in mm
+    pub uuid: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 /// Result of dark library creation

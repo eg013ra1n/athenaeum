@@ -195,6 +195,8 @@ mod tests {
             archived_in_operation: None,
             archive_zip_path: None,
             archive_path_in_zip: None,
+            uuid: None,
+            updated_at: None,
         };
 
         let frame = Frame {
@@ -234,6 +236,8 @@ mod tests {
             swcreate: None,
             bayerpat: None,
             rotation: None,
+            uuid: None,
+            updated_at: None,
         };
 
         (id, file, frame)
