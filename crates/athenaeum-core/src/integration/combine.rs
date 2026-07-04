@@ -11,8 +11,10 @@ pub enum CombineMethod {
     Median,
     /// Iterative winsorized sigma clipping, then mean of survivors.
     WinsorizedSigmaClip { sigma_low: f64, sigma_high: f64 },
-    /// PixInsight-style percentile clipping around the median:
-    /// reject x when (m - x) > low*m or (x - m) > high*m.
+    /// PixInsight-style percentile clipping around the median m:
+    /// reject x when (m - x)/|m| > low or (x - m)/|m| > high.
+    /// Deviations are normalized by |m| (not m), so thresholds are
+    /// sign-agnostic and behave the same for negative medians.
     PercentileClip { low: f64, high: f64 },
 }
 
@@ -74,14 +76,7 @@ pub fn combine_pixel(values: &mut [f32], method: CombineMethod) -> (f32, usize) 
             //    clamp the working copy at m±1.5σ, recompute, repeat to 0.5% change.
             let mut work: Vec<f64> = values.iter().map(|&x| x as f64).collect();
             let mut m = work.iter().sum::<f64>() / n as f64;
-            let mut s = {
-                let var = work
-                    .iter()
-                    .map(|x| (x - m) * (x - m))
-                    .sum::<f64>()
-                    / (n - 1) as f64;
-                var.sqrt()
-            };
+            let mut s = stddev(values, m);
             for _ in 0..10 {
                 if s <= f64::EPSILON {
                     break;
@@ -193,6 +188,37 @@ mod tests {
         );
         assert_eq!(rejected, 0);
         assert!((v - clean_mean).abs() < 0.5);
+    }
+
+    #[test]
+    fn winsorized_sums_original_not_clamped_values() {
+        // 12 cluster samples spread over 100.0..100.4 + one at 106.0. The
+        // winsorized iteration clamps 106 in the WORK copy (down to ~100.5),
+        // but the final estimate keeps sigma_final > 0 (~0.19) thanks to the
+        // cluster spread, so with sigma_high = 50 the rejection band reaches
+        // ~109 and the ORIGINAL 106.0 is kept. A buggy implementation that
+        // means the CLAMPED work values would return ~100.20 (< true mean);
+        // the correct one returns the mean of the ORIGINAL samples (~100.62).
+        //
+        // NOTE: a zero-spread cluster (12 x exactly 100.0) does NOT work here:
+        // the winsorized sigma collapses toward 0 each iteration, the 50-sigma
+        // band shrinks to ~ +/-0.2, and the original 106 gets rejected. The
+        // spread keeps sigma_final positive so `rejected == 0` holds.
+        let mut vals: Vec<f32> = (0..12).map(|i| 100.0 + (i % 5) as f32 * 0.1).collect();
+        vals.push(106.0);
+        let expected = vals.iter().map(|&x| x as f64).sum::<f64>() / vals.len() as f64;
+        let (v, rejected) = combine_pixel(
+            &mut vals,
+            CombineMethod::WinsorizedSigmaClip {
+                sigma_low: 50.0,
+                sigma_high: 50.0,
+            },
+        );
+        assert_eq!(rejected, 0);
+        assert!(
+            (v as f64 - expected).abs() < 1e-3,
+            "must average ORIGINAL samples: got {v}, want {expected}"
+        );
     }
 
     #[test]
