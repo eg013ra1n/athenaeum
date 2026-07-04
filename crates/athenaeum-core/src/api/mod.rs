@@ -1,0 +1,87 @@
+//! Shared command layer: one handler per command, wrapped by thin Tauri/Axum shims.
+//! Handlers do NOT carry #[tracing::instrument] — boundary spans live on the wrappers.
+
+use std::path::{Path, PathBuf};
+
+// pub mod scan_roots;      // Task 9
+// pub mod files;           // Task 10
+// pub mod calibration;     // Task 11
+// pub mod analysis;        // Task 12
+
+#[derive(Debug)]
+pub enum ApiError {
+    NotFound(String),
+    Invalid(String),
+    Conflict(String),
+    Forbidden(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::NotFound(m) | ApiError::Invalid(m) | ApiError::Conflict(m)
+            | ApiError::Forbidden(m) | ApiError::Internal(m) => f.write_str(m),
+        }
+    }
+}
+impl std::error::Error for ApiError {}
+
+impl From<rusqlite::Error> for ApiError {
+    fn from(e: rusqlite::Error) -> Self { ApiError::Internal(e.to_string()) }
+}
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self { ApiError::Internal(format!("{e:#}")) }
+}
+
+#[derive(Debug, Clone)]
+pub enum PathPolicy {
+    AllowAll,
+    AllowedRoots(Vec<PathBuf>),
+}
+
+impl PathPolicy {
+    pub fn check(&self, p: &Path) -> Result<(), ApiError> {
+        match self {
+            PathPolicy::AllowAll => Ok(()),
+            PathPolicy::AllowedRoots(roots) => {
+                if roots.iter().any(|r| p.starts_with(r)) {
+                    Ok(())
+                } else {
+                    Err(ApiError::Forbidden(format!(
+                        "path {} is outside the allowed roots", p.display()
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Fetch the shared `Database` handle out of `ServiceContext`, mirroring the
+/// `state.ctx.db.get().ok_or("Database not initialized")?` expression used
+/// throughout today's Tauri commands (e.g.
+/// `crates/athenaeum-tauri/src/commands/scan_roots.rs:94`). `ServiceContext.db`
+/// is a `OnceLock<Database>`, so `.get()` returns `Option<&Database>` — same
+/// shape here, just mapped onto `ApiError::Internal` instead of a bare string.
+pub fn db(ctx: &crate::services::ServiceContext) -> Result<&crate::db::Database, ApiError> {
+    ctx.db.get().ok_or_else(|| ApiError::Internal("Database not initialized".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn display_shows_message() {
+        assert_eq!(ApiError::NotFound("frame 7".into()).to_string(), "frame 7");
+    }
+
+    #[test]
+    fn path_policy_allows_and_forbids() {
+        let p = PathPolicy::AllowedRoots(vec!["/data/astro".into()]);
+        assert!(p.check(Path::new("/data/astro/lights")).is_ok());
+        assert!(matches!(p.check(Path::new("/etc/passwd")), Err(ApiError::Forbidden(_))));
+        assert!(PathPolicy::AllowAll.check(Path::new("/anything")).is_ok());
+    }
+}

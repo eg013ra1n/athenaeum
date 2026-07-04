@@ -243,6 +243,23 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
     }
 }
 
+/// Maps a shared-core `ApiError` onto an Axum status/body pair. Lives here
+/// (not as a `From` impl) because both `ApiError` and `(StatusCode, String)`
+/// are foreign to this crate — the orphan rule blocks a trait impl on a
+/// tuple of two externally-defined types.
+pub(crate) fn api_err(e: athenaeum_core::api::ApiError) -> (StatusCode, String) {
+    use athenaeum_core::api::ApiError as E;
+    use axum::http::StatusCode as S;
+    let code = match &e {
+        E::NotFound(_) => S::NOT_FOUND,
+        E::Invalid(_) => S::BAD_REQUEST,
+        E::Conflict(_) => S::CONFLICT,
+        E::Forbidden(_) => S::FORBIDDEN,
+        E::Internal(_) => S::INTERNAL_SERVER_ERROR,
+    };
+    (code, e.to_string())
+}
+
 // ── SSE endpoint ─────────────────────────────────────────────────────────────
 
 async fn sse_handler(
