@@ -38,6 +38,12 @@ use crate::flat_analysis::{self, FlatContourOpts};
 use crate::models::{FrameAnalysis, StarMetric, StarMetricsResponse};
 use crate::services::ServiceContext;
 
+/// Pre-conversion hardcoded concurrency ceiling for analyze_frame_set —
+/// both the auto path and the manual batch_concurrency clamp used a
+/// literal 16 before the api-layer conversion. Keep byte-for-byte
+/// behavior; wiring a machine-derived value is a future product decision.
+pub const ANALYZE_THREAD_CAP: usize = 16;
+
 // ── Response DTOs / progress payloads (single-sourced) ──────────────────────
 
 #[derive(Clone, serde::Serialize)]

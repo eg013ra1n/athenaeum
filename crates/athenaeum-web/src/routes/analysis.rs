@@ -121,12 +121,11 @@ pub async fn analyze_frame_set(
     Json(args): Json<AnalyzeFrameSetArgs>,
 ) -> Result<Json<AnalyzeFrameSetResult>, (StatusCode, String)> {
     let ctx = state.ctx.clone();
-    let thread_budget = state.max_blink_threads;
     let event_tx = state.event_tx.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let emitter = SseProgressEmitter::new(event_tx);
-        api::analyze_frame_set(&ctx, args.frame_set_id, args.force, thread_budget, &emitter)
+        api::analyze_frame_set(&ctx, args.frame_set_id, args.force, api::ANALYZE_THREAD_CAP, &emitter)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Analysis task panicked: {}", e)))?

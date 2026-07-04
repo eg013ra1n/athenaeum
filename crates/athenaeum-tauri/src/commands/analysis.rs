@@ -57,11 +57,10 @@ pub async fn analyze_frame_set(
     force: Option<bool>,
 ) -> Result<AnalyzeFrameSetResult, String> {
     let ctx = state.ctx.clone();
-    let thread_budget = state.max_blink_threads;
 
     tokio::task::spawn_blocking(move || {
         let emitter = TauriProgressEmitter(app_handle);
-        api::analyze_frame_set(&ctx, frame_set_id, force, thread_budget, &emitter)
+        api::analyze_frame_set(&ctx, frame_set_id, force, api::ANALYZE_THREAD_CAP, &emitter)
     })
     .await
     .map_err(|e| format!("Analysis task panicked: {}", e))?
