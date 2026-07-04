@@ -1,6 +1,6 @@
 [package]
 name = "athenaeum-tauri"
-version = "0.2.3"
+version = "0.2.4"
 description = "Astrophotography File Manager - Tauri desktop frontend"
 authors = ["you"]
 edition = "2021"
