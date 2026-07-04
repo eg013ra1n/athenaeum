@@ -1321,23 +1321,29 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     const UUID_V4_SQL: &str = "lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || \
         substr(hex(randomblob(2)),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || \
         substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))";
+    // NOTE: trigger DDL is DROP+CREATE (not CREATE ... IF NOT EXISTS) so it is
+    // authoritative on every init_db run. This is the trigger-evolution
+    // mechanism: dev/test DBs created under an older trigger definition get
+    // upgraded in place instead of ossifying with stale trigger bodies.
     for t in UUID_TABLES {
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {t}_identity"), [])?;
         conn.execute(
             &format!(
-                "CREATE TRIGGER IF NOT EXISTS {t}_identity AFTER INSERT ON {t}
-                 FOR EACH ROW WHEN NEW.uuid IS NULL
+                "CREATE TRIGGER {t}_identity AFTER INSERT ON {t}
+                 FOR EACH ROW WHEN NEW.uuid IS NULL OR NEW.updated_at IS NULL
                  BEGIN
-                     UPDATE {t} SET uuid = {UUID_V4_SQL},
+                     UPDATE {t} SET uuid = COALESCE(NEW.uuid, {UUID_V4_SQL}),
                          updated_at = COALESCE(NEW.updated_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                      WHERE id = NEW.id;
                  END"
             ),
             [],
         )?;
+        conn.execute(&format!("DROP TRIGGER IF EXISTS {t}_touch"), [])?;
         conn.execute(
             &format!(
-                "CREATE TRIGGER IF NOT EXISTS {t}_touch AFTER UPDATE ON {t}
-                 FOR EACH ROW WHEN NEW.updated_at IS OLD.updated_at
+                "CREATE TRIGGER {t}_touch AFTER UPDATE ON {t}
+                 FOR EACH ROW WHEN NEW.updated_at IS OLD.updated_at AND NEW.uuid IS OLD.uuid
                  BEGIN
                      UPDATE {t} SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                      WHERE id = NEW.id;
@@ -1481,6 +1487,34 @@ mod identity_schema_tests {
             .unwrap();
         assert_eq!(u, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "identity trigger must not clobber explicit uuid");
         assert_eq!(ts, "2021-06-01T12:00:00.000Z", "identity trigger must preserve explicit updated_at");
+    }
+
+    #[test]
+    fn insert_with_explicit_updated_at_but_no_uuid_preserves_timestamp() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO tags (name, color, updated_at) VALUES ('q3', NULL, '2022-03-03T03:03:03.000Z')",
+            [],
+        ).unwrap();
+        let (u, ts): (Option<String>, String) = conn
+            .query_row("SELECT uuid, updated_at FROM tags WHERE name='q3'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert!(u.is_some(), "uuid generated");
+        assert_eq!(ts, "2022-03-03T03:03:03.000Z", "explicit updated_at must survive the trigger cascade");
+    }
+
+    #[test]
+    fn insert_with_explicit_uuid_but_no_updated_at_gets_timestamp() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO tags (name, color, uuid) VALUES ('q2', NULL, 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff')",
+            [],
+        ).unwrap();
+        let (u, ts): (String, Option<String>) = conn
+            .query_row("SELECT uuid, updated_at FROM tags WHERE name='q2'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(u, "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff");
+        assert!(ts.is_some(), "updated_at must be filled at insert, not at next startup");
     }
 }
 
