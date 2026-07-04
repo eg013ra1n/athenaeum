@@ -40,6 +40,9 @@ pub mod defaults {
 
     // Archive feature
     pub const ARCHIVE_COMPRESSION: &str = "store"; // "store" | "deflate"
+
+    // Compute queue (global FIFO admission for heavy CPU jobs)
+    pub const COMPUTE_MAX_CONCURRENT: &str = "1";
 }
 
 /// Setting keys used throughout the application
@@ -74,6 +77,9 @@ pub mod keys {
     // Archive feature
     pub const ARCHIVE_ROOT_PATH: &str = "archive.root_path";
     pub const ARCHIVE_COMPRESSION: &str = "archive.compression";
+
+    // Compute queue (global FIFO admission for heavy CPU jobs)
+    pub const COMPUTE_MAX_CONCURRENT: &str = "compute.max_concurrent";
 }
 
 /// Runtime overrides for settings (session-specific)
@@ -251,6 +257,24 @@ impl SettingsManager {
             defaults::ARCHIVE_COMPRESSION,
         )
     }
+
+    /// Get the configured concurrency ceiling for the global compute queue
+    /// (heavy CPU jobs: analysis, master build, light calibration). Clamped
+    /// to the same 1..=8 range `api::compute::set_compute_max_concurrent`
+    /// enforces on write — defense in depth against a value that reached the
+    /// `compute.max_concurrent` row some other way (direct DB edit, a future
+    /// settings import, a botched migration), so a stray `0` can never
+    /// permanently stall the admission queue and a stray huge value can
+    /// never defeat the point of having one.
+    pub fn get_compute_max_concurrent(&self, conn: &Connection) -> Result<usize> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::COMPUTE_MAX_CONCURRENT,
+            defaults::COMPUTE_MAX_CONCURRENT,
+        )?;
+        let n: usize = value.parse()?;
+        Ok(n.clamp(1, 8))
+    }
 }
 
 #[cfg(test)]
@@ -358,5 +382,44 @@ mod tests {
         let manager = SettingsManager::new();
 
         assert_eq!(manager.get_archive_compression(&conn).unwrap(), "store");
+    }
+
+    #[test]
+    fn test_compute_max_concurrent_default_is_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        assert_eq!(defaults::COMPUTE_MAX_CONCURRENT, "1");
+        assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_compute_max_concurrent_reads_persisted_value() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        manager.persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "4").unwrap();
+        assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_compute_max_concurrent_clamps_out_of_range_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        // A `0` or huge value can only reach the DB via something other
+        // than `api::compute::set_compute_max_concurrent` (which itself
+        // rejects 0 and >8) — a direct DB edit, a future settings
+        // import/export, or a botched migration. The getter clamps
+        // defensively so such a value can never permanently stall the
+        // queue (0) or defeat the point of having one (huge).
+        manager.persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "0").unwrap();
+        assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 1);
+
+        manager.persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "999").unwrap();
+        assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 8);
     }
 }

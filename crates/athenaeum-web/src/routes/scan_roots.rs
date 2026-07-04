@@ -262,6 +262,7 @@ mod relink_tests {
             bright_cache: Arc::new(RwLock::new(None)),
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
+            compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {

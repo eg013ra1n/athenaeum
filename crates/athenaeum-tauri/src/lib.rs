@@ -177,6 +177,25 @@ pub fn run() {
                 }
             }
 
+            // Wire the compute-queue transport notifier. DB-independent (just
+            // needs the AppHandle), so this belongs here rather than
+            // `initialize_database` — unlike the persisted `compute.max_concurrent`
+            // value itself, which is applied in `initialize_database` (see its
+            // doc comment: the desktop app's DB handle is initialized lazily by
+            // the frontend AFTER this closure returns, so a read attempted here
+            // would silently always no-op, exactly like `blink.threads`).
+            {
+                let emitter_handle = app_handle.clone();
+                state.ctx.compute_queue.set_notifier(Box::new(move |entries| {
+                    let emitter = tauri_events::TauriProgressEmitter(emitter_handle.clone());
+                    athenaeum_core::events::emit_event(
+                        &emitter,
+                        "compute-queue-changed",
+                        &serde_json::json!({ "entries": entries }),
+                    );
+                }));
+            }
+
             // Spawn background sweeper for stale memory-cache entries (every 60s)
             let memory_cache = Arc::clone(&state.ctx.memory_cache);
             tauri::async_runtime::spawn(async move {
@@ -332,6 +351,10 @@ pub fn run() {
             commands::get_analysis_for_frame_set,
             commands::get_frame_star_metrics,
             commands::compute_flat_contour_plot,
+            // Compute queue commands
+            commands::get_compute_queue,
+            commands::cancel_compute_job,
+            commands::set_compute_max_concurrent,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,

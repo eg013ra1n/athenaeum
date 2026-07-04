@@ -126,6 +126,9 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::registration::service::StackingPrepCompleteEvent,
             crate::logging::config::LoggingConfig,
             crate::logging::config::LoggingConfigResponse,
+            crate::services::compute_queue::ComputeJobKind,
+            crate::services::compute_queue::ComputeJobState,
+            crate::services::compute_queue::ComputeQueueEntry,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::archive::models::ArchiveDisposition,

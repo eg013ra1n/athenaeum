@@ -396,3 +396,9 @@ export type LoggingConfig = { level: string, modules: { [key in string]?: string
 
 export type LoggingConfigResponse = { config: LoggingConfig, envOverrideActive: boolean, };
 
+export type ComputeJobKind = "analysis" | "master_build" | "light_calibration";
+
+export type ComputeJobState = "queued" | "running";
+
+export type ComputeQueueEntry = { jobId: number, kind: ComputeJobKind, label: string, state: ComputeJobState, queuedAt: string, };
+

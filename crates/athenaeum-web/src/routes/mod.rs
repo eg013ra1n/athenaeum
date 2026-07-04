@@ -28,6 +28,7 @@ mod spatial;
 mod images;
 mod missing_files;
 mod analysis;
+mod compute;
 mod plate_solve;
 mod registration;
 mod archive;
@@ -175,6 +176,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/cancel_analysis", post(analysis::cancel_analysis))
         .route("/api/get_frame_star_metrics", post(analysis::get_frame_star_metrics))
         .route("/api/compute_flat_contour_plot", post(analysis::compute_flat_contour_plot))
+        // Compute queue
+        .route("/api/get_compute_queue", post(compute::get_compute_queue))
+        .route("/api/cancel_compute_job", post(compute::cancel_compute_job))
+        .route("/api/set_compute_max_concurrent", post(compute::set_compute_max_concurrent))
         // Plate solving
         .route("/api/get_plate_solve_config", post(plate_solve::get_plate_solve_config))
         .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))
@@ -387,6 +392,7 @@ mod tests {
             // is no lighter-weight constructor); matches that module's own
             // tests, which accept the same one-thread-per-test-run cost.
             operation_queue: OperationQueue::start(),
+            compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {

@@ -112,6 +112,24 @@ pub async fn initialize_database(
         }
     }
 
+    // Apply persisted compute.max_concurrent to the global compute queue.
+    // Same DB-availability reasoning as blink.threads above: the desktop
+    // app's `ctx.db` OnceLock is only populated here (frontend-triggered,
+    // after `setup()` has already returned), so this is the sole spot on
+    // desktop where a saved value actually takes effect at startup.
+    if let Some(db) = state.ctx.db.get() {
+        let conn = db.conn();
+        match state.ctx.settings.get_compute_max_concurrent(&conn) {
+            Ok(n) => {
+                state.ctx.compute_queue.set_max_concurrent(n);
+                tracing::info!(max_concurrent = n, "compute queue concurrency set from DB");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read compute.max_concurrent; leaving default in place");
+            }
+        }
+    }
+
     tracing::info!(path = %db_path.display(), "database initialized");
     Ok(db_path.to_string_lossy().to_string())
 }

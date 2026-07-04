@@ -187,6 +187,35 @@ async fn main() {
     // SSE broadcast channel
     let (event_tx, _) = tokio::sync::broadcast::channel::<events::SseEvent>(1024);
 
+    // Wire the compute-queue transport notifier now that the SSE channel
+    // exists.
+    {
+        let sse_emitter = events::SseProgressEmitter::new(event_tx.clone());
+        ctx.compute_queue.set_notifier(Box::new(move |entries| {
+            athenaeum_core::events::emit_event(
+                &sse_emitter,
+                "compute-queue-changed",
+                &serde_json::json!({ "entries": entries }),
+            );
+        }));
+    }
+
+    // Apply persisted compute.max_concurrent — unlike desktop, the web
+    // server's DB is already initialized synchronously above (before `ctx`
+    // was built), so this reliably takes effect on every startup.
+    if let Some(db) = ctx.db.get() {
+        let conn = db.conn();
+        match ctx.settings.get_compute_max_concurrent(&conn) {
+            Ok(n) => {
+                ctx.compute_queue.set_max_concurrent(n);
+                tracing::info!(max_concurrent = n, "compute queue concurrency set from DB");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to read compute.max_concurrent; leaving default in place");
+            }
+        }
+    }
+
     let state = WebAppState {
         ctx,
         event_tx,

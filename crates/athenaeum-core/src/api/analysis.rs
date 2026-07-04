@@ -178,6 +178,34 @@ pub fn analyze_frame_set(
         });
     }
 
+    // Global compute-queue admission: heavy jobs run one-at-a-time (default)
+    // across analysis/master-build/light-calibration. Blocks this (already
+    // spawn_blocking) thread until admitted; a cancel while queued surfaces
+    // as a normal cancelled result, mirroring a cancel during the run.
+    let queue_permit = match ctx.compute_queue.acquire(
+        crate::services::compute_queue::ComputeJobKind::Analysis,
+        &format!("Analysis: frame set {frame_set_id}"),
+        cancel_flag.clone(),
+    ) {
+        Ok((permit, _job_id)) => permit,
+        Err(_cancelled) => {
+            let mut analyses = ctx.active_analyses.lock().unwrap();
+            analyses.remove(&frame_set_id);
+            drop(analyses);
+            emit_event(emitter, "analysis-complete", &AnalysisCompleteEvent {
+                frame_set_id,
+                analyzed: 0,
+                skipped: 0,
+                failed: 0,
+                errors: Vec::new(),
+                cancelled: true,
+            });
+            return Ok(AnalyzeFrameSetResult {
+                analyzed: 0, skipped: 0, failed: 0, errors: Vec::new(), cancelled: true,
+            });
+        }
+    };
+
     // Load config and frame list under DB lock, then release
     let (analysis_config, frames_to_analyze) = {
         let db = db(ctx)?;
@@ -343,6 +371,11 @@ pub fn analyze_frame_set(
     }
 
     let skipped = total.saturating_sub(analyzed + failed);
+
+    // Release the compute-queue slot before emitting the completion event
+    // (not after) so the next queued job is admitted the moment CPU work
+    // ends, rather than waiting on event serialization.
+    drop(queue_permit);
 
     emit_event(emitter, "analysis-complete", &AnalysisCompleteEvent {
         frame_set_id,
