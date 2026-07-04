@@ -7,6 +7,7 @@ mod operations_blackhole;
 mod equipment;
 pub mod calibration_links;
 pub mod analysis;
+pub mod master_provenance;
 
 pub use schema::*;
 pub use operations::*;

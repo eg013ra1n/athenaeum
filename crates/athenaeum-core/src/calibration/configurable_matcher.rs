@@ -350,11 +350,18 @@ pub fn find_calibration_candidates(
     // Always query both regular + master rows. Master preference is applied
     // post-query so the manual modal can show masters in "Show All" even when
     // the user has master preference set to NoPreference.
+    // superseded_by_set_id IS NULL: a raw set that's been replaced by a
+    // registered master (calibration_library::register::register_master)
+    // must never surface as a candidate — the master is already relinked in
+    // its place. This is the ONE place both auto-link (OnlyCompatible) and
+    // the manual modal (IncludeIncompatible) enumerate candidate sets, so
+    // gating it here covers both call sites in api/calibration.rs.
     let query = format!(
         "SELECT id, gain, offset, binning, instrume, exptime, focallen, filter,
                 ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library
          FROM calibration_set
          WHERE imagetyp IN ('{}', '{}')
+           AND superseded_by_set_id IS NULL
          ORDER BY date_start DESC",
         imagetyp_str, master_imagetyp_str
     );

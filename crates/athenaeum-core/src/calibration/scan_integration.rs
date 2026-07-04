@@ -866,7 +866,12 @@ fn create_dark_calibration_set_with_type(
 ///
 /// Master frames are already calibrated and don't need sub-calibration.
 /// Each master frame becomes its own calibration set with is_master_library = 1.
-fn create_master_sets_from_frames(
+/// Skips any frame already in a set.
+///
+/// `pub` since Task 11 (`calibration_library::register::register_master`)
+/// calls this directly to guarantee direct-registration and scanner
+/// ingestion produce identical master `calibration_set` rows by construction.
+pub fn create_master_sets_from_frames(
     conn: &Connection,
     frame_ids: &[i64],
     imagetyp: &str,
