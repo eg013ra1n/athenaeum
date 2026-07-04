@@ -264,3 +264,10 @@ The legacy `is_archived` boolean is the soft-hide flag (`archive_frame_set` / `u
 
 - [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · [XISF 1.0](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html) · [xxHash](https://xxhash.com/)
 - 2025-11-17 modular-refactor map: `crates/athenaeum-tauri/REFACTORING.md`
+
+## Release workflow
+
+1. Rewrite `RELEASE_NOTES.md` (file is fully REPLACED each release): italic tagline line, then `## What's New` / `## Changes` / `## Bug Fixes` — user-facing EN prose.
+2. Version bump ×5: `package.json`, `crates/{athenaeum-core,athenaeum-tauri,athenaeum-web}/Cargo.toml`, `crates/athenaeum-tauri/tauri.conf.json`; refresh `Cargo.lock` via `cargo check`.
+3. One commit `chore(release): vX.Y.Z — …` on the version branch; gates (`cargo build --workspace`, core tests, `npx tsc --noEmit`); ff-merge to `main`; tag `vX.Y.Z`; push `main` + the version branch + the tag. The tag pipeline then: builds ×3 platforms → uploads to `artfrom.space/builds/<tag>/` (+ `latest` symlink + stable-named aliases) → GitLab Release from RELEASE_NOTES.md → publishes `version.json` → Discord/Telegram notifications.
+4. **Docs site (easy to forget — separate repo `../artfrom-space`):** add blog post `src/content/docs/blog/vX.Y.Z.md` (frontmatter: title/date/authors: vilen/tags: release/excerpt; Starlight de-dots the slug → `/blog/vXYZ/`) + a Version History row in `src/content/docs/releases/download.md`. Commit `docs: vX.Y.Z release post + download-page row`, push `main` — its CI builds and rsync-deploys the site. Refresh guides/manuals only when UI flows actually changed.
