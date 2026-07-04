@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub mod scan_roots;
 pub mod files;
 pub mod calibration;
-// pub mod analysis;        // Task 12
+pub mod analysis;
 
 #[derive(Debug)]
 pub enum ApiError {
