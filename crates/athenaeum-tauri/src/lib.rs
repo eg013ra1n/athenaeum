@@ -86,6 +86,7 @@ pub fn run() {
                             .expect("Failed to create image processing thread pool"),
                     ),
                     operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
+                    compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
                 }),
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),

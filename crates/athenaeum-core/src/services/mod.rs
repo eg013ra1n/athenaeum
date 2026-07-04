@@ -3,6 +3,7 @@
 //! The `ServiceContext` holds all shared state. Each backend creates one at
 //! startup and passes it (or references to it) into service functions.
 
+pub mod compute_queue;
 pub mod operation_queue;
 
 use crate::cache::MemoryImageCache;
@@ -82,4 +83,7 @@ pub struct ServiceContext {
     /// Single serialized worker queue shared by ZIP archive + file ops.
     /// Created at startup; lives for the process lifetime.
     pub operation_queue: operation_queue::OperationQueue,
+    /// Global FIFO admission queue for heavy CPU jobs (analysis, master
+    /// builds). See compute_queue module docs.
+    pub compute_queue: compute_queue::ComputeQueue,
 }

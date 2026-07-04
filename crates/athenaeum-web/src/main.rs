@@ -181,6 +181,7 @@ async fn main() {
         bright_cache: Arc::new(std::sync::RwLock::new(None)),
         image_pool: Arc::new(image_pool),
         operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
+        compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
     });
 
     // SSE broadcast channel
