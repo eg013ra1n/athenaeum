@@ -1003,11 +1003,14 @@ pub(crate) mod tests {
 
     /// Pins the M33 data-loss bug: archive (move) → restore → monitor scan
     /// must leave the JOIN chain `session_members → frames → files` intact for
-    /// every restored frame. Production runs with `PRAGMA foreign_keys = 0`, so
-    /// the failure mode is orphaning rather than CASCADE — when the scanner's
-    /// modified-file branch DELETEs and re-INSERTs `files` with a fresh id, the
-    /// original `frames` row keeps pointing at a now-missing `files.id` and the
-    /// frame becomes unreachable through the JOIN.
+    /// every restored frame. NOTE: FK enforcement is ON by default for this
+    /// codebase's connections (rusqlite's bundled sqlite3 is compiled with
+    /// SQLITE_DEFAULT_FOREIGN_KEYS=1) — an earlier version of this comment
+    /// claimed production runs with `foreign_keys = 0`, which was stale. The
+    /// scanner's modified-file branch DELETEs and re-INSERTs `files` with a
+    /// fresh id; the JOIN chain breaks under either FK mode (orphaned
+    /// `frames.file_id` with FKs off, CASCADE through `frames` into
+    /// `session_members` with FKs on), and the assertions below catch both.
     #[test]
     fn archive_then_restore_then_scan_preserves_session_members() {
         use crate::scanner::scan_directory_parallel;
@@ -1026,14 +1029,18 @@ pub(crate) mod tests {
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        // Match production: SQLite has FKs off by default, and the production
-        // catalog runs that way too (verified via PRAGMA foreign_keys on the
-        // live DB). The bug therefore is NOT a CASCADE wipe — it's orphaning:
-        // the scanner DELETEs the files row, leaving the original frames row
-        // pointing at a now-missing files.id; then re-INSERTs a fresh files
-        // row + fresh frames row with new IDs, but session_members still
-        // references the ORIGINAL frames.id. The JOIN chain through files
-        // breaks at the orphaned frames.file_id, so the UI sees an empty set.
+        // This connection matches production: FK enforcement is ON (the
+        // bundled sqlite3's SQLITE_DEFAULT_FOREIGN_KEYS=1 default — nothing
+        // in this codebase turns it off). An earlier version of this comment
+        // claimed production runs with foreign_keys=0, "verified" on the
+        // live DB via the sqlite3 CLI — but the pragma is per-connection,
+        // not a DB property, and the CLI's own connections default to OFF.
+        // Either FK mode kills the JOIN chain when the scanner DELETEs and
+        // re-INSERTs the files row with fresh IDs: with FKs off the original
+        // frames row is orphaned pointing at a now-missing files.id; with
+        // FKs on the DELETE cascades through frames into session_members.
+        // Both leave the restored set empty in the UI, and the assertions
+        // below catch both.
         conn.execute("INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
             [scan.path().to_str().unwrap()]).unwrap();
         conn.execute("INSERT INTO frames_set (id, name, is_archived) VALUES (1, 'M33', 1)", []).unwrap();

@@ -1332,7 +1332,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // SQLite can't drop NOT NULL via ALTER — rebuild once, detected by the
     // absence of the calibration_set_id column.
     if !column_exists(conn, "archive_operations", "calibration_set_id")? {
-        conn.execute_batch(
+        // FK enforcement MUST be disabled around the rebuild. With
+        // foreign_keys=ON (this codebase's connection default — rusqlite's
+        // bundled sqlite3 is compiled with SQLITE_DEFAULT_FOREIGN_KEYS=1),
+        // `DROP TABLE archive_operations` performs an implicit DELETE of
+        // every row before dropping, which fires the ON DELETE CASCADE on
+        // archive_operation_files.operation_id and
+        // archive_operation_steps.operation_id — silently wiping every
+        // operation's file manifest and audit log while the copied parent
+        // rows survive. This is step 1 of the official SQLite 12-step ALTER
+        // recipe. The pragma is a no-op inside an open transaction, so it
+        // must be issued here, OUTSIDE the BEGIN/COMMIT batch below.
+        conn.pragma_update(None, "foreign_keys", false)?;
+        let rebuild = conn.execute_batch(
             "BEGIN;
              CREATE TABLE archive_operations_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1378,7 +1390,35 @@ pub fn init_db(conn: &Connection) -> Result<()> {
              DROP TABLE archive_operations;
              ALTER TABLE archive_operations_new RENAME TO archive_operations;
              COMMIT;",
-        )?;
+        );
+        // Re-enable FK enforcement whether or not the rebuild succeeded, then
+        // surface the rebuild error (if any) — never leave the connection
+        // running unenforced.
+        let re_enable = conn.pragma_update(None, "foreign_keys", true);
+        rebuild?;
+        re_enable?;
+        // Step 10 of the 12-step recipe: verify the rebuild didn't break FK
+        // integrity (e.g. children left orphaned, or copied rows referencing
+        // missing parents). Scoped to the three tables the rebuild touches —
+        // FK constraints live on the child side, so checking these covers
+        // both directions — rather than a whole-DB check, so an unrelated
+        // pre-existing violation elsewhere can't brick catalog startup.
+        for table in ["archive_operations", "archive_operation_files", "archive_operation_steps"] {
+            let violations: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
+                [],
+                |r| r.get(0),
+            )?;
+            if violations > 0 {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                    Some(format!(
+                        "archive_operations rebuild broke foreign-key integrity: \
+                         {violations} violation(s) reported by foreign_key_check on {table}"
+                    )),
+                ));
+            }
+        }
         // Recreate the two indexes the rebuild dropped
         conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_ops_status ON archive_operations(status)", [])?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_archive_ops_frames_set ON archive_operations(frames_set_id)", [])?;
@@ -2063,5 +2103,125 @@ mod archive_schema_tests {
             .query_row("SELECT id FROM archive_operations WHERE archive_root_path='/arch3'", [], |r| r.get(0))
             .unwrap();
         assert!(new_id > 5, "post-rebuild insert must not reuse a retired id (got {new_id})");
+    }
+
+    // Regression pin for the FK cascade wipe (review finding): with
+    // foreign_keys=ON — this codebase's connection default, rusqlite's
+    // bundled sqlite3 is compiled with SQLITE_DEFAULT_FOREIGN_KEYS=1 — the
+    // rebuild's `DROP TABLE archive_operations` performs an implicit DELETE
+    // of every row before dropping, which fires the ON DELETE CASCADE on
+    // archive_operation_files.operation_id and
+    // archive_operation_steps.operation_id. On a real catalog with archive
+    // history that silently and irrecoverably wipes every operation's file
+    // manifest and audit log while the copied parent rows survive. The
+    // rebuild must therefore run with FK enforcement disabled (the official
+    // SQLite 12-step ALTER recipe's step 1).
+    #[test]
+    fn archive_operations_rebuild_preserves_child_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Manufacture the legacy (pre-migration) schema by hand so init_db
+        // takes the rebuild path: the FK parent (frames_set), the legacy
+        // archive_operations shape, and both child tables.
+        conn.execute(
+            "CREATE TABLE frames_set (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                is_custom INTEGER NOT NULL DEFAULT 0,
+                date_obs_start TEXT,
+                date_obs_end TEXT,
+                objctra TEXT,
+                objctdec TEXT,
+                total_exp_time REAL
+            )",
+            [],
+        ).unwrap();
+        conn.execute(
+            "CREATE TABLE archive_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                frames_set_id INTEGER NOT NULL,
+                archive_root_path TEXT NOT NULL,
+                flats_disposition TEXT,
+                darks_disposition TEXT,
+                bias_disposition TEXT,
+                darkflats_disposition TEXT,
+                compression TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error_message TEXT,
+                FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+            )",
+            [],
+        ).unwrap();
+        conn.execute(
+            "CREATE TABLE archive_operation_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id INTEGER NOT NULL,
+                file_id INTEGER,
+                source_path TEXT NOT NULL,
+                target_zip_path TEXT NOT NULL,
+                target_path_in_zip TEXT NOT NULL,
+                expected_hash TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                frame_role TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL,
+                FOREIGN KEY (operation_id) REFERENCES archive_operations(id) ON DELETE CASCADE
+            )",
+            [],
+        ).unwrap();
+        conn.execute(
+            "CREATE TABLE archive_operation_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operation_id INTEGER NOT NULL,
+                operation_file_id INTEGER,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                actual_hash TEXT,
+                error_message TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                FOREIGN KEY (operation_id) REFERENCES archive_operations(id) ON DELETE CASCADE,
+                FOREIGN KEY (operation_file_id) REFERENCES archive_operation_files(id) ON DELETE CASCADE
+            )",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute(
+            "INSERT INTO archive_operations (id, frames_set_id, archive_root_path, compression, status, started_at)
+             VALUES (1, 1, '/arch', 'store', 'completed', '2026-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO archive_operation_files
+             (id, operation_id, source_path, target_zip_path, target_path_in_zip,
+              expected_hash, disposition, frame_role, file_size_bytes)
+             VALUES (1, 1, '/data/L1.fits', '/arch/M31.zip', 'L1.fits', 'aabb', 'archive', 'light', 1024)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO archive_operation_steps (id, operation_id, operation_file_id, stage, status)
+             VALUES (1, 1, 1, 'copy', 'completed')",
+            [],
+        ).unwrap();
+
+        // Trigger the rebuild.
+        init_db(&conn).unwrap();
+
+        let files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archive_operation_files WHERE operation_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files, 1, "rebuild must not cascade-wipe the operation's file manifest");
+        let steps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archive_operation_steps WHERE operation_id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(steps, 1, "rebuild must not cascade-wipe the operation's audit log");
+        // And the whole parent→children JOIN chain must still resolve.
+        let joined: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM archive_operations ao
+             JOIN archive_operation_files aof ON aof.operation_id = ao.id
+             JOIN archive_operation_steps aos ON aos.operation_id = ao.id
+             WHERE ao.id = 1",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(joined, 1, "parent and both children must survive the rebuild joinable");
     }
 }
