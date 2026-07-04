@@ -208,17 +208,12 @@ pub fn start_scan(ctx: &ServiceContext, root_id: i64) -> Result<ScanResultDto, A
     );
 
     // If reconciliation changed frames, wipe and rebuild calibration sets.
-    // Best-effort: a failure here must not discard an already-successful,
-    // already-persisted scan result (harmonized with start_scan_with_progress's
-    // pre-conversion web behavior — see Task 9 report drift catalog).
+    // Failures propagate: deletions or rebuilds must succeed to maintain
+    // data consistency. Matches original desktop behavior (Task 9 drift).
     if reconcile.frames_renamed > 0 {
-        if let Err(e) = crate::db::delete_calibration_sets_for_root(&conn, root_id) {
-            tracing::warn!(root_id, error = %e, "failed to delete calibration sets for root");
-        }
-        match recreate_calibration_sets_for_root(&conn, root_id) {
-            Ok(count) => result.calibration_sets_created = count,
-            Err(e) => tracing::warn!(root_id, error = %e, "failed to recreate calibration sets for root"),
-        }
+        crate::db::delete_calibration_sets_for_root(&conn, root_id)?;
+        let count = recreate_calibration_sets_for_root(&conn, root_id)?;
+        result.calibration_sets_created = count;
     }
 
     // Update last_scan timestamp
@@ -658,18 +653,14 @@ pub fn start_scan_with_progress<E: crate::events::ProgressEmitter>(
 
     // Interactive-only follow-up: if reconciliation renamed frames, rebuild
     // calibration sets under this root. Monitor cycles never trigger this path
-    // because they don't toggle `unique_camera`. Best-effort: a failure here
-    // must not discard the (already-persisted) scan result.
+    // because they don't toggle `unique_camera`. Failures propagate to maintain
+    // data consistency. Matches original desktop behavior (Task 9 drift).
     if reconcile.frames_renamed > 0 {
         let db = db(ctx)?;
         let conn = db.conn();
-        if let Err(e) = crate::db::delete_calibration_sets_for_root(&conn, root_id) {
-            tracing::warn!(root_id, error = %e, "failed to delete calibration sets for root");
-        }
-        match recreate_calibration_sets_for_root(&conn, root_id) {
-            Ok(count) => result.calibration_sets_created = count,
-            Err(e) => tracing::warn!(root_id, error = %e, "failed to recreate calibration sets for root"),
-        }
+        crate::db::delete_calibration_sets_for_root(&conn, root_id)?;
+        let count = recreate_calibration_sets_for_root(&conn, root_id)?;
+        result.calibration_sets_created = count;
     }
 
     tracing::info!(
