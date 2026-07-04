@@ -3,7 +3,8 @@
 //! N full frames in RAM — the working set is N × one band.
 
 pub mod banded;
-// combine (Task 7) and engine (Task 8) land in later tasks.
+pub mod combine;
+// engine (Task 8) lands in a later task.
 
 #[derive(Debug)]
 pub enum IntegrationError {
