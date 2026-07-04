@@ -7,7 +7,7 @@
 //! master-build / light-calibration jobs will call `acquire` the same way.
 
 use crate::api::{db, ApiError};
-use crate::services::compute_queue::ComputeQueueEntry;
+use crate::services::compute_queue::{ComputeQueue, ComputeQueueEntry};
 use crate::services::ServiceContext;
 use crate::settings::keys;
 
@@ -16,24 +16,39 @@ pub fn get_compute_queue(ctx: &ServiceContext) -> Vec<ComputeQueueEntry> {
     ctx.compute_queue.snapshot()
 }
 
-/// Cancel a queued or running compute job. `NotFound` if `job_id` is
-/// unknown (already finished or never existed) — matches `cancel_analysis`'s
-/// identical-shape precedent in `api::analysis`.
-pub fn cancel_compute_job(ctx: &ServiceContext, job_id: i64) -> Result<(), ApiError> {
-    if ctx.compute_queue.cancel(job_id) {
+/// The cancel + NotFound mapping, on a bare queue. Split out of
+/// `cancel_compute_job` so the mapping is testable without faking a full
+/// `ServiceContext` (this IS the handler's logic, not a parallel copy).
+pub(crate) fn cancel_on(queue: &ComputeQueue, job_id: i64) -> Result<(), ApiError> {
+    if queue.cancel(job_id) {
         Ok(())
     } else {
         Err(ApiError::NotFound(format!("no compute job with id {job_id}")))
     }
 }
 
-/// Persist and apply the global compute-queue concurrency ceiling.
-/// Clamped to 1..=8: 0 would stall the queue forever (nothing ever admits),
-/// and unbounded values defeat the point of a heavy-job admission queue.
-pub fn set_compute_max_concurrent(ctx: &ServiceContext, n: usize) -> Result<(), ApiError> {
+/// Cancel a queued or running compute job. `NotFound` if `job_id` is
+/// unknown (already finished or never existed) — matches `cancel_analysis`'s
+/// identical-shape precedent in `api::analysis`.
+pub fn cancel_compute_job(ctx: &ServiceContext, job_id: i64) -> Result<(), ApiError> {
+    cancel_on(&ctx.compute_queue, job_id)
+}
+
+/// Bounds check for `set_compute_max_concurrent`, split out so the real
+/// guard (not a test-local copy) is what tests pin. 0 would stall the queue
+/// forever (nothing ever admits), and unbounded values defeat the point of
+/// a heavy-job admission queue.
+pub(crate) fn validate_max_concurrent(n: usize) -> Result<(), ApiError> {
     if n == 0 || n > 8 {
         return Err(ApiError::Invalid("compute.max_concurrent must be 1..=8".into()));
     }
+    Ok(())
+}
+
+/// Persist and apply the global compute-queue concurrency ceiling
+/// (clamped to 1..=8 — see `validate_max_concurrent`).
+pub fn set_compute_max_concurrent(ctx: &ServiceContext, n: usize) -> Result<(), ApiError> {
+    validate_max_concurrent(n)?;
     let db = db(ctx)?;
     let conn = db.conn();
     ctx.settings
@@ -45,12 +60,16 @@ pub fn set_compute_max_concurrent(ctx: &ServiceContext, n: usize) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    // The api handlers are thin; what needs pinning is the settings key
-    // default and the NotFound classification (cancel_compute_job's true
-    // path is exercised by compute_queue.rs's own `cancel` tests — the
-    // ComputeQueue this file's tests would need is heavier to fake than
-    // just re-asserting this contract).
+    // The api handlers are thin; what needs pinning is the settings-key
+    // default, the cancel→NotFound mapping, and the max_concurrent bounds
+    // check. The latter two are tested through the REAL functions
+    // (`cancel_on`, `validate_max_concurrent`) — the ctx-taking wrappers
+    // only forward to them, so nothing handler-side is left untested
+    // besides trivial field plumbing.
     use super::*;
+    use crate::services::compute_queue::ComputeJobKind;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     #[test]
     fn default_max_concurrent_is_one() {
@@ -58,23 +77,29 @@ mod tests {
     }
 
     #[test]
-    fn cancel_unknown_job_is_not_found() {
-        let queue = crate::services::compute_queue::ComputeQueue::new();
-        assert!(!queue.cancel(999));
+    fn cancel_on_unknown_job_is_not_found() {
+        let queue = ComputeQueue::new();
+        assert!(matches!(cancel_on(&queue, 999), Err(ApiError::NotFound(_))));
     }
 
     #[test]
-    fn set_compute_max_concurrent_rejects_zero_and_above_eight() {
-        // Pure input-validation guard — doesn't need a full ServiceContext.
-        fn validate(n: usize) -> Result<(), ApiError> {
-            if n == 0 || n > 8 {
-                return Err(ApiError::Invalid("compute.max_concurrent must be 1..=8".into()));
-            }
-            Ok(())
-        }
-        assert!(validate(0).is_err());
-        assert!(validate(9).is_err());
-        assert!(validate(1).is_ok());
-        assert!(validate(8).is_ok());
+    fn cancel_on_known_job_is_ok() {
+        let queue = ComputeQueue::new();
+        // Empty queue + free slot: acquire admits immediately on this
+        // thread; hold the permit so the job stays in the registry.
+        let flag = Arc::new(AtomicBool::new(false));
+        let (_permit, job_id) = queue
+            .acquire(ComputeJobKind::Analysis, "held", flag.clone())
+            .unwrap();
+        assert!(cancel_on(&queue, job_id).is_ok());
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "cancel flag flipped");
+    }
+
+    #[test]
+    fn validate_max_concurrent_rejects_zero_and_above_eight() {
+        assert!(matches!(validate_max_concurrent(0), Err(ApiError::Invalid(_))));
+        assert!(matches!(validate_max_concurrent(9), Err(ApiError::Invalid(_))));
+        assert!(validate_max_concurrent(1).is_ok());
+        assert!(validate_max_concurrent(8).is_ok());
     }
 }
