@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// What to do with a calibration type's files during archiving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
 pub enum ArchiveDisposition {
     Move,
@@ -31,7 +31,7 @@ impl ArchiveDisposition {
 }
 
 /// Compression mode for archive zips.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
 pub enum ArchiveCompression {
     Store,
@@ -162,7 +162,7 @@ impl ArchiveStatus {
 }
 
 /// The frame role determines which zip a file goes into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameRole {
     Light,
@@ -208,7 +208,7 @@ impl FrameRole {
 
 /// Disposition selections for the four calibration types.
 /// `None` means the type is not present in the chain (so no question was asked).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct Dispositions {
     pub flats: Option<ArchiveDisposition>,
     pub darks: Option<ArchiveDisposition>,
@@ -234,7 +234,7 @@ pub struct ArchiveOperation {
 }
 
 /// One row of `archive_operation_files`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ArchiveOperationFile {
     pub id: i64,
     pub operation_id: i64,
@@ -263,7 +263,7 @@ pub struct ArchiveOperationStep {
 }
 
 /// One zip the operation will produce.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct PlannedZip {
     pub zip_path: String,            // absolute
     pub zip_filename: String,
@@ -275,7 +275,7 @@ pub struct PlannedZip {
 /// Warning emitted by the planner when the user chose Move on a calibration set
 /// that's also linked to other (non-archived) frame sets. UI uses this to
 /// disable the Move radio for that calibration type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct SharedCalibrationWarning {
     pub frame_role: FrameRole,
     pub calibration_set_id: i64,
@@ -283,7 +283,7 @@ pub struct SharedCalibrationWarning {
 }
 
 /// Conflict emitted by the planner when a target zip filename already exists.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ZipFilenameConflict {
     pub zip_path: String,
     pub zip_filename: String,
@@ -291,7 +291,7 @@ pub struct ZipFilenameConflict {
 
 /// The complete plan for an archive operation. Returned by `plan_archive_operation`
 /// for the disposition dialog preview, and (after `commit_plan`) used to drive the executor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ArchivePlan {
     pub frames_set_id: i64,
     pub archive_root_path: String,
@@ -305,7 +305,7 @@ pub struct ArchivePlan {
 }
 
 /// How to resolve filename conflicts. Provided by the user via the conflict dialog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictResolution {
     Overwrite,
@@ -313,7 +313,7 @@ pub enum ConflictResolution {
 }
 
 /// Summary used by the resume banner + Archive page.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ArchiveOperationSummary {
     pub id: i64,
     pub frames_set_id: i64,

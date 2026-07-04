@@ -59,7 +59,7 @@ pub struct AutofindProgress {
     pub closest_distance_deg: Option<f64>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum AutofindStatus {
     Processing,

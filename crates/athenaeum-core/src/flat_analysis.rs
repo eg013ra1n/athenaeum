@@ -36,7 +36,7 @@
 use anyhow::{anyhow, Context, Result};
 use astroimage::{ImageConverter, ImageMetadata, PixelData};
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FlatContourOpts {
     /// Resampling factor in percent. Final width/height are

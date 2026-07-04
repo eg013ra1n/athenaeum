@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::coordinates::{format_dec_sexagesimal, format_ra_sexagesimal};
 
 /// A stored plate solve result, mirroring the plate_solves table.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct PlateSolveRecord {
     pub id: Option<i64>,
     pub frame_id: i64,

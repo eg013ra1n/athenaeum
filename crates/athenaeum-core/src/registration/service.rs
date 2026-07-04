@@ -28,7 +28,7 @@ use super::reference::select_reference;
 // ── progress event shapes ─────────────────────────────────────────────────────
 
 /// Per-frame progress event emitted on the `stacking-prep-progress` channel.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 struct StackingPrepProgressEvent {
     frame_id: i64,
@@ -42,7 +42,7 @@ struct StackingPrepProgressEvent {
 }
 
 /// Summary event emitted once on the `stacking-prep-complete` channel.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 struct StackingPrepCompleteEvent {
     reference_frame_id: i64,

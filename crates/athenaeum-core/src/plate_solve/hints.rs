@@ -31,7 +31,7 @@ pub fn frame_fov_deg(frame: &Frame) -> Option<f64> {
 
 /// Field-of-view summary across a set of LIGHT frames (the catalog-tier
 /// recommendation input).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct FovSummary {
     pub light_count: u32,
     pub computable_count: u32,

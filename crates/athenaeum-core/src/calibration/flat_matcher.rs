@@ -14,7 +14,7 @@ use super::flat_groups::{FlatGroup, detect_flat_groups};
 use super::configurable_matcher::load_config;
 
 /// Represents a flat group with match score and metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FlatGroupMatch {
     /// The flat group
     pub group: FlatGroup,
@@ -33,7 +33,7 @@ pub struct FlatGroupMatch {
 }
 
 /// Timing relationship between flat group and light frame/session
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 pub enum FlatTiming {
     /// Flat group taken before the light frame
     Before,

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 /// Progress event payload for `bulk-move-to-black-hole-progress`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkMoveProgressEvent {
     pub current: usize,

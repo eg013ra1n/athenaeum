@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// All WCS and affine fields are `Option<f64>` because the reference row
 /// stores identity/solved values while failed rows may have `NULL` affine
 /// columns.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistrationRecord {
     pub id: Option<i64>,
@@ -187,7 +187,7 @@ pub fn clear_registration_for_frame_set(
 
 /// A row from `frame_set_reference`, returned to callers and serialised across
 /// the IPC/HTTP boundary.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameSetReference {
     pub frames_set_id: i64,

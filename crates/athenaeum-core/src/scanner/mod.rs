@@ -95,7 +95,7 @@ pub struct FileProcessResult {
 }
 
 /// Progress event sent to frontend via Tauri events
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, ts_rs::TS)]
 pub struct ScanProgressEvent {
     pub current: usize,
     pub total: usize,
@@ -106,7 +106,7 @@ pub struct ScanProgressEvent {
 }
 
 /// Scan completion event
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, ts_rs::TS)]
 pub struct ScanCompleteEvent {
     pub root_id: i64,
     pub files_found: usize,

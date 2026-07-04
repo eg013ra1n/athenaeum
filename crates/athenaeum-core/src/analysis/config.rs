@@ -17,7 +17,7 @@ fn default_batch_concurrency() -> u32 {
 
 /// Star detection and analysis configuration.
 /// Stored as JSON in the settings table under key "analysis.config".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct AnalysisConfig {
     /// Detection threshold in sigma above background. Default: 5.0
     pub detection_sigma: f64,

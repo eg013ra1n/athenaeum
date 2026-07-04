@@ -14,7 +14,7 @@ const SETTINGS_KEY: &str = "plate_solve.config";
 /// and per-camera pixel-size defaults. Every field is `#[serde(default)]`,
 /// so configs written by older versions (which carried extra, now-removed
 /// keys) still load — unknown keys are ignored.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 pub struct PlateSolveConfig {
     /// SIP distortion polynomial order passed to `solvemyastro` (2 or 3).
     /// Higher orders fit more distortion at the cost of needing more matched

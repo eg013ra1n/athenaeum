@@ -12,7 +12,7 @@ use std::collections::HashMap;
 pub const CONFIG_VERSION: i32 = 3;
 
 /// Match mode for parameter comparison
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchMode {
     /// Must match exactly (with small tolerance for floats)
@@ -30,7 +30,7 @@ impl Default for MatchMode {
 }
 
 /// Configuration for a single parameter matching rule
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ParameterConfig {
     /// How to match this parameter
     pub mode: MatchMode,
@@ -127,7 +127,7 @@ impl ParameterConfig {
 
 /// Configuration for matching a specific calibration type
 /// Contains rules for all 9 matchable parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationTypeConfig {
     /// Camera/instrument name - exact by default, can be set to ignore
     pub instrume: ParameterConfig,
@@ -185,7 +185,7 @@ impl CalibrationTypeConfig {
 }
 
 /// Configuration for a source type (what calibrations it can link to)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ts_rs::TS)]
 pub struct SourceTypeConfig {
     /// Flat calibration rules (for Lights)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,7 +202,7 @@ pub struct SourceTypeConfig {
 }
 
 /// Behavioral options for a source type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct BehavioralOptions {
     /// Link Bias sets as sub-calibration to Dark sets
     #[serde(default)]
@@ -226,7 +226,7 @@ impl Default for BehavioralOptions {
 }
 
 /// Preference for Master frames vs frame sets
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum MasterPreference {
     PreferMaster,
@@ -241,7 +241,7 @@ impl Default for MasterPreference {
 }
 
 /// Clustering configuration for a calibration type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ClusteringConfig {
     /// Maximum age of frames to consider valid (in days)
     pub max_age_days: i64,
@@ -267,7 +267,7 @@ impl Default for ClusteringConfig {
 }
 
 /// Scoring configuration for calibration matching
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ScoringConfig {
     /// Weight for temperature proximity in scoring (0.0-1.0)
     pub temperature_match_weight: f64,
@@ -291,7 +291,7 @@ impl Default for ScoringConfig {
 }
 
 /// Warning thresholds for calibration matching
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct WarningConfig {
     /// Flat calibration date warning threshold in days
     pub flat_date_warning_days: i64,
@@ -312,7 +312,7 @@ impl Default for WarningConfig {
 }
 
 /// Complete calibration matching configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationMatchingConfig {
     /// Schema version for migration support
     pub version: i32,

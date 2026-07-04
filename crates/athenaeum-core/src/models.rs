@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 
 /// Represents a physical file on disk
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct File {
     pub id: Option<i64>,
     pub path: String,
@@ -22,7 +22,7 @@ pub struct File {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 pub enum FileFormat {
     FITS,
     XISF,
@@ -53,7 +53,7 @@ pub fn is_mono_with_ambiguous_filter(bayerpat: &Option<String>, filter: &Option<
 }
 
 /// Represents a FITS/XISF frame with metadata
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ts_rs::TS)]
 pub struct Frame {
     pub id: Option<i64>,
     pub file_id: i64,
@@ -97,7 +97,7 @@ pub struct Frame {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 pub enum ImageType {
     Light,
     Dark,
@@ -148,7 +148,7 @@ impl ImageType {
 }
 
 /// Monitored scan root path
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ScanRoot {
     pub id: Option<i64>,
     pub path: String,
@@ -164,7 +164,7 @@ pub struct ScanRoot {
 /// frontend needs to apply "keep" rules (modified time, assigned scan root)
 /// and to display meaningful per-group summaries (filename, frame type,
 /// observation date).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateFile {
     pub file_id: i64,
@@ -187,7 +187,7 @@ pub struct DuplicateFile {
 ///
 /// `file_paths` + `file_ids` are kept as parallel-array convenience fields
 /// for existing consumers (folder view, etc.); new code should use `files`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct DuplicateGroup {
     pub id: Option<i64>,
     pub size: i64,
@@ -200,7 +200,7 @@ pub struct DuplicateGroup {
 }
 
 /// Result of a bulk move-to-black-hole operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkMoveResult {
     pub moved: usize,
@@ -209,7 +209,7 @@ pub struct BulkMoveResult {
 }
 
 /// Black hole entry (soft-deleted file)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct BlackHoleEntry {
     pub id: Option<i64>,
     pub file_id: i64,
@@ -221,7 +221,7 @@ pub struct BlackHoleEntry {
 }
 
 /// Folder similarity result for duplicate detection
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FolderSimilarity {
     pub folder_a: String,
     pub folder_b: String,
@@ -234,7 +234,7 @@ pub struct FolderSimilarity {
 }
 
 /// Frames set (collection of related frames)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FramesSet {
     pub id: Option<i64>,
     pub name: Option<String>,
@@ -257,7 +257,7 @@ pub struct FramesSet {
 }
 
 /// Application settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct Setting {
     pub key: String,
     pub value: String,
@@ -265,7 +265,7 @@ pub struct Setting {
 }
 
 /// Imaging night - top-level grouping of frames by observation night
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ImagingNight {
     pub id: Option<i64>,
     pub frames_set_id: i64,
@@ -275,7 +275,7 @@ pub struct ImagingNight {
 }
 
 /// Session - grouping of frames by instrument within an imaging night
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct Session {
     pub id: Option<i64>,
     pub imaging_night_id: i64,
@@ -288,7 +288,7 @@ pub struct Session {
 }
 
 /// DTO: File with optional frame metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FileWithFrame {
     pub file: File,
     pub frame: Option<Frame>,
@@ -298,7 +298,7 @@ pub struct FileWithFrame {
 /// duplicate-detection flag so the UI can show which missing-metadata files
 /// also have a duplicate somewhere in the catalog. Uses camelCase on the
 /// wire to match the frontend convention.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MissingMetadataRow {
     pub file: File,
@@ -307,28 +307,28 @@ pub struct MissingMetadataRow {
 }
 
 /// DTO: Session with its frames
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct SessionWithFrames {
     pub session: Session,
     pub frames: Vec<FileWithFrame>,
 }
 
 /// DTO: Imaging night with its sessions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ImagingNightWithSessions {
     pub imaging_night: ImagingNight,
     pub sessions: Vec<SessionWithFrames>,
 }
 
 /// DTO: Complete frame set detail with nights and sessions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FrameSetDetail {
     pub frames_set: FramesSet,
     pub nights: Vec<ImagingNightWithSessions>,
 }
 
 /// Equipment/Camera statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CameraStats {
     pub instrume: String,
     pub frame_count: i64,
@@ -338,7 +338,7 @@ pub struct CameraStats {
 }
 
 /// Calibration set with extended metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationSetDetail {
     pub id: Option<i64>,
     pub imagetyp: ImageType,
@@ -369,7 +369,7 @@ pub struct CalibrationSetDetail {
 }
 
 /// Result of dark library creation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct DarkLibraryResult {
     pub sets_created: i64,
     pub frames_grouped: i64,
@@ -377,7 +377,7 @@ pub struct DarkLibraryResult {
 }
 
 /// Result of file relinking operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct RelinkResult {
     pub files_matched: usize,
     pub files_new: usize,
@@ -386,7 +386,7 @@ pub struct RelinkResult {
 }
 
 /// Represents an orphaned file that couldn't be relinked
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct OrphanedFile {
     pub id: i64,
     pub path: String,
@@ -399,7 +399,7 @@ pub struct OrphanedFile {
 }
 
 /// Sky atlas imaging location (for visualization)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ImagingLocation {
     pub id: i64,
@@ -462,7 +462,7 @@ pub enum SplitSelection {
 }
 
 /// Link between a frame/calibration set and its required calibration set
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationLink {
     pub id: Option<i64>,
     pub source_id: i64,
@@ -477,7 +477,7 @@ pub struct CalibrationLink {
 }
 
 /// Calibration status for a single frame
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FrameCalibrationStatus {
     pub frame_id: i64,
     pub has_flats: bool,
@@ -494,7 +494,7 @@ pub struct FrameCalibrationStatus {
 }
 
 /// Complete calibration hierarchy for a frame
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationHierarchy {
     pub light_frame_id: i64,
     pub flat_sets: Vec<CalibrationSetWithLinks>,
@@ -504,14 +504,14 @@ pub struct CalibrationHierarchy {
 }
 
 /// Calibration set with its sub-calibration links
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationSetWithLinks {
     pub set: CalibrationSetDetail,
     pub sub_calibration: Vec<CalibrationLink>,  // Links to Dark/Bias sets for this set
 }
 
 /// Warning about calibration quality
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationWarning {
     pub warning_type: String,  // 'date' or 'temperature'
     pub message: String,
@@ -520,7 +520,7 @@ pub struct CalibrationWarning {
 }
 
 /// Statistics about calibration for a frame set
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationStats {
     pub total_frames: usize,
     pub frames_with_flats: usize,
@@ -533,7 +533,7 @@ pub struct CalibrationStats {
 }
 
 /// Group of frames sharing the same calibration set combination
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationGroup {
     pub flat_set_id: Option<i64>,
     pub dark_set_id: Option<i64>,
@@ -551,7 +551,7 @@ pub struct CalibrationGroup {
 }
 
 /// Complete calibration grouping for a frame set
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FrameSetCalibrationGroups {
     pub groups: Vec<CalibrationGroup>,
     pub uncalibrated_frame_count: usize,
@@ -560,7 +560,7 @@ pub struct FrameSetCalibrationGroups {
 }
 
 /// Tolerance configuration for calibration matching
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationTolerance {
     pub flat_date_warning_days: i64,
     pub dark_date_warning_days: i64,
@@ -578,7 +578,7 @@ impl Default for CalibrationTolerance {
 // ========== Calibration Hierarchy View Structures ==========
 
 /// Hierarchical calibration view organized by Date → Camera → Filter
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationHierarchyView {
     pub date_groups: Vec<CalibrationDateGroup>,
     pub total_frames: usize,
@@ -587,7 +587,7 @@ pub struct CalibrationHierarchyView {
 }
 
 /// Group of frames for a single session date
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationDateGroup {
     pub date: String,                    // e.g., "2024-01-15"
     pub date_display: String,            // e.g., "January 15, 2024"
@@ -597,7 +597,7 @@ pub struct CalibrationDateGroup {
 }
 
 /// Group of frames for a single camera within a date
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationCameraGroup {
     pub instrume: String,                // Camera name
     pub filter_groups: Vec<CalibrationFilterGroup>,
@@ -606,7 +606,7 @@ pub struct CalibrationCameraGroup {
 }
 
 /// Sub-calibration linked to a calibration set with full details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct SubCalibrationDetail {
     pub calibration_type: String,        // "Dark", "DarkFlat", "Bias"
     pub set: CalibrationSetDetail,       // Full set details
@@ -615,7 +615,7 @@ pub struct SubCalibrationDetail {
 }
 
 /// A calibration set with the count of frames that use it
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationSetWithFrameCount {
     pub set: CalibrationSetDetail,
     pub frame_count: i64,              // How many frames in this group use this set
@@ -625,7 +625,7 @@ pub struct CalibrationSetWithFrameCount {
 }
 
 /// A calibration set with match score for manual selection
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationSetWithScore {
     pub set: CalibrationSetDetail,
     pub match_score: f64,              // 0.0-1.0, higher is better match
@@ -633,7 +633,7 @@ pub struct CalibrationSetWithScore {
 }
 
 /// Details about how well a calibration set matches light frame parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct MatchDetails {
     pub instrume_match: bool,          // Camera matches
     pub binning_match: bool,           // Binning matches
@@ -646,7 +646,7 @@ pub struct MatchDetails {
 }
 
 /// Average parameters of light frames for manual selection display
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct LightFrameParameters {
     pub instrume: Option<String>,
     pub binning: Option<String>,
@@ -664,7 +664,7 @@ pub struct LightFrameParameters {
 }
 
 /// Parameters of a calibration set for sub-calibration selection display
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationSetParameters {
     pub set_id: i64,
     pub imagetyp: String,
@@ -685,7 +685,7 @@ pub struct CalibrationSetParameters {
 }
 
 /// Group of frames for a single filter within a camera
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationFilterGroup {
     pub filter: Option<String>,          // None = "No Filter"
     pub filter_display: String,          // "Ha", "OIII", "No Filter", or "Ha (60s)" when split by exptime
@@ -699,7 +699,7 @@ pub struct CalibrationFilterGroup {
 }
 
 /// A light frame with its calibration status
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct LightFrameWithCalibration {
     pub frame_id: i64,
     pub file_id: i64,
@@ -730,7 +730,7 @@ pub struct LightFrameWithCalibration {
 // ========== Calendar View Structures ==========
 
 /// Summary of a frame set for calendar display
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarFrameSetSummary {
     pub id: i64,
@@ -744,7 +744,7 @@ pub struct CalendarFrameSetSummary {
 }
 
 /// Group of unorganized frames for calendar display
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarUnorganizedGroup {
     pub id: String,
@@ -758,7 +758,7 @@ pub struct CalendarUnorganizedGroup {
 }
 
 /// Summary of imaging activity for a single calendar day
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarDayEvent {
     pub date: String, // YYYY-MM-DD
@@ -769,7 +769,7 @@ pub struct CalendarDayEvent {
 }
 
 /// Full calendar data for a month
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalendarMonthData {
     pub year: i32,
@@ -783,7 +783,7 @@ pub struct CalendarMonthData {
 
 /// Edits to apply to calibration set metadata (selective fields)
 /// None means don't change that field
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationMetadataEdits {
     pub ccd_temp: Option<f64>,
     pub gain: Option<f64>,
@@ -821,7 +821,7 @@ where
 ///
 /// `is_master` is the one exception: it's a derived tri-state paired with
 /// `imagetyp`, not a user-typed value, so plain `Option<bool>` is fine.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameMetadataEdits {
     #[serde(default, deserialize_with = "deserialize_double_option")]
@@ -888,7 +888,7 @@ pub struct FrameMetadataEdits {
 }
 
 /// Excluded frame entry (frame excluded during auto-generation)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ExcludedFrameEntry {
     pub file_id: i64,
     pub path: String,
@@ -900,7 +900,7 @@ pub struct ExcludedFrameEntry {
 /// Excluded frame with full file + frame metadata. Mirrors `MissingMetadataRow`
 /// so the same view shell can render both — adds the exclusion `reason` and
 /// `excluded_at` so the Excluded Frames page can surface why a row landed there.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExcludedFrameRow {
     pub file: File,
@@ -911,7 +911,7 @@ pub struct ExcludedFrameRow {
 }
 
 /// Frame analysis results from star detection and image quality metrics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FrameAnalysis {
     pub id: Option<i64>,
     pub frame_id: i64,
@@ -940,7 +940,7 @@ pub struct FrameAnalysis {
 
 /// Individual star detection result with position, shape, and quality metrics.
 /// Used for client-side annotation overlay rendering.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct StarMetric {
     pub id: Option<i64>,
     pub frame_analysis_id: i64,
@@ -961,7 +961,7 @@ pub struct StarMetric {
 }
 
 /// Response for the get_frame_star_metrics command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct StarMetricsResponse {
     pub stars: Vec<StarMetric>,
     pub metrics: FrameAnalysis,
@@ -976,7 +976,7 @@ pub struct StarMetricsResponse {
 /// One frame set that ultimately consumes a calibration set, either directly
 /// (a Light using the set) or transitively via the sub-cal chain
 /// (e.g. Light → Dark → Bias).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationSetConsumer {
     pub frame_set_id: i64,
@@ -985,7 +985,7 @@ pub struct CalibrationSetConsumer {
 }
 
 /// Original calibration set metadata values (backed up before editing)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CalibrationSetOriginals {
     pub set_id: i64,
     pub ccd_temp: Option<f64>,
@@ -999,7 +999,7 @@ pub struct CalibrationSetOriginals {
 }
 
 /// Reason a frame was skipped during auto-merge candidate evaluation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
     NoCoords,
@@ -1008,7 +1008,7 @@ pub enum SkipReason {
 }
 
 /// A candidate light frame eligible for merging into a frame set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct CandidateFrame {
     pub frame_id: i64,
     pub file_id: i64,
@@ -1021,7 +1021,7 @@ pub struct CandidateFrame {
 }
 
 /// A frame skipped during auto-merge, with reason.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct SkippedFrame {
     pub frame_id: i64,
     pub filename: String,
@@ -1029,14 +1029,14 @@ pub struct SkippedFrame {
 }
 
 /// Result of `find_new_frames_for_set` command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FindNewFramesResult {
     pub candidates: Vec<CandidateFrame>,
     pub scan_was_awaited: bool,
 }
 
 /// Report produced by merging candidates into a frame set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct MergeReport {
     pub frames_set_id: i64,
     pub added_count: i64,
@@ -1048,7 +1048,7 @@ pub struct MergeReport {
 }
 
 /// One row of the frame-set merge audit log, as returned to the frontend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct MergeLogEntry {
     pub id: i64,
     pub frames_set_id: i64,

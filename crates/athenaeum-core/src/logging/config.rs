@@ -15,7 +15,7 @@ const MODULE_TARGETS: [(&str, &[&str]); 4] = [
     ),
 ];
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LoggingConfig {
     pub level: String,
@@ -88,7 +88,7 @@ impl LoggingConfig {
 /// Response body for `get_logging_config` — the effective config plus
 /// whether the `ATHENAEUM_LOG` env override is active (in which case
 /// `apply_config` no-ops and the UI should show the config as read-only).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct LoggingConfigResponse {
     pub config: LoggingConfig,

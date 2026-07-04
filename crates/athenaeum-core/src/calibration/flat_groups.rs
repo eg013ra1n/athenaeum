@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::Frame;
 
 /// Represents a group of flat frames captured in close temporal proximity
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct FlatGroup {
     /// IDs of frames in this group
     pub frame_ids: Vec<i64>,

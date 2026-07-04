@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
 
 /// Progress report for frame set processing
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ProcessingProgress {
     pub total_frames: usize,
     pub processed_frames: usize,
@@ -16,7 +16,7 @@ pub struct ProcessingProgress {
 }
 
 /// Statistics for completed frame set processing
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ProcessingStats {
     pub total_frames: i64,
     pub frames_with_full_calibration: i64,

@@ -150,7 +150,7 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
 
 /// User-configurable annotation display settings.
 /// Stored as JSON in the settings table under key "blink.annotation_config".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct AnnotationSettings {
     /// Color scheme: "eccentricity", "fwhm", or "uniform"
     pub color_scheme: String,

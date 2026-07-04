@@ -8,7 +8,7 @@ use std::collections::HashMap;
 // ============================================================================
 
 /// Camera type based on Bayer pattern presence
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraType {
     /// One-shot color camera (has Bayer pattern like RGGB, BGGR)
@@ -36,7 +36,7 @@ impl CameraType {
 }
 
 /// A single frame for export
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportFrame {
     /// Frame ID in database
@@ -72,7 +72,7 @@ pub struct ExportFrame {
 }
 
 /// A calibration set with its frames (legacy - kept for compatibility)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportCalibrationSet {
     /// Calibration set ID
@@ -94,7 +94,7 @@ pub struct ExportCalibrationSet {
 // ============================================================================
 
 /// Information about a calibration set and its sub-calibrations (recursive)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationSetInfo {
     /// Calibration set ID
@@ -118,7 +118,7 @@ pub struct CalibrationSetInfo {
 }
 
 /// A subgroup of frames that share the same calibration set links
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationSubgroup {
     /// Unique subgroup key (hash of calibration set IDs)
@@ -139,7 +139,7 @@ pub struct CalibrationSubgroup {
 
 /// An export group - frames that will be stacked into one master light
 /// Groups frames by filter AND camera type (OSC vs Mono)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportGroup {
     /// Unique group key for identification (e.g., "Ha_Mono")
@@ -179,7 +179,7 @@ impl ExportGroup {
 // ============================================================================
 
 /// Plan for creating all required master calibration files
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterCreationPlan {
     /// Ordered list of masters to create (respects dependencies)
@@ -198,7 +198,7 @@ impl Default for MasterCreationPlan {
 }
 
 /// Information about a master calibration file to create
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterInfo {
     /// Calibration set ID
@@ -272,7 +272,7 @@ pub fn sanitize_display_folder_name(name: &str) -> String {
 // ============================================================================
 
 /// Calibration route for UI display - shows complete hierarchy and script preview
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationRoute {
     /// Export groups and their calibration trees
@@ -282,7 +282,7 @@ pub struct CalibrationRoute {
 }
 
 /// A group in the calibration route display
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationRouteGroup {
     /// Group display name (e.g., "Ha (Mono)")
@@ -298,7 +298,7 @@ pub struct CalibrationRouteGroup {
 }
 
 /// A node in the calibration tree for UI display
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationTreeNode {
     /// Node type: "Light", "Flat", "Dark", "Bias", "DarkFlat"
@@ -320,7 +320,7 @@ pub struct CalibrationTreeNode {
 }
 
 /// Summary of the calibration route
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationRouteSummary {
     /// Total export groups
@@ -346,7 +346,7 @@ pub struct CalibrationRouteSummary {
 // ============================================================================
 
 /// Progress event emitted during export file organization
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportProgressEvent {
     pub frame_set_id: i64,
@@ -361,7 +361,7 @@ pub struct ExportProgressEvent {
 }
 
 /// Event emitted when export finishes (success or failure)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportCompleteEvent {
     pub frame_set_id: i64,
@@ -377,7 +377,7 @@ pub struct ExportCompleteEvent {
 // ============================================================================
 
 /// Group of light frames by filter with their calibrations (legacy)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterExportGroup {
     /// Filter name (None for unfiltered/OSC)
@@ -393,7 +393,7 @@ pub struct FilterExportGroup {
 }
 
 /// Summary of calibration availability
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationSummary {
     /// Total flat frames available
@@ -415,7 +415,7 @@ pub struct CalibrationSummary {
 }
 
 /// Complete export data for a frame set
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportData {
     /// Frame set ID
@@ -440,7 +440,7 @@ pub struct ExportData {
 }
 
 /// Result of an export operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportResult {
     /// Whether the export was successful
@@ -462,7 +462,7 @@ pub struct ExportResult {
 // ============================================================================
 
 /// Complete export summary for the enhanced UI
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportSummary {
     /// Frame set ID
@@ -490,7 +490,7 @@ pub struct ExportSummary {
 }
 
 /// Summary for a single filter group (filter + camera type combination)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FilterGroupSummary {
     /// Filter name (None for unfiltered/luminance)
@@ -526,7 +526,7 @@ pub struct FilterGroupSummary {
 }
 
 /// Exposure time group (frames with same exposure)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ExposureGroup {
     /// Exposure time in seconds
@@ -538,7 +538,7 @@ pub struct ExposureGroup {
 }
 
 /// Detailed calibration information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationDetail {
     /// Calibration set ID
@@ -562,7 +562,7 @@ pub struct CalibrationDetail {
 }
 
 /// Individual frame detail for expandable list
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameDetail {
     /// Frame ID
@@ -588,7 +588,7 @@ pub struct FrameDetail {
 }
 
 /// Folder structure preview for export
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderPreview {
     /// Root folder name
@@ -602,7 +602,7 @@ pub struct FolderPreview {
 }
 
 /// A node in the folder structure tree
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderNode {
     /// Node name (folder or file name)
@@ -618,7 +618,7 @@ pub struct FolderNode {
 }
 
 /// Type of folder node
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum FolderNodeType {
     /// A folder
@@ -630,7 +630,7 @@ pub enum FolderNodeType {
 }
 
 /// Detailed warning with full context
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DetailedWarning {
     /// Warning type
@@ -656,7 +656,7 @@ pub struct DetailedWarning {
 }
 
 /// Warning type categories
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningType {
     /// Temperature mismatch between lights and calibration
@@ -676,7 +676,7 @@ pub enum WarningType {
 }
 
 /// Warning severity levels
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningSeverity {
     /// Informational (won't affect results much)
@@ -696,7 +696,7 @@ pub enum WarningSeverity {
 /// Controls the keyword nesting order used to build the folder structure.
 /// WBPP's "Grouping Keywords with Pre" reads folder nesting to determine
 /// calibration chains — parent calibrates child.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct WbppExportConfig {
     /// Keyword nesting order (outermost first).
@@ -718,7 +718,7 @@ impl Default for WbppExportConfig {
 }
 
 /// Setup instructions for configuring WBPP grouping keywords
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct WbppSetupInstructions {
@@ -729,7 +729,7 @@ pub struct WbppSetupInstructions {
 }
 
 /// A single WBPP keyword instruction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct WbppKeywordInstruction {
