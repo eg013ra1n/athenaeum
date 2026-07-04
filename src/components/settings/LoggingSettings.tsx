@@ -30,7 +30,9 @@ export default function LoggingSettings() {
   const { notify } = useNotifications();
 
   const [level, setLevel] = useState('info');
-  const [modules, setModules] = useState<Record<string, string>>({});
+  // Partial, not Record: LoggingConfig.modules is a HashMap-backed optional-
+  // index map on the generated type ({ [key in string]?: string }).
+  const [modules, setModules] = useState<Partial<Record<string, string>>>({});
   const [envOverrideActive, setEnvOverrideActive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);

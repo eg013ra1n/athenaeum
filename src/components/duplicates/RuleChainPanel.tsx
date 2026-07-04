@@ -1,11 +1,6 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Plus, RotateCcw, Settings } from 'lucide-react';
-import type {
-  Rule,
-  RuleChain,
-  RuleKind,
-  ScanRootWithAvailability,
-} from '../../types/models';
+import type { Rule, RuleChain, RuleKind, ScanRootWithAvailability } from '../../types/helpers';
 import { RULE_KIND_META, defaultRuleChain } from './keepRules';
 import { RuleRow } from './rules/RuleRow';
 

@@ -5,7 +5,7 @@ import type {
   PlateSolveProgressEvent,
   PlateSolveCompleteEvent,
   CatalogStatusInfo,
-} from '../types/plate-solve';
+} from '../types/helpers';
 
 export type FrameSolveStatus =
   | { kind: 'pending' }

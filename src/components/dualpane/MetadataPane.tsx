@@ -22,7 +22,8 @@ import {
   PlateSolveBatchPanel,
   type PlateSolveBatchPanelHandle,
 } from '../plate-solve/PlateSolveBatchPanel';
-import type { PlateSolveCompleteEvent, PlateSolveRecord } from '../../types/plate-solve';
+import type { PlateSolveRecord } from '../../types/plate-solve';
+import type { PlateSolveCompleteEvent } from '../../types/helpers';
 import { formatTimestamp } from '../../utils/dateFormatting';
 
 interface Props {

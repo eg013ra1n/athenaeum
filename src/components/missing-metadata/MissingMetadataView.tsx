@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom';
 import { Pencil, X } from 'lucide-react';
 import { api } from '../../api';
-import { ImageType } from '../../types/models';
+import { ImageTypeValues } from '../../types/helpers';
 import type { ExcludedFrameRow, FileWithFrame, MissingMetadataRow } from '../../types/models';
 
 import { MissingMetadataToolbar, type FilterChip, type EligibleCounts } from './MissingMetadataToolbar';
@@ -279,7 +279,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
       // Plate Solve: LIGHT AND missing coordinates. The existing flow is only
       // meant to seed coords on no-coord frames.
       const plateSolveEligible =
-        frame.imagetyp === ImageType.Light && flags.coordinates;
+        frame.imagetyp === ImageTypeValues.Light && flags.coordinates;
       if (plateSolveEligible) {
         plateSolveIds.push(frameId);
       }
@@ -289,7 +289,7 @@ export const MissingMetadataView: React.FC<MissingMetadataViewProps> = ({
         frame.ra != null &&
         frame.dec != null &&
         !(frame.ra === 0 && frame.dec === 0);
-      if (frame.imagetyp === ImageType.Light && hasCoords && flags.object) {
+      if (frame.imagetyp === ImageTypeValues.Light && hasCoords && flags.object) {
         findObjectIds.push(frameId);
       }
 

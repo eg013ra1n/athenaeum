@@ -13,7 +13,8 @@ import {
 } from 'lucide-react';
 import { api } from '../api';
 import { useRegistrationProgressContext } from '../contexts/RegistrationProgressContext';
-import type { RegistrationRecord, FrameRegistrationStatus } from '../types/models';
+import type { RegistrationRecord } from '../types/models';
+import type { FrameRegistrationStatus } from '../types/helpers';
 
 interface StackingPrepTabProps {
   framesSetId: number;
@@ -383,7 +384,11 @@ export function StackingPrepTab({ framesSetId, frameSetName, referenceFrameId }:
                         </span>
                       </td>
                       <td className="px-3 py-2">
-                        <StatusBadge status={r.status} />
+                        {/* RegistrationRecord.status is a plain `string` on
+                            the generated type (Rust field has no enum); the
+                            actual values are always one of the documented
+                            FrameRegistrationStatus literals. */}
+                        <StatusBadge status={r.status as FrameRegistrationStatus} />
                       </td>
                       <td className="px-3 py-2 text-right text-content-muted tabular-nums">
                         {r.matchedStars > 0 ? r.matchedStars : '—'}

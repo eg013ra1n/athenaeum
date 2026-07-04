@@ -3,13 +3,8 @@ import { CheckCircle2, Loader2, ShieldCheck, XCircle } from 'lucide-react';
 import { api } from '../../api';
 import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
 import { useDeepVerify, groupVerifyStatus } from '../../hooks/useDeepVerify';
-import type {
-  DuplicateGroup,
-  ScanRootWithAvailability,
-  ScanRoot,
-  RuleChain,
-  RuleKind,
-} from '../../types/models';
+import type { DuplicateGroup, ScanRoot } from '../../types/models';
+import type { ScanRootWithAvailability, RuleChain, RuleKind } from '../../types/helpers';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { AlertDialog } from '../AlertDialog';
 import { DuplicatesToolbar, type SortMode } from './DuplicatesToolbar';

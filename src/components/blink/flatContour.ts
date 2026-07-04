@@ -13,7 +13,8 @@
 // settings store (`flat_contour.*` keys). Defaults match PI exactly.
 
 import { api } from '../../api';
-import type { FlatContourOpts, FlatContourPlot } from '../../types/models';
+import type { FlatContourOpts } from '../../types/models';
+import type { FlatContourPlot } from '../../types/helpers';
 
 /** PixInsight FlatContourPlot v1.3.1 defaults — used when no settings
  *  override is provided. */

@@ -11,7 +11,7 @@ import { isTauri } from '../utils/platform';
 import { getArchiveSettings, setArchiveCompression as apiSetArchiveCompression } from '../api/archive';
 import type { ArchiveCompression } from '../types/archive';
 import type { AnnotationSettings } from '../types/analysis-config';
-import { DEFAULT_ANNOTATION_SETTINGS } from '../types/analysis-config';
+import { DEFAULT_ANNOTATION_SETTINGS } from '../types/helpers';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
 

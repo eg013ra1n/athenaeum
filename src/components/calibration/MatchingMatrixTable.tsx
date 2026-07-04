@@ -1,13 +1,16 @@
-import {
+import type {
   MatchMode,
   ParameterConfig,
   SourceTypeConfig,
   CalibrationTypeConfig,
+} from "../../types/calibration-config";
+import {
+  MatchModeValues,
   CONFIGURABLE_PARAMETERS,
   getParameterLabel,
   supportsWarningMode,
   validateThresholds,
-} from "../../types/calibration-config";
+} from "../../types/helpers";
 import { Lock, AlertTriangle } from "lucide-react";
 
 interface MatchingMatrixTableProps {
@@ -39,11 +42,11 @@ export default function MatchingMatrixTable({
       return "bg-surface-hover/40 text-content-muted border-border/50";
     }
     switch (mode) {
-      case MatchMode.Exact:
+      case MatchModeValues.Exact:
         return "bg-success/30 text-success border-success/50";
-      case MatchMode.Warning:
+      case MatchModeValues.Warning:
         return "bg-warning/30 text-warning border-warning/50";
-      case MatchMode.Ignore:
+      case MatchModeValues.Ignore:
         return "bg-surface-hover/30 text-content-muted border-border/50";
       default:
         return "bg-surface-hover/30 text-content-muted border-border/50";
@@ -87,22 +90,22 @@ export default function MatchingMatrixTable({
     // Using symbols: = (Exact), ≈ (Warning), - (Ignore)
     const getModeOptions = () => {
       if (isLocked) {
-        return <option value={MatchMode.Exact}>=</option>;
+        return <option value={MatchModeValues.Exact}>=</option>;
       }
       if (canWarn) {
         return (
           <>
-            <option value={MatchMode.Exact}>=</option>
-            <option value={MatchMode.Warning}>≈</option>
-            <option value={MatchMode.Ignore}>-</option>
+            <option value={MatchModeValues.Exact}>=</option>
+            <option value={MatchModeValues.Warning}>≈</option>
+            <option value={MatchModeValues.Ignore}>-</option>
           </>
         );
       }
       // Exact or disabled (no warning option)
       return (
         <>
-          <option value={MatchMode.Exact}>=</option>
-          <option value={MatchMode.Ignore}>-</option>
+          <option value={MatchModeValues.Exact}>=</option>
+          <option value={MatchModeValues.Ignore}>-</option>
         </>
       );
     };
@@ -128,7 +131,7 @@ export default function MatchingMatrixTable({
             />
           )}
         </div>
-        {paramConfig.mode === MatchMode.Warning && (
+        {paramConfig.mode === MatchModeValues.Warning && (
           <div className="flex flex-col gap-1">
             <input
               type="number"

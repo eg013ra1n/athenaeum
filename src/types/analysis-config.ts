@@ -1,57 +1,92 @@
-/** Star detection and analysis configuration */
-export interface AnalysisConfig {
-  detection_sigma: number;
-  min_star_area: number;
-  max_star_area: number;
-  saturation_fraction: number;
-  max_stars: number;
-  trail_threshold: number;
-  mrs_layers: number;
-  measure_cap: number;
-  fit_max_iter: number;
-  fit_tolerance: number;
-  fit_max_rejects: number;
-  batch_concurrency: number;
-}
+// AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
+// Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
-/** Default analysis configuration values */
-export const DEFAULT_ANALYSIS_CONFIG: AnalysisConfig = {
-  detection_sigma: 5.0,
-  min_star_area: 5,
-  max_star_area: 2000,
-  saturation_fraction: 0.95,
-  max_stars: 500,
-  trail_threshold: 0.5,
-  mrs_layers: 0,
-  measure_cap: 2000,
-  fit_max_iter: 25,
-  fit_tolerance: 1e-4,
-  fit_max_rejects: 5,
-  batch_concurrency: 3,
-};
+export type AnalysisConfig = { 
+/**
+ * Detection threshold in sigma above background. Default: 5.0
+ */
+detection_sigma: number, 
+/**
+ * Minimum connected-component area in pixels. Default: 5
+ */
+min_star_area: number, 
+/**
+ * Maximum connected-component area in pixels. Default: 2000
+ */
+max_star_area: number, 
+/**
+ * Reject stars with peak > this fraction of saturation. Default: 0.95
+ */
+saturation_fraction: number, 
+/**
+ * Keep only the brightest N stars. Default: 500
+ */
+max_stars: number, 
+/**
+ * R² threshold for trail detection. Default: 0.5 (range 0.0-1.0)
+ */
+trail_threshold: number, 
+/**
+ * MRS wavelet noise estimation layers. Default: 0 (disabled)
+ */
+mrs_layers: number, 
+/**
+ * Max stars to PSF-fit. 0 = measure all. Default: 2000
+ */
+measure_cap: number, 
+/**
+ * LM max iterations for measurement pass. Default: 25
+ */
+fit_max_iter: number, 
+/**
+ * LM convergence tolerance for measurement pass. Default: 1e-4
+ */
+fit_tolerance: number, 
+/**
+ * LM consecutive reject bailout. Default: 5
+ */
+fit_max_rejects: number, 
+/**
+ * Concurrent frames during batch analysis. Default: auto (cores/3, min 2).
+ * Higher values increase throughput but use more memory (~200MB per concurrent frame).
+ */
+batch_concurrency: number, };
 
-/** Star annotation display settings */
-export interface AnnotationSettings {
-  color_scheme: string; // "eccentricity" | "fwhm" | "uniform"
-  show_direction_tick: boolean;
-  min_radius: number;
-  max_radius: number;
-  line_width: number; // 1-3
-  ecc_good: number;
-  ecc_warn: number;
-  fwhm_good: number;
-  fwhm_warn: number;
-}
+export type AnnotationSettings = { 
+/**
+ * Color scheme: "eccentricity", "fwhm", or "uniform"
+ */
+color_scheme: string, 
+/**
+ * Draw a direction tick along the elongation axis
+ */
+show_direction_tick: boolean, 
+/**
+ * Minimum ellipse semi-axis radius in output pixels
+ */
+min_radius: number, 
+/**
+ * Maximum ellipse semi-axis radius in output pixels
+ */
+max_radius: number, 
+/**
+ * Line thickness: 1 = single pixel, 2 = 3px cross, 3 = 5px diamond
+ */
+line_width: number, 
+/**
+ * Eccentricity threshold: below this is green (good)
+ */
+ecc_good: number, 
+/**
+ * Eccentricity threshold: above this is red (problem)
+ */
+ecc_warn: number, 
+/**
+ * FWHM ratio threshold: below this is green (good)
+ */
+fwhm_good: number, 
+/**
+ * FWHM ratio threshold: above this is red (problem)
+ */
+fwhm_warn: number, };
 
-/** Default annotation settings matching rustafits defaults */
-export const DEFAULT_ANNOTATION_SETTINGS: AnnotationSettings = {
-  color_scheme: 'eccentricity',
-  show_direction_tick: true,
-  min_radius: 6.0,
-  max_radius: 60.0,
-  line_width: 2,
-  ecc_good: 0.5,
-  ecc_warn: 0.6,
-  fwhm_good: 1.3,
-  fwhm_warn: 2.0,
-};

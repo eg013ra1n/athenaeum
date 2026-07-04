@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
-import type { BlackholeChangedEvent } from '../types/models';
+import type { BlackholeChangedEvent } from '../types/helpers';
 
 /**
  * Reactive blackhole state hook.

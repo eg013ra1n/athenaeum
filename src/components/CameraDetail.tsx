@@ -6,7 +6,7 @@ import MasterDarkLibrary from "./MasterDarkLibrary";
 import MasterFlatLibrary from "./MasterFlatLibrary";
 import DualPaneFileBrowser from "./dualpane/DualPaneFileBrowser";
 import { api } from '../api';
-import { ImageType } from "../types/models";
+import { ImageTypeValues } from "../types/helpers";
 import { useScanRootsWithAvailability } from "../hooks/useTauri";
 import { format } from "date-fns";
 
@@ -82,8 +82,8 @@ export default function CameraDetail({ instrume, onClose, initialTab, highlightS
   }, [instrume]);
 
   // Memoize imageTypeFilter arrays to prevent infinite re-render loops
-  const darksFilter = useMemo(() => [ImageType.Dark, ImageType.Bias, ImageType.DarkFlat], []);
-  const flatsFilter = useMemo(() => [ImageType.Flat], []);
+  const darksFilter = useMemo(() => [ImageTypeValues.Dark, ImageTypeValues.Bias, ImageTypeValues.DarkFlat], []);
+  const flatsFilter = useMemo(() => [ImageTypeValues.Flat], []);
 
   const handleRefreshLibrary = async () => {
     try {

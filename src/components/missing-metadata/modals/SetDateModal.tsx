@@ -75,7 +75,10 @@ export const SetDateModal: React.FC<SetDateModalProps> = ({
     try {
       setApplying(true);
       setError(null);
-      const edits: FrameMetadataEdits = { dateObs };
+      // isMaster is not a tri-state (absent | null | value) field like the
+      // others here — it's a plain, required, nullable boolean on the wire —
+      // so it must be explicitly set even though this modal never edits it.
+      const edits: FrameMetadataEdits = { dateObs, isMaster: null };
       await api.invoke<number>('bulk_update_frame_metadata', {
         frameIds: eligibleFrameIds,
         edits,

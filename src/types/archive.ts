@@ -1,109 +1,25 @@
-// Mirrors crates/athenaeum-core/src/archive/models.rs
+// AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
+// Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
-export type ArchiveDisposition = 'move' | 'copy' | 'skip';
-export type ArchiveCompression = 'store' | 'deflate';
-export type ConflictResolution = 'overwrite' | 'add_suffix';
-export type FrameRole = 'light' | 'flat' | 'dark' | 'bias' | 'darkflat';
+export type ArchiveDisposition = "move" | "copy" | "skip";
 
-export interface Dispositions {
-  flats: ArchiveDisposition | null;
-  darks: ArchiveDisposition | null;
-  bias: ArchiveDisposition | null;
-  darkflats: ArchiveDisposition | null;
-}
+export type ArchiveCompression = "store" | "deflate";
 
-export interface ArchiveSettings {
-  rootPath: string | null;
-  compression: ArchiveCompression;
-}
+export type ConflictResolution = "overwrite" | "add_suffix";
 
-export interface ArchiveOperationFile {
-  id: number;
-  operation_id: number;
-  file_id: number | null;
-  source_path: string;
-  target_zip_path: string;
-  target_path_in_zip: string;
-  expected_hash: string;
-  disposition: string;
-  frame_role: string;
-  file_size_bytes: number;
-}
+export type FrameRole = "light" | "flat" | "dark" | "bias" | "darkflat";
 
-export interface PlannedZip {
-  zip_path: string;
-  zip_filename: string;
-  frame_role: FrameRole;
-  file_count: number;
-  total_size_bytes: number;
-}
+export type Dispositions = { flats: ArchiveDisposition | null, darks: ArchiveDisposition | null, bias: ArchiveDisposition | null, darkflats: ArchiveDisposition | null, };
 
-export interface SharedCalibrationWarning {
-  frame_role: FrameRole;
-  calibration_set_id: number;
-  other_frames_set_ids: number[];
-}
+export type ArchiveOperationFile = { id: number, operation_id: number, file_id: number | null, source_path: string, target_zip_path: string, target_path_in_zip: string, expected_hash: string, disposition: string, frame_role: string, file_size_bytes: number, };
 
-export interface ZipFilenameConflict {
-  zip_path: string;
-  zip_filename: string;
-}
+export type PlannedZip = { zip_path: string, zip_filename: string, frame_role: FrameRole, file_count: number, total_size_bytes: number, };
 
-export interface ArchivePlan {
-  frames_set_id: number;
-  archive_root_path: string;
-  dispositions: Dispositions;
-  compression: ArchiveCompression;
-  files: ArchiveOperationFile[];
-  zips: PlannedZip[];
-  shared_calibrations: SharedCalibrationWarning[];
-  conflicts: ZipFilenameConflict[];
-  total_size_bytes: number;
-}
+export type SharedCalibrationWarning = { frame_role: FrameRole, calibration_set_id: number, other_frames_set_ids: Array<number>, };
 
-export interface ArchiveOperationSummary {
-  id: number;
-  frames_set_id: number;
-  frame_set_name: string | null;
-  status: string;
-  started_at: string;
-  finished_at: string | null;
-  error_message: string | null;
-}
+export type ZipFilenameConflict = { zip_path: string, zip_filename: string, };
 
-export interface ArchivedFrameSetSummary {
-  frames_set_id: number;
-  name: string | null;
-  archived_at: string | null;
-  operation_id: number | null;
-  archive_root_path: string | null;
-  started_at: string | null;
-  lights_count: number;
-  flats_count: number;
-  darks_count: number;
-  bias_count: number;
-  darkflats_count: number;
-}
+export type ArchivePlan = { frames_set_id: number, archive_root_path: string, dispositions: Dispositions, compression: ArchiveCompression, files: Array<ArchiveOperationFile>, zips: Array<PlannedZip>, shared_calibrations: Array<SharedCalibrationWarning>, conflicts: Array<ZipFilenameConflict>, total_size_bytes: number, };
 
-export interface ArchiveProgressEvent {
-  operation_id: number;
-  stage: string;
-  current: number;
-  total: number;
-  message: string;
-}
+export type ArchiveOperationSummary = { id: number, frames_set_id: number, frame_set_name: string | null, status: string, started_at: string, finished_at: string | null, error_message: string | null, };
 
-export interface ArchiveRoot {
-  id: number;
-  path: string;
-  label: string | null;
-  is_default: boolean;
-}
-
-export interface ArchiveZip {
-  path: string;
-  filename: string;
-  frame_role: FrameRole | string;
-  exists: boolean;
-  size_bytes: number;
-}

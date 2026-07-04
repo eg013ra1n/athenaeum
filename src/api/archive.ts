@@ -1,15 +1,17 @@
 import { api } from './index';
 import type {
   ArchiveCompression,
-  ArchivedFrameSetSummary,
   ArchiveOperationSummary,
   ArchivePlan,
-  ArchiveRoot,
-  ArchiveSettings,
-  ArchiveZip,
   ConflictResolution,
   Dispositions,
 } from '../types/archive';
+import type {
+  ArchivedFrameSetSummary,
+  ArchiveRoot,
+  ArchiveSettings,
+  ArchiveZip,
+} from '../types/helpers';
 
 export async function getArchiveSettings(): Promise<ArchiveSettings> {
   return api.invoke<ArchiveSettings>('get_archive_settings');

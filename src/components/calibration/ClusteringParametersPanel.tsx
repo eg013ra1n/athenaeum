@@ -1,7 +1,11 @@
 import { ClusteringConfig, ScoringConfig } from "../../types/calibration-config";
 
 interface ClusteringParametersPanelProps {
-  clustering: Record<string, ClusteringConfig>;
+  // Partial, not Record: the generated CalibrationMatchingConfig types this
+  // as a HashMap-backed optional-index map ({ [key in string]?: T }), which
+  // is the accurate shape (a key can be genuinely absent) — Record<string, T>
+  // over-promised every key was always present.
+  clustering: Partial<Record<string, ClusteringConfig>>;
   scoring: ScoringConfig;
   onClusteringUpdate: (
     calibrationType: string,

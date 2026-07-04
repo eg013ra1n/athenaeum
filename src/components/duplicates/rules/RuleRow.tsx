@@ -1,6 +1,6 @@
 import React from 'react';
 import { ArrowDown, ArrowUp, Trash2 } from 'lucide-react';
-import type { Rule, ScanRootWithAvailability } from '../../../types/models';
+import type { Rule, ScanRootWithAvailability } from '../../../types/helpers';
 import { RULE_KIND_META } from '../keepRules';
 import { MasterRootConfig } from './MasterRootConfig';
 import { PathContainsConfig } from './PathContainsConfig';

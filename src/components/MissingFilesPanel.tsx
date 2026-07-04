@@ -13,7 +13,7 @@ import {
   Loader2,
   CheckCircle2,
 } from 'lucide-react';
-import type { MissingFileRecord } from '../types/models';
+import type { MissingFileRecord } from '../types/helpers';
 
 interface MissingFilesPanelProps {
   rootId: number;

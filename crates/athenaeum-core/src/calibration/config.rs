@@ -38,11 +38,13 @@ pub struct ParameterConfig {
     pub required: bool,
     /// For Warning mode: threshold that triggers warning display (must be <= matching_threshold)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub warning_threshold: Option<f64>,
     /// For Warning mode: threshold that rejects match if exceeded
     /// If value difference > matching_threshold, the calibration set is rejected.
     /// If value difference > warning_threshold but <= matching_threshold, match is accepted with warning.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub matching_threshold: Option<f64>,
     /// Whether this parameter can be changed by user (false = locked to Exact mode)
     #[serde(default)]
@@ -189,15 +191,19 @@ impl CalibrationTypeConfig {
 pub struct SourceTypeConfig {
     /// Flat calibration rules (for Lights)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub flat: Option<CalibrationTypeConfig>,
     /// DarkFlat calibration rules (for Flats)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub darkflat: Option<CalibrationTypeConfig>,
     /// Dark calibration rules
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub dark: Option<CalibrationTypeConfig>,
     /// Bias calibration rules
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub bias: Option<CalibrationTypeConfig>,
 }
 

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
 import { api, type UnlistenFn } from '../api';
-import type { ScanProgressEvent, ScanCompleteEvent, ScanResult, OrphanedFile } from '../types/models';
+import type { ScanProgressEvent, ScanCompleteEvent, OrphanedFile } from '../types/models';
+import type { ScanResult } from '../types/helpers';
 import { useNotifications } from '../contexts/NotificationContext';
 
 // Extended result that includes missing files info
@@ -70,9 +71,15 @@ export function useScanProgress() {
                 bias_count: payload.bias_count,
                 darkflats_count: payload.darkflats_count,
                 calibration_sets_created: payload.calibration_sets_created,
-                frames_renamed: payload.frames_renamed ?? 0,
-                calibration_sets_deleted: payload.calibration_sets_deleted ?? 0,
-                sessions_updated: payload.sessions_updated ?? 0,
+                // ScanCompleteEvent (the live Tauri event payload) never
+                // carried these 3 fields on the Rust side — they only exist
+                // on the ScanResult DTO returned by the `start_scan_with_progress`
+                // invoke (see p1-ts-inventory.md row 29). The old hand-written
+                // type declared them optional here and this call site already
+                // defaulted to 0, so behavior is unchanged.
+                frames_renamed: 0,
+                calibration_sets_deleted: 0,
+                sessions_updated: 0,
                 cancelled: payload.cancelled,
               },
               progress: null,

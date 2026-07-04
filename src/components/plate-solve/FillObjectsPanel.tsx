@@ -10,11 +10,8 @@ import {
 } from 'lucide-react';
 import { api } from '../../api';
 import { useNotifications } from '../../contexts/NotificationContext';
-import type {
-  AutofindProgressEvent,
-  AutofindCompleteEvent,
-  AutofindStatus,
-} from '../../types/plate-solve';
+import type { AutofindStatus } from '../../types/plate-solve';
+import type { AutofindProgressEvent, AutofindCompleteEvent } from '../../types/helpers';
 
 export interface FillObjectsPanelProps {
   /** All frame IDs shown in the current missing-object list. Optional when the panel is driven imperatively. */

@@ -2,7 +2,8 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Folder, File as FileIcon, ArrowLeft, AlertCircle, FolderOpen, AlertTriangle, Play } from 'lucide-react';
 import { api } from '../api';
 import { revealItemInDir } from '../api/desktop';
-import type { ScanRootWithAvailability, DuplicateGroup, DirectoryContents, FileWithFrame } from '../types/models';
+import type { DuplicateGroup, FileWithFrame } from '../types/models';
+import type { ScanRootWithAvailability, DirectoryContents } from '../types/helpers';
 import BlinkViewer from './BlinkViewer';
 
 /** Split a file path by either / or \ */

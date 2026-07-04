@@ -1,6 +1,7 @@
 import { format, parseISO } from 'date-fns';
 import { Camera, Clock } from 'lucide-react';
-import type { CalendarYearData, CalendarDayEvent } from '../../types/models';
+import type { CalendarDayEvent } from '../../types/models';
+import type { CalendarYearData } from '../../types/helpers';
 
 interface CalendarYearListProps {
   data: CalendarYearData;

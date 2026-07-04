@@ -28,9 +28,13 @@ use super::reference::select_reference;
 // ── progress event shapes ─────────────────────────────────────────────────────
 
 /// Per-frame progress event emitted on the `stacking-prep-progress` channel.
+///
+/// `pub(crate)` (not module-private) so `ts_export.rs` can reference the type
+/// path from outside this module — the ts-rs harness lives in the same crate,
+/// so crate-visibility is sufficient; no need to expose it outside the crate.
 #[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
-struct StackingPrepProgressEvent {
+pub(crate) struct StackingPrepProgressEvent {
     frame_id: i64,
     current: usize,
     total: usize,
@@ -42,9 +46,11 @@ struct StackingPrepProgressEvent {
 }
 
 /// Summary event emitted once on the `stacking-prep-complete` channel.
+///
+/// `pub(crate)` for the same reason as `StackingPrepProgressEvent` above.
 #[derive(Clone, Debug, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
-struct StackingPrepCompleteEvent {
+pub(crate) struct StackingPrepCompleteEvent {
     reference_frame_id: i64,
     aligned: usize,
     failed: usize,

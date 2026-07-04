@@ -47,8 +47,9 @@ import { useNotifications } from '../../contexts/NotificationContext';
 import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { useBulkMoveToBlackHole } from '../../hooks/useBulkMoveToBlackHole';
-import { ImageType } from '../../types/models';
-import type { FileWithFrame, Frame, ScanRootWithAvailability } from '../../types/models';
+import { ImageTypeValues } from '../../types/helpers';
+import type { FileWithFrame, Frame } from '../../types/models';
+import type { ScanRootWithAvailability } from '../../types/helpers';
 import BlinkViewer from '../BlinkViewer';
 import { computeMissingFlags, type MissingFlags } from '../missing-metadata/MissingMetadataTable';
 import CatalogSearch from './CatalogSearch';
@@ -1740,7 +1741,7 @@ const MISSING_LABELS: Record<keyof MissingFlags, string> = {
 function applicableMissing(frame: Frame | null): (keyof MissingFlags)[] {
   if (!frame) return [];
   const flags = computeMissingFlags(frame);
-  const isLight = frame.imagetyp === ImageType.Light;
+  const isLight = frame.imagetyp === ImageTypeValues.Light;
   const keys: (keyof MissingFlags)[] = isLight
     ? ['coordinates', 'object', 'date', 'camera', 'type']
     : ['date', 'camera', 'type'];

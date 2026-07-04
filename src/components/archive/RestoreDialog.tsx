@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { getRestoreSuggestions, startRestoreOperation } from '../../api/archive';
 import { pickDirectory } from '../../api/desktop';
-import type { ArchivedFrameSetSummary } from '../../types/archive';
+import type { ArchivedFrameSetSummary } from '../../types/helpers';
 
 interface Props {
   item: ArchivedFrameSetSummary;

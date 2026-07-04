@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api';
 import { cancelArchiveOperation } from '../../api/archive';
-import type { ArchiveProgressEvent } from '../../types/archive';
+import type { ArchiveProgressEvent } from '../../types/helpers';
 import { useNotifications } from '../../contexts/NotificationContext';
 
 interface Props {

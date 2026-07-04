@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { api } from '../api';
 import { isTauri } from '../utils/platform';
 import { useNotifications } from '../contexts/NotificationContext';
-import type { UpdateInfo } from '../types/models';
+import type { UpdateInfo } from '../types/helpers';
 
 /**
  * On desktop startup, run the existing update check once per launch (unless the

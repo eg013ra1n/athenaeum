@@ -2,11 +2,11 @@ import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
 import type {
   ExportData,
-  ExportableFrameSet,
   CalibrationRoute,
   ExportSummary,
   WbppExportConfig,
 } from '../types/export';
+import type { ExportableFrameSet } from '../types/helpers';
 
 interface UseExportDataResult {
   data: ExportData | null;

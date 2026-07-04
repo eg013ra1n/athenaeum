@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { Sparkles, Trash2, Eye, Clock, MapPin, AlertCircle, Target, Pencil, Check, X, Star, AlertTriangle, Grip, RotateCcw, Filter, LayoutGrid, Table2, RotateCw, FileX, Archive } from 'lucide-react';
-import type { FramesSetWithCount, AutoGenerateResult } from '../types/models';
+import type { AutoGenerateResult, FramesSetWithCount } from '../types/helpers';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import {
   ObjectsFilterPanel,

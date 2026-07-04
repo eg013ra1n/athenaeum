@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { Trash2, Pencil, Check, X, Star, ChevronUp, ChevronDown, MapPin, Clock, RotateCw, Archive } from 'lucide-react';
-import type { FramesSetWithCount } from '../types/models';
+import type { FramesSetWithCount } from '../types/helpers';
 
 export type ObjectsTab = 'stage' | 'wip' | 'archive';
 

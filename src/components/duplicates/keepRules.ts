@@ -1,10 +1,5 @@
-import type {
-  DuplicateFile,
-  DuplicateGroup,
-  Rule,
-  RuleChain,
-  RuleKind,
-} from '../../types/models';
+import type { DuplicateFile, DuplicateGroup } from '../../types/models';
+import type { Rule, RuleChain, RuleKind } from '../../types/helpers';
 
 /**
  * Per-group deletion status for the header badge.

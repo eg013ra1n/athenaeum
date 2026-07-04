@@ -425,7 +425,10 @@ function deriveTableData(
       camera: s.instrume,
       focallen: s.focallen,
       subCalSetId: subCal?.set.id ?? null,
-      subCalType: subCal?.calibration_type ?? null,
+      // CalibrationLink.calibration_type is a plain `string` on the wire
+      // (Rust field has no enum, just a doc-commented convention); narrowed
+      // here since a sub-calibration link is always Dark/DarkFlat/Bias.
+      subCalType: (subCal?.calibration_type ?? null) as 'Dark' | 'DarkFlat' | 'Bias' | null,
       gain: s.gain,
       offset: s.offset,
       isMaster: s.is_master,

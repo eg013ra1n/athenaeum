@@ -1,5 +1,5 @@
 import { X, CheckCircle2, XCircle, Sun, Moon, Aperture, CircleDot, Eclipse, Layers, FileWarning, AlertTriangle, RefreshCw } from 'lucide-react';
-import type { ScanResult } from '../types/models';
+import type { ScanResult } from '../types/helpers';
 
 interface ScanSummaryModalProps {
   isOpen: boolean;

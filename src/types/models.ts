@@ -1,1283 +1,390 @@
-// TypeScript interfaces matching Rust models
+// AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
+// Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
-export interface BlackholeChangedEvent {
-  file_id: number;
-  action: 'blackholed' | 'restored';
-}
+export type FileFormat = "FITS" | "XISF";
 
-// Result of the `check_for_updates` command. Fields are snake_case to match
-// the Rust command's serialization (see athenaeum-tauri commands::core).
-export interface UpdateInfo {
-  current_version: string;
-  latest_version: string;
-  is_update_available: boolean;
-  download_url: string;
-}
+export type ImageType = "Light" | "Dark" | "Flat" | "Bias" | "DarkFlat" | "MasterLight" | "MasterDark" | "MasterFlat" | "MasterBias" | "MasterDarkFlat";
 
-export enum FileFormat {
-  FITS = "FITS",
-  XISF = "XISF",
-}
+export type File = { id: number | null, path: string, filename: string, size: number, modified_at: string, format: FileFormat, created_at: string, metadata_hash: string | null, content_hash: string | null, archived_in_operation: number | null, archive_zip_path: string | null, archive_path_in_zip: string | null, uuid: string | null, updated_at: string | null, };
 
-export enum ImageType {
-  Light = "Light",
-  Dark = "Dark",
-  Flat = "Flat",
-  Bias = "Bias",
-  DarkFlat = "DarkFlat",
-  // Master calibration types (already calibrated, no sub-calibration needed)
-  MasterDark = "MasterDark",
-  MasterFlat = "MasterFlat",
-  MasterBias = "MasterBias",
-  MasterDarkFlat = "MasterDarkFlat",
-}
-
-// Helper function to check if an imagetyp is a master type
-export function isMasterType(imagetyp: ImageType | string): boolean {
-  return [
-    ImageType.MasterDark,
-    ImageType.MasterFlat,
-    ImageType.MasterBias,
-    ImageType.MasterDarkFlat,
-    "MasterDark",
-    "MasterFlat",
-    "MasterBias",
-    "MasterDarkFlat",
-  ].includes(imagetyp as ImageType);
-}
-
-export interface File {
-  id: number | null;
-  path: string;
-  filename: string;
-  size: number;
-  modified_at: string; // ISO 8601 datetime
-  format: FileFormat;
-  created_at: string; // ISO 8601 datetime
-  metadata_hash: string | null; // Quick hash for duplicate detection
-}
-
-export interface Frame {
-  id: number | null;
-  file_id: number;
-  object: string | null;
-  date_obs: string | null; // ISO 8601 datetime
-  telescop: string | null;
-  instrume: string | null;
-  exptime: number | null;
-  filter: string | null;
-  imagetyp: ImageType | null;
-  is_master: boolean;
-  gain: number | null;
-  offset: number | null;
-  binning: string | null;
-  xbinning: number | null;
-  ybinning: number | null;
-  ccd_temp: number | null;
-  set_temp: number | null;
-  focallen: number | null;
-  xpixsz: number | null;
-  ypixsz: number | null;
-  ra: number | null;
-  dec: number | null;
-  sitelat: number | null;
-  lat_obs: number | null;
-  sitelong: number | null;
-  long_obs: number | null;
-  objctra: string | null;
-  objctdec: string | null;
-  rotation: number | null;
-  override_: boolean;
-}
-
-export interface Day {
-  id: number | null;
-  date: string; // ISO 8601 date (YYYY-MM-DD)
-  frame_count: number;
-}
-
-export interface Setup {
-  id: number | null;
-  telescop: string | null;
-  instrume: string | null;
-  filter: string | null;
-  binning: string | null;
-  gain: number | null;
-}
-
-export interface CalibrationSet {
-  id: number | null;
-  imagetyp: ImageType;
-  exptime: number | null;
-  filter: string | null;
-  ccd_temp: number | null;
-  gain: number | null;
-  binning: string | null;
-  instrume: string | null;
-  date: string;
-  frame_ids: number[];
-}
-
-export interface Tag {
-  id: number | null;
-  name: string;
-  color: string | null;
-}
-
-export interface FrameTag {
-  frame_id: number;
-  tag_id: number;
-}
-
-export interface ScanRoot {
-  id: number | null;
-  path: string;
-  enabled: boolean;
-  find_duplicates: boolean;
-  unique_camera: boolean;
-  last_scan: string | null; // ISO 8601 datetime
-  last_scan_errors: string[] | null;
-  monitor_enabled: boolean;
-}
-
-export interface ScanRootWithAvailability extends ScanRoot {
-  is_available: boolean;
-}
-
-export interface ExportTemplate {
-  id: number | null;
-  name: string;
-  template: string;
-  description: string | null;
-}
-
-/** One file inside a duplicate group, enriched with the metadata the batch
- *  deletion UI needs to apply keep-rules and display meaningful summaries. */
-export interface DuplicateFile {
-  fileId: number;
-  path: string;
-  filename: string;
-  modifiedAt: string; // ISO 8601
-  /** Longest-prefix match against scan_roots.path, or null if not inside one. */
-  scanRootId: number | null;
-  scanRootPath: string | null;
-  /** Raw IMAGETYP from the FITS header ("LIGHT", "FLAT", etc). */
-  imagetyp: string | null;
-  /** DATE-OBS as an RFC3339 string. */
-  dateObs: string | null;
-}
-
-export interface DuplicateGroup {
-  id: number | null;
-  size: number;
-  content_hash: string;
-  file_count: number;
-  file_paths: string[];
-  file_ids: number[];
-  /** Enriched per-file info. Empty for groups returned by legacy callers. */
-  files: DuplicateFile[];
-}
-
-// ── Duplicates picker rule chain ─────────────────────────────────────────────
-//
-// The duplicates view auto-marks files for deletion using an ordered chain of
-// rules. Each rule either picks a deletion set for a group or abstains; the
-// first non-abstaining rule wins per group. A rule that would mark every file
-// in a group also abstains (safety) so we never produce a group with no
-// keepers.
-
-export type RuleKind =
-  | 'master_root'
-  | 'path_contains'
-  | 'oldest_mtime'
-  | 'shortest_path';
-
-interface BaseRule {
-  enabled: boolean;
-}
-
-export interface MasterRootRule extends BaseRule {
-  kind: 'master_root';
-  config: { rootId: number | null };
-}
-
-export interface PathContainsRule extends BaseRule {
-  kind: 'path_contains';
-  config: { patterns: string[]; caseSensitive: boolean };
-}
-
-export interface OldestMtimeRule extends BaseRule {
-  kind: 'oldest_mtime';
-  config: Record<string, never>;
-}
-
-export interface ShortestPathRule extends BaseRule {
-  kind: 'shortest_path';
-  config: Record<string, never>;
-}
-
-export type Rule =
-  | MasterRootRule
-  | PathContainsRule
-  | OldestMtimeRule
-  | ShortestPathRule;
-
-export type RuleChain = Rule[];
-
-/** Result of a bulk move-to-black-hole operation. */
-export interface BulkMoveResult {
-  moved: number;
-  /** (file_id, error message) pairs for rows that couldn't be moved. */
-  failed: Array<[number, string]>;
-}
-
-/** Payload for the `bulk-move-to-black-hole-progress` event. */
-export interface BulkMoveProgressEvent {
-  current: number;
-  total: number;
-  percent: number;
-  currentFile: string | null;
-}
-
-export interface BlackHoleEntry {
-  id: number | null;
-  file_id: number;
-  filename: string;
-  original_path: string;
-  from_where: string;
-  moved_at: string; // ISO 8601 datetime
-  file_size: number;
-}
-
-export interface FolderSimilarity {
-  folder_a: string;
-  folder_b: string;
-  similarity_percent: number;
-  shared_files: number;
-  shared_size: number;
-  unique_a: number;
-  unique_b: number;
-  shared_file_ids: number[];
-}
-
-// DTOs for Tauri commands
-export interface ScanResult {
-  files_found: number;
-  files_processed: number;
-  files_skipped: number;
-  errors: string[];
-  // Frame type counts
-  lights_count: number;
-  darks_count: number;
-  flats_count: number;
-  bias_count: number;
-  darkflats_count: number;
-  // Calibration sets created
-  calibration_sets_created: number;
-  // Unique camera reconciliation stats (non-zero when instrume suffix state changed during rescan)
-  frames_renamed: number;
-  calibration_sets_deleted: number;
-  sessions_updated: number;
-  // Whether scan was cancelled by user
-  cancelled: boolean;
-}
-
-// Scan progress event sent from backend
-export interface ScanProgressEvent {
-  current: number;
-  total: number;
-  current_file: string | null;
-  percent: number;
-  root_id: number;
-  phase: 'verifying' | 'discovery' | 'processing' | 'inserting' | 'calibrating' | 'caching';
-}
-
-// Scan completion event sent from backend
-export interface ScanCompleteEvent {
-  root_id: number;
-  files_found: number;
-  files_processed: number;
-  files_skipped: number;
-  errors: string[];
-  lights_count: number;
-  darks_count: number;
-  flats_count: number;
-  bias_count: number;
-  darkflats_count: number;
-  calibration_sets_created: number;
-  frames_renamed?: number;
-  calibration_sets_deleted?: number;
-  sessions_updated?: number;
-  cancelled: boolean;
-}
-
-export interface FileWithFrame {
-  file: File;
-  frame: Frame | null;
-}
-
-export interface DirectoryContents {
-  subdirectories: string[];
-  files: FileWithFrame[];
-}
-
-export interface Project {
-  id: number | null;
-  name: string;
-}
-
-export interface FramesSet {
-  id: number | null;
-  name: string | null;
-  is_custom: boolean;
-  is_archived: boolean;
-  archived_at: string | null;        // ISO 8601; non-null means ZIP-archived
-  archive_operation_id: number | null;
-  date_obs_start: string | null;
-  date_obs_end: string | null;
-  objctra: string | null;
-  objctdec: string | null;
-  total_exp_time: number | null;
-  flat_pattern: string | null;  // e.g., "before_session", "after_session", "manual"
-  avg_rotation: number | null;
-  min_rotation: number | null;
-  max_rotation: number | null;
-}
-
-export interface FramesSetMember {
-  frames_set_id: number;
-  frame_id: number;
-}
-
-export interface FitsHeader {
-  id: number | null;
-  file_id: number;
-  header: string;
-}
-
-export interface Setting {
-  key: string;
-  value: string;
-  updated_at: string | null;
-}
-
-// Frame Sets DTOs
-export interface AutoGenerateResult {
-  sets_created: number;
-  frames_clustered: number;
-  frames_excluded: number;
-  frames_already_in_sets: number;
-  exclusion_reasons: string[];
-}
-
-export interface FramesSetWithCount {
-  frames_set: FramesSet;
-  member_count: number;
-}
-
-// Imaging Nights and Sessions
-export interface ImagingNight {
-  id: number | null;
-  frames_set_id: number;
-  start_time: string;
-  end_time: string;
-  created_at: string | null;
-}
-
-export interface Session {
-  id: number | null;
-  imaging_night_id: number;
-  instrume: string;
-  frame_count: number;
-  total_exp_time: number | null;
-  created_at: string | null;
-}
-
-export interface SessionWithMetadata {
-  id: number | null;
-  imaging_night_id: number;
-  instrume: string;
-  frame_count: number;
-  total_exp_time: number | null;
-  created_at: string | null;
-  start_date: string | null;
-  end_date: string | null;
-  avg_ra: string | null;
-  avg_dec: string | null;
-}
-
-export interface SessionMember {
-  session_id: number;
-  frame_id: number;
-}
-
-export interface SessionWithFrames {
-  session: Session;
-  frames: FileWithFrame[];
-}
-
-export interface ImagingNightWithSessions {
-  imaging_night: ImagingNight;
-  sessions: SessionWithFrames[];
-}
-
-export interface FrameSetDetail {
-  frames_set: FramesSet;
-  nights: ImagingNightWithSessions[];
-}
-
-// Equipment & Dark Library
-export interface CameraStats {
-  instrume: string;
-  frame_count: number;
-  total_hours: number;
-  first_use: string | null;
-  last_use: string | null;
-}
-
-export interface CalibrationSetDetail {
-  id: number | null;
-  imagetyp: ImageType;
-  exptime: number | null;
-  ccd_temp: number;
-  temp_min: number;
-  temp_max: number;
-  gain: number | null;
-  offset: number | null;
-  binning: string | null;
-  instrume: string | null;
-  filter: string | null;  // Filter (for flats)
-  date_start: string;
-  date_end: string;
-  date_display: string;
-  frame_count: number;
-  is_master: boolean;  // True if this is a master calibration set
-  // Extended fields from frame metadata
-  naxis1: number | null;      // Image width
-  naxis2: number | null;      // Image height
-  bayerpat: string | null;    // Bayer pattern (e.g., "RGGB") or null for mono
-  swcreate: string | null;    // Software that created the file
-  xpixsz: number | null;      // Pixel size in microns
-  format: string | null;      // File format (FITS, XISF)
-  focallen: number | null;    // Focal length in mm
-}
-
-export interface DarkLibraryResult {
-  sets_created: number;
-  frames_grouped: number;
-  frames_excluded: number;
-}
-
-// FITS Image Data for Blink Viewer
-export interface FitsImageData {
-  image_base64: string;
-  width: number;
-  height: number;
-  is_color: boolean;
-  bit_depth: number;
-}
-
-// File Relinking
-export interface RelinkResult {
-  files_matched: number;
-  files_new: number;
-  files_orphaned: number;
-  orphaned_file_ids: number[];
-}
-
-export interface OrphanedFile {
-  id: number;
-  path: string;
-  filename: string;
-  size: number;
-  modified_at: string;
-  has_frame: boolean;
-  object: string | null;
-  date_obs: string | null;
-}
-
-// Missing file record with status from the database
-export interface MissingFileRecord {
-  id: number;
-  file_id: number;
-  scan_root_id: number;
-  detected_at: string;
-  last_checked_at: string;
-  status: 'missing' | 'ignored';
-  // File info
-  path: string;
-  filename: string;
-  size: number;
-  modified_at: string;
-  // Frame info (if exists)
-  has_frame: boolean;
-  object: string | null;
-  date_obs: string | null;
-}
-
-// Sky Atlas
-export interface ImagingLocation {
-  id: number;
-  ra: number;
-  dec: number;
-  objectName: string | null;
-  frameCount: number;
-  totalExposure: number;  // in seconds
-  filters: string[];
-  dateRange: [string, string];  // ISO date strings
-  frameSetId: number | null;
-  fovWidth: number | null;   // Field of view in degrees
-  fovHeight: number | null;  // Field of view in degrees
-  locationType: 'frameset' | 'cluster';  // 'frameset' for organized, 'cluster' for unorganized
-  cameras: string | null;  // Comma-separated list of camera/instrument names
-  focalLengths: string | null;  // Comma-separated list of focal lengths in mm
-  isCustom: boolean;  // true for custom frame sets, false for auto-generated or clusters
-  rotation: number | null;  // Average position angle in degrees (N through E)
-}
-
-// Frame Set Refresh
-export interface SetUpdateReport {
-  set_id: number;
-  set_name: string;
-  frames_added: number;
-  nights_created: number;
-  nights_updated: number;
-  frame_ids_added: number[];
-  frame_names_added: string[];
-}
-
-export interface RefreshResult {
-  frames_added: number;
-  sets_updated: SetUpdateReport[];
-  frames_unassigned: number;
-}
-
-// Calibration Finder
-export interface CalibrationLink {
-  id: number | null;
-  source_id: number;
-  source_type: 'frame' | 'calibration_set';
-  calibration_set_id: number;
-  calibration_type: 'Dark' | 'Flat' | 'Bias' | 'DarkFlat';
-  matched_at: string;  // ISO 8601
-  match_score: number | null;  // 0.0-1.0 confidence
-  date_warning: boolean;
-  temp_warning: boolean;
-  is_manual_override: boolean;  // true if manually assigned by user
-}
-
-export interface FrameCalibrationStatus {
-  frame_id: number;
-  has_flats: boolean;
-  has_darks: boolean;
-  has_bias: boolean;
-  has_darkflats: boolean;
-  flats_warning: boolean;
-  darks_warning: boolean;
-  bias_warning: boolean;
-  flat_set_id: number | null;
-  dark_set_id: number | null;
-  bias_set_id: number | null;
-  darkflat_set_id: number | null;
-}
-
-export interface CalibrationHierarchy {
-  light_frame_id: number;
-  flat_sets: CalibrationSetWithLinks[];
-  dark_sets: CalibrationSetWithLinks[];
-  missing_calibration: string[];  // List of missing calibration types
-  warnings: CalibrationWarning[];
-}
-
-export interface CalibrationSetWithLinks {
-  set: CalibrationSetDetail;
-  sub_calibration: CalibrationLink[];  // Links to Dark/Bias sets for this set
-}
-
-export interface CalibrationWarning {
-  warning_type: 'date' | 'temperature';
-  message: string;
-  calibration_type: 'Dark' | 'Flat' | 'Bias' | 'DarkFlat';
-  set_id: number;
-}
-
-export interface CalibrationMatchResult {
-  frames_processed: number;
-  frames_with_calibration: number;
-  frames_partial_calibration: number;
-  frames_no_calibration: number;
-  sets_linked: number;
-  warnings_count: number;
-  processing_time_ms: number;
-  frame_statuses: FrameCalibrationStatus[];
-}
-
-export interface CalibrationStats {
-  total_frames: number;
-  frames_with_flats: number;
-  frames_with_darks: number;
-  frames_with_bias: number;
-  frames_complete: number;  // All required calibration found
-  frames_partial: number;    // Some calibration found
-  frames_none: number;       // No calibration found
-  total_warnings: number;
-}
-
-export interface CalibrationGroup {
-  flat_set_id: number | null;
-  dark_set_id: number | null;
-  bias_set_id: number | null;
-  flat_set_detail: CalibrationSetDetail | null;
-  dark_set_detail: CalibrationSetDetail | null;
-  bias_set_detail: CalibrationSetDetail | null;
-  frame_count: number;
-  frame_ids: number[];
-  has_warnings: boolean;
-  // Per-calibration warnings with contextual messages
-  flat_warnings: CalibrationWarning[];
-  dark_warnings: CalibrationWarning[];
-  bias_warnings: CalibrationWarning[];
-}
-
-export interface FrameSetCalibrationGroups {
-  groups: CalibrationGroup[];
-  uncalibrated_frame_count: number;
-  uncalibrated_frame_ids: number[];
-  total_frames: number;
-}
-
-export interface CalibrationTolerance {
-  flat_date_warning_days: number;
-  dark_date_warning_days: number;
-}
-
-export interface ProcessingProgress {
-  total_frames: number;
-  processed_frames: number;
-  current_frame_id: number | null;
-  percent_complete: number;
-}
-
-export interface ProcessingStats {
-  total_frames: number;
-  frames_with_full_calibration: number;
-  frames_with_partial_calibration: number;
-  frames_with_no_calibration: number;
-  total_flat_sets_linked: number;
-  total_dark_sets_linked: number;
-  total_warnings: number;
-  date_warnings: number;
-  temp_warnings: number;
-  missing_flats: number;
-  missing_darks: number;
-  missing_bias: number;
-  frames_with_flats_only: number;
-  frames_with_darks_only: number;
-}
-
-// Flat Calibration System
-export enum FlatTiming {
-  Before = "Before",
-  After = "After",
-  During = "During",
-}
-
-
-export interface FlatGroup {
-  frame_ids: number[];
-  start_time: string;  // ISO 8601 datetime
-  end_time: string;    // ISO 8601 datetime
-  avg_temp: number | null;
-  frame_count: number;
-  filter: string | null;
-  instrume: string;
-  binning: string;
-  gain: number | null;
-  offset: number | null;
-  exptime: number | null;
-  focal_length: number | null;
-}
-
-export interface FlatGroupMatch {
-  group: FlatGroup;
-  match_score: number;  // 0.0-1.0, higher is better
-  age_days: number;
-  temp_diff: number | null;
-  timing: FlatTiming;
-}
-
-export interface FilterPeriod {
-  filter: string | null;
-  start_time: string;  // ISO 8601 datetime
-  end_time: string;    // ISO 8601 datetime
-  frame_count: number;
-}
-
-// ========== Calibration Hierarchy View ==========
-
-/** Hierarchical calibration view organized by Date → Camera → Filter */
-export interface CalibrationHierarchyView {
-  date_groups: CalibrationDateGroup[];
-  total_frames: number;
-  calibrated_frames: number;
-  uncalibrated_frames: number;
-}
-
-/** Group of frames for a single session date */
-export interface CalibrationDateGroup {
-  date: string;                    // e.g., "2024-01-15"
-  date_display: string;            // e.g., "January 15, 2024"
-  camera_groups: CalibrationCameraGroup[];
-  frame_count: number;
-  has_warnings: boolean;
-}
-
-/** Group of frames for a single camera within a date */
-export interface CalibrationCameraGroup {
-  instrume: string;                // Camera name
-  filter_groups: CalibrationFilterGroup[];
-  frame_count: number;
-  has_warnings: boolean;
-}
-
-/** Sub-calibration linked to a calibration set with full details */
-export interface SubCalibrationDetail {
-  calibration_type: 'Dark' | 'DarkFlat' | 'Bias';
-  set: CalibrationSetDetail;
-  date_warning: boolean;
-  temp_warning: boolean;
-}
-
-/** A frame set (object) that ultimately consumes a calibration set, either
- *  directly or via the sub-cal chain. Returned by get_calibration_set_consumers. */
-export interface CalibrationSetConsumer {
-  frameSetId: number;
-  name: string | null;
-  dateObsStart: string | null;
-}
-
-/** A calibration set with the count of frames that use it */
-export interface CalibrationSetWithFrameCount {
-  set: CalibrationSetDetail;
-  frame_count: number;        // How many frames in this group use this set
-  frame_ids: number[];        // Which frames use this set
-  warnings: CalibrationWarning[];
-  sub_calibration: SubCalibrationDetail[];  // Linked sub-calibrations (e.g., Flat→Dark, Dark→Bias)
-}
-
-/** A calibration set with match score for manual selection */
-export interface CalibrationSetWithScore {
-  set: CalibrationSetDetail;
-  match_score: number;        // 0.0-1.0, higher is better match
-  match_details: MatchDetails;
-}
-
-/** Details about how well a calibration set matches light frame parameters */
-export interface MatchDetails {
-  instrume_match: boolean;    // Camera matches
-  binning_match: boolean;     // Binning matches
-  gain_match: boolean;        // Gain matches (or both null)
-  filter_match: boolean;      // Filter matches (only relevant for flats)
-  temp_diff: number | null;   // Temperature difference in Celsius
-  date_diff_days: number;     // Days between calibration and light frames
-}
-
-/** Average parameters of light frames for manual selection display */
-export interface LightFrameParameters {
-  instrume: string | null;
-  binning: string | null;
-  gain: number | null;
-  offset: number | null;
-  filter: string | null;
-  avg_ccd_temp: number | null;
-  avg_exptime: number | null;
-  exptime_range: [number, number] | null;  // [min, max]
-  frame_count: number;
-  date_range: [string, string] | null;     // [start, end]
-  current_flat_set_id: number | null;
-  current_dark_set_id: number | null;
-  current_bias_set_id: number | null;
-}
-
-/** Parameters of a calibration set for sub-calibration selection display */
-export interface CalibrationSetParameters {
-  set_id: number;
-  imagetyp: string;
-  instrume: string | null;
-  binning: string | null;
-  gain: number | null;
-  offset: number | null;
-  exptime: number | null;
-  filter: string | null;
-  ccd_temp: number | null;
-  date_start: string | null;
-  date_end: string | null;
-  frame_count: number;
-  // Current sub-calibration links
-  current_dark_set_id: number | null;
-  current_darkflat_set_id: number | null;
-  current_bias_set_id: number | null;
-}
-
-/** Group of frames for a single filter within a camera */
-export interface CalibrationFilterGroup {
-  filter: string | null;          // null = "No Filter"
-  filter_display: string;          // "Ha", "OIII", "No Filter", or "Ha (60s)" when split by exptime
-  exptime: number | null;         // When split by exposure time, this is the exptime for this sub-group
-  light_frames: LightFrameWithCalibration[];
-  flat_sets: CalibrationSetWithFrameCount[];   // All unique flat sets used by frames in this group
-  dark_sets: CalibrationSetWithFrameCount[];   // All unique dark sets used by frames in this group
-  bias_sets: CalibrationSetWithFrameCount[];   // All unique bias sets used by frames in this group
-  has_warnings: boolean;
-  frame_count: number;
-}
-
-/** A light frame with its calibration status */
-export interface LightFrameWithCalibration {
-  frame_id: number;
-  file_id: number;
-  filename: string;
-  file_path: string;
-  date_obs: string | null;
-  exptime: number | null;
-  telescop: string | null;
-  focallen: number | null;
-  xpixsz: number | null;
-  binning: string | null;
-  ccd_temp: number | null;
-  swcreate: string | null;
-  gain: number | null;
-  offset: number | null;
-  rotation: number | null;
-  objctra: string | null;
-  objctdec: string | null;
-  ra: number | null;
-  dec: number | null;
-  /** True when a plate_solves row exists for this frame (WCS computed by
-   * Athenaeum's plate solver, not read from the FITS header). */
-  plate_solved: boolean;
-  calibration_status: FrameCalibrationStatus;
-}
-
-// ========== Calendar View Interfaces ==========
-
-/** Summary of a frame set for calendar display */
-export interface CalendarFrameSetSummary {
-  id: number;
-  name: string | null;
-  objectName: string | null;
-  frameCount: number;
-  totalExposureSeconds: number;
-  ra: number | null;
-  dec: number | null;
-  filters: string[];
-}
-
-/** Group of unorganized frames for calendar display */
-export interface CalendarUnorganizedGroup {
-  id: string;
-  objectName: string | null;
-  frameCount: number;
-  totalExposureSeconds: number;
-  ra: number | null;
-  dec: number | null;
-  filters: string[];
-  frameIds: number[];
-}
-
-/** Summary of imaging activity for a single calendar day */
-export interface CalendarDayEvent {
-  date: string; // YYYY-MM-DD
-  frameSets: CalendarFrameSetSummary[];
-  unorganizedGroups: CalendarUnorganizedGroup[];
-  totalFrameCount: number;
-  totalExposureSeconds: number;
-}
-
-/** Full calendar data for a month */
-export interface CalendarMonthData {
-  year: number;
-  month: number; // 1-12
-  days: CalendarDayEvent[];
-  totalFrameCount: number;
-  totalExposureSeconds: number;
-}
-
-export interface CalendarYearData {
-  year: number;
-  months: CalendarMonthData[]; // Only months with data
-  totalFrameCount: number;
-  totalExposureSeconds: number;
-}
-
-// ========== Calibration Set Metadata Editing ==========
-
-// Excluded frames from auto-generation
-export interface ExcludedFrameEntry {
-  file_id: number;
-  path: string;
-  filename: string;
-  reason: string;
-  excluded_at: string;
-}
-
-/** Excluded frame with full file + frame metadata. Mirrors `MissingMetadataRow`
- *  so the same view shell can render both, plus the exclusion reason and
- *  excluded_at timestamp. Returned by get_excluded_frames_with_metadata. */
-export interface ExcludedFrameRow {
-  file: File;
-  frame: Frame;
-  hasDuplicate: boolean;
-  reason: string;
-  excludedAt: string;
-}
-
-/** Result of reclassifying excluded frames */
-export interface ReclassifyResult {
-  frames_updated: number;
-  cameras_refreshed: string[];
-}
-
-// ========== Frame Analysis ==========
-
-/** Star detection and image quality analysis results for a single frame */
-export interface FrameAnalysis {
-  id: number | null;
-  frame_id: number;
-  file_id: number;
-  stars_detected: number;
-  median_fwhm: number;
-  median_eccentricity: number;
-  median_snr: number;
-  median_hfr: number;
-  frame_snr: number;
-  snr_weight: number;
-  psf_signal: number;
-  background: number;
-  noise: number;
-  detection_threshold: number;
-  width: number;
-  height: number;
-  source_channels: number;
-  trail_r_squared: number;
-  possibly_trailed: boolean;
-  median_beta: number | null;
-  quality_score: number | null;
-  config_hash: string | null;
-  analyzed_at: string;
-}
-
-/** Result of batch frame set analysis */
-export interface AnalyzeFrameSetResult {
-  analyzed: number;
-  skipped: number;
-  failed: number;
-  errors: string[];
-  cancelled: boolean;
-}
-
-/** Analysis progress event emitted during batch analysis */
-export interface AnalysisProgressEvent {
-  frame_set_id: number;
-  current: number;
-  total: number;
-  current_file: string;
-  percent: number;
-}
-
-/** Analysis complete event emitted when a frame set analysis finishes */
-export interface AnalysisCompleteEvent {
-  frame_set_id: number;
-  analyzed: number;
-  skipped: number;
-  failed: number;
-  errors: string[];
-  cancelled: boolean;
-}
-
-/** Edits to apply to calibration set metadata (selective fields) */
-export interface CalibrationMetadataEdits {
-  ccd_temp?: number | null;
-  gain?: number | null;
-  offset?: number | null;
-  binning?: string | null;
-  exptime?: number | null;
-}
-
-/** Individual star detection result for client-side overlay rendering */
-export interface StarMetric {
-  id: number | null;
-  frame_analysis_id: number;
-  x: number;
-  y: number;
-  peak: number;
-  flux: number;
-  fwhm: number;
-  fwhm_x: number;
-  fwhm_y: number;
-  eccentricity: number;
-  snr: number;
-  hfr: number;
-  theta: number;
-  beta: number | null;
-  fit_method: string;
-  fit_residual: number;
-}
-
-/** Response from get_frame_star_metrics command */
-export interface StarMetricsResponse {
-  stars: StarMetric[];
-  metrics: FrameAnalysis;
-  flip_vertical: boolean;
-  image_width: number;
-  image_height: number;
-}
-
-/** Original calibration set metadata values (backed up before editing) */
-export interface CalibrationSetOriginals {
-  set_id: number;
-  ccd_temp: number | null;
-  temp_min: number | null;
-  temp_max: number | null;
-  gain: number | null;
-  offset: number | null;
-  binning: string | null;
-  exptime: number | null;
-  saved_at: string;  // ISO 8601
-}
-
+export type Frame = { id: number | null, file_id: number, object: string | null, date_obs: string | null, telescop: string | null, instrume: string | null, exptime: number | null, filter: string | null, imagetyp: ImageType | null, is_master: boolean, gain: number | null, offset: number | null, binning: string | null, xbinning: number | null, ybinning: number | null, ccd_temp: number | null, set_temp: number | null, focallen: number | null, xpixsz: number | null, ypixsz: number | null, naxis1: number | null, naxis2: number | null, ra: number | null, dec: number | null, sitelat: number | null, lat_obs: number | null, sitelong: number | null, long_obs: number | null, objctra: string | null, objctdec: string | null, override_: boolean, swcreate: string | null, 
 /**
- * Row returned by the Missing Metadata endpoint. Same shape as FileWithFrame
- * plus a duplicate-detection flag computed server-side (true when another
- * file shares the same content_hash or metadata_hash).
+ * Bayer pattern for OSC cameras (e.g., "RGGB", "BGGR")
+ * None indicates a mono camera
  */
-export interface MissingMetadataRow {
-  file: File;
-  frame: Frame;
-  hasDuplicate: boolean;
-}
-
+bayerpat: string | null, 
 /**
- * Bulk edits for light/calibration frame metadata in the `frames` table.
- * Used by the Missing Metadata page's Set Camera / Set Date / Set Frame Type
- * actions. `null`/omitted fields are left unchanged. Serde uses `camelCase`
- * on the wire, matching Rust struct `FrameMetadataEdits`.
+ * Image position angle in degrees (North through East)
+ * Extracted from CROTA2 or computed from CD matrix
  */
-export interface FrameMetadataEdits {
-  instrume?: string | null;
-  /** ISO 8601 / RFC 3339 datetime string */
-  dateObs?: string | null;
-  /** Raw IMAGETYP — "LIGHT" | "DARK" | "FLAT" | "BIAS" | "DARKFLAT" */
-  imagetyp?: string | null;
-  /** True when the frame type is a master variant (paired with imagetyp) */
-  isMaster?: boolean | null;
-  /** Target name (FITS OBJECT) */
-  object?: string | null;
-  /** Filter name (FITS FILTER) */
-  filter?: string | null;
-  /** Telescope name (FITS TELESCOP) */
-  telescop?: string | null;
-  /** Focal length in mm (FITS FOCALLEN) */
-  focallen?: number | null;
-  /** Sensor gain (FITS GAIN), 0..1000 */
-  gain?: number | null;
-  /** Sensor offset (FITS OFFSET), >=0 */
-  offset?: number | null;
-  /** Binning string in "AxB" form. Backend also updates xbinning/ybinning. */
-  binning?: string | null;
-  /** Exposure time (FITS EXPTIME), seconds, > 0 */
-  exptime?: number | null;
-  /** CCD temperature (FITS CCD-TEMP), °C, finite. Backend serde uses
-   *  camelCase, so the wire field is `ccdTemp` — not `ccd_temp`. */
-  ccdTemp?: number | null;
-}
+rotation: number | null, uuid: string | null, updated_at: string | null, };
 
+export type ScanRoot = { id: number | null, path: string, enabled: boolean, find_duplicates: boolean, unique_camera: boolean, last_scan: string | null, last_scan_errors: Array<string> | null, monitor_enabled: boolean, };
+
+export type DuplicateFile = { fileId: number, path: string, filename: string, modifiedAt: string, 
 /**
- * Auto-merge: reason a candidate frame was skipped.
- * Mirrors Rust `SkipReason` (serde rename_all = "snake_case").
+ * Longest-prefix match against `scan_roots.path`. `None` when the file
+ * isn't inside any registered scan root (shouldn't happen for scanned
+ * libraries, but we don't want to drop the row).
  */
+scanRootId: number | null, scanRootPath: string | null, 
+/**
+ * IMAGETYP from the frame row (raw string — e.g. "LIGHT", "FLAT").
+ * `None` if no frame row or the field was missing.
+ */
+imagetyp: string | null, 
+/**
+ * DATE-OBS from the frame row (RFC3339). `None` if not set.
+ */
+dateObs: string | null, };
+
+export type DuplicateGroup = { id: number | null, size: number, content_hash: string, file_count: number, file_paths: Array<string>, file_ids: Array<number>, files: Array<DuplicateFile>, };
+
+export type BulkMoveResult = { moved: number, 
+/**
+ * Per-file failures — (file_id, error message). Empty on full success.
+ */
+failed: Array<[number, string]>, };
+
+export type BulkMoveProgressEvent = { current: number, total: number, percent: number, currentFile: string | null, };
+
+export type BlackHoleEntry = { id: number | null, file_id: number, filename: string, original_path: string, from_where: string, moved_at: string, file_size: number, };
+
+export type FolderSimilarity = { folder_a: string, folder_b: string, similarity_percent: number, shared_files: number, shared_size: number, unique_a: number, unique_b: number, shared_file_ids: Array<number>, };
+
+export type ScanProgressEvent = { current: number, total: number, current_file: string | null, percent: number, root_id: number, phase: string, };
+
+export type ScanCompleteEvent = { root_id: number, files_found: number, files_processed: number, files_skipped: number, errors: Array<string>, lights_count: number, darks_count: number, flats_count: number, bias_count: number, darkflats_count: number, calibration_sets_created: number, cancelled: boolean, };
+
+export type FileWithFrame = { file: File, frame: Frame | null, };
+
+export type FramesSet = { id: number | null, name: string | null, is_custom: boolean, is_archived: boolean, date_obs_start: string | null, date_obs_end: string | null, objctra: string | null, objctdec: string | null, total_exp_time: number | null, flat_pattern: string | null, avg_rotation: number | null, min_rotation: number | null, max_rotation: number | null, archived_at: string | null, archive_operation_id: number | null, uuid: string | null, updated_at: string | null, };
+
+export type Setting = { key: string, value: string, updated_at: string | null, };
+
+export type ImagingNight = { id: number | null, frames_set_id: number, start_time: string, end_time: string, created_at: string | null, };
+
+export type Session = { id: number | null, imaging_night_id: number, instrume: string, frame_count: number, total_exp_time: number | null, created_at: string | null, uuid: string | null, updated_at: string | null, };
+
+export type SessionWithFrames = { session: Session, frames: Array<FileWithFrame>, };
+
+export type ImagingNightWithSessions = { imaging_night: ImagingNight, sessions: Array<SessionWithFrames>, };
+
+export type FrameSetDetail = { frames_set: FramesSet, nights: Array<ImagingNightWithSessions>, };
+
+export type CameraStats = { instrume: string, frame_count: number, total_hours: number, first_use: string | null, last_use: string | null, };
+
+export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exptime: number | null, ccd_temp: number, temp_min: number, temp_max: number, gain: number | null, offset: number | null, binning: string | null, instrume: string | null, filter: string | null, date_start: string, date_end: string, date_display: string, frame_count: number, is_master: boolean, naxis1: number | null, naxis2: number | null, bayerpat: string | null, swcreate: string | null, xpixsz: number | null, format: string | null, focallen: number | null, uuid: string | null, updated_at: string | null, };
+
+export type DarkLibraryResult = { sets_created: number, frames_grouped: number, frames_excluded: number, };
+
+export type RelinkResult = { files_matched: number, files_new: number, files_orphaned: number, orphaned_file_ids: Array<number>, };
+
+export type OrphanedFile = { id: number, path: string, filename: string, size: number, modified_at: string, has_frame: boolean, object: string | null, date_obs: string | null, };
+
+export type ImagingLocation = { id: number, ra: number, dec: number, objectName: string | null, frameCount: number, totalExposure: number, filters: Array<string>, dateRange: [string, string], frameSetId: number | null, fovWidth: number | null, fovHeight: number | null, locationType: string, cameras: string | null, focalLengths: string | null, isCustom: boolean, rotation: number | null, };
+
+export type CalibrationLink = { id: number | null, source_id: number, source_type: string, calibration_set_id: number, calibration_type: string, matched_at: string, match_score: number | null, date_warning: boolean, temp_warning: boolean, is_manual_override: boolean, };
+
+export type FrameCalibrationStatus = { frame_id: number, has_flats: boolean, has_darks: boolean, has_bias: boolean, has_darkflats: boolean, flats_warning: boolean, darks_warning: boolean, bias_warning: boolean, flat_set_id: number | null, dark_set_id: number | null, bias_set_id: number | null, darkflat_set_id: number | null, };
+
+export type CalibrationHierarchy = { light_frame_id: number, flat_sets: Array<CalibrationSetWithLinks>, dark_sets: Array<CalibrationSetWithLinks>, missing_calibration: Array<string>, warnings: Array<CalibrationWarning>, };
+
+export type CalibrationSetWithLinks = { set: CalibrationSetDetail, sub_calibration: Array<CalibrationLink>, };
+
+export type CalibrationWarning = { warning_type: string, message: string, calibration_type: string, set_id: number, };
+
+export type CalibrationStats = { total_frames: number, frames_with_flats: number, frames_with_darks: number, frames_with_bias: number, frames_complete: number, frames_partial: number, frames_none: number, total_warnings: number, };
+
+export type CalibrationGroup = { flat_set_id: number | null, dark_set_id: number | null, bias_set_id: number | null, flat_set_detail: CalibrationSetDetail | null, dark_set_detail: CalibrationSetDetail | null, bias_set_detail: CalibrationSetDetail | null, frame_count: number, frame_ids: Array<number>, has_warnings: boolean, flat_warnings: Array<CalibrationWarning>, dark_warnings: Array<CalibrationWarning>, bias_warnings: Array<CalibrationWarning>, };
+
+export type FrameSetCalibrationGroups = { groups: Array<CalibrationGroup>, uncalibrated_frame_count: number, uncalibrated_frame_ids: Array<number>, total_frames: number, };
+
+export type CalibrationTolerance = { flat_date_warning_days: number, dark_date_warning_days: number, };
+
+export type ProcessingProgress = { total_frames: number, processed_frames: number, current_frame_id: number | null, percent_complete: number, };
+
+export type ProcessingStats = { total_frames: number, frames_with_full_calibration: number, frames_with_partial_calibration: number, frames_with_no_calibration: number, total_flat_sets_linked: number, total_dark_sets_linked: number, total_warnings: number, date_warnings: number, temp_warnings: number, missing_flats: number, missing_darks: number, missing_bias: number, frames_with_flats_only: number, frames_with_darks_only: number, };
+
+export type FlatTiming = "Before" | "After" | "During";
+
+export type FlatGroup = { 
+/**
+ * IDs of frames in this group
+ */
+frame_ids: Array<number>, 
+/**
+ * Timestamp of first frame in group
+ */
+start_time: string, 
+/**
+ * Timestamp of last frame in group
+ */
+end_time: string, 
+/**
+ * Average CCD temperature across all frames (if available)
+ */
+avg_temp: number | null, 
+/**
+ * Coldest CCD temperature observed in the group (if any frame has temp).
+ * Persisted as `calibration_set.temp_min` so the matcher / UI can see the
+ * real range, not the synthetic average.
+ */
+temp_min: number | null, 
+/**
+ * Warmest CCD temperature observed in the group.
+ */
+temp_max: number | null, 
+/**
+ * Number of frames in group
+ */
+frame_count: number, 
+/**
+ * Filter used (if any)
+ */
+filter: string | null, 
+/**
+ * Camera/instrument name (None if unknown)
+ */
+instrume: string | null, 
+/**
+ * Binning pattern (e.g., "1x1", "2x2") (None if unknown)
+ */
+binning: string | null, 
+/**
+ * Gain setting
+ */
+gain: number | null, 
+/**
+ * Offset setting
+ */
+offset: number | null, 
+/**
+ * Exposure time (seconds)
+ */
+exptime: number | null, 
+/**
+ * Focal length
+ */
+focal_length: number | null, };
+
+export type FlatGroupMatch = { 
+/**
+ * The flat group
+ */
+group: FlatGroup, 
+/**
+ * Match score (0.0-1.0), higher is better
+ */
+match_score: number, 
+/**
+ * Days between light frame and flat group
+ */
+age_days: number, 
+/**
+ * Temperature difference (if available)
+ */
+temp_diff: number | null, 
+/**
+ * Relative timing to session
+ */
+timing: FlatTiming, };
+
+export type CalibrationHierarchyView = { date_groups: Array<CalibrationDateGroup>, total_frames: number, calibrated_frames: number, uncalibrated_frames: number, };
+
+export type CalibrationDateGroup = { date: string, date_display: string, camera_groups: Array<CalibrationCameraGroup>, frame_count: number, has_warnings: boolean, };
+
+export type CalibrationCameraGroup = { instrume: string, filter_groups: Array<CalibrationFilterGroup>, frame_count: number, has_warnings: boolean, };
+
+export type SubCalibrationDetail = { calibration_type: string, set: CalibrationSetDetail, date_warning: boolean, temp_warning: boolean, };
+
+export type CalibrationSetConsumer = { frameSetId: number, name: string | null, dateObsStart: string | null, };
+
+export type CalibrationSetWithFrameCount = { set: CalibrationSetDetail, frame_count: number, frame_ids: Array<number>, warnings: Array<CalibrationWarning>, sub_calibration: Array<SubCalibrationDetail>, };
+
+export type CalibrationSetWithScore = { set: CalibrationSetDetail, match_score: number, match_details: MatchDetails, };
+
+export type MatchDetails = { instrume_match: boolean, binning_match: boolean, gain_match: boolean, offset_match: boolean, exptime_match: boolean, filter_match: boolean, temp_diff: number | null, date_diff_days: number, };
+
+export type LightFrameParameters = { instrume: string | null, binning: string | null, gain: number | null, offset: number | null, filter: string | null, avg_ccd_temp: number | null, avg_exptime: number | null, exptime_range: [number, number] | null, frame_count: number, date_range: [string, string] | null, current_flat_set_id: number | null, current_dark_set_id: number | null, current_bias_set_id: number | null, };
+
+export type CalibrationSetParameters = { set_id: number, imagetyp: string, instrume: string | null, binning: string | null, gain: number | null, offset: number | null, exptime: number | null, filter: string | null, ccd_temp: number | null, date_start: string | null, date_end: string | null, frame_count: number, current_dark_set_id: number | null, current_darkflat_set_id: number | null, current_bias_set_id: number | null, };
+
+export type CalibrationFilterGroup = { filter: string | null, filter_display: string, exptime: number | null, light_frames: Array<LightFrameWithCalibration>, flat_sets: Array<CalibrationSetWithFrameCount>, dark_sets: Array<CalibrationSetWithFrameCount>, bias_sets: Array<CalibrationSetWithFrameCount>, has_warnings: boolean, frame_count: number, };
+
+export type LightFrameWithCalibration = { frame_id: number, file_id: number, filename: string, file_path: string, date_obs: string | null, exptime: number | null, telescop: string | null, focallen: number | null, xpixsz: number | null, binning: string | null, ccd_temp: number | null, swcreate: string | null, gain: number | null, offset: number | null, rotation: number | null, objctra: string | null, objctdec: string | null, ra: number | null, dec: number | null, 
+/**
+ * True when a `plate_solves` row exists for this frame, i.e. the WCS
+ * was computed by Athenaeum's plate solver (vs. read from the FITS
+ * header). Drives the Original/Athenaeum WCS badge.
+ */
+plate_solved: boolean, calibration_status: FrameCalibrationStatus, };
+
+export type CalendarFrameSetSummary = { id: number, name: string | null, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, };
+
+export type CalendarUnorganizedGroup = { id: string, objectName: string | null, frameCount: number, totalExposureSeconds: number, ra: number | null, dec: number | null, filters: Array<string>, frameIds: Array<number>, };
+
+export type CalendarDayEvent = { date: string, frameSets: Array<CalendarFrameSetSummary>, unorganizedGroups: Array<CalendarUnorganizedGroup>, totalFrameCount: number, totalExposureSeconds: number, };
+
+export type CalendarMonthData = { year: number, month: number, days: Array<CalendarDayEvent>, totalFrameCount: number, totalExposureSeconds: number, };
+
+export type ExcludedFrameEntry = { file_id: number, path: string, filename: string, reason: string, excluded_at: string, };
+
+export type ExcludedFrameRow = { file: File, frame: Frame, hasDuplicate: boolean, reason: string, excludedAt: string, };
+
+export type FrameAnalysis = { id: number | null, frame_id: number, file_id: number, stars_detected: number, median_fwhm: number, median_eccentricity: number, median_snr: number, median_hfr: number, frame_snr: number, snr_weight: number, psf_signal: number, background: number, noise: number, detection_threshold: number, width: number, height: number, source_channels: number, trail_r_squared: number, possibly_trailed: boolean, median_beta: number | null, quality_score: number | null, config_hash: string | null, analyzed_at: string, };
+
+export type CalibrationMetadataEdits = { ccd_temp?: number | null, gain?: number | null, offset?: number | null, binning?: string | null, exptime?: number | null, };
+
+export type StarMetric = { id: number | null, frame_analysis_id: number, x: number, y: number, peak: number, flux: number, fwhm: number, fwhm_x: number, fwhm_y: number, eccentricity: number, snr: number, hfr: number, theta: number, beta: number | null, fit_method: string, fit_residual: number, };
+
+export type StarMetricsResponse = { stars: Array<StarMetric>, metrics: FrameAnalysis, image_width: number, image_height: number, 
+/**
+ * Whether the displayed image was vertically flipped during processing.
+ * When true, star Y coordinates must be flipped: y_display = image_height - 1 - y
+ * and theta must be negated. Mirrors rustafits annotate.rs compute_annotations().
+ */
+flip_vertical: boolean, };
+
+export type CalibrationSetOriginals = { set_id: number, ccd_temp: number | null, temp_min: number | null, temp_max: number | null, gain: number | null, offset: number | null, binning: string | null, exptime: number | null, saved_at: string, };
+
+export type MissingMetadataRow = { file: File, frame: Frame, hasDuplicate: boolean, };
+
+export type FrameMetadataEdits = { instrume?: string | null, 
+/**
+ * RFC 3339 / ISO 8601 datetime string (frontend converts from user input).
+ */
+dateObs?: string | null, 
+/**
+ * Raw IMAGETYP value — "LIGHT", "DARK", "FLAT", "BIAS", "DARKFLAT".
+ * For master variants, pair with `is_master = Some(true)` and a base
+ * type (e.g. `imagetyp = "DARK"`, `is_master = true` → master dark).
+ */
+imagetyp?: string | null, isMaster: boolean | null, 
+/**
+ * Target name (FITS OBJECT). Common cleanup case for misnamed targets.
+ */
+object?: string | null, 
+/**
+ * Filter name (FITS FILTER). Common cleanup case for ASIAir mis-records.
+ */
+filter?: string | null, 
+/**
+ * Telescope name (FITS TELESCOP).
+ */
+telescop?: string | null, 
+/**
+ * Focal length in mm (FITS FOCALLEN).
+ */
+focallen?: number | null, 
+/**
+ * Pixel size in µm (FITS XPIXSZ). Required alongside FOCALLEN for the
+ * plate-solve scale hint; user-editable on any frame for sparse headers
+ * (some surveys ship without XPIXSZ — e.g. SkyMapper).
+ */
+xpixsz?: number | null, 
+/**
+ * Sensor gain (FITS GAIN). Typically 0-1000.
+ */
+gain?: number | null, 
+/**
+ * Sensor offset (FITS OFFSET). Typically 0+.
+ */
+offset?: number | null, 
+/**
+ * Binning string (e.g. "1x1", "2x2"). When set, xbinning/ybinning are
+ * also updated to match the parsed components.
+ */
+binning?: string | null, 
+/**
+ * Exposure time in seconds (FITS EXPTIME). Must be > 0.
+ */
+exptime?: number | null, 
+/**
+ * CCD temperature in °C (FITS CCD-TEMP). Typically -50..50.
+ */
+ccdTemp?: number | null, 
+/**
+ * Right Ascension in decimal degrees [0, 360). Only set by the metadata
+ * pane's RA/DEC revert path — there is no text input for these. The
+ * "manual update" path for coordinates is plate-solving. When set,
+ * `bulk_update_frame_metadata` also writes the parallel sexagesimal
+ * `objctra` so derived consumers stay consistent with what the scanner
+ * and plate solver produce.
+ */
+ra?: number | null, 
+/**
+ * Declination in decimal degrees [-90, 90]. See `ra`.
+ */
+dec?: number | null, 
+/**
+ * Image position angle in degrees (north through east). Plate solving
+ * derives this from the CD matrix. The metadata pane lets the user
+ * override or revert it just like any other numeric field. Range is
+ * `[-360, 360]` to accept either sign convention.
+ */
+rotation?: number | null, };
+
 export type SkipReason = "no_coords" | "outside_threshold" | "already_in_set";
 
+export type CandidateFrame = { frame_id: number, file_id: number, filename: string, ra: number | null, dec: number | null, date_obs: string | null, filter: string | null, instrume: string | null, };
+
+export type SkippedFrame = { frame_id: number, filename: string, reason: SkipReason, };
+
+export type FindNewFramesResult = { candidates: Array<CandidateFrame>, scan_was_awaited: boolean, };
+
+export type MergeReport = { frames_set_id: number, added_count: number, skipped_count: number, frames_added: Array<CandidateFrame>, frames_skipped: Array<SkippedFrame>, threshold_arcmin: number, source: string, };
+
+export type MergeLogEntry = { id: number, frames_set_id: number, occurred_at: string, source: string, threshold_arcmin: number, frames_added: Array<CandidateFrame>, frames_skipped: Array<SkippedFrame>, added_count: number, skipped_count: number, };
+
+export type FlatContourOpts = { 
 /**
- * A light frame eligible for merging into a frame set. Mirrors Rust `CandidateFrame`.
+ * Resampling factor in percent. Final width/height are
+ * `original * resolution_pct / 100`. PI range: 5..=100.
  */
-export interface CandidateFrame {
-  frame_id: number;
-  file_id: number;
-  filename: string;
-  ra: number | null;
-  dec: number | null;
-  date_obs: string | null;
-  filter: string | null;
-  instrume: string | null;
-}
+resolutionPct: number, 
+/**
+ * Gaussian blur sigma in pixels (post-resample). PI range: 0..=10.
+ */
+sigmaPx: number, 
+/**
+ * Number of discrete contour bands. PI range: 4..=20 (default 15).
+ */
+contours: number, 
+/**
+ * Boundary-emphasis strength as a percentage. PI range: 0..=200,
+ * default 50. Higher values darken the band boundaries more.
+ */
+gradientPct: number, };
 
-/** A frame that was skipped during an auto-merge, with the reason. */
-export interface SkippedFrame {
-  frame_id: number;
-  filename: string;
-  reason: SkipReason;
-}
+export type FrameSetReference = { framesSetId: number, referenceFrameId: number, 
+/**
+ * ISO-8601 timestamp stored as TEXT in SQLite.
+ */
+setAt: string, };
 
-/** Result of `find_new_frames_for_set`. */
-export interface FindNewFramesResult {
-  candidates: CandidateFrame[];
-  scan_was_awaited: boolean;
-}
+export type RegistrationRecord = { id: number | null, framesSetId: number, frameId: number, referenceFrameId: number, isReference: boolean, crpix1: number | null, crpix2: number | null, crval1: number | null, crval2: number | null, cd11: number | null, cd12: number | null, cd21: number | null, cd22: number | null, affineA1: number | null, affineB1: number | null, affineC1: number | null, affineA2: number | null, affineB2: number | null, affineC2: number | null, matchedStars: number, rmsResidualPx: number, 
+/**
+ * RMS in arcsec: `rms_residual_px * pixel_scale_arcsec`. `None` when the
+ * reference pixel scale is unavailable (rare).
+ */
+rmsResidualArcsec: number | null, 
+/**
+ * `"aligned"` | `"aligned_flipped"` | `"reference"` | `"failed"`.
+ * `"aligned_flipped"` is an aligned variant (not a distinct outcome): the
+ * fitted transform includes a reflection (meridian-flipped sub).
+ */
+status: string, 
+/**
+ * Error message for failed rows.
+ */
+error: string | null, computeTimeMs: number, registeredAt: string, };
 
-/** Report returned after merging candidates into a frame set. */
-export interface MergeReport {
-  frames_set_id: number;
-  added_count: number;
-  skipped_count: number;
-  frames_added: CandidateFrame[];
-  frames_skipped: SkippedFrame[];
-  threshold_arcmin: number;
-  /** "button" | "monitor" */
-  source: string;
-}
+export type StackingPrepProgressEvent = { frameId: number, current: number, total: number, status: string, matchedStars: number | null, rmsPx: number | null, error: string | null, filename: string | null, };
 
-/** One row of the per-frame-set merge audit log. */
-export interface MergeLogEntry {
-  id: number;
-  frames_set_id: number;
-  occurred_at: string;
-  /** "button" | "monitor" */
-  source: string;
-  threshold_arcmin: number;
-  frames_added: CandidateFrame[];
-  frames_skipped: SkippedFrame[];
-  added_count: number;
-  skipped_count: number;
-}
+export type StackingPrepCompleteEvent = { referenceFrameId: number, aligned: number, failed: number, total: number, };
 
-// ── Flat Contour Plot ────────────────────────────────────────────────────
+export type LoggingConfig = { level: string, modules: { [key in string]?: string }, };
 
-/** Settings for the FlatContourPlot analysis. Mirrors PixInsight's
- *  FlatContourPlot v1.3.1 (Mike Schuster). */
-export interface FlatContourOpts {
-  /** Resampling factor in percent (1..100). 50 halves both dimensions. */
-  resolutionPct: number;
-  /** Gaussian blur sigma in pixels (0..50). */
-  sigmaPx: number;
-  /** Number of discrete grayscale bands (2..64). */
-  contours: number;
-  /** Percent of post-clip range mapped to full grayscale (1..100). */
-  gradientPct: number;
-}
+export type LoggingConfigResponse = { config: LoggingConfig, envOverrideActive: boolean, };
 
-// ========== Frame Set Reference Frame ==========
-
-/** Persisted user-chosen reference frame for a frame set.
- *  Mirrors Rust `FrameSetReference` (serde rename_all = "camelCase"). */
-export interface FrameSetReference {
-  framesSetId: number;
-  referenceFrameId: number;
-  setAt: string; // ISO 8601
-}
-
-// ========== Stacking Preparation / Frame Registration ==========
-
-/** Registration status for a single frame. */
-export type FrameRegistrationStatus =
-  | 'pending'
-  | 'aligning'
-  | 'aligned'
-  | 'aligned_flipped'
-  | 'reference'
-  | 'failed';
-
-/** Persisted registration result for a single frame within a frame set.
- *  Mirrors Rust `RegistrationRecord` (serde rename_all = "camelCase"). */
-export interface RegistrationRecord {
-  id?: number;
-  framesSetId: number;
-  frameId: number;
-  referenceFrameId: number;
-  isReference: boolean;
-  crpix1?: number;
-  crpix2?: number;
-  crval1?: number;
-  crval2?: number;
-  cd11?: number;
-  cd12?: number;
-  cd21?: number;
-  cd22?: number;
-  affineA1?: number;
-  affineB1?: number;
-  affineC1?: number;
-  affineA2?: number;
-  affineB2?: number;
-  affineC2?: number;
-  matchedStars: number;
-  rmsResidualPx: number;
-  rmsResidualArcsec?: number;
-  status: 'aligned' | 'aligned_flipped' | 'reference' | 'failed';
-  error?: string;
-  computeTimeMs: number;
-  registeredAt: string;
-}
-
-/** Live progress event emitted during frame registration.
- *  Event name: `stacking-prep-progress`. */
-export interface StackingPrepProgressEvent {
-  frameId: number;
-  current: number;
-  total: number;
-  status: FrameRegistrationStatus;
-  matchedStars?: number;
-  rmsPx?: number;
-  error?: string;
-  filename?: string;
-}
-
-/** Completion event emitted when frame registration finishes.
- *  Event name: `stacking-prep-complete`. */
-export interface StackingPrepCompleteEvent {
-  referenceFrameId: number;
-  aligned: number;
-  failed: number;
-  total: number;
-}
-
-/** Response from `compute_flat_contour_plot`. The `pixelsB64` field is the
- *  final 8-bit grayscale display image (length == width*height) base64-
- *  encoded for JSON transport. The frontend paints those bytes directly
- *  via putImageData; the legend strip is built from `minQuantile`,
- *  `maxQuantile`, and `contours`. */
-export interface FlatContourPlot {
-  width: number;
-  height: number;
-  /** Raw-units peak of the resampled, pre-rescale image. */
-  peak: number;
-  /** Raw-units mean. */
-  mean: number;
-  /** Raw-units min. */
-  min: number;
-  /** 1st-percentile sample value (legend low edge, original flat units). */
-  minQuantile: number;
-  /** 99th-percentile sample value (legend high edge, original flat units). */
-  maxQuantile: number;
-  /** Echoed back from the request — number of bands the result uses. */
-  contours: number;
-  /** Base64-encoded 8-bit grayscale buffer. */
-  pixelsB64: string;
-}
-
-/** Persisted logging configuration (`get_logging_config` / `set_logging_config`).
- *  `level` is the base tracing level; `modules` maps a UI module key
- *  (`scanner`, `solver`, `calibration`, `archive`) to a per-module override
- *  level. Both must be one of `error` | `warn` | `info` | `debug`. */
-export interface LoggingConfig {
-  level: string;
-  modules: Record<string, string>;
-}
-
-/** Response from `get_logging_config`. `envOverrideActive` is true when the
- *  `ATHENAEUM_LOG` environment variable is set on the process — in that case
- *  `set_logging_config` persists but does not live-apply (the UI should
- *  reflect this as read-only). */
-export interface LoggingConfigResponse {
-  config: LoggingConfig;
-  envOverrideActive: boolean;
-}

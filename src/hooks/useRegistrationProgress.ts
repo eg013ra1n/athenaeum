@@ -4,8 +4,8 @@ import { useNotifications } from '../contexts/NotificationContext';
 import type {
   StackingPrepProgressEvent,
   StackingPrepCompleteEvent,
-  FrameRegistrationStatus,
 } from '../types/models';
+import type { FrameRegistrationStatus } from '../types/helpers';
 
 // ── Per-frame live status ────────────────────────────────────────────────────
 
@@ -143,11 +143,18 @@ export function useRegistrationProgress() {
           if (!entry) return prev;
           const frameStatuses = new Map(entry.frameStatuses);
           frameStatuses.set(payload.frameId, {
-            status: payload.status,
-            matchedStars: payload.matchedStars,
-            rmsArcsec: payload.rmsPx,
-            error: payload.error,
-            filename: payload.filename,
+            // Generated StackingPrepProgressEvent.status is a plain `string`
+            // (Rust field has no enum, just a doc-commented value set —
+            // see registration/service.rs); narrowed here to the documented
+            // FrameRegistrationStatus values.
+            status: payload.status as FrameRegistrationStatus,
+            // Generated StackingPrepProgressEvent fields are `T | null`
+            // (plain Option<T>, no #[ts(optional)] override); FrameRegStatus
+            // keeps its local `T | undefined` shape, so normalize here.
+            matchedStars: payload.matchedStars ?? undefined,
+            rmsArcsec: payload.rmsPx ?? undefined,
+            error: payload.error ?? undefined,
+            filename: payload.filename ?? undefined,
           });
           const updated = new Map(prev);
           updated.set(setId, {

@@ -18,7 +18,7 @@ import {
 } from '../../api/archive';
 import { pickDirectory, revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
-import type { ArchiveRoot, ArchivedFrameSetSummary, ArchiveZip } from '../../types/archive';
+import type { ArchiveRoot, ArchivedFrameSetSummary, ArchiveZip } from '../../types/helpers';
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

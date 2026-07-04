@@ -1,5 +1,5 @@
 import React from 'react';
-import type { ScanRootWithAvailability } from '../../../types/models';
+import type { ScanRootWithAvailability } from '../../../types/helpers';
 
 interface Props {
   rootId: number | null;

@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import type { FrameAnalysis } from "../types/models";
 import type { AnnotationSettings } from "../types/analysis-config";
-import { DEFAULT_ANNOTATION_SETTINGS } from "../types/analysis-config";
+import { DEFAULT_ANNOTATION_SETTINGS } from "../types/helpers";
 import { ToolBar, FrameList, FrameInfoPanel } from "./blink";
 import { fetchAndComposeFlatContour, loadFlatContourOpts } from "./blink/flatContour";
 import { useBlinkCache } from "../hooks/useBlinkCache";

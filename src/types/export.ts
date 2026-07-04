@@ -1,487 +1,797 @@
-// TypeScript interfaces for export module
+// AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.
+// Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract
 
+export type CameraType = "osc" | "mono";
+
+export type ExportFrame = { 
 /**
- * Camera type based on Bayer pattern presence
+ * Frame ID in database
  */
-export type CameraType = 'osc' | 'mono';
-
+frameId: number, 
 /**
- * A single frame for export
+ * File ID in database
  */
-export interface ExportFrame {
-  frameId: number;
-  fileId: number;
-  filePath: string;
-  filename: string;
-  exptime: number | null;
-  filter: string | null;
-  ccdTemp: number | null;
-  gain: number | null;
-  offset: number | null;
-  binning: string | null;
-  dateObs: string | null;
-  focallen: number | null;
-  bayerpat: string | null;
-  instrume: string | null;
-}
-
+fileId: number, 
 /**
- * Information about a calibration set and its sub-calibrations (recursive)
+ * Full file path
  */
-export interface CalibrationSetInfo {
-  setId: number;
-  imagetyp: string;
-  frames: ExportFrame[];
-  frameCount: number;
-  darkFlat: CalibrationSetInfo | null;
-  dark: CalibrationSetInfo | null;
-  bias: CalibrationSetInfo | null;
-  matchScore: number | null;
-  warnings: string[];
-}
-
+filePath: string, 
 /**
- * A subgroup of frames that share the same calibration set links
+ * Filename only
  */
-export interface CalibrationSubgroup {
-  subgroupKey: string;
-  displayName: string;
-  frames: ExportFrame[];
-  flat: CalibrationSetInfo | null;
-  dark: CalibrationSetInfo | null;
-  bias: CalibrationSetInfo | null;
-  warnings: string[];
-}
-
+filename: string, 
 /**
- * An export group - frames that will be stacked into one master light
+ * Exposure time in seconds
  */
-export interface ExportGroup {
-  groupKey: string;
-  filter: string | null;
-  cameraType: CameraType;
-  displayName: string;
-  subgroups: CalibrationSubgroup[];
-  totalFrames: number;
-  totalExposure: number;
-  warnings: string[];
-}
-
+exptime: number | null, 
 /**
- * Summary of calibration availability
+ * Filter name
  */
-export interface CalibrationSummary {
-  flatCount: number;
-  darkCount: number;
-  biasCount: number;
-  darkFlatCount: number;
-  flatsComplete: boolean;
-  darksComplete: boolean;
-  biasComplete: boolean;
-  warnings: string[];
-}
-
+filter: string | null, 
 /**
- * Plan for creating all required master calibration files
+ * CCD temperature
  */
-export interface MasterCreationPlan {
-  masters: MasterInfo[];
-  masterPaths: Record<number, string>;
-}
-
+ccdTemp: number | null, 
 /**
- * Information about a master calibration file to create
+ * Gain setting
  */
-export interface MasterInfo {
-  setId: number;
-  masterType: string;
-  outputName: string;
-  sourceFrames: ExportFrame[];
-  dependsOn: number[];
-  applyBias: number | null;
-  applyDark: number | null;
-}
-
+gain: number | null, 
 /**
- * Complete export data for a frame set
+ * Offset setting
  */
-export interface ExportData {
-  frameSetId: number;
-  frameSetName: string;
-  objectName: string | null;
-  groups: ExportGroup[];
-  masterPlan: MasterCreationPlan;
-  filters: FilterExportGroup[];
-  calibrationSummary: CalibrationSummary;
-  totalLightFrames: number;
-  totalExposureSeconds: number;
-}
-
+offset: number | null, 
 /**
- * Legacy filter group structure
+ * Binning (e.g., "1x1")
  */
-export interface FilterExportGroup {
-  filter: string | null;
-  lightFrames: ExportFrame[];
-  flatSets: ExportCalibrationSet[];
-  darkSets: ExportCalibrationSet[];
-  biasSets: ExportCalibrationSet[];
-}
-
+binning: string | null, 
 /**
- * Legacy calibration set structure
+ * Date observed
  */
-export interface ExportCalibrationSet {
-  setId: number;
-  imagetyp: string;
-  frames: ExportFrame[];
-  subCalibrations: ExportCalibrationSet[];
-  matchScore: number | null;
-  warnings: string[];
-}
-
-// ============================================================================
-// Calibration Route (UI Display)
-// ============================================================================
-
+dateObs: string | null, 
 /**
- * Calibration route for UI display
+ * Focal length in mm
  */
-export interface CalibrationRoute {
-  groups: CalibrationRouteGroup[];
-  summary: CalibrationRouteSummary;
-}
-
+focallen: number | null, 
 /**
- * A group in the calibration route display
+ * Pixel size in micrometers (from XPIXSZ or PIXSIZE1 FITS header)
  */
-export interface CalibrationRouteGroup {
-  name: string;
-  lightCount: number;
-  totalExposure: number;
-  subgroupCount: number;
-  calibrationTree: CalibrationTreeNode[];
-}
-
+xpixsz: number | null, 
 /**
- * A node in the calibration tree for UI display
+ * Bayer pattern for OSC detection (e.g., "RGGB")
  */
-export interface CalibrationTreeNode {
-  nodeType: 'Light' | 'Flat' | 'Dark' | 'Bias' | 'DarkFlat';
-  label: string;
-  setId: number | null;
-  count: number;
-  children: CalibrationTreeNode[];
-  warnings: string[];
-  isMissing: boolean;
-  isShared: boolean;
-}
-
+bayerpat: string | null, 
 /**
- * Summary of the calibration route
+ * Camera/instrument name
  */
-export interface CalibrationRouteSummary {
-  groupCount: number;
-  totalLights: number;
-  totalExposure: number;
-  uniqueCalibrationSets: number;
-  mastersToCreate: number;
-  flatsComplete: boolean;
-  darksComplete: boolean;
-  biasComplete: boolean;
-  warnings: string[];
-}
+instrume: string | null, };
 
+export type CalibrationSetInfo = { 
 /**
- * Result of an export operation
+ * Calibration set ID
  */
-export interface ExportResult {
-  success: boolean;
-  outputDir: string;
-  filesOrganized: number;
-  scriptsGenerated: string[];
-  warnings: string[];
-  error: string | null;
-}
-
+setId: number, 
 /**
- * Frame set summary for export selection
+ * Image type (FLAT, DARK, BIAS, DARKFLAT)
  */
-export interface ExportableFrameSet {
-  id: number;
-  name: string | null;
-  totalExposureSeconds: number;
-  frameCount: number;
-  objectName: string | null;
-  filters: string[];
-}
-
-// ============================================================================
-// Export Summary (Enhanced UI)
-// ============================================================================
-
+imagetyp: string, 
 /**
- * Complete export summary for the enhanced UI
+ * Frames in this calibration set
  */
-export interface ExportSummary {
-  frameSetId: number;
-  frameSetName: string;
-  objectName: string | null;
-  /** Unique cameras used */
-  cameras: string[];
-  /** Unique telescopes used */
-  telescopes: string[];
-  /** Date range of sessions [start, end] */
-  dateRange: [string, string] | null;
-  /** Filter groups with full breakdown */
-  filterGroups: FilterGroupSummary[];
-  /** Folder structure preview */
-  folderPreview: FolderPreview;
-  /** Detailed warnings */
-  warnings: DetailedWarning[];
-  /** Total file count */
-  totalFiles: number;
-  /** Estimated total size in bytes */
-  estimatedSizeBytes: number;
-}
-
+frames: Array<ExportFrame>, 
 /**
- * Summary for a single filter group (filter + camera type combination)
+ * Frame count
  */
-export interface FilterGroupSummary {
-  /** Filter name (null for unfiltered/luminance) */
-  filter: string | null;
-  /** Camera type (OSC or Mono) */
-  cameraType: CameraType;
-  /** Camera/instrument name */
-  camera: string | null;
-  /** Telescope name */
-  telescope: string | null;
-  /** Gain setting */
-  gain: number | null;
-  /** Offset setting */
-  offset: number | null;
-  /** Binning mode (e.g., "1x1") */
-  binning: string | null;
-  /** Average CCD temperature */
-  avgTemp: number | null;
-  /** Exposure breakdown by exposure time */
-  exposureGroups: ExposureGroup[];
-  /** Total exposure time in seconds */
-  totalExposure: number;
-  /** Total frame count */
-  frameCount: number;
-  /** Linked flat calibration info */
-  flatInfo: CalibrationDetail | null;
-  /** Linked dark calibration info */
-  darkInfo: CalibrationDetail | null;
-  /** Linked bias calibration info */
-  biasInfo: CalibrationDetail | null;
-  /** All frames in this group (for expandable list) */
-  frames: FrameDetail[];
-}
-
+frameCount: number, 
 /**
- * Exposure time group (frames with same exposure)
+ * Sub-calibration: DarkFlat set (for Flats)
  */
-export interface ExposureGroup {
-  /** Exposure time in seconds */
-  exptime: number;
-  /** Number of frames with this exposure */
-  count: number;
-  /** Total exposure time for this group (exptime * count) */
-  totalSeconds: number;
-}
-
+darkFlat: CalibrationSetInfo | null, 
 /**
- * Detailed calibration information
+ * Sub-calibration: Dark set (for Flats or Lights)
  */
-export interface CalibrationDetail {
-  /** Calibration set ID */
-  setId: number;
-  /** Calibration type (Flat, Dark, Bias, DarkFlat) */
-  calibrationType: string;
-  /** Number of calibration frames */
-  frameCount: number;
-  /** Average exposure time (for darks/flats) */
-  avgExptime: number | null;
-  /** Average CCD temperature */
-  avgTemp: number | null;
-  /** Match quality score (0.0 - 1.0) */
-  matchScore: number;
-  /** Date range of calibration frames [start, end] */
-  dateRange: [string, string] | null;
-  /** Specific warnings for this calibration */
-  warnings: string[];
-  /** Sub-calibrations (e.g., Flat -> Dark -> Bias chain) */
-  subCalibrations: CalibrationDetail[];
-}
-
+dark: CalibrationSetInfo | null, 
 /**
- * Individual frame detail for expandable list
+ * Sub-calibration: Bias set (for Flats, Darks, or Lights)
  */
-export interface FrameDetail {
-  /** Frame ID */
-  frameId: number;
-  /** Filename */
-  filename: string;
-  /** Full file path */
-  filePath: string;
-  /** Date observed */
-  dateObs: string | null;
-  /** Exposure time in seconds */
-  exptime: number | null;
-  /** CCD temperature */
-  temp: number | null;
-  /** Gain setting */
-  gain: number | null;
-  /** Offset setting */
-  offset: number | null;
-  /** Calibration chain description (e.g., "Flat #12 → Dark #8 → Bias #3") */
-  calibrationChain: string;
-  /** File size in bytes (if known) */
-  fileSize: number | null;
-}
-
+bias: CalibrationSetInfo | null, 
 /**
- * Folder structure preview for export
+ * Match quality score (0.0 - 1.0)
  */
-export interface FolderPreview {
-  /** Root folder name */
-  rootName: string;
-  /** Folder structure tree */
-  structure: FolderNode[];
-  /** Total file count */
-  totalFiles: number;
-  /** Estimated total size (human readable) */
-  estimatedSize: string;
-}
-
+matchScore: number | null, 
 /**
- * A node in the folder structure tree
+ * Warnings (date, temperature mismatch, etc.)
  */
-export interface FolderNode {
-  /** Node name (folder or file name) */
-  name: string;
-  /** Node type */
-  nodeType: FolderNodeType;
-  /** File count (for folders) */
-  fileCount: number | null;
-  /** Description (e.g., "← 50 darks, 100 bias") */
-  description: string | null;
-  /** Child nodes */
-  children: FolderNode[];
-}
+warnings: Array<string>, };
 
+export type CalibrationSubgroup = { 
 /**
- * Type of folder node
+ * Unique subgroup key (hash of calibration set IDs)
  */
-export type FolderNodeType = 'folder' | 'file' | 'ellipsis';
-
+subgroupKey: string, 
 /**
- * Detailed warning with full context
+ * Display name (e.g., "Night 1 - Camera X" or auto-generated)
  */
-export interface DetailedWarning {
-  /** Warning type */
-  warningType: WarningType;
-  /** Warning severity */
-  severity: WarningSeverity;
-  /** Short title */
-  title: string;
-  /** Detailed description */
-  description: string;
-  /** Related calibration set ID (if applicable) */
-  setId: number | null;
-  /** Related filter (if applicable) */
-  filter: string | null;
-  /** Actual value (for mismatches) */
-  actualValue: string | null;
-  /** Expected value (for mismatches) */
-  expectedValue: string | null;
-  /** Delta/difference (for numeric comparisons) */
-  delta: string | null;
-  /** Recommendation text */
-  recommendation: string | null;
-}
-
+displayName: string, 
 /**
- * Warning type categories
+ * Light frames in this subgroup
  */
-export type WarningType =
-  | 'temperature_mismatch'
-  | 'calibration_age'
-  | 'missing_calibration'
-  | 'gain_offset_mismatch'
-  | 'binning_mismatch'
-  | 'exposure_mismatch'
-  | 'general';
-
+frames: Array<ExportFrame>, 
 /**
- * Warning severity levels
+ * Linked Flat calibration set (with its own sub-calibrations)
  */
-export type WarningSeverity = 'info' | 'warning' | 'error';
-
-// ============================================================================
-// Export Progress Events
-// ============================================================================
-
+flat: CalibrationSetInfo | null, 
 /**
- * Progress event emitted during export file organization
+ * Linked Dark calibration set (with its own sub-calibrations)
  */
-export interface ExportProgressEvent {
-  frameSetId: number;
-  /** Files copied so far */
-  current: number;
-  /** Total files to copy */
-  total: number;
-  percent: number;
-  currentFile: string | null;
-  /** "collecting" | "copying" | "complete" */
-  phase: string;
-}
-
+dark: CalibrationSetInfo | null, 
 /**
- * Event emitted when export finishes (success or failure)
+ * Linked Bias calibration set
  */
-export interface ExportCompleteEvent {
-  frameSetId: number;
-  success: boolean;
-  filesOrganized: number;
-  warnings: string[];
-  error: string | null;
-  outputDir: string;
-}
-
-// ============================================================================
-// WBPP Export Configuration
-// ============================================================================
-
+bias: CalibrationSetInfo | null, 
 /**
- * Configuration for WBPP export folder hierarchy
+ * Warnings for this subgroup
  */
-export interface WbppExportConfig {
-  /** Keyword nesting order (outermost first). Default: ["CAMERA", "BIAS", "DARKS", "FLAT"] */
-  keywordOrder: string[];
-}
+warnings: Array<string>, };
 
+export type ExportGroup = { 
 /**
- * Setup instructions for configuring WBPP grouping keywords
+ * Unique group key for identification (e.g., "Ha_Mono")
  */
-export interface WbppSetupInstructions {
-  /** Ordered list of keywords to configure in WBPP */
-  keywords: WbppKeywordInstruction[];
-  /** Example folder structure matching the current config */
-  exampleStructure: string;
-}
+groupKey: string, 
+/**
+ * Filter name (None for unfiltered/OSC luminance)
+ */
+filter: string | null, 
+/**
+ * Camera type (OSC or Mono)
+ */
+cameraType: CameraType, 
+/**
+ * Display name for UI (e.g., "Ha (Mono)", "Luminance (OSC)")
+ */
+displayName: string, 
+/**
+ * Calibration subgroups - frames grouped by their linked calibration sets
+ */
+subgroups: Array<CalibrationSubgroup>, 
+/**
+ * Total light frame count across all subgroups
+ */
+totalFrames: number, 
+/**
+ * Total exposure time across all subgroups (seconds)
+ */
+totalExposure: number, 
+/**
+ * Warnings specific to this group
+ */
+warnings: Array<string>, };
 
+export type CalibrationSummary = { 
 /**
- * A single WBPP keyword instruction
+ * Total flat frames available
  */
-export interface WbppKeywordInstruction {
-  /** The WBPP grouping keyword name */
-  keyword: string;
-  /** Whether "Pre" should be checked for this keyword */
-  preChecked: boolean;
-  /** Description of what this keyword controls */
-  description: string;
-}
+flatCount: number, 
+/**
+ * Total dark frames available
+ */
+darkCount: number, 
+/**
+ * Total bias frames available
+ */
+biasCount: number, 
+/**
+ * Total dark flat frames available
+ */
+darkFlatCount: number, 
+/**
+ * Whether all lights have matched flats
+ */
+flatsComplete: boolean, 
+/**
+ * Whether all lights have matched darks
+ */
+darksComplete: boolean, 
+/**
+ * Whether all lights have matched bias
+ */
+biasComplete: boolean, 
+/**
+ * Warnings about calibration matching
+ */
+warnings: Array<string>, };
+
+export type MasterCreationPlan = { 
+/**
+ * Ordered list of masters to create (respects dependencies)
+ */
+masters: Array<MasterInfo>, 
+/**
+ * Map of set_id → master file path for reference
+ */
+masterPaths: { [key in number]?: string }, };
+
+export type MasterInfo = { 
+/**
+ * Calibration set ID
+ */
+setId: number, 
+/**
+ * Master type (Bias, Dark, DarkFlat, Flat)
+ */
+masterType: string, 
+/**
+ * Output filename (e.g., "master_bias_3.fit")
+ */
+outputName: string, 
+/**
+ * Source frames for this master
+ */
+sourceFrames: Array<ExportFrame>, 
+/**
+ * Dependencies - set IDs of masters needed before this one
+ */
+dependsOn: Array<number>, 
+/**
+ * Calibration master to apply: Bias set ID
+ */
+applyBias: number | null, 
+/**
+ * Calibration master to apply: Dark set ID (for lights and darks that need dark calibration)
+ * For flats, this is only set if the dark exposure time matches the flat exposure (±30%)
+ */
+applyDark: number | null, 
+/**
+ * Calibration master to apply: DarkFlat set ID (for flats - short exposure dark matching flat exposure)
+ */
+applyDarkflat: number | null, 
+/**
+ * Source frame exposure time (for exposure-time matching in flat calibration)
+ */
+sourceExptime: number | null, };
+
+export type ExportData = { 
+/**
+ * Frame set ID
+ */
+frameSetId: number, 
+/**
+ * Frame set name
+ */
+frameSetName: string, 
+/**
+ * Object name
+ */
+objectName: string | null, 
+/**
+ * Export groups (new structure with subgroups)
+ */
+groups: Array<ExportGroup>, 
+/**
+ * Master creation plan (ordered list of masters to create)
+ */
+masterPlan: MasterCreationPlan, 
+/**
+ * Filter groups with their calibrations (legacy - kept for compatibility)
+ */
+filters: Array<FilterExportGroup>, 
+/**
+ * Overall calibration summary
+ */
+calibrationSummary: CalibrationSummary, 
+/**
+ * Total light frame count
+ */
+totalLightFrames: number, 
+/**
+ * Total exposure time in seconds
+ */
+totalExposureSeconds: number, };
+
+export type FilterExportGroup = { 
+/**
+ * Filter name (None for unfiltered/OSC)
+ */
+filter: string | null, 
+/**
+ * Light frames for this filter
+ */
+lightFrames: Array<ExportFrame>, 
+/**
+ * Matched flat calibration sets
+ */
+flatSets: Array<ExportCalibrationSet>, 
+/**
+ * Matched dark calibration sets
+ */
+darkSets: Array<ExportCalibrationSet>, 
+/**
+ * Matched bias calibration sets
+ */
+biasSets: Array<ExportCalibrationSet>, };
+
+export type ExportCalibrationSet = { 
+/**
+ * Calibration set ID
+ */
+setId: number, 
+/**
+ * Image type (FLAT, DARK, BIAS, DARKFLAT)
+ */
+imagetyp: string, 
+/**
+ * Frames in this calibration set
+ */
+frames: Array<ExportFrame>, 
+/**
+ * Sub-calibrations (e.g., Flat -> Dark, Dark -> Bias)
+ */
+subCalibrations: Array<ExportCalibrationSet>, 
+/**
+ * Match quality score (0.0 - 1.0)
+ */
+matchScore: number | null, 
+/**
+ * Warnings about this calibration match
+ */
+warnings: Array<string>, };
+
+export type CalibrationRoute = { 
+/**
+ * Export groups and their calibration trees
+ */
+groups: Array<CalibrationRouteGroup>, 
+/**
+ * Overall summary
+ */
+summary: CalibrationRouteSummary, };
+
+export type CalibrationRouteGroup = { 
+/**
+ * Group display name (e.g., "Ha (Mono)")
+ */
+name: string, 
+/**
+ * Number of light frames
+ */
+lightCount: number, 
+/**
+ * Total exposure time (seconds)
+ */
+totalExposure: number, 
+/**
+ * Number of subgroups
+ */
+subgroupCount: number, 
+/**
+ * Calibration tree nodes
+ */
+calibrationTree: Array<CalibrationTreeNode>, };
+
+export type CalibrationTreeNode = { 
+/**
+ * Node type: "Light", "Flat", "Dark", "Bias", "DarkFlat"
+ */
+nodeType: string, 
+/**
+ * Display label (e.g., "Flat Set 5 (30 frames)")
+ */
+label: string, 
+/**
+ * Calibration set ID (None for Light nodes)
+ */
+setId: number | null, 
+/**
+ * Frame count
+ */
+count: number, 
+/**
+ * Child nodes (sub-calibrations)
+ */
+children: Array<CalibrationTreeNode>, 
+/**
+ * Warnings for this node
+ */
+warnings: Array<string>, 
+/**
+ * Whether this node is missing/incomplete
+ */
+isMissing: boolean, 
+/**
+ * Whether this set is shared with other subgroups/groups
+ */
+isShared: boolean, };
+
+export type CalibrationRouteSummary = { 
+/**
+ * Total export groups
+ */
+groupCount: number, 
+/**
+ * Total light frames
+ */
+totalLights: number, 
+/**
+ * Total exposure time (seconds)
+ */
+totalExposure: number, 
+/**
+ * Number of unique calibration sets
+ */
+uniqueCalibrationSets: number, 
+/**
+ * Number of masters to create
+ */
+mastersToCreate: number, 
+/**
+ * Calibration completeness flags
+ */
+flatsComplete: boolean, darksComplete: boolean, biasComplete: boolean, 
+/**
+ * Overall warnings
+ */
+warnings: Array<string>, };
+
+export type ExportResult = { 
+/**
+ * Whether the export was successful
+ */
+success: boolean, 
+/**
+ * Output directory path
+ */
+outputDir: string, 
+/**
+ * Number of files copied/linked
+ */
+filesOrganized: number, 
+/**
+ * Generated script paths
+ */
+scriptsGenerated: Array<string>, 
+/**
+ * Any warnings during export
+ */
+warnings: Array<string>, 
+/**
+ * Error message if failed
+ */
+error: string | null, };
+
+export type ExportSummary = { 
+/**
+ * Frame set ID
+ */
+frameSetId: number, 
+/**
+ * Frame set name
+ */
+frameSetName: string, 
+/**
+ * Object name (target)
+ */
+objectName: string | null, 
+/**
+ * Unique cameras used
+ */
+cameras: Array<string>, 
+/**
+ * Unique telescopes used
+ */
+telescopes: Array<string>, 
+/**
+ * Date range of sessions (start, end)
+ */
+dateRange: [string, string] | null, 
+/**
+ * Filter groups with full breakdown
+ */
+filterGroups: Array<FilterGroupSummary>, 
+/**
+ * Folder structure preview
+ */
+folderPreview: FolderPreview, 
+/**
+ * Detailed warnings
+ */
+warnings: Array<DetailedWarning>, 
+/**
+ * Total file count
+ */
+totalFiles: number, 
+/**
+ * Estimated total size in bytes
+ */
+estimatedSizeBytes: number, };
+
+export type FilterGroupSummary = { 
+/**
+ * Filter name (None for unfiltered/luminance)
+ */
+filter: string | null, 
+/**
+ * Camera type (OSC or Mono)
+ */
+cameraType: CameraType, 
+/**
+ * Camera/instrument name
+ */
+camera: string | null, 
+/**
+ * Telescope name
+ */
+telescope: string | null, 
+/**
+ * Gain setting
+ */
+gain: number | null, 
+/**
+ * Offset setting
+ */
+offset: number | null, 
+/**
+ * Binning mode (e.g., "1x1")
+ */
+binning: string | null, 
+/**
+ * Average CCD temperature
+ */
+avgTemp: number | null, 
+/**
+ * Exposure breakdown by exposure time
+ */
+exposureGroups: Array<ExposureGroup>, 
+/**
+ * Total exposure time in seconds
+ */
+totalExposure: number, 
+/**
+ * Total frame count
+ */
+frameCount: number, 
+/**
+ * Linked flat calibration info
+ */
+flatInfo: CalibrationDetail | null, 
+/**
+ * Linked dark calibration info
+ */
+darkInfo: CalibrationDetail | null, 
+/**
+ * Linked bias calibration info
+ */
+biasInfo: CalibrationDetail | null, 
+/**
+ * All frames in this group (for expandable list)
+ */
+frames: Array<FrameDetail>, };
+
+export type ExposureGroup = { 
+/**
+ * Exposure time in seconds
+ */
+exptime: number, 
+/**
+ * Number of frames with this exposure
+ */
+count: number, 
+/**
+ * Total exposure time for this group (exptime * count)
+ */
+totalSeconds: number, };
+
+export type CalibrationDetail = { 
+/**
+ * Calibration set ID
+ */
+setId: number, 
+/**
+ * Calibration type (Flat, Dark, Bias, DarkFlat)
+ */
+calibrationType: string, 
+/**
+ * Number of calibration frames
+ */
+frameCount: number, 
+/**
+ * Average exposure time (for darks/flats)
+ */
+avgExptime: number | null, 
+/**
+ * Average CCD temperature
+ */
+avgTemp: number | null, 
+/**
+ * Match quality score (0.0 - 1.0)
+ */
+matchScore: number, 
+/**
+ * Date range of calibration frames (start, end)
+ */
+dateRange: [string, string] | null, 
+/**
+ * Specific warnings for this calibration
+ */
+warnings: Array<string>, 
+/**
+ * Sub-calibrations (e.g., Flat -> Dark -> Bias chain)
+ */
+subCalibrations: Array<CalibrationDetail>, };
+
+export type FrameDetail = { 
+/**
+ * Frame ID
+ */
+frameId: number, 
+/**
+ * Filename
+ */
+filename: string, 
+/**
+ * Full file path
+ */
+filePath: string, 
+/**
+ * Date observed
+ */
+dateObs: string | null, 
+/**
+ * Exposure time in seconds
+ */
+exptime: number | null, 
+/**
+ * CCD temperature
+ */
+temp: number | null, 
+/**
+ * Gain setting
+ */
+gain: number | null, 
+/**
+ * Offset setting
+ */
+offset: number | null, 
+/**
+ * Calibration chain description (e.g., "Flat #12 → Dark #8 → Bias #3")
+ */
+calibrationChain: string, 
+/**
+ * File size in bytes (if known)
+ */
+fileSize: number | null, };
+
+export type FolderPreview = { 
+/**
+ * Root folder name
+ */
+rootName: string, 
+/**
+ * Folder structure tree
+ */
+structure: Array<FolderNode>, 
+/**
+ * Total file count
+ */
+totalFiles: number, 
+/**
+ * Estimated total size (human readable)
+ */
+estimatedSize: string, };
+
+export type FolderNode = { 
+/**
+ * Node name (folder or file name)
+ */
+name: string, 
+/**
+ * Node type
+ */
+nodeType: FolderNodeType, 
+/**
+ * File count (for folders)
+ */
+fileCount: number | null, 
+/**
+ * Description (e.g., "← 50 darks, 100 bias")
+ */
+description: string | null, 
+/**
+ * Child nodes
+ */
+children: Array<FolderNode>, };
+
+export type FolderNodeType = "folder" | "file" | "ellipsis";
+
+export type DetailedWarning = { 
+/**
+ * Warning type
+ */
+warningType: WarningType, 
+/**
+ * Warning severity
+ */
+severity: WarningSeverity, 
+/**
+ * Short title
+ */
+title: string, 
+/**
+ * Detailed description
+ */
+description: string, 
+/**
+ * Related calibration set ID (if applicable)
+ */
+setId: number | null, 
+/**
+ * Related filter (if applicable)
+ */
+filter: string | null, 
+/**
+ * Actual value (for mismatches)
+ */
+actualValue: string | null, 
+/**
+ * Expected value (for mismatches)
+ */
+expectedValue: string | null, 
+/**
+ * Delta/difference (for numeric comparisons)
+ */
+delta: string | null, 
+/**
+ * Recommendation text
+ */
+recommendation: string | null, };
+
+export type WarningType = "temperature_mismatch" | "calibration_age" | "missing_calibration" | "gain_offset_mismatch" | "binning_mismatch" | "exposure_mismatch" | "general";
+
+export type WarningSeverity = "info" | "warning" | "error";
+
+export type ExportProgressEvent = { frameSetId: number, 
+/**
+ * Files copied so far
+ */
+current: number, 
+/**
+ * Total files to copy
+ */
+total: number, percent: number, currentFile: string | null, 
+/**
+ * "collecting" | "copying" | "complete"
+ */
+phase: string, };
+
+export type ExportCompleteEvent = { frameSetId: number, success: boolean, filesOrganized: number, warnings: Array<string>, error: string | null, outputDir: string, };
+
+export type WbppExportConfig = { 
+/**
+ * Keyword nesting order (outermost first).
+ * Default: ["CAMERA", "BIAS", "DARKS", "FLAT"]
+ */
+keywordOrder: Array<string>, };
+
+export type WbppSetupInstructions = { 
+/**
+ * Ordered list of keywords to configure in WBPP
+ */
+keywords: Array<WbppKeywordInstruction>, 
+/**
+ * Example folder structure matching the current config
+ */
+exampleStructure: string, };
+
+export type WbppKeywordInstruction = { 
+/**
+ * The WBPP grouping keyword name
+ */
+keyword: string, 
+/**
+ * Whether "Pre" should be checked for this keyword
+ */
+preChecked: boolean, 
+/**
+ * Description of what this keyword controls
+ */
+description: string, };
+

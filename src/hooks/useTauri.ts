@@ -3,13 +3,12 @@ import { api } from '../api';
 import { useState, useEffect, useCallback } from 'react';
 import type {
   ScanRoot,
-  ScanRootWithAvailability,
   FileWithFrame,
   DuplicateGroup,
   FolderSimilarity,
-  ScanResult,
   RelinkResult,
 } from '../types/models';
+import type { ScanRootWithAvailability, ScanResult } from '../types/helpers';
 
 /**
  * Manage scan roots (monitored directories)

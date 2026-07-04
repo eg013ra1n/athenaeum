@@ -3,7 +3,7 @@ import { api } from '../api';
 import { openUrl } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { RefreshCw, Download, CheckCircle2, AlertCircle, Info, ExternalLink } from 'lucide-react';
-import type { UpdateInfo } from '../types/models';
+import type { UpdateInfo } from '../types/helpers';
 
 interface Dependency {
   name: string;

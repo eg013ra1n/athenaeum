@@ -1,25 +1,33 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Save, RotateCw, CheckCircle, AlertCircle, Download, Info } from 'lucide-react';
 import { api } from '../../api';
-import type {
-  PlateSolveConfig,
-  CatalogStatusInfo,
-  CatalogDownloadProgress,
-  FovSummary,
-} from '../../types/plate-solve';
+import type { PlateSolveConfig, FovSummary } from '../../types/plate-solve';
+import type { CatalogStatusInfo, CatalogDownloadProgress } from '../../types/helpers';
 import {
   recommendTier,
   TIER_POLICY,
 } from './cameraPresets';
 
-// Fallback default shown while loading, matching backend defaults. The full
-// config object is replaced by `get_plate_solve_config` on mount; saves spread
-// the loaded object, so backend-only fields (blind-gate thresholds, bright
-// cache path) round-trip untouched even though they're not typed here.
+// Fallback default shown while loading, matching backend defaults (see
+// PlateSolveConfig::default() in athenaeum-core/src/plate_solve/config.rs).
+// The full config object is replaced by `get_plate_solve_config` on mount.
+// PlateSolveConfig is now the complete generated struct (previously a partial
+// hand-written mirror covering only the 3 settings-UI fields), so every field
+// must be present here too.
 const DEFAULT_CONFIG: PlateSolveConfig = {
   sip_order: 3,
-  autofind_tolerance_deg: 0.5,
   base_verification_tolerance_arcsec: 8.0,
+  autofind_tolerance_deg: 0.5,
+  batch_concurrency: 0,
+  blind_gate_enabled: true,
+  blind_rms_max_px_mult: 2.5,
+  blind_min_inlier_ratio: 0.04,
+  blind_inlier_floor: 6,
+  blind_scale_sanity_min: 0.05,
+  blind_scale_sanity_max: 60.0,
+  blind_scale_header_tol: 8.0,
+  camera_defaults: {},
+  bright_cache_path: null,
 };
 
 function formatStarCount(n: number): string {

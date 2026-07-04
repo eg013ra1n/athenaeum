@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star, Pencil } from "lucide-react";
-import { CalibrationSetDetail, CalibrationSetConsumer, FileWithFrame, ImageType, isMasterType } from "../types/models";
+import type { CalibrationSetDetail, CalibrationSetConsumer, FileWithFrame } from "../types/models";
+import { ImageTypeValues, isMasterType } from "../types/helpers";
 import { format } from "date-fns";
 import { api } from '../api';
 import BlinkViewer from "./BlinkViewer";
@@ -409,11 +410,11 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                         {loadingFrames === set.id ? 'Loading...' : 'View'}
                       </button>
                       {/* Don't show Sub-Cal button for Bias or Master types (masters don't need sub-calibration) */}
-                      {onEditSubCalibration && set.id !== null && set.imagetyp !== ImageType.Bias && !isMasterType(set.imagetyp) && (
+                      {onEditSubCalibration && set.id !== null && set.imagetyp !== ImageTypeValues.Bias && !isMasterType(set.imagetyp) && (
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            const setType = set.imagetyp === ImageType.Flat ? 'flat' : 'dark';
+                            const setType = set.imagetyp === ImageTypeValues.Flat ? 'flat' : 'dark';
                             onEditSubCalibration(set.id!, setType);
                           }}
                           className="inline-flex items-center gap-1 px-2 py-1 bg-surface-hover hover:brightness-110 text-content text-xs rounded transition-colors"
@@ -496,9 +497,9 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                             // collapse to their non-master kind.
                             const t = set.imagetyp;
                             const kind: 'flat' | 'dark' | 'bias' =
-                              t === ImageType.Flat || t === ImageType.MasterFlat
+                              t === ImageTypeValues.Flat || t === ImageTypeValues.MasterFlat
                                 ? 'flat'
-                                : t === ImageType.Bias || t === ImageType.MasterBias
+                                : t === ImageTypeValues.Bias || t === ImageTypeValues.MasterBias
                                 ? 'bias'
                                 : 'dark';
                             const params = new URLSearchParams({

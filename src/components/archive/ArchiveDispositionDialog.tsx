@@ -2,11 +2,11 @@ import { useEffect, useState } from 'react';
 import type {
   ArchiveCompression,
   ArchivePlan,
-  ArchiveRoot,
   ConflictResolution,
   Dispositions,
   FrameRole,
 } from '../../types/archive';
+import type { ArchiveRoot } from '../../types/helpers';
 import { listArchiveRoots, planArchiveOperation } from '../../api/archive';
 import { ArchiveConflictDialog } from './ArchiveConflictDialog';
 

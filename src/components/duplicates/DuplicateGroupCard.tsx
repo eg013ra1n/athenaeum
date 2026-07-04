@@ -1,6 +1,7 @@
 import React from 'react';
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Circle, Loader2, Sparkles, Trash2 } from 'lucide-react';
-import type { DuplicateFile, DuplicateGroup, RuleKind } from '../../types/models';
+import type { DuplicateFile, DuplicateGroup } from '../../types/models';
+import type { RuleKind } from '../../types/helpers';
 import type { FileVerifyResult, GroupVerifyStatus } from '../../hooks/useDeepVerify';
 import { groupDeletionStatus, RULE_KIND_META, type DeletionStatus } from './keepRules';
 

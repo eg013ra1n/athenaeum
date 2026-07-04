@@ -21,7 +21,8 @@ import { StackingPrepTab } from '../components/StackingPrepTab';
 import { revealItemInDir } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { Upload, FolderOpen } from 'lucide-react';
-import type { ArchiveCompression, Dispositions, ConflictResolution, ArchivedFrameSetSummary } from '../types/archive';
+import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
+import type { ArchivedFrameSetSummary } from '../types/helpers';
 
 type FrameSetTab = 'calibration' | 'analysis' | 'history' | 'export' | 'registration';
 

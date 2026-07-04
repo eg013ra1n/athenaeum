@@ -8,12 +8,13 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
-import {
+import type {
   CalibrationMatchingConfig as ConfigType,
   CalibrationTypeConfig,
   MasterPreference,
   ParameterConfig,
 } from "../../types/calibration-config";
+import { MasterPreferenceValues } from "../../types/helpers";
 import MatchingMatrixTable from "./MatchingMatrixTable";
 import BehavioralOptionsPanel from "./BehavioralOptionsPanel";
 import ClusteringParametersPanel from "./ClusteringParametersPanel";
@@ -517,20 +518,20 @@ export default function CalibrationMatchingConfig() {
                   <select
                     value={
                       config.master_preferences[type] ||
-                      MasterPreference.NoPreference
+                      MasterPreferenceValues.NoPreference
                     }
                     onChange={(e) =>
                       updateMasterPreference(type, e.target.value as MasterPreference)
                     }
                     className="w-full bg-surface-hover border border-border rounded px-3 py-2 text-content text-sm"
                   >
-                    <option value={MasterPreference.NoPreference}>
+                    <option value={MasterPreferenceValues.NoPreference}>
                       No Preference
                     </option>
-                    <option value={MasterPreference.PreferMaster}>
+                    <option value={MasterPreferenceValues.PreferMaster}>
                       Prefer Master
                     </option>
-                    <option value={MasterPreference.PreferFrameset}>
+                    <option value={MasterPreferenceValues.PreferFrameset}>
                       Prefer Frameset
                     </option>
                   </select>

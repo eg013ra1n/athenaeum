@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
-import type { CalendarMonthData, CalendarYearData } from '../types/models';
+import type { CalendarMonthData } from '../types/models';
+import type { CalendarYearData } from '../types/helpers';
 
 interface UseCalendarYearDataResult {
   data: CalendarYearData | null;

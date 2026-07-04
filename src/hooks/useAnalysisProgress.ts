@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../api';
-import type { AnalysisProgressEvent, AnalysisCompleteEvent, AnalyzeFrameSetResult } from '../types/models';
+import type { AnalysisProgressEvent, AnalysisCompleteEvent, AnalyzeFrameSetResult } from '../types/helpers';
 import { useNotifications } from '../contexts/NotificationContext';
 
 export interface QueueItem {
