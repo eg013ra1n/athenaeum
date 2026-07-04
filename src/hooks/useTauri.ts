@@ -31,10 +31,10 @@ export function useScanRoots() {
     }
   }, []);
 
-  const addScanRoot = useCallback(async (path: string) => {
+  const addScanRoot = useCallback(async (path: string, kind?: string) => {
     try {
       setLoading(true);
-      const newRoot = await api.invoke<ScanRoot>('add_scan_root', { path });
+      const newRoot = await api.invoke<ScanRoot>('add_scan_root', { path, kind: kind ?? null });
       setScanRoots((prev) => [...prev, newRoot]);
       setError(null);
       return newRoot;

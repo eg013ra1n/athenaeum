@@ -87,11 +87,26 @@ pub fn get_scan_roots(ctx: &ServiceContext) -> Result<Vec<ScanRoot>, ApiError> {
 ///
 /// Overlap/duplicate cases return `ApiError::Conflict` — matching the web
 /// route's pre-conversion `StatusCode::CONFLICT` mapping.
+///
+/// `kind` defaults to `"normal"` when `None`. `"calibration_library"` is
+/// enforced unique across all scan roots (`ApiError::Conflict` if another
+/// library root already exists); any other value is `ApiError::Invalid`.
+/// Note: the overlap checks below reject a new root that is a subdirectory
+/// of an existing one — so a calibration_library root nested inside an
+/// existing scan root is rejected too. That's intentional: the library is
+/// itself just a normal scanned root, so it must live outside every other
+/// registered root rather than inside one.
 pub fn add_scan_root(
     ctx: &ServiceContext,
     path: String,
     policy: &PathPolicy,
+    kind: Option<String>,
 ) -> Result<ScanRoot, ApiError> {
+    let kind = kind.unwrap_or_else(|| "normal".to_string());
+    if kind != "normal" && kind != "calibration_library" {
+        return Err(ApiError::Invalid(format!("unknown scan root kind: {kind}")));
+    }
+
     let db = db(ctx)?;
     let conn = db.conn();
 
@@ -149,10 +164,21 @@ pub fn add_scan_root(
         }
     }
 
-    // 5. Store the canonicalized path
+    // 5. Single-library-root enforcement — checked after overlap validation
+    //    so a doomed-anyway overlapping add doesn't get misreported as a
+    //    library-uniqueness conflict.
+    if kind == "calibration_library"
+        && crate::db::count_scan_roots_of_kind(&conn, "calibration_library")? > 0
+    {
+        return Err(ApiError::Conflict(
+            "A Calibration Library root already exists — only one is allowed".to_string(),
+        ));
+    }
+
+    // 6. Store the canonicalized path
     let path_str = new_path.to_string_lossy().to_string();
-    tracing::info!(path = %path_str, "adding scan root");
-    let id = crate::db::upsert_scan_root(&conn, &path_str).map_err(|e| {
+    tracing::info!(path = %path_str, kind = %kind, "adding scan root");
+    let id = crate::db::upsert_scan_root(&conn, &path_str, &kind).map_err(|e| {
         tracing::error!(path = %path_str, error = %e, "failed to add scan root");
         e
     })?;
@@ -166,8 +192,19 @@ pub fn add_scan_root(
         last_scan: None,
         last_scan_errors: None,
         monitor_enabled: false,
-        kind: "normal".into(),
+        kind,
     })
+}
+
+/// The (single) calibration library root, if configured. Used by the
+/// Settings UI and (Task 12) master-write orchestration to resolve the
+/// destination directory for newly built master calibration frames.
+pub fn get_calibration_library_root(ctx: &ServiceContext) -> Result<Option<ScanRoot>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(crate::db::get_scan_roots(&conn)?
+        .into_iter()
+        .find(|r| r.kind == "calibration_library"))
 }
 
 pub fn delete_scan_root(ctx: &ServiceContext, id: i64) -> Result<(), ApiError> {

@@ -1,16 +1,18 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText } from 'lucide-react';
-import { revealItemInDir, openPath } from '../api/desktop';
+import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText, Library } from 'lucide-react';
+import { revealItemInDir, openPath, pickDirectory } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import LoggingSettings from '../components/settings/LoggingSettings';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
+import { FolderBrowserModal } from '../components/FolderBrowserModal';
 import { isTauri } from '../utils/platform';
 import { getArchiveSettings, setArchiveCompression as apiSetArchiveCompression } from '../api/archive';
 import type { ArchiveCompression } from '../types/archive';
 import type { AnnotationSettings } from '../types/analysis-config';
+import type { ScanRoot } from '../types/models';
 import { DEFAULT_ANNOTATION_SETTINGS } from '../types/helpers';
 
 type ThresholdUnit = 'arcsec' | 'arcmin' | 'deg';
@@ -557,6 +559,7 @@ export default function Settings() {
           <CalibrationMatchingConfig />
         </div>
       )}
+      {activeTab === 'calibration' && <CalibrationLibrarySection />}
 
       {/* Analysis Tab */}
       {activeTab === 'analysis' && (
@@ -1317,6 +1320,92 @@ export default function Settings() {
       </div>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * "Calibration Library" section — designates the single scan root (kind
+ * `calibration_library`) that Phase-2 master calibration frames get written
+ * to. The folder is a normal scan root under the hood (scanned like any
+ * other), so this section only surfaces/creates it; deleting or rescanning
+ * happens through the regular File Manager scan-root list.
+ *
+ * Web mode has no native folder picker (`pickDirectory()` always returns
+ * null there) — falls back to the in-app `FolderBrowserModal`, same branch
+ * `ExportTab.tsx` uses for its output-directory picker.
+ */
+function CalibrationLibrarySection() {
+  const [libraryRoot, setLibraryRoot] = useState<ScanRoot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [showFolderBrowser, setShowFolderBrowser] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const root = await api.invoke<ScanRoot | null>('get_calibration_library_root');
+      setLibraryRoot(root);
+    } catch (e) {
+      setError(typeof e === 'string' ? e : String(e));
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const addLibraryRoot = useCallback(async (path: string) => {
+    setError(null);
+    try {
+      await api.invoke<ScanRoot>('add_scan_root', { path, kind: 'calibration_library' });
+      await load();
+    } catch (e) {
+      setError(typeof e === 'string' ? e : String(e));
+    }
+  }, [load]);
+
+  const choose = async () => {
+    if (!isTauri) {
+      setShowFolderBrowser(true);
+      return;
+    }
+    const dir = await pickDirectory();
+    if (!dir || typeof dir !== 'string') return;
+    await addLibraryRoot(dir);
+  };
+
+  return (
+    <div className="mt-6 bg-surface-elevated rounded-lg p-6">
+      <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+        <Library size={20} />
+        Calibration Library
+      </h3>
+      <p className="text-xs text-content-muted mb-4">
+        Master calibration frames built by Athenaeum are written here. The folder is
+        scanned like any other root, so masters dropped in from elsewhere are imported too.
+      </p>
+      {libraryRoot ? (
+        <div className="bg-surface-secondary rounded p-4 text-sm font-mono text-content">
+          {libraryRoot.path}
+        </div>
+      ) : (
+        <button
+          onClick={choose}
+          className="px-4 py-2 rounded-lg flex items-center gap-2 bg-accent/10 border border-accent/40 text-accent hover:bg-accent/20 transition-colors text-sm"
+        >
+          <FolderOpen size={16} />
+          Choose library folder…
+        </button>
+      )}
+      {error && <div className="text-xs text-error mt-2">{error}</div>}
+
+      {/* Web mode: folder browser for the library directory */}
+      <FolderBrowserModal
+        isOpen={showFolderBrowser}
+        scope="scan"
+        onSelect={path => {
+          setShowFolderBrowser(false);
+          void addLibraryRoot(path);
+        }}
+        onClose={() => setShowFolderBrowser(false)}
+      />
     </div>
   );
 }

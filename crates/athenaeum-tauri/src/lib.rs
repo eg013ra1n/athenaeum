@@ -229,6 +229,7 @@ pub fn run() {
             commands::check_for_updates,
             commands::add_scan_root,
             commands::get_scan_roots,
+            commands::get_calibration_library_root,
             commands::delete_scan_root,
             commands::start_scan,
             commands::start_scan_with_progress,

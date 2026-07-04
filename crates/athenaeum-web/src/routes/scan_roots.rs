@@ -30,6 +30,9 @@ pub use athenaeum_core::api::scan_roots::{RescanResultDto, ScanResultDto};
 #[derive(serde::Deserialize)]
 pub struct AddScanRootArgs {
     pub path: String,
+    /// `"normal"` (default, when omitted) | `"calibration_library"`.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -71,7 +74,7 @@ pub async fn add_scan_root(
     Json(args): Json<AddScanRootArgs>,
 ) -> Result<Json<ScanRoot>, (StatusCode, String)> {
     let policy = allowed_roots_policy(&state.allowed_paths);
-    api::add_scan_root(&state.ctx, args.path, &policy)
+    api::add_scan_root(&state.ctx, args.path, &policy, args.kind)
         .map(Json)
         .map_err(api_err)
 }
@@ -83,6 +86,18 @@ pub async fn get_scan_roots(
     _body: Json<serde_json::Value>,
 ) -> Result<Json<Vec<ScanRoot>>, (StatusCode, String)> {
     api::get_scan_roots(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/get_calibration_library_root
+///
+/// The (single) calibration library root, if configured — used by the
+/// Settings UI's "Calibration Library" section.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_calibration_library_root(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<Option<ScanRoot>>, (StatusCode, String)> {
+    api::get_calibration_library_root(&state.ctx).map(Json).map_err(api_err)
 }
 
 /// POST /api/delete_scan_root

@@ -41,6 +41,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Scan roots
         .route("/api/add_scan_root", post(scan_roots::add_scan_root))
         .route("/api/get_scan_roots", post(scan_roots::get_scan_roots))
+        .route("/api/get_calibration_library_root", post(scan_roots::get_calibration_library_root))
         .route("/api/delete_scan_root", post(scan_roots::delete_scan_root))
         .route("/api/start_scan", post(scan_roots::start_scan))
         .route("/api/start_scan_with_progress", post(scan_roots::start_scan_with_progress))

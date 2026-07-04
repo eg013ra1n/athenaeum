@@ -17,14 +17,26 @@ pub use athenaeum_core::api::scan_roots::{RescanResultDto, ScanResultDto};
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<ScanRoot, String> {
-    api::add_scan_root(&state.ctx, path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
+pub async fn add_scan_root(
+    path: String,
+    kind: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ScanRoot, String> {
+    api::add_scan_root(&state.ctx, path, &PathPolicy::AllowAll, kind).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>, String> {
     api::get_scan_roots(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// The (single) calibration library root, if configured — used by the
+/// Settings UI's "Calibration Library" section.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_calibration_library_root(state: State<'_, AppState>) -> Result<Option<ScanRoot>, String> {
+    api::get_calibration_library_root(&state.ctx).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

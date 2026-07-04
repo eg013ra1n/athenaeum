@@ -295,12 +295,13 @@ pub fn set_scan_root_monitor_enabled(conn: &Connection, id: i64, enabled: bool) 
     Ok(())
 }
 
-/// Insert or update a scan root
-pub fn upsert_scan_root(conn: &Connection, path: &str) -> Result<i64> {
+/// Insert or update a scan root. `kind` applies only on INSERT — an existing
+/// row's kind is never silently changed by re-adding the same path.
+pub fn upsert_scan_root(conn: &Connection, path: &str, kind: &str) -> Result<i64> {
     conn.execute(
-        "INSERT INTO scan_roots (path, enabled, find_duplicates) VALUES (?1, 1, 1)
+        "INSERT INTO scan_roots (path, enabled, find_duplicates, kind) VALUES (?1, 1, 1, ?2)
          ON CONFLICT(path) DO NOTHING",
-        params![path],
+        params![path, kind],
     )?;
 
     let id: i64 = conn.query_row(
@@ -310,6 +311,15 @@ pub fn upsert_scan_root(conn: &Connection, path: &str) -> Result<i64> {
     )?;
 
     Ok(id)
+}
+
+/// Count scan roots of a given kind (uniqueness guard for calibration_library).
+pub fn count_scan_roots_of_kind(conn: &Connection, kind: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM scan_roots WHERE kind = ?1",
+        params![kind],
+        |row| row.get(0),
+    )
 }
 
 /// Update scan root find_duplicates flag
@@ -5187,6 +5197,44 @@ mod savepoint_migration_tests {
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0, "commit() must persist the delete past the savepoint");
+    }
+}
+
+/// Task 9 (calibration_library scan-root kind) — DB-level coverage for
+/// `upsert_scan_root`'s INSERT-only kind semantics and the
+/// `count_scan_roots_of_kind` uniqueness-guard helper. The code-level
+/// single-library-root enforcement lives in `api::scan_roots::add_scan_root`
+/// (no `#[cfg(test)] mod tests` there to append to — see Task 9 brief).
+#[cfg(test)]
+mod scan_root_kind_tests {
+    use crate::db::schema::init_db;
+    use rusqlite::Connection;
+
+    #[test]
+    fn upsert_scan_root_stores_kind() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let id = crate::db::upsert_scan_root(&conn, "/data/library", "calibration_library").unwrap();
+        let kind: String = conn.query_row(
+            "SELECT kind FROM scan_roots WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(kind, "calibration_library");
+        // Upserting an existing path must NOT silently flip its kind.
+        let id2 = crate::db::upsert_scan_root(&conn, "/data/library", "normal").unwrap();
+        assert_eq!(id, id2);
+        let kind: String = conn.query_row(
+            "SELECT kind FROM scan_roots WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(kind, "calibration_library");
+    }
+
+    #[test]
+    fn only_one_calibration_library_root() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
+        // The uniqueness check is code-level in api::add_scan_root; expose the
+        // count helper it uses and pin it here:
+        let n = crate::db::count_scan_roots_of_kind(&conn, "calibration_library").unwrap();
+        assert_eq!(n, 1);
     }
 }
 
