@@ -1317,6 +1317,36 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Create identity and touch triggers for all UUID tables
+    const UUID_V4_SQL: &str = "lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || \
+        substr(hex(randomblob(2)),2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || \
+        substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))";
+    for t in UUID_TABLES {
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER IF NOT EXISTS {t}_identity AFTER INSERT ON {t}
+                 FOR EACH ROW WHEN NEW.uuid IS NULL
+                 BEGIN
+                     UPDATE {t} SET uuid = {UUID_V4_SQL},
+                         updated_at = COALESCE(NEW.updated_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                     WHERE id = NEW.id;
+                 END"
+            ),
+            [],
+        )?;
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER IF NOT EXISTS {t}_touch AFTER UPDATE ON {t}
+                 FOR EACH ROW WHEN NEW.updated_at IS OLD.updated_at
+                 BEGIN
+                     UPDATE {t} SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                     WHERE id = NEW.id;
+                 END"
+            ),
+            [],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1395,6 +1425,42 @@ mod identity_schema_tests {
         let u = u.expect("uuid backfilled");
         assert_eq!(u.len(), 36);
         assert!(ts.is_some(), "updated_at backfilled");
+    }
+
+    fn assert_v4_shape(u: &str) {
+        assert_eq!(u.len(), 36);
+        let b: Vec<char> = u.chars().collect();
+        for i in [8, 13, 18, 23] { assert_eq!(b[i], '-', "dash at {i} in {u}"); }
+        assert_eq!(b[14], '4', "version nibble in {u}");
+        assert!("89ab".contains(b[19]), "variant nibble in {u}");
+    }
+
+    #[test]
+    fn insert_trigger_fills_uuid_and_updated_at() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO tags (name, color) VALUES ('t1', NULL)", []).unwrap();
+        let (u, ts): (String, String) = conn
+            .query_row("SELECT uuid, updated_at FROM tags WHERE name='t1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_v4_shape(&u);
+        assert!(ts.ends_with('Z') && ts.contains('T'));
+    }
+
+    #[test]
+    fn update_trigger_bumps_updated_at_but_respects_explicit_set() {
+        let conn = mem_db();
+        conn.execute("INSERT INTO tags (name, color) VALUES ('t2', NULL)", []).unwrap();
+        let ts0: String = conn.query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| r.get(0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        conn.execute("UPDATE tags SET color = 'red' WHERE name='t2'", []).unwrap();
+        let ts1: String = conn.query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| r.get(0)).unwrap();
+        assert_ne!(ts0, ts1, "touch trigger must bump updated_at");
+        // explicit set wins (future sync import path)
+        conn.execute("UPDATE tags SET color='blue', updated_at='2020-01-01T00:00:00.000Z' WHERE name='t2'", []).unwrap();
+        let ts2: String = conn.query_row("SELECT updated_at FROM tags WHERE name='t2'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ts2, "2020-01-01T00:00:00.000Z");
     }
 }
 
