@@ -34,3 +34,4 @@ pub mod file_op;
 pub mod registration;
 pub mod ts_export;
 pub mod api;
+pub mod integration;
