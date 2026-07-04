@@ -1,257 +1,48 @@
 // Scan root commands - directory scanning and monitoring
+//
+// Thin wrappers only: extraction + policy construction + handler call + error
+// mapping. Business logic lives in `athenaeum_core::api::scan_roots` (Task 9
+// conversion — see `.superpowers/sdd/p1-task-9-report.md`).
 
-use crate::db::{self};
-use crate::tauri_events::TauriProgressEmitter;
 use crate::models::*;
-use crate::scanner::{self, scan_directory, emit_progress};
-use rayon::prelude::*;
-use std::path::Path;
-use std::sync::atomic::Ordering;
+use crate::tauri_events::TauriProgressEmitter;
 use tauri::State;
 
+use athenaeum_core::api::scan_roots as api;
+use athenaeum_core::api::PathPolicy;
+
 use super::AppState;
-use super::utils::normalize_path;
+
+pub use athenaeum_core::api::scan_roots::{RescanResultDto, ScanResultDto};
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn add_scan_root(path: String, state: State<'_, AppState>) -> Result<ScanRoot, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // 1. Check if directory exists
-    let path_buf = Path::new(&path);
-    if !path_buf.exists() {
-        return Err("Directory does not exist".to_string());
-    }
-    if !path_buf.is_dir() {
-        return Err("Path is not a directory".to_string());
-    }
-
-    // 2. Canonicalize the new path (resolve symlinks, .., etc.)
-    //    normalize_path strips the \\?\ prefix that Windows canonicalize() adds
-    let new_path = normalize_path(
-        &path_buf
-            .canonicalize()
-            .map_err(|e| format!("Failed to resolve path: {}", e))?,
-    );
-
-    // 3. Get existing scan roots and check for overlaps
-    let existing_roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
-
-    for root in existing_roots.iter() {
-        let existing_path = normalize_path(
-            &Path::new(&root.path)
-                .canonicalize()
-                .map_err(|e| format!("Failed to resolve existing root path: {}", e))?,
-        );
-
-        // Check exact match
-        if new_path == existing_path {
-            return Err("This directory is already being monitored".to_string());
-        }
-
-        // Check if new path is a subdirectory of existing root
-        if new_path.starts_with(&existing_path) {
-            return Err(format!(
-                "Cannot add directory: it is a subdirectory of existing scan root '{}'",
-                root.path
-            ));
-        }
-
-        // Check if new path is a parent of existing root
-        if existing_path.starts_with(&new_path) {
-            return Err(format!(
-                "Cannot add directory: existing scan root '{}' is a subdirectory of it",
-                root.path
-            ));
-        }
-    }
-
-    // 4. Store the canonicalized path
-    let path_str = new_path.to_string_lossy().to_string();
-    tracing::info!(path = %path_str, "adding scan root");
-    let id = db::upsert_scan_root(&conn, &path_str).map_err(|e| {
-        tracing::error!(path = %path_str, error = %e, "failed to add scan root");
-        e.to_string()
-    })?;
-
-    Ok(ScanRoot {
-        id: Some(id),
-        path: path_str,
-        enabled: true,
-        find_duplicates: true,
-        unique_camera: false,
-        last_scan: None,
-        last_scan_errors: None,
-        monitor_enabled: false,
-    })
+    api::add_scan_root(&state.ctx, path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::get_scan_roots(&conn).map_err(|e| e.to_string())
+    api::get_scan_roots(&state.ctx).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::delete_scan_root(&conn, id).map_err(|e| e.to_string())
+    api::delete_scan_root(&state.ctx, id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<ScanResultDto, String> {
-    let span = tracing::info_span!("scan", root_id);
-    let _g = span.enter();
-
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Reconcile unique_camera instrume suffix state before scanning
-    let reconcile = db::reconcile_unique_camera_instrume(&conn, root_id)
-        .map_err(|e| format!("Reconciliation failed: {}", e))?;
-
-    // Get the scan root path
-    let roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
-    let root = roots
-        .into_iter()
-        .find(|r| r.id == Some(root_id))
-        .ok_or("Scan root not found")?;
-
-    // Check if content hash should be computed
-    let use_content_hash = state.ctx.settings
-        .get_duplicates_use_content_hash(&conn)
-        .unwrap_or(false);
-
-    // Perform the scan
-    let mut result = scan_directory(Path::new(&root.path), &conn, None, use_content_hash, root.unique_camera, root_id);
-
-    // If reconciliation changed frames, wipe and rebuild calibration sets
-    if reconcile.frames_renamed > 0 {
-        db::delete_calibration_sets_for_root(&conn, root_id)
-            .map_err(|e| format!("Failed to delete cal sets: {}", e))?;
-        let cal_sets_created = recreate_calibration_sets_for_root(&conn, root_id)
-            .map_err(|e| format!("Failed to recreate cal sets: {}", e))?;
-        result.calibration_sets_created = cal_sets_created;
-    }
-
-    // Update last_scan timestamp
-    db::update_scan_root_timestamp(&conn, root_id).map_err(|e| e.to_string())?;
-
-    // Persist scan errors so they survive app restarts
-    if let Err(e) = db::update_scan_root_errors(&conn, root_id, &result.errors) {
-        tracing::error!(root_id, error = %e, "failed to persist scan errors");
-    }
-
-    Ok(ScanResultDto {
-        files_found: result.files_found,
-        files_processed: result.files_processed,
-        files_skipped: result.files_skipped,
-        errors: result.errors,
-        lights_count: result.lights_count,
-        darks_count: result.darks_count,
-        flats_count: result.flats_count,
-        bias_count: result.bias_count,
-        darkflats_count: result.darkflats_count,
-        calibration_sets_created: result.calibration_sets_created,
-        cancelled: result.cancelled,
-        frames_renamed: reconcile.frames_renamed,
-        calibration_sets_deleted: reconcile.calibration_sets_deleted,
-        sessions_updated: reconcile.sessions_updated,
-    })
+    api::start_scan(&state.ctx, root_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<RescanResultDto, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    tracing::info!("starting content hash rescan for all files");
-
-    // Get all files from database
-    let all_files = db::get_files(&conn, None).map_err(|e| e.to_string())?;
-    let total = all_files.len();
-
-    let mut updated = 0;
-    let mut skipped = 0;
-    let mut missing = 0;
-    let mut errors = Vec::new();
-
-    for (file, _frame) in all_files {
-        let path_buf = std::path::PathBuf::from(&file.path);
-
-        // Skip if file doesn't exist on disk
-        if !path_buf.exists() {
-            missing += 1;
-            continue;
-        }
-
-        // Skip if already has content hash
-        if file.content_hash.is_some() {
-            skipped += 1;
-            continue;
-        }
-
-        // Compute content hash
-        match crate::duplicates::compute_xxhash(&path_buf) {
-            Ok(hash) => {
-                // Update database
-                match conn.execute(
-                    "UPDATE files SET content_hash = ?1 WHERE id = ?2",
-                    rusqlite::params![hash, file.id],
-                ) {
-                    Ok(_) => {
-                        updated += 1;
-                        if updated % 100 == 0 {
-                            tracing::debug!(current = updated + skipped + missing, total, "content hash rescan progress");
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = format!("{}: Failed to update database: {}", file.path, e);
-                        errors.push(error_msg);
-                    }
-                }
-            }
-            Err(e) => {
-                let error_msg = format!("{}: Failed to compute hash: {}", file.path, e);
-                errors.push(error_msg);
-            }
-        }
-    }
-
-    tracing::info!(
-        total,
-        updated,
-        skipped,
-        missing,
-        errors = errors.len(),
-        "content hash rescan complete"
-    );
-
-    // Mark content hash rescan as completed
-    if updated > 0 || skipped > 0 {
-        // Only set flag if we actually processed files successfully
-        state.ctx.settings
-            .persist_setting(&conn, "duplicates.content_hash_rescanned", "true")
-            .map_err(|e| format!("Failed to set rescan flag: {}", e))?;
-        tracing::debug!("content hash rescan flag set to true");
-    }
-
-    Ok(RescanResultDto {
-        files_total: total,
-        files_updated: updated,
-        files_skipped: skipped,
-        files_missing: missing,
-        errors,
-    })
+    api::rescan_all_for_content_hash(&state.ctx).map_err(|e| e.to_string())
 }
 
 /// Relink files from old scan root to new location
@@ -261,45 +52,9 @@ pub async fn relink_scan_root(
     root_id: i64,
     new_path: String,
     state: State<'_, AppState>,
-) -> Result<crate::models::RelinkResult, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Get old root path
-    let old_path: String = conn
-        .query_row(
-            "SELECT path FROM scan_roots WHERE id = ?1",
-            rusqlite::params![root_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| {
-            tracing::error!(root_id, path = %new_path, error = %e, "failed to load scan root for relink");
-            format!("Failed to get scan root: {}", e)
-        })?;
-
-    tracing::info!(root_id, old_path = %old_path, new_path = %new_path, "relinking scan root");
-
-    // Perform relinking
-    let result = crate::relinking::relink_files(&conn, &old_path, &new_path)
-        .map_err(|e| {
-            tracing::error!(root_id, path = %new_path, error = %e, "relinking failed");
-            format!("Relinking failed: {}", e)
-        })?;
-
-    // Update scan root path if all files were matched
-    if result.files_orphaned == 0 || result.files_matched > 0 {
-        conn.execute(
-            "UPDATE scan_roots SET path = ?1 WHERE id = ?2",
-            rusqlite::params![new_path, root_id],
-        )
-        .map_err(|e| {
-            tracing::error!(root_id, path = %new_path, error = %e, "failed to update scan root path");
-            format!("Failed to update scan root path: {}", e)
-        })?;
-        tracing::info!(root_id, new_path = %new_path, "updated scan root path");
-    }
-
-    Ok(result)
+) -> Result<RelinkResult, String> {
+    api::relink_scan_root(&state.ctx, root_id, new_path, &PathPolicy::AllowAll)
+        .map_err(|e| e.to_string())
 }
 
 /// Check availability of all scan roots
@@ -308,20 +63,7 @@ pub async fn relink_scan_root(
 pub async fn check_all_scan_roots_availability(
     state: State<'_, AppState>,
 ) -> Result<Vec<(i64, bool)>, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    let roots = db::get_scan_roots(&conn).map_err(|e| e.to_string())?;
-
-    let availability: Vec<(i64, bool)> = roots
-        .into_iter()
-        .map(|root| {
-            let exists = std::path::Path::new(&root.path).exists();
-            (root.id.unwrap_or(0), exists)
-        })
-        .collect();
-
-    Ok(availability)
+    api::check_all_scan_roots_availability(&state.ctx).map_err(|e| e.to_string())
 }
 
 /// Check for missing files within a scan root
@@ -332,108 +74,8 @@ pub async fn check_missing_files_in_scan_root(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::models::OrphanedFile>, String> {
-    // Emit initial "verifying" phase progress
     let emitter = TauriProgressEmitter(app_handle.clone());
-    emit_progress(&emitter, root_id, 0, 0, None, "verifying");
-
-    // Collect files from database
-    let files = {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        let conn = db.conn();
-
-        // Get scan root path
-        let path: String = conn
-            .query_row(
-                "SELECT path FROM scan_roots WHERE id = ?1",
-                rusqlite::params![root_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to get scan root: {}", e))?;
-
-        // Get all files under this scan root, excluding files known to live
-        // inside an archive zip (`archived_in_operation IS NOT NULL`). Their
-        // on-disk paths intentionally don't exist post-archive — flagging
-        // them as "missing" would fill the missing_files table with false
-        // positives the user has to manually clear.
-        // Use LEFT JOIN instead of subqueries to avoid N+1 query problem.
-        let mut stmt = conn
-            .prepare(
-                "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
-                        CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
-                        fr.object,
-                        fr.date_obs
-                 FROM files f
-                 LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE f.path LIKE ?1 AND f.archived_in_operation IS NULL"
-            )
-            .map_err(|e| e.to_string())?;
-
-        let path_prefix = format!("{}%", path);
-        let result: Vec<crate::models::OrphanedFile> = stmt
-            .query_map(rusqlite::params![path_prefix], |row| {
-                Ok(crate::models::OrphanedFile {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    filename: row.get(2)?,
-                    size: row.get(3)?,
-                    modified_at: row.get(4)?,
-                    has_frame: row.get::<_, i64>(5)? != 0,
-                    object: row.get(6).ok(),
-                    date_obs: row.get(7).ok(),
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        result
-    };
-
-    // Filter to only files that don't exist on disk - done in parallel
-    // This is done OUTSIDE the lock since filesystem checks can be slow
-    let total_files = files.len();
-
-    // Use parallel iteration for filesystem checks (I/O bound operations)
-    let missing_files: Vec<crate::models::OrphanedFile> = files
-        .into_par_iter()
-        .filter(|file| !std::path::Path::new(&file.path).exists())
-        .collect();
-
-    // Emit final progress
-    emit_progress(&emitter, root_id, total_files, total_files, None, "verifying");
-
-    Ok(missing_files)
-}
-
-// DTOs for scan_roots commands
-#[derive(serde::Serialize)]
-pub struct ScanResultDto {
-    pub files_found: usize,
-    pub files_processed: usize,
-    pub files_skipped: usize,
-    pub errors: Vec<String>,
-    // Frame type counts
-    pub lights_count: usize,
-    pub darks_count: usize,
-    pub flats_count: usize,
-    pub bias_count: usize,
-    pub darkflats_count: usize,
-    // Calibration sets created
-    pub calibration_sets_created: usize,
-    // Whether scan was cancelled by user
-    pub cancelled: bool,
-    // Unique camera reconciliation (only non-zero when instrume suffix state changed)
-    pub frames_renamed: usize,
-    pub calibration_sets_deleted: usize,
-    pub sessions_updated: usize,
-}
-
-#[derive(serde::Serialize)]
-pub struct RescanResultDto {
-    pub files_total: usize,
-    pub files_updated: usize,
-    pub files_skipped: usize,
-    pub files_missing: usize,
-    pub errors: Vec<String>,
+    api::check_missing_files_in_scan_root(&state.ctx, root_id, &emitter).map_err(|e| e.to_string())
 }
 
 /// Toggle unique_camera flag (flag-only, cascade happens on re-scan)
@@ -444,15 +86,7 @@ pub async fn set_scan_root_unique_camera_flag(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::set_unique_camera_flag(&conn, id, enabled)
-        .map_err(|e| e.to_string())?;
-
-    tracing::info!(root_id = id, enabled, "unique_camera flag set");
-
-    Ok(())
+    api::set_scan_root_unique_camera_flag(&state.ctx, id, enabled).map_err(|e| e.to_string())
 }
 
 /// Toggle the background-monitoring flag for a scan root. The monitor service
@@ -465,96 +99,8 @@ pub async fn set_scan_root_monitor_enabled(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    db::set_scan_root_monitor_enabled(&conn, id, enabled)
-        .map_err(|e| e.to_string())?;
-
-    tracing::info!(root_id = id, monitor_enabled = enabled, "scan root monitor toggled");
-
-    // Wake the monitor loop so the user gets an immediate scan instead of
-    // waiting for the current sleep to finish. Only relevant when enabling.
-    if enabled {
-        state.monitor.kick();
-    }
-
-    Ok(())
-}
-
-/// Query calibration frame IDs under a scan root and recreate calibration sets
-fn recreate_calibration_sets_for_root(
-    conn: &rusqlite::Connection,
-    root_id: i64,
-) -> anyhow::Result<usize> {
-    use crate::calibration::scan_integration::{
-        create_calibration_sets_from_scan_with_masters, MasterFrameIds,
-    };
-
-    // Get root path
-    let root_path: String = conn.query_row(
-        "SELECT path FROM scan_roots WHERE id = ?1",
-        rusqlite::params![root_id],
-        |row| row.get(0),
-    )?;
-
-    let like_pattern = format!("{}%", root_path);
-
-    // Query all calibration frame IDs under this root, grouped by imagetyp
-    let mut stmt = conn.prepare(
-        "SELECT fr.id, fr.imagetyp FROM frames fr
-         JOIN files f ON fr.file_id = f.id
-         WHERE f.path LIKE ?1
-           AND fr.imagetyp IN ('Flat','Dark','Bias','DarkFlat','MasterFlat','MasterDark','MasterBias','MasterDarkFlat')"
-    )?;
-
-    let mut flat_ids = Vec::new();
-    let mut dark_ids = Vec::new();
-    let mut bias_ids = Vec::new();
-    let mut darkflat_ids = Vec::new();
-    let mut master_ids = MasterFrameIds::default();
-
-    let rows = stmt.query_map(rusqlite::params![like_pattern], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-
-    for row in rows {
-        let (frame_id, imagetyp) = row?;
-        match imagetyp.as_str() {
-            "Flat" => flat_ids.push(frame_id),
-            "Dark" => dark_ids.push(frame_id),
-            "Bias" => bias_ids.push(frame_id),
-            "DarkFlat" => darkflat_ids.push(frame_id),
-            "MasterFlat" => master_ids.master_flat_ids.push(frame_id),
-            "MasterDark" => master_ids.master_dark_ids.push(frame_id),
-            "MasterBias" => master_ids.master_bias_ids.push(frame_id),
-            "MasterDarkFlat" => master_ids.master_darkflat_ids.push(frame_id),
-            _ => {}
-        }
-    }
-
-    let total_cal_frames = flat_ids.len() + dark_ids.len() + bias_ids.len()
-        + darkflat_ids.len() + master_ids.total_count();
-
-    if total_cal_frames == 0 {
-        return Ok(0);
-    }
-
-    tracing::debug!(
-        root_id,
-        flats = flat_ids.len(),
-        darks = dark_ids.len(),
-        bias = bias_ids.len(),
-        darkflats = darkflat_ids.len(),
-        masters = master_ids.total_count(),
-        "recreating calibration sets for root"
-    );
-
-    let scan_result = create_calibration_sets_from_scan_with_masters(
-        conn, flat_ids, dark_ids, bias_ids, darkflat_ids, master_ids,
-    )?;
-
-    Ok(scan_result.sets_created as usize)
+    api::set_scan_root_monitor_enabled(&state.ctx, id, enabled, &state.monitor)
+        .map_err(|e| e.to_string())
 }
 
 /// Start a scan with progress events - runs synchronously but emits progress events
@@ -566,67 +112,13 @@ pub async fn start_scan_with_progress(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanResultDto, String> {
-    tracing::info!(root_id = root_id, "scan started");
-
     let scan_emitter = TauriProgressEmitter(app_handle.clone());
-
-    // Run the shared scan engine (registers handle, reconciles, scans, persists).
-    let outcome = scanner::run_registered_scan(&state.ctx, &scan_emitter, root_id)?;
-    let mut result = outcome.result;
-    let reconcile = outcome.reconcile;
-
-    // Interactive-only follow-up: if reconciliation renamed frames, rebuild
-    // calibration sets under this root. Monitor cycles never trigger this path
-    // because they don't toggle `unique_camera`.
-    if reconcile.frames_renamed > 0 {
-        let db = state.ctx.db.get().ok_or("Database not initialized")?;
-        let conn = db.conn();
-        db::delete_calibration_sets_for_root(&conn, root_id)
-            .map_err(|e| format!("Failed to delete cal sets: {}", e))?;
-        let cal_sets_created = recreate_calibration_sets_for_root(&conn, root_id)
-            .map_err(|e| format!("Failed to recreate cal sets: {}", e))?;
-        result.calibration_sets_created = cal_sets_created;
-    }
-
-    tracing::info!(
-        root_id = root_id,
-        found = result.files_found,
-        processed = result.files_processed,
-        skipped = result.files_skipped,
-        errors = result.errors.len(),
-        "scan complete"
-    );
-
-    Ok(ScanResultDto {
-        files_found: result.files_found,
-        files_processed: result.files_processed,
-        files_skipped: result.files_skipped,
-        errors: result.errors,
-        lights_count: result.lights_count,
-        darks_count: result.darks_count,
-        flats_count: result.flats_count,
-        bias_count: result.bias_count,
-        darkflats_count: result.darkflats_count,
-        calibration_sets_created: result.calibration_sets_created,
-        cancelled: result.cancelled,
-        frames_renamed: reconcile.frames_renamed,
-        calibration_sets_deleted: reconcile.calibration_sets_deleted,
-        sessions_updated: reconcile.sessions_updated,
-    })
+    api::start_scan_with_progress(&state.ctx, root_id, &scan_emitter).map_err(|e| e.to_string())
 }
 
 /// Cancel an active scan
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn cancel_scan(
-    root_id: i64,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let scans = state.ctx.active_scans.lock().unwrap();
-    if let Some(handle) = scans.get(&root_id) {
-        handle.cancel_flag.store(true, Ordering::SeqCst);
-        Ok(())
-    } else {
-        Err("No active scan for this root".to_string())
-    }
+pub async fn cancel_scan(root_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    api::cancel_scan(&state.ctx, root_id).map_err(|e| e.to_string())
 }

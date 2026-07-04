@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-// pub mod scan_roots;      // Task 9
+pub mod scan_roots;
 // pub mod files;           // Task 10
 // pub mod calibration;     // Task 11
 // pub mod analysis;        // Task 12
