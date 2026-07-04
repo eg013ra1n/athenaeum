@@ -126,7 +126,7 @@ impl FitsHeader {
 
     /// Parse header from raw bytes (used by tests and in-memory data).
     #[cfg(test)]
-    fn parse_header(data: &[u8]) -> Result<Self> {
+    pub(crate) fn parse_header(data: &[u8]) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(data);
         Self::parse_from_reader(&mut cursor)
     }

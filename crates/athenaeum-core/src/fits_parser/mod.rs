@@ -236,7 +236,7 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
 }
 
 /// Build a Frame from an already-parsed FitsHeader.
-fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Result<Frame> {
+pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Result<Frame> {
     // Extract standard FITS keywords
     let object = header.get_str("OBJECT");
     let date_obs_str = header.get_str("DATE-OBS");
@@ -251,7 +251,7 @@ fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Re
     );
     let telescop = header.get_str("TELESCOP");
     let instrume = header.get_str("INSTRUME");
-    let exptime = header.get_f64("EXPTIME");
+    let exptime = header.get_f64("EXPTIME").or_else(|| header.get_f64("EXPOSURE"));
     let filter = header.get_str("FILTER");
     let imagetyp_str = header.get_str("IMAGETYP");
 
@@ -830,5 +830,68 @@ mod tests {
     fn test_parse_date_obs_with_time() {
         let dt = parse_date_obs("2024-01-15", Some("20:30:45")).unwrap();
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "2024-01-15");
+    }
+
+    #[test]
+    fn test_exptime_falls_back_to_exposure() {
+        // Build a FITS header block with EXPOSURE=120.0 but no EXPTIME
+        const BLOCK_SIZE: usize = 2880;
+        const CARD_SIZE: usize = 80;
+        let mut block = vec![b' '; BLOCK_SIZE];
+
+        fn write_card(block: &mut [u8], index: usize, card: &str) {
+            let start = index * CARD_SIZE;
+            let bytes = card.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                if start + i < block.len() {
+                    block[start + i] = b;
+                }
+            }
+        }
+
+        write_card(&mut block, 0, "SIMPLE  =                    T / Standard FITS");
+        write_card(&mut block, 1, "BITPIX  =                   16 / bits per pixel");
+        write_card(&mut block, 2, "NAXIS   =                    2 / number of axes");
+        write_card(&mut block, 3, "OBJECT  = 'Test Object'        / Target name");
+        write_card(&mut block, 4, "EXPOSURE=              120.000 / Exposure time");
+        write_card(&mut block, 5, "FILTER  = 'R       '           / Filter name");
+        write_card(&mut block, 6, "END                                                                             ");
+
+        let header = FitsHeader::parse_header(&block).unwrap();
+        let path = std::path::Path::new("/tmp/test.fits");
+        let frame = build_frame_from_header(&header, 1, path).unwrap();
+        assert_eq!(frame.exptime, Some(120.0));
+    }
+
+    #[test]
+    fn test_exptime_takes_precedence_over_exposure() {
+        // Build a FITS header block with both EXPTIME and EXPOSURE; EXPTIME should win
+        const BLOCK_SIZE: usize = 2880;
+        const CARD_SIZE: usize = 80;
+        let mut block = vec![b' '; BLOCK_SIZE];
+
+        fn write_card(block: &mut [u8], index: usize, card: &str) {
+            let start = index * CARD_SIZE;
+            let bytes = card.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                if start + i < block.len() {
+                    block[start + i] = b;
+                }
+            }
+        }
+
+        write_card(&mut block, 0, "SIMPLE  =                    T / Standard FITS");
+        write_card(&mut block, 1, "BITPIX  =                   16 / bits per pixel");
+        write_card(&mut block, 2, "NAXIS   =                    2 / number of axes");
+        write_card(&mut block, 3, "OBJECT  = 'Test Object'        / Target name");
+        write_card(&mut block, 4, "EXPTIME =               60.000 / Exposure time");
+        write_card(&mut block, 5, "EXPOSURE=              120.000 / Alternative exposure");
+        write_card(&mut block, 6, "FILTER  = 'R       '           / Filter name");
+        write_card(&mut block, 7, "END                                                                             ");
+
+        let header = FitsHeader::parse_header(&block).unwrap();
+        let path = std::path::Path::new("/tmp/test.fits");
+        let frame = build_frame_from_header(&header, 1, path).unwrap();
+        assert_eq!(frame.exptime, Some(60.0));
     }
 }
