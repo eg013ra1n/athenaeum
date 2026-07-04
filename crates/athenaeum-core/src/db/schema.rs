@@ -1,5 +1,46 @@
 use rusqlite::{Connection, Result};
 
+pub const UUID_TABLES: [&str; 7] = [
+    "files", "frames", "frames_set", "sessions",
+    "calibration_set", "tags", "export_templates",
+];
+
+fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        rusqlite::params![table, col],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn backfill_identity(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for t in UUID_TABLES {
+        let ids: Vec<i64> = {
+            let mut st = tx.prepare(&format!("SELECT id FROM {t} WHERE uuid IS NULL"))?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if !ids.is_empty() {
+            let mut up = tx.prepare(&format!("UPDATE {t} SET uuid = ?1 WHERE id = ?2"))?;
+            for id in &ids {
+                up.execute(rusqlite::params![uuid::Uuid::new_v4().to_string(), id])?;
+            }
+        }
+        // best-available timestamp source per table; NULL-safe
+        let src = match t {
+            "files" | "sessions" => "COALESCE(created_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            _ => "strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        };
+        tx.execute(
+            &format!("UPDATE {t} SET updated_at = {src} WHERE updated_at IS NULL"),
+            [],
+        )?;
+    }
+    tx.commit()
+}
+
 /// Initialize the database schema
 pub fn init_db(conn: &Connection) -> Result<()> {
     // Files table - includes metadata hash for quick duplicate detection and content_hash for xxhash-based detection
@@ -1259,6 +1300,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ],
     )?;
 
+    // Add uuid and updated_at columns to the 7 entity tables
+    for t in UUID_TABLES {
+        if !column_exists(conn, t, "uuid")? {
+            conn.execute(&format!("ALTER TABLE {t} ADD COLUMN uuid TEXT"), [])?;
+        }
+        if !column_exists(conn, t, "updated_at")? {
+            conn.execute(&format!("ALTER TABLE {t} ADD COLUMN updated_at TEXT"), [])?;
+        }
+    }
+    backfill_identity(conn)?;
+    for t in UUID_TABLES {
+        conn.execute(
+            &format!("CREATE UNIQUE INDEX IF NOT EXISTS idx_{t}_uuid ON {t}(uuid)"),
+            [],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1291,6 +1349,52 @@ mod identity_schema_tests {
         assert_eq!(uuid1, uuid2);
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM catalog_meta", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn identity_columns_and_indexes_exist_on_all_seven_tables() {
+        let conn = mem_db();
+        for t in super::UUID_TABLES {
+            for col in ["uuid", "updated_at"] {
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                        rusqlite::params![t, col],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 1, "{t}.{col} missing");
+            }
+            let idx: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+                    rusqlite::params![format!("idx_{t}_uuid")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx, 1, "unique index on {t}.uuid missing");
+        }
+    }
+
+    #[test]
+    fn legacy_rows_get_backfilled() {
+        // Simulate a legacy catalog: rows inserted while triggers/columns are absent is
+        // impossible after init_db, so emulate by clearing uuid on an inserted row and
+        // re-running init_db (backfill must repair NULL uuids idempotently).
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO tags (name, color) VALUES ('legacy', NULL)", [],
+        ).unwrap();
+        conn.execute("UPDATE tags SET uuid = NULL, updated_at = NULL", []).unwrap();
+        init_db(&conn).unwrap();
+        let (u, ts): (Option<String>, Option<String>) = conn
+            .query_row("SELECT uuid, updated_at FROM tags WHERE name='legacy'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let u = u.expect("uuid backfilled");
+        assert_eq!(u.len(), 36);
+        assert!(ts.is_some(), "updated_at backfilled");
     }
 }
 
