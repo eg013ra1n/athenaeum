@@ -44,6 +44,9 @@ pub fn central_third_mean(data: &[f32], width: usize, height: usize) -> f64 {
 
 /// Shared banded-combine core. `scale[i]`/`precal` transform frame i's
 /// samples before combining: v' = (v - precal(i, pixel)) * scale[i].
+/// `band_budget_bytes` is injectable (module-internal) so tests can force
+/// multi-band runs on tiny images; production passes `BAND_BUDGET_BYTES`.
+#[allow(clippy::too_many_arguments)]
 fn run_banded(
     src: &mut BandSource,
     scales: &[f32],
@@ -52,10 +55,11 @@ fn run_banded(
     pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
     progress: &EngineProgress<'_>,
+    band_budget_bytes: usize,
 ) -> Result<IntegrationOutput, IntegrationError> {
     use rayon::prelude::*;
     let (w, h, n) = (src.width(), src.height(), src.frame_count());
-    let band_rows = band_rows_for_budget(w, n, BAND_BUDGET_BYTES).min(h);
+    let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(h);
     let bands_total = h.div_ceil(band_rows);
     let mut out = vec![0f32; w * h];
     let rejected = AtomicUsize::new(0);
@@ -125,9 +129,21 @@ pub fn integrate_bias_like(
     cancel: &AtomicBool,
     progress: EngineProgress<'_>,
 ) -> Result<IntegrationOutput, IntegrationError> {
+    integrate_bias_like_inner(paths, method, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
+}
+
+fn integrate_bias_like_inner(
+    paths: &[PathBuf],
+    method: CombineMethod,
+    pool: &rayon::ThreadPool,
+    scratch_dir: &Path,
+    cancel: &AtomicBool,
+    progress: EngineProgress<'_>,
+    band_budget_bytes: usize,
+) -> Result<IntegrationOutput, IntegrationError> {
     let mut src = BandSource::open(paths, scratch_dir)?;
     let scales = vec![1.0f32; src.frame_count()];
-    run_banded(&mut src, &scales, None, method, pool, cancel, &progress)
+    run_banded(&mut src, &scales, None, method, pool, cancel, &progress, band_budget_bytes)
 }
 
 pub fn integrate_flat(
@@ -138,6 +154,20 @@ pub fn integrate_flat(
     scratch_dir: &Path,
     cancel: &AtomicBool,
     progress: EngineProgress<'_>,
+) -> Result<IntegrationOutput, IntegrationError> {
+    integrate_flat_inner(paths, precal, method, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn integrate_flat_inner(
+    paths: &[PathBuf],
+    precal: &FlatPrecal,
+    method: CombineMethod,
+    pool: &rayon::ThreadPool,
+    scratch_dir: &Path,
+    cancel: &AtomicBool,
+    progress: EngineProgress<'_>,
+    band_budget_bytes: usize,
 ) -> Result<IntegrationOutput, IntegrationError> {
     let mut src = BandSource::open(paths, scratch_dir)?;
     let (w, h, n) = (src.width(), src.height(), src.frame_count());
@@ -154,7 +184,7 @@ pub fn integrate_flat(
     let (cx0, cx1) = (w / 3, ((2 * w) / 3).max(w / 3 + 1).min(w));
     let mut sums = vec![0f64; n];
     let mut counts = vec![0usize; n];
-    let band_rows = band_rows_for_budget(w, n, BAND_BUDGET_BYTES).min(cy1 - cy0);
+    let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(cy1 - cy0);
     let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
     let mut y = cy0;
     while y < cy1 {
@@ -194,7 +224,7 @@ pub fn integrate_flat(
     // Pass 2: full combine with precal + scale applied. `BandSource::read_band`
     // takes `&mut self`, so pass 1 (above) and pass 2 reuse the SAME `src` —
     // readers just seek back to the start and stream again; no need to reopen.
-    let mut out = run_banded(&mut src, &scales, Some(precal), method, pool, cancel, &progress)?;
+    let mut out = run_banded(&mut src, &scales, Some(precal), method, pool, cancel, &progress, band_budget_bytes)?;
     out.flat_norm = Some(central_third_mean(&out.data, w, h));
     Ok(out)
 }
@@ -335,5 +365,71 @@ mod tests {
             EngineProgress { on_band: &on_band },
         ).unwrap();
         assert!(out.data.iter().all(|&v| v == -5.0), "no clipping policy");
+    }
+
+    /// Multi-band precal row indexing: with band_budget_bytes=1 the budget
+    /// clamps to 16-row bands, so h=48 runs as 3 bands. The master is a row
+    /// gradient (master[y] = y), the flats are 1000 + y, so after subtraction
+    /// every sample is exactly 1000.0 — but ONLY if the MasterFrame index uses
+    /// the GLOBAL row (`gy = y0 + row_in_band`). A regression that drops `y0`
+    /// reuses master rows 0..16 in bands 2 and 3 (output rows 16.. become
+    /// 1000 + 16k) and fails here while all single-band tests still pass.
+    #[test]
+    fn multi_band_precal_uses_global_row_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (32, 48);
+        let paths = vec![
+            write(dir.path(), "f1.fits", w, h, |_, y| 1000.0 + y as f32),
+            write(dir.path(), "f2.fits", w, h, |_, y| 1000.0 + y as f32),
+            write(dir.path(), "f3.fits", w, h, |_, y| 1000.0 + y as f32),
+        ];
+        let mut master = vec![0f32; w * h];
+        for y in 0..h { for x in 0..w { master[y * w + x] = y as f32; } }
+        let precal = FlatPrecal::MasterFrame { data: master, width: w, height: h };
+        let on_band = nop();
+        let out = integrate_flat_inner(
+            &paths, &precal, CombineMethod::Median,
+            &pool(), dir.path(), &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            1, // band_rows_for_budget(..).max(16) => 16-row bands => 3 bands
+        ).unwrap();
+        for (i, &v) in out.data.iter().enumerate() {
+            assert!(
+                (v - 1000.0).abs() < 1e-3,
+                "pixel {i} (row {}): got {v}, want 1000.0 — precal master row index broken past band 1",
+                i / w
+            );
+        }
+        let fnorm = out.flat_norm.expect("flats carry flat_norm");
+        assert!((fnorm - 1000.0).abs() < 1e-3, "flat_norm {fnorm} != 1000.0");
+    }
+
+    /// Composition order at non-unity scales: normalization must be
+    /// (v - precal) * scale, not (v * scale) - precal. Post-subtraction means
+    /// are 1000/2000/1500 → target 1500 → scales 1.5/0.75/1.0. Correct math
+    /// gives every normalized sample = 1500.0; the swapped order gives
+    /// 1750/1375/1500 whose MEAN is 1541.67 (Median would NOT discriminate —
+    /// median of {1375,1500,1750} is 1500 — hence Mean here).
+    #[test]
+    fn precal_applies_before_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (16, 16);
+        let paths = vec![
+            write(dir.path(), "f1.fits", w, h, |_, _| 1500.0),
+            write(dir.path(), "f2.fits", w, h, |_, _| 2500.0),
+            write(dir.path(), "f3.fits", w, h, |_, _| 2000.0),
+        ];
+        let on_band = nop();
+        let out = integrate_flat_inner(
+            &paths, &FlatPrecal::SyntheticBias(500.0), CombineMethod::Mean,
+            &pool(), dir.path(), &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+            BAND_BUDGET_BYTES,
+        ).unwrap();
+        assert!(
+            out.data.iter().all(|&v| (v - 1500.0).abs() < 1e-3),
+            "every normalized sample must be (v - 500) * scale = 1500; got {}",
+            out.data[0]
+        );
     }
 }
