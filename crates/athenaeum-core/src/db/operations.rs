@@ -3597,6 +3597,20 @@ pub fn get_excluded_frames_with_metadata(
     rows.collect()
 }
 
+pub fn get_catalog_meta(conn: &Connection) -> rusqlite::Result<crate::models::CatalogMeta> {
+    conn.query_row(
+        "SELECT catalog_uuid, schema_version, created_at FROM catalog_meta WHERE id = 1",
+        [],
+        |r| {
+            Ok(crate::models::CatalogMeta {
+                catalog_uuid: r.get(0)?,
+                schema_version: r.get(1)?,
+                created_at: r.get(2)?,
+            })
+        },
+    )
+}
+
 #[cfg(test)]
 mod bulk_metadata_tests {
     use super::*;

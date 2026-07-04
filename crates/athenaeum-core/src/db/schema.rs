@@ -1240,7 +1240,58 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // ---- Collaboration Stage 1: catalog identity (Phase 1) ----
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS catalog_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            catalog_uuid TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO catalog_meta (id, catalog_uuid, schema_version, created_at)
+         VALUES (1, ?1, 1, ?2)",
+        rusqlite::params![
+            uuid::Uuid::new_v4().to_string(),
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_schema_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn catalog_meta_seeded_once_and_stable() {
+        let conn = mem_db();
+        let (uuid1, ver): (String, i64) = conn
+            .query_row("SELECT catalog_uuid, schema_version FROM catalog_meta WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ver, 1);
+        assert_eq!(uuid1.len(), 36, "catalog_uuid must be a hyphenated UUID");
+        // re-running init_db must NOT regenerate the uuid
+        init_db(&conn).unwrap();
+        let uuid2: String = conn
+            .query_row("SELECT catalog_uuid FROM catalog_meta WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uuid1, uuid2);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM catalog_meta", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+    }
 }
 
 #[cfg(test)]

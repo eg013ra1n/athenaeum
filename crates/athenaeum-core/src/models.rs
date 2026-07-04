@@ -1050,3 +1050,10 @@ pub struct MergeLogEntry {
     pub added_count: i64,
     pub skipped_count: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogMeta {
+    pub catalog_uuid: String,
+    pub schema_version: i64,
+    pub created_at: String,
+}
