@@ -174,17 +174,29 @@ mod tests {
     #[test]
     fn bypassed_card_constructor_still_validated_at_format_time() {
         // Card fields are pub — a caller can build an invalid keyword directly.
-        let evil = Card { keyword: "BAD KEY!".into(), value: Some(CardValue::Integer(1)), comment: None, text: None };
+        let evil = Card { keyword: "BAD KEY!".into(), value: Some(CardValue::Integer(1)), comment: None, text: None, structural: false };
         let r = crate::fits_writer::card::format_card(&evil);
         assert!(r.is_err(), "format_card must re-validate keywords: {r:?}");
-        let reserved = Card { keyword: "NAXIS1".into(), value: Some(CardValue::Integer(1)), comment: None, text: None };
+        let reserved = Card { keyword: "NAXIS1".into(), value: Some(CardValue::Integer(1)), comment: None, text: None, structural: false };
         assert!(crate::fits_writer::card::format_card(&reserved).is_err());
+        // Reserved keywords must fail closed even when hand-built to mimic the
+        // writer's own structural cards — only the crate-private `structural`
+        // capability flag (Card::structural) exempts a card, never its name.
+        for kw in ["SIMPLE", "BITPIX", "END"] {
+            let fake = Card { keyword: kw.into(), value: Some(CardValue::Integer(1)), comment: None, text: None, structural: false };
+            let r = crate::fits_writer::card::format_card(&fake);
+            assert!(r.is_err(), "hand-built {kw} card must be rejected: {r:?}");
+        }
+        // A comment is caller-settable and must not act as a trust signal.
+        let fake_naxis = Card { keyword: "NAXIS1".into(), value: Some(CardValue::Integer(1)), comment: Some("x".into()), text: None, structural: false };
+        let r = crate::fits_writer::card::format_card(&fake_naxis);
+        assert!(r.is_err(), "NAXIS1 with a comment must still be rejected: {r:?}");
     }
 
     #[test]
     fn text_card_with_no_value_is_error_not_panic() {
         // value: None + text: None used to hit `expect("value card")`.
-        let broken = Card { keyword: "GAIN".into(), value: None, comment: None, text: None };
+        let broken = Card { keyword: "GAIN".into(), value: None, comment: None, text: None, structural: false };
         assert!(crate::fits_writer::card::format_card(&broken).is_err());
     }
 }

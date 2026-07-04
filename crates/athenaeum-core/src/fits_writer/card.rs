@@ -16,6 +16,7 @@ pub enum FitsWriteError {
     DataSizeMismatch { expected: usize, got: usize },
     BadChannels(usize),
     BadDimensions(String),
+    MissingValue(String),
     Io(std::io::Error),
 }
 
@@ -31,6 +32,7 @@ impl std::fmt::Display for FitsWriteError {
             Self::DataSizeMismatch { expected, got } => write!(f, "data length {got}, expected {expected}"),
             Self::BadChannels(c) => write!(f, "channels must be 1 or 3, got {c}"),
             Self::BadDimensions(m) => write!(f, "bad image dimensions: {m}"),
+            Self::MissingValue(k) => write!(f, "card has neither value nor text: {k}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
     }
@@ -54,6 +56,10 @@ pub struct Card {
     pub value: Option<CardValue>, // None => COMMENT/HISTORY-style text card
     pub comment: Option<String>,
     pub(crate) text: Option<String>, // COMMENT/HISTORY payload
+    /// Capability token: true only for writer-owned structural cards built via
+    /// `Card::structural`. Not settable through any public constructor, so a
+    /// hand-built card cannot claim a reserved keyword at format time.
+    pub(crate) structural: bool,
 }
 
 const RESERVED: [&str; 6] = ["SIMPLE", "BITPIX", "END", "BZERO", "BSCALE", "CONTINUE"];
@@ -73,7 +79,7 @@ fn validate_keyword(kw: &str) -> Result<String, FitsWriteError> {
 
 impl Card {
     pub fn new(keyword: &str, value: CardValue) -> Result<Card, FitsWriteError> {
-        Ok(Card { keyword: validate_keyword(keyword)?, value: Some(value), comment: None, text: None })
+        Ok(Card { keyword: validate_keyword(keyword)?, value: Some(value), comment: None, text: None, structural: false })
     }
 
     pub fn with_comment(mut self, comment: &str) -> Card {
@@ -94,6 +100,7 @@ impl Card {
                 value: None,
                 comment: None,
                 text: Some(String::from_utf8_lossy(c).into_owned()),
+                structural: false,
             })
             .collect())
     }
@@ -110,7 +117,7 @@ impl Card {
                 && keyword.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-' || b == b'_'),
             "structural keyword {keyword:?} fails FITS charset/length rules"
         );
-        Card { keyword: keyword.to_string(), value: Some(value), comment: Some(comment.to_string()), text: None }
+        Card { keyword: keyword.to_string(), value: Some(value), comment: Some(comment.to_string()), text: None, structural: true }
     }
 }
 
@@ -143,16 +150,10 @@ fn pack(line: &str) -> [u8; 80] {
 
 pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
     // Re-validate: Card fields are pub, so constructor-only validation is
-    // bypassable. Structural keywords are writer-owned and arrive here via
-    // Card::structural — allow exactly those through the reserved check.
-    const STRUCTURAL_OK: [&str; 4] = ["SIMPLE", "BITPIX", "NAXIS", "END"];
-    let is_structural = STRUCTURAL_OK.contains(&card.keyword.as_str())
-        || (card.keyword.starts_with("NAXIS")
-            && card.keyword.len() <= 8
-            && card.keyword[5..].bytes().all(|b| b.is_ascii_digit())
-            && card.comment.is_some()); // structural cards from writer have comment set
-    let is_text_kind = card.keyword == "COMMENT" || card.keyword == "HISTORY";
-    if !is_structural && !is_text_kind {
+    // bypassable. Only writer-owned cards built via `Card::structural` carry
+    // the crate-private `structural` capability flag; everything else must
+    // pass the full keyword grammar + reserved check again here.
+    if !card.structural {
         validate_keyword(&card.keyword)?;
     }
     // COMMENT / HISTORY text cards
@@ -164,9 +165,7 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
     }
 
     let Some(value) = card.value.as_ref() else {
-        return Err(FitsWriteError::InvalidKeyword(format!(
-            "{}: card has neither value nor text", card.keyword
-        )));
+        return Err(FitsWriteError::MissingValue(card.keyword.clone()));
     };
     let kw8 = format!("{:<8}", card.keyword);
 
