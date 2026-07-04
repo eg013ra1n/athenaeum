@@ -564,20 +564,67 @@ fn map_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogSearchHit>
     })
 }
 
+/// Resolve and validate an mkdir target. Fails closed instead of the naive
+/// "canonicalize the target, falling back to the raw string on failure"
+/// pattern used elsewhere in this file (`enqueue_move_operation`,
+/// `rename_path`) for sources/dests that are expected to already exist: an
+/// mkdir target never exists yet, so `canonicalize()` on it always fails,
+/// and falling back to the raw string lets a traversal string like
+/// `"/allowed/../../tmp/evil"` pass `PathPolicy::check` lexically
+/// (`Path::starts_with` is component-prefix only, not resolution — see its
+/// doc comment) even though it resolves outside the allowed root once
+/// created.
+///
+/// Instead: canonicalize the PARENT (which does exist), fail closed
+/// (`ApiError::Invalid`) if it's missing or fails to canonicalize, reject a
+/// final path component that is empty, `.`, `..`, or itself contains a path
+/// separator, then re-join that final component onto the canonical parent.
+/// `PathPolicy::check` runs against that canonicalized-parent+child path, so
+/// traversal segments anywhere in the input are resolved against the real
+/// filesystem before the containment check ever sees them — same fail-closed
+/// posture as `browse_directories` (which requires the *target itself* to
+/// canonicalize, since it must already exist to be browsed).
+///
+/// `pub(crate)` (not private) so it can be unit-tested directly without a
+/// `ServiceContext` — the scan-root containment check in
+/// `mkdir_in_scan_root` below needs the DB handle and stays there.
+pub(crate) fn resolve_mkdir_target(path: &str, policy: &PathPolicy) -> Result<PathBuf, ApiError> {
+    let target = PathBuf::from(path);
+
+    let final_component = target
+        .file_name()
+        .ok_or_else(|| ApiError::Invalid(format!("'{}' has no valid final path component", path)))?;
+    let final_str = final_component.to_string_lossy();
+    if final_str.is_empty()
+        || final_str == "."
+        || final_str == ".."
+        || final_str.contains('/')
+        || final_str.contains('\\')
+    {
+        return Err(ApiError::Invalid(format!("'{}' is not a valid directory name", path)));
+    }
+
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| ApiError::Invalid(format!("'{}' has no parent directory", path)))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| ApiError::Invalid(format!("parent of '{}' does not exist: {}", path, e)))?;
+
+    let candidate = canonical_parent.join(final_component);
+    policy.check(&candidate)?;
+    Ok(candidate)
+}
+
 /// Create a directory inside a scan root. Validated to refuse paths that
 /// would land outside any configured scan root.
 ///
 /// Path sandboxing (web: `AllowedRoots`; desktop: `AllowAll` no-op) is a
-/// rule-1 fold-in, checked before the scan-root containment check below
-/// (matches pre-conversion web ordering). `path` doesn't exist yet — we're
-/// about to create it — so the candidate is canonicalized with a fallback to
-/// the raw path on failure, same as the pre-conversion `path_inside_allowed`
-/// helper.
+/// rule-1 fold-in, checked (via `resolve_mkdir_target`) before the scan-root
+/// containment check below (matches pre-conversion web ordering).
 pub fn mkdir_in_scan_root(ctx: &ServiceContext, path: String, policy: &PathPolicy) -> Result<(), ApiError> {
-    let target = PathBuf::from(&path);
-
-    let candidate = target.canonicalize().unwrap_or_else(|_| target.clone());
-    policy.check(&candidate)?;
+    let target = resolve_mkdir_target(&path, policy)?;
 
     let db = db(ctx)?;
     let conn = db.conn();
@@ -586,8 +633,7 @@ pub fn mkdir_in_scan_root(ctx: &ServiceContext, path: String, policy: &PathPolic
     let inside_root = scan_roots.iter().filter(|r| r.enabled).any(|r| {
         let root = PathBuf::from(&r.path);
         let rc = std::fs::canonicalize(&root).unwrap_or(root);
-        let tc = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-        tc.starts_with(&rc)
+        target.starts_with(&rc)
     });
     if !inside_root {
         return Err(ApiError::Invalid(format!("'{}' is not inside any scan root", path)));
@@ -764,4 +810,50 @@ pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Resul
     });
 
     Ok(BrowseDirectoriesResponse { current: canonical.to_string_lossy().to_string(), parent, directories })
+}
+
+#[cfg(test)]
+mod mkdir_target_tests {
+    use super::*;
+    use crate::api::PathPolicy;
+
+    #[test]
+    fn mkdir_rejects_parent_traversal_against_allowed_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let policy = PathPolicy::AllowedRoots(vec![root.clone()]);
+        // escape attempt via ..
+        let evil = root.join("..").join("evil-dir");
+        let r = resolve_mkdir_target(&evil.to_string_lossy(), &policy);
+        assert!(r.is_err(), "traversal must be rejected");
+        assert!(!root.parent().unwrap().join("evil-dir").exists());
+    }
+
+    #[test]
+    fn mkdir_allows_legit_path_under_allowed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let policy = PathPolicy::AllowedRoots(vec![root.clone()]);
+        let target = root.join("new-subdir");
+        let r = resolve_mkdir_target(&target.to_string_lossy(), &policy).unwrap();
+        assert_eq!(r, root.join("new-subdir"));
+    }
+
+    #[test]
+    fn mkdir_rejects_dotdot_final_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let policy = PathPolicy::AllowedRoots(vec![root.clone()]);
+        let evil = format!("{}/..", root.display());
+        assert!(resolve_mkdir_target(&evil, &policy).is_err());
+    }
+
+    #[test]
+    fn mkdir_fails_closed_when_parent_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let policy = PathPolicy::AllowAll;
+        let target = root.join("nonexistent-parent").join("child");
+        assert!(resolve_mkdir_target(&target.to_string_lossy(), &policy).is_err());
+    }
 }
