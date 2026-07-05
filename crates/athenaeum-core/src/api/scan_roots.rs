@@ -343,8 +343,13 @@ pub fn set_calibration_library_dir(
                 // conflicts (subdirectory/parent/duplicate) pass through
                 // unchanged — those are unambiguous already.
                 ApiError::Conflict(msg) if msg.starts_with("A Calibration Library root already exists") => {
+                    // Order matters: the deletion guard blocks removing the old
+                    // root while the setting still resolves to it, so Clear
+                    // must come first. And be honest about the purge: removing
+                    // the root deletes its masters' CATALOG rows (files on
+                    // disk survive; a rescan of a covering root re-imports).
                     ApiError::Conflict(format!(
-                        "{msg}. Remove the existing dedicated library root under Monitored Directories first (your masters catalog is kept)."
+                        "{msg}. Clear the Calibration Folder first, then remove the old dedicated library root under Monitored Directories (master files on disk are kept; their catalog entries are removed with the root)."
                     ))
                 }
                 other => other,
