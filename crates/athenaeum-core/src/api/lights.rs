@@ -1621,6 +1621,468 @@ mod orchestration_tests {
         // remove or replace it.
         assert!(ctx.active_light_cal.lock().unwrap().contains_key(&1));
     }
+
+    // ── Real-data end-to-end (B5 Task 9, spec §10 integration) ───────────────
+    //
+    // Full pipeline against the owner's real archive, sandboxed: copy a real
+    // LIGHT cluster + its raw dark/flat member frames into a scratch tree,
+    // scan them into a fresh catalog (auto-creating the raw calibration sets),
+    // seed the frame-set structure, run the real matcher, designate a sandbox
+    // calibration-library root, then drive the *public* `start_light_calibration`
+    // path — preflight master builds + calibration — and assert masters were
+    // built + superseded, every light is CALSTAT='BDF', the ATH_C* header
+    // vocabulary is present, pixels are finite and match the §2 formula, and the
+    // scanner reconcile-adopt branches (known / moved / duplicate) all fire.
+    //
+    // `#[ignore]` because it needs the owner's catalog DB + reachable FITS on
+    // disk. Run it with:
+    //   ATHENAEUM_E2E_DB=<path/to/athenaeum.db> \
+    //   ATHENAEUM_E2E_SANDBOX=<scratch dir> \
+    //   cargo test -p athenaeum-core --release real_data_e2e -- --ignored --nocapture
+    // The DB is opened strictly READ-ONLY; every artifact lives under the
+    // sandbox. If the DB or the FITS are unreachable the test prints SKIP and
+    // returns green (never a spurious failure in a checkout without the data).
+    #[test]
+    #[ignore = "real-data e2e: set ATHENAEUM_E2E_DB + ATHENAEUM_E2E_SANDBOX, run with --ignored"]
+    fn real_data_e2e_light_calibration() {
+        use crate::api::calibration::find_calibration_for_frame_set;
+        use crate::fits_parser::stored_header::parse_stored_header_keys;
+        use crate::integration::banded::BandSource;
+        use crate::models::FileFormat;
+        use crate::scanner::scan_directory;
+        use rusqlite::OpenFlags;
+
+        // ── Read a full f32 plane (one band) for exact pixel assertions ──────
+        fn read_plane(path: &Path, scratch: &Path) -> (usize, usize, Vec<f32>) {
+            let mut src = BandSource::open(&[path.to_path_buf()], scratch).unwrap();
+            let (w, h) = (src.width(), src.height());
+            let mut bufs = vec![Vec::new()];
+            src.read_band(0, h, &mut bufs).unwrap();
+            (w, h, bufs.remove(0))
+        }
+        fn header_keys(path: &Path) -> std::collections::HashMap<String, String> {
+            let (_f, text) = crate::fits_parser::parse_fits_with_header(path, 0).unwrap();
+            parse_stored_header_keys(FileFormat::FITS, &text)
+        }
+        let files_count = |conn: &Connection, path: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let count = |conn: &Connection, sql: &str| -> i64 {
+            conn.query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+
+        // ── Locate the real catalog (read-only) ──────────────────────────────
+        let db_path = std::env::var("ATHENAEUM_E2E_DB").unwrap_or_else(|_| {
+            format!(
+                "{}/Library/Application Support/com.vsharifov.athenaeum/athenaeum.db",
+                std::env::var("HOME").unwrap_or_default()
+            )
+        });
+        if !Path::new(&db_path).exists() {
+            eprintln!("[b5-e2e] SKIP: real catalog not found at {db_path}");
+            return;
+        }
+        let real = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .expect("open real DB read-only");
+
+        // ── Pick a cluster: a LIGHT frame set whose lights link to a RAW dark
+        //    set AND a RAW flat set, with the member FITS present on disk. ─────
+        let query_paths = |conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+            let mut stmt = conn.prepare(sql).unwrap();
+            stmt.query_map(p, |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter(|path| Path::new(path).exists())
+                .collect()
+        };
+
+        let mut candidates = real
+            .prepare(
+                "SELECT fs.id, d.calibration_set_id, fl.calibration_set_id
+                 FROM frames_set fs
+                 JOIN imaging_nights ino ON ino.frames_set_id = fs.id
+                 JOIN sessions s ON s.imaging_night_id = ino.id
+                 JOIN session_members sm ON sm.session_id = s.id
+                 JOIN frames f ON f.id = sm.frame_id AND f.imagetyp = 'Light'
+                 JOIN calibration_set_to_frames d
+                     ON d.source_id = f.id AND d.source_type = 'frame' AND d.calibration_type = 'Dark'
+                 JOIN calibration_set dcs
+                     ON dcs.id = d.calibration_set_id AND dcs.is_master_library = 0 AND dcs.superseded_by_set_id IS NULL
+                 JOIN calibration_set_to_frames fl
+                     ON fl.source_id = f.id AND fl.source_type = 'frame' AND fl.calibration_type = 'Flat'
+                 JOIN calibration_set fcs
+                     ON fcs.id = fl.calibration_set_id AND fcs.is_master_library = 0 AND fcs.superseded_by_set_id IS NULL
+                 GROUP BY fs.id, d.calibration_set_id, fl.calibration_set_id
+                 LIMIT 40",
+            )
+            .unwrap();
+        let triples: Vec<(i64, i64, i64)> = candidates
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut chosen: Option<(i64, i64, i64, Vec<String>, Vec<String>, Vec<String>)> = None;
+        for (fs_id, dark_set, flat_set) in triples {
+            let lights = query_paths(
+                &real,
+                "SELECT DISTINCT fi.path FROM frames_set fs
+                 JOIN imaging_nights ino ON ino.frames_set_id = fs.id
+                 JOIN sessions s ON s.imaging_night_id = ino.id
+                 JOIN session_members sm ON sm.session_id = s.id
+                 JOIN frames f ON f.id = sm.frame_id AND f.imagetyp = 'Light'
+                 JOIN files fi ON fi.id = f.file_id
+                 WHERE fs.id = ?1
+                   AND EXISTS (SELECT 1 FROM calibration_set_to_frames d WHERE d.source_id = f.id AND d.calibration_type='Dark' AND d.calibration_set_id=?2)
+                   AND EXISTS (SELECT 1 FROM calibration_set_to_frames l WHERE l.source_id = f.id AND l.calibration_type='Flat' AND l.calibration_set_id=?3)
+                 ORDER BY f.date_obs LIMIT 3",
+                &[&fs_id as &dyn rusqlite::ToSql, &dark_set, &flat_set],
+            );
+            let darks = query_paths(
+                &real,
+                "SELECT fi.path FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1 ORDER BY f.date_obs LIMIT 5",
+                &[&dark_set as &dyn rusqlite::ToSql],
+            );
+            let flats = query_paths(
+                &real,
+                "SELECT fi.path FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1 ORDER BY f.date_obs LIMIT 5",
+                &[&flat_set as &dyn rusqlite::ToSql],
+            );
+            if lights.len() >= 2 && darks.len() >= 2 && flats.len() >= 2 {
+                chosen = Some((fs_id, dark_set, flat_set, lights, darks, flats));
+                break;
+            }
+        }
+        drop(candidates);
+        let Some((real_fs, real_dark_set, real_flat_set, lights, darks, flats)) = chosen else {
+            eprintln!("[b5-e2e] SKIP: no reachable real cluster (raw dark+flat with files on disk)");
+            return;
+        };
+        eprintln!(
+            "[b5-e2e] cluster: frame_set={real_fs} raw_dark_set={real_dark_set} raw_flat_set={real_flat_set} \
+             lights={} darks={} flats={}",
+            lights.len(),
+            darks.len(),
+            flats.len()
+        );
+        for p in lights.iter().chain(&darks).chain(&flats) {
+            eprintln!("[b5-e2e]   src {p}");
+        }
+
+        // ── Build the sandbox tree; copy (never move) the real FITS in ───────
+        let sandbox = std::env::var("ATHENAEUM_E2E_SANDBOX")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("athenaeum-b5-e2e"));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let src = sandbox.join("src");
+        let library_dir = sandbox.join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+        let copy_group = |paths: &[String], sub: &str| -> Vec<PathBuf> {
+            let dir = src.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            paths
+                .iter()
+                .map(|p| {
+                    let dest = dir.join(Path::new(p).file_name().unwrap());
+                    std::fs::copy(p, &dest).unwrap_or_else(|e| panic!("copy {p}: {e}"));
+                    dest
+                })
+                .collect()
+        };
+        copy_group(&lights, "LIGHT");
+        copy_group(&darks, "DARK");
+        copy_group(&flats, "FLAT");
+
+        // ── Fresh catalog: scan the sandbox → real frames + raw calib sets ───
+        let database = crate::db::Database::new(sandbox.join("catalog.db")).unwrap();
+        let (frame_set_id, light_frame_ids, lib_root_id) = {
+            let conn = database.conn();
+            conn.execute(
+                "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+                params![src.to_string_lossy()],
+            )
+            .unwrap();
+            let sr = scan_directory(&src, &conn, None, false, false, 1);
+            assert!(sr.errors.is_empty(), "scan errors: {:?}", sr.errors);
+            eprintln!(
+                "[b5-e2e] scan: lights={} darks={} flats={} calib_sets_created={}",
+                sr.lights_count, sr.darks_count, sr.flats_count, sr.calibration_sets_created
+            );
+            assert!(sr.lights_count >= 2 && sr.darks_count >= 2 && sr.flats_count >= 2);
+
+            let light_ids: Vec<i64> = {
+                let mut stmt = conn
+                    .prepare("SELECT id FROM frames WHERE imagetyp='Light' ORDER BY id")
+                    .unwrap();
+                stmt.query_map([], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect()
+            };
+            assert!(light_ids.len() >= 2, "scanned lights: {}", light_ids.len());
+
+            // Seed the frame-set / night / session structure and enrol the
+            // scanned real light frames (clustering itself is Phase-1 machinery,
+            // out of B5 scope — we wire the members directly).
+            let fs_id = 9001;
+            let session = seed_frame_set(&conn, fs_id);
+            for lid in &light_ids {
+                conn.execute(
+                    "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                    params![session, lid],
+                )
+                .unwrap();
+            }
+
+            // Designate the sandbox calibration-library root.
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO scan_roots (id, path, kind) VALUES (2, ?1, 'calibration_library')",
+                params![library_dir.to_string_lossy()],
+            )
+            .unwrap();
+            (fs_id, light_ids, 2i64)
+        };
+
+        let ctx = test_ctx(database);
+
+        // ── Run the real matcher → raw dark/flat links on every light ────────
+        let stats =
+            find_calibration_for_frame_set(&ctx, frame_set_id, None, None, None, None).unwrap();
+        eprintln!(
+            "[b5-e2e] matcher: total={} full_calibration={}",
+            stats.total_frames, stats.frames_with_full_calibration
+        );
+
+        // ── Readiness: every light must classify dark+flat as rawSet ─────────
+        let readiness = get_light_calibration_readiness(&ctx, frame_set_id, true).unwrap();
+        eprintln!(
+            "[b5-e2e] readiness: ready={} raw={} missing={} to_build={:?}",
+            readiness.ready_count, readiness.raw_set_count, readiness.missing_count,
+            readiness.raw_set_ids_to_build
+        );
+        assert!(
+            !readiness.raw_set_ids_to_build.is_empty(),
+            "expected raw sets to build; matcher produced no raw links"
+        );
+        for fr in &readiness.frames {
+            assert_eq!(fr.dark, "rawSet", "frame {} dark class", fr.frame_id);
+            assert_eq!(fr.flat, "rawSet", "frame {} flat class", fr.frame_id);
+            assert_eq!(fr.status, "notCalibrated", "frame {} status", fr.frame_id);
+        }
+
+        // ── Drive the public start path: preflight master builds + calibrate ─
+        let emitter = Arc::new(CollectingEmitter::default());
+        let emitter_dyn: Arc<dyn ProgressEmitter> = emitter.clone();
+        start_light_calibration(
+            ctx.clone(),
+            emitter_dyn,
+            "0.2.5".into(),
+            frame_set_id,
+            LightCalScope { only_stale: false },
+            true,
+        )
+        .unwrap();
+
+        // Wait for the detached light-cal thread to finish (masters build first
+        // at max_concurrent=1, then the light job). Generous cap for real frames.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+        loop {
+            let running = ctx.active_light_cal.lock().unwrap().contains_key(&frame_set_id);
+            if !running {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "light calibration timed out");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // ── Assert the run outcome ───────────────────────────────────────────
+        let finished = emitter.first("calibration-finished");
+        eprintln!("[b5-e2e] finished: {finished}");
+        assert_eq!(finished["outcome"], "success", "finished payload: {finished}");
+        assert_eq!(finished["ok_count"], light_frame_ids.len() as u64);
+
+        let db_ref = db(&ctx).unwrap();
+
+        // Masters: raw sets superseded, master-library sets + provenance exist.
+        {
+            let conn = db_ref.conn();
+            let master_sets = count(&conn, "SELECT COUNT(*) FROM calibration_set WHERE is_master_library=1");
+            let provenance = count(&conn, "SELECT COUNT(*) FROM master_provenance");
+            let superseded = count(
+                &conn,
+                "SELECT COUNT(*) FROM calibration_set WHERE superseded_by_set_id IS NOT NULL",
+            );
+            eprintln!(
+                "[b5-e2e] masters: library_sets={master_sets} provenance={provenance} superseded={superseded}"
+            );
+            assert!(master_sets >= 2, "expected >=2 master sets (dark+flat)");
+            assert!(provenance >= 2, "expected master_provenance rows");
+            assert!(superseded >= 2, "raw dark+flat sets must be superseded");
+        }
+
+        // Per-light: BDF, output on disk, headers + pixels sane.
+        let scratch = std::env::temp_dir();
+        let mut checked = 0usize;
+        let mut first_output: Option<String> = None;
+        for &fid in &light_frame_ids {
+            let conn = db_ref.conn();
+            let row = get_light_calibration_for_frame(&conn, fid).unwrap().unwrap();
+            assert_eq!(row.calstat, "BDF", "frame {fid} calstat");
+            assert!(row.flat_norm_applied, "frame {fid} flat_norm_applied");
+            let out = PathBuf::from(&row.output_path);
+            assert!(out.exists(), "output {} missing", row.output_path);
+            first_output.get_or_insert(row.output_path.clone());
+
+            // Header vocabulary (§7).
+            let keys = header_keys(&out);
+            for k in ["CALSTAT", "ATH_CSRC", "ATH_CSRN", "ATH_CSCL", "ATH_CFNM", "ATH_CVER"] {
+                assert!(keys.contains_key(k), "output {} missing card {k}", row.output_path);
+            }
+            assert_eq!(keys.get("CALSTAT").map(String::as_str), Some("BDF"));
+
+            // Master file paths + fnrm from the (superseded → master) sets.
+            let dark_path: String = conn
+                .query_row(
+                    "SELECT fi.path FROM calibration_set_frames csf JOIN frames fr ON fr.id=csf.frame_id JOIN files fi ON fi.id=fr.file_id WHERE csf.set_id=?1 LIMIT 1",
+                    params![row.dark_set_id.unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let flat_path: String = conn
+                .query_row(
+                    "SELECT fi.path FROM calibration_set_frames csf JOIN frames fr ON fr.id=csf.frame_id JOIN files fi ON fi.id=fr.file_id WHERE csf.set_id=?1 LIMIT 1",
+                    params![row.flat_set_id.unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let light_path: String = conn
+                .query_row(
+                    "SELECT fi.path FROM frames fr JOIN files fi ON fi.id=fr.file_id WHERE fr.id=?1",
+                    params![fid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            drop(conn);
+
+            let fnrm: f64 = header_keys(Path::new(&flat_path))
+                .get("ATH_FNRM")
+                .and_then(|s| s.parse().ok())
+                .expect("master flat carries ATH_FNRM");
+
+            let (lw, lh, lpix) = read_plane(Path::new(&light_path), &scratch);
+            let (dw, dh, dpix) = read_plane(Path::new(&dark_path), &scratch);
+            let (fw, fh, fpix) = read_plane(Path::new(&flat_path), &scratch);
+            let (ow, oh, opix) = read_plane(&out, &scratch);
+            assert_eq!((lw, lh), (ow, oh), "output geometry");
+            assert_eq!((dw, dh), (ow, oh), "dark geometry");
+            assert_eq!((fw, fh), (ow, oh), "flat geometry");
+
+            // No NaN/Inf anywhere in the full plane; background positive & <<1.
+            assert!(opix.iter().all(|v| v.is_finite()), "output has NaN/Inf");
+            let mean = opix.iter().map(|&v| v as f64).sum::<f64>() / opix.len() as f64;
+            eprintln!(
+                "[b5-e2e] frame {fid}: out={} {ow}x{oh} mean={mean:.6} fnrm={fnrm:.2}",
+                Path::new(&row.output_path).file_name().unwrap().to_string_lossy()
+            );
+            assert!(mean > 0.0 && mean < 1.0, "background mean {mean} out of (0,1)");
+
+            // Spot-check the §2 formula on a spread of pixels.
+            let n = opix.len();
+            for i in [0usize, n / 4, n / 2, (3 * n) / 4, n - 1] {
+                let expect = (((lpix[i] as f64) - (dpix[i] as f64))
+                    / ((fpix[i] as f64) / fnrm))
+                    / OUTPUT_SCALE_DIVISOR;
+                let got = opix[i] as f64;
+                let tol = 1e-4 * expect.abs().max(1e-6);
+                assert!(
+                    (got - expect).abs() <= tol,
+                    "frame {fid} px {i}: got {got} want {expect}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 2, "checked {checked} lights");
+
+        // ── Scanner reconcile-adopt over the library root ────────────────────
+        // (a) rescan: calibrated outputs skipped, zero new frames.
+        {
+            let conn = db_ref.conn();
+            let frames_before = count(&conn, "SELECT COUNT(*) FROM frames");
+            let cal_before = count(&conn, "SELECT COUNT(*) FROM light_calibrations");
+            let sr = scan_directory(&library_dir, &conn, None, false, false, lib_root_id);
+            assert!(sr.errors.is_empty(), "rescan errors: {:?}", sr.errors);
+            let frames_after = count(&conn, "SELECT COUNT(*) FROM frames");
+            let cal_after = count(&conn, "SELECT COUNT(*) FROM light_calibrations");
+            eprintln!(
+                "[b5-e2e] rescan(a): frames {frames_before}->{frames_after} cal {cal_before}->{cal_after} dups={}",
+                sr.calibrated_duplicates.len()
+            );
+            assert_eq!(frames_before, frames_after, "rescan must add no frames");
+            assert_eq!(cal_before, cal_after, "rescan must add no tracking rows");
+            assert!(sr.calibrated_duplicates.is_empty(), "known paths are not duplicates");
+            let out0 = first_output.clone().unwrap();
+            assert_eq!(files_count(&conn, &out0), 0, "calibrated output never registered as a file");
+        }
+
+        // (b) move one output → rescan repairs output_path.
+        {
+            let moved_fid = light_frame_ids[0];
+            let (old_path, moved_path) = {
+                let conn = db_ref.conn();
+                let old = get_light_calibration_for_frame(&conn, moved_fid).unwrap().unwrap().output_path;
+                let moved = format!("{old}.moved.fits");
+                std::fs::rename(&old, &moved).unwrap();
+                (old, moved)
+            };
+            let conn = db_ref.conn();
+            let sr = scan_directory(&library_dir, &conn, None, false, false, lib_root_id);
+            assert!(sr.errors.is_empty(), "move-rescan errors: {:?}", sr.errors);
+            let repaired = get_light_calibration_for_frame(&conn, moved_fid).unwrap().unwrap().output_path;
+            eprintln!("[b5-e2e] move(b): {old_path} -> {repaired}");
+            assert_eq!(repaired, moved_path, "output_path must be repaired to the new location");
+            assert!(sr.calibrated_duplicates.is_empty(), "a move is not a duplicate");
+        }
+
+        // (c) copy one output → rescan reports a duplicate; row untouched.
+        {
+            let dup_fid = light_frame_ids[1];
+            let (kept_path, dup_path) = {
+                let conn = db_ref.conn();
+                let kept = get_light_calibration_for_frame(&conn, dup_fid).unwrap().unwrap().output_path;
+                let dup = format!("{kept}.copy.fits");
+                std::fs::copy(&kept, &dup).unwrap();
+                (kept, dup)
+            };
+            let conn = db_ref.conn();
+            let sr = scan_directory(&library_dir, &conn, None, false, false, lib_root_id);
+            assert!(sr.errors.is_empty(), "copy-rescan errors: {:?}", sr.errors);
+            eprintln!("[b5-e2e] copy(c): dups={:?}", sr.calibrated_duplicates);
+            assert!(
+                sr.calibrated_duplicates.iter().any(|d| d.duplicate_path == dup_path),
+                "duplicate copy must be reported: {:?}",
+                sr.calibrated_duplicates
+            );
+            let row = get_light_calibration_for_frame(&conn, dup_fid).unwrap().unwrap();
+            assert_eq!(row.output_path, kept_path, "tracking row untouched by a duplicate");
+        }
+
+        eprintln!("[b5-e2e] PASS: real-data end-to-end light calibration verified");
+    }
 }
 
 #[cfg(test)]
