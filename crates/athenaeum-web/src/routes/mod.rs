@@ -33,6 +33,7 @@ mod plate_solve;
 mod registration;
 mod archive;
 mod masters;
+mod lights;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -231,6 +232,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/archive_calibration_originals", post(masters::archive_calibration_originals))
         .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))
         .route("/api/clear_stale_archive_markers", post(masters::clear_stale_archive_markers))
+        .route("/api/get_light_calibration_readiness", post(lights::get_light_calibration_readiness))
+        .route("/api/start_light_calibration", post(lights::start_light_calibration))
+        .route("/api/cancel_light_calibration", post(lights::cancel_light_calibration))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))

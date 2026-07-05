@@ -520,3 +520,5 @@ export type LightCalReadiness = { frames: Array<LightFrameReadiness>, readyCount
  */
 rawSetIdsToBuild: Array<number>, };
 
+export type LightCalScope = { onlyStale: boolean, };
+

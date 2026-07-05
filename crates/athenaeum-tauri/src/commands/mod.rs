@@ -45,6 +45,7 @@ pub mod registration;
 pub mod utils;
 pub mod archive;
 pub mod masters;
+pub mod lights;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -64,3 +65,4 @@ pub use plate_solve::*;
 pub use registration::*;
 pub use archive::*;
 pub use masters::*;
+pub use lights::*;
