@@ -402,3 +402,35 @@ export type ComputeJobState = "queued" | "running";
 
 export type ComputeQueueEntry = { jobId: number, kind: ComputeJobKind, label: string, state: ComputeJobState, queuedAt: string, };
 
+export type CombineMethod = { "method": "mean" } | { "method": "median" } | { "method": "winsorized_sigma_clip", sigma_low: number, sigma_high: number, } | { "method": "percentile_clip", low: number, high: number, };
+
+export type MasterRecipe = { 
+/**
+ * None => Auto (per-type/per-N rule from spec §9).
+ */
+combine: CombineMethod | null, 
+/**
+ * Constant-ADU fallback for flat pre-calibration when no darkflat/dark/bias master is linked.
+ */
+syntheticBias: number | null, };
+
+export type MasterBuildPreview = { setId: number, imagetyp: string, frameCount: number, resolvedCombine: CombineMethod, 
+/**
+ * Human description: "master darkflat #12" | "synthetic bias 500 ADU" | null.
+ */
+flatPrecal: string | null, 
+/**
+ * Absolute, collision-resolved.
+ */
+targetPath: string, warnings: Array<string>, };
+
+export type MasterProvenanceInfo = { masterSetId: number, sourceSetId: number | null, recipeJson: string, memberCount: number, memberHash: string, createdAt: string, 
+/**
+ * Rebuild possible?
+ */
+sourceFramesOnDisk: boolean, 
+/**
+ * Any source file has archive markers.
+ */
+originalsArchived: boolean, };
+

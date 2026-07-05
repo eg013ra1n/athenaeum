@@ -76,6 +76,7 @@ pub fn run() {
                     active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
                     active_registrations: Arc::new(Mutex::new(HashMap::new())),
                     active_archives: Arc::new(Mutex::new(HashMap::new())),
+                    active_master_builds: Arc::new(Mutex::new(HashMap::new())),
                     dso_catalog: Arc::new(std::sync::RwLock::new(None)),
                     star_cache: Arc::new(std::sync::RwLock::new(None)),
                     bright_cache: Arc::new(std::sync::RwLock::new(None)),
@@ -356,6 +357,11 @@ pub fn run() {
             commands::get_compute_queue,
             commands::cancel_compute_job,
             commands::set_compute_max_concurrent,
+            // Master build commands
+            commands::preview_master_build,
+            commands::start_master_build,
+            commands::cancel_master_build,
+            commands::get_master_provenance,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,

@@ -129,6 +129,10 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::services::compute_queue::ComputeJobKind,
             crate::services::compute_queue::ComputeJobState,
             crate::services::compute_queue::ComputeQueueEntry,
+            crate::integration::combine::CombineMethod,
+            crate::api::masters::MasterRecipe,
+            crate::api::masters::MasterBuildPreview,
+            crate::api::masters::MasterProvenanceInfo,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::archive::models::ArchiveDisposition,

@@ -32,6 +32,7 @@ mod compute;
 mod plate_solve;
 mod registration;
 mod archive;
+mod masters;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -219,6 +220,11 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/add_archive_root", post(archive::add_archive_root))
         .route("/api/delete_archive_root", post(archive::delete_archive_root))
         .route("/api/set_default_archive_root", post(archive::set_default_archive_root))
+        // Master build
+        .route("/api/preview_master_build", post(masters::preview_master_build))
+        .route("/api/start_master_build", post(masters::start_master_build))
+        .route("/api/cancel_master_build", post(masters::cancel_master_build))
+        .route("/api/get_master_provenance", post(masters::get_master_provenance))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))
@@ -385,6 +391,7 @@ mod tests {
             active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),

@@ -49,6 +49,13 @@ pub struct ArchiveHandle {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
+/// Handle to track an active master-build operation (Task 12). Keyed by the
+/// SOURCE calibration_set id (not the resulting master set id — that doesn't
+/// exist yet while the build is running).
+pub struct MasterBuildHandle {
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
 /// Shared application state accessible from any backend (Tauri, Axum, CLI).
 pub struct ServiceContext {
     pub db: OnceLock<Database>,
@@ -64,6 +71,9 @@ pub struct ServiceContext {
     /// time by command-layer enforcement; HashMap form keeps the same shape
     /// as the other active-handle maps for consistency.
     pub active_archives: Arc<Mutex<HashMap<i64, ArchiveHandle>>>,
+    /// Active master-build operations (Task 12), keyed by SOURCE calibration
+    /// set id. Only one build per source set at a time.
+    pub active_master_builds: Arc<Mutex<HashMap<i64, MasterBuildHandle>>>,
     /// Lazy-loaded deep-sky object catalog, used to auto-label plate-solve
     /// results (e.g. "M 42", "NGC 7000"). Parsed on first use, then cached.
     pub dso_catalog: Arc<RwLock<Option<Arc<DsoCatalog>>>>,
