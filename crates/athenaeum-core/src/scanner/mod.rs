@@ -5,7 +5,11 @@ use crate::db::{
     file_exists, insert_file, insert_frame, insert_fits_header,
     rebuild_duplicate_groups_cache, rebuild_folder_similarity_cache,
 };
-use crate::fits_parser::{parse_xisf, extract_xisf_header, parse_fits_with_header};
+use crate::fits_parser::stored_header::parse_stored_header_keys;
+use crate::fits_parser::{
+    calibrated_light_identity, extract_xisf_header, parse_fits_with_header, parse_xisf,
+    CalibratedIdentity,
+};
 use crate::duplicates::compute_metadata_hash;
 use crate::models::{File, Frame, FileFormat, ImageType};
 use chrono::Utc;
@@ -92,6 +96,11 @@ pub struct FileProcessResult {
     /// Non-fatal hash failure encountered during processing. The file was
     /// still parsed and is in the result; only its content_hash is None.
     pub hash_error: Option<String>,
+    /// Set when the parsed header identifies a calibrated-LIGHT artifact
+    /// (design §4). The Phase-2 write loop diverts these onto the DB-touching
+    /// reconcile-adopt path instead of inserting a `files`/`frames` row —
+    /// `process_file_parallel` has no `conn`, so the decision is carried here.
+    pub calibrated_identity: Option<CalibratedIdentity>,
 }
 
 /// Progress event sent to frontend via Tauri events
@@ -120,6 +129,21 @@ pub struct ScanCompleteEvent {
     pub darkflats_count: usize,
     pub calibration_sets_created: usize,
     pub cancelled: bool,
+    /// Calibrated-LIGHT artifacts (design §4.3) whose header identity matches a
+    /// tracked output whose file ALSO still exists — a duplicate copy the user
+    /// should be told about. Never registered as frames; surfaced only here.
+    pub calibrated_duplicates: Vec<CalibratedDuplicate>,
+}
+
+/// One duplicate calibrated-LIGHT sighting (design §4.3): the tracked output
+/// that stays authoritative (`kept_path`) and the just-scanned copy
+/// (`duplicate_path`). Carried to the frontend in the scan-finished
+/// notification; the tracking row is never changed.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibratedDuplicate {
+    pub kept_path: String,
+    pub duplicate_path: String,
 }
 
 /// Scan a directory for FITS/XISF files
@@ -143,6 +167,7 @@ pub fn scan_directory(
         darkflats_count: 0,
         calibration_sets_created: 0,
         cancelled: false,
+        calibrated_duplicates: Vec::new(),
     };
 
     // Find all FITS/XISF files. max_depth caps recursion in case follow_links
@@ -192,6 +217,9 @@ pub fn scan_directory(
     let mut master_flat_ids: Vec<i64> = Vec::new();
     let mut master_bias_ids: Vec<i64> = Vec::new();
     let mut master_darkflat_ids: Vec<i64> = Vec::new();
+
+    // Duplicate calibrated-LIGHT sightings collected during this scan (§4.3).
+    let mut calibrated_duplicates: Vec<CalibratedDuplicate> = Vec::new();
 
     for (idx, file_path) in files.iter().enumerate() {
         if let Some(ref cb) = progress_callback {
@@ -262,6 +290,7 @@ pub fn scan_directory(
             unique_camera,
             root_id,
             &mut hash_errors_local,
+            &mut calibrated_duplicates,
         ) {
             Ok(frame_info) => {
                 *processed.lock().unwrap() += 1;
@@ -308,6 +337,7 @@ pub fn scan_directory(
     result.darks_count = dark_frame_ids.len();
     result.bias_count = bias_frame_ids.len();
     result.darkflats_count = darkflat_frame_ids.len();
+    result.calibrated_duplicates = calibrated_duplicates;
 
     // Create calibration sets from newly scanned calibration frames
     let has_calibration_frames = !flat_frame_ids.is_empty()
@@ -372,6 +402,7 @@ fn process_file(
     unique_camera: bool,
     root_id: i64,
     hash_errors_out: &mut Vec<String>,
+    calibrated_duplicates_out: &mut Vec<CalibratedDuplicate>,
 ) -> anyhow::Result<Option<(i64, ImageType)>> {
     // Get file metadata
     let metadata = std::fs::metadata(path)?;
@@ -418,6 +449,24 @@ fn process_file(
             (None, extract_xisf_header(path).ok())
         }
     };
+
+    // Calibrated-LIGHT artifacts (design §4) are recognized by their header
+    // cards and never registered as frames — they take the reconcile-adopt
+    // path instead. Runs BEFORE the moved-file / new-file insert logic below.
+    if let Some(ref header) = header_text {
+        let keys = parse_stored_header_keys(format.clone(), header);
+        if let Some(identity) = calibrated_light_identity(&keys) {
+            reconcile_calibrated_light(
+                conn,
+                path,
+                &current_path,
+                &identity,
+                root_id,
+                calibrated_duplicates_out,
+            )?;
+            return Ok(None);
+        }
+    }
 
     // Check for moved files using the header fingerprint
     if let Some(ref header) = header_text {
@@ -589,6 +638,199 @@ fn process_file(
 
     // Return frame info if imagetyp is known
     Ok(imagetyp.map(|it| (frame_id, it)))
+}
+
+/// Reconcile a calibrated-LIGHT artifact against the `light_calibrations`
+/// tracking table (design §4). Never registers a `files`/`frames` row — the
+/// file is an out-of-catalog artifact (§3). Four branches, keyed on whether an
+/// existing tracking row matches this file's header identity:
+///
+/// 1. **Known path** — a row's `output_path` equals the scanned path → no-op.
+/// 2. **Moved** — a row matches identity but its `output_path` no longer exists
+///    on disk → repair `output_path` to the new location, `info!`.
+/// 3. **Duplicate copy** — a row matches identity and its `output_path` ALSO
+///    still exists → record the (kept, duplicate) pair, `warn!`; row untouched.
+/// 4. **Unknown** — no row matches → adopt: resolve the source frame by uuid
+///    then filename; resolved → INSERT a tracking row (`info!`); unresolved →
+///    `warn!` and skip so a later scan (once the source is cataloged) succeeds.
+fn reconcile_calibrated_light(
+    conn: &Connection,
+    path: &Path,
+    current_path: &str,
+    identity: &CalibratedIdentity,
+    root_id: i64,
+    calibrated_duplicates_out: &mut Vec<CalibratedDuplicate>,
+) -> anyhow::Result<()> {
+    use crate::db::light_calibrations::{
+        find_by_identity, update_output_path, upsert_light_calibration, LightCalRow,
+        LIGHT_CAL_ENGINE_VERSION,
+    };
+
+    let existing = find_by_identity(
+        conn,
+        identity.source_uuid.as_deref(),
+        identity.source_filename.as_deref(),
+    )?;
+
+    if let Some(row) = existing {
+        if row.output_path == current_path {
+            // Branch 1: this is the tracked file at its known location.
+            tracing::debug!(root_id, path = %current_path, "known calibrated light — skipping ingestion");
+        } else if !Path::new(&row.output_path).exists() {
+            // Branch 2: the tracked file is gone from its old location and this
+            // is it under a new path — repair the pointer (file-relink philosophy).
+            update_output_path(conn, row.id, current_path)?;
+            tracing::info!(
+                root_id,
+                old_path = %row.output_path,
+                path = %current_path,
+                "calibrated light moved — output_path repaired"
+            );
+        } else {
+            // Branch 3: the tracked file still exists elsewhere, so this is a
+            // duplicate copy. Signal it; leave the tracking row untouched.
+            tracing::warn!(
+                root_id,
+                kept_path = %row.output_path,
+                duplicate_path = %current_path,
+                "duplicate calibrated light detected"
+            );
+            calibrated_duplicates_out.push(CalibratedDuplicate {
+                kept_path: row.output_path.clone(),
+                duplicate_path: current_path.to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    // Branch 4: no tracking row — adopt if the source frame is cataloged.
+    let frame_id = resolve_calibrated_source_frame(
+        conn,
+        identity.source_uuid.as_deref(),
+        identity.source_filename.as_deref(),
+    )?;
+    let Some(frame_id) = frame_id else {
+        tracing::warn!(
+            root_id,
+            path = %current_path,
+            source_uuid = identity.source_uuid.as_deref().unwrap_or(""),
+            source_filename = identity.source_filename.as_deref().unwrap_or(""),
+            "calibrated light source not in catalog — deferring adoption"
+        );
+        return Ok(());
+    };
+
+    // Resolve master references (uuid then path) to calibration-set ids where
+    // possible; an unresolvable reference records NULL (honest — a rebuilt
+    // catalog may no longer carry that master).
+    let dark_set_id = identity.dark.as_ref().and_then(|m| resolve_master_set_id(conn, m));
+    let flat_set_id = identity.flat.as_ref().and_then(|m| resolve_master_set_id(conn, m));
+    let bias_set_id = identity.bias.as_ref().and_then(|m| resolve_master_set_id(conn, m));
+
+    // A flat was normalized iff a flat was applied AND the recorded divisor is
+    // not the 1.0 sentinel (§2: ATH_CFNM = 1.0 means normalization was off).
+    let flat_norm_applied = identity.flat.is_some()
+        && identity
+            .flat_norm_divisor
+            .map(|d| (d - 1.0).abs() > 1e-9)
+            .unwrap_or(false);
+
+    // Best-effort content hash of the artifact on disk (same function the
+    // engine uses); a failure records an empty hash rather than aborting.
+    let output_hash = crate::duplicates::compute_xxhash(path).unwrap_or_default();
+
+    let row = LightCalRow {
+        id: 0,
+        frame_id: Some(frame_id),
+        source_uuid: identity.source_uuid.clone(),
+        source_filename: identity.source_filename.clone(),
+        output_path: current_path.to_string(),
+        dark_set_id,
+        flat_set_id,
+        bias_set_id,
+        calstat: identity.calstat.clone(),
+        flat_norm_applied,
+        output_hash,
+        // Carry the file's own engine version so staleness derivation (§5)
+        // correctly flags a file built by an older engine.
+        engine_version: identity.engine_version.unwrap_or(LIGHT_CAL_ENGINE_VERSION),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    upsert_light_calibration(conn, &row)?;
+    tracing::info!(root_id, frame_id, path = %current_path, "adopted calibrated light");
+    Ok(())
+}
+
+/// Resolve the source LIGHT frame for an adopted calibrated artifact: by
+/// `frames.uuid` first (DB-generated, may not survive a rebuild), then by
+/// `files.filename` (indexed) joined to its frame. Returns the frame id, or
+/// `None` when the source is not yet cataloged.
+fn resolve_calibrated_source_frame(
+    conn: &Connection,
+    source_uuid: Option<&str>,
+    source_filename: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    if let Some(uuid) = source_uuid {
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM frames WHERE uuid = ?1 LIMIT 1",
+                rusqlite::params![uuid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if id.is_some() {
+            return Ok(id);
+        }
+    }
+    if let Some(filename) = source_filename {
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT fr.id FROM frames fr JOIN files fi ON fi.id = fr.file_id
+                 WHERE fi.filename = ?1 LIMIT 1",
+                rusqlite::params![filename],
+                |r| r.get(0),
+            )
+            .optional()?;
+        return Ok(id);
+    }
+    Ok(None)
+}
+
+/// Resolve a master reference (`"<uuid> <path>"`) to its calibration-set id —
+/// by the master frame's `uuid` first, then by its file `path`. Any miss
+/// yields `None` (recorded as a NULL set id on the adopted row).
+fn resolve_master_set_id(conn: &Connection, master: &crate::fits_parser::MasterRef) -> Option<i64> {
+    if !master.uuid.is_empty() {
+        let by_uuid: Option<i64> = conn
+            .query_row(
+                "SELECT csf.set_id FROM frames fr
+                 JOIN calibration_set_frames csf ON csf.frame_id = fr.id
+                 WHERE fr.uuid = ?1 LIMIT 1",
+                rusqlite::params![master.uuid],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if by_uuid.is_some() {
+            return by_uuid;
+        }
+    }
+    if !master.path.is_empty() {
+        return conn
+            .query_row(
+                "SELECT csf.set_id FROM files fi
+                 JOIN frames fr ON fr.file_id = fi.id
+                 JOIN calibration_set_frames csf ON csf.frame_id = fr.id
+                 WHERE fi.path = ?1 LIMIT 1",
+                rusqlite::params![master.path],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+    }
+    None
 }
 
 /// Re-parse a file whose on-disk metadata has drifted from the catalog and
@@ -900,6 +1142,8 @@ pub struct ScanResult {
     pub calibration_sets_created: usize,
     // Whether scan was cancelled by user
     pub cancelled: bool,
+    // Duplicate calibrated-LIGHT sightings (design §4.3); never registered.
+    pub calibrated_duplicates: Vec<CalibratedDuplicate>,
 }
 
 #[allow(dead_code)]
@@ -951,6 +1195,7 @@ fn emit_scan_complete<E: ProgressEmitter>(emitter: &E, root_id: i64, result: &Sc
         darkflats_count: result.darkflats_count,
         calibration_sets_created: result.calibration_sets_created,
         cancelled: result.cancelled,
+        calibrated_duplicates: result.calibrated_duplicates.clone(),
     };
 
     emit_event(emitter, "scan-complete", &event);
@@ -1046,12 +1291,21 @@ fn process_file_parallel(
 
     let imagetyp = frame.imagetyp.clone();
 
+    // A calibrated-LIGHT artifact is recognized by its header cards, not its
+    // path or IMAGETYP. Parse the (already-read) header and flag it so the
+    // sequential write phase can reconcile-adopt it with DB access.
+    let calibrated_identity = header.as_ref().and_then(|h| {
+        let keys = parse_stored_header_keys(format, h);
+        calibrated_light_identity(&keys)
+    });
+
     Ok(FileProcessResult {
         file,
         frame,
         header,
         imagetyp,
         hash_error,
+        calibrated_identity,
     })
 }
 
@@ -1081,6 +1335,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         darkflats_count: 0,
         calibration_sets_created: 0,
         cancelled: false,
+        calibrated_duplicates: Vec::new(),
     };
 
     // Phase 1a: Discovery - collect all file paths with progress updates
@@ -1350,6 +1605,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     let mut master_bias_ids: Vec<i64> = Vec::new();
     let mut master_darkflat_ids: Vec<i64> = Vec::new();
     let mut lights_count: usize = 0;
+    // Duplicate calibrated-LIGHT sightings collected during this scan (§4.3).
+    let mut calibrated_duplicates: Vec<CalibratedDuplicate> = Vec::new();
 
     // Begin transaction for batch insert
     tracing::debug!(root_id, count = processed_results.len(), stage = "inserting", "starting DB inserts");
@@ -1387,6 +1644,33 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 Some(file_result.file.filename.clone()),
                 "inserting",
             );
+        }
+
+        // Calibrated-LIGHT artifacts (design §4) take the reconcile-adopt path
+        // instead of frame registration. Detected during the parallel parse
+        // phase (`calibrated_identity`); the DB-touching decision runs here,
+        // inside the batch transaction, BEFORE any move/insert logic.
+        if let Some(ref identity) = file_result.calibrated_identity {
+            if let Err(e) = reconcile_calibrated_light(
+                conn,
+                Path::new(&file_result.file.path),
+                &file_result.file.path,
+                identity,
+                root_id,
+                &mut calibrated_duplicates,
+            ) {
+                tracing::error!(
+                    root_id,
+                    path = %file_result.file.path,
+                    error = %e,
+                    "calibrated-light reconcile failed"
+                );
+                result.errors.push(format!(
+                    "{}: calibrated-light reconcile failed: {}",
+                    file_result.file.path, e
+                ));
+            }
+            continue;
         }
 
         // Check for moved files (same fingerprint at different path)
@@ -1653,6 +1937,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     result.darks_count = dark_frame_ids.len();
     result.bias_count = bias_frame_ids.len();
     result.darkflats_count = darkflat_frame_ids.len();
+    result.calibrated_duplicates = calibrated_duplicates;
 
     // Skip calibration and caching phases if cancelled
     if !result.cancelled {
@@ -2187,7 +2472,9 @@ mod moved_file_guard_tests {
         std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
 
         let mut hash_errors = Vec::new();
-        let result = process_file(&new_path, &conn, false, false, 2, &mut hash_errors).unwrap();
+        let mut cal_dups = Vec::new();
+        let result =
+            process_file(&new_path, &conn, false, false, 2, &mut hash_errors, &mut cal_dups).unwrap();
         assert!(
             result.is_some(),
             "guard must let the new file insert instead of silently treating it as a move"
@@ -2248,7 +2535,9 @@ mod moved_file_guard_tests {
         std::fs::copy(MONO_FIXTURE, &new_path).unwrap();
 
         let mut hash_errors = Vec::new();
-        let result = process_file(&new_path, &conn, false, false, 2, &mut hash_errors).unwrap();
+        let mut cal_dups = Vec::new();
+        let result =
+            process_file(&new_path, &conn, false, false, 2, &mut hash_errors, &mut cal_dups).unwrap();
         assert!(
             result.is_none(),
             "a genuine move must short-circuit with Ok(None), not insert a new row"
@@ -2407,5 +2696,256 @@ mod moved_file_guard_tests {
             Some(inner_root.to_str().unwrap().to_string()),
             "the more specific (offline) inner root must win over the online outer root"
         );
+    }
+}
+
+/// Scanner reconcile-adopt for calibrated-LIGHT artifacts (design §4). Each
+/// test runs through BOTH scan entry points — the sequential `scan_directory`
+/// and the parallel `scan_directory_parallel` (the production path) — since the
+/// branch is implemented in both.
+#[cfg(test)]
+mod calibrated_light_scan_tests {
+    use super::*;
+    use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalCardInputs};
+    use crate::db::light_calibrations::{
+        find_by_identity, upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
+    };
+    use crate::db::schema::init_db;
+    use crate::events::NullEmitter;
+    use crate::fits_writer::write_fits_f32;
+    use rusqlite::params;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    /// Write a real calibrated-LIGHT FITS using the SAME header cards
+    /// production writes (`build_light_cal_cards`, Task 2), so the scanner's
+    /// detection path is exercised end to end.
+    fn write_calibrated_light(
+        path: &Path,
+        source_uuid: &str,
+        source_filename: &str,
+        calstat: &str,
+    ) {
+        let inputs = LightCalCardInputs {
+            source_uuid: source_uuid.to_string(),
+            source_filename: source_filename.to_string(),
+            calstat: calstat.to_string(),
+            dark: None,
+            flat: None,
+            bias: None,
+            scale_divisor: 65535.0,
+            flat_norm_divisor: 1.0,
+        };
+        let cards = build_light_cal_cards(&[], &inputs).unwrap();
+        let data = vec![0.5f32; 4 * 4];
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_fits_f32(path, 4, 4, 1, &data, &cards).unwrap();
+    }
+
+    fn fresh_db(root: &Path, root_id: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (?1, ?2)",
+            params![root_id, root.to_str().unwrap()],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Seed a `light_calibrations` tracking row (adopted-row shape, keyed on
+    /// output_path) with a known identity.
+    fn seed_row(conn: &Connection, source_uuid: &str, output_path: &str) {
+        let row = LightCalRow {
+            id: 0,
+            frame_id: None,
+            source_uuid: Some(source_uuid.to_string()),
+            source_filename: None,
+            output_path: output_path.to_string(),
+            dark_set_id: None,
+            flat_set_id: None,
+            bias_set_id: None,
+            calstat: "BD".to_string(),
+            flat_norm_applied: false,
+            output_hash: "seed".to_string(),
+            engine_version: LIGHT_CAL_ENGINE_VERSION,
+            created_at: "2026-07-05T00:00:00Z".to_string(),
+        };
+        upsert_light_calibration(conn, &row).unwrap();
+    }
+
+    fn run_scan(parallel: bool, root: &Path, conn: &Connection, root_id: i64) -> ScanResult {
+        if parallel {
+            scan_directory_parallel(
+                root,
+                root_id,
+                conn,
+                &NullEmitter,
+                false,
+                Arc::new(AtomicBool::new(false)),
+                false,
+            )
+        } else {
+            scan_directory(root, conn, None, false, false, root_id)
+        }
+    }
+
+    fn files_count(conn: &Connection, path: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE path = ?1",
+            params![path],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn light_cal_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM light_calibrations", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Branch 1: the tracking row's output_path equals the scanned path — no-op.
+    /// The file is never registered as a frame and the row is untouched.
+    #[test]
+    fn scan_skips_known_calibrated_light() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("M42/c_L_0001.fits");
+            write_calibrated_light(&cal, "uuid-known", "L_0001.fits", "BDF");
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            seed_row(&conn, "uuid-known", &cal_str);
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
+            assert_eq!(light_cal_count(&conn), 1, "parallel={parallel}: no new row");
+            assert!(
+                result.calibrated_duplicates.is_empty(),
+                "parallel={parallel}: known path is not a duplicate"
+            );
+            let row = find_by_identity(&conn, Some("uuid-known"), None).unwrap().unwrap();
+            assert_eq!(row.output_path, cal_str, "parallel={parallel}: output_path unchanged");
+        }
+    }
+
+    /// Branch 2: identity matches a row whose output_path no longer exists on
+    /// disk — repair the pointer to the new location.
+    #[test]
+    fn scan_repairs_moved_calibrated_light() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("M42/c_L_0002.fits");
+            write_calibrated_light(&cal, "uuid-moved", "L_0002.fits", "BD");
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            // Old output_path points somewhere that does NOT exist on disk.
+            let old_path = root.path().join("old/gone/c_L_0002.fits");
+            seed_row(&conn, "uuid-moved", old_path.to_str().unwrap());
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
+            assert!(result.calibrated_duplicates.is_empty(), "parallel={parallel}: a move is not a dup");
+
+            let row = find_by_identity(&conn, Some("uuid-moved"), None).unwrap().unwrap();
+            assert_eq!(row.output_path, cal_str, "parallel={parallel}: output_path repaired to new location");
+            assert_eq!(light_cal_count(&conn), 1, "parallel={parallel}: repaired in place, no new row");
+        }
+    }
+
+    /// Branch 3: identity matches a row whose output_path ALSO still exists — a
+    /// duplicate copy. Record the pair; leave the tracking row untouched.
+    #[test]
+    fn scan_reports_duplicate_copy() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            // The kept (tracked) file lives OUTSIDE the scan root and stays on disk.
+            let kept_dir = TempDir::new().unwrap();
+            let kept = kept_dir.path().join("c_L_0003.fits");
+            write_calibrated_light(&kept, "uuid-dup", "L_0003.fits", "BDF");
+            let kept_str = kept.to_str().unwrap().to_string();
+
+            // The duplicate copy sits inside the scan root.
+            let dup = root.path().join("M42/c_L_0003.fits");
+            write_calibrated_light(&dup, "uuid-dup", "L_0003.fits", "BDF");
+            let dup_str = dup.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            seed_row(&conn, "uuid-dup", &kept_str);
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &dup_str), 0, "parallel={parallel}: dup never registered");
+            assert_eq!(
+                result.calibrated_duplicates,
+                vec![CalibratedDuplicate { kept_path: kept_str.clone(), duplicate_path: dup_str.clone() }],
+                "parallel={parallel}: duplicate pair reported"
+            );
+            // Row untouched: still points at the kept file.
+            let row = find_by_identity(&conn, Some("uuid-dup"), None).unwrap().unwrap();
+            assert_eq!(row.output_path, kept_str, "parallel={parallel}: tracking row unchanged");
+        }
+    }
+
+    /// Branch 4 (resolved): no tracking row, but the source frame is cataloged
+    /// by filename — adopt: INSERT a tracking row pointing at the source frame.
+    #[test]
+    fn scan_adopts_after_db_rebuild() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("M42/c_L_src.fits");
+            // Empty uuid -> adoption falls back to the filename (§4).
+            write_calibrated_light(&cal, "", "L_src.fits", "BDF");
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            // Cataloged source frame with the referenced filename.
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (900, '/src/L_src.fits', 'L_src.fits', 0, '2025-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id, file_id) VALUES (900, 900)", []).unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: artifact never registered");
+
+            let (count, output_path): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(output_path) FROM light_calibrations WHERE frame_id = 900",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "parallel={parallel}: adopted row created for source frame");
+            assert_eq!(output_path.as_deref(), Some(cal_str.as_str()), "parallel={parallel}: output_path = artifact");
+        }
+    }
+
+    /// Branch 4 (unresolved): no tracking row and the source frame is NOT
+    /// cataloged — defer. No row is inserted and the artifact is never
+    /// registered, so a later scan (once the source lands) can still adopt.
+    #[test]
+    fn scan_defers_adoption_when_source_missing() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("M42/c_L_missing.fits");
+            write_calibrated_light(&cal, "", "L_missing.fits", "BDF");
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            // No source frame cataloged.
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: artifact never registered");
+            assert_eq!(light_cal_count(&conn), 0, "parallel={parallel}: adoption deferred, no row");
+            assert!(result.calibrated_duplicates.is_empty(), "parallel={parallel}");
+        }
     }
 }

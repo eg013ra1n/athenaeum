@@ -59,6 +59,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::BlackHoleEntry,
             crate::models::FolderSimilarity,
             crate::scanner::ScanProgressEvent,
+            crate::scanner::CalibratedDuplicate,
             crate::scanner::ScanCompleteEvent,
             crate::models::FileWithFrame,
             crate::models::FramesSet,

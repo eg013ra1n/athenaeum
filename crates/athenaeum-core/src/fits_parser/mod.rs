@@ -1,11 +1,13 @@
 // FITS/XISF metadata parser module
 
+pub mod calibrated_light;
 pub(crate) mod fits_header_reader;
 pub mod stored_header;
 
 use crate::models::{Frame, ImageType};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
+pub use calibrated_light::{calibrated_light_identity, CalibratedIdentity, MasterRef};
 pub use fits_header_reader::FitsHeader; // Task 14: reachable for round-trip tests (fits_header_reader itself stays pub(crate))
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
