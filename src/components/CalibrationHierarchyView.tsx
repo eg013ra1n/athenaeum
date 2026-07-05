@@ -13,6 +13,8 @@ import { CalibrationTableView } from './calibration/CalibrationTableView';
 import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibration/utils';
 import { CalibrationFinderButton } from './CalibrationFinderButton';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
+import { CreateMasterDialog } from './calibration/CreateMasterDialog';
+import { useMasterBuildContext } from '../contexts/MasterBuildContext';
 
 interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
@@ -75,6 +77,64 @@ export function CalibrationHierarchyView({
     setCheckedKeys(new Set());
     api.invoke('set_setting', { key: 'ui.tree_view_mode', value: mode }).catch(() => {});
   }, []);
+
+  // ── Create Master (Task 17) ────────────────────────────────────────────
+  // `data` (the raw hierarchy) already carries `is_master` / `superseded_by_set_id`
+  // on every `CalibrationSetDetail` nested inside each filter group's
+  // flat_sets/dark_sets/bias_sets (and, one level deeper, inside each of
+  // those sets' own `sub_calibration` links — this is where DarkFlat sets
+  // used to calibrate a flat live, since they're not exposed as their own
+  // top-level array). That means the raw id list can be computed directly
+  // from `data` without lifting anything out of CalibrationTableView's
+  // internal `deriveTableData` — cheaper than the `onRawSetsComputed`
+  // callback alternative sketched in the brief, and it avoids coupling this
+  // list to CalibrationTableView's tree-selection filtering (which would be
+  // wrong here anyway: "Create all masters" should cover the whole object,
+  // not just the currently checked tree nodes).
+  const rawCalSetIds = useMemo(() => {
+    const ids = new Set<number>();
+    const consider = (s: { id: number | null; is_master: boolean; superseded_by_set_id: number | null }) => {
+      if (s.id != null && !s.is_master && s.superseded_by_set_id == null) ids.add(s.id);
+    };
+    for (const dg of data.date_groups) {
+      for (const cg of dg.camera_groups) {
+        for (const fg of cg.filter_groups) {
+          for (const fs of fg.flat_sets) {
+            consider(fs.set);
+            for (const sc of fs.sub_calibration) consider(sc.set);
+          }
+          for (const ds of fg.dark_sets) {
+            consider(ds.set);
+            for (const sc of ds.sub_calibration) consider(sc.set);
+          }
+          for (const bs of fg.bias_sets) {
+            consider(bs.set);
+            for (const sc of bs.sub_calibration) consider(sc.set);
+          }
+        }
+      }
+    }
+    return [...ids];
+  }, [data]);
+
+  const { buildStates } = useMasterBuildContext();
+  const buildStatusBySet = useMemo(() => {
+    const m: Record<number, 'starting' | 'building' | 'done'> = {};
+    for (const [id, s] of buildStates) m[id] = s.phase;
+    return m;
+  }, [buildStates]);
+
+  // Hosts both single-row ([setId]) and batch (rawCalSetIds) Create Master flows.
+  const [batchDialogIds, setBatchDialogIds] = useState<number[] | null>(null);
+
+  // Builds complete asynchronously (possibly one-at-a-time within a batch);
+  // each completion fires 'library-updated' (useMasterBuilds). Refresh the
+  // hierarchy so tables re-derive with the new master + superseded raw set.
+  useEffect(() => {
+    const h = () => onRefresh?.();
+    window.addEventListener('library-updated', h);
+    return () => window.removeEventListener('library-updated', h);
+  }, [onRefresh]);
 
   // Build both tree structures
   const dateTree = useMemo(() => buildCameraFilterTree(data), [data]);
@@ -323,6 +383,14 @@ export function CalibrationHierarchyView({
                   <ScanSearch size={12} />
                   Re-assign
                 </button>
+                <button
+                  onClick={() => setBatchDialogIds(rawCalSetIds)}
+                  disabled={rawCalSetIds.length === 0}
+                  className="h-7 inline-flex items-center px-3 bg-surface-hover hover:brightness-110 text-content text-sm rounded disabled:opacity-50 transition-colors"
+                  title="Integrate every raw calibration set used by this object into masters"
+                >
+                  Create all masters ({rawCalSetIds.length})
+                </button>
               </div>
             )}
 
@@ -336,6 +404,8 @@ export function CalibrationHierarchyView({
               reassignMode={reassignMode}
               highlightCalSet={highlightCalSet}
               onHighlightConsumed={onHighlightConsumed}
+              onCreateMaster={(setId) => setBatchDialogIds([setId])}
+              buildStatusBySet={buildStatusBySet}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 
@@ -381,6 +451,14 @@ export function CalibrationHierarchyView({
         onClose={() => setManualModalOpen(false)}
         onRefresh={onRefresh}
       />
+
+      {/* Create Master dialog — single-set (row click) or batch (toolbar) */}
+      {batchDialogIds && batchDialogIds.length > 0 && (
+        <CreateMasterDialog
+          setIds={batchDialogIds}
+          onClose={() => setBatchDialogIds(null)}
+        />
+      )}
     </div>
   );
 }
