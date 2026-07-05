@@ -82,6 +82,9 @@ pub fn register_master(
     // should be calling the Task 13 rebuild path instead), not a silent
     // no-op — surfacing it here avoids creating a second master set for the
     // same raw frames.
+    // TODO: this pre-transaction SELECT is a benign TOCTOU window for
+    // concurrent same-set registrations; Task 12's per-set duplicate guard
+    // serializes this in practice.
     let already_superseded: Option<i64> = conn
         .query_row(
             "SELECT superseded_by_set_id FROM calibration_set WHERE id = ?1",
@@ -291,6 +294,27 @@ mod tests {
         light_id
     }
 
+    /// A Flat calibration set whose sub-calibration Dark link targets the
+    /// raw dark set (source_type='calibration_set') — the OTHER half of the
+    /// relink guarantee. Returns the flat set's id.
+    fn seed_subcal_link(conn: &Connection, raw_set_id: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set
+             (imagetyp, exptime, ccd_temp, gain, offset, binning, instrume, date,
+              date_start, date_end, temp_min, temp_max, frame_count)
+             VALUES ('Flat', 2.0, -10.0, 100.0, 50.0, '1x1', 'TestCam', '2026-06-28',
+              '2026-06-28T19:00:00Z', '2026-06-28T19:30:00Z', -10.2, -9.8, 5)",
+            [],
+        ).unwrap();
+        let flat_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, match_score, is_manual_override)
+             VALUES (?1, 'calibration_set', ?2, 'Dark', 0.8, 0)",
+            rusqlite::params![flat_set_id, raw_set_id]).unwrap();
+        flat_set_id
+    }
+
     fn write_master(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("master_dark.fits");
         let cards = HeaderBuilder::new(FrameKind::MasterDark)
@@ -307,6 +331,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let raw = seed_source_set(&conn, dir.path());
         let light = seed_light_link(&conn, raw);
+        let flat_set = seed_subcal_link(&conn, raw);
         let master_path = write_master(dir.path());
 
         let reg = register_master(&conn, raw, &master_path, r#"{"combine":"median"}"#).unwrap();
@@ -331,7 +356,20 @@ mod tests {
              WHERE source_id=?1 AND source_type='frame' AND calibration_type='Dark'",
             [light], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((set_id, manual), (reg.master_set_id, 1));
-        assert_eq!(reg.relinked_links, 1);
+
+        // relink also covers sub-calibration links: the flat set's Dark
+        // sub-cal (source_type='calibration_set') now points at the master
+        // too, with match_score / is_manual_override untouched.
+        let (sub_set_id, sub_score, sub_manual): (i64, f64, i64) = conn.query_row(
+            "SELECT calibration_set_id, match_score, is_manual_override FROM calibration_set_to_frames
+             WHERE source_id=?1 AND source_type='calibration_set' AND calibration_type='Dark'",
+            [flat_set], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(sub_set_id, reg.master_set_id, "sub-cal link must repoint to the master");
+        assert!((sub_score - 0.8).abs() < 1e-9, "sub-cal match_score must be preserved");
+        assert_eq!(sub_manual, 0, "sub-cal is_manual_override must be preserved");
+
+        // both link kinds were repointed by the single relink UPDATE
+        assert_eq!(reg.relinked_links, 2);
 
         // supersede + provenance
         let sup: Option<i64> = conn.query_row(
