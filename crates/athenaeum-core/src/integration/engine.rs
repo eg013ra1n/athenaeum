@@ -8,7 +8,10 @@ use super::IntegrationError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const BAND_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+// Shared band-memory budget (§4). `pub(crate)` so the light-calibration engine
+// (`calibration_library::light_cal`) sizes its bands with the same policy
+// instead of redefining the constant.
+pub(crate) const BAND_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct IntegrationOutput {
     pub width: usize,

@@ -20,9 +20,11 @@ use super::master_provenance;
 
 /// Bump when the calibration math changes — every existing row becomes
 /// [`LightCalStatus::Stale`] via the `engine_version` check in
-/// [`derive_status`]. Owned here for now (Task 3 may move/re-export it
-/// alongside the calibration engine itself).
-pub const LIGHT_CAL_ENGINE_VERSION: i64 = 1;
+/// [`derive_status`]. The single definition now lives with the calibration
+/// engine ([`crate::calibration_library::light_cal`]); re-exported here so
+/// this module's `derive_status` and callers keep referring to it by the same
+/// path.
+pub use crate::calibration_library::light_cal::LIGHT_CAL_ENGINE_VERSION;
 
 /// Column list shared by every read query, so `row_from_sql`'s index-based
 /// `row.get(N)` calls can't silently drift out of sync with the SELECT.

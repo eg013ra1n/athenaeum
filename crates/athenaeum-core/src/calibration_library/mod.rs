@@ -5,6 +5,7 @@
 //! relink, and supersede.
 
 pub mod headers;
+pub mod light_cal;
 pub mod light_headers;
 pub mod paths;
 pub mod register;
