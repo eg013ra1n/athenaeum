@@ -919,7 +919,28 @@ fn run_master_build_thread(
     // chains regardless of `recipe.archive_after`.
     let was_new_build = matches!(target, BuildTarget::New);
 
-    let result = run_build(&ctx, emitter.as_ref(), &app_version, set_id, &recipe, &cancel_flag, target);
+    // Wrap the fallible body so a panic inside `run_build` can never unwind past
+    // the handle removal / `master-build-complete` emission below (which would
+    // leak the `active_master_builds` handle — and, since fa6f7423, hang any
+    // light-calibration job that polls that map in `wait_for_preflight_builds`).
+    // A caught panic is folded into `BuildStepError::Other` so the SINGLE exit
+    // path (handle removal + error-outcome event) handles it identically to any
+    // other build failure. Mirrors `run_light_cal_thread`'s finally discipline.
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_build(&ctx, emitter.as_ref(), &app_version, set_id, &recipe, &cancel_flag, target)
+    })) {
+        Ok(r) => r,
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown".to_string());
+            let msg = format!("master build panicked: {detail}");
+            tracing::error!(set_id, error = %msg, "master build thread panicked");
+            Err(BuildStepError::Other(msg))
+        }
+    };
 
     // Task 14: archive_after chaining. Deliberately happens BEFORE the handle
     // removal / master-build-complete emission below, but its outcome is
