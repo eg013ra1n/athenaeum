@@ -167,8 +167,8 @@ pub fn calibrate_light(
     };
 
     tracing::debug!(
-        light = %inputs.light_path.display(),
-        output = %inputs.output_path.display(),
+        src = %inputs.light_path.display(),
+        dest = %inputs.output_path.display(),
         calstat = %calstat,
         flat_norm_divisor,
         width = w,
@@ -192,7 +192,7 @@ pub fn flat_norm_constant(
     scratch_dir: &Path,
 ) -> Result<f64, IntegrationError> {
     if let Some(n) = read_ath_fnrm(flat_path) {
-        tracing::debug!(flat = %flat_path.display(), ath_fnrm = n, "flat normalization from ATH_FNRM card");
+        tracing::debug!(path = %flat_path.display(), ath_fnrm = n, "flat normalization from ATH_FNRM card");
         return Ok(n);
     }
 
@@ -211,7 +211,7 @@ pub fn flat_norm_constant(
         y += rows;
     }
     let mean = central_third_mean(&data, w, h);
-    tracing::debug!(flat = %flat_path.display(), recomputed = mean, "flat normalization recomputed (ATH_FNRM absent)");
+    tracing::debug!(path = %flat_path.display(), recomputed = mean, "flat normalization recomputed (ATH_FNRM absent)");
     Ok(mean)
 }
 

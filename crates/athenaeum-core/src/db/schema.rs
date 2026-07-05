@@ -1339,9 +1339,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // §5). `frame_id` is nullable + UNIQUE: NULL only for an "adopted" row
     // whose source frame isn't cataloged yet, UNIQUE because a frame has at
     // most one tracked calibrated output. `dark_set_id`/`flat_set_id`/
-    // `bias_set_id` intentionally have no ON DELETE action (unlike
-    // `master_provenance.master_set_id`'s CASCADE) — deleting a calibration
-    // set must not silently delete calibrated-light history.
+    // `bias_set_id` are `ON DELETE SET NULL` (unlike
+    // `master_provenance.master_set_id`'s CASCADE): deleting a calibration set
+    // — including a master a calibrated light references — must NOT delete the
+    // calibrated-light history AND must NOT abort the delete with a
+    // FOREIGN KEY constraint failure (as a no-action FK would once any light is
+    // calibrated). A NULLed set id makes `derive_status` yield Partial/Stale,
+    // i.e. an honest "re-calibrate" prompt.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS light_calibrations (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1349,9 +1353,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             source_uuid       TEXT,
             source_filename   TEXT,
             output_path       TEXT NOT NULL UNIQUE,
-            dark_set_id       INTEGER REFERENCES calibration_set(id),
-            flat_set_id       INTEGER REFERENCES calibration_set(id),
-            bias_set_id       INTEGER REFERENCES calibration_set(id),
+            dark_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+            flat_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+            bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
             calstat           TEXT NOT NULL,
             flat_norm_applied INTEGER NOT NULL,
             output_hash       TEXT NOT NULL,
@@ -1368,6 +1372,90 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_light_cal_source_filename ON light_calibrations(source_filename)",
         [],
     )?;
+
+    // Guarded migration for dev DBs created before the `ON DELETE SET NULL`
+    // fix (v0.2.5 is unreleased, so only dev DBs can carry the old no-action
+    // FK). Detect via the pragma FK list: if any of the three set-id FKs
+    // reference calibration_set WITHOUT `SET NULL`, rebuild the table in place
+    // preserving rows (SQLite can't alter an FK action). Same FK-off / 12-step
+    // recipe the archive_operations rebuild below uses.
+    let light_cal_needs_rebuild = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_list('light_calibrations')")?;
+        // columns: 0 id, 1 seq, 2 table, 3 from, 4 to, 5 on_update, 6 on_delete, 7 match
+        let fks = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(3)?, r.get::<_, String>(6)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+        fks.iter().any(|(from, on_delete)| {
+            matches!(from.as_str(), "dark_set_id" | "flat_set_id" | "bias_set_id")
+                && on_delete != "SET NULL"
+        })
+    };
+    if light_cal_needs_rebuild {
+        // FK enforcement OFF around the rebuild (a no-op inside a transaction,
+        // so it must be issued OUTSIDE the BEGIN/COMMIT batch). light_calibrations
+        // is a leaf — no other table FK-references its id — so DROP TABLE fires
+        // no cascades and id preservation via the explicit-column INSERT
+        // (SQLite re-seeds sqlite_sequence from the max copied id) is safe.
+        conn.pragma_update(None, "foreign_keys", false)?;
+        let rebuild = conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE light_calibrations_new (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                frame_id          INTEGER UNIQUE REFERENCES frames(id) ON DELETE CASCADE,
+                source_uuid       TEXT,
+                source_filename   TEXT,
+                output_path       TEXT NOT NULL UNIQUE,
+                dark_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                flat_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                calstat           TEXT NOT NULL,
+                flat_norm_applied INTEGER NOT NULL,
+                output_hash       TEXT NOT NULL,
+                engine_version    INTEGER NOT NULL,
+                created_at        TEXT NOT NULL
+             );
+             INSERT INTO light_calibrations_new
+                (id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
+                 flat_set_id, bias_set_id, calstat, flat_norm_applied, output_hash,
+                 engine_version, created_at)
+                SELECT id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
+                       flat_set_id, bias_set_id, calstat, flat_norm_applied, output_hash,
+                       engine_version, created_at
+                FROM light_calibrations;
+             DROP TABLE light_calibrations;
+             ALTER TABLE light_calibrations_new RENAME TO light_calibrations;
+             COMMIT;",
+        );
+        // Re-enable FK enforcement whether or not the rebuild succeeded, then
+        // surface the rebuild error — never leave the connection unenforced.
+        let re_enable = conn.pragma_update(None, "foreign_keys", true);
+        rebuild?;
+        re_enable?;
+        // Step 10 of the recipe: verify the rebuild didn't orphan any row.
+        let violations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check('light_calibrations')",
+            [],
+            |r| r.get(0),
+        )?;
+        if violations > 0 {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some(format!(
+                    "light_calibrations rebuild broke foreign-key integrity: \
+                     {violations} violation(s)"
+                )),
+            ));
+        }
+        // Recreate the two indexes the DROP removed.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_light_cal_source_uuid ON light_calibrations(source_uuid)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_light_cal_source_filename ON light_calibrations(source_filename)",
+            [],
+        )?;
+    }
 
     // B2: prune empty `calibration_set` rows automatically. The
     // `calibration_set_frames` junction table CASCADE-deletes rows when

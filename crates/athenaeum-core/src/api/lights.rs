@@ -20,9 +20,10 @@
 //! unit-testable against a seeded in-memory connection (the `api/calibration.rs`
 //! inner-fn precedent); the public handler is a thin `ctx` → `conn` wrapper.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -760,10 +761,51 @@ fn frame_set_label(conn: &Connection, set_id: i64) -> String {
     .unwrap_or_else(|| format!("set {set_id}"))
 }
 
-/// The batch body: queue admission, then per-frame calibration. Returns
-/// `Ok(true)` if cancelled, `Ok(false)` if it ran to completion; `ok_count` and
-/// `failed` accumulate in place so the caller can emit the finished event even
-/// on an early return. A per-frame failure is collected, never fatal.
+/// Block the calling thread until none of `build_set_ids` remain registered in
+/// `active_master_builds` — i.e. every preflight master build has completed and
+/// removed its handle (`start_master_build` inserts the handle synchronously
+/// before spawn and removes it on completion) — or the cancel flag is set
+/// (returns `true`). This is the explicit handshake that orders the light job
+/// AFTER its preflight builds: it must run BEFORE `ComputeQueue::acquire`,
+/// because at `max_concurrent = 1` a still-running build holds the only slot and
+/// waiting while holding a permit would deadlock. No overall timeout is needed —
+/// builds always terminate and drop their handle; the poll only backstops.
+fn wait_for_preflight_builds<V>(
+    active_master_builds: &Mutex<HashMap<i64, V>>,
+    build_set_ids: &[i64],
+    cancel_flag: &AtomicBool,
+) -> bool {
+    if build_set_ids.is_empty() {
+        return false;
+    }
+    let mut announced = false;
+    loop {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return true;
+        }
+        let still_building = {
+            let active = active_master_builds.lock().unwrap();
+            build_set_ids.iter().any(|id| active.contains_key(id))
+        };
+        if !still_building {
+            return false;
+        }
+        if !announced {
+            tracing::debug!(
+                count = build_set_ids.len(),
+                "waiting for preflight master builds before light calibration"
+            );
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// The batch body: wait for preflight builds, queue admission, then per-frame
+/// calibration. Returns `Ok(true)` if cancelled, `Ok(false)` if it ran to
+/// completion; `ok_count` and `failed` accumulate in place so the caller can
+/// emit the finished event even on an early return. A per-frame failure is
+/// collected, never fatal.
 #[allow(clippy::too_many_arguments)]
 fn run_light_cal(
     ctx: &ServiceContext,
@@ -771,6 +813,7 @@ fn run_light_cal(
     set_id: i64,
     scope: LightCalScope,
     flat_norm: bool,
+    preflight_build_set_ids: &[i64],
     cancel_flag: &Arc<AtomicBool>,
     job_id_slot: &AtomicI64,
     ok_count: &mut usize,
@@ -785,9 +828,22 @@ fn run_light_cal(
         (members, label)
     };
 
-    // Admission (spec §6): any preflighted master builds were enqueued ahead of
-    // us, so at max_concurrent=1 they finish first. Cancelled-while-queued →
-    // treat the whole batch as cancelled.
+    // Explicit ordering handshake (spec §6): wait for every preflight master
+    // build to finish BEFORE we acquire a compute slot. At max_concurrent=1 the
+    // build holds the only slot, so this MUST precede `acquire` (waiting after
+    // would deadlock). This — not FIFO admission — is what guarantees masters
+    // build first; the supersede/relink they perform is then visible when each
+    // light re-resolves its links at calibration time.
+    if wait_for_preflight_builds(
+        &ctx.active_master_builds,
+        preflight_build_set_ids,
+        cancel_flag.as_ref(),
+    ) {
+        return Ok(true);
+    }
+
+    // Admission (spec §6): cancelled-while-queued → treat the whole batch as
+    // cancelled.
     let (_permit, job_id) = match ctx.compute_queue.acquire(
         ComputeJobKind::LightCalibration,
         &label,
@@ -861,6 +917,7 @@ fn run_light_cal_thread(
     set_id: i64,
     scope: LightCalScope,
     flat_norm: bool,
+    preflight_build_set_ids: Vec<i64>,
     cancel_flag: Arc<AtomicBool>,
     job_id_slot: Arc<AtomicI64>,
 ) {
@@ -874,6 +931,7 @@ fn run_light_cal_thread(
             set_id,
             scope,
             flat_norm,
+            &preflight_build_set_ids,
             &cancel_flag,
             &job_id_slot,
             &mut ok_count,
@@ -964,6 +1022,12 @@ pub fn start_light_calibration(
             return Err(e);
         }
     };
+    // The set ids whose preflight builds actually STARTED (handle registered in
+    // `active_master_builds`); the worker thread waits on exactly these before
+    // acquiring its compute slot. Skipped/unstarted sets are never in the map,
+    // so they'd be a no-op wait — but tracking the started set precisely keeps
+    // the handshake honest.
+    let mut preflight_build_set_ids: Vec<i64> = Vec::new();
     if !readiness.raw_set_ids_to_build.is_empty() {
         let recipe = MasterRecipe {
             combine: None,
@@ -978,6 +1042,7 @@ pub fn start_light_calibration(
             recipe,
         ) {
             Ok(report) => {
+                preflight_build_set_ids = report.started_set_ids.clone();
                 for skip in &report.skipped {
                     tracing::warn!(
                         set_id,
@@ -1006,6 +1071,7 @@ pub fn start_light_calibration(
                 set_id,
                 scope,
                 flat_norm,
+                preflight_build_set_ids,
                 cancel_flag,
                 job_id_slot,
             );
@@ -1382,6 +1448,7 @@ mod orchestration_tests {
             set_id,
             LightCalScope { only_stale },
             true,
+            Vec::new(), // no preflight builds in this direct-thread harness
             cancel_flag,
             job_id_slot,
         );
@@ -2286,5 +2353,64 @@ mod tests {
         assert_eq!(f4.dark, MASTER);
         assert_eq!(f4.flat, MISSING);
         assert!(f4.raw_set_ids.is_empty());
+    }
+
+    // ── F3: preflight-build handshake ───────────────────────────────────────
+
+    /// The wait returns (not cancelled) once the last build handle is removed
+    /// from the map — the ordering the handshake guarantees.
+    #[test]
+    fn wait_for_preflight_builds_returns_when_handles_clear() {
+        let active: Arc<Mutex<HashMap<i64, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut m = active.lock().unwrap();
+            m.insert(1, ());
+            m.insert(2, ());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let active2 = active.clone();
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            active2.lock().unwrap().remove(&1);
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            active2.lock().unwrap().remove(&2);
+        });
+
+        let start = std::time::Instant::now();
+        let cancelled = wait_for_preflight_builds(&active, &[1, 2], &cancel);
+        remover.join().unwrap();
+        assert!(!cancelled, "not cancelled — the builds completed");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(120),
+            "must wait until BOTH build handles are gone"
+        );
+        assert!(active.lock().unwrap().is_empty());
+    }
+
+    /// The cancel flag breaks the wait even while a build handle lingers.
+    #[test]
+    fn wait_for_preflight_builds_breaks_on_cancel() {
+        let active: Arc<Mutex<HashMap<i64, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        active.lock().unwrap().insert(7, ()); // never removed
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let cancel2 = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            cancel2.store(true, Ordering::SeqCst);
+        });
+
+        let cancelled = wait_for_preflight_builds(&active, &[7], &cancel);
+        canceller.join().unwrap();
+        assert!(cancelled, "cancel must break the wait even with a build handle still present");
+    }
+
+    /// No preflight builds → immediate no-op, never cancelled.
+    #[test]
+    fn wait_for_preflight_builds_empty_is_noop() {
+        let active: Arc<Mutex<HashMap<i64, ()>>> = Arc::new(Mutex::new(HashMap::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(!wait_for_preflight_builds(&active, &[], &cancel));
     }
 }

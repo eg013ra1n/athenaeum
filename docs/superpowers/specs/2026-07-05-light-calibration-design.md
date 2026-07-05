@@ -154,13 +154,19 @@ Composition of existing queues (approach B, owner-approved):
    as ordinary master-build jobs via the existing batch machinery
    (dependency-ordered, `start_master_builds_batch` path). The
    `LightCalibration` job is submitted immediately after.
-2. FIFO admission at `compute.max_concurrent = 1` (default) guarantees the
-   masters are built before the light job runs. At higher concurrency this
-   degrades gracefully, never wrongly: the job re-resolves every light's
-   links **at execution time** — Phase 2's supersede repoints links onto the
-   master automatically when a build lands — and calibrates with whatever is
-   ready, labeling honestly (§2 fallbacks). A `warn!` flags the weakened
-   ordering, mirroring the batch-build precedent.
+2. The light job's worker thread then runs an explicit
+   **wait-for-preflight-builds handshake**: it blocks until every preflight
+   build has completed and dropped its `active_master_builds` handle, and this
+   wait runs **before** the job acquires its compute slot (at
+   `compute.max_concurrent = 1` a still-running build holds the only slot, so
+   waiting after admission would deadlock). This handshake — **not** FIFO queue
+   admission — is what guarantees the masters are built before the light job
+   runs, at any `max_concurrent`. Independently, the job re-resolves every
+   light's links **at execution time** — Phase 2's supersede repoints links
+   onto the master automatically when a build lands — so it always calibrates
+   with whatever is ready, labeling honestly (§2 fallbacks); a preflight build
+   that was skipped/failed is `warn!`-logged and its lights calibrate
+   best-effort.
 3. The job itself follows the master-build execution pattern: runs on the
    caller's `spawn_blocking` thread, `ComputeQueue::acquire(LightCalibration)`
    for admission, cooperative cancellation between frames.
@@ -176,7 +182,7 @@ Per light frame:
 5. UPSERT the `light_calibrations` row; emit `calibration-progress`
    (frame index / total / filename).
 
-Batch end: `calibration-finished` event `{ operation_id, outcome, ok_count,
+Batch end: `calibration-finished` event `{ set_id, outcome, ok_count,
 failed: [{frame_id, reason}] }`; per-frame errors never abort the batch. A
 failed master build does not abort either — affected lights calibrate
 best-effort per policy.

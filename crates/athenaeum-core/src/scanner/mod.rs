@@ -664,14 +664,20 @@ fn reconcile_calibrated_light(
     calibrated_duplicates_out: &mut Vec<CalibratedDuplicate>,
 ) -> anyhow::Result<()> {
     use crate::db::light_calibrations::{
-        find_by_identity, update_output_path, upsert_light_calibration, LightCalRow,
+        find_by_identity_disambiguated, update_output_path, upsert_light_calibration, LightCalRow,
         LIGHT_CAL_ENGINE_VERSION,
     };
 
-    let existing = find_by_identity(
+    // Disambiguated identity match (§4): the filename fallback is narrowed by
+    // the copied-through OBJECT/DATE-OBS so a colliding filename can't repair
+    // (branch 2) or duplicate-flag (branch 3) against a row that belongs to a
+    // different source frame.
+    let existing = find_by_identity_disambiguated(
         conn,
         identity.source_uuid.as_deref(),
         identity.source_filename.as_deref(),
+        identity.source_object.as_deref(),
+        identity.source_date_obs.as_deref(),
     )?;
 
     if let Some(row) = existing {
@@ -834,6 +840,9 @@ fn resolve_calibrated_source_frame(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    // OBJECT/DATE-OBS predicates shared with the tracking-row identity match
+    // (`db::light_calibrations`) so both filename-fallback paths stay symmetric.
+    use crate::db::light_calibrations::{date_obs_matches, object_matches};
     let matched: Vec<i64> = candidates
         .into_iter()
         .filter(|(_, object, date_obs)| {
@@ -848,34 +857,6 @@ fn resolve_calibrated_source_frame(
         [id] => SourceResolution::Resolved(*id),
         many => SourceResolution::Ambiguous(many.len()),
     })
-}
-
-/// OBJECT disambiguation predicate. A `None` want (the calibrated file carried
-/// no OBJECT card) never filters; otherwise the candidate must carry the same
-/// trimmed OBJECT (a candidate with no OBJECT can't confidently match).
-fn object_matches(want: Option<&str>, got: Option<&str>) -> bool {
-    match want {
-        None => true,
-        Some(want) => got.map(|g| g.trim() == want.trim()).unwrap_or(false),
-    }
-}
-
-/// DATE-OBS disambiguation predicate, instant-aware. The header carries
-/// DATE-OBS verbatim (e.g. `2025-01-01T22:00:00`, no timezone) while
-/// `frames.date_obs` is stored re-serialized to RFC3339, so a byte compare
-/// would spuriously miss a genuine match. Parse both and compare the instant;
-/// fall back to trimmed string equality only if either side won't parse. A
-/// `None` want never filters.
-fn date_obs_matches(want: Option<&str>, got: Option<&str>) -> bool {
-    let Some(want) = want else { return true };
-    let Some(got) = got else { return false };
-    match (
-        crate::fits_parser::parse_date_obs(want.trim(), None),
-        crate::fits_parser::parse_date_obs(got.trim(), None),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => want.trim() == got.trim(),
-    }
 }
 
 /// Resolve a master reference (`"<uuid> <path>"`) to its calibration-set id —
@@ -3244,6 +3225,161 @@ mod calibrated_light_scan_tests {
             assert_eq!(dark_id, Some(dark_set), "parallel={parallel}: dark resolved by uuid");
             assert_eq!(flat_id, Some(flat_set), "parallel={parallel}: flat resolved by path fallback");
             assert_eq!(bias_id, None, "parallel={parallel}: unresolvable bias ref -> NULL");
+        }
+    }
+
+    /// Seed a cataloged source LIGHT frame (files + frames) carrying a specific
+    /// filename / OBJECT / DATE-OBS, for filename-collision tests.
+    fn seed_source_frame(conn: &Connection, frame_id: i64, filename: &str, object: &str, date_obs: &str) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2025-01-01T00:00:00Z', 'FITS')",
+            params![frame_id, format!("/src/{frame_id}/{filename}"), filename],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, date_obs) VALUES (?1, ?1, ?2, ?3)",
+            params![frame_id, object, date_obs],
+        )
+        .unwrap();
+    }
+
+    /// Seed a tracking row bound to a cataloged source frame (keyed on frame_id),
+    /// carrying a `source_filename` and `output_path`.
+    fn seed_tracking_row(conn: &Connection, frame_id: i64, source_filename: &str, output_path: &str) {
+        let row = LightCalRow {
+            id: 0,
+            frame_id: Some(frame_id),
+            source_uuid: None,
+            source_filename: Some(source_filename.to_string()),
+            output_path: output_path.to_string(),
+            dark_set_id: None,
+            flat_set_id: None,
+            bias_set_id: None,
+            calstat: "BD".to_string(),
+            flat_norm_applied: false,
+            output_hash: "seed".to_string(),
+            engine_version: LIGHT_CAL_ENGINE_VERSION,
+            created_at: "2026-07-05T00:00:00Z".to_string(),
+        };
+        upsert_light_calibration(conn, &row).unwrap();
+    }
+
+    /// F2 (branch 3): a tracking row for object M81 and a calibrated file for
+    /// object M42 share the filename `L_0001.fits`. Scanning the M42 file must
+    /// NOT branch-3-duplicate it against the M81 row (which the bare-filename
+    /// match did) — it belongs to a different source frame — but instead adopt a
+    /// fresh row for the true M42 owner.
+    #[test]
+    fn scan_no_cross_object_duplicate_on_filename_collision() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path(), 1);
+
+            // Two cataloged source frames collide on the filename.
+            seed_source_frame(&conn, 900, "L_0001.fits", "M42", "2025-01-01T22:00:00+00:00");
+            seed_source_frame(&conn, 901, "L_0001.fits", "M81", "2025-02-01T22:00:00+00:00");
+
+            // The M81 tracking row points at a file that STILL exists on disk
+            // (outside the scan root) — a bare-filename match would branch-3 it.
+            let kept_dir = TempDir::new().unwrap();
+            let kept_m81 = kept_dir.path().join("c_m81.fits");
+            write_calibrated_light(&kept_m81, "", "L_0001.fits", "BDF");
+            let kept_m81_str = kept_m81.to_str().unwrap().to_string();
+            seed_tracking_row(&conn, 901, "L_0001.fits", &kept_m81_str);
+
+            // The calibrated M42 file lands in the scan root (object/date = M42's).
+            let cal = root.path().join("M42/c_L_0001.fits");
+            write_calibrated_light_full(
+                &cal, "", "L_0001.fits", "BDF",
+                Some("M42"), Some("2025-01-01T22:00:00"), None, None, None,
+            );
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert!(
+                result.calibrated_duplicates.is_empty(),
+                "parallel={parallel}: must not cross-object duplicate against the M81 row"
+            );
+            // The M42 file was adopted for its true owner (frame 900).
+            let adopted: i64 = conn
+                .query_row(
+                    "SELECT frame_id FROM light_calibrations WHERE output_path = ?1",
+                    params![cal_str],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(adopted, 900, "parallel={parallel}: adopted the M42 owner");
+            // The M81 row is untouched.
+            let m81_path: String = conn
+                .query_row(
+                    "SELECT output_path FROM light_calibrations WHERE frame_id = 901",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(m81_path, kept_m81_str, "parallel={parallel}: M81 row unchanged");
+            assert_eq!(light_cal_count(&conn), 2, "parallel={parallel}: M81 row + adopted M42 row");
+        }
+    }
+
+    /// F2 (branch 2): two tracking rows share the filename `L_0001.fits` for
+    /// different objects — M42's output is gone from disk, M81's is present.
+    /// Scanning the M42 file must repair ONLY the M42 row (its true owner),
+    /// never the M81 row, and never emit a duplicate.
+    #[test]
+    fn scan_repairs_only_true_owner_on_filename_collision() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path(), 1);
+
+            seed_source_frame(&conn, 900, "L_0001.fits", "M42", "2025-01-01T22:00:00+00:00");
+            seed_source_frame(&conn, 901, "L_0001.fits", "M81", "2025-02-01T22:00:00+00:00");
+
+            // M42 row's output is GONE from disk (repair candidate)...
+            let gone_m42 = root.path().join("old/gone/c_m42.fits");
+            seed_tracking_row(&conn, 900, "L_0001.fits", gone_m42.to_str().unwrap());
+            // ...M81 row's output is PRESENT (must stay untouched).
+            let kept_dir = TempDir::new().unwrap();
+            let present_m81 = kept_dir.path().join("c_m81.fits");
+            write_calibrated_light(&present_m81, "", "L_0001.fits", "BDF");
+            let present_m81_str = present_m81.to_str().unwrap().to_string();
+            seed_tracking_row(&conn, 901, "L_0001.fits", &present_m81_str);
+
+            // The scanned M42 file carries M42's OBJECT/DATE-OBS.
+            let cal = root.path().join("M42/c_L_0001.fits");
+            write_calibrated_light_full(
+                &cal, "", "L_0001.fits", "BD",
+                Some("M42"), Some("2025-01-01T22:00:00"), None, None, None,
+            );
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert!(
+                result.calibrated_duplicates.is_empty(),
+                "parallel={parallel}: a same-owner move must not be a duplicate"
+            );
+            // M42 row repaired to the scanned file...
+            let m42_path: String = conn
+                .query_row(
+                    "SELECT output_path FROM light_calibrations WHERE frame_id = 900",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(m42_path, cal_str, "parallel={parallel}: M42 row repaired to new location");
+            // ...M81 row untouched.
+            let m81_path: String = conn
+                .query_row(
+                    "SELECT output_path FROM light_calibrations WHERE frame_id = 901",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(m81_path, present_m81_str, "parallel={parallel}: M81 row unchanged");
+            assert_eq!(light_cal_count(&conn), 2, "parallel={parallel}: repaired in place, no new row");
         }
     }
 }

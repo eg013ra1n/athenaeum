@@ -158,6 +158,13 @@ pub fn get_light_calibration_for_frame(
 /// Resolve a tracking row by identity when there is no cataloged `frame_id`
 /// yet (adoption / scanner-repair paths, design §4). Tries `source_uuid`
 /// first, then falls back to `source_filename`.
+///
+/// The bare-filename fallback is unsafe for the scanner's reconcile branches:
+/// astro filenames collide across nights/objects, so a lone `= ?1` can
+/// false-match a row that belongs to a *different* source frame. Non-scanner
+/// callers (and identity-only tests) still use this; the scanner uses
+/// [`find_by_identity_disambiguated`], which narrows the filename fallback with
+/// the source frame's OBJECT/DATE-OBS exactly like adoption does.
 pub fn find_by_identity(
     conn: &Connection,
     source_uuid: Option<&str>,
@@ -188,6 +195,118 @@ pub fn find_by_identity(
             .map_err(Into::into);
     }
     Ok(None)
+}
+
+/// Scanner-facing identity match, symmetric with the adoption policy
+/// ([`crate::scanner`]'s `resolve_calibrated_source_frame`): a non-empty
+/// `source_uuid` match wins uniquely; the `source_filename` fallback is
+/// disambiguated against each candidate row's SOURCE frame OBJECT/DATE-OBS
+/// (joined via `frame_id`) so a filename shared by two objects can't
+/// false-match. Exactly one surviving candidate → `Some`; zero → `None`;
+/// more than one → `None` with a `warn!` (defer, same as adoption). A
+/// candidate row with no `frame_id` (adopted-but-source-not-cataloged) has no
+/// OBJECT/DATE-OBS to compare, so it only survives when the caller carries no
+/// disambiguator to apply.
+pub fn find_by_identity_disambiguated(
+    conn: &Connection,
+    source_uuid: Option<&str>,
+    source_filename: Option<&str>,
+    source_object: Option<&str>,
+    source_date_obs: Option<&str>,
+) -> Result<Option<LightCalRow>> {
+    if let Some(uuid) = source_uuid.filter(|u| !u.is_empty()) {
+        let by_uuid = conn
+            .query_row(
+                &format!("SELECT {SELECT_COLS} FROM light_calibrations WHERE source_uuid = ?1"),
+                params![uuid],
+                row_from_sql,
+            )
+            .optional()?;
+        if by_uuid.is_some() {
+            return Ok(by_uuid);
+        }
+    }
+
+    let Some(filename) = source_filename else {
+        return Ok(None);
+    };
+
+    // Every tracking row sharing this filename, LEFT-joined to its source frame
+    // so a frameless (adopted-orphan) row surfaces NULL object/date_obs and is
+    // filtered out whenever the caller carries a disambiguator. Column indices
+    // 0..12 are the SELECT_COLS in order (read by `row_from_sql`); 13/14 are the
+    // joined frame's object/date_obs.
+    let prefixed = SELECT_COLS
+        .split(", ")
+        .map(|c| format!("lc.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {prefixed}, fr.object, fr.date_obs
+         FROM light_calibrations lc
+         LEFT JOIN frames fr ON fr.id = lc.frame_id
+         WHERE lc.source_filename = ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let candidates = stmt
+        .query_map(params![filename], |row| {
+            let lc = row_from_sql(row)?;
+            let object: Option<String> = row.get(13)?;
+            let date_obs: Option<String> = row.get(14)?;
+            Ok((lc, object, date_obs))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let matched: Vec<LightCalRow> = candidates
+        .into_iter()
+        .filter(|(_, object, date_obs)| {
+            object_matches(source_object, object.as_deref())
+                && date_obs_matches(source_date_obs, date_obs.as_deref())
+        })
+        .map(|(lc, _, _)| lc)
+        .collect();
+
+    match matched.len() {
+        0 => Ok(None),
+        1 => Ok(matched.into_iter().next()),
+        n => {
+            tracing::warn!(
+                count = n,
+                filename,
+                "ambiguous calibrated-light identity by filename — deferring reconcile"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// OBJECT disambiguation predicate (shared with the scanner's source-frame
+/// resolution so the two identity paths stay symmetric). A `None` want never
+/// filters; otherwise the candidate must carry the same trimmed OBJECT (a
+/// candidate with no OBJECT can't confidently match).
+pub(crate) fn object_matches(want: Option<&str>, got: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(want) => got.map(|g| g.trim() == want.trim()).unwrap_or(false),
+    }
+}
+
+/// DATE-OBS disambiguation predicate, instant-aware (shared with the scanner).
+/// The calibrated header carries DATE-OBS verbatim (e.g.
+/// `2025-01-01T22:00:00`, no timezone) while `frames.date_obs` is stored
+/// re-serialized to RFC3339, so a byte compare would spuriously miss a genuine
+/// match. Parse both and compare the instant; fall back to trimmed string
+/// equality only if either side won't parse. A `None` want never filters.
+pub(crate) fn date_obs_matches(want: Option<&str>, got: Option<&str>) -> bool {
+    let Some(want) = want else { return true };
+    let Some(got) = got else { return false };
+    match (
+        crate::fits_parser::parse_date_obs(want.trim(), None),
+        crate::fits_parser::parse_date_obs(got.trim(), None),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => want.trim() == got.trim(),
+    }
 }
 
 /// Repoint a row's `output_path` after the underlying file moved on disk
@@ -647,5 +766,180 @@ mod tests {
             LightCalStatus::Calibrated,
             "same flat frame matches when the caller does not want normalization"
         );
+    }
+
+    /// Seed a `frames` (+ backing `files`) row carrying OBJECT/DATE-OBS so the
+    /// disambiguated identity match has something to join against.
+    fn seed_frame_obj(conn: &Connection, frame_id: i64, filename: &str, object: &str, date_obs: &str) {
+        let file_id = frame_id + 2_000_000;
+        conn.execute(
+            "INSERT OR IGNORE INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2025-01-01T00:00:00Z', 'FITS')",
+            params![file_id, format!("/src/{frame_id}/{filename}"), filename],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, object, date_obs) VALUES (?1, ?2, ?3, ?4)",
+            params![frame_id, file_id, object, date_obs],
+        )
+        .unwrap();
+    }
+
+    /// `on_delete` action reported by the pragma for a given FK `from` column.
+    fn fk_on_delete(conn: &Connection, from_col: &str) -> String {
+        let mut stmt = conn
+            .prepare("PRAGMA foreign_key_list('light_calibrations')")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(3)?, r.get::<_, String>(6)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.into_iter()
+            .find(|(from, _)| from == from_col)
+            .map(|(_, od)| od)
+            .unwrap_or_default()
+    }
+
+    /// F2: the disambiguated identity match narrows a shared `source_filename`
+    /// by the SOURCE frame's OBJECT/DATE-OBS, and defers (None) on a genuine tie.
+    #[test]
+    fn find_by_identity_disambiguated_narrows_filename() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Two source frames share the filename but belong to different objects.
+        seed_frame_obj(&conn, 900, "L_0001.fits", "M42", "2025-01-01T22:00:00+00:00");
+        seed_frame_obj(&conn, 901, "L_0001.fits", "M81", "2025-02-01T22:00:00+00:00");
+
+        let mut a = base_row(Some(900), "/lib/m42/c_a.fits");
+        a.source_filename = Some("L_0001.fits".to_string());
+        upsert_light_calibration(&conn, &a).unwrap();
+        let mut b = base_row(Some(901), "/lib/m81/c_b.fits");
+        b.source_filename = Some("L_0001.fits".to_string());
+        upsert_light_calibration(&conn, &b).unwrap();
+
+        // DATE-OBS carried verbatim (no tz) vs stored RFC3339 — instant compare.
+        let m42 = find_by_identity_disambiguated(
+            &conn,
+            None,
+            Some("L_0001.fits"),
+            Some("M42"),
+            Some("2025-01-01T22:00:00"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m42.output_path, "/lib/m42/c_a.fits");
+
+        let m81 = find_by_identity_disambiguated(
+            &conn,
+            None,
+            Some("L_0001.fits"),
+            Some("M81"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m81.output_path, "/lib/m81/c_b.fits");
+
+        // No disambiguator + two candidates → defer (None), never arbitrary.
+        assert!(find_by_identity_disambiguated(&conn, None, Some("L_0001.fits"), None, None)
+            .unwrap()
+            .is_none());
+        // OBJECT that matches neither candidate → None.
+        assert!(find_by_identity_disambiguated(
+            &conn,
+            None,
+            Some("L_0001.fits"),
+            Some("NGC7000"),
+            None
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// F1(a): deleting a master `calibration_set` referenced by a tracking row
+    /// must succeed (no FK abort) and NULL the referencing column, preserving
+    /// the row.
+    #[test]
+    fn deleting_referenced_calibration_set_nulls_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_frame(&conn, 1);
+        seed_calibration_set(&conn, 10, "MasterDark");
+
+        let mut row = base_row(Some(1), "/lib/1.fits");
+        row.dark_set_id = Some(10);
+        upsert_light_calibration(&conn, &row).unwrap();
+
+        // With the pre-fix no-action FK this DELETE aborted with FOREIGN KEY
+        // constraint failed; ON DELETE SET NULL makes it succeed.
+        conn.execute("DELETE FROM calibration_set WHERE id = 10", []).unwrap();
+
+        let got = get_light_calibration_for_frame(&conn, 1).unwrap().unwrap();
+        assert_eq!(got.dark_set_id, None, "referencing column nulled on set delete");
+        assert_eq!(got.output_path, "/lib/1.fits", "tracking row survives");
+    }
+
+    /// F1(b): a dev DB whose `light_calibrations` predates the fix (no-action
+    /// FK) is rebuilt in place by `init_db` — the three set-id FKs become
+    /// `SET NULL` and pre-existing rows survive the rebuild.
+    #[test]
+    fn init_db_migrates_no_action_fk_to_set_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate the pre-fix table: drop the correct one and recreate it with
+        // the OLD no-action FK DDL (light_calibrations is a leaf, so DROP is
+        // safe under FK enforcement).
+        conn.execute_batch(
+            "DROP TABLE light_calibrations;
+             CREATE TABLE light_calibrations (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                frame_id          INTEGER UNIQUE REFERENCES frames(id) ON DELETE CASCADE,
+                source_uuid       TEXT,
+                source_filename   TEXT,
+                output_path       TEXT NOT NULL UNIQUE,
+                dark_set_id       INTEGER REFERENCES calibration_set(id),
+                flat_set_id       INTEGER REFERENCES calibration_set(id),
+                bias_set_id       INTEGER REFERENCES calibration_set(id),
+                calstat           TEXT NOT NULL,
+                flat_norm_applied INTEGER NOT NULL,
+                output_hash       TEXT NOT NULL,
+                engine_version    INTEGER NOT NULL,
+                created_at        TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+
+        seed_frame(&conn, 1);
+        // Master set (is_master_library=1) so the calibration_set startup sweep
+        // in the second init_db won't garbage-collect this empty set.
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (10, 'MasterDark', '2025-01-01', 1)",
+            [],
+        )
+        .unwrap();
+        let mut row = base_row(Some(1), "/lib/mig.fits");
+        row.dark_set_id = Some(10);
+        upsert_light_calibration(&conn, &row).unwrap();
+
+        assert_ne!(fk_on_delete(&conn, "dark_set_id"), "SET NULL", "precondition: old no-action FK");
+
+        // Re-run init_db: detects the stale FK and rebuilds in place.
+        init_db(&conn).unwrap();
+
+        for col in ["dark_set_id", "flat_set_id", "bias_set_id"] {
+            assert_eq!(fk_on_delete(&conn, col), "SET NULL", "{col} migrated to SET NULL");
+        }
+        let got = get_light_calibration_for_frame(&conn, 1).unwrap().unwrap();
+        assert_eq!(got.dark_set_id, Some(10), "row survived the rebuild");
+        assert_eq!(got.output_path, "/lib/mig.fits");
+
+        // And a set delete now nulls instead of aborting.
+        conn.execute("DELETE FROM calibration_set WHERE id = 10", []).unwrap();
+        let after = get_light_calibration_for_frame(&conn, 1).unwrap().unwrap();
+        assert_eq!(after.dark_set_id, None);
     }
 }
