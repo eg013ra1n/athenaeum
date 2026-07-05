@@ -8,6 +8,8 @@ import { ExportProgressProvider } from '../contexts/ExportProgressContext';
 import { ExportProgressIndicator } from './ExportProgressIndicator';
 import { AnalysisProgressProvider } from '../contexts/AnalysisProgressContext';
 import { AnalysisQueueIndicator } from './AnalysisQueueIndicator';
+import { MasterBuildProvider } from '../contexts/MasterBuildContext';
+import { ComputeQueueIndicator } from './ComputeQueueIndicator';
 import { PlateSolveProgressProvider } from '../contexts/PlateSolveProgressContext';
 import { PlateSolveQueueIndicator } from './PlateSolveQueueIndicator';
 import { RegistrationProgressProvider } from '../contexts/RegistrationProgressContext';
@@ -47,6 +49,7 @@ export default function Layout() {
         <AnalysisProgressProvider>
         <PlateSolveProgressProvider>
         <RegistrationProgressProvider>
+        <MasterBuildProvider>
         <div className="flex h-screen bg-surface text-content">
           {/* Sidebar Navigation */}
           <aside
@@ -83,6 +86,7 @@ export default function Layout() {
             </nav>
 
             <AnalysisQueueIndicator collapsed={collapsed} />
+            <ComputeQueueIndicator collapsed={collapsed} />
             <PlateSolveQueueIndicator collapsed={collapsed} />
             <RegistrationQueueIndicator collapsed={collapsed} />
             <NotificationBell collapsed={collapsed} />
@@ -116,6 +120,7 @@ export default function Layout() {
           <NotificationPanel />
           <AutoUpdateCheck />
         </div>
+        </MasterBuildProvider>
         </RegistrationProgressProvider>
         </PlateSolveProgressProvider>
         </AnalysisProgressProvider>

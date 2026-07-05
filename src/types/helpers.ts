@@ -346,6 +346,33 @@ export interface AnalysisCompleteEvent {
   cancelled: boolean;
 }
 
+/** Progress event emitted during a master build (`master-build-progress`).
+ *  `stage` documents the full backend contract including `'reading'`
+ *  (reserved for future use — member-path enumeration is cheap enough today
+ *  not to need its own tick, so the backend never actually emits it; see
+ *  `athenaeum-core/src/api/masters.rs`'s `MasterBuildProgressEvent` doc
+ *  comment). Consumers must not assume every listed stage will arrive. */
+export interface MasterBuildProgressEvent {
+  set_id: number;
+  stage: 'reading' | 'integrating' | 'writing' | 'registering';
+  current: number;
+  total: number;
+  percent: number;
+}
+
+/** Completion event for a master build (`master-build-complete`). ALWAYS
+ *  emitted exactly once per `start_master_build` call regardless of outcome
+ *  (success, error, cancelled). `set_id` is the SOURCE calibration set id,
+ *  not `master_set_id` — see the Rust doc comment for why (rebuild keys off
+ *  the same source set). */
+export interface MasterBuildCompleteEvent {
+  set_id: number;
+  master_set_id: number | null;
+  success: boolean;
+  cancelled: boolean;
+  error: string | null;
+}
+
 /** Registration status for a single frame. Note: the generated
  *  `RegistrationRecord.status` / `StackingPrepProgressEvent.status` fields
  *  are plain `string` (Rust field type is `String`, not an enum), so this

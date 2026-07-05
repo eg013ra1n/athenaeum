@@ -44,6 +44,7 @@ export type NotificationKind =
   | 'archive'
   | 'fileop'
   | 'registration'
+  | 'masterbuild'
   | 'generic';
 
 /** Short-lived toast shown bottom-right. */
