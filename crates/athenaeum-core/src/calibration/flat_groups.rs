@@ -566,6 +566,7 @@ fn check_for_existing_flat_set(
         "SELECT cs.id
          FROM calibration_set cs
          WHERE cs.imagetyp = 'Flat'
+           AND cs.superseded_by_set_id IS NULL
            AND cs.date_start IS NOT NULL
            AND cs.date_end IS NOT NULL
            AND cs.date_start <= ?1

@@ -703,6 +703,7 @@ fn create_dark_calibration_set_with_type(
         let mut query = String::from(
             "SELECT id FROM calibration_set
              WHERE imagetyp = ?1
+             AND superseded_by_set_id IS NULL
              AND date_start IS NOT NULL AND date_end IS NOT NULL
              AND date_start <= ?2 AND date_end >= ?3"
         );

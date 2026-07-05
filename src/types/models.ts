@@ -84,8 +84,6 @@ export type CalibrationSetDetail = { id: number | null, imagetyp: ImageType, exp
  */
 superseded_by_set_id: number | null, };
 
-export type DarkLibraryResult = { sets_created: number, frames_grouped: number, frames_excluded: number, };
-
 export type RelinkResult = { files_matched: number, files_new: number, files_orphaned: number, orphaned_file_ids: Array<number>, };
 
 export type OrphanedFile = { id: number, path: string, filename: string, size: number, modified_at: string, has_frame: boolean, object: string | null, date_obs: string | null, };

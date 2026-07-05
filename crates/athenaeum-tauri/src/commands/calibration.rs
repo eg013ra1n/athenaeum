@@ -33,12 +33,6 @@ pub async fn has_dark_library(state: State<'_, AppState>, instrume: String) -> R
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn create_master_dark_library(state: State<'_, AppState>, instrume: String) -> Result<DarkLibraryResult, String> {
-    api::create_master_dark_library(&state.ctx, instrume).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
 pub async fn get_master_dark_library(state: State<'_, AppState>, instrume: String) -> Result<Vec<CalibrationSetDetail>, String> {
     api::get_master_dark_library(&state.ctx, instrume).map_err(|e| e.to_string())
 }
@@ -47,12 +41,6 @@ pub async fn get_master_dark_library(state: State<'_, AppState>, instrume: Strin
 #[tracing::instrument(skip_all, err)]
 pub async fn has_master_dark_library(state: State<'_, AppState>, instrume: String) -> Result<bool, String> {
     api::has_master_dark_library(&state.ctx, instrume).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn create_master_flat_library(state: State<'_, AppState>, instrume: String) -> Result<DarkLibraryResult, String> {
-    api::create_master_flat_library(&state.ctx, instrume).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

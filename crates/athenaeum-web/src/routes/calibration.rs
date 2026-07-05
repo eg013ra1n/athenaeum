@@ -94,17 +94,6 @@ pub async fn has_dark_library(
 
 // ── Master dark library ───────────────────────────────────────────────────────
 
-/// POST /api/create_master_dark_library
-///
-/// Build calibration sets from master dark frames for a camera.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn create_master_dark_library(
-    State(state): State<WebAppState>,
-    Json(args): Json<InstrumeArgs>,
-) -> Result<Json<athenaeum_core::models::DarkLibraryResult>, (StatusCode, String)> {
-    api::create_master_dark_library(&state.ctx, args.instrume).map(Json).map_err(api_err)
-}
-
 /// POST /api/get_master_dark_library
 ///
 /// Retrieve master dark calibration sets for a camera.
@@ -128,17 +117,6 @@ pub async fn has_master_dark_library(
 }
 
 // ── Master flat library ───────────────────────────────────────────────────────
-
-/// POST /api/create_master_flat_library
-///
-/// Build calibration sets from master flat frames for a camera.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn create_master_flat_library(
-    State(state): State<WebAppState>,
-    Json(args): Json<InstrumeArgs>,
-) -> Result<Json<athenaeum_core::models::DarkLibraryResult>, (StatusCode, String)> {
-    api::create_master_flat_library(&state.ctx, args.instrume).map(Json).map_err(api_err)
-}
 
 /// POST /api/get_master_flat_library
 ///

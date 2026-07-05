@@ -130,37 +130,6 @@ pub fn get_camera_dark_library(
     Ok(sets)
 }
 
-/// Delete Dark/Bias/DarkFlat calibration sets for a camera (preserves Flat sets)
-pub fn delete_camera_dark_library(conn: &Connection, instrume: &str) -> Result<()> {
-    // First, get all Dark/Bias/DarkFlat set IDs for this camera (NOT Flat sets!)
-    let mut stmt = conn.prepare(
-        "SELECT id FROM calibration_set
-         WHERE instrume = ?1 AND is_master_library = 0
-         AND UPPER(imagetyp) IN ('DARK', 'BIAS', 'DARKFLAT')"
-    )?;
-    let set_ids: Vec<i64> = stmt
-        .query_map([instrume], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Delete all calibration_set_frames entries for these sets
-    for set_id in &set_ids {
-        conn.execute(
-            "DELETE FROM calibration_set_frames WHERE set_id = ?1",
-            [set_id],
-        )?;
-    }
-
-    // Delete only Dark/Bias/DarkFlat calibration_set entries (preserves Flat sets)
-    conn.execute(
-        "DELETE FROM calibration_set
-         WHERE instrume = ?1 AND is_master_library = 0
-         AND UPPER(imagetyp) IN ('DARK', 'BIAS', 'DARKFLAT')",
-        [instrume]
-    )?;
-
-    Ok(())
-}
-
 /// Check if dark library exists for camera
 pub fn has_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0")?;

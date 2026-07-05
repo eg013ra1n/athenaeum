@@ -15,14 +15,18 @@ import type {
   ParameterConfig,
 } from "../../types/calibration-config";
 import { MasterPreferenceValues } from "../../types/helpers";
+import type { CameraStats } from "../../types/models";
+import { useNotifications } from "../../contexts/NotificationContext";
 import MatchingMatrixTable from "./MatchingMatrixTable";
 import BehavioralOptionsPanel from "./BehavioralOptionsPanel";
 import ClusteringParametersPanel from "./ClusteringParametersPanel";
 
 export default function CalibrationMatchingConfig() {
+  const { notify } = useNotifications();
   const [config, setConfig] = useState<ConfigType | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [refreshingAll, setRefreshingAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
 
@@ -74,6 +78,38 @@ export default function CalibrationMatchingConfig() {
       console.error("Failed to save calibration config:", err);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleRefreshAllCameras = async () => {
+    try {
+      setRefreshingAll(true);
+      const cameras = await api.invoke<CameraStats[]>("get_equipment_cameras");
+      let newSets = 0;
+      for (const cam of cameras) {
+        const result = await api.invoke<{ sets_created: number }>(
+          "refresh_calibration_library_for_camera",
+          { instrume: cam.instrume },
+        );
+        newSets += result.sets_created;
+      }
+      notify({
+        title: `Calibration sets refreshed — ${cameras.length} camera${cameras.length === 1 ? "" : "s"}`,
+        detail: newSets > 0 ? `${newSets} new sets after re-clustering` : "No regrouping needed",
+        kind: "generic",
+        tone: "success",
+      });
+    } catch (err) {
+      console.error("[CalibrationMatchingConfig] refresh all cameras failed:", err);
+      notify({
+        title: "Calibration refresh failed",
+        detail: String(err),
+        kind: "generic",
+        tone: "warning",
+        hasErrors: true,
+      });
+    } finally {
+      setRefreshingAll(false);
     }
   };
 
@@ -400,6 +436,23 @@ export default function CalibrationMatchingConfig() {
               onClusteringUpdate={updateClusteringConfig}
               onScoringUpdate={updateScoringConfig}
             />
+            <div className="mt-4 pt-4 border-t border-border flex items-center justify-between gap-4">
+              <p className="text-xs text-content-muted">
+                Clustering changes apply to newly scanned frames. To regroup the
+                already-cataloged calibration frames with these settings, save
+                first, then refresh all cameras. Masters and superseded sets are
+                left untouched.
+              </p>
+              <button
+                onClick={handleRefreshAllCameras}
+                disabled={refreshingAll || saving}
+                title="Re-cluster the existing calibration sets of every camera using the saved clustering settings"
+                className="flex items-center gap-2 shrink-0 rounded-lg border border-border bg-surface-hover px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <RefreshCw size={14} className={refreshingAll ? "animate-spin" : ""} />
+                {refreshingAll ? "Refreshing…" : "Refresh All Calibration Sets"}
+              </button>
+            </div>
           </div>
         )}
       </div>

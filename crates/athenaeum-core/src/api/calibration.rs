@@ -25,7 +25,7 @@ use crate::calibration::CalibrationMatchingConfig;
 use crate::models::{
     CalibrationHierarchyView, CalibrationLink, CalibrationMetadataEdits, CalibrationSetConsumer,
     CalibrationSetDetail, CalibrationSetParameters, CalibrationSetWithScore, CalibrationTolerance,
-    CameraStats, DarkLibraryResult, FileWithFrame, LightFrameParameters,
+    CameraStats, FileWithFrame, LightFrameParameters,
 };
 use crate::services::ServiceContext;
 
@@ -51,16 +51,6 @@ pub fn has_dark_library(ctx: &ServiceContext, instrume: String) -> Result<bool, 
     Ok(crate::db::has_dark_library(&conn, &instrume)?)
 }
 
-pub fn create_master_dark_library(ctx: &ServiceContext, instrume: String) -> Result<DarkLibraryResult, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-
-    let date_threshold = ctx.settings.get_dark_library_date_threshold(&conn)?;
-    let temp_threshold = ctx.settings.get_dark_library_temp_threshold(&conn)?;
-
-    Ok(crate::calibration::create_master_dark_library(&conn, &instrume, date_threshold, temp_threshold)?)
-}
-
 pub fn get_master_dark_library(ctx: &ServiceContext, instrume: String) -> Result<Vec<CalibrationSetDetail>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
@@ -71,16 +61,6 @@ pub fn has_master_dark_library(ctx: &ServiceContext, instrume: String) -> Result
     let db = db(ctx)?;
     let conn = db.conn();
     Ok(crate::db::has_master_dark_library(&conn, &instrume)?)
-}
-
-pub fn create_master_flat_library(ctx: &ServiceContext, instrume: String) -> Result<DarkLibraryResult, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-
-    let date_threshold = ctx.settings.get_dark_library_date_threshold(&conn)?;
-    let temp_threshold = ctx.settings.get_dark_library_temp_threshold(&conn)?;
-
-    Ok(crate::calibration::create_master_flat_library(&conn, &instrume, date_threshold, temp_threshold)?)
 }
 
 pub fn get_master_flat_library(ctx: &ServiceContext, instrume: String) -> Result<Vec<CalibrationSetDetail>, ApiError> {
@@ -583,34 +563,56 @@ fn most_common_f64(values: &[Option<f64>]) -> Option<f64> {
 /// 3. Reclusters and assigns frames to sets - sets are matched by params + date overlap
 /// 4. Deletes orphaned sets (sets with 0 frames after reclustering)
 ///
-/// Desktop pre-conversion split this into a `pub(crate) fn
-/// refresh_calibration_library_inner(conn, instrume)` so a second, still
-/// hypothetical Tauri command (`reclassify_excluded_frames`, mentioned in the
-/// old doc comment but not implemented anywhere in the crate) could reuse it
-/// without going through IPC. `grep`'d the whole workspace — there is no
-/// second caller today, so the `ctx`-based signature used everywhere else in
-/// this module supersedes the old conn-taking split; any future in-process
-/// caller with a `&ServiceContext` can call this directly, same as before.
+/// Superseded raw sets (Phase 2: a master was built from them) are frozen
+/// provenance history — every step skips them and their member frames.
+///
+/// Split into a conn-taking `refresh_calibration_library_inner` so the
+/// superseded-set / trigger-suspension semantics can be pinned by unit tests
+/// without constructing a full `ServiceContext`.
 pub fn refresh_calibration_library_for_camera(ctx: &ServiceContext, instrume: String) -> Result<CalibrationScanResult, ApiError> {
     let db = db(ctx)?;
-    let conn = db.conn();
+    let mut conn = db.conn();
+    refresh_calibration_library_inner(&mut conn, &instrume)
+}
 
+pub(crate) fn refresh_calibration_library_inner(
+    conn: &mut rusqlite::Connection,
+    instrume: &str,
+) -> Result<CalibrationScanResult, ApiError> {
     tracing::info!(instrume, "refreshing calibration library");
 
-    // Step 1: Clear frame memberships for this camera's sets (but keep the sets)
-    conn.execute(
+    let tx = conn
+        .transaction()
+        .map_err(|e| ApiError::Internal(format!("Failed to begin refresh transaction: {}", e)))?;
+
+    // Suspend the empty-prune trigger for the clear + recluster window: Step 1
+    // empties every live set BY DESIGN, and the trigger would delete the
+    // emptied rows — destroying the set-ID stability this command exists to
+    // provide and CASCADE-wiping every consumer link (including manual
+    // overrides). The DROP is transaction-local: any early return rolls back
+    // to the intact trigger, and the happy path re-creates the identical
+    // definition before COMMIT.
+    tx.execute("DROP TRIGGER IF EXISTS calibration_set_empty_prune", [])
+        .map_err(|e| ApiError::Internal(format!("Failed to suspend empty-prune trigger: {}", e)))?;
+
+    // Step 1: Clear frame memberships for this camera's live sets (keep the
+    // sets themselves; superseded sets keep their memberships too).
+    tx.execute(
         "DELETE FROM calibration_set_frames
          WHERE set_id IN (
-             SELECT id FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0
+             SELECT id FROM calibration_set
+              WHERE instrume = ?1 AND is_master_library = 0
+                AND superseded_by_set_id IS NULL
          )",
         rusqlite::params![instrume],
     )
     .map_err(|e| ApiError::Internal(format!("Failed to clear frame memberships: {}", e)))?;
 
     // Reset frame counts to 0 for these sets
-    conn.execute(
+    tx.execute(
         "UPDATE calibration_set SET frame_count = 0
-         WHERE instrume = ?1 AND is_master_library = 0",
+         WHERE instrume = ?1 AND is_master_library = 0
+           AND superseded_by_set_id IS NULL",
         rusqlite::params![instrume],
     )
     .map_err(|e| ApiError::Internal(format!("Failed to reset frame counts: {}", e)))?;
@@ -618,23 +620,23 @@ pub fn refresh_calibration_library_for_camera(ctx: &ServiceContext, instrume: St
     tracing::debug!(instrume, "cleared existing frame memberships (sets preserved for ID stability)");
 
     // Step 2: Query all calibration frame IDs for this camera
-    let flat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "FLAT")
+    let flat_frame_ids = query_frame_ids_by_type(&tx, instrume, "FLAT")
         .map_err(|e| ApiError::Internal(format!("Failed to query flat frames: {}", e)))?;
-    let dark_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARK")
+    let dark_frame_ids = query_frame_ids_by_type(&tx, instrume, "DARK")
         .map_err(|e| ApiError::Internal(format!("Failed to query dark frames: {}", e)))?;
-    let bias_frame_ids = query_frame_ids_by_type(&conn, &instrume, "BIAS")
+    let bias_frame_ids = query_frame_ids_by_type(&tx, instrume, "BIAS")
         .map_err(|e| ApiError::Internal(format!("Failed to query bias frames: {}", e)))?;
-    let darkflat_frame_ids = query_frame_ids_by_type(&conn, &instrume, "DARKFLAT")
+    let darkflat_frame_ids = query_frame_ids_by_type(&tx, instrume, "DARKFLAT")
         .map_err(|e| ApiError::Internal(format!("Failed to query darkflat frames: {}", e)))?;
 
     // Query master frame IDs
-    let master_dark_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARK")
+    let master_dark_ids = query_frame_ids_by_type(&tx, instrume, "MASTERDARK")
         .map_err(|e| ApiError::Internal(format!("Failed to query master dark frames: {}", e)))?;
-    let master_flat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERFLAT")
+    let master_flat_ids = query_frame_ids_by_type(&tx, instrume, "MASTERFLAT")
         .map_err(|e| ApiError::Internal(format!("Failed to query master flat frames: {}", e)))?;
-    let master_bias_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERBIAS")
+    let master_bias_ids = query_frame_ids_by_type(&tx, instrume, "MASTERBIAS")
         .map_err(|e| ApiError::Internal(format!("Failed to query master bias frames: {}", e)))?;
-    let master_darkflat_ids = query_frame_ids_by_type(&conn, &instrume, "MASTERDARKFLAT")
+    let master_darkflat_ids = query_frame_ids_by_type(&tx, instrume, "MASTERDARKFLAT")
         .map_err(|e| ApiError::Internal(format!("Failed to query master darkflat frames: {}", e)))?;
 
     let master_frame_ids = MasterFrameIds { master_dark_ids, master_flat_ids, master_bias_ids, master_darkflat_ids };
@@ -658,7 +660,7 @@ pub fn refresh_calibration_library_for_camera(ctx: &ServiceContext, instrume: St
 
     // Step 3: Recreate calibration sets using the same algorithm as folder scanning
     let result = create_calibration_sets_from_scan_with_masters(
-        &conn,
+        &tx,
         flat_frame_ids,
         dark_frame_ids,
         bias_frame_ids,
@@ -668,10 +670,11 @@ pub fn refresh_calibration_library_for_camera(ctx: &ServiceContext, instrume: St
     .map_err(|e| ApiError::Internal(format!("Failed to create calibration sets: {}", e)))?;
 
     // Step 4: Delete orphaned sets (sets with no frames after reclustering)
-    let deleted_orphans = conn
+    let deleted_orphans = tx
         .execute(
             "DELETE FROM calibration_set
-             WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0",
+             WHERE instrume = ?1 AND is_master_library = 0 AND frame_count = 0
+               AND superseded_by_set_id IS NULL",
             rusqlite::params![instrume],
         )
         .map_err(|e| ApiError::Internal(format!("Failed to delete orphaned sets: {}", e)))?;
@@ -680,16 +683,31 @@ pub fn refresh_calibration_library_for_camera(ctx: &ServiceContext, instrume: St
         tracing::debug!(count = deleted_orphans, "deleted orphaned calibration sets");
     }
 
+    // Restore the empty-prune trigger before committing.
+    crate::db::schema::create_calibration_set_empty_prune_trigger(&tx)
+        .map_err(|e| ApiError::Internal(format!("Failed to restore empty-prune trigger: {}", e)))?;
+
+    tx.commit()
+        .map_err(|e| ApiError::Internal(format!("Failed to commit refresh transaction: {}", e)))?;
+
     tracing::info!(instrume, sets_created = result.sets_created, "calibration library refresh complete");
 
     Ok(result)
 }
 
 /// Query frame IDs for a specific camera and image type (case-insensitive).
+/// Members of superseded sets are excluded: those frames are frozen
+/// provenance history, already represented in matching by the built master.
 fn query_frame_ids_by_type(conn: &rusqlite::Connection, instrume: &str, imagetyp: &str) -> Result<Vec<i64>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id FROM frames
-         WHERE instrume = ?1 AND UPPER(imagetyp) = UPPER(?2)",
+         WHERE instrume = ?1 AND UPPER(imagetyp) = UPPER(?2)
+           AND id NOT IN (
+               SELECT csf.frame_id
+                 FROM calibration_set_frames csf
+                 JOIN calibration_set cs ON cs.id = csf.set_id
+                WHERE cs.superseded_by_set_id IS NOT NULL
+           )",
     )?;
 
     let ids: Vec<i64> = stmt.query_map([instrume, imagetyp], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
@@ -1145,4 +1163,193 @@ pub fn get_custom_metadata_set_ids(ctx: &ServiceContext, instrume: String) -> Re
     let ids: Vec<i64> = stmt.query_map([&instrume], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
 
     Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn seed_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn
+    }
+
+    /// Raw Dark calibration set with one member frame per entry in `times`
+    /// (all shot on `date`, minutes apart so they cluster into one group).
+    fn seed_raw_dark_set(conn: &Connection, date: &str, times: &[&str]) -> (i64, Vec<i64>) {
+        let date_start = format!("{date}T{}Z", times.first().unwrap());
+        let date_end = format!("{date}T{}Z", times.last().unwrap());
+        conn.execute(
+            "INSERT INTO calibration_set
+             (imagetyp, exptime, ccd_temp, gain, offset, binning, instrume, date,
+              date_start, date_end, temp_min, temp_max, frame_count)
+             VALUES ('Dark', 300.0, -10.0, 100.0, 50.0, '1x1', 'TestCam', ?1, ?2, ?3, -10.5, -9.5, ?4)",
+            rusqlite::params![date, date_start, date_end, times.len() as i64],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        let mut frame_ids = Vec::new();
+        for (i, t) in times.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 100, ?3, 'FITS')",
+                rusqlite::params![format!("/cal/{date}/d{i}.fits"), format!("d{i}.fits"), date],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, instrume, exptime, gain, offset, binning, ccd_temp, date_obs)
+                 VALUES (?1, 'Dark', 'TestCam', 300.0, 100.0, 50.0, '1x1', -10.0, ?2)",
+                rusqlite::params![file_id, format!("{date}T{t}Z")],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frame_id],
+            )
+            .unwrap();
+            frame_ids.push(frame_id);
+        }
+        (set_id, frame_ids)
+    }
+
+    /// Master set (is_master_library = 1) with its single MasterDark member.
+    fn seed_master_set(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/lib/master_dark.fits', 'master_dark.fits', 100, '2026-06-02', 'FITS')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp, instrume, exptime, gain, offset, binning, ccd_temp, date_obs)
+             VALUES (?1, 'MasterDark', 'TestCam', 300.0, 100.0, 50.0, '1x1', -10.0, '2026-06-02T00:00:00Z')",
+            [file_id],
+        )
+        .unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set
+             (imagetyp, exptime, ccd_temp, gain, offset, binning, instrume, date,
+              date_start, date_end, temp_min, temp_max, frame_count, is_master_library)
+             VALUES ('MasterDark', 300.0, -10.0, 100.0, 50.0, '1x1', 'TestCam', '2026-06-02',
+              '2026-06-02T00:00:00Z', '2026-06-02T00:00:00Z', -10.0, -10.0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![set_id, frame_id],
+        )
+        .unwrap();
+        set_id
+    }
+
+    /// Mark `raw_set_id` superseded by `master_set_id` and record provenance,
+    /// like `calibration_library::register` does in one transaction.
+    fn supersede(conn: &Connection, raw_set_id: i64, master_set_id: i64) {
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            rusqlite::params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance
+             (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (?1, ?2, '{}', '[]', 'hash', '2026-06-02T00:00:00Z')",
+            rusqlite::params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+    }
+
+    /// Regression: refresh must leave superseded raw sets (frozen provenance
+    /// history) untouched. Pre-fix, Step 1 emptied them, the empty-prune
+    /// trigger tried to delete them, and `master_provenance.source_set_id`
+    /// (FK, NO ACTION) aborted the whole command with
+    /// "FOREIGN KEY constraint failed".
+    #[test]
+    fn refresh_skips_superseded_sets() {
+        let mut conn = seed_db();
+        let (raw_id, raw_frames) = seed_raw_dark_set(&conn, "2026-06-01", &["20:00:00", "20:10:00"]);
+        let master_id = seed_master_set(&conn);
+        supersede(&conn, raw_id, master_id);
+        let (live_id, _) = seed_raw_dark_set(&conn, "2026-06-15", &["21:00:00", "21:10:00"]);
+
+        refresh_calibration_library_inner(&mut conn, "TestCam").unwrap();
+
+        let (count, superseded_by): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT frame_count, superseded_by_set_id FROM calibration_set WHERE id = ?1",
+                [raw_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(superseded_by, Some(master_id), "supersede pointer must survive");
+        assert_eq!(count, 2, "frozen membership must not be cleared");
+        for fid in &raw_frames {
+            let set_of: i64 = conn
+                .query_row("SELECT set_id FROM calibration_set_frames WHERE frame_id = ?1", [fid], |r| r.get(0))
+                .unwrap();
+            assert_eq!(set_of, raw_id, "superseded member must not be re-clustered into a live set");
+        }
+        let prov: i64 = conn
+            .query_row("SELECT COUNT(*) FROM master_provenance WHERE source_set_id = ?1", [raw_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(prov, 1, "provenance row must survive");
+        let live: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = ?1", [live_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live, 1, "live set must survive the refresh");
+    }
+
+    /// Refresh exists to preserve set identity: a live raw set must keep its
+    /// row (same id) and its consumer links across the clear + recluster
+    /// cycle. Pre-fix, the Phase-2 empty-prune trigger fired while Step 1
+    /// emptied the set, deleted the row, and ON DELETE CASCADE silently wiped
+    /// the light's calibration link (including manual overrides).
+    #[test]
+    fn refresh_preserves_live_set_identity_and_consumer_links() {
+        let mut conn = seed_db();
+        let (live_id, _) = seed_raw_dark_set(&conn, "2026-06-15", &["21:00:00", "21:10:00"]);
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/l/light.fits', 'light.fits', 100, '2026-06-15', 'FITS')",
+            [],
+        )
+        .unwrap();
+        let light_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp, instrume, exptime) VALUES (?1, 'Light', 'TestCam', 300.0)",
+            [light_file],
+        )
+        .unwrap();
+        let light_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, match_score, is_manual_override)
+             VALUES (?1, 'frame', ?2, 'Dark', 0.9, 1)",
+            rusqlite::params![light_id, live_id],
+        )
+        .unwrap();
+
+        refresh_calibration_library_inner(&mut conn, "TestCam").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT frame_count FROM calibration_set WHERE id = ?1", [live_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "set must be refilled under its original id");
+        let link: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_to_frames WHERE calibration_set_id = ?1 AND source_id = ?2",
+                rusqlite::params![live_id, light_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(link, 1, "consumer link must survive refresh");
+    }
 }

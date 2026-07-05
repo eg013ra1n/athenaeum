@@ -5,6 +5,47 @@ pub const UUID_TABLES: [&str; 7] = [
     "calibration_set", "tags", "export_templates",
 ];
 
+/// (Re)create the `calibration_set_empty_prune` trigger (B2). Factored out so
+/// `api::calibration::refresh_calibration_library_inner` can suspend it around
+/// its clear-memberships + recluster window and restore the identical
+/// definition afterwards.
+///
+/// Exemptions in the WHEN clause:
+/// - master library sets (`is_master_library = 1`): intrinsically
+///   single-frame; the sole member may legitimately be removed via re-import
+///   without the parent row being garbage.
+/// - superseded raw sets / `master_provenance.source_set_id` targets: frozen
+///   provenance history. `source_set_id` is an FK with no ON DELETE action,
+///   so pruning such a set would abort the caller's own DELETE with a
+///   foreign-key failure (and losing the row would orphan the master's
+///   provenance anchor even if it didn't).
+pub(crate) fn create_calibration_set_empty_prune_trigger(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS calibration_set_empty_prune
+         AFTER DELETE ON calibration_set_frames
+         FOR EACH ROW
+         WHEN NOT EXISTS (
+            SELECT 1 FROM calibration_set_frames
+             WHERE set_id = OLD.set_id
+         )
+           AND EXISTS (
+            SELECT 1 FROM calibration_set
+             WHERE id = OLD.set_id
+               AND COALESCE(is_master_library, 0) = 0
+               AND superseded_by_set_id IS NULL
+         )
+           AND NOT EXISTS (
+            SELECT 1 FROM master_provenance
+             WHERE source_set_id = OLD.set_id
+         )
+         BEGIN
+            DELETE FROM calibration_set WHERE id = OLD.set_id;
+         END",
+        [],
+    )?;
+    Ok(())
+}
+
 fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -757,45 +798,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // B2: prune empty `calibration_set` rows automatically. The
-    // `calibration_set_frames` junction table CASCADE-deletes rows when
-    // either side is removed (e.g., a frame is deleted from `frames` or the
-    // parent set itself is deleted). But a parent that loses its last
-    // member through frame deletion is never cleaned up — the
-    // `bulk_update_frame_metadata` cascade in `db/operations.rs` does it in
-    // application code, but other deletion paths (raw frame delete from
-    // file_op cleanup, archive operations, etc.) leave empty parent rows.
-    // This trigger handles every path uniformly. Master library sets
-    // (is_master_library = 1) are exempt: a master is intrinsically a
-    // single-frame set and may legitimately have its sole member removed
-    // via re-import without the parent row being garbage.
-    conn.execute(
-        "CREATE TRIGGER IF NOT EXISTS calibration_set_empty_prune
-         AFTER DELETE ON calibration_set_frames
-         FOR EACH ROW
-         WHEN NOT EXISTS (
-            SELECT 1 FROM calibration_set_frames
-             WHERE set_id = OLD.set_id
-         )
-           AND EXISTS (
-            SELECT 1 FROM calibration_set
-             WHERE id = OLD.set_id
-               AND COALESCE(is_master_library, 0) = 0
-         )
-         BEGIN
-            DELETE FROM calibration_set WHERE id = OLD.set_id;
-         END",
-        [],
-    )?;
-    conn.execute(
-        "DELETE FROM calibration_set
-         WHERE COALESCE(is_master_library, 0) = 0
-           AND NOT EXISTS (
-            SELECT 1 FROM calibration_set_frames
-             WHERE set_id = calibration_set.id
-         )",
-        [],
-    )?;
+    // B2 (empty-set prune trigger + startup sweep) lives further down, after
+    // the Phase 2 migration block: its WHEN clause references
+    // `superseded_by_set_id` and `master_provenance`, which must exist first.
 
     // Migrations - add columns to existing tables if they don't exist
     // Add find_duplicates to scan_roots table (migration for existing databases)
@@ -1325,6 +1330,34 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             member_hash        TEXT NOT NULL,
             created_at         TEXT NOT NULL
         )",
+        [],
+    )?;
+
+    // B2: prune empty `calibration_set` rows automatically. The
+    // `calibration_set_frames` junction table CASCADE-deletes rows when
+    // either side is removed (e.g., a frame is deleted from `frames` or the
+    // parent set itself is deleted). But a parent that loses its last
+    // member through frame deletion is never cleaned up — the
+    // `bulk_update_frame_metadata` cascade in `db/operations.rs` does it in
+    // application code, but other deletion paths (raw frame delete from
+    // file_op cleanup, archive operations, etc.) leave empty parent rows.
+    // This trigger handles every path uniformly. DROP + re-create (instead of
+    // CREATE IF NOT EXISTS) so databases that already carry an older
+    // definition pick up the current WHEN clause on next startup.
+    conn.execute("DROP TRIGGER IF EXISTS calibration_set_empty_prune", [])?;
+    create_calibration_set_empty_prune_trigger(conn)?;
+    // One-shot startup sweep for empty sets that pre-date the trigger, with
+    // the same exemptions the trigger applies (see helper doc).
+    conn.execute(
+        "DELETE FROM calibration_set
+         WHERE COALESCE(is_master_library, 0) = 0
+           AND superseded_by_set_id IS NULL
+           AND id NOT IN (SELECT source_set_id FROM master_provenance
+                           WHERE source_set_id IS NOT NULL)
+           AND NOT EXISTS (
+            SELECT 1 FROM calibration_set_frames
+             WHERE set_id = calibration_set.id
+         )",
         [],
     )?;
 
@@ -1878,6 +1911,68 @@ mod archive_schema_tests {
             "SELECT COUNT(*) FROM calibration_set WHERE id = 502",
             [], |r| r.get(0)).unwrap();
         assert_eq!(after, 0, "startup sweep should remove the empty set");
+    }
+
+    /// Superseded raw set (frozen provenance history) losing its last member
+    /// — e.g. the raw files get deleted via file_op — must survive the prune:
+    /// `master_provenance.source_set_id` references it with an FK that has no
+    /// ON DELETE action, so pre-hardening the trigger's DELETE aborted the
+    /// caller's own statement with "FOREIGN KEY constraint failed".
+    fn seed_superseded_set(conn: &Connection, raw_id: i64, master_id: i64, frame_id: i64) {
+        insert_dummy_calibration_set(conn, raw_id, "Dark");
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, 'MasterDark', '2025-01-01', 1)",
+            [master_id],
+        ).unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            rusqlite::params![master_id, raw_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance
+             (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (?1, ?2, '{}', '[]', 'hash', '2025-01-01T00:00:00Z')",
+            rusqlite::params![master_id, raw_id],
+        ).unwrap();
+        insert_dummy_frame(conn, frame_id);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![raw_id, frame_id],
+        ).unwrap();
+    }
+
+    #[test]
+    fn empty_prune_trigger_spares_provenance_referenced_sets() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_superseded_set(&conn, 510, 511, 7010);
+
+        // Must neither FK-error nor prune the frozen set.
+        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 510", []).unwrap();
+
+        let still_there: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 510",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(still_there, 1, "superseded set must survive losing its members");
+    }
+
+    #[test]
+    fn startup_sweep_spares_empty_superseded_sets() {
+        // Same guard for the init_db bulk sweep: an already-empty superseded
+        // set must not be swept (pre-hardening this made init_db itself fail
+        // with a FK error → app refused to start).
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_superseded_set(&conn, 512, 513, 7011);
+        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 512", []).unwrap();
+
+        init_db(&conn).unwrap();
+
+        let still_there: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 512",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(still_there, 1, "startup sweep must spare superseded sets");
     }
 
     #[test]

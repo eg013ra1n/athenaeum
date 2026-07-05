@@ -70,7 +70,6 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::FrameSetDetail,
             crate::models::CameraStats,
             crate::models::CalibrationSetDetail,
-            crate::models::DarkLibraryResult,
             crate::models::RelinkResult,
             crate::models::OrphanedFile,
             crate::models::ImagingLocation,

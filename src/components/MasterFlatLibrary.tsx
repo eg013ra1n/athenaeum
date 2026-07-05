@@ -1,10 +1,9 @@
 import { useState, useEffect, useMemo } from "react";
 import { api } from '../api';
-import { ArrowLeft, Search, RefreshCw, Pencil } from "lucide-react";
-import { CalibrationSetDetail, DarkLibraryResult } from "../types/models";
+import { ArrowLeft, Pencil } from "lucide-react";
+import { CalibrationSetDetail } from "../types/models";
 import CalibrationSetTable from "./CalibrationSetTable";
 import DarkLibraryFilters, { FilterState, emptyFilters, FilterMode } from "./DarkLibraryFilters";
-import { ConfirmDialog } from "./ConfirmDialog";
 import BulkEditMetadataModal from "./BulkEditMetadataModal";
 
 interface MasterFlatLibraryProps {
@@ -22,10 +21,7 @@ interface MasterFlatLibraryProps {
 export default function MasterFlatLibrary({ instrume, onClose, isTabView = false, highlightSetId, onCreateMaster, buildingSetIds }: MasterFlatLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
-  const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [showConfirm, setShowConfirm] = useState(false);
   const [filters, setFilters] = useState<FilterState>(emptyFilters);
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [customMetadataSetIds, setCustomMetadataSetIds] = useState<number[]>([]);
@@ -68,36 +64,6 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleCreateLibrary = async () => {
-    try {
-      setCreating(true);
-      setError(null);
-      setSuccessMessage(null);
-
-      const result = await api.invoke<DarkLibraryResult>("create_master_flat_library", { instrume });
-
-      setSuccessMessage(
-        `Created ${result.sets_created} master flat sets with ${result.frames_grouped} frames`
-      );
-
-      // Reload the library
-      await checkAndLoadLibrary();
-    } catch (err) {
-      setError(err as string);
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  const handleRegenerateLibrary = async () => {
-    setShowConfirm(true);
-  };
-
-  const confirmRegenerate = async () => {
-    setShowConfirm(false);
-    await handleCreateLibrary();
   };
 
   const handleFilterChange = (newFilters: FilterState) => {
@@ -178,20 +144,10 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
               <div className="flex gap-2">
                 <button
                   onClick={() => setShowBulkEdit(true)}
-                  disabled={creating}
-                  className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors"
                 >
                   <Pencil size={16} />
                   Edit Metadata
-                </button>
-                <button
-                  onClick={handleRegenerateLibrary}
-                  disabled={creating}
-                  title="Delete and recreate the master flat library from scanned FITS/XISF files. Custom metadata edits will be reset to original header values."
-                  className="flex items-center gap-2 px-4 py-2 bg-surface-hover hover:brightness-110 text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <RefreshCw size={16} className={creating ? "animate-spin" : ""} />
-                  Regenerate
                 </button>
               </div>
             )}
@@ -206,12 +162,6 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
         </div>
       )}
 
-      {successMessage && (
-        <div className="bg-success-muted border border-success/50 rounded-lg p-4 mb-4">
-          <p className="text-success">{successMessage}</p>
-        </div>
-      )}
-
       {/* Loading */}
       {loading && (
         <div className="text-center py-12 text-content-muted">
@@ -222,18 +172,10 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
       {/* Empty state */}
       {!loading && sets.length === 0 && (
         <div className="bg-surface-elevated rounded-lg p-12 text-center">
-          <p className="text-content-muted mb-6">
-            No master flat library created yet. Scan your monitored folders for existing master flat files
-            (MasterFlat) and organize them by filter, date, temperature, gain, offset, and binning.
+          <p className="text-content-muted">
+            No master flat sets for this camera yet. Master flat files (MasterFlat) found in your monitored
+            folders are registered automatically when scanned, and masters built in-app appear here as well.
           </p>
-          <button
-            onClick={handleCreateLibrary}
-            disabled={creating}
-            className="inline-flex items-center gap-2 px-6 py-3 bg-accent hover:bg-accent-hover text-white rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg font-medium"
-          >
-            <Search size={20} />
-            {creating ? "Creating..." : "Find and Create"}
-          </button>
         </div>
       )}
 
@@ -247,25 +189,13 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
             onFilterChange={handleFilterChange}
             mode={filterMode}
             actions={isTabView ? (
-              <>
-                <button
-                  onClick={() => setShowBulkEdit(true)}
-                  disabled={creating}
-                  className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:brightness-110 text-white rounded text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <Pencil size={14} />
-                  Edit Metadata
-                </button>
-                <button
-                  onClick={handleRegenerateLibrary}
-                  disabled={creating}
-                  title="Delete and recreate the master flat library from scanned FITS/XISF files. Custom metadata edits will be reset to original header values."
-                  className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:brightness-110 text-white rounded text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <RefreshCw size={14} className={creating ? "animate-spin" : ""} />
-                  Regenerate
-                </button>
-              </>
+              <button
+                onClick={() => setShowBulkEdit(true)}
+                className="flex items-center gap-2 px-3 py-1.5 bg-surface-hover hover:brightness-110 text-white rounded text-sm transition-colors"
+              >
+                <Pencil size={14} />
+                Edit Metadata
+              </button>
             ) : undefined}
           />
 
@@ -298,19 +228,6 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
           )}
         </div>
       )}
-
-      {/* Confirm Dialog */}
-      <ConfirmDialog
-        isOpen={showConfirm}
-        title="Regenerate Master Library"
-        message={
-          customMetadataSetIds.length > 0
-            ? "This will delete the existing master flat library and recreate it from FITS files. WARNING: All custom metadata edits will be reset to original FITS header values. Continue?"
-            : "This will delete the existing master flat library and recreate it. Continue?"
-        }
-        onConfirm={confirmRegenerate}
-        onCancel={() => setShowConfirm(false)}
-      />
 
       {/* Bulk Edit Modal */}
       <BulkEditMetadataModal

@@ -372,14 +372,6 @@ pub struct CalibrationSetDetail {
     pub superseded_by_set_id: Option<i64>,
 }
 
-/// Result of dark library creation
-#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
-pub struct DarkLibraryResult {
-    pub sets_created: i64,
-    pub frames_grouped: i64,
-    pub frames_excluded: i64,
-}
-
 /// Result of file relinking operation
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct RelinkResult {
