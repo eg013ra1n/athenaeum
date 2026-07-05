@@ -270,6 +270,21 @@ pub(crate) fn resolve_calibration_library_dir(
     }
 }
 
+/// Validates a candidate calibration-library path: must exist and be a
+/// directory. Mirrors `add_scan_root`'s exists/is_dir pair (same messages)
+/// — kept as its own function rather than shared so each call site's error
+/// text stays independently editable, and so this one is directly testable
+/// without a `ServiceContext` (Important-3).
+pub(crate) fn validate_library_dir_candidate(path_buf: &Path) -> Result<(), ApiError> {
+    if !path_buf.exists() {
+        return Err(ApiError::Invalid("Directory does not exist".to_string()));
+    }
+    if !path_buf.is_dir() {
+        return Err(ApiError::Invalid("Path is not a directory".to_string()));
+    }
+    Ok(())
+}
+
 /// Set the calibration-library directory (master-frame write destination).
 ///
 /// - Folder inside (or equal to) an existing monitored directory → persists
@@ -288,9 +303,7 @@ pub fn set_calibration_library_dir(
     policy: &PathPolicy,
 ) -> Result<String, ApiError> {
     let path_buf = Path::new(&path);
-    if !path_buf.exists() {
-        return Err(ApiError::Invalid("Directory does not exist".to_string()));
-    }
+    validate_library_dir_candidate(path_buf)?;
     let new_path = normalize_path(
         &path_buf
             .canonicalize()
@@ -320,7 +333,22 @@ pub fn set_calibration_library_dir(
     if !covered {
         // Standalone folder — becomes the dedicated library scan root
         // (add_scan_root re-validates overlap + single-library uniqueness).
-        add_scan_root(ctx, path_str.clone(), policy, Some("calibration_library".to_string()))?;
+        add_scan_root(ctx, path_str.clone(), policy, Some("calibration_library".to_string()))
+            .map_err(|e| match e {
+                // Minor-4/5: switching from one standalone calibration
+                // folder to another hits `check_library_root_uniqueness`'s
+                // bare "only one is allowed" — a dead end unless the
+                // operator already knows the fix. Spell it out here rather
+                // than leaving them to reverse-engineer it. Overlap
+                // conflicts (subdirectory/parent/duplicate) pass through
+                // unchanged — those are unambiguous already.
+                ApiError::Conflict(msg) if msg.starts_with("A Calibration Library root already exists") => {
+                    ApiError::Conflict(format!(
+                        "{msg}. Remove the existing dedicated library root under Monitored Directories first (your masters catalog is kept)."
+                    ))
+                }
+                other => other,
+            })?;
     }
 
     let db = db(ctx)?;
@@ -346,9 +374,70 @@ pub fn clear_calibration_library_dir(ctx: &ServiceContext) -> Result<(), ApiErro
     Ok(())
 }
 
+/// Best-effort canonicalize for path comparison: falls back to the raw path
+/// when the target no longer exists on disk (a stale registered path, or a
+/// calibration folder the operator already deleted outside the app — see
+/// Important-2's `check_library_dir_exists`). Paths stored in `scan_roots`
+/// and the `calibration.library_dir` setting were canonicalized at write
+/// time, so the raw-string fallback still compares correctly even when a
+/// fresh `canonicalize()` call can't run.
+fn canonical_or_raw(path: &str) -> std::path::PathBuf {
+    let p = Path::new(path);
+    normalize_path(&p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+}
+
+/// Guard behind `delete_scan_root`'s Critical-1 fix: refuses to delete a
+/// root whose subtree contains (or IS) the currently active
+/// calibration-library directory. `db::delete_scan_root` purges files,
+/// frames, etc. by path PREFIX with no awareness of the calibration library,
+/// so an unguarded delete would silently wipe a nested calibration folder's
+/// registered masters (or a dedicated library root's own masters) with no
+/// way back. A *vestigial* `calibration_library`-kind root — one the
+/// `calibration.library_dir` setting no longer points at, e.g. superseded by
+/// a folder configured elsewhere — is intentionally NOT blocked: deleting it
+/// is the documented cleanup path (Minor-5).
+///
+/// Extracted to `Connection` level (no `ServiceContext`) so it's directly
+/// testable with an in-memory DB + real temp dirs — same pattern as
+/// `check_library_root_uniqueness` / `resolve_calibration_library_dir` above.
+pub(crate) fn guard_against_calibration_library_deletion(
+    conn: &rusqlite::Connection,
+    root_path: &str,
+) -> Result<(), ApiError> {
+    let Some(lib_dir) = resolve_calibration_library_dir(conn)? else {
+        return Ok(());
+    };
+    let root_canon = canonical_or_raw(root_path);
+    let lib_canon = canonical_or_raw(&lib_dir);
+    // `starts_with` covers both the nested-folder case and the
+    // dedicated-root case (a path starts_with itself).
+    if lib_canon.starts_with(&root_canon) {
+        return Err(ApiError::Conflict(format!(
+            "This directory contains your Calibration Folder ({lib_dir}). Clear or move the Calibration Folder in File Manager first, then remove the directory."
+        )));
+    }
+    Ok(())
+}
+
 pub fn delete_scan_root(ctx: &ServiceContext, id: i64) -> Result<(), ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
+
+    let root_path: String = conn
+        .query_row(
+            "SELECT path FROM scan_roots WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                ApiError::NotFound(format!("Scan root {} not found", id))
+            } else {
+                ApiError::Internal(format!("Failed to get scan root: {}", e))
+            }
+        })?;
+    guard_against_calibration_library_deletion(&conn, &root_path)?;
+
     Ok(crate::db::delete_scan_root(&conn, id)?)
 }
 
@@ -1001,5 +1090,171 @@ mod kind_check_tests {
     fn first_library_root_is_ok() {
         let conn = test_conn();
         assert!(check_library_root_uniqueness(&conn, "calibration_library").is_ok());
+    }
+}
+
+/// Critical-1 fix round — `guard_against_calibration_library_deletion`
+/// exercised at `Connection` level with real temp dirs (canonicalize needs
+/// real paths on disk), matching the "test the extracted real logic"
+/// convention established in `kind_check_tests` above. Covers the five
+/// scenarios from the fix-round brief: nested folder blocks, unrelated root
+/// is fine, active dedicated root blocks, vestigial dedicated root is fine,
+/// and clearing the setting unblocks a previously-blocked deletion.
+#[cfg(test)]
+mod delete_guard_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn nested_calibration_folder_blocks_root_deletion() {
+        let root = TempDir::new().unwrap();
+        let calib = root.path().join("calib");
+        std::fs::create_dir_all(&calib).unwrap();
+
+        let conn = test_conn();
+        let root_path = root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        crate::db::upsert_scan_root(&conn, &root_path, "normal").unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &calib.canonicalize().unwrap().to_string_lossy(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            guard_against_calibration_library_deletion(&conn, &root_path),
+            Err(ApiError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn unrelated_root_deletes_fine() {
+        let root_a = TempDir::new().unwrap();
+        let lib = TempDir::new().unwrap();
+
+        let conn = test_conn();
+        let root_a_path = root_a.path().canonicalize().unwrap().to_string_lossy().to_string();
+        crate::db::upsert_scan_root(&conn, &root_a_path, "normal").unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &lib.path().canonicalize().unwrap().to_string_lossy(),
+        )
+        .unwrap();
+
+        assert!(guard_against_calibration_library_deletion(&conn, &root_a_path).is_ok());
+    }
+
+    #[test]
+    fn active_dedicated_root_blocks() {
+        let lib_root = TempDir::new().unwrap();
+
+        let conn = test_conn();
+        let lib_root_path = lib_root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        // No `calibration.library_dir` setting — resolve falls back to the
+        // legacy `calibration_library`-kind root, which IS the one being
+        // deleted here.
+        crate::db::upsert_scan_root(&conn, &lib_root_path, "calibration_library").unwrap();
+
+        assert!(matches!(
+            guard_against_calibration_library_deletion(&conn, &lib_root_path),
+            Err(ApiError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn vestigial_calibration_library_root_deletes_fine() {
+        let old_lib_root = TempDir::new().unwrap();
+        let new_lib = TempDir::new().unwrap();
+
+        let conn = test_conn();
+        let old_lib_root_path = old_lib_root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        // Vestigial: still registered as a calibration_library-kind root,
+        // but the settings key has since moved on to somewhere else.
+        crate::db::upsert_scan_root(&conn, &old_lib_root_path, "calibration_library").unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &new_lib.path().canonicalize().unwrap().to_string_lossy(),
+        )
+        .unwrap();
+
+        assert!(guard_against_calibration_library_deletion(&conn, &old_lib_root_path).is_ok());
+    }
+
+    #[test]
+    fn after_clear_the_blocked_deletion_succeeds() {
+        let root = TempDir::new().unwrap();
+        let calib = root.path().join("calib");
+        std::fs::create_dir_all(&calib).unwrap();
+
+        let conn = test_conn();
+        let root_path = root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        crate::db::upsert_scan_root(&conn, &root_path, "normal").unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            &calib.canonicalize().unwrap().to_string_lossy(),
+        )
+        .unwrap();
+
+        // Blocked before clearing...
+        assert!(guard_against_calibration_library_deletion(&conn, &root_path).is_err());
+
+        // clear_calibration_library_dir writes an empty value (not a
+        // delete) — mirror that here rather than re-implementing via ctx.
+        crate::db::set_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, "").unwrap();
+
+        // ...and allowed after.
+        assert!(guard_against_calibration_library_deletion(&conn, &root_path).is_ok());
+    }
+}
+
+/// Important-3 fix round — `set_calibration_library_dir` rejects a file path
+/// the same way `add_scan_root` does, instead of silently accepting it (only
+/// to fail later when a master build tries to write into "the folder").
+/// Exercises `validate_library_dir_candidate` directly — the function
+/// `set_calibration_library_dir` calls first, before any DB/settings work —
+/// since the full function needs a `ServiceContext` that none of this
+/// module's tests construct (see `kind_check_tests`' doc comment for the
+/// established "test the extracted real logic, not a local
+/// re-implementation" convention this follows).
+#[cfg(test)]
+mod set_library_dir_validation_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn file_path_inside_a_root_is_invalid() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        assert!(matches!(
+            validate_library_dir_candidate(&file_path),
+            Err(ApiError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn real_directory_passes() {
+        let dir = TempDir::new().unwrap();
+        assert!(validate_library_dir_candidate(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn nonexistent_path_is_invalid() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does_not_exist");
+        assert!(matches!(
+            validate_library_dir_candidate(&missing),
+            Err(ApiError::Invalid(_))
+        ));
     }
 }

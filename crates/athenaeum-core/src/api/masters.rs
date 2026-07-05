@@ -447,16 +447,35 @@ fn check_rebuild_source_ready(conn: &rusqlite::Connection, source_set_id: i64) -
     }
 }
 
+/// Important-2 fix round: the resolved dir (settings key or legacy scan
+/// root) can point at a folder that was since renamed/deleted/unmounted
+/// outside the app — the setting itself doesn't track disk state. Without
+/// this check that surfaces only as an opaque I/O error partway through
+/// `write_fits_f32` (or, worse, a silent `create_dir_all` recreating an
+/// empty folder at the old path). Extracted so it's testable with a plain
+/// path — no `ServiceContext` needed, unlike `library_dir_or_err` itself.
+pub(crate) fn check_library_dir_exists(dir: &str) -> Result<(), ApiError> {
+    if !Path::new(dir).is_dir() {
+        return Err(ApiError::Invalid(format!(
+            "Calibration folder no longer exists on disk: {dir} — reconfigure it in File Manager → Calibration Folder"
+        )));
+    }
+    Ok(())
+}
+
 /// Effective master-write destination — the `calibration.library_dir`
 /// settings key (folder nested inside a monitored directory) or the legacy
 /// dedicated `calibration_library` scan root. See
 /// `api::scan_roots::get_calibration_library_dir` for the precedence rules.
+/// Shared by both `preview_master_build` and `start_master_build`, so the
+/// build-time existence check (Important-2) covers both call sites.
 fn library_dir_or_err(ctx: &ServiceContext) -> Result<std::path::PathBuf, ApiError> {
-    crate::api::scan_roots::get_calibration_library_dir(ctx)?
-        .map(std::path::PathBuf::from)
+    let dir = crate::api::scan_roots::get_calibration_library_dir(ctx)?
         .ok_or_else(|| ApiError::Invalid(
             "no calibration library folder configured — set one before building masters".into(),
-        ))
+        ))?;
+    check_library_dir_exists(&dir)?;
+    Ok(std::path::PathBuf::from(dir))
 }
 
 // ── Preview ───────────────────────────────────────────────────────────────
@@ -1667,5 +1686,33 @@ mod tests {
         let set_id = conn.last_insert_rowid();
         let err = check_rebuild_source_ready(&conn, set_id).unwrap_err();
         assert!(err.to_string().contains("no member frames"), "{err}");
+    }
+
+    // ── Important-2: check_library_dir_exists ────────────────────────────
+
+    #[test]
+    fn library_dir_check_passes_for_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(check_library_dir_exists(&dir.path().to_string_lossy()).is_ok());
+    }
+
+    #[test]
+    fn library_dir_check_fails_for_deleted_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        drop(dir); // simulates the folder being removed/unmounted outside the app
+        let err = check_library_dir_exists(&path).unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)));
+        assert!(err.to_string().contains(&path), "{err}");
+        assert!(err.to_string().contains("reconfigure it in File Manager"), "{err}");
+    }
+
+    #[test]
+    fn library_dir_check_fails_for_a_file_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+        let err = check_library_dir_exists(&file_path.to_string_lossy()).unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)));
     }
 }

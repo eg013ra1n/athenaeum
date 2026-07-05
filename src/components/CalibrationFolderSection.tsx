@@ -113,7 +113,9 @@ export function CalibrationFolderSection({ scanRoots, onRootsChanged }: Calibrat
           <p className="text-sm text-content-muted mt-1">
             Master calibration frames built by Athenaeum are written here. Pick a folder inside a
             monitored directory, or any other folder &mdash; standalone folders are added as a
-            monitored library root so masters dropped in from elsewhere are imported too.
+            monitored library root so masters dropped in from elsewhere are imported too. A
+            standalone (dedicated) folder appears under Monitored Directories above and must be
+            removed there if you switch to a different standalone folder later.
           </p>
         </div>
         <button

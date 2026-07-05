@@ -222,6 +222,12 @@ export default function FileManager() {
           await deleteScanRoot(id);
         } catch (error) {
           console.error('Failed to remove directory:', error);
+          clearRootsError();
+          // Surfaces the backend's Conflict message verbatim (e.g. "This
+          // directory contains your Calibration Folder...") instead of
+          // silently swallowing it — the operator needs to know WHY the
+          // directory wasn't removed.
+          showAlert('Remove Directory Failed', typeof error === 'string' ? error : 'Failed to remove directory', 'error');
         }
       },
       true
