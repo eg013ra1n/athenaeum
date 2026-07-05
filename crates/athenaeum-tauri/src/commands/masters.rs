@@ -155,3 +155,18 @@ pub async fn restore_calibration_originals(
     let emitter = Arc::new(TauriProgressEmitter(app_handle));
     api::restore_originals(state.ctx.clone(), emitter, calibration_set_id).map_err(|e| e.to_string())
 }
+
+/// Clear the stale archive markers on a calibration set whose archive zip
+/// was deleted outside the app — the "Forget archive" escape hatch from the
+/// otherwise-dead missing-zip state. Gated in core on the zip genuinely
+/// being missing (Conflict if it still exists — Restore is the right tool
+/// then). Returns the number of member files cleared. Synchronous DB work,
+/// no worker/events involved.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn clear_stale_archive_markers(
+    state: State<'_, AppState>,
+    calibration_set_id: i64,
+) -> Result<usize, String> {
+    api::clear_stale_archive_markers(&state.ctx, calibration_set_id).map_err(|e| e.to_string())
+}

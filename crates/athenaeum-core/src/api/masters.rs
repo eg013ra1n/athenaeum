@@ -1535,7 +1535,8 @@ pub fn restore_originals(
         if !Path::new(&zip_path).exists() {
             return Err(ApiError::Invalid(format!(
                 "Archive zip is missing on disk: {zip_path} — it may have been deleted; \
-                 you can clear the stale archive markers"
+                 you can use 'Forget archive' in the master's provenance panel to clear \
+                 the stale markers"
             )));
         }
 
@@ -1596,6 +1597,94 @@ pub fn restore_originals(
     });
 
     Ok(op_id)
+}
+
+/// Escape hatch for the stuck missing-zip state: clear the archive markers
+/// (`archived_in_operation` / `archive_zip_path` / `archive_path_in_zip`) on
+/// every member file of a SUPERSEDED calibration set whose archive zip has
+/// been deleted outside the app. Without this, `archive_zip_missing` is a
+/// dead end — the originals are gone (they were Move-disposition into the
+/// zip), the markers say "archived", and neither restore (zip gone) nor
+/// re-archive (`build_calibration_set_plan` bails on already-archived
+/// members) can ever run. After clearing, provenance honestly reports the
+/// files as not-archived and missing on disk (`originals_archived: false`,
+/// `source_frames_on_disk: false`).
+///
+/// **Gated on the zip actually being missing** — re-checked here, not
+/// trusted from the UI's earlier `get_master_provenance` snapshot. If the
+/// zip still exists this returns `Conflict`: forgetting a live archive would
+/// orphan a perfectly restorable zip, so the only supported path in that
+/// state is `restore_originals`.
+///
+/// Marker clearing goes through the same `unmark_file_archived` helper the
+/// restore reconcile path uses (path/mtime/size args all `None` — the files
+/// are gone from disk, there is nothing to sync), wrapped in one transaction
+/// so a crash mid-loop can't leave a half-forgotten set. The
+/// `archive_operations` row is deliberately left untouched: a successful
+/// restore also leaves the op row as-is (status stays `completed` — see
+/// `restore::run_restore`, which never calls `update_operation_status` on
+/// success), so the honest end-state here mirrors that — the op row is
+/// history ("this archive happened"), the file markers are current state
+/// ("these bytes live in that zip"), and only the latter is now a lie worth
+/// fixing.
+///
+/// Pool discipline (the 27eff86b invariant): acquires exactly ONE pooled
+/// connection for the whole request — every query below runs on `conn`, and
+/// no helper called from here touches `ServiceContext`/the pool itself.
+///
+/// Returns the number of member files whose markers were cleared.
+pub fn clear_stale_archive_markers(
+    ctx: &ServiceContext,
+    calibration_set_id: i64,
+) -> Result<usize, ApiError> {
+    let db_handle = db(ctx)?;
+    let conn = db_handle.conn();
+
+    let mut stmt = conn.prepare(
+        "SELECT fi.id, fi.archive_zip_path
+         FROM calibration_set_frames csf
+         JOIN frames f ON f.id = csf.frame_id
+         JOIN files fi ON fi.id = f.file_id
+         WHERE csf.set_id = ?1 AND fi.archived_in_operation IS NOT NULL",
+    )?;
+    let marked: Vec<(i64, Option<String>)> = stmt
+        .query_map([calibration_set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    if marked.is_empty() {
+        return Err(ApiError::Invalid(
+            "calibration set's originals are not archived — no markers to clear".into(),
+        ));
+    }
+
+    // The gate: if ANY marked member's zip still exists on disk, this is not
+    // the stuck state — the archive is intact and restorable. (All members
+    // share one zip by construction — see `MasterProvenanceInfo::archive_operation_id`'s
+    // doc comment — but checking every row costs nothing and stays correct
+    // even if that invariant ever bends.)
+    if marked.iter().any(|(_, zip)| {
+        zip.as_deref().map(|p| Path::new(p).exists()).unwrap_or(false)
+    }) {
+        return Err(ApiError::Conflict(
+            "archive zip still exists on disk — use Restore originals instead".into(),
+        ));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let cleared = marked.len();
+    for (file_id, _) in &marked {
+        crate::archive::db::unmark_file_archived(&tx, *file_id, None, None, None)?;
+    }
+    tx.commit()?;
+
+    tracing::info!(
+        calibration_set_id,
+        cleared,
+        "cleared stale archive markers for a calibration set whose zip is missing on disk"
+    );
+
+    Ok(cleared)
 }
 
 #[cfg(test)]
@@ -2255,6 +2344,15 @@ mod tests {
         let zip_path = prov.archive_zip_path.clone().expect("zip path recorded");
         assert!(!prov.archive_zip_missing, "zip still on disk at this point");
 
+        // Forget-archive is GATED on the zip actually being missing: while
+        // the zip is intact the only supported path is Restore originals,
+        // so this must refuse with Conflict (not clear anything).
+        let err = clear_stale_archive_markers(&ctx, calibration_set_id).unwrap_err();
+        assert!(
+            matches!(&err, ApiError::Conflict(m) if m.contains("use Restore originals")),
+            "expected Conflict while zip exists, got {err:?}"
+        );
+
         // Delete the zip out from under the catalog — simulates the user
         // removing it (or the drive it lived on going away) outside the app.
         std::fs::remove_file(&zip_path).unwrap();
@@ -2275,6 +2373,9 @@ mod tests {
             ApiError::Invalid(msg) => {
                 assert!(msg.contains("missing on disk"), "{msg}");
                 assert!(msg.contains(&zip_path), "{msg}");
+                // The message must point at the affordance that actually
+                // exists — the provenance panel's Forget-archive button.
+                assert!(msg.contains("Forget archive"), "{msg}");
             }
             other => panic!("expected ApiError::Invalid, got {other:?}"),
         }
@@ -2282,5 +2383,77 @@ mod tests {
         // No operation was ever enqueued for the failed attempt — the
         // handle map must be exactly as empty as it started.
         assert!(ctx.active_archives.lock().unwrap().is_empty());
+
+        // (c) the exit from the stuck state: Forget archive clears the
+        // markers (zip genuinely missing now), and provenance flips to the
+        // honest end-state — not archived, originals missing on disk.
+        let cleared = clear_stale_archive_markers(&ctx, calibration_set_id).unwrap();
+        assert_eq!(cleared, 1, "exactly the one member file's markers cleared");
+
+        let prov_final = get_master_provenance(&ctx, master_set_id).unwrap().unwrap();
+        assert!(!prov_final.originals_archived, "markers gone — no longer 'archived'");
+        assert!(!prov_final.archive_zip_missing, "nothing archived => nothing missing");
+        assert_eq!(prov_final.archive_operation_id, None);
+        assert_eq!(prov_final.archive_zip_path, None);
+        assert!(
+            !prov_final.source_frames_on_disk,
+            "the files themselves are still gone — provenance must say so, not pretend they're back"
+        );
+
+        // Second call: nothing left to clear — Invalid, not a silent 0.
+        let err = clear_stale_archive_markers(&ctx, calibration_set_id).unwrap_err();
+        assert!(
+            matches!(&err, ApiError::Invalid(m) if m.contains("no markers to clear")),
+            "expected Invalid on re-run, got {err:?}"
+        );
+    }
+
+    // ── common_source_dir (pure — pins the target_root_path synthesis) ──────
+    //
+    // `restore_originals` feeds this into `restore::classify_target`, which
+    // picks Original mode iff every file's source_path starts with the
+    // target root. Even the degenerate all-the-way-divergent case therefore
+    // still resolves to Original mode (a root like "/" prefixes every
+    // absolute path) — these cases pin `common_source_dir` itself.
+    #[test]
+    fn common_source_dir_multi_path_cases() {
+        // Different subtrees under a shared ancestor → the shared ancestor.
+        assert_eq!(
+            common_source_dir(&[
+                PathBuf::from("/data/roots/a/f1.fits"),
+                PathBuf::from("/data/other/b/f2.fits"),
+            ]),
+            PathBuf::from("/data"),
+        );
+
+        // Identical directories → that directory (not its parent).
+        assert_eq!(
+            common_source_dir(&[
+                PathBuf::from("/data/roots/a/f1.fits"),
+                PathBuf::from("/data/roots/a/f2.fits"),
+            ]),
+            PathBuf::from("/data/roots/a"),
+        );
+
+        // Fully divergent absolute paths → the degenerate ancestor (the
+        // filesystem root) — still a valid Original-mode target root, per
+        // the note above.
+        assert_eq!(
+            common_source_dir(&[
+                PathBuf::from("/data/a/f1.fits"),
+                PathBuf::from("/var/b/f2.fits"),
+            ]),
+            PathBuf::from("/"),
+        );
+
+        // Single path → its parent directory (not the file itself).
+        assert_eq!(
+            common_source_dir(&[PathBuf::from("/data/roots/a/f1.fits")]),
+            PathBuf::from("/data/roots/a"),
+        );
+
+        // Empty input → empty path (restore_originals bails on empty member
+        // lists long before calling this; pinned for totality).
+        assert_eq!(common_source_dir(&[]), PathBuf::new());
     }
 }

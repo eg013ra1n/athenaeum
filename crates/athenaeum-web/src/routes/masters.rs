@@ -73,6 +73,12 @@ pub struct RestoreCalibrationOriginalsArgs {
     pub calibration_set_id: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearStaleArchiveMarkersArgs {
+    pub calibration_set_id: i64,
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 /// POST /api/preview_master_build
@@ -218,6 +224,24 @@ pub async fn restore_calibration_originals(
 ) -> Result<Json<i64>, (StatusCode, String)> {
     let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
     api::restore_originals(state.ctx.clone(), emitter, args.calibration_set_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/clear_stale_archive_markers
+///
+/// Clear the stale archive markers on a calibration set whose archive zip
+/// was deleted outside the app — the "Forget archive" escape hatch from the
+/// otherwise-dead missing-zip state. Gated in core on the zip genuinely
+/// being missing (409 if it still exists — Restore is the right tool then).
+/// Returns the number of member files cleared. Synchronous DB work, no
+/// worker/events involved.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn clear_stale_archive_markers(
+    State(state): State<WebAppState>,
+    Json(args): Json<ClearStaleArchiveMarkersArgs>,
+) -> Result<Json<usize>, (StatusCode, String)> {
+    api::clear_stale_archive_markers(&state.ctx, args.calibration_set_id)
         .map(Json)
         .map_err(api_err)
 }

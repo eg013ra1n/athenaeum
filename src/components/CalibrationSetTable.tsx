@@ -585,6 +585,8 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
   const [archiveStartError, setArchiveStartError] = useState<string | null>(null);
   const [restoreOpId, setRestoreOpId] = useState<number | null>(null);
   const [restoreStartError, setRestoreStartError] = useState<string | null>(null);
+  const [forgetBusy, setForgetBusy] = useState(false);
+  const [forgetError, setForgetError] = useState<string | null>(null);
 
   const fetchProvenance = useCallback(() => {
     let gone = false;
@@ -634,6 +636,30 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
     }
   };
 
+  // Escape hatch from the missing-zip dead end: clears the stale archive
+  // markers (backend re-checks the zip really is gone — 409 otherwise).
+  // window.confirm matches this codebase's destructive-action pattern
+  // (CalibrationFolderSection, ArchiveFoldersSection).
+  const forgetArchive = async () => {
+    if (prov.sourceSetId == null) return;
+    if (!window.confirm(
+      'Forget this archive?\n\n' +
+      'The catalog will mark the original files as NOT archived. Since the zip is gone, ' +
+      'the files themselves cannot be recovered — they will show as missing on disk. ' +
+      'This only clears the stale bookkeeping; nothing is deleted.',
+    )) return;
+    setForgetError(null);
+    setForgetBusy(true);
+    try {
+      await api.invoke<number>('clear_stale_archive_markers', { calibrationSetId: prov.sourceSetId });
+      fetchProvenance();
+    } catch (e) {
+      setForgetError(String(e));
+    } finally {
+      setForgetBusy(false);
+    }
+  };
+
   return (
     <div className="mt-2 text-xs space-y-1">
       <span className="px-1.5 py-0.5 rounded bg-accent/20 text-accent">built in Athenaeum</span>
@@ -652,7 +678,19 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
               <span className="text-content">archived to zip</span>
             )}
             {prov.archiveZipMissing ? (
-              <div className="mt-1 text-error">archive file is missing on disk (deleted?)</div>
+              <>
+                <div className="mt-1 text-error">archive file is missing on disk (deleted?)</div>
+                <div className="mt-1">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); void forgetArchive(); }}
+                    disabled={forgetBusy}
+                    className="px-2 py-0.5 bg-surface-hover hover:brightness-110 rounded text-content disabled:opacity-50"
+                  >
+                    {forgetBusy ? 'Clearing…' : 'Forget archive (clear markers)'}
+                  </button>
+                </div>
+                {forgetError && <div className="text-error mt-1">{forgetError}</div>}
+              </>
             ) : restoreOpId != null ? (
               <div className="mt-1 max-w-xs" onClick={e => e.stopPropagation()}>
                 <ArchiveProgress

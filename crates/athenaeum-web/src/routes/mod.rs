@@ -232,6 +232,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_master_provenance", post(masters::get_master_provenance))
         .route("/api/archive_calibration_originals", post(masters::archive_calibration_originals))
         .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))
+        .route("/api/clear_stale_archive_markers", post(masters::clear_stale_archive_markers))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))

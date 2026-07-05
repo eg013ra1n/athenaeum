@@ -369,6 +369,7 @@ pub fn run() {
             commands::get_master_provenance,
             commands::archive_calibration_originals,
             commands::restore_calibration_originals,
+            commands::clear_stale_archive_markers,
             // Plate solve commands
             commands::get_plate_solve_config,
             commands::set_plate_solve_config,
