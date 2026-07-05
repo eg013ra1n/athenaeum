@@ -16,8 +16,11 @@ use super::AppState;
 
 pub use athenaeum_core::api::masters::{MasterBuildPreview, MasterProvenanceInfo, MasterRecipe};
 
-/// Preview a master build: validation + recipe/precal resolution + target
-/// path, no thread spawned.
+/// Preview a master build: validation + recipe/precal selection + target
+/// path. Pure DB work (no pixel I/O — precal pixels only ever load inside
+/// the build thread via `load_precal_pixels`), but still run under
+/// `spawn_blocking` so the queries stay off the async executor (matches the
+/// `analyze_frame_set` wrapper precedent).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn preview_master_build(
@@ -25,7 +28,11 @@ pub async fn preview_master_build(
     set_id: i64,
     recipe: MasterRecipe,
 ) -> Result<MasterBuildPreview, String> {
-    api::preview_master_build(&state.ctx, set_id, &recipe).map_err(|e| e.to_string())
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::preview_master_build(&ctx, set_id, &recipe))
+        .await
+        .map_err(|e| format!("Preview task panicked: {}", e))?
+        .map_err(|e| e.to_string())
 }
 
 /// Start a master build. Validates, registers the cancel handle, and spawns

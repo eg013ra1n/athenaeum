@@ -47,12 +47,25 @@ pub struct GetMasterProvenanceArgs {
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 /// POST /api/preview_master_build
+///
+/// Pure DB work (no pixel I/O — precal pixels only ever load inside the
+/// build thread via `load_precal_pixels`), but still run under
+/// `spawn_blocking` so the queries stay off the async executor (matches the
+/// `analyze_frame_set` wrapper precedent).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn preview_master_build(
     State(state): State<WebAppState>,
     Json(args): Json<PreviewMasterBuildArgs>,
 ) -> Result<Json<MasterBuildPreview>, (StatusCode, String)> {
-    api::preview_master_build(&state.ctx, args.set_id, &args.recipe).map(Json).map_err(api_err)
+    let ctx = state.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        api::preview_master_build(&ctx, args.set_id, &args.recipe)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Preview task panicked: {}", e)))?
+    .map_err(api_err)?;
+
+    Ok(Json(result))
 }
 
 /// POST /api/start_master_build
