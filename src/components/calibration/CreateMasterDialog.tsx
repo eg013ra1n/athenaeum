@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
-import { X, Hammer, AlertTriangle, Loader2, XCircle } from 'lucide-react';
+import { X, Hammer, AlertTriangle, Loader2, XCircle, CheckCircle2 } from 'lucide-react';
 import { api } from '../../api';
-import type { MasterBuildPreview, MasterRecipe, CombineMethod } from '../../types/models';
+import type { MasterBuildPreview, MasterRecipe, CombineMethod, RawPrecalSetDto } from '../../types/models';
 import { useMasterBuildContext } from '../../contexts/MasterBuildContext';
 import { useNotifications } from '../../contexts/NotificationContext';
 
@@ -85,6 +85,13 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   const [checkedRawIds, setCheckedRawIds] = useState<Set<number>>(new Set());
   const [batchResults, setBatchResults] = useState<BatchPreviewResult[] | null>(null);
   const [batchLoading, setBatchLoading] = useState(false);
+  // Batch mode only: raw precal candidates (surfaced by a flat row's
+  // `rawPrecalSets`) the operator has checked to add to this batch. Only
+  // holds ids NOT already in `setIds` — a candidate already in the batch
+  // needs no checkbox, it's handled by the `effectiveIds`/in-batch branch
+  // below. See the defaulting effect further down for how this gets
+  // seeded from the original setIds' previews.
+  const [extraRawIds, setExtraRawIds] = useState<Set<number>>(new Set());
   const [combine, setCombine] = useState<CombineChoice>('auto');
   const [sigLo, setSigLo] = useState(3.0);
   const [sigHi, setSigHi] = useState(3.0);
@@ -135,12 +142,22 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     ));
   }, [preview]);
 
-  // Batch mode: preview every set with the current recipe. Same debounce +
-  // stale-guard pattern as the single-set effect above, fanned out with
-  // `Promise.allSettled` so one ineligible/rejected set doesn't take the
-  // whole batch preview down — its row just renders the error instead.
-  // `preview_master_build` is cheap (pure DB, no pixel I/O) so N parallel
-  // calls for a 50-set batch is fine.
+  // Batch mode: the EFFECTIVE batch is the operator-selected setIds plus any
+  // checked `extraRawIds` (raw precal candidates found among those setIds'
+  // own previews — see the discovery effect below). `extraRawIds` never
+  // holds an id already present in `setIds`, so a plain concat is safe.
+  const effectiveIds = useMemo(
+    () => [...setIds, ...Array.from(extraRawIds).filter(id => !setIds.includes(id))],
+    [setIds, extraRawIds]
+  );
+  const effectiveIdSet = useMemo(() => new Set(effectiveIds), [effectiveIds]);
+
+  // Batch mode: preview every set in the EFFECTIVE batch with the current
+  // recipe. Same debounce + stale-guard pattern as the single-set effect
+  // above, fanned out with `Promise.allSettled` so one ineligible/rejected
+  // set doesn't take the whole batch preview down — its row just renders the
+  // error instead. `preview_master_build` is cheap (pure DB, no pixel I/O) so
+  // N parallel calls for a 50-set batch is fine.
   useEffect(() => {
     if (single) return;
     setBatchLoading(true);
@@ -148,20 +165,63 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     const t = setTimeout(() => {
       const r = recipe();
       Promise.allSettled(
-        setIds.map(setId => api.invoke<MasterBuildPreview>('preview_master_build', { setId, recipe: r }))
+        effectiveIds.map(setId => api.invoke<MasterBuildPreview>('preview_master_build', { setId, recipe: r }))
       ).then(settled => {
         if (cancelled) return;
         setBatchResults(settled.map((res, i): BatchPreviewResult =>
           res.status === 'fulfilled'
-            ? { setId: setIds[i], kind: 'ok', preview: res.value }
-            : { setId: setIds[i], kind: 'error', error: String(res.reason) }
+            ? { setId: effectiveIds[i], kind: 'ok', preview: res.value }
+            : { setId: effectiveIds[i], kind: 'error', error: String(res.reason) }
         ));
         setBatchLoading(false);
       });
     }, 250);
     return () => { cancelled = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setIds, combine, sigLo, sigHi, pLo, pHi, syntheticBias]);
+  }, [effectiveIds, combine, sigLo, sigHi, pLo, pHi, syntheticBias]);
+
+  // Discover raw precal candidates from the ORIGINAL setIds' previews only
+  // (never from a candidate row's own preview — darks/bias always report an
+  // empty `rawPrecalSets` per the backend contract, so this can't chain into
+  // new candidates once seeded). `rawCandidatesKey` reduces this to a string
+  // of `setId:frameCount` pairs so the defaulting effect below only re-fires
+  // when the ORIGINAL rows' data actually changes (recipe/setIds), not every
+  // time `batchResults` gets a new array reference — which happens whenever
+  // `extraRawIds` itself changes and refetches the effective batch. Without
+  // this, checking/unchecking a candidate would refetch, which would
+  // re-derive candidates, which would reset the very checkbox the operator
+  // just touched — an infinite fight between operator input and defaulting.
+  const rawCandidates = useMemo(() => {
+    if (!batchResults) return [] as RawPrecalSetDto[];
+    const seen = new Set<number>();
+    const list: RawPrecalSetDto[] = [];
+    for (const row of batchResults) {
+      if (row.kind !== 'ok' || !setIds.includes(row.setId)) continue;
+      for (const c of row.preview.rawPrecalSets) {
+        if (seen.has(c.setId) || setIds.includes(c.setId)) continue;
+        seen.add(c.setId);
+        list.push(c);
+      }
+    }
+    return list;
+  }, [batchResults, setIds]);
+  const rawCandidatesKey = useMemo(
+    () => rawCandidates.map(c => `${c.setId}:${c.frameCount}`).join(','),
+    [rawCandidates]
+  );
+
+  // Default-check candidates at/above the frame-count floor, same rule as
+  // single-set mode. Re-defaulting here on a recipe change is acceptable
+  // (mirrors the single-mode comment above) — it only fires when
+  // `rawCandidatesKey` changes, i.e. the original setIds' own candidate list
+  // changed, not on every batch refetch.
+  useEffect(() => {
+    if (single) return;
+    setExtraRawIds(new Set(
+      rawCandidates.filter(c => c.frameCount >= MIN_MASTER_FRAMES).map(c => c.setId)
+    ));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rawCandidatesKey]);
 
   const sortedBatch = useMemo(() => {
     if (!batchResults) return [];
@@ -171,9 +231,39 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     });
   }, [batchResults]);
 
+  // Which flat row "owns" the add-candidate checkbox when two+ flats
+  // reference the same not-yet-batched raw set — the first flat in build
+  // order renders the checkbox; later ones just show their own in-batch/
+  // warning line per the same effective-batch check (see render below).
+  const firstCandidateOwner = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const row of sortedBatch) {
+      if (row.kind !== 'ok') continue;
+      for (const c of row.preview.rawPrecalSets) {
+        if (!m.has(c.setId)) m.set(c.setId, row.setId);
+      }
+    }
+    return m;
+  }, [sortedBatch]);
+
+  // Per-row warnings with any "#<id> is raw" line suppressed once that
+  // candidate is in the effective batch — mirrors single-mode's
+  // `visibleWarnings` but keyed by row since batch mode has many previews.
+  const batchVisibleWarnings = useMemo(() => {
+    const m = new Map<number, string[]>();
+    if (!batchResults) return m;
+    for (const row of batchResults) {
+      if (row.kind !== 'ok') continue;
+      m.set(row.setId, row.preview.warnings.filter(w =>
+        !row.preview.rawPrecalSets.some(c => effectiveIdSet.has(c.setId) && w.includes(`#${c.setId} is raw`))
+      ));
+    }
+    return m;
+  }, [batchResults, effectiveIdSet]);
+
   const batchOkCount = batchResults?.filter(r => r.kind === 'ok').length ?? 0;
   const batchErrorCount = batchResults?.filter(r => r.kind === 'error').length ?? 0;
-  const batchWarningCount = batchResults?.filter(r => r.kind === 'ok' && r.preview.warnings.length > 0).length ?? 0;
+  const batchWarningCount = batchResults?.filter(r => r.kind === 'ok' && (batchVisibleWarnings.get(r.setId)?.length ?? 0) > 0).length ?? 0;
 
   // Single-set mode: raw precal candidates the operator has ticked to build
   // first. Non-empty here means the start button submits a batch (this set
@@ -218,7 +308,7 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
       } else if (single) {
         await startBuild(setIds[0], recipe());
       } else {
-        await runBatch(setIds);
+        await runBatch(effectiveIds);
       }
       onClose();
     } catch (e) {
@@ -234,7 +324,7 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-medium text-content flex items-center gap-2">
             <Hammer size={16} className="text-accent" />
-            {single ? `Create master from set #${setIds[0]}` : `Create ${setIds.length} masters`}
+            {single ? `Create master from set #${setIds[0]}` : `Create ${effectiveIds.length} masters`}
           </h3>
           <button onClick={onClose} className="text-content-muted hover:text-content"><X size={16} /></button>
         </div>
@@ -356,7 +446,7 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
           <div className="mb-3">
             <div className="text-xs text-content-muted mb-1 flex items-center gap-1.5">
               {batchLoading ? (
-                <><Loader2 size={12} className="animate-spin shrink-0" /> Loading preview for {setIds.length} masters…</>
+                <><Loader2 size={12} className="animate-spin shrink-0" /> Loading preview for {effectiveIds.length} masters…</>
               ) : (
                 `Build order — ${sortedBatch.length} masters:`
               )}
@@ -368,7 +458,7 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                 into the dialog once this list hits its own edge. */}
             <div className="max-h-64 overflow-y-auto overscroll-contain rounded border border-border divide-y divide-border">
               {batchLoading
-                ? setIds.map(id => (
+                ? effectiveIds.map(id => (
                     <div key={id} className="px-2 py-1.5">
                       <div className="h-3.5 w-full rounded bg-surface animate-pulse" />
                     </div>
@@ -408,12 +498,74 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                           <span className="truncate">{row.error}</span>
                         </div>
                       )}
-                      {row.kind === 'ok' && row.preview.warnings.length > 0 && (
-                        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-warning" title={row.preview.warnings.join('\n')}>
+                      {row.kind === 'ok' && (batchVisibleWarnings.get(row.setId)?.length ?? 0) > 0 && (
+                        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-warning" title={batchVisibleWarnings.get(row.setId)!.join('\n')}>
                           <AlertTriangle size={11} className="shrink-0" />
-                          <span className="truncate">{row.preview.warnings[0]}</span>
+                          <span className="truncate">{batchVisibleWarnings.get(row.setId)![0]}</span>
                         </div>
                       )}
+                      {/* Batch-aware precal notes: for each raw candidate a
+                          flat row's preview points at —
+                          1. If it's in the effective batch (a hard `setIds`
+                             member, or a checked `extraRawIds` entry): show
+                             the green confirmation line, for EVERY flat that
+                             references it (the warning above is already
+                             suppressed for this candidate via
+                             `batchVisibleWarnings`).
+                          2. If it's a genuine extra candidate (not a hard
+                             `setIds` member) AND this is the first flat row
+                             that references it: also show its checkbox —
+                             always rendered (checked or not) so the operator
+                             can add/remove it, rather than disappearing once
+                             checked (which would make it impossible to
+                             uncheck). Later flats sharing the same candidate
+                             don't get a second checkbox — the single
+                             `extraRawIds` entry already governs all of them,
+                             they just each get their own green/amber line
+                             above. */}
+                      {row.kind === 'ok' && row.preview.rawPrecalSets.map(c => {
+                        const inEffectiveBatch = effectiveIdSet.has(c.setId);
+                        const isExtraCandidate = !setIds.includes(c.setId);
+                        const isOwner = firstCandidateOwner.get(c.setId) === row.setId;
+                        const tooFewFrames = c.frameCount < MIN_MASTER_FRAMES;
+                        return (
+                          <div key={c.setId} className="mt-0.5 space-y-0.5">
+                            {inEffectiveBatch && (
+                              <div className="flex items-center gap-1 text-[11px] text-success">
+                                <CheckCircle2 size={11} className="shrink-0" />
+                                <span className="truncate">
+                                  {c.calType} master will be built earlier in this batch (set #{c.setId})
+                                </span>
+                              </div>
+                            )}
+                            {isExtraCandidate && isOwner && (
+                              <label className={`flex items-start gap-1.5 text-[11px] ${tooFewFrames ? 'opacity-50' : ''}`}>
+                                <input
+                                  type="checkbox"
+                                  className="mt-0.5"
+                                  checked={extraRawIds.has(c.setId)}
+                                  disabled={tooFewFrames}
+                                  onChange={e => setExtraRawIds(prev => {
+                                    const next = new Set(prev);
+                                    if (e.target.checked) next.add(c.setId); else next.delete(c.setId);
+                                    return next;
+                                  })}
+                                />
+                                <span className={tooFewFrames ? 'text-content-muted' : 'text-content-secondary'}>
+                                  Add{' '}
+                                  <span className={`font-mono text-[10px] font-bold rounded px-1 py-0.5 ${typeBadgeClass(c.calType)}`}>
+                                    {c.calType}
+                                  </span>{' '}
+                                  master build from set #{c.setId} first (× {c.frameCount} frames)
+                                  {tooFewFrames && (
+                                    <span className="text-content-muted"> (only {c.frameCount} frames — minimum {MIN_MASTER_FRAMES})</span>
+                                  )}
+                                </span>
+                              </label>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   ))
               }
