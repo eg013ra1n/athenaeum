@@ -432,7 +432,17 @@ flatPrecal: string | null,
 /**
  * Absolute, collision-resolved.
  */
-targetPath: string, warnings: Array<string>, };
+targetPath: string, warnings: Array<string>, 
+/**
+ * Raw (non-master) sub-cal sets encountered while resolving flat
+ * pre-cal (see `select_flat_precal`'s DarkFlat -> Dark -> Bias
+ * fallback chain) — lets the caller offer a "build its master first"
+ * shortcut instead of just surfacing the warning string. Always empty
+ * for non-flat previews.
+ */
+rawPrecalSets: Array<RawPrecalSetDto>, };
+
+export type RawPrecalSetDto = { setId: number, calType: string, frameCount: number, };
 
 export type MasterProvenanceInfo = { masterSetId: number, sourceSetId: number | null, recipeJson: string, memberCount: number, memberHash: string, createdAt: string, 
 /**

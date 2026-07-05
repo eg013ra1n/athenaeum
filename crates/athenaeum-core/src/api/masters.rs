@@ -88,6 +88,24 @@ pub struct MasterBuildPreview {
     /// Absolute, collision-resolved.
     pub target_path: String,
     pub warnings: Vec<String>,
+    /// Raw (non-master) sub-cal sets encountered while resolving flat
+    /// pre-cal (see `select_flat_precal`'s DarkFlat -> Dark -> Bias
+    /// fallback chain) — lets the caller offer a "build its master first"
+    /// shortcut instead of just surfacing the warning string. Always empty
+    /// for non-flat previews.
+    pub raw_precal_sets: Vec<RawPrecalSetDto>,
+}
+
+/// Wire DTO for a raw sub-cal set a flat's pre-cal chain skipped over.
+/// `cal_type` is the link type ("DarkFlat" | "Dark" | "Bias"), not the raw
+/// set's own `imagetyp` — they're the same string in practice, but `cal_type`
+/// is what the fallback chain was looking for at that step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RawPrecalSetDto {
+    pub set_id: i64,
+    pub cal_type: String,
+    pub frame_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
@@ -232,37 +250,66 @@ impl PrecalChoice {
     }
 }
 
+/// A raw (non-master) sub-cal set encountered while walking the flat's
+/// DarkFlat -> Dark -> Bias fallback chain, before landing on a usable
+/// master (or falling all the way through). `cal_type` is the link type the
+/// chain was looking for at that step ("DarkFlat" | "Dark" | "Bias").
+#[derive(Debug, Clone, PartialEq)]
+struct RawPrecalCandidate {
+    set_id: i64,
+    cal_type: String,
+    frame_count: i64,
+}
+
+/// Full result of `select_flat_precal`: the WHAT (`PrecalChoice`), any
+/// warnings collected along the way, and every raw sub-cal set skipped en
+/// route — the last of these is what lets `preview_master_build` offer a
+/// "build its master first" shortcut instead of just the warning string.
+struct PrecalSelection {
+    choice: PrecalChoice,
+    warnings: Vec<String>,
+    raw_candidates: Vec<RawPrecalCandidate>,
+}
+
 /// Flat pre-cal selection per spec §9 fallback chain — pure DB, no pixel
 /// I/O. Walks the sub-cal links of this flat set by type preference
 /// (DarkFlat → exposure-matched Dark(±0.5s) → Bias), skipping raw
-/// (non-master) links with a warning. Falls back to the recipe's synthetic
-/// bias, then to `PrecalChoice::None` + warning.
+/// (non-master) links with a warning (and recording them as
+/// `raw_candidates`). Falls back to the recipe's synthetic bias, then to
+/// `PrecalChoice::None` + warning.
 ///
-/// Called by `preview_master_build` (description only) AND inside the build
-/// thread (so a just-built darkflat master — earlier in a batch — is
-/// visible at build time, not preview time).
+/// Called by `preview_master_build` (description + raw-candidate surfacing)
+/// AND inside the build thread (so a just-built darkflat master — earlier in
+/// a batch — is visible at build time, not preview time; the build thread
+/// only uses `.choice`, it ignores `raw_candidates`).
 fn select_flat_precal(
     conn: &rusqlite::Connection,
     set_id: i64,
     set_exptime: Option<f64>,
     synthetic_bias: Option<f64>,
-) -> Result<(PrecalChoice, Vec<String>), ApiError> {
+) -> Result<PrecalSelection, ApiError> {
     let mut warnings = Vec::new();
+    let mut raw_candidates = Vec::new();
     // sub-cal links of this flat set, by type preference
     for cal_type in ["DarkFlat", "Dark", "Bias"] {
-        let row: Option<(i64, String, i64, Option<f64>)> = conn.query_row(
-            "SELECT cs.id, cs.imagetyp, cs.is_master_library, cs.exptime
+        let row: Option<(i64, String, i64, Option<f64>, i64)> = conn.query_row(
+            "SELECT cs.id, cs.imagetyp, cs.is_master_library, cs.exptime, cs.frame_count
              FROM calibration_set_to_frames l
              JOIN calibration_set cs ON cs.id = l.calibration_set_id
              WHERE l.source_id = ?1 AND l.source_type = 'calibration_set'
                AND l.calibration_type = ?2",
             rusqlite::params![set_id, cal_type],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         ).optional()?;
-        let Some((precal_set, imagetyp, is_master, precal_expt)) = row else { continue };
+        let Some((precal_set, imagetyp, is_master, precal_expt, precal_frame_count)) = row else { continue };
         if is_master != 1 {
             warnings.push(format!(
                 "linked {cal_type} set #{precal_set} is raw — build its master first (skipped)"));
+            raw_candidates.push(RawPrecalCandidate {
+                set_id: precal_set,
+                cal_type: cal_type.to_string(),
+                frame_count: precal_frame_count,
+            });
             continue;
         }
         if cal_type == "Dark" {
@@ -284,16 +331,17 @@ fn select_flat_precal(
              WHERE csf.set_id = ?1 LIMIT 1",
             [precal_set], |r| r.get(0),
         )?;
-        return Ok((
-            PrecalChoice::Master { set_id: precal_set, imagetyp, cal_type, path },
+        return Ok(PrecalSelection {
+            choice: PrecalChoice::Master { set_id: precal_set, imagetyp, cal_type, path },
             warnings,
-        ));
+            raw_candidates,
+        });
     }
     if let Some(b) = synthetic_bias {
-        return Ok((PrecalChoice::Synthetic(b), warnings));
+        return Ok(PrecalSelection { choice: PrecalChoice::Synthetic(b), warnings, raw_candidates });
     }
     warnings.push("no pre-calibration master linked and no synthetic bias set — flat combined un-pre-calibrated (vignetting zero level slightly off)".into());
-    Ok((PrecalChoice::None, warnings))
+    Ok(PrecalSelection { choice: PrecalChoice::None, warnings, raw_candidates })
 }
 
 /// Materializes a `PrecalChoice` into engine-ready pixels. The Master arm
@@ -495,11 +543,16 @@ pub fn preview_master_build(
     let resolved_combine = resolve_combine(recipe.combine, &set.imagetyp, set.frame_count);
     let is_flat = set.imagetyp == "Flat";
     // Selection only (pure DB) — preview never loads precal pixels.
-    let (flat_precal, warnings) = if is_flat {
-        let (choice, warnings) = select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?;
-        (choice.describe(), warnings)
+    let (flat_precal, warnings, raw_precal_sets) = if is_flat {
+        let sel = select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?;
+        let raw_precal_sets = sel.raw_candidates.into_iter().map(|c| RawPrecalSetDto {
+            set_id: c.set_id,
+            cal_type: c.cal_type,
+            frame_count: c.frame_count,
+        }).collect();
+        (sel.choice.describe(), sel.warnings, raw_precal_sets)
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), Vec::new())
     };
 
     let inputs = load_header_inputs(&conn, set_id)?;
@@ -525,6 +578,7 @@ pub fn preview_master_build(
         flat_precal,
         target_path,
         warnings,
+        raw_precal_sets,
     })
 }
 
@@ -649,10 +703,15 @@ fn run_build(
 
     let is_flat = set.imagetyp == "Flat";
     let resolved_combine = resolve_combine(recipe.combine, &set.imagetyp, set.frame_count);
-    let (precal_choice, _warnings) = if is_flat {
-        select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?
+    // The build thread only cares about the resolved choice — `raw_candidates`
+    // is a preview-only affordance (the "build its master first" checkboxes);
+    // by build time any raw dependency the operator wanted addressed was
+    // already submitted earlier in the same batch (see `plan_batch`/dependency
+    // ordering), so there's nothing actionable left to do with it here.
+    let precal_choice = if is_flat {
+        select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?.choice
     } else {
-        (PrecalChoice::None, Vec::new())
+        PrecalChoice::None
     };
     let precal_desc = precal_choice.describe();
 
@@ -1407,17 +1466,18 @@ mod tests {
         let bias = seed_precal_set(&conn, "MasterBias", 1, None);
         link(&conn, flat, bias, "Bias");
 
-        let (choice, warnings) = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
-        match &choice {
+        let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
+        assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
+        match &sel.choice {
             PrecalChoice::Master { set_id, cal_type, .. } => {
                 assert_eq!(*set_id, df);
                 assert_eq!(*cal_type, "DarkFlat");
             }
             other => panic!("expected darkflat master, got {other:?}"),
         }
-        assert!(choice.describe().unwrap().contains("darkflat master"),
-            "{:?}", choice.describe());
+        assert!(sel.choice.describe().unwrap().contains("darkflat master"),
+            "{:?}", sel.choice.describe());
+        assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
     #[test]
@@ -1427,9 +1487,10 @@ mod tests {
         let dark = seed_precal_set(&conn, "MasterDark", 1, Some(2.3)); // within ±0.5s
         link(&conn, flat, dark, "Dark");
 
-        let (choice, warnings) = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert!(matches!(choice, PrecalChoice::Master { cal_type: "Dark", .. }), "{choice:?}");
+        let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
+        assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
+        assert!(matches!(sel.choice, PrecalChoice::Master { cal_type: "Dark", .. }), "{:?}", sel.choice);
+        assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
     #[test]
@@ -1439,11 +1500,14 @@ mod tests {
         let dark = seed_precal_set(&conn, "MasterDark", 1, Some(4.0)); // off by 2s
         link(&conn, flat, dark, "Dark");
 
-        let (choice, warnings) = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
-        assert!(matches!(choice, PrecalChoice::None), "{choice:?}");
-        assert!(warnings.iter().any(|w| w.contains("exposure does not match")), "{warnings:?}");
+        let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
+        assert!(matches!(sel.choice, PrecalChoice::None), "{:?}", sel.choice);
+        assert!(sel.warnings.iter().any(|w| w.contains("exposure does not match")), "{:?}", sel.warnings);
         // fell all the way through: also carries the un-pre-calibrated warning
-        assert!(warnings.iter().any(|w| w.contains("un-pre-calibrated")), "{warnings:?}");
+        assert!(sel.warnings.iter().any(|w| w.contains("un-pre-calibrated")), "{:?}", sel.warnings);
+        // a mismatched-exposure dark master is skipped for a different reason
+        // than "raw" — it's not a build-a-master-first candidate.
+        assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
     #[test]
@@ -1452,10 +1516,15 @@ mod tests {
         let flat = seed_flat_set(&conn, 2.0);
         let raw_df = seed_precal_set(&conn, "DarkFlat", 0, Some(2.0)); // NOT a master
         link(&conn, flat, raw_df, "DarkFlat");
+        // Give the raw set a realistic member count (seed_precal_set hardcodes
+        // 1, since it's normally a 1:1 MASTER set) so the reported
+        // `frame_count` is actually exercised.
+        conn.execute("UPDATE calibration_set SET frame_count = 12 WHERE id = ?1", [raw_df]).unwrap();
         let bias = seed_precal_set(&conn, "MasterBias", 1, None);
         link(&conn, flat, bias, "Bias");
 
-        let (choice, warnings) = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
+        let PrecalSelection { choice, warnings, raw_candidates } =
+            select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
         assert!(warnings.iter().any(|w| w.contains("build its master first")), "{warnings:?}");
         match &choice {
             PrecalChoice::Master { set_id, cal_type, .. } => {
@@ -1464,6 +1533,13 @@ mod tests {
             }
             other => panic!("expected bias master fallback, got {other:?}"),
         }
+        // The skipped raw darkflat is reported as a "build its master first"
+        // candidate, not silently dropped.
+        assert_eq!(raw_candidates, vec![RawPrecalCandidate {
+            set_id: raw_df,
+            cal_type: "DarkFlat".to_string(),
+            frame_count: 12,
+        }]);
     }
 
     #[test]
@@ -1473,10 +1549,11 @@ mod tests {
         let bias = seed_precal_set(&conn, "MasterBias", 1, None);
         link(&conn, flat, bias, "Bias");
 
-        let (choice, warnings) = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert!(matches!(choice, PrecalChoice::Master { cal_type: "Bias", .. }), "{choice:?}");
-        assert!(choice.describe().unwrap().contains("bias master"), "{:?}", choice.describe());
+        let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
+        assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
+        assert!(matches!(sel.choice, PrecalChoice::Master { cal_type: "Bias", .. }), "{:?}", sel.choice);
+        assert!(sel.choice.describe().unwrap().contains("bias master"), "{:?}", sel.choice.describe());
+        assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
     #[test]
@@ -1484,10 +1561,11 @@ mod tests {
         let conn = test_conn();
         let flat = seed_flat_set(&conn, 2.0);
 
-        let (choice, warnings) = select_flat_precal(&conn, flat, Some(2.0), Some(500.0)).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(choice, PrecalChoice::Synthetic(500.0));
-        assert_eq!(choice.describe().as_deref(), Some("synthetic bias 500 ADU"));
+        let sel = select_flat_precal(&conn, flat, Some(2.0), Some(500.0)).unwrap();
+        assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
+        assert_eq!(sel.choice, PrecalChoice::Synthetic(500.0));
+        assert_eq!(sel.choice.describe().as_deref(), Some("synthetic bias 500 ADU"));
+        assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
     #[test]
@@ -1495,10 +1573,11 @@ mod tests {
         let conn = test_conn();
         let flat = seed_flat_set(&conn, 2.0);
 
-        let (choice, warnings) = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
-        assert!(matches!(choice, PrecalChoice::None), "{choice:?}");
-        assert_eq!(choice.describe(), Option::None);
-        assert!(warnings.iter().any(|w| w.contains("un-pre-calibrated")), "{warnings:?}");
+        let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
+        assert!(matches!(sel.choice, PrecalChoice::None), "{:?}", sel.choice);
+        assert_eq!(sel.choice.describe(), Option::None);
+        assert!(sel.warnings.iter().any(|w| w.contains("un-pre-calibrated")), "{:?}", sel.warnings);
+        assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
     // ── plan_batch (pure DB — Task 13 dependency-ordering + skip reasons) ───

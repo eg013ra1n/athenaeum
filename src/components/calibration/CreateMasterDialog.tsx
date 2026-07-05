@@ -68,12 +68,21 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+// Mirrors `MIN_MASTER_FRAMES` in crates/athenaeum-core/src/api/masters.rs —
+// kept as a literal here since the constant isn't exposed across the IPC
+// boundary; a raw precal candidate below this floor can't itself be built
+// into a master, so its checkbox renders disabled+muted instead of checked.
+const MIN_MASTER_FRAMES = 3;
+
 export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps) {
   const { startBuild, startBatch } = useMasterBuildContext();
   const { notify } = useNotifications();
   const single = setIds.length === 1;
   const [preview, setPreview] = useState<MasterBuildPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  // Single-set mode only: which of `preview.rawPrecalSets` the operator wants
+  // built as a master BEFORE this one (see the effect below for defaulting).
+  const [checkedRawIds, setCheckedRawIds] = useState<Set<number>>(new Set());
   const [batchResults, setBatchResults] = useState<BatchPreviewResult[] | null>(null);
   const [batchLoading, setBatchLoading] = useState(false);
   const [combine, setCombine] = useState<CombineChoice>('auto');
@@ -111,6 +120,20 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     return () => { cancelled = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setIds, combine, sigLo, sigHi, pLo, pHi, syntheticBias]);
+
+  // Re-derive default-checked raw-precal candidates whenever a new preview
+  // resolves. A recipe change (e.g. toggling synthetic bias) can change
+  // which candidates even appear, so this deliberately resets any manual
+  // check/uncheck the operator made against the PREVIOUS preview rather than
+  // trying to preserve it across an unrelated set of candidates — simplest
+  // correct behavior, and previews are cheap enough that re-checking is a
+  // non-issue in practice.
+  useEffect(() => {
+    if (!preview) return;
+    setCheckedRawIds(new Set(
+      preview.rawPrecalSets.filter(c => c.frameCount >= MIN_MASTER_FRAMES).map(c => c.setId)
+    ));
+  }, [preview]);
 
   // Batch mode: preview every set with the current recipe. Same debounce +
   // stale-guard pattern as the single-set effect above, fanned out with
@@ -152,26 +175,50 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   const batchErrorCount = batchResults?.filter(r => r.kind === 'error').length ?? 0;
   const batchWarningCount = batchResults?.filter(r => r.kind === 'ok' && r.preview.warnings.length > 0).length ?? 0;
 
+  // Single-set mode: raw precal candidates the operator has ticked to build
+  // first. Non-empty here means the start button submits a batch (this set
+  // PLUS its checked dependencies) instead of a lone `startBuild` — the
+  // backend's existing dependency ordering (`plan_batch` / `type_build_rank`)
+  // takes care of sequencing bias/darkflat/dark before this flat.
+  const checkedRawIdsList = useMemo(() => Array.from(checkedRawIds), [checkedRawIds]);
+  const willBatchRawFirst = single && checkedRawIdsList.length > 0;
+
+  // Warnings of the form "linked <Type> set #<id> is raw — build its master
+  // first (skipped)" are suppressed once the operator has checked that
+  // candidate's box — the warning is being actively addressed, not ignored.
+  const visibleWarnings = useMemo(() => {
+    if (!preview) return [];
+    return preview.warnings.filter(w =>
+      !preview.rawPrecalSets.some(c => checkedRawIds.has(c.setId) && w.includes(`#${c.setId} is raw`))
+    );
+  }, [preview, checkedRawIds]);
+
+  const runBatch = async (ids: number[]) => {
+    const report = await startBatch(ids, recipe());
+    if (report.skipped.length > 0) {
+      const detail = report.skipped
+        .slice(0, 5)
+        .map(s => `#${s.setId}: ${s.reason}`)
+        .join('\n');
+      notify({
+        title: `${report.startedSetIds.length} builds started, ${report.skipped.length} skipped`,
+        detail,
+        kind: 'masterbuild',
+        tone: 'warning',
+      });
+    }
+  };
+
   const start = async () => {
     setStarting(true);
     setStartError(null);
     try {
-      if (single) {
+      if (willBatchRawFirst) {
+        await runBatch([...checkedRawIdsList, setIds[0]]);
+      } else if (single) {
         await startBuild(setIds[0], recipe());
       } else {
-        const report = await startBatch(setIds, recipe());
-        if (report.skipped.length > 0) {
-          const detail = report.skipped
-            .slice(0, 5)
-            .map(s => `#${s.setId}: ${s.reason}`)
-            .join('\n');
-          notify({
-            title: `${report.startedSetIds.length} builds started, ${report.skipped.length} skipped`,
-            detail,
-            kind: 'masterbuild',
-            tone: 'warning',
-          });
-        }
+        await runBatch(setIds);
       }
       onClose();
     } catch (e) {
@@ -232,20 +279,74 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
           Archive originals to zip after the master is built
         </label>
 
-        {/* Preview (single-set only) */}
+        {/* Preview (single-set only) — same visual language as the batch
+            rows below: type badge + id + frame count header, short-form
+            combine method, muted flat pre-cal line, mono truncated target
+            basename (title = full path), amber warning rows. */}
         {single && preview && (
           <div className="bg-surface rounded p-2.5 border border-border text-xs space-y-1 mb-3">
-            <div><span className="text-content-muted">Frames:</span> <span className="text-content">{preview.frameCount}</span></div>
-            <div><span className="text-content-muted">Method:</span> <span className="text-content font-mono">{JSON.stringify(preview.resolvedCombine)}</span></div>
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`shrink-0 font-mono text-[10px] font-bold rounded px-1 py-0.5 ${typeBadgeClass(preview.imagetyp)}`}
+              >
+                {preview.imagetyp}
+              </span>
+              <span className="font-mono text-content-muted shrink-0">#{preview.setId}</span>
+              <span className="text-content-secondary shrink-0">× {preview.frameCount} frames</span>
+            </div>
+            <div><span className="text-content-muted">Method:</span> <span className="text-content">{formatCombine(preview.resolvedCombine)}</span></div>
             {preview.flatPrecal && (
-              <div><span className="text-content-muted">Flat pre-cal:</span> <span className="text-content">{preview.flatPrecal}</span></div>
+              <div className="text-content-muted">Flat pre-cal: {preview.flatPrecal}</div>
             )}
-            <div><span className="text-content-muted">Target:</span> <span className="text-content font-mono break-all">{preview.targetPath}</span></div>
-            {preview.warnings.map((w, i) => (
-              <div key={i} className="flex items-start gap-1 text-warning">
-                <AlertTriangle size={12} className="mt-0.5 shrink-0" />{w}
+            <div className="flex items-center gap-1">
+              <span className="text-content-muted shrink-0">Target:</span>
+              <span className="font-mono text-content truncate flex-1 min-w-0" title={preview.targetPath}>
+                {basename(preview.targetPath)}
+              </span>
+            </div>
+            {visibleWarnings.map((w, i) => (
+              <div key={i} className="flex items-start gap-1 text-warning" title={w}>
+                <AlertTriangle size={12} className="mt-0.5 shrink-0" /><span>{w}</span>
               </div>
             ))}
+          </div>
+        )}
+
+        {/* "Build raw sub-cal masters first" (single-set, flat-precal-hits-raw only) */}
+        {single && preview && preview.rawPrecalSets.length > 0 && (
+          <div className="bg-surface rounded p-2.5 border border-border text-xs space-y-1.5 mb-3">
+            <div className="text-content-secondary font-medium">Build raw sub-cal masters first</div>
+            {preview.rawPrecalSets.map(c => {
+              const tooFewFrames = c.frameCount < MIN_MASTER_FRAMES;
+              return (
+                <label key={c.setId} className={`flex items-start gap-2 ${tooFewFrames ? 'opacity-50' : ''}`}>
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={checkedRawIds.has(c.setId)}
+                    disabled={tooFewFrames}
+                    onChange={e => setCheckedRawIds(prev => {
+                      const next = new Set(prev);
+                      if (e.target.checked) next.add(c.setId); else next.delete(c.setId);
+                      return next;
+                    })}
+                  />
+                  <span className={tooFewFrames ? 'text-content-muted' : 'text-content'}>
+                    Build{' '}
+                    <span className={`font-mono text-[10px] font-bold rounded px-1 py-0.5 ${typeBadgeClass(c.calType)}`}>
+                      {c.calType}
+                    </span>{' '}
+                    master from set #{c.setId} first (× {c.frameCount} frames)
+                    {tooFewFrames && (
+                      <span className="text-content-muted"> (only {c.frameCount} frames — minimum {MIN_MASTER_FRAMES})</span>
+                    )}
+                  </span>
+                </label>
+              );
+            })}
+            <div className="text-content-muted italic">
+              The flat will automatically use the new master (links are repointed after each build).
+            </div>
           </div>
         )}
         {previewError && <div className="text-xs text-error mb-2">{previewError}</div>}
@@ -332,7 +433,11 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
           <button onClick={onClose} className="px-3 py-1.5 text-sm text-content-secondary hover:bg-surface-hover rounded">Cancel</button>
           <button onClick={start} disabled={starting}
                   className="px-3 py-1.5 bg-accent hover:bg-accent-hover text-white text-sm rounded disabled:opacity-50">
-            {starting ? 'Starting…' : single ? 'Create master' : 'Create all'}
+            {starting
+              ? 'Starting…'
+              : willBatchRawFirst
+                ? `Create ${checkedRawIdsList.length + 1} masters`
+                : single ? 'Create master' : 'Create all'}
           </button>
         </div>
       </div>

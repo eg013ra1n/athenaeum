@@ -132,6 +132,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::integration::combine::CombineMethod,
             crate::api::masters::MasterRecipe,
             crate::api::masters::MasterBuildPreview,
+            crate::api::masters::RawPrecalSetDto,
             crate::api::masters::MasterProvenanceInfo,
             crate::api::masters::BatchBuildReport,
             crate::api::masters::BatchSkip,
