@@ -545,7 +545,11 @@ pub(crate) fn check_library_dir_exists(dir: &str) -> Result<(), ApiError> {
 /// could progress, everyone timed out after the pool's 30s checkout wait,
 /// and `Database::conn()` panicked (`db/mod.rs:124`). Call this ONLY with a
 /// connection the caller already owns; never acquire a fresh one inside.
-fn library_dir_or_err(conn: &rusqlite::Connection) -> Result<std::path::PathBuf, ApiError> {
+///
+/// `pub(crate)` so the light-calibration orchestration (`api::lights`) resolves
+/// the calibrated-output root through the exact same precedence + on-disk
+/// existence check as master builds.
+pub(crate) fn library_dir_or_err(conn: &rusqlite::Connection) -> Result<std::path::PathBuf, ApiError> {
     let dir = crate::api::scan_roots::resolve_calibration_library_dir(conn)?
         .ok_or_else(|| ApiError::Invalid(
             "no calibration library folder configured — set one before building masters".into(),
@@ -2186,6 +2190,7 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
@@ -2314,6 +2319,7 @@ mod tests {
             active_registrations: Arc::new(Mutex::new(HashMap::new())),
             active_archives: Arc::new(Mutex::new(HashMap::new())),
             active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),

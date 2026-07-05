@@ -177,6 +177,7 @@ async fn main() {
         active_registrations: Arc::new(Mutex::new(HashMap::new())),
         active_archives: Arc::new(Mutex::new(HashMap::new())),
         active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+        active_light_cal: Arc::new(Mutex::new(HashMap::new())),
         dso_catalog: Arc::new(std::sync::RwLock::new(None)),
         star_cache: Arc::new(std::sync::RwLock::new(None)),
         bright_cache: Arc::new(std::sync::RwLock::new(None)),
