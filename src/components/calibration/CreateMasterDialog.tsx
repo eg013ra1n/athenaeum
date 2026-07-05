@@ -211,10 +211,15 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   );
 
   // Default-check candidates at/above the frame-count floor, same rule as
-  // single-set mode. Re-defaulting here on a recipe change is acceptable
-  // (mirrors the single-mode comment above) — it only fires when
-  // `rawCandidatesKey` changes, i.e. the original setIds' own candidate list
-  // changed, not on every batch refetch.
+  // single-set mode. `rawCandidatesKey` only changes when the ORIGINAL
+  // setIds' own raw-precal candidates actually change — e.g. a build or
+  // relink happening elsewhere in the DB between refetches — NOT on a
+  // recipe edit: `select_flat_precal`'s raw-candidate walk doesn't depend on
+  // the recipe (synthetic bias only affects the *final* fallback choice
+  // when nothing is linked at all, not which raw sets get surfaced as
+  // candidates). So toggling combine method / sigma / synthetic bias
+  // re-fetches previews but leaves this effect alone, preserving whatever
+  // the operator has manually checked/unchecked.
   useEffect(() => {
     if (single) return;
     setExtraRawIds(new Set(
@@ -235,31 +240,55 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   // reference the same not-yet-batched raw set — the first flat in build
   // order renders the checkbox; later ones just show their own in-batch/
   // warning line per the same effective-batch check (see render below).
+  // Restricted to rows whose setId is an ORIGINAL setIds member — same
+  // guard as `rawCandidates` above — so this doesn't lean on the unstated
+  // (if currently true) backend invariant that non-Flat rows always report
+  // an empty `rawPrecalSets`; only original flats are ever a source of
+  // candidate ownership here.
   const firstCandidateOwner = useMemo(() => {
     const m = new Map<number, number>();
     for (const row of sortedBatch) {
-      if (row.kind !== 'ok') continue;
+      if (row.kind !== 'ok' || !setIds.includes(row.setId)) continue;
       for (const c of row.preview.rawPrecalSets) {
         if (!m.has(c.setId)) m.set(c.setId, row.setId);
       }
     }
     return m;
-  }, [sortedBatch]);
+  }, [sortedBatch, setIds]);
+
+  // Lookup of each fetched row's resolution kind, keyed by setId — lets the
+  // "in effective batch" checks below also confirm the CANDIDATE's own
+  // preview actually resolved ok, not just that its id is a member of
+  // `effectiveIds`. A candidate can be in-batch yet have a rejected preview
+  // (e.g. concurrently superseded elsewhere) — its own row then renders red
+  // "will be skipped", and a sibling flat must not claim the dependency is
+  // covered in that case.
+  const resultKindBySetId = useMemo(() => {
+    const m = new Map<number, BatchPreviewResult['kind']>();
+    if (!batchResults) return m;
+    for (const row of batchResults) m.set(row.setId, row.kind);
+    return m;
+  }, [batchResults]);
 
   // Per-row warnings with any "#<id> is raw" line suppressed once that
-  // candidate is in the effective batch — mirrors single-mode's
-  // `visibleWarnings` but keyed by row since batch mode has many previews.
+  // candidate is in the effective batch AND its own preview resolved ok —
+  // mirrors single-mode's `visibleWarnings` but keyed by row since batch
+  // mode has many previews.
   const batchVisibleWarnings = useMemo(() => {
     const m = new Map<number, string[]>();
     if (!batchResults) return m;
     for (const row of batchResults) {
       if (row.kind !== 'ok') continue;
       m.set(row.setId, row.preview.warnings.filter(w =>
-        !row.preview.rawPrecalSets.some(c => effectiveIdSet.has(c.setId) && w.includes(`#${c.setId} is raw`))
+        !row.preview.rawPrecalSets.some(c =>
+          effectiveIdSet.has(c.setId) &&
+          resultKindBySetId.get(c.setId) === 'ok' &&
+          w.includes(`#${c.setId} is raw`)
+        )
       ));
     }
     return m;
-  }, [batchResults, effectiveIdSet]);
+  }, [batchResults, effectiveIdSet, resultKindBySetId]);
 
   const batchOkCount = batchResults?.filter(r => r.kind === 'ok').length ?? 0;
   const batchErrorCount = batchResults?.filter(r => r.kind === 'error').length ?? 0;
@@ -506,12 +535,20 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                       )}
                       {/* Batch-aware precal notes: for each raw candidate a
                           flat row's preview points at —
-                          1. If it's in the effective batch (a hard `setIds`
-                             member, or a checked `extraRawIds` entry): show
-                             the green confirmation line, for EVERY flat that
+                          1. If it's in the effective batch AND its own
+                             preview resolved ok (a hard `setIds` member, or
+                             a checked `extraRawIds` entry): show the green
+                             confirmation line, for EVERY flat that
                              references it (the warning above is already
                              suppressed for this candidate via
                              `batchVisibleWarnings`).
+                          1b. If it's in the effective batch but its own
+                             preview REJECTED (e.g. concurrently superseded —
+                             its own row renders red "will be skipped"):
+                             show an error-tone line instead of the green
+                             one, and leave the amber raw-warning above
+                             un-suppressed — the dependency is NOT actually
+                             covered, don't let the operator believe it is.
                           2. If it's a genuine extra candidate (not a hard
                              `setIds` member) AND this is the first flat row
                              that references it: also show its checkbox —
@@ -521,10 +558,12 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                              uncheck). Later flats sharing the same candidate
                              don't get a second checkbox — the single
                              `extraRawIds` entry already governs all of them,
-                             they just each get their own green/amber line
-                             above. */}
+                             they just each get their own green/amber/error
+                             line above. */}
                       {row.kind === 'ok' && row.preview.rawPrecalSets.map(c => {
-                        const inEffectiveBatch = effectiveIdSet.has(c.setId);
+                        const candidateResultKind = resultKindBySetId.get(c.setId);
+                        const inEffectiveBatch = effectiveIdSet.has(c.setId) && candidateResultKind === 'ok';
+                        const inBatchButFailed = effectiveIdSet.has(c.setId) && candidateResultKind === 'error';
                         const isExtraCandidate = !setIds.includes(c.setId);
                         const isOwner = firstCandidateOwner.get(c.setId) === row.setId;
                         const tooFewFrames = c.frameCount < MIN_MASTER_FRAMES;
@@ -535,6 +574,14 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                                 <CheckCircle2 size={11} className="shrink-0" />
                                 <span className="truncate">
                                   {c.calType} master will be built earlier in this batch (set #{c.setId})
+                                </span>
+                              </div>
+                            )}
+                            {inBatchButFailed && (
+                              <div className="flex items-center gap-1 text-[11px] text-error">
+                                <XCircle size={11} className="shrink-0" />
+                                <span className="truncate">
+                                  {c.calType} set #{c.setId} is in this batch but its preview failed — will be skipped
                                 </span>
                               </div>
                             )}
