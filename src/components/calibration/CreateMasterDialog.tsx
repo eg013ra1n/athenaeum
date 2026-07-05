@@ -22,6 +22,41 @@ function toCombineMethod(c: CombineChoice, sigLo: number, sigHi: number, pLo: nu
   }
 }
 
+// Batch preview fan-out is capped at this many concurrent `preview_master_build`
+// calls (see `settledWithConcurrency` below). `preview_master_build` acquires
+// one pooled DB connection per call (backend invariant, `masters.rs`) rather
+// than deadlocking the pool like it used to, but an unbounded fan-out — one
+// call per calibration set, and a batch can have dozens — would still stampede
+// the pool alongside whatever else the app is doing (scans, other tabs), so
+// keep the burst small regardless.
+const PREVIEW_FANOUT_LIMIT = 6;
+
+// `Promise.allSettled` over `items.map(fn)`, but running at most `limit` calls
+// of `fn` concurrently at a time. Preserves `items`' order in the returned
+// array, and per-item fulfilled/rejected semantics — same contract as
+// `Promise.allSettled`, just throttled. Simple shared-cursor worker pool
+// (same pattern as `useDeepVerify`'s bounded-concurrency slots).
+async function settledWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let cursor = 0;
+  async function runSlot() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      try {
+        results[i] = { status: 'fulfilled', value: await fn(items[i]) };
+      } catch (error) {
+        results[i] = { status: 'rejected', reason: error };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runSlot));
+  return results;
+}
+
 // One row of the batch preview list — either a resolved preview, or the
 // ApiError string `preview_master_build` rejected with (same validation as
 // `start`, so an ineligible set here means it'll be skipped server-side too).
@@ -154,18 +189,21 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
 
   // Batch mode: preview every set in the EFFECTIVE batch with the current
   // recipe. Same debounce + stale-guard pattern as the single-set effect
-  // above, fanned out with `Promise.allSettled` so one ineligible/rejected
-  // set doesn't take the whole batch preview down — its row just renders the
-  // error instead. `preview_master_build` is cheap (pure DB, no pixel I/O) so
-  // N parallel calls for a 50-set batch is fine.
+  // above, fanned out (at most `PREVIEW_FANOUT_LIMIT` concurrent calls — see
+  // `settledWithConcurrency`) so one ineligible/rejected set doesn't take the
+  // whole batch preview down — its row just renders the error instead.
+  // `preview_master_build` is cheap (pure DB, no pixel I/O) but a large batch
+  // (dozens of calibration sets) firing every call at once would still
+  // stampede the backend's pooled DB connections, hence the cap.
   useEffect(() => {
     if (single) return;
     setBatchLoading(true);
     let cancelled = false;
     const t = setTimeout(() => {
       const r = recipe();
-      Promise.allSettled(
-        effectiveIds.map(setId => api.invoke<MasterBuildPreview>('preview_master_build', { setId, recipe: r }))
+      settledWithConcurrency(
+        effectiveIds, PREVIEW_FANOUT_LIMIT,
+        setId => api.invoke<MasterBuildPreview>('preview_master_build', { setId, recipe: r })
       ).then(settled => {
         if (cancelled) return;
         setBatchResults(settled.map((res, i): BatchPreviewResult =>

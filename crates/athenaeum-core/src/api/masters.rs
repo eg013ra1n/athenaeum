@@ -515,10 +515,22 @@ pub(crate) fn check_library_dir_exists(dir: &str) -> Result<(), ApiError> {
 /// settings key (folder nested inside a monitored directory) or the legacy
 /// dedicated `calibration_library` scan root. See
 /// `api::scan_roots::get_calibration_library_dir` for the precedence rules.
-/// Shared by both `preview_master_build` and `start_master_build`, so the
-/// build-time existence check (Important-2) covers both call sites.
-fn library_dir_or_err(ctx: &ServiceContext) -> Result<std::path::PathBuf, ApiError> {
-    let dir = crate::api::scan_roots::get_calibration_library_dir(ctx)?
+/// Shared by `preview_master_build`, `run_build`, and `start_master_build`.
+///
+/// Takes a `&rusqlite::Connection`, NOT `&ServiceContext` — it must reuse the
+/// caller's already-checked-out pooled connection rather than checking out a
+/// second one via `api::scan_roots::get_calibration_library_dir(ctx)`. That
+/// used to be the signature here, and it deadlocked the pool: with N
+/// concurrent `preview_master_build` calls (e.g. the batch Create-Masters
+/// dialog firing one preview per calibration set via `Promise.allSettled`)
+/// exceeding `Database`'s pool `max_size` (8, see `db::mod::Database::new`),
+/// every task would hold its own conn from `preview_master_build`'s checkout
+/// AND simultaneously block here trying to check out a second one — nobody
+/// could progress, everyone timed out after the pool's 30s checkout wait,
+/// and `Database::conn()` panicked (`db/mod.rs:124`). Call this ONLY with a
+/// connection the caller already owns; never acquire a fresh one inside.
+fn library_dir_or_err(conn: &rusqlite::Connection) -> Result<std::path::PathBuf, ApiError> {
+    let dir = crate::api::scan_roots::resolve_calibration_library_dir(conn)?
         .ok_or_else(|| ApiError::Invalid(
             "no calibration library folder configured — set one before building masters".into(),
         ))?;
@@ -529,6 +541,12 @@ fn library_dir_or_err(ctx: &ServiceContext) -> Result<std::path::PathBuf, ApiErr
 // ── Preview ───────────────────────────────────────────────────────────────
 
 /// Validation + speculative recipe/precal/target-path resolution, no thread.
+///
+/// Invariant: acquires exactly ONE pooled connection (`conn`, below) for its
+/// entire body. Every helper called from here must take `&rusqlite::Connection`
+/// and must NOT touch `ServiceContext`/the pool itself — see `library_dir_or_err`'s
+/// doc comment for the deadlock this guards against (many concurrent previews
+/// from the batch Create-Masters dialog vs. a bounded connection pool).
 pub fn preview_master_build(
     ctx: &ServiceContext,
     set_id: i64,
@@ -538,7 +556,7 @@ pub fn preview_master_build(
     let conn = db.conn();
 
     let set = load_and_validate_set(&conn, set_id)?;
-    let library_dir = library_dir_or_err(ctx)?;
+    let library_dir = library_dir_or_err(&conn)?;
 
     let resolved_combine = resolve_combine(recipe.combine, &set.imagetyp, set.frame_count);
     let is_flat = set.imagetyp == "Flat";
@@ -754,7 +772,7 @@ fn run_build(
 
     let target_abs = match &target {
         BuildTarget::New => {
-            let library_dir = library_dir_or_err(ctx)?;
+            let library_dir = library_dir_or_err(&conn)?;
             let target_rel = master_relative_path(&MasterPathParams {
                 instrume: inputs.instrume.as_deref(),
                 master_kind: inputs.kind,
@@ -936,8 +954,8 @@ pub fn start_master_build(
         let db = db(&ctx)?;
         let conn = db.conn();
         load_and_validate_set(&conn, set_id)?;
+        library_dir_or_err(&conn)?;
     }
-    library_dir_or_err(&ctx)?;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
@@ -1793,5 +1811,108 @@ mod tests {
         std::fs::write(&file_path, b"hello").unwrap();
         let err = check_library_dir_exists(&file_path.to_string_lossy()).unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)));
+    }
+
+    // ── Regression: concurrent preview_master_build must not deadlock the
+    // pool ────────────────────────────────────────────────────────────────
+    //
+    // Pins the fix for the production panic this module's `library_dir_or_err`
+    // doc comment describes: `preview_master_build` must acquire exactly ONE
+    // pooled connection for its whole body. Before the fix, `library_dir_or_err`
+    // took `&ServiceContext` and re-entered the pool via
+    // `scan_roots::get_calibration_library_dir(ctx)` while the caller's own
+    // connection (acquired at the top of `preview_master_build`) was still
+    // held — so N concurrent previews exceeding `Database`'s pool `max_size`
+    // (8, see `db::Database::new`) each grabbed one connection and then
+    // deadlocked trying to grab a second, exactly reproducing what the batch
+    // Create-Masters dialog did in production (one `preview_master_build`
+    // call per calibration set, all fired concurrently via
+    // `Promise.allSettled`). This spawns pool_size + 4 real OS threads, each
+    // running a genuine `preview_master_build` call against a seeded catalog
+    // + configured library dir, and requires them all to finish well under
+    // the pool's connection-checkout timeout — pre-fix this test hangs for
+    // ~30s per stranded task and then panics (`Database::conn()`'s `.expect`);
+    // post-fix it completes in well under a second.
+    #[test]
+    fn preview_master_build_survives_pool_sized_concurrency() {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock, RwLock};
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+
+        let lib_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+
+        // Seed one buildable Bias set (not a Flat, so no select_flat_precal
+        // lookups are in play — keeps this focused on the library-dir
+        // resolution path that used to double-acquire) plus the calibration
+        // library setting `resolve_calibration_library_dir` reads.
+        let set_id = {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO calibration_set (imagetyp, date, frame_count) VALUES ('Bias', '2026-06-28', 5)",
+                [],
+            ).unwrap();
+            let set_id = conn.last_insert_rowid();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &lib_dir.to_string_lossy(),
+            ).unwrap();
+            set_id
+        };
+
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+        });
+
+        // Pool max_size is 8 — exceed it so, pre-fix, every task grabs one
+        // connection and then blocks forever on a second.
+        const N: usize = 12;
+        let recipe = MasterRecipe { combine: None, synthetic_bias: None, archive_after: false };
+        let start = Instant::now();
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let ctx = ctx.clone();
+                let recipe = recipe.clone();
+                std::thread::spawn(move || preview_master_build(&ctx, set_id, &recipe))
+            })
+            .collect();
+
+        for h in handles {
+            let result = h.join().expect(
+                "preview_master_build thread panicked — pool-checkout deadlock regression");
+            result.expect("preview_master_build returned an error");
+        }
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "12 previews against an 8-conn pool took {elapsed:?} — \
+             looks like pool contention/near-timeout, not the near-instant pure-DB path"
+        );
     }
 }
