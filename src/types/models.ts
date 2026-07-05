@@ -434,3 +434,7 @@ sourceFramesOnDisk: boolean,
  */
 originalsArchived: boolean, };
 
+export type BatchBuildReport = { startedSetIds: Array<number>, skipped: Array<BatchSkip>, };
+
+export type BatchSkip = { setId: number, reason: string, };
+

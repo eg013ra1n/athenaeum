@@ -223,6 +223,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Master build
         .route("/api/preview_master_build", post(masters::preview_master_build))
         .route("/api/start_master_build", post(masters::start_master_build))
+        .route("/api/start_master_builds_batch", post(masters::start_master_builds_batch))
+        .route("/api/rebuild_master", post(masters::rebuild_master))
         .route("/api/cancel_master_build", post(masters::cancel_master_build))
         .route("/api/get_master_provenance", post(masters::get_master_provenance))
         // Core

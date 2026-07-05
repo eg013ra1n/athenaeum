@@ -1,5 +1,7 @@
 // Master-build route handlers — business logic single-sourced in
-// `athenaeum_core::api::masters`.
+// `athenaeum_core::api::masters`. Covers Task 12 (preview/start/cancel/
+// provenance) plus Task 13 (dependency-ordered batch builds + in-place
+// rebuild).
 //
 // Thin wrappers only: extraction + handler call + error mapping.
 
@@ -14,7 +16,9 @@ use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
 
-pub use athenaeum_core::api::masters::{MasterBuildPreview, MasterProvenanceInfo, MasterRecipe};
+pub use athenaeum_core::api::masters::{
+    BatchBuildReport, MasterBuildPreview, MasterProvenanceInfo, MasterRecipe,
+};
 
 // ── Request structs ───────────────────────────────────────────────────────
 
@@ -30,6 +34,19 @@ pub struct PreviewMasterBuildArgs {
 pub struct StartMasterBuildArgs {
     pub set_id: i64,
     pub recipe: MasterRecipe,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartMasterBuildsBatchArgs {
+    pub set_ids: Vec<i64>,
+    pub recipe: MasterRecipe,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebuildMasterArgs {
+    pub master_set_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +104,49 @@ pub async fn start_master_build(
         env!("CARGO_PKG_VERSION").to_string(),
         args.set_id,
         args.recipe,
+    )
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// POST /api/start_master_builds_batch
+///
+/// Dependency-ordered fan-out of `start_master_build` over many sets (see
+/// `api::masters::plan_batch`). Sets already superseded / too small /
+/// themselves masters / unknown are skipped with a per-set reason instead of
+/// failing the whole batch.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn start_master_builds_batch(
+    State(state): State<WebAppState>,
+    Json(args): Json<StartMasterBuildsBatchArgs>,
+) -> Result<Json<BatchBuildReport>, (StatusCode, String)> {
+    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::start_master_builds_batch(
+        state.ctx.clone(),
+        emitter,
+        env!("CARGO_PKG_VERSION").to_string(),
+        args.set_ids,
+        args.recipe,
+    )
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// POST /api/rebuild_master
+///
+/// Re-integrates an existing built master in place (same path), refreshing
+/// its provenance instead of registering a new master set.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn rebuild_master(
+    State(state): State<WebAppState>,
+    Json(args): Json<RebuildMasterArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::rebuild_master(
+        state.ctx.clone(),
+        emitter,
+        env!("CARGO_PKG_VERSION").to_string(),
+        args.master_set_id,
     )
     .map(Json)
     .map_err(api_err)

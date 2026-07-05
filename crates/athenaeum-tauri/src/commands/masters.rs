@@ -1,5 +1,6 @@
 // Master-build commands — orchestrates the compute-queue-backed master
-// build (Task 12).
+// build (Task 12) plus dependency-ordered batch builds and in-place rebuild
+// (Task 13).
 //
 // Thin wrappers only: extraction + handler call + error mapping. Business
 // logic lives in `athenaeum_core::api::masters`.
@@ -14,7 +15,9 @@ use crate::tauri_events::TauriProgressEmitter;
 
 use super::AppState;
 
-pub use athenaeum_core::api::masters::{MasterBuildPreview, MasterProvenanceInfo, MasterRecipe};
+pub use athenaeum_core::api::masters::{
+    BatchBuildReport, MasterBuildPreview, MasterProvenanceInfo, MasterRecipe,
+};
 
 /// Preview a master build: validation + recipe/precal selection + target
 /// path. Pure DB work (no pixel I/O — precal pixels only ever load inside
@@ -55,6 +58,47 @@ pub async fn start_master_build(
         env!("CARGO_PKG_VERSION").to_string(),
         set_id,
         recipe,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Enqueue builds for many sets, dependency-ordered (Bias/DarkFlat -> Dark ->
+/// Flat). Sets already superseded / too small / themselves masters / unknown
+/// are skipped with a per-set reason instead of failing the whole batch.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn start_master_builds_batch(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    set_ids: Vec<i64>,
+    recipe: MasterRecipe,
+) -> Result<BatchBuildReport, String> {
+    let emitter = Arc::new(TauriProgressEmitter(app_handle));
+    api::start_master_builds_batch(
+        state.ctx.clone(),
+        emitter,
+        env!("CARGO_PKG_VERSION").to_string(),
+        set_ids,
+        recipe,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Re-integrate an existing built master in place (same path), refreshing
+/// its provenance instead of registering a new master set.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn rebuild_master(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    master_set_id: i64,
+) -> Result<(), String> {
+    let emitter = Arc::new(TauriProgressEmitter(app_handle));
+    api::rebuild_master(
+        state.ctx.clone(),
+        emitter,
+        env!("CARGO_PKG_VERSION").to_string(),
+        master_set_id,
     )
     .map_err(|e| e.to_string())
 }

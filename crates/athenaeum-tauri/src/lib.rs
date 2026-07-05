@@ -360,6 +360,8 @@ pub fn run() {
             // Master build commands
             commands::preview_master_build,
             commands::start_master_build,
+            commands::start_master_builds_batch,
+            commands::rebuild_master,
             commands::cancel_master_build,
             commands::get_master_provenance,
             // Plate solve commands

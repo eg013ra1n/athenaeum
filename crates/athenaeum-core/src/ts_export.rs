@@ -133,6 +133,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::masters::MasterRecipe,
             crate::api::masters::MasterBuildPreview,
             crate::api::masters::MasterProvenanceInfo,
+            crate::api::masters::BatchBuildReport,
+            crate::api::masters::BatchSkip,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::archive::models::ArchiveDisposition,

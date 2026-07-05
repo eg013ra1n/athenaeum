@@ -1,7 +1,7 @@
 //! Shared `masters` command-layer handlers — single business-logic source
 //! for the Tauri (`commands/masters.rs`) and web (`routes/masters.rs`)
-//! wrappers. See `.superpowers/sdd/task-12-brief.md` for the design this
-//! module follows.
+//! wrappers. See `.superpowers/sdd/task-12-brief.md` and
+//! `.superpowers/sdd/task-13-brief.md` for the design this module follows.
 //!
 //! Wires together Tasks 4-11 (compute queue, banded integration engine,
 //! combiners, master naming/headers, registration) into the user-facing
@@ -20,6 +20,17 @@
 //! transports' preview wrappers still call it inside
 //! `tokio::task::spawn_blocking` (the `analyze_frame_set` wrapper
 //! precedent) so even its DB queries stay off the async executor.
+//!
+//! Task 13 adds two more entry points on top of the same build-thread
+//! machinery (see `BuildTarget` below for how `run_build`/
+//! `run_master_build_thread` branch on New-vs-Rebuild without duplicating
+//! the integrate -> write -> finalize pipeline):
+//! - `start_master_builds_batch`: dependency-ordered fan-out of
+//!   `start_master_build` over many sets (`plan_batch` is the pure/testable
+//!   planning step — see its doc comment).
+//! - `rebuild_master`: re-integrates an EXISTING master's source frames in
+//!   place (same file, atomic replace) and refreshes provenance instead of
+//!   registering a brand-new master set.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,6 +96,23 @@ pub struct MasterProvenanceInfo {
     pub originals_archived: bool,
 }
 
+/// Result of [`start_master_builds_batch`]: which sets were actually
+/// enqueued (in submission order — that order IS the dependency order, see
+/// `plan_batch`) and which were skipped, with a per-set reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchBuildReport {
+    pub started_set_ids: Vec<i64>,
+    pub skipped: Vec<BatchSkip>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSkip {
+    pub set_id: i64,
+    pub reason: String,
+}
+
 // ── Progress / completion event payloads (snake_case, analysis precedent) ───
 
 /// `master-build-progress` event payload. `stage` is one of "reading" |
@@ -106,6 +134,17 @@ struct MasterBuildProgressEvent {
 /// `start_master_build` call, regardless of how the build thread ends
 /// (success, error, cancelled-in-queue, cancelled-mid-integration, write
 /// failure, register failure) — see `run_master_build_thread`.
+///
+/// Task 13 / `rebuild_master`: `set_id` here is the SOURCE calibration set
+/// id (the one whose member frames got re-integrated), NOT `master_set_id`
+/// — deliberate. The duplicate-build guard (`active_master_builds`) and
+/// every existing consumer of `master-build-progress`/`master-build-complete`
+/// already key an in-flight build by "the raw set being worked on"; a
+/// rebuild is still working on the same source set, it just writes to a
+/// different (pre-existing) target and updates provenance instead of
+/// registering. `master_set_id` keeps its existing meaning: "the master
+/// that resulted from this build" — for a rebuild that's always the master
+/// that was passed in, echoed back.
 #[derive(Clone, serde::Serialize)]
 struct MasterBuildCompleteEvent {
     set_id: i64,
@@ -130,6 +169,23 @@ pub fn resolve_combine(explicit: Option<CombineMethod>, imagetyp: &str, n: i64) 
         CombineMethod::PercentileClip { low: 0.2, high: 0.02 }
     } else {
         CombineMethod::Median
+    }
+}
+
+/// Dependency-build order for a batch (Task 13, spec: bias/darkflat before
+/// dark before flat — flats resolve pre-cal at RUN time via
+/// `select_flat_precal`, so a darkflat/dark/bias master built earlier in the
+/// SAME batch is already visible on disk by the time a later flat build
+/// runs, as long as submission order respects this rank). Anything not one
+/// of the four calibration types (shouldn't normally reach here) sorts last
+/// rather than erroring — `plan_batch` already only calls this on rows that
+/// passed the buildability checks.
+pub(crate) fn type_build_rank(imagetyp: &str) -> u8 {
+    match imagetyp {
+        "Bias" | "DarkFlat" => 0,
+        "Dark" => 1,
+        "Flat" => 2,
+        _ => 3,
     }
 }
 
@@ -323,6 +379,65 @@ fn load_and_validate_set(conn: &rusqlite::Connection, set_id: i64) -> Result<Set
     Ok(SetRow { imagetyp, exptime, binning, date, frame_count })
 }
 
+/// Same field set as `load_and_validate_set`, but WITHOUT
+/// `validate_buildable_set` — used only by the `BuildTarget::Rebuild` path.
+/// A rebuild's source set is, by definition, already
+/// `superseded_by_set_id`-marked (that's exactly what `register_master` did
+/// when the master it built was first registered), so running the normal
+/// buildability check against it would always reject with "already
+/// superseded". `rebuild_master`'s own preconditions (provenance row with a
+/// `source_set_id`, every source file on disk) are the real gate here; this
+/// helper only fetches the fields `run_build` needs to resolve combine/
+/// precal/header inputs for that source set.
+fn load_set_row(conn: &rusqlite::Connection, set_id: i64) -> Result<SetRow, ApiError> {
+    let row: Option<(String, Option<f64>, Option<String>, String, i64)> = conn.query_row(
+        "SELECT imagetyp, exptime, binning, date, frame_count FROM calibration_set WHERE id = ?1",
+        [set_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).optional()?;
+
+    let Some((imagetyp, exptime, binning, date, frame_count)) = row else {
+        return Err(ApiError::NotFound(format!("calibration set {set_id} not found")));
+    };
+
+    Ok(SetRow { imagetyp, exptime, binning, date, frame_count })
+}
+
+/// Rebuild precondition (Task 13): every member frame of the source set must
+/// still be present on disk — a rebuild re-reads and re-integrates the SAME
+/// raw frames, it can't recombine frames that were archived into a ZIP or
+/// otherwise removed. Pure DB + `Path::exists` — no `ServiceContext`
+/// needed, so it's unit-testable directly (see tests below) the same way
+/// `plan_batch` is. Distinguishes "archived" (actionable: restore first)
+/// from "missing" (the file is just gone) when cheap to do so via
+/// `files.archived_in_operation`.
+fn check_rebuild_source_ready(conn: &rusqlite::Connection, source_set_id: i64) -> Result<(), ApiError> {
+    let mut stmt = conn.prepare(
+        "SELECT fi.path, fi.archived_in_operation FROM calibration_set_frames csf
+         JOIN frames f ON f.id = csf.frame_id
+         JOIN files fi ON fi.id = f.file_id
+         WHERE csf.set_id = ?1",
+    )?;
+    let rows: Vec<(String, Option<i64>)> = stmt
+        .query_map([source_set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    if rows.is_empty() {
+        return Err(ApiError::Invalid(
+            "source calibration set has no member frames on record".into(),
+        ));
+    }
+    if rows.iter().all(|(p, _)| Path::new(p).exists()) {
+        return Ok(());
+    }
+    if rows.iter().any(|(_, archived)| archived.is_some()) {
+        Err(ApiError::Invalid("originals are archived — restore them first".into()))
+    } else {
+        Err(ApiError::Invalid("original source frames are missing on disk".into()))
+    }
+}
+
 fn library_root_or_err(ctx: &ServiceContext) -> Result<crate::models::ScanRoot, ApiError> {
     crate::api::scan_roots::get_calibration_library_root(ctx)?
         .ok_or_else(|| ApiError::Invalid(
@@ -415,11 +530,36 @@ impl From<IntegrationError> for BuildStepError {
     }
 }
 
+/// Where a build's output goes and what happens to the DB afterward (Task
+/// 13). `New` is the Task 12 path unchanged: a fresh, collision-resolved
+/// path under the library root, then `register_master` (new master
+/// `calibration_set` + provenance + relink + supersede the source). `Rebuild`
+/// is Task 13: the master's OWN existing file path (no collision
+/// resolution — `write_fits_f32` replaces it atomically), then
+/// `master_provenance::update_rebuild` + a direct refresh of that file's
+/// `size`/`modified_at` row. Rebuild never touches `calibration_set`,
+/// `frames`, or any `calibration_set_to_frames` link — the master set/frame
+/// identity and every consumer relink from the original registration stay
+/// exactly as they were; only the pixels on disk and the provenance
+/// bookkeeping change.
+enum BuildTarget {
+    New,
+    Rebuild {
+        master_set_id: i64,
+        /// `files.id` for the master's existing file row — the direct SQL
+        /// UPDATE's key.
+        master_file_id: i64,
+        /// The master's existing `files.path` — write target, unchanged.
+        target_path: PathBuf,
+    },
+}
+
 /// The whole build: acquire queue slot -> load member paths/set row ->
-/// resolve combine/precal -> integrate -> write -> register. Every early
-/// exit is a plain `?`/`Err` return — `run_master_build_thread` (the only
-/// caller) always removes the handle and always emits
-/// `master-build-complete` afterward, so there's no cleanup duty here.
+/// resolve combine/precal -> integrate -> write -> register (or, for a
+/// rebuild, update-in-place — see `BuildTarget`). Every early exit is a
+/// plain `?`/`Err` return — `run_master_build_thread` (the only caller)
+/// always removes the handle and always emits `master-build-complete`
+/// afterward, so there's no cleanup duty here.
 #[allow(clippy::too_many_arguments)]
 fn run_build(
     ctx: &ServiceContext,
@@ -428,6 +568,7 @@ fn run_build(
     set_id: i64,
     recipe: &MasterRecipe,
     cancel_flag: &Arc<AtomicBool>,
+    target: BuildTarget,
 ) -> Result<i64, BuildStepError> {
     let label = format!("Master build: calibration set {set_id}");
     // Bound (not discarded with `_`) so the permit's Drop — which releases
@@ -447,7 +588,17 @@ fn run_build(
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
 
-    let set = load_and_validate_set(&conn, set_id)?;
+    let set = match &target {
+        BuildTarget::New => load_and_validate_set(&conn, set_id)?,
+        BuildTarget::Rebuild { .. } => {
+            // Defensive re-check (same spirit as `load_and_validate_set` for
+            // the New path) — `rebuild_master` already checked this before
+            // spawning, but the thread re-verifies rather than trusting a
+            // check that ran on a possibly-stale snapshot.
+            check_rebuild_source_ready(&conn, set_id)?;
+            load_set_row(&conn, set_id)?
+        }
+    };
 
     let mut stmt = conn.prepare(
         "SELECT fi.path FROM calibration_set_frames csf
@@ -509,18 +660,25 @@ fn run_build(
     let recipe_summary = recipe_summary_string(resolved_combine, set.frame_count);
     let cards = build_master_cards(&inputs, app_version, &recipe_summary, &member_hash_str, out.flat_norm)?;
 
-    let library_root = library_root_or_err(ctx)?;
-    let target_rel = master_relative_path(&MasterPathParams {
-        instrume: inputs.instrume.as_deref(),
-        master_kind: inputs.kind,
-        filter: inputs.filter.as_deref(),
-        exptime: inputs.exptime,
-        ccd_temp: inputs.temp_mean,
-        gain: inputs.gain,
-        binning: set.binning.as_deref(),
-        date: &set.date,
-    });
-    let target_abs = resolve_collision(&Path::new(&library_root.path).join(&target_rel));
+    let target_abs = match &target {
+        BuildTarget::New => {
+            let library_root = library_root_or_err(ctx)?;
+            let target_rel = master_relative_path(&MasterPathParams {
+                instrume: inputs.instrume.as_deref(),
+                master_kind: inputs.kind,
+                filter: inputs.filter.as_deref(),
+                exptime: inputs.exptime,
+                ccd_temp: inputs.temp_mean,
+                gain: inputs.gain,
+                binning: set.binning.as_deref(),
+                date: &set.date,
+            });
+            resolve_collision(&Path::new(&library_root.path).join(&target_rel))
+        }
+        // Same path the master already lives at — no collision resolution:
+        // `write_fits_f32` replaces the existing file atomically.
+        BuildTarget::Rebuild { target_path, .. } => target_path.clone(),
+    };
     if let Some(parent) = target_abs.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -539,13 +697,37 @@ fn run_build(
         "version": app_version,
     }).to_string();
 
-    match register_master(&conn, set_id, &target_abs, &recipe_json) {
-        Ok(reg) => Ok(reg.master_set_id),
-        Err(e) => {
-            // Registration failed AFTER the file was written — remove it so
-            // no orphan master sits in the library unregistered.
-            let _ = std::fs::remove_file(&target_abs);
-            Err(BuildStepError::Other(format!("{e:#}")))
+    match target {
+        BuildTarget::New => match register_master(&conn, set_id, &target_abs, &recipe_json) {
+            Ok(reg) => Ok(reg.master_set_id),
+            Err(e) => {
+                // Registration failed AFTER the file was written — remove it
+                // so no orphan master sits in the library unregistered.
+                let _ = std::fs::remove_file(&target_abs);
+                Err(BuildStepError::Other(format!("{e:#}")))
+            }
+        },
+        BuildTarget::Rebuild { master_set_id, master_file_id, .. } => {
+            let tx = conn.unchecked_transaction()?;
+            crate::db::master_provenance::update_rebuild(&tx, master_set_id, &recipe_json, &member_hash_str)?;
+            let meta = std::fs::metadata(&target_abs)?;
+            let modified_at = chrono::DateTime::<chrono::Utc>::from(meta.modified()?);
+            tx.execute(
+                "UPDATE files SET size = ?1, modified_at = ?2 WHERE id = ?3",
+                rusqlite::params![meta.len() as i64, modified_at.to_rfc3339(), master_file_id],
+            )?;
+            tx.commit()?;
+            // Deliberately NO remove_file on any error above (unlike the New
+            // arm): by this point `write_fits_f32` already atomically
+            // replaced the PRE-EXISTING master file with the freshly
+            // rebuilt pixels/header — there is no orphan to clean up, only
+            // a DB update that may have failed. Deleting the file here
+            // would turn a provenance-refresh failure into total data loss
+            // (no master file at all, where there was a perfectly good one
+            // moments ago); leaving the rebuilt file in place is strictly
+            // better, and the `tx` above is one transaction so
+            // update_rebuild + the files UPDATE can't half-apply.
+            Ok(master_set_id)
         }
     }
 }
@@ -553,6 +735,7 @@ fn run_build(
 /// Runs on the dedicated `master-build-{set_id}` thread. The single exit
 /// path for the whole build: handle removal and `master-build-complete`
 /// ALWAYS happen here, exactly once, regardless of how `run_build` ended.
+#[allow(clippy::too_many_arguments)]
 fn run_master_build_thread(
     ctx: Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -560,8 +743,9 @@ fn run_master_build_thread(
     set_id: i64,
     recipe: MasterRecipe,
     cancel_flag: Arc<AtomicBool>,
+    target: BuildTarget,
 ) {
-    let result = run_build(&ctx, emitter.as_ref(), &app_version, set_id, &recipe, &cancel_flag);
+    let result = run_build(&ctx, emitter.as_ref(), &app_version, set_id, &recipe, &cancel_flag, target);
 
     ctx.active_master_builds.lock().unwrap().remove(&set_id);
 
@@ -576,7 +760,7 @@ fn run_master_build_thread(
     });
 }
 
-// ── Public start/cancel/provenance API ───────────────────────────────────────
+// ── Public start/batch/rebuild/cancel/provenance API ─────────────────────────
 
 /// Validates, registers the cancel handle, spawns the detached build thread
 /// (queue admission happens INSIDE the thread), returns immediately.
@@ -609,13 +793,203 @@ pub fn start_master_build(
     let spawn_result = std::thread::Builder::new()
         .name(format!("master-build-{set_id}"))
         .spawn(move || {
-            run_master_build_thread(thread_ctx, emitter, app_version, set_id, recipe, cancel_flag);
+            run_master_build_thread(
+                thread_ctx, emitter, app_version, set_id, recipe, cancel_flag, BuildTarget::New,
+            );
         });
 
     if let Err(e) = spawn_result {
         // The thread never started, so nothing will ever remove this handle
         // or emit master-build-complete — clean up right here instead.
         ctx.active_master_builds.lock().unwrap().remove(&set_id);
+        return Err(ApiError::Internal(format!("failed to spawn master-build thread: {e}")));
+    }
+
+    Ok(())
+}
+
+/// Pure planning step for [`start_master_builds_batch`] (Task 13): loads
+/// `(imagetyp, frame_count, superseded_by_set_id, is_master_library)` for
+/// every requested id, buckets each into "ready to start" or "skipped" using
+/// the SAME predicates as `validate_buildable_set` (in the SAME order —
+/// superseded, then already-a-master, then too-few-frames — so a set that
+/// happens to match more than one, e.g. a master itself always has
+/// `frame_count == 1 < MIN_MASTER_FRAMES`, gets the more specific reason),
+/// then sorts the ready set by `(type_build_rank, id)` — dependency order,
+/// ties broken by id for determinism. No `ServiceContext`, no thread, no
+/// side effects — just DB reads — so it's unit-testable directly against an
+/// in-memory DB (see tests below). `start_master_builds_batch` is exactly
+/// this plus a loop of `start_master_build`.
+fn plan_batch(
+    conn: &rusqlite::Connection,
+    set_ids: &[i64],
+) -> Result<(Vec<(i64, String)>, Vec<BatchSkip>), ApiError> {
+    let mut ready: Vec<(i64, String)> = Vec::new();
+    let mut skipped: Vec<BatchSkip> = Vec::new();
+
+    for &set_id in set_ids {
+        let row: Option<(String, i64, Option<i64>, i64)> = conn.query_row(
+            "SELECT imagetyp, frame_count, superseded_by_set_id, is_master_library
+             FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).optional()?;
+
+        let Some((imagetyp, frame_count, superseded_by_set_id, is_master_library)) = row else {
+            skipped.push(BatchSkip { set_id, reason: "unknown set".into() });
+            continue;
+        };
+
+        if superseded_by_set_id.is_some() {
+            skipped.push(BatchSkip { set_id, reason: "already has a master".into() });
+            continue;
+        }
+        if is_master_library != 0 {
+            skipped.push(BatchSkip { set_id, reason: "is itself a master".into() });
+            continue;
+        }
+        if frame_count < MIN_MASTER_FRAMES {
+            skipped.push(BatchSkip {
+                set_id,
+                reason: format!("only {frame_count} frames (minimum {MIN_MASTER_FRAMES})"),
+            });
+            continue;
+        }
+
+        ready.push((set_id, imagetyp));
+    }
+
+    ready.sort_by_key(|(id, imagetyp)| (type_build_rank(imagetyp), *id));
+    Ok((ready, skipped))
+}
+
+/// Enqueue builds for many sets, dependency-ordered: Bias & DarkFlat first,
+/// then Dark, then Flat (flats resolve pre-cal at RUN time inside the build
+/// thread — see `select_flat_precal` — so a master built earlier in THIS
+/// batch is already visible on disk to a later flat build, as long as it was
+/// submitted first; `plan_batch`'s sort plus the compute queue's FIFO
+/// admission is what guarantees that). Sets already superseded / too small /
+/// themselves masters / unknown are skipped with a per-set reason instead of
+/// failing the whole batch; likewise, a per-set `start_master_build` error
+/// (e.g. a Conflict from a concurrent duplicate-build click) is caught and
+/// folded into `skipped` rather than aborting the remaining sets.
+pub fn start_master_builds_batch(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    app_version: String,
+    set_ids: Vec<i64>,
+    recipe: MasterRecipe,
+) -> Result<BatchBuildReport, ApiError> {
+    let (ready, mut skipped) = {
+        let db = db(&ctx)?;
+        let conn = db.conn();
+        plan_batch(&conn, &set_ids)?
+    };
+
+    let mut started_set_ids = Vec::new();
+    for (set_id, _imagetyp) in ready {
+        match start_master_build(ctx.clone(), emitter.clone(), app_version.clone(), set_id, recipe.clone()) {
+            Ok(()) => started_set_ids.push(set_id),
+            Err(e) => skipped.push(BatchSkip { set_id, reason: e.to_string() }),
+        }
+    }
+
+    Ok(BatchBuildReport { started_set_ids, skipped })
+}
+
+/// Re-integrate an existing Athenaeum-built master IN PLACE from the SAME
+/// source frames that originally built it (Task 13) — same target file
+/// (atomic replace via `write_fits_f32`, no collision suffix), refreshed
+/// `master_provenance` + `files` row instead of a new registration. See
+/// `BuildTarget::Rebuild` for exactly what changes vs. a normal build, and
+/// the `MasterBuildCompleteEvent` doc comment for why events key on the
+/// SOURCE set id rather than `master_set_id`.
+///
+/// Recipe: unlike `start_master_build`/`start_master_builds_batch`, this
+/// takes no `MasterRecipe` argument — matches the spec'd interface. A
+/// rebuild always resolves a fresh Auto recipe
+/// (`MasterRecipe { combine: None, synthetic_bias: None }`) rather than
+/// replaying whatever explicit override built the original: the persisted
+/// `recipe_json.combine` is already-RESOLVED (not the original
+/// `Option<CombineMethod>` input), so treating it as a future override would
+/// freeze the recipe forever instead of picking up a since-built precal
+/// master (spec §9 fallback chain) or a frame-count change that shifts the
+/// Auto combine method — exactly the kind of drift a rebuild exists to
+/// correct. An operator wanting a specific non-Auto override has no path
+/// through this command in v1 (out of scope for Task 13).
+pub fn rebuild_master(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    app_version: String,
+    master_set_id: i64,
+) -> Result<(), ApiError> {
+    let (source_set_id, master_file_id, target_path) = {
+        let db = db(&ctx)?;
+        let conn = db.conn();
+
+        let prov = crate::db::master_provenance::get(&conn, master_set_id)?
+            .ok_or_else(|| ApiError::Invalid(
+                "master was not built by Athenaeum — no provenance recorded, cannot rebuild".into(),
+            ))?;
+        let source_set_id = prov.source_set_id.ok_or_else(|| ApiError::Invalid(
+            "master was not built by Athenaeum — no source set recorded, cannot rebuild".into(),
+        ))?;
+
+        check_rebuild_source_ready(&conn, source_set_id)?;
+
+        // LIMIT 1: a master is a 1:1 calibration_set by invariant (exactly
+        // one member frame), so this never actually needs to disambiguate —
+        // matches `select_flat_precal`'s defensive `LIMIT 1` on the same
+        // shape of query.
+        let master_file: Option<(i64, String)> = conn.query_row(
+            "SELECT fi.id, fi.path FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             JOIN files fi ON fi.id = f.file_id
+             WHERE csf.set_id = ?1 LIMIT 1",
+            [master_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let (master_file_id, target_path) = master_file.ok_or_else(|| {
+            ApiError::NotFound(format!("master set {master_set_id} has no file on record"))
+        })?;
+
+        (source_set_id, master_file_id, target_path)
+    };
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        // Keyed by the SOURCE set id (reusing `active_master_builds`, same
+        // map `start_master_build` uses) — a rebuild is, mechanically,
+        // still "a build of this source set's frames", so it shares the
+        // same duplicate-build guard rather than a parallel one keyed by
+        // `master_set_id`.
+        let mut active = ctx.active_master_builds.lock().unwrap();
+        if active.contains_key(&source_set_id) {
+            return Err(ApiError::Conflict(format!(
+                "a master build is already in progress for calibration set {source_set_id}"
+            )));
+        }
+        active.insert(source_set_id, MasterBuildHandle { cancel_flag: cancel_flag.clone() });
+    }
+
+    let recipe = MasterRecipe { combine: None, synthetic_bias: None };
+    let target = BuildTarget::Rebuild {
+        master_set_id,
+        master_file_id,
+        target_path: PathBuf::from(target_path),
+    };
+
+    let thread_ctx = ctx.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("master-build-{source_set_id}"))
+        .spawn(move || {
+            run_master_build_thread(
+                thread_ctx, emitter, app_version, source_set_id, recipe, cancel_flag, target,
+            );
+        });
+
+    if let Err(e) = spawn_result {
+        ctx.active_master_builds.lock().unwrap().remove(&source_set_id);
         return Err(ApiError::Internal(format!("failed to spawn master-build thread: {e}")));
     }
 
@@ -708,6 +1082,19 @@ mod tests {
             CombineMethod::PercentileClip { low: 0.2, high: 0.02 });
         // explicit override wins
         assert_eq!(resolve_combine(Some(CombineMethod::Mean), "Flat", 6), CombineMethod::Mean);
+    }
+
+    #[test]
+    fn batch_order_bias_darkflat_dark_flat() {
+        let order = |t: &str| type_build_rank(t);
+        assert!(order("Bias") < order("Dark"));
+        assert!(order("DarkFlat") < order("Dark"));
+        assert!(order("Dark") < order("Flat"));
+        // Bias and DarkFlat are co-equal rank 0 (either order between them is
+        // fine — neither can be the OTHER's flat pre-cal).
+        assert_eq!(order("Bias"), order("DarkFlat"));
+        // anything unrecognized sorts after every real calibration type.
+        assert!(order("Flat") < order("Light"));
     }
 
     // ── select_flat_precal fallback chain (pure DB — no pixel I/O) ──────────
@@ -869,5 +1256,192 @@ mod tests {
         assert!(matches!(choice, PrecalChoice::None), "{choice:?}");
         assert_eq!(choice.describe(), Option::None);
         assert!(warnings.iter().any(|w| w.contains("un-pre-calibrated")), "{warnings:?}");
+    }
+
+    // ── plan_batch (pure DB — Task 13 dependency-ordering + skip reasons) ───
+
+    /// A minimal buildable (or not) calibration_set row — only the columns
+    /// `plan_batch` reads. `superseded_by_set_id` doesn't need to point at a
+    /// real row for these tests (no FK enforcement on that column in
+    /// sqlite's default mode), so a dummy id is fine.
+    fn seed_set(
+        conn: &Connection,
+        imagetyp: &str,
+        frame_count: i64,
+        superseded_by_set_id: Option<i64>,
+        is_master_library: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, frame_count, superseded_by_set_id, is_master_library)
+             VALUES (?1, '2026-06-28', ?2, ?3, ?4)",
+            rusqlite::params![imagetyp, frame_count, superseded_by_set_id, is_master_library],
+        ).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn plan_batch_orders_by_type_then_id() {
+        let conn = test_conn();
+        // Seeded out of dependency order and out of id order within a rank,
+        // to make sure both the rank AND the id tie-break are exercised.
+        let flat = seed_set(&conn, "Flat", 5, None, 0);
+        let dark = seed_set(&conn, "Dark", 5, None, 0);
+        let darkflat_b = seed_set(&conn, "DarkFlat", 5, None, 0);
+        let bias = seed_set(&conn, "Bias", 5, None, 0);
+        let darkflat_a = seed_set(&conn, "DarkFlat", 5, None, 0);
+
+        let (ready, skipped) = plan_batch(&conn, &[flat, dark, darkflat_b, bias, darkflat_a]).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let ordered_ids: Vec<i64> = ready.iter().map(|(id, _)| *id).collect();
+        // rank 0 (Bias/DarkFlat) sorted by id, then rank 1 (Dark), then rank 2 (Flat).
+        let mut expected_rank0 = vec![bias, darkflat_a, darkflat_b];
+        expected_rank0.sort();
+        let mut expected = expected_rank0;
+        expected.push(dark);
+        expected.push(flat);
+        assert_eq!(ordered_ids, expected);
+    }
+
+    #[test]
+    fn plan_batch_skips_already_superseded() {
+        let conn = test_conn();
+        let master = seed_set(&conn, "MasterDark", 1, None, 1);
+        let raw = seed_set(&conn, "Dark", 5, Some(master), 0);
+
+        let (ready, skipped) = plan_batch(&conn, &[raw]).unwrap();
+        assert!(ready.is_empty());
+        assert_eq!(skipped, vec![BatchSkip { set_id: raw, reason: "already has a master".into() }]);
+    }
+
+    #[test]
+    fn plan_batch_skips_too_few_frames() {
+        let conn = test_conn();
+        let raw = seed_set(&conn, "Dark", 2, None, 0);
+
+        let (ready, skipped) = plan_batch(&conn, &[raw]).unwrap();
+        assert!(ready.is_empty());
+        assert_eq!(
+            skipped,
+            vec![BatchSkip { set_id: raw, reason: "only 2 frames (minimum 3)".into() }],
+        );
+    }
+
+    #[test]
+    fn plan_batch_skips_set_that_is_itself_a_master() {
+        let conn = test_conn();
+        // A 1:1 master set: frame_count == 1, which is ALSO < MIN_MASTER_FRAMES —
+        // the reason must still come out as "is itself a master", not the
+        // frame-count reason, because the is-master check runs first.
+        let master = seed_set(&conn, "MasterDark", 1, None, 1);
+
+        let (ready, skipped) = plan_batch(&conn, &[master]).unwrap();
+        assert!(ready.is_empty());
+        assert_eq!(skipped, vec![BatchSkip { set_id: master, reason: "is itself a master".into() }]);
+    }
+
+    #[test]
+    fn plan_batch_skips_unknown_set() {
+        let conn = test_conn();
+        let (ready, skipped) = plan_batch(&conn, &[999_999]).unwrap();
+        assert!(ready.is_empty());
+        assert_eq!(skipped, vec![BatchSkip { set_id: 999_999, reason: "unknown set".into() }]);
+    }
+
+    #[test]
+    fn plan_batch_mixed_batch_ready_and_skipped_independently() {
+        let conn = test_conn();
+        let dark = seed_set(&conn, "Dark", 5, None, 0);
+        let master = seed_set(&conn, "MasterBias", 1, None, 1);
+        let too_small = seed_set(&conn, "Flat", 1, None, 0);
+
+        let (ready, skipped) = plan_batch(&conn, &[dark, master, too_small, 424242]).unwrap();
+        assert_eq!(ready, vec![(dark, "Dark".to_string())]);
+        assert_eq!(skipped.len(), 3);
+        assert!(skipped.iter().any(|s| s.set_id == master && s.reason == "is itself a master"));
+        assert!(skipped.iter().any(|s| s.set_id == too_small && s.reason.contains("minimum 3")));
+        assert!(skipped.iter().any(|s| s.set_id == 424242 && s.reason == "unknown set"));
+    }
+
+    // ── check_rebuild_source_ready (pure DB + Path::exists) ─────────────────
+
+    /// A source calibration_set with `n` member frames, each pointing at a
+    /// real (but possibly not actually created) path so `Path::exists` has
+    /// something concrete to check. `archived` marks every member's
+    /// `files.archived_in_operation` as set (non-NULL) or not.
+    fn seed_source_with_files(conn: &Connection, dir: &std::path::Path, n: usize, archived: bool) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, frame_count) VALUES ('Dark', '2026-06-28', ?1)",
+            [n as i64],
+        ).unwrap();
+        let set_id = conn.last_insert_rowid();
+        for i in 0..n {
+            let p = dir.join(format!("raw{i}.fits"));
+            std::fs::write(&p, b"not a real fits file, existence is all that matters here").unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, archived_in_operation)
+                 VALUES (?1, ?2, 10, '2026-06-28', 'FITS', ?3)",
+                rusqlite::params![
+                    p.to_string_lossy(), format!("raw{i}.fits"), archived.then_some(1i64),
+                ],
+            ).unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')",
+                [file_id],
+            ).unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frame_id],
+            ).unwrap();
+        }
+        set_id
+    }
+
+    #[test]
+    fn rebuild_source_ready_when_all_files_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+        let set_id = seed_source_with_files(&conn, dir.path(), 3, false);
+        assert!(check_rebuild_source_ready(&conn, set_id).is_ok());
+    }
+
+    #[test]
+    fn rebuild_source_not_ready_when_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+        let set_id = seed_source_with_files(&conn, dir.path(), 3, true);
+        // Remove the files on disk too — an archived original really is gone
+        // from its recorded path (moved into a ZIP).
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let err = check_rebuild_source_ready(&conn, set_id).unwrap_err();
+        assert!(err.to_string().contains("archived"), "{err}");
+    }
+
+    #[test]
+    fn rebuild_source_not_ready_when_missing_but_not_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = test_conn();
+        let set_id = seed_source_with_files(&conn, dir.path(), 3, false);
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let err = check_rebuild_source_ready(&conn, set_id).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+        assert!(!err.to_string().contains("archived"), "{err}");
+    }
+
+    #[test]
+    fn rebuild_source_not_ready_when_no_member_frames() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, frame_count) VALUES ('Dark', '2026-06-28', 0)",
+            [],
+        ).unwrap();
+        let set_id = conn.last_insert_rowid();
+        let err = check_rebuild_source_ready(&conn, set_id).unwrap_err();
+        assert!(err.to_string().contains("no member frames"), "{err}");
     }
 }
