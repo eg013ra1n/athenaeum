@@ -1,7 +1,8 @@
 import { useState, useMemo, useCallback } from 'react';
 import { FolderOpen, AlertTriangle, CheckCircle, MapPin, Crosshair, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import type { LightFrameWithCalibration, FrameAnalysis } from '../../types/models';
+import type { LightFrameWithCalibration, FrameAnalysis, LightFrameReadiness } from '../../types/models';
+import { LightCalStatusBadge } from './LightCalStatusBadge';
 
 type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
 type SortDirection = 'asc' | 'desc';
@@ -33,6 +34,9 @@ interface LightsAnalysisTableProps {
   onSetReference?: (frameId: number) => void;
   /** Whether a reference-set action is in progress (disables buttons). */
   settingReference?: boolean;
+  /** Per-frame light-calibration readiness (keyed by frame_id). When present and
+   *  non-empty, a "Calib" status column is shown. */
+  readinessByFrameId?: Map<number, LightFrameReadiness>;
 }
 
 function formatDateTime(dateStr: string | null): string {
@@ -111,8 +115,10 @@ export function LightsAnalysisTable({
   referenceFrameId,
   onSetReference,
   settingReference,
+  readinessByFrameId,
 }: LightsAnalysisTableProps) {
   const navigate = useNavigate();
+  const showCalib = !!readinessByFrameId && readinessByFrameId.size > 0;
   const [sortField, setSortField] = useState<SortField | null>('date');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
 
@@ -324,6 +330,11 @@ export function LightsAnalysisTable({
                 <SortableHeader field="beta" label={`Moffat \u03B2`} currentSort={sortField} currentDirection={sortDirection} onSort={handleSort} avg={averages?.beta != null ? averages.beta.toFixed(2) : undefined} />
               </th>
             )}
+            {showCalib && (
+              <th scope="col" className="w-24 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
+                Calib
+              </th>
+            )}
             <th scope="col" className="w-16 px-1.5 py-1.5 text-center text-xs font-semibold text-content-secondary">
               WCS
             </th>
@@ -421,6 +432,11 @@ export function LightsAnalysisTable({
                 {hasBeta && (
                   <td className="px-1.5 py-1 text-sm text-content-secondary text-center bg-accent/5">
                     {analysis?.median_beta != null ? analysis.median_beta.toFixed(2) : '-'}
+                  </td>
+                )}
+                {showCalib && (
+                  <td className="w-24 px-1.5 py-1 text-center">
+                    <LightCalStatusBadge frame={readinessByFrameId!.get(frame.frame_id)} />
                   </td>
                 )}
                 <td className="w-16 px-1.5 py-1 text-center">

@@ -45,6 +45,7 @@ export type NotificationKind =
   | 'fileop'
   | 'registration'
   | 'masterbuild'
+  | 'calibration'
   | 'generic';
 
 /** Short-lived toast shown bottom-right. */

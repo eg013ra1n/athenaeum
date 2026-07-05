@@ -108,6 +108,26 @@ export function useScanProgress() {
               ? 'info'
               : 'success',
         });
+
+        // Calibrated-LIGHT duplicates (design §4.3): the scanner found calibrated
+        // outputs whose identity matches a tracked file that is ALSO still on
+        // disk — a redundant copy the user should know about. Never blocks; just
+        // a heads-up listing the count and the first few pairs.
+        const dups = payload.calibrated_duplicates ?? [];
+        if (dups.length > 0) {
+          const baseName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
+          const preview = dups
+            .slice(0, 3)
+            .map((d) => `${baseName(d.duplicatePath)} ↔ ${baseName(d.keptPath)}`)
+            .join('\n');
+          notify({
+            title: `${dups.length} duplicate calibrated light${dups.length === 1 ? '' : 's'} found`,
+            detail: preview + (dups.length > 3 ? `\n… and ${dups.length - 3} more` : ''),
+            kind: 'files',
+            tone: 'warning',
+            dedupeKey: `caldups-${payload.root_id}-${dups.length}-${dups[0]?.duplicatePath ?? ''}`,
+          });
+        }
       })
       .then((fn) => { if (cancelled) fn(); else completeUnlisten = fn; })
       .catch((err) => console.error('[useScanProgress] listen failed:', err));

@@ -17,6 +17,7 @@ import {
   FolderInput,
   Layers,
   Blend,
+  Wand2,
   type LucideIcon,
 } from 'lucide-react';
 import { useNotifications, type NotificationKind } from '../contexts/NotificationContext';
@@ -35,6 +36,7 @@ const KIND_ICON: Record<NotificationKind, LucideIcon> = {
   fileop: FolderInput,
   registration: Layers,
   masterbuild: Blend,
+  calibration: Wand2,
   generic: Bell,
 };
 

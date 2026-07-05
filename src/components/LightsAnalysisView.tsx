@@ -5,6 +5,7 @@ import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
   FrameSetReference,
+  LightFrameReadiness,
 } from '../types/models';
 import { useNotifications } from '../contexts/NotificationContext';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
@@ -36,9 +37,12 @@ interface LightsAnalysisViewProps {
    *  parent provides this, the component will use it instead of loading it
    *  independently (avoids a double fetch). */
   referenceFrameId?: number | null;
+  /** Per-frame light-calibration readiness (keyed by frame_id), fetched once by
+   *  the parent. Drives the "Calib" status column in the table. */
+  readinessByFrameId?: Map<number, LightFrameReadiness>;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, readinessByFrameId }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');
 
@@ -888,6 +892,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                   referenceFrameId={effectiveReferenceFrameId}
                   onSetReference={onReferenceChanged !== undefined ? handleSetReference : undefined}
                   settingReference={settingReference}
+                  readinessByFrameId={readinessByFrameId}
                 />
               </div>
             ) : (
