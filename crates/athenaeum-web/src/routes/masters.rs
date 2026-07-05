@@ -67,6 +67,12 @@ pub struct ArchiveCalibrationOriginalsArgs {
     pub calibration_set_id: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreCalibrationOriginalsArgs {
+    pub calibration_set_id: i64,
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 /// POST /api/preview_master_build
@@ -191,6 +197,27 @@ pub async fn archive_calibration_originals(
 ) -> Result<Json<i64>, (StatusCode, String)> {
     let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
     api::archive_originals(state.ctx.clone(), emitter, args.calibration_set_id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/restore_calibration_originals
+///
+/// Restore a SUPERSEDED calibration set's archived originals from their zip
+/// (mirror of `archive_calibration_originals`, reverse direction). Thin
+/// wrapper: op-id resolution + zip-exists validation happen synchronously
+/// inside `api::masters::restore_originals` (returns an actionable error if
+/// the zip is missing), which then enqueues the restore on the shared disk
+/// worker exactly like `archive_originals` does. Progress/completion arrive
+/// via the existing `archive-progress` / `archive-finished` SSE events
+/// (`kind: "restore"`), same as the frame-set restore flow.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn restore_calibration_originals(
+    State(state): State<WebAppState>,
+    Json(args): Json<RestoreCalibrationOriginalsArgs>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::restore_originals(state.ctx.clone(), emitter, args.calibration_set_id)
         .map(Json)
         .map_err(api_err)
 }

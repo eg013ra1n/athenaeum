@@ -121,6 +121,22 @@ pub struct MasterProvenanceInfo {
     pub source_frames_on_disk: bool,
     /// Any source file has archive markers.
     pub originals_archived: bool,
+    /// `archived_in_operation` read off whichever source member file has it
+    /// set — every member of a single archive-of-originals op shares the
+    /// same op id and zip by construction (`planner::build_calibration_set_plan`
+    /// produces exactly one `PlannedZip` per calibration set), so "any member"
+    /// and "the" op id are the same thing here. `None` when `originals_archived`
+    /// is false.
+    pub archive_operation_id: Option<i64>,
+    /// `archive_zip_path` read off the same member file as
+    /// `archive_operation_id`. `None` when `originals_archived` is false.
+    pub archive_zip_path: Option<String>,
+    /// `true` when archive markers are present but `Path::exists(archive_zip_path)`
+    /// is false — the zip was deleted (or moved) outside the app. Always
+    /// `false` when `originals_archived` is false (nothing to be missing).
+    /// The UI uses this to hide the restore button and show an actionable
+    /// warning instead of letting the user kick off a restore doomed to fail.
+    pub archive_zip_missing: bool,
 }
 
 /// Result of [`start_master_builds_batch`]: which sets were actually
@@ -1344,31 +1360,51 @@ pub fn get_master_provenance(
         .map(|v| v.len())
         .unwrap_or(0);
 
-    let (originals_archived, source_frames_on_disk) = if let Some(src_id) = prov.source_set_id {
-        let archived_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set_frames csf
-             JOIN frames f ON f.id = csf.frame_id
-             JOIN files fi ON fi.id = f.file_id
-             WHERE csf.set_id = ?1 AND fi.archived_in_operation IS NOT NULL",
-            [src_id],
-            |r| r.get(0),
-        )?;
+    let (originals_archived, source_frames_on_disk, archive_operation_id, archive_zip_path, archive_zip_missing) =
+        if let Some(src_id) = prov.source_set_id {
+            let archived_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id
+                 JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1 AND fi.archived_in_operation IS NOT NULL",
+                [src_id],
+                |r| r.get(0),
+            )?;
 
-        let mut stmt = conn.prepare(
-            "SELECT fi.path FROM calibration_set_frames csf
-             JOIN frames f ON f.id = csf.frame_id
-             JOIN files fi ON fi.id = f.file_id
-             WHERE csf.set_id = ?1",
-        )?;
-        let paths: Vec<String> = stmt
-            .query_map([src_id], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        let source_frames_on_disk = !paths.is_empty() && paths.iter().all(|p| Path::new(p).exists());
+            let mut stmt = conn.prepare(
+                "SELECT fi.path FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id
+                 JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1",
+            )?;
+            let paths: Vec<String> = stmt
+                .query_map([src_id], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let source_frames_on_disk = !paths.is_empty() && paths.iter().all(|p| Path::new(p).exists());
+            drop(stmt);
 
-        (archived_count > 0, source_frames_on_disk)
-    } else {
-        (false, false)
-    };
+            // Any ONE member's markers — see the field doc comments above for
+            // why every member shares the same op id / zip path.
+            let marker: Option<(Option<i64>, Option<String>)> = conn.query_row(
+                "SELECT fi.archived_in_operation, fi.archive_zip_path
+                 FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id
+                 JOIN files fi ON fi.id = f.file_id
+                 WHERE csf.set_id = ?1 AND fi.archived_in_operation IS NOT NULL
+                 LIMIT 1",
+                [src_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+            let (archive_operation_id, archive_zip_path) = marker.unwrap_or((None, None));
+            let archive_zip_missing = archive_zip_path
+                .as_deref()
+                .map(|p| !Path::new(p).exists())
+                .unwrap_or(false);
+
+            (archived_count > 0, source_frames_on_disk, archive_operation_id, archive_zip_path, archive_zip_missing)
+        } else {
+            (false, false, None, None, false)
+        };
 
     Ok(Some(MasterProvenanceInfo {
         master_set_id: prov.master_set_id,
@@ -1379,7 +1415,187 @@ pub fn get_master_provenance(
         created_at: prov.created_at,
         source_frames_on_disk,
         originals_archived,
+        archive_operation_id,
+        archive_zip_path,
+        archive_zip_missing,
     }))
+}
+
+/// Common ancestor directory of a set of absolute file paths. Used by
+/// [`restore_originals`] to synthesize a `target_root_path` for
+/// `archive::restore::run_restore` that is GUARANTEED to be a string prefix
+/// of every member's `source_path` — which is exactly what
+/// `restore::classify_target` checks to pick "restore to original location"
+/// mode. Any common ancestor works for that purpose (the value itself is
+/// never used as an actual restore destination in Original mode — see
+/// `RestoreTargetMode::Original`), so this doesn't need to be the TIGHTEST
+/// possible ancestor, just A valid one; comparing path components pairwise
+/// happens to produce the tightest one for free. Deliberately NOT a hardcoded
+/// `/` (or `C:\`): that only works on Unix-style absolute paths, and this
+/// needs to work identically on Windows.
+fn common_source_dir(paths: &[PathBuf]) -> PathBuf {
+    match paths.split_first() {
+        None => PathBuf::new(),
+        Some((first, rest)) if rest.is_empty() => {
+            first.parent().map(Path::to_path_buf).unwrap_or_else(|| first.clone())
+        }
+        Some((first, rest)) => {
+            let first_components: Vec<_> = first.components().collect();
+            let mut common_len = first_components.len();
+            for p in rest {
+                let matched = first_components
+                    .iter()
+                    .zip(p.components())
+                    .take_while(|(a, b)| **a == *b)
+                    .count();
+                common_len = common_len.min(matched);
+            }
+            first_components[..common_len].iter().collect()
+        }
+    }
+}
+
+/// Restore a SUPERSEDED calibration set's archived originals from their zip
+/// (the reverse of `archive_originals`, sharing its enqueue-on-shared-worker
+/// shape). Resolves the archive operation id + zip path from the source
+/// set's member files (same query `get_master_provenance` uses to populate
+/// `archive_operation_id`/`archive_zip_path` — see those field doc comments
+/// for why "any member" is enough), validates the zip still exists on disk
+/// (returns an actionable `ApiError::Invalid` — never an io panic — if it
+/// doesn't; the UI's `archive_zip_missing` flag is meant to keep the operator
+/// from ever reaching this path via the button, but the API itself must
+/// degrade gracefully if called directly), then enqueues
+/// `archive::restore::run_restore` on the same shared disk-op worker
+/// `archive_originals` uses.
+///
+/// Restores to each file's own recorded `source_path` (Original mode — see
+/// `common_source_dir`) with `overwrite_existing: false,
+/// keep_zip_after_restore: true`: never clobber something already sitting at
+/// the original path, and don't delete the only other known-good copy (the
+/// zip) until the operator has separately confirmed the restore stuck. The
+/// frame-set restore dialog exposes both of these as user choices; this
+/// one-click calibration flow doesn't ask, so it defaults to the safer
+/// option on both axes.
+///
+/// Reuses `archive::restore::run_restore` — the exact engine
+/// `start_restore_operation` (Tauri) / its web twin drive for frame-set
+/// restores, already proven subject-agnostic end-to-end by the Task 14
+/// `calibration_archive_executor_and_restore_round_trip` test — rather than
+/// duplicating any extract/reconcile/catalog-update logic here.
+pub fn restore_originals(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    calibration_set_id: i64,
+) -> Result<i64, ApiError> {
+    use crate::archive::restore;
+    use crate::services::operation_queue::{OperationKind, QueuedJob};
+    use crate::services::ArchiveHandle;
+
+    {
+        let map = ctx.active_archives.lock().unwrap();
+        if !map.is_empty() {
+            return Err(ApiError::Conflict(
+                "another archive/restore operation is already in progress".into(),
+            ));
+        }
+    }
+
+    let (op_id, target_root) = {
+        let db_handle = db(&ctx)?;
+        let conn = db_handle.conn();
+
+        let mut stmt = conn.prepare(
+            "SELECT fi.path, fi.archived_in_operation, fi.archive_zip_path
+             FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             JOIN files fi ON fi.id = f.file_id
+             WHERE csf.set_id = ?1",
+        )?;
+        let rows: Vec<(String, Option<i64>, Option<String>)> = stmt
+            .query_map([calibration_set_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        if rows.is_empty() {
+            return Err(ApiError::Invalid(
+                "calibration set has no member frames on record".into(),
+            ));
+        }
+
+        let marker = rows.iter().find_map(|(_, op, zip)| match (op, zip) {
+            (Some(op), Some(zip)) => Some((*op, zip.clone())),
+            _ => None,
+        });
+        let Some((op_id, zip_path)) = marker else {
+            return Err(ApiError::Invalid(
+                "calibration set's originals are not archived — nothing to restore".into(),
+            ));
+        };
+
+        if !Path::new(&zip_path).exists() {
+            return Err(ApiError::Invalid(format!(
+                "Archive zip is missing on disk: {zip_path} — it may have been deleted; \
+                 you can clear the stale archive markers"
+            )));
+        }
+
+        let paths: Vec<PathBuf> = rows.into_iter().map(|(p, _, _)| PathBuf::from(p)).collect();
+        let target_root = common_source_dir(&paths);
+
+        (op_id, target_root)
+    };
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut map = ctx.active_archives.lock().unwrap();
+        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
+    }
+
+    let ctx_for_worker = ctx.clone();
+    let emitter_for_worker = emitter.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let Some(db_handle) = ctx_for_worker.db.get() else {
+                tracing::error!(operation_id = op_id, "db not initialized for calibration restore worker");
+                ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
+                return;
+            };
+            let conn = db_handle.conn();
+            let (outcome, conflicts) = match restore::run_restore(
+                &conn, op_id, &target_root, false, true, &cancel_flag, emitter_for_worker.as_ref(),
+            ) {
+                Ok(result) if result.has_conflicts() => {
+                    tracing::warn!(
+                        operation_id = op_id,
+                        conflicts = result.conflicts.len(),
+                        "calibration originals restore completed with conflicts"
+                    );
+                    ("completed_with_conflicts", result.conflicts.len())
+                }
+                Ok(_) => ("completed", 0),
+                Err(e) => {
+                    tracing::error!(operation_id = op_id, error = ?e, "calibration originals restore failed");
+                    let outcome = if format!("{:#}", e).contains("cancelled") { "cancelled" } else { "failed" };
+                    (outcome, 0)
+                }
+            };
+            emit_event(
+                emitter_for_worker.as_ref(),
+                "archive-finished",
+                &serde_json::json!({
+                    "operation_id": op_id,
+                    "outcome": outcome,
+                    "kind": "restore",
+                    "conflicts": conflicts,
+                }),
+            );
+            ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
+        }),
+    });
+
+    Ok(op_id)
 }
 
 #[cfg(test)]
@@ -1914,5 +2130,157 @@ mod tests {
             "12 previews against an 8-conn pool took {elapsed:?} — \
              looks like pool contention/near-timeout, not the near-instant pure-DB path"
         );
+    }
+
+    // ── Shakedown gap: deleted archive zip must be detected, not panic ──────
+    //
+    // Lives here rather than alongside the Task 14
+    // `calibration_archive_executor_and_restore_round_trip` test in
+    // `archive/planner.rs` because both functions under test
+    // (`get_master_provenance`, `restore_originals`) need a full
+    // `ServiceContext` (`operation_queue`, `active_archives`) — borrows the
+    // construction precedent from `preview_master_build_survives_pool_sized_concurrency`
+    // above rather than `archive/planner.rs`'s bare-`Connection` tests.
+    #[test]
+    fn archive_zip_missing_is_detected_and_restore_is_actionable() {
+        use crate::archive::models::{ArchiveCompression, ConflictResolution};
+        use crate::archive::planner::{build_calibration_set_plan, commit_plan};
+        use crate::cache::MemoryImageCache;
+        use crate::events::NullEmitter;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock, RwLock};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let archive_dir = tmp.path().join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let raw_dir = tmp.path().join("raw");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+
+        // Named `catalog_db` (not `db`) — a local binding named `db` would
+        // shadow the `db(ctx)` helper fn for the rest of this scope (see
+        // `run_build`'s `db_handle` precedent above for the same pitfall).
+        let catalog_db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+
+        // Same fixture shape as the Task 14 round-trip test: a raw Dark set
+        // superseded by a master, one member file, a master_provenance row
+        // linking them.
+        let calibration_set_id = {
+            let conn = catalog_db.conn();
+            conn.execute(
+                "INSERT INTO scan_roots (path) VALUES (?1)",
+                [raw_dir.to_string_lossy()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+                 VALUES (999, 'MasterDark', '2026-06-28', 1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set
+                    (imagetyp, date, instrume, gain, exptime, date_start, date_end, superseded_by_set_id)
+                 VALUES ('Dark','2026-06-28','TestCam',100.0,300.0,
+                         '2026-06-28T20:00:00Z','2026-06-28T21:00:00Z', 999)",
+                [],
+            ).unwrap();
+            let set_id = conn.last_insert_rowid();
+
+            let f = raw_dir.join("d1.fits");
+            std::fs::write(&f, b"data").unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, 'd1.fits', 4, '2026-06-28', 'FITS')",
+                [f.to_string_lossy()],
+            ).unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')", [file_id]).unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frame_id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO master_provenance
+                    (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+                 VALUES (999, ?1, '{}', '[]', 'abc123', '2026-06-28T00:00:00Z')",
+                [set_id],
+            ).unwrap();
+
+            set_id
+        };
+        let master_set_id: i64 = 999;
+
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(catalog_db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+        });
+
+        // Archive the raw set's originals for real (plan -> commit -> execute) —
+        // the same sequence `api::masters::archive_originals` drives — so the
+        // fixture matches exactly what production writes to `files`.
+        let op_id = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            let plan = build_calibration_set_plan(
+                &conn, calibration_set_id, &archive_dir, ArchiveCompression::Store,
+            ).unwrap();
+            let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            crate::archive::executor::run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
+            op_id
+        };
+
+        // Sanity: provenance sees it archived and NOT missing yet.
+        let prov = get_master_provenance(&ctx, master_set_id).unwrap().unwrap();
+        assert!(prov.originals_archived);
+        assert_eq!(prov.archive_operation_id, Some(op_id));
+        let zip_path = prov.archive_zip_path.clone().expect("zip path recorded");
+        assert!(!prov.archive_zip_missing, "zip still on disk at this point");
+
+        // Delete the zip out from under the catalog — simulates the user
+        // removing it (or the drive it lived on going away) outside the app.
+        std::fs::remove_file(&zip_path).unwrap();
+
+        // (a) provenance now reports the gap instead of silently claiming the
+        // originals are still one click away from being restored.
+        let prov_after = get_master_provenance(&ctx, master_set_id).unwrap().unwrap();
+        assert!(prov_after.archive_zip_missing, "must detect the deleted zip");
+        assert!(prov_after.originals_archived, "markers are still present — only the zip vanished");
+
+        // (b) a restore attempt fails with an actionable Invalid, not an io
+        // panic — this is what the UI's `archiveZipMissing` gate exists to
+        // pre-empt, but the API itself must degrade gracefully even if
+        // called directly (e.g. from a script, or a future UI regression).
+        let emitter: Arc<dyn ProgressEmitter> = Arc::new(NullEmitter);
+        let err = restore_originals(ctx.clone(), emitter, calibration_set_id).unwrap_err();
+        match err {
+            ApiError::Invalid(msg) => {
+                assert!(msg.contains("missing on disk"), "{msg}");
+                assert!(msg.contains(&zip_path), "{msg}");
+            }
+            other => panic!("expected ApiError::Invalid, got {other:?}"),
+        }
+
+        // No operation was ever enqueued for the failed attempt — the
+        // handle map must be exactly as empty as it started.
+        assert!(ctx.active_archives.lock().unwrap().is_empty());
     }
 }

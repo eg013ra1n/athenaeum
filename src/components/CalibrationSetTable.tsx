@@ -572,10 +572,19 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
 // call, and re-fetch provenance once the op finishes so
 // `originalsArchived`/`sourceFramesOnDisk` reflect the new state.
 
+/** Last path segment (basename); same small helper as `CreateMasterDialog`'s
+ *  local `basename()` — kept duplicated rather than shared for one line. */
+function provenanceBasename(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
 function MasterProvenanceBlock({ setId }: { setId: number }) {
   const [prov, setProv] = useState<MasterProvenanceInfo | null | 'loading'>('loading');
   const [archiveOpId, setArchiveOpId] = useState<number | null>(null);
   const [archiveStartError, setArchiveStartError] = useState<string | null>(null);
+  const [restoreOpId, setRestoreOpId] = useState<number | null>(null);
+  const [restoreStartError, setRestoreStartError] = useState<string | null>(null);
 
   const fetchProvenance = useCallback(() => {
     let gone = false;
@@ -610,6 +619,21 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
     }
   };
 
+  // Restore targets the SOURCE set (the raw calibration set whose originals
+  // got zipped), same as `startArchive` above — `setId` here is the MASTER
+  // set id, `prov.sourceSetId` is what `restore_calibration_originals`
+  // (and `archive_calibration_originals`) actually operate on.
+  const startRestore = async () => {
+    if (prov.sourceSetId == null) return;
+    setRestoreStartError(null);
+    try {
+      const opId = await api.invoke<number>('restore_calibration_originals', { calibrationSetId: prov.sourceSetId });
+      setRestoreOpId(opId);
+    } catch (e) {
+      setRestoreStartError(String(e));
+    }
+  };
+
   return (
     <div className="mt-2 text-xs space-y-1">
       <span className="px-1.5 py-0.5 rounded bg-accent/20 text-accent">built in Athenaeum</span>
@@ -619,7 +643,36 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
       <div>
         <span className="text-content-muted">Originals:</span>{' '}
         {prov.originalsArchived ? (
-          <span className="text-content">archived to zip</span>
+          <>
+            {prov.archiveZipPath ? (
+              <span className="text-content font-mono" title={prov.archiveZipPath}>
+                {provenanceBasename(prov.archiveZipPath)}
+              </span>
+            ) : (
+              <span className="text-content">archived to zip</span>
+            )}
+            {prov.archiveZipMissing ? (
+              <div className="mt-1 text-error">archive file is missing on disk (deleted?)</div>
+            ) : restoreOpId != null ? (
+              <div className="mt-1 max-w-xs" onClick={e => e.stopPropagation()}>
+                <ArchiveProgress
+                  operationId={restoreOpId}
+                  onFinished={() => fetchProvenance()}
+                  onClose={() => setRestoreOpId(null)}
+                />
+              </div>
+            ) : (
+              <div className="mt-1">
+                <button
+                  onClick={(e) => { e.stopPropagation(); void startRestore(); }}
+                  className="px-2 py-0.5 bg-surface-hover hover:brightness-110 rounded text-content disabled:opacity-50"
+                >
+                  Restore originals
+                </button>
+              </div>
+            )}
+            {restoreStartError && <div className="text-error mt-1">{restoreStartError}</div>}
+          </>
         ) : prov.sourceFramesOnDisk && prov.sourceSetId != null ? (
           archiveOpId != null ? (
             <div className="mt-1 max-w-xs" onClick={e => e.stopPropagation()}>

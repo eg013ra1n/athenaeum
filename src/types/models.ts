@@ -452,7 +452,29 @@ sourceFramesOnDisk: boolean,
 /**
  * Any source file has archive markers.
  */
-originalsArchived: boolean, };
+originalsArchived: boolean, 
+/**
+ * `archived_in_operation` read off whichever source member file has it
+ * set — every member of a single archive-of-originals op shares the
+ * same op id and zip by construction (`planner::build_calibration_set_plan`
+ * produces exactly one `PlannedZip` per calibration set), so "any member"
+ * and "the" op id are the same thing here. `None` when `originals_archived`
+ * is false.
+ */
+archiveOperationId: number | null, 
+/**
+ * `archive_zip_path` read off the same member file as
+ * `archive_operation_id`. `None` when `originals_archived` is false.
+ */
+archiveZipPath: string | null, 
+/**
+ * `true` when archive markers are present but `Path::exists(archive_zip_path)`
+ * is false — the zip was deleted (or moved) outside the app. Always
+ * `false` when `originals_archived` is false (nothing to be missing).
+ * The UI uses this to hide the restore button and show an actionable
+ * warning instead of letting the user kick off a restore doomed to fail.
+ */
+archiveZipMissing: boolean, };
 
 export type BatchBuildReport = { startedSetIds: Array<number>, skipped: Array<BatchSkip>, };
 

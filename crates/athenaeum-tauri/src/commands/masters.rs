@@ -136,3 +136,22 @@ pub async fn archive_calibration_originals(
     let emitter = Arc::new(TauriProgressEmitter(app_handle));
     api::archive_originals(state.ctx.clone(), emitter, calibration_set_id).map_err(|e| e.to_string())
 }
+
+/// Restore a SUPERSEDED calibration set's archived originals from their zip
+/// (mirror of `archive_calibration_originals`, reverse direction). Thin
+/// wrapper: op-id resolution + zip-exists validation happen synchronously
+/// inside `api::masters::restore_originals` (returns an actionable error
+/// string if the zip is missing), which then enqueues the restore on the
+/// shared disk worker exactly like `archive_originals` does. Progress/
+/// completion arrive via the existing `archive-progress` / `archive-finished`
+/// events (`kind: "restore"`), same as the frame-set restore flow.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn restore_calibration_originals(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    calibration_set_id: i64,
+) -> Result<i64, String> {
+    let emitter = Arc::new(TauriProgressEmitter(app_handle));
+    api::restore_originals(state.ctx.clone(), emitter, calibration_set_id).map_err(|e| e.to_string())
+}
