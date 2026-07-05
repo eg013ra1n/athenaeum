@@ -58,6 +58,17 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
   maximum (65535 for 16-bit sources), recorded as `ATH_CSCL`. Verifying that
   WBPP consumes this correctly with calibration disabled is an acceptance
   test (research open question #2); the divisor lives in one constant.
+
+  **Acceptance verdict (2026-07-06, owner's Tadpoles/ASI294MM data,
+  `scripts/compare_calibrated.py`):** PASSED. Same 60s light calibrated by
+  Athenaeum vs PixInsight ImageCalibration with the same masters: correlation
+  0.999884, 0.3% rms residual, zero offset. The single systematic difference
+  is a global gain of 0.939 — a flat-normalization *convention*: Athenaeum
+  divides the flat by its central-third mean (`ATH_FNRM`), PI by a whole-frame
+  statistic; ~10% corner vignetting puts the full-frame mean ~6% below the
+  central-third mean. Irrelevant for integration (WBPP normalizes frames).
+  Also observed: PI clips negatives to 0 in its output; our
+  negatives-preserved f32 is consumed without issue.
 - OSC/CFA: calibrated **un-debayered** (CFA mosaic preserved), `BAYERPAT` /
   `XBAYROFF`/`YBAYROFF` copied through. Global flat normalization (the single
   `ATH_FNRM`) preserves channel ratios; per-CFA-plane normalization is
