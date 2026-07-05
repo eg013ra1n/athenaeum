@@ -3,6 +3,7 @@ import { X, Hammer, AlertTriangle } from 'lucide-react';
 import { api } from '../../api';
 import type { MasterBuildPreview, MasterRecipe, CombineMethod } from '../../types/models';
 import { useMasterBuildContext } from '../../contexts/MasterBuildContext';
+import { useNotifications } from '../../contexts/NotificationContext';
 
 interface CreateMasterDialogProps {
   setIds: number[];          // 1 = single set, >1 = batch
@@ -23,6 +24,7 @@ function toCombineMethod(c: CombineChoice, sigLo: number, sigHi: number, pLo: nu
 
 export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps) {
   const { startBuild, startBatch } = useMasterBuildContext();
+  const { notify } = useNotifications();
   const single = setIds.length === 1;
   const [preview, setPreview] = useState<MasterBuildPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -66,8 +68,23 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     setStarting(true);
     setStartError(null);
     try {
-      if (single) await startBuild(setIds[0], recipe());
-      else await startBatch(setIds, recipe());
+      if (single) {
+        await startBuild(setIds[0], recipe());
+      } else {
+        const report = await startBatch(setIds, recipe());
+        if (report.skipped.length > 0) {
+          const detail = report.skipped
+            .slice(0, 5)
+            .map(s => `#${s.setId}: ${s.reason}`)
+            .join('\n');
+          notify({
+            title: `${report.startedSetIds.length} builds started, ${report.skipped.length} skipped`,
+            detail,
+            kind: 'masterbuild',
+            tone: 'warning',
+          });
+        }
+      }
       onClose();
     } catch (e) {
       setStartError(String(e));

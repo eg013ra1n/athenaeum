@@ -82,7 +82,16 @@ fn spill_via_read_raw(path: &Path, scratch_dir: &Path, idx: usize)
         )));
     }
     let (w, h) = (meta.width, meta.height);
-    let scratch_path: PathBuf = scratch_dir.join(format!("athint_scratch_{}_{idx}.f32", std::process::id()));
+    // `idx` alone repeats across concurrent `BandSource::open` calls in the
+    // same process (each call restarts its own per-frame index at 0), so two
+    // builds racing the spill fallback at the same `idx` can collide on this
+    // path — one truncates/removes the other's scratch file mid-read, causing
+    // silent pixel corruption (mirrors the fits_writer/writer.rs tmp-suffix
+    // fix on this branch). A process-wide atomic sequence makes every spill
+    // path unique regardless of caller overlap.
+    static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch_path: PathBuf = scratch_dir.join(format!("athint_scratch_{}_{seq}_{idx}.f32", std::process::id()));
     {
         let mut out = std::io::BufWriter::new(File::create(&scratch_path)?);
         use std::io::Write;
@@ -281,6 +290,46 @@ mod tests {
         let p1 = f32_fixture(dir.path(), "a.fits", 32, 24, |_, _| 0.0);
         let p2 = f32_fixture(dir.path(), "b.fits", 16, 24, |_, _| 0.0);
         assert!(matches!(BandSource::open(&[p1, p2], dir.path()), Err(IntegrationError::BadInput(_))));
+    }
+
+    #[test]
+    fn concurrent_spills_at_same_idx_never_cross_contaminate() {
+        // Root cause: `idx` is a per-`BandSource::open`-call frame index that
+        // restarts at 0 every call, so two concurrent builds racing the
+        // decode-and-spill fallback (e.g. both integrating their first
+        // XISF/nonstandard frame) can land on `idx == 0` at the same time.
+        // Before the fix that meant an identical scratch path
+        // (`athint_scratch_{pid}_{idx}.f32`) — one thread's create/write
+        // could race the other's read/rename, silently corrupting pixels.
+        //
+        // Crafting a real non-FITS/fallback-triggering fixture is heavy, so
+        // this pins the fix at the actual seam: call the private
+        // `spill_via_read_raw` helper directly from two threads with the
+        // SAME `idx`, many times, each spilling a distinct known fill value,
+        // and assert every read-back is exactly its own thread's value —
+        // never the other thread's, and never garbage from a torn write.
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_dir = scratch.path().to_path_buf();
+
+        let run = |tag: f32, scratch_dir: PathBuf| {
+            let fixtures = tempfile::tempdir().unwrap();
+            for i in 0..25 {
+                let p = f32_fixture(fixtures.path(), &format!("f{i}.fits"), 12, 10, move |_, _| tag);
+                let (mut file, w, h) = spill_via_read_raw(&p, &scratch_dir, 0).unwrap();
+                let mut buf = vec![0u8; w * h * 4];
+                std::io::Read::read_exact(&mut file, &mut buf).unwrap();
+                for c in buf.chunks_exact(4) {
+                    let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    assert_eq!(v, tag, "read back the other thread's (or torn) scratch data");
+                }
+            }
+        };
+
+        let (sd1, sd2) = (scratch_dir.clone(), scratch_dir.clone());
+        let t1 = std::thread::spawn(move || run(1.0, sd1));
+        let t2 = std::thread::spawn(move || run(2.0, sd2));
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 
     #[test]

@@ -85,7 +85,40 @@ export function useMasterBuilds() {
       for (const id of setIds) next.set(id, { phase: 'starting' });
       return next;
     });
-    return api.invoke<BatchBuildReport>('start_master_builds_batch', { setIds, recipe });
+    let report: BatchBuildReport;
+    try {
+      report = await api.invoke<BatchBuildReport>('start_master_builds_batch', { setIds, recipe });
+    } catch (err) {
+      setBuildStates(prev => {
+        const next = new Map(prev);
+        for (const id of setIds) {
+          next.set(id, {
+            phase: 'done',
+            result: { set_id: id, master_set_id: null, success: false, cancelled: false, error: String(err) },
+          });
+        }
+        return next;
+      });
+      throw err;
+    }
+
+    // Sets the backend declined to enqueue (e.g. too few frames) never emit a
+    // `master-build-complete` event — reconcile them here so they don't stay
+    // stuck on the optimistic 'starting' state forever.
+    if (report.skipped.length > 0) {
+      setBuildStates(prev => {
+        const next = new Map(prev);
+        for (const skip of report.skipped) {
+          next.set(skip.setId, {
+            phase: 'done',
+            result: { set_id: skip.setId, master_set_id: null, success: false, cancelled: false, error: skip.reason },
+          });
+        }
+        return next;
+      });
+    }
+
+    return report;
   }, []);
 
   const cancelBuild = useCallback(async (setId: number) => {

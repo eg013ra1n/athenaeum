@@ -93,8 +93,12 @@ export function CalibrationHierarchyView({
   // not just the currently checked tree nodes).
   const rawCalSetIds = useMemo(() => {
     const ids = new Set<number>();
-    const consider = (s: { id: number | null; is_master: boolean; superseded_by_set_id: number | null }) => {
-      if (s.id != null && !s.is_master && s.superseded_by_set_id == null) ids.add(s.id);
+    // frame_count < 3 mirrors the backend's minimum-frames guard for master
+    // builds (Task 12) — filtered here too so "Create all masters (N)" doesn't
+    // advertise a count the backend will immediately skip. Backend remains
+    // the source of truth; this is purely a UI count/eligibility mirror.
+    const consider = (s: { id: number | null; is_master: boolean; superseded_by_set_id: number | null; frame_count: number }) => {
+      if (s.id != null && !s.is_master && s.superseded_by_set_id == null && s.frame_count >= 3) ids.add(s.id);
     };
     for (const dg of data.date_groups) {
       for (const cg of dg.camera_groups) {

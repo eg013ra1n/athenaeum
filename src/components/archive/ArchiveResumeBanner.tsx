@@ -16,7 +16,11 @@ export function ArchiveResumeBanner() {
   if (dismissed || ops.length === 0) return null;
 
   const op = ops[0];
-  const name = op.frame_set_name ?? `Frame Set #${op.frames_set_id}`;
+  const name = op.frame_set_name
+    ? op.frame_set_name
+    : op.frames_set_id != null
+      ? `Frame Set #${op.frames_set_id}`
+      : `Calibration originals archive #${op.id}`;
 
   return (
     <div className="bg-warning/10 border-b border-warning/40 px-4 py-2 flex items-center gap-3 text-sm flex-wrap">
