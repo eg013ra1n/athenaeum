@@ -273,19 +273,32 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   // Per-row warnings with any "#<id> is raw" line suppressed once that
   // candidate is in the effective batch AND its own preview resolved ok —
   // mirrors single-mode's `visibleWarnings` but keyed by row since batch
-  // mode has many previews.
+  // mode has many previews. ALSO suppresses the terminal "no pre-calibration
+  // master linked" warning (see `masters.rs`'s
+  // "no pre-calibration master linked and no synthetic bias set — flat
+  // combined un-pre-calibrated" message) once at least one raw candidate is
+  // covered: that warning reflects the chain resolving to None TODAY, but a
+  // covered candidate means a master will exist and get relinked before this
+  // flat builds, so the warning is stale rather than current. Anchored on
+  // the stable "no pre-calibration master linked" prefix rather than the
+  // full string so wording tweaks to the parenthetical don't break this.
+  // Accepted edge (documented, not fixed here): a raw DARK candidate is
+  // reported without exposure-time-match verification, so in a rare
+  // mismatch the runtime chain could still skip it and fall through to
+  // un-pre-calibrated — this green/suppression is optimistic in that case.
   const batchVisibleWarnings = useMemo(() => {
     const m = new Map<number, string[]>();
     if (!batchResults) return m;
     for (const row of batchResults) {
       if (row.kind !== 'ok') continue;
-      m.set(row.setId, row.preview.warnings.filter(w =>
-        !row.preview.rawPrecalSets.some(c =>
-          effectiveIdSet.has(c.setId) &&
-          resultKindBySetId.get(c.setId) === 'ok' &&
-          w.includes(`#${c.setId} is raw`)
-        )
-      ));
+      const coveredCandidates = row.preview.rawPrecalSets.filter(c =>
+        effectiveIdSet.has(c.setId) && resultKindBySetId.get(c.setId) === 'ok'
+      );
+      m.set(row.setId, row.preview.warnings.filter(w => {
+        if (coveredCandidates.some(c => w.includes(`#${c.setId} is raw`))) return false;
+        if (coveredCandidates.length > 0 && w.includes('no pre-calibration master linked')) return false;
+        return true;
+      }));
     }
     return m;
   }, [batchResults, effectiveIdSet, resultKindBySetId]);
@@ -305,11 +318,20 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   // Warnings of the form "linked <Type> set #<id> is raw — build its master
   // first (skipped)" are suppressed once the operator has checked that
   // candidate's box — the warning is being actively addressed, not ignored.
+  // Once ANY candidate is checked, also suppress the terminal "no
+  // pre-calibration master linked" warning (anchored on that stable prefix,
+  // see the batch-mode `batchVisibleWarnings` comment for the full
+  // rationale and the accepted raw-DARK-exposure-match edge case) — it
+  // reflects today's DB state, not the state after the checked candidate's
+  // master gets built and relinked.
   const visibleWarnings = useMemo(() => {
     if (!preview) return [];
-    return preview.warnings.filter(w =>
-      !preview.rawPrecalSets.some(c => checkedRawIds.has(c.setId) && w.includes(`#${c.setId} is raw`))
-    );
+    const hasCheckedCandidate = preview.rawPrecalSets.some(c => checkedRawIds.has(c.setId));
+    return preview.warnings.filter(w => {
+      if (preview.rawPrecalSets.some(c => checkedRawIds.has(c.setId) && w.includes(`#${c.setId} is raw`))) return false;
+      if (hasCheckedCandidate && w.includes('no pre-calibration master linked')) return false;
+      return true;
+    });
   }, [preview, checkedRawIds]);
 
   const runBatch = async (ids: number[]) => {
@@ -522,15 +544,15 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                           </span>
                         </div>
                       ) : (
-                        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-error" title={row.error}>
-                          <XCircle size={11} className="shrink-0" />
-                          <span className="truncate">{row.error}</span>
+                        <div className="mt-0.5 flex items-start gap-1 text-[11px] text-error" title={row.error}>
+                          <XCircle size={11} className="mt-0.5 shrink-0" />
+                          <span className="break-words">{row.error}</span>
                         </div>
                       )}
                       {row.kind === 'ok' && (batchVisibleWarnings.get(row.setId)?.length ?? 0) > 0 && (
-                        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-warning" title={batchVisibleWarnings.get(row.setId)!.join('\n')}>
-                          <AlertTriangle size={11} className="shrink-0" />
-                          <span className="truncate">{batchVisibleWarnings.get(row.setId)![0]}</span>
+                        <div className="mt-0.5 flex items-start gap-1 text-[11px] text-warning" title={batchVisibleWarnings.get(row.setId)!.join('\n')}>
+                          <AlertTriangle size={11} className="mt-0.5 shrink-0" />
+                          <span className="break-words">{batchVisibleWarnings.get(row.setId)![0]}</span>
                         </div>
                       )}
                       {/* Batch-aware precal notes: for each raw candidate a
@@ -570,17 +592,17 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                         return (
                           <div key={c.setId} className="mt-0.5 space-y-0.5">
                             {inEffectiveBatch && (
-                              <div className="flex items-center gap-1 text-[11px] text-success">
-                                <CheckCircle2 size={11} className="shrink-0" />
-                                <span className="truncate">
+                              <div className="flex items-start gap-1 text-[11px] text-success">
+                                <CheckCircle2 size={11} className="mt-0.5 shrink-0" />
+                                <span className="break-words">
                                   {c.calType} master will be built earlier in this batch (set #{c.setId})
                                 </span>
                               </div>
                             )}
                             {inBatchButFailed && (
-                              <div className="flex items-center gap-1 text-[11px] text-error">
-                                <XCircle size={11} className="shrink-0" />
-                                <span className="truncate">
+                              <div className="flex items-start gap-1 text-[11px] text-error">
+                                <XCircle size={11} className="mt-0.5 shrink-0" />
+                                <span className="break-words">
                                   {c.calType} set #{c.setId} is in this batch but its preview failed — will be skipped
                                 </span>
                               </div>
