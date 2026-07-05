@@ -8,6 +8,7 @@ mod equipment;
 pub mod calibration_links;
 pub mod analysis;
 pub mod master_provenance;
+pub mod light_calibrations;
 
 pub use schema::*;
 pub use operations::*;

@@ -1333,6 +1333,42 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // B5: light_calibrations — sole tracking record for calibrated-light FITS
+    // artifacts, which live OUTSIDE the catalog and are never registered in
+    // `files`/`frames` (design spec 2026-07-05-light-calibration-design.md
+    // §5). `frame_id` is nullable + UNIQUE: NULL only for an "adopted" row
+    // whose source frame isn't cataloged yet, UNIQUE because a frame has at
+    // most one tracked calibrated output. `dark_set_id`/`flat_set_id`/
+    // `bias_set_id` intentionally have no ON DELETE action (unlike
+    // `master_provenance.master_set_id`'s CASCADE) — deleting a calibration
+    // set must not silently delete calibrated-light history.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS light_calibrations (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id          INTEGER UNIQUE REFERENCES frames(id) ON DELETE CASCADE,
+            source_uuid       TEXT,
+            source_filename   TEXT,
+            output_path       TEXT NOT NULL UNIQUE,
+            dark_set_id       INTEGER REFERENCES calibration_set(id),
+            flat_set_id       INTEGER REFERENCES calibration_set(id),
+            bias_set_id       INTEGER REFERENCES calibration_set(id),
+            calstat           TEXT NOT NULL,
+            flat_norm_applied INTEGER NOT NULL,
+            output_hash       TEXT NOT NULL,
+            engine_version    INTEGER NOT NULL,
+            created_at        TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_light_cal_source_uuid ON light_calibrations(source_uuid)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_light_cal_source_filename ON light_calibrations(source_filename)",
+        [],
+    )?;
+
     // B2: prune empty `calibration_set` rows automatically. The
     // `calibration_set_frames` junction table CASCADE-deletes rows when
     // either side is removed (e.g., a frame is deleted from `frames` or the
