@@ -13,65 +13,24 @@ use tauri::{AppHandle, State};
 
 /// Migrate the legacy single-folder `archive.root_path` setting into the
 /// archive_roots table on first call. Idempotent: if the table already has
-/// rows, do nothing.
+/// rows, do nothing. Thin `Result<_, String>` shim over the shared core
+/// helper (`athenaeum_core::archive::migrate_legacy_archive_root`) so the
+/// existing `?`-into-`String` call sites below don't change.
 fn migrate_legacy_archive_root(conn: &Connection, settings: &athenaeum_core::settings::SettingsManager) -> Result<(), String> {
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM archive_roots", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    if count > 0 {
-        return Ok(());
-    }
-    if let Some(legacy) = settings.get_archive_root_path(conn).map_err(|e| e.to_string())? {
-        if !legacy.trim().is_empty() {
-            conn.execute(
-                "INSERT OR IGNORE INTO archive_roots (path, label, is_default) VALUES (?1, NULL, 1)",
-                [&legacy],
-            ).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
+    athenaeum_core::archive::migrate_legacy_archive_root(conn, settings).map_err(|e| format!("{:#}", e))
 }
 
-/// Resolve which archive root path to use for an operation. If the caller
-/// passed an explicit path, validate it's a known archive root. Otherwise
-/// pick the default (or the only one if just one exists). Errors when no
-/// archive roots are configured or no default is set with multiple roots.
+/// Resolve which archive root path to use for an operation. Thin
+/// `Result<_, String>` shim over the shared core helper
+/// (`athenaeum_core::archive::resolve_archive_root`) — moved there (Task 14)
+/// so `api::masters::archive_originals` can share the exact same
+/// default-root selection logic instead of a third copy.
 fn resolve_archive_root(
     conn: &Connection,
     settings: &athenaeum_core::settings::SettingsManager,
     requested: Option<&str>,
 ) -> Result<String, String> {
-    migrate_legacy_archive_root(conn, settings)?;
-    if let Some(p) = requested {
-        let known: i64 = conn
-            .query_row("SELECT COUNT(*) FROM archive_roots WHERE path = ?1", [p], |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        if known == 0 {
-            return Err(format!("'{}' is not a configured archive folder", p));
-        }
-        return Ok(p.to_string());
-    }
-    let rows: Vec<(String, i32)> = {
-        let mut stmt = conn
-            .prepare("SELECT path, is_default FROM archive_roots ORDER BY id")
-            .map_err(|e| e.to_string())?;
-        let mapped = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)))
-            .map_err(|e| e.to_string())?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| e.to_string())?;
-        mapped
-    };
-    if rows.is_empty() {
-        return Err("no archive folders configured — add one in File Manager → Archive Folders".into());
-    }
-    if rows.len() == 1 {
-        return Ok(rows[0].0.clone());
-    }
-    if let Some((path, _)) = rows.iter().find(|(_, d)| *d == 1) {
-        return Ok(path.clone());
-    }
-    Err("multiple archive folders configured but no default — pick a destination explicitly".into())
+    athenaeum_core::archive::resolve_archive_root(conn, settings, requested).map_err(|e| format!("{:#}", e))
 }
 
 #[tauri::command]
@@ -633,11 +592,20 @@ pub async fn delete_archive(
 
     // Get frames_set_id, then delete frame set + cascading rows.
     let op = adb::get_operation(&conn, operation_id).map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM frames_set WHERE id = ?1",
-        [op.frames_set_id],
-    ).map_err(|e| e.to_string())?;
-    // archive_operations row is also deleted via FK cascade from frames_set_id.
+    match op.frames_set_id {
+        Some(fs_id) => {
+            conn.execute("DELETE FROM frames_set WHERE id = ?1", [fs_id])
+                .map_err(|e| e.to_string())?;
+            // archive_operations row is also deleted via FK cascade from frames_set_id.
+        }
+        None => {
+            // Calibration-set archive op (Task 14): no frames_set to cascade
+            // from — delete the archive_operations row directly (cascades to
+            // archive_operation_files/steps via their own FKs).
+            conn.execute("DELETE FROM archive_operations WHERE id = ?1", [operation_id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     Ok(())
 }

@@ -101,6 +101,51 @@ pub fn path_in_zip(unique_root_name: &str, scan_root: &Path, source_file: &Path)
     buf.to_string_lossy().replace('\\', "/")
 }
 
+/// Compute the archive directory for a calibration-set archive-of-originals
+/// plan (Task 14): `Calibration_Archive/<Camera>/<YYYY-MM-DD>`, relative to
+/// the archive root. Falls back to `UnknownCamera` / `unknown-date` the same
+/// way `zip_filename`'s tokens do, but as path segments rather than
+/// underscore-joined tokens (so the FrameRole zip-suffix convention doesn't
+/// apply here).
+pub fn calibration_zip_dir(instrume: Option<&str>, date_start: &str) -> PathBuf {
+    let cam = instrume
+        .map(sanitize_for_filename)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "UnknownCamera".into());
+    let date = date_start.get(..10).unwrap_or("unknown-date");
+    PathBuf::from("Calibration_Archive").join(cam).join(date)
+}
+
+/// Compute the zip filename for a calibration-set archive-of-originals plan
+/// (Task 14): `<Camera>_<Type>_g<gain>_<exptime>s_<date_start>_<date_end>.zip`.
+/// Missing optional tokens (gain, exptime) simply collapse out rather than
+/// falling back to a placeholder — unlike `zip_filename`'s all-tokens-always
+/// shape, since a calibration set may genuinely have no gain recorded (e.g.
+/// older CCD-only data).
+pub fn calibration_zip_filename(
+    instrume: Option<&str>,
+    imagetyp: &str,
+    gain: Option<f64>,
+    exptime: Option<f64>,
+    date_start: &str,
+    date_end: &str,
+) -> String {
+    let cam = instrume
+        .map(sanitize_for_filename)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "UnknownCamera".into());
+    let mut parts = vec![cam, sanitize_for_filename(imagetyp)];
+    if let Some(g) = gain {
+        parts.push(format!("g{}", g.round() as i64));
+    }
+    if let Some(e) = exptime {
+        parts.push(format!("{}s", e));
+    }
+    parts.push(date_start.get(..10).unwrap_or("x").to_string());
+    parts.push(date_end.get(..10).unwrap_or("x").to_string());
+    format!("{}.zip", parts.join("_"))
+}
+
 /// Add a numeric suffix to a zip path before the `.zip` extension.
 /// e.g. `/tmp/M31_Lights.zip` + 2 → `/tmp/M31_Lights (2).zip`
 pub fn add_suffix(path: &Path, n: u32) -> PathBuf {
@@ -172,6 +217,35 @@ mod tests {
             Path::new("/Other/foo.fits"),
         );
         assert_eq!(zip_path, "Lights/foo.fits");
+    }
+
+    #[test]
+    fn calibration_zip_dir_uses_camera_and_date() {
+        let dir = calibration_zip_dir(Some("ASI2600MM"), "2026-06-28T20:00:00Z");
+        assert_eq!(dir, PathBuf::from("Calibration_Archive/ASI2600MM/2026-06-28"));
+    }
+
+    #[test]
+    fn calibration_zip_dir_falls_back_when_missing() {
+        let dir = calibration_zip_dir(None, "");
+        assert_eq!(dir, PathBuf::from("Calibration_Archive/UnknownCamera/unknown-date"));
+    }
+
+    #[test]
+    fn calibration_zip_filename_includes_all_tokens() {
+        let f = calibration_zip_filename(
+            Some("ASI2600MM"), "Dark", Some(100.0), Some(300.0),
+            "2026-06-28T20:00:00Z", "2026-06-28T21:00:00Z",
+        );
+        assert_eq!(f, "ASI2600MM_Dark_g100_300s_2026-06-28_2026-06-28.zip");
+    }
+
+    #[test]
+    fn calibration_zip_filename_collapses_missing_gain_and_exptime() {
+        let f = calibration_zip_filename(
+            None, "Bias", None, None, "2026-06-28T20:00:00Z", "2026-06-28T21:00:00Z",
+        );
+        assert_eq!(f, "UnknownCamera_Bias_2026-06-28_2026-06-28.zip");
     }
 
     #[test]

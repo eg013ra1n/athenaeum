@@ -10,9 +10,15 @@ use rusqlite::{params, Connection};
 
 /// Insert a new archive_operations row in `Planning` status.
 /// Returns the new operation_id.
+///
+/// Exactly one of `frames_set_id` / `calibration_set_id` should be `Some` —
+/// the operation's "subject". Enforced by the caller (`planner::commit_plan`'s
+/// `ensure!`), not here: this is a plain CRUD insert.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_operation(
     conn: &Connection,
-    frames_set_id: i64,
+    frames_set_id: Option<i64>,
+    calibration_set_id: Option<i64>,
     archive_root_path: &str,
     flats: Option<&str>,
     darks: Option<&str>,
@@ -23,12 +29,13 @@ pub fn insert_operation(
     let now = Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO archive_operations (
-            frames_set_id, archive_root_path,
+            frames_set_id, calibration_set_id, archive_root_path,
             flats_disposition, darks_disposition, bias_disposition, darkflats_disposition,
             compression, status, started_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             frames_set_id,
+            calibration_set_id,
             archive_root_path,
             flats,
             darks,
@@ -205,7 +212,7 @@ pub fn list_steps(conn: &Connection, operation_id: i64) -> Result<Vec<ArchiveOpe
 /// Get a single archive_operations row.
 pub fn get_operation(conn: &Connection, operation_id: i64) -> Result<ArchiveOperation> {
     let row = conn.query_row(
-        "SELECT id, frames_set_id, archive_root_path,
+        "SELECT id, frames_set_id, calibration_set_id, archive_root_path,
                 flats_disposition, darks_disposition, bias_disposition, darkflats_disposition,
                 compression, status, started_at, finished_at, error_message
          FROM archive_operations
@@ -215,16 +222,17 @@ pub fn get_operation(conn: &Connection, operation_id: i64) -> Result<ArchiveOper
             Ok(ArchiveOperation {
                 id: row.get(0)?,
                 frames_set_id: row.get(1)?,
-                archive_root_path: row.get(2)?,
-                flats_disposition: row.get(3)?,
-                darks_disposition: row.get(4)?,
-                bias_disposition: row.get(5)?,
-                darkflats_disposition: row.get(6)?,
-                compression: row.get(7)?,
-                status: row.get(8)?,
-                started_at: row.get(9)?,
-                finished_at: row.get(10)?,
-                error_message: row.get(11)?,
+                calibration_set_id: row.get(2)?,
+                archive_root_path: row.get(3)?,
+                flats_disposition: row.get(4)?,
+                darks_disposition: row.get(5)?,
+                bias_disposition: row.get(6)?,
+                darkflats_disposition: row.get(7)?,
+                compression: row.get(8)?,
+                status: row.get(9)?,
+                started_at: row.get(10)?,
+                finished_at: row.get(11)?,
+                error_message: row.get(12)?,
             })
         },
     )?;
@@ -232,6 +240,9 @@ pub fn get_operation(conn: &Connection, operation_id: i64) -> Result<ArchiveOper
 }
 
 /// List operations whose status is "unfinished" (not Completed/Cancelled/RolledBack/Failed).
+/// Includes calibration-set archive ops (Task 14) — `frames_set_id` and
+/// `frame_set_name` come back `None` for those, rather than excluding the row,
+/// so an interrupted calibration archive still surfaces in the resume banner.
 pub fn list_unfinished_operations(conn: &Connection) -> Result<Vec<ArchiveOperationSummary>> {
     let mut stmt = conn.prepare(
         "SELECT op.id, op.frames_set_id, fs.name, op.status, op.started_at, op.finished_at, op.error_message
@@ -371,10 +382,11 @@ mod tests {
     fn insert_and_get_operation() {
         let (conn, fs_id) = setup();
         let op_id = insert_operation(
-            &conn, fs_id, "/tmp/arch", Some("move"), Some("copy"), None, None, "store",
+            &conn, Some(fs_id), None, "/tmp/arch", Some("move"), Some("copy"), None, None, "store",
         ).unwrap();
         let op = get_operation(&conn, op_id).unwrap();
-        assert_eq!(op.frames_set_id, fs_id);
+        assert_eq!(op.frames_set_id, Some(fs_id));
+        assert!(op.calibration_set_id.is_none());
         assert_eq!(op.archive_root_path, "/tmp/arch");
         assert_eq!(op.status, "planning");
         assert_eq!(op.flats_disposition.as_deref(), Some("move"));
@@ -383,9 +395,24 @@ mod tests {
     }
 
     #[test]
+    fn insert_and_get_calibration_operation() {
+        let (conn, _fs_id) = setup();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (42, 'Dark', '2026-06-28')",
+            [],
+        ).unwrap();
+        let op_id = insert_operation(
+            &conn, None, Some(42), "/tmp/arch", None, None, None, None, "store",
+        ).unwrap();
+        let op = get_operation(&conn, op_id).unwrap();
+        assert!(op.frames_set_id.is_none());
+        assert_eq!(op.calibration_set_id, Some(42));
+    }
+
+    #[test]
     fn update_operation_status_sets_finished_at_on_terminal() {
         let (conn, fs_id) = setup();
-        let op_id = insert_operation(&conn, fs_id, "/tmp", None, None, None, None, "store").unwrap();
+        let op_id = insert_operation(&conn, Some(fs_id), None, "/tmp", None, None, None, None, "store").unwrap();
 
         update_operation_status(&conn, op_id, ArchiveStatus::Copying, None).unwrap();
         let op = get_operation(&conn, op_id).unwrap();
@@ -399,7 +426,7 @@ mod tests {
     #[test]
     fn insert_files_and_steps() {
         let (conn, fs_id) = setup();
-        let op_id = insert_operation(&conn, fs_id, "/tmp", None, None, None, None, "store").unwrap();
+        let op_id = insert_operation(&conn, Some(fs_id), None, "/tmp", None, None, None, None, "store").unwrap();
         let file_id = insert_operation_file(
             &conn, op_id, None, "/src/a.fits", "/tmp/A.zip", "Lights/a.fits",
             "deadbeefdeadbeef", "move", "light", 1024,
@@ -419,9 +446,9 @@ mod tests {
     #[test]
     fn list_unfinished_excludes_terminal_states() {
         let (conn, fs_id) = setup();
-        let a = insert_operation(&conn, fs_id, "/tmp/a", None, None, None, None, "store").unwrap();
-        let b = insert_operation(&conn, fs_id, "/tmp/b", None, None, None, None, "store").unwrap();
-        let c = insert_operation(&conn, fs_id, "/tmp/c", None, None, None, None, "store").unwrap();
+        let a = insert_operation(&conn, Some(fs_id), None, "/tmp/a", None, None, None, None, "store").unwrap();
+        let b = insert_operation(&conn, Some(fs_id), None, "/tmp/b", None, None, None, None, "store").unwrap();
+        let c = insert_operation(&conn, Some(fs_id), None, "/tmp/c", None, None, None, None, "store").unwrap();
 
         update_operation_status(&conn, a, ArchiveStatus::Completed, None).unwrap();
         update_operation_status(&conn, b, ArchiveStatus::Copying, None).unwrap();
@@ -432,10 +459,29 @@ mod tests {
         assert_eq!(unfinished[0].id, b);
     }
 
+    /// Task 14: a calibration-set archive op (no `frames_set_id`) must still
+    /// surface from `list_unfinished_operations` — the LEFT JOIN against
+    /// `frames_set` tolerates a NULL `frames_set_id`, it doesn't drop the row.
+    #[test]
+    fn list_unfinished_includes_calibration_ops() {
+        let (conn, _fs_id) = setup();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (42, 'Dark', '2026-06-28')",
+            [],
+        ).unwrap();
+        let op_id = insert_operation(&conn, None, Some(42), "/tmp/cal", None, None, None, None, "store").unwrap();
+
+        let unfinished = list_unfinished_operations(&conn).unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].id, op_id);
+        assert!(unfinished[0].frames_set_id.is_none());
+        assert!(unfinished[0].frame_set_name.is_none());
+    }
+
     #[test]
     fn mark_unmark_frame_set() {
         let (conn, fs_id) = setup();
-        let op_id = insert_operation(&conn, fs_id, "/tmp", None, None, None, None, "store").unwrap();
+        let op_id = insert_operation(&conn, Some(fs_id), None, "/tmp", None, None, None, None, "store").unwrap();
         mark_frame_set_archived(&conn, fs_id, op_id).unwrap();
 
         // mark_frame_set_archived only sets the zip markers; is_archived was

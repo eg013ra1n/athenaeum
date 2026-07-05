@@ -19,7 +19,13 @@ export type SharedCalibrationWarning = { frame_role: FrameRole, calibration_set_
 
 export type ZipFilenameConflict = { zip_path: string, zip_filename: string, };
 
-export type ArchivePlan = { frames_set_id: number, archive_root_path: string, dispositions: Dispositions, compression: ArchiveCompression, files: Array<ArchiveOperationFile>, zips: Array<PlannedZip>, shared_calibrations: Array<SharedCalibrationWarning>, conflicts: Array<ZipFilenameConflict>, total_size_bytes: number, };
+export type ArchivePlan = { frames_set_id: number, 
+/**
+ * `Some(id)` for a calibration-set archive-of-originals plan; `None` for
+ * the original frame-set plan shape. Mutually exclusive with a real
+ * (non-zero) `frames_set_id` — see the struct doc comment.
+ */
+calibration_set_id: number | null, archive_root_path: string, dispositions: Dispositions, compression: ArchiveCompression, files: Array<ArchiveOperationFile>, zips: Array<PlannedZip>, shared_calibrations: Array<SharedCalibrationWarning>, conflicts: Array<ZipFilenameConflict>, total_size_bytes: number, };
 
-export type ArchiveOperationSummary = { id: number, frames_set_id: number, frame_set_name: string | null, status: string, started_at: string, finished_at: string | null, error_message: string | null, };
+export type ArchiveOperationSummary = { id: number, frames_set_id: number | null, frame_set_name: string | null, status: string, started_at: string, finished_at: string | null, error_message: string | null, };
 

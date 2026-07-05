@@ -412,7 +412,17 @@ combine: CombineMethod | null,
 /**
  * Constant-ADU fallback for flat pre-calibration when no darkflat/dark/bias master is linked.
  */
-syntheticBias: number | null, };
+syntheticBias: number | null, 
+/**
+ * Task 14: when true, chain `archive_originals` on the SOURCE
+ * calibration set right after a successful `New`-target build (i.e.
+ * after `register_master` supersedes it) — non-fatally: an archive
+ * failure is logged but never turns a successful master build into a
+ * reported failure. Has no effect on `BuildTarget::Rebuild` (that path
+ * never calls `register_master`, so there's no "just superseded" moment
+ * to chain from — see `rebuild_master`'s own recipe construction).
+ */
+archiveAfter: boolean, };
 
 export type MasterBuildPreview = { setId: number, imagetyp: string, frameCount: number, resolvedCombine: CombineMethod, 
 /**

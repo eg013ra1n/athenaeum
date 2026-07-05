@@ -119,3 +119,20 @@ pub async fn get_master_provenance(
 ) -> Result<Option<MasterProvenanceInfo>, String> {
     api::get_master_provenance(&state.ctx, master_set_id).map_err(|e| e.to_string())
 }
+
+/// Archive a SUPERSEDED calibration set's original member frames into a ZIP
+/// (Task 14). Thin wrapper: plan+commit happen synchronously inside
+/// `api::masters::archive_originals`, which returns as soon as the operation
+/// is queued on the shared disk worker. Progress/completion arrive via the
+/// existing `archive-progress` / `archive-finished` events, same as the
+/// frame-set archive flow.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn archive_calibration_originals(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    calibration_set_id: i64,
+) -> Result<i64, String> {
+    let emitter = Arc::new(TauriProgressEmitter(app_handle));
+    api::archive_originals(state.ctx.clone(), emitter, calibration_set_id).map_err(|e| e.to_string())
+}

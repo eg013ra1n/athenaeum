@@ -61,6 +61,12 @@ pub struct GetMasterProvenanceArgs {
     pub master_set_id: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveCalibrationOriginalsArgs {
+    pub calibration_set_id: i64,
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────
 
 /// POST /api/preview_master_build
@@ -168,4 +174,23 @@ pub async fn get_master_provenance(
     Json(args): Json<GetMasterProvenanceArgs>,
 ) -> Result<Json<Option<MasterProvenanceInfo>>, (StatusCode, String)> {
     api::get_master_provenance(&state.ctx, args.master_set_id).map(Json).map_err(api_err)
+}
+
+/// POST /api/archive_calibration_originals
+///
+/// Archive a SUPERSEDED calibration set's original member frames into a ZIP
+/// (Task 14). Thin wrapper: plan+commit happen synchronously inside
+/// `api::masters::archive_originals`, which returns as soon as the operation
+/// is queued on the shared disk worker. Progress/completion arrive via the
+/// existing `archive-progress` / `archive-finished` SSE events, same as the
+/// frame-set archive flow.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn archive_calibration_originals(
+    State(state): State<WebAppState>,
+    Json(args): Json<ArchiveCalibrationOriginalsArgs>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::archive_originals(state.ctx.clone(), emitter, args.calibration_set_id)
+        .map(Json)
+        .map_err(api_err)
 }

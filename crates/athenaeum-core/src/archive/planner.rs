@@ -213,6 +213,7 @@ pub fn build_plan(
 
     Ok(ArchivePlan {
         frames_set_id,
+        calibration_set_id: None,
         archive_root_path: archive_root_path.to_string_lossy().to_string(),
         dispositions: dispositions.clone(),
         compression,
@@ -224,14 +225,216 @@ pub fn build_plan(
     })
 }
 
+/// Build a plan to archive a SUPERSEDED calibration set's original member
+/// frames into a single ZIP (Task 14 — "archive-of-originals": once a raw
+/// calibration set has been combined into a master, the raw frames are
+/// candidates for tidy long-term storage the same way a frame set's lights
+/// are). WITHOUT writing any rows — mirrors `build_plan`'s plan/commit split.
+///
+/// Guards (all `bail!` on violation):
+/// - The set must be superseded (`calibration_set.superseded_by_set_id IS
+///   NOT NULL`) — archiving a still-in-use raw set would delete frames a
+///   future (re)build needs.
+/// - No member file may already be archived (`files.archived_in_operation IS
+///   NOT NULL`) — partial archiving of a set is not a thing; the error lists
+///   every already-archived member path so the caller can investigate.
+/// - Every member file must still exist on disk.
+///
+/// Unlike `build_plan` (mixed roles, dedup, one zip per role), a calibration
+/// set is homogeneous by construction — every member shares the set's own
+/// `imagetyp` — so this always produces exactly one `PlannedZip`, and
+/// `Dispositions` has exactly one type set to `Move` (the set's own type;
+/// every other type is `None`, matching `build_plan`'s "type not present in
+/// the chain" convention). The returned plan's `frames_set_id` is `0`
+/// (sentinel — see `ArchivePlan` doc comment) with `calibration_set_id:
+/// Some(calibration_set_id)`.
+pub fn build_calibration_set_plan(
+    conn: &Connection,
+    calibration_set_id: i64,
+    archive_root_path: &Path,
+    compression: ArchiveCompression,
+) -> Result<ArchivePlan> {
+    let (imagetyp, instrume, gain, exptime, date_start, date_end, superseded_by_set_id): (
+        String, Option<String>, Option<f64>, Option<f64>, Option<String>, Option<String>, Option<i64>,
+    ) = conn.query_row(
+        "SELECT imagetyp, instrume, gain, exptime, date_start, date_end, superseded_by_set_id
+         FROM calibration_set WHERE id = ?1",
+        [calibration_set_id],
+        |row| Ok((
+            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+        )),
+    ).with_context(|| format!("calibration set {calibration_set_id} not found"))?;
+
+    if superseded_by_set_id.is_none() {
+        anyhow::bail!(
+            "calibration set {calibration_set_id} is not superseded by a master — \
+             only superseded sets can have their originals archived"
+        );
+    }
+
+    let role = match imagetyp.as_str() {
+        "Dark" => FrameRole::Dark,
+        "Flat" => FrameRole::Flat,
+        "Bias" => FrameRole::Bias,
+        "DarkFlat" => FrameRole::Darkflat,
+        other => anyhow::bail!(
+            "calibration set {calibration_set_id} has unsupported imagetyp for archiving: {other}"
+        ),
+    };
+
+    // Member files: calibration_set_frames -> frames -> files. Fetch
+    // archived_in_operation too so we can bail with a precise list rather
+    // than silently skipping already-archived members.
+    let member_rows: Vec<(i64, String, i64, Option<i64>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT fi.id, fi.path, fi.size, fi.archived_in_operation
+             FROM calibration_set_frames csf
+             JOIN frames f ON f.id = csf.frame_id
+             JOIN files fi ON fi.id = f.file_id
+             WHERE csf.set_id = ?1
+             ORDER BY fi.path",
+        )?;
+        let rows = stmt.query_map([calibration_set_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    if member_rows.is_empty() {
+        anyhow::bail!("calibration set {calibration_set_id} has no member frames on record");
+    }
+
+    let already_archived: Vec<&str> = member_rows.iter()
+        .filter(|(_, _, _, archived)| archived.is_some())
+        .map(|(_, path, _, _)| path.as_str())
+        .collect();
+    if !already_archived.is_empty() {
+        anyhow::bail!(
+            "calibration set {calibration_set_id} already has archived member file(s): {}",
+            already_archived.join(", "),
+        );
+    }
+
+    let scan_roots = load_all_scan_roots(conn)?;
+    let prefix_map = path_layout::resolve_scan_root_prefixes(&scan_roots);
+
+    let zip_dir = path_layout::calibration_zip_dir(
+        instrume.as_deref(), date_start.as_deref().unwrap_or(""),
+    );
+    let zip_filename = path_layout::calibration_zip_filename(
+        instrume.as_deref(), &imagetyp, gain, exptime,
+        date_start.as_deref().unwrap_or(""), date_end.as_deref().unwrap_or(""),
+    );
+    let zip_path = archive_root_path.join(&zip_dir).join(&zip_filename);
+
+    let mut files: Vec<ArchiveOperationFile> = Vec::with_capacity(member_rows.len());
+    let mut total_size: u64 = 0;
+
+    for (file_id, path, size, _) in &member_rows {
+        let src = Path::new(path);
+        if !src.exists() {
+            return Err(anyhow!("source file no longer exists: {}", path));
+        }
+        let scan_root = scan_roots
+            .iter()
+            .find(|r| src.starts_with(r))
+            .cloned()
+            .unwrap_or_else(|| {
+                src.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+            });
+        let unique_prefix = prefix_map
+            .get(&scan_root)
+            .cloned()
+            .unwrap_or_else(|| {
+                Path::new(&scan_root)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(path_layout::sanitize_for_filename)
+                    .unwrap_or_else(|| "Root".into())
+            });
+        let path_in_zip = path_layout::path_in_zip(&unique_prefix, Path::new(&scan_root), src);
+        let hash = compute_xxhash(src).with_context(|| format!("failed to hash {}", path))?;
+
+        total_size += *size as u64;
+        files.push(ArchiveOperationFile {
+            id: 0,
+            operation_id: 0,
+            file_id: Some(*file_id),
+            source_path: path.clone(),
+            target_zip_path: zip_path.to_string_lossy().to_string(),
+            target_path_in_zip: path_in_zip,
+            expected_hash: hash,
+            disposition: ArchiveDisposition::Move.as_str().to_string(),
+            frame_role: role.as_str().to_string(),
+            file_size_bytes: *size,
+        });
+    }
+
+    let zips = vec![PlannedZip {
+        zip_path: zip_path.to_string_lossy().to_string(),
+        zip_filename: zip_filename.clone(),
+        frame_role: role,
+        file_count: files.len(),
+        total_size_bytes: total_size,
+    }];
+
+    let conflicts = if zip_path.exists() {
+        vec![ZipFilenameConflict {
+            zip_path: zip_path.to_string_lossy().to_string(),
+            zip_filename: zip_filename.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+
+    // Exactly the set's own type is Move; every other type is absent — same
+    // "type not present in the chain" convention `build_plan` uses.
+    let mut dispositions = Dispositions { flats: None, darks: None, bias: None, darkflats: None };
+    match role {
+        FrameRole::Flat => dispositions.flats = Some(ArchiveDisposition::Move),
+        FrameRole::Dark => dispositions.darks = Some(ArchiveDisposition::Move),
+        FrameRole::Bias => dispositions.bias = Some(ArchiveDisposition::Move),
+        FrameRole::Darkflat => dispositions.darkflats = Some(ArchiveDisposition::Move),
+        FrameRole::Light => unreachable!("role mapping above never yields Light for a calibration set"),
+    }
+
+    Ok(ArchivePlan {
+        frames_set_id: 0,
+        calibration_set_id: Some(calibration_set_id),
+        archive_root_path: archive_root_path.to_string_lossy().to_string(),
+        dispositions,
+        compression,
+        files,
+        zips,
+        shared_calibrations: Vec::new(),
+        conflicts,
+        total_size_bytes: total_size,
+    })
+}
+
 /// Persist the plan: insert archive_operations + archive_operation_files rows,
 /// applying the conflict resolution to zip paths if needed (renaming with `_2`, `_3` etc.).
 /// Returns the new operation_id.
+///
+/// Subject-aware (Task 14): a plan is either a frame-set plan (real,
+/// non-zero `frames_set_id`, `calibration_set_id: None` — from `build_plan`)
+/// or a calibration-set plan (`frames_set_id: 0`, `calibration_set_id:
+/// Some(id)` — from `build_calibration_set_plan`). Exactly one subject must
+/// be present; a plan with neither (or, in principle, both) is a caller bug
+/// caught here before anything is written.
 pub fn commit_plan(
     conn: &Connection,
     plan: &ArchivePlan,
     conflict_resolution: ConflictResolution,
 ) -> Result<i64> {
+    let has_frame_set = plan.frames_set_id != 0;
+    let has_calibration_set = plan.calibration_set_id.is_some();
+    anyhow::ensure!(
+        has_frame_set != has_calibration_set,
+        "archive plan must have exactly one subject: frames_set_id={}, calibration_set_id={:?}",
+        plan.frames_set_id, plan.calibration_set_id,
+    );
+
     // Apply conflict resolution: rewrite target_zip_path on plan.files + plan.zips
     let mut files = plan.files.clone();
     let mut zips = plan.zips.clone();
@@ -260,7 +463,8 @@ pub fn commit_plan(
 
     let op_id = adb::insert_operation(
         conn,
-        plan.frames_set_id,
+        has_frame_set.then_some(plan.frames_set_id),
+        plan.calibration_set_id,
         &plan.archive_root_path,
         plan.dispositions.flats.map(|d| d.as_str()),
         plan.dispositions.darks.map(|d| d.as_str()),
@@ -588,8 +792,191 @@ mod tests {
         let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
 
         let op = adb::get_operation(&conn, op_id).unwrap();
-        assert_eq!(op.frames_set_id, 1);
+        assert_eq!(op.frames_set_id, Some(1));
+        assert!(op.calibration_set_id.is_none());
         let files = adb::list_operation_files(&conn, op_id).unwrap();
         assert_eq!(files.len(), 3);
+    }
+
+    // ── build_calibration_set_plan (Task 14) ────────────────────────────────
+
+    #[test]
+    fn calibration_plan_requires_superseded_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        // raw set with one real file, NOT superseded
+        conn.execute("INSERT INTO calibration_set (imagetyp, date, instrume, date_start, date_end)
+                      VALUES ('Dark','2026-06-28','Cam','2026-06-28T20:00:00Z','2026-06-28T21:00:00Z')", []).unwrap();
+        let set = conn.last_insert_rowid();
+        let r = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store);
+        assert!(r.is_err(), "non-superseded set must be rejected");
+    }
+
+    #[test]
+    fn calibration_plan_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES (?1)",
+            [dir.path().to_string_lossy()]).unwrap();
+        // superseded_by_set_id is a real FK (foreign_keys=ON by default in
+        // this codebase's connections) — the master row it points to must
+        // exist first.
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+            VALUES (999, 'MasterDark', '2026-06-28', 1)", []).unwrap();
+        conn.execute("INSERT INTO calibration_set
+            (imagetyp, date, instrume, gain, exptime, date_start, date_end, superseded_by_set_id)
+            VALUES ('Dark','2026-06-28','Test Cam',100.0,300.0,
+                    '2026-06-28T20:00:00Z','2026-06-28T21:00:00Z', 999)", []).unwrap();
+        let set = conn.last_insert_rowid();
+        let f = dir.path().join("d1.fits");
+        std::fs::write(&f, b"data").unwrap();
+        conn.execute("INSERT INTO files (path, filename, size, modified_at, format)
+                      VALUES (?1,'d1.fits',4,'2026-06-28','FITS')",
+            [f.to_string_lossy()]).unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (?1,'Dark')", [file_id]).unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1,?2)",
+            rusqlite::params![set, frame_id]).unwrap();
+
+        let plan = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store).unwrap();
+        assert_eq!(plan.calibration_set_id, Some(set));
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.zips.len(), 1);
+        let zp = &plan.zips[0].zip_path;
+        assert!(zp.contains("Calibration_Archive"), "{zp}");
+        assert!(zp.contains("2026-06-28"), "date dir: {zp}");
+        assert!(plan.files.iter().all(|f| f.disposition == "move"));
+    }
+
+    #[test]
+    fn calibration_plan_rejects_already_archived_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES (?1)",
+            [dir.path().to_string_lossy()]).unwrap();
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+            VALUES (999, 'MasterBias', '2026-06-28', 1)", []).unwrap();
+        conn.execute("INSERT INTO calibration_set
+            (imagetyp, date, instrume, date_start, date_end, superseded_by_set_id)
+            VALUES ('Bias','2026-06-28','Cam','2026-06-28T20:00:00Z','2026-06-28T21:00:00Z', 999)", []).unwrap();
+        let set = conn.last_insert_rowid();
+        let f = dir.path().join("b1.fits");
+        std::fs::write(&f, b"data").unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, archived_in_operation)
+             VALUES (?1,'b1.fits',4,'2026-06-28','FITS', 777)",
+            [f.to_string_lossy()],
+        ).unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (?1,'Bias')", [file_id]).unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1,?2)",
+            rusqlite::params![set, frame_id]).unwrap();
+
+        let err = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store).unwrap_err();
+        assert!(format!("{err:#}").contains("already has archived member"), "{err:#}");
+    }
+
+    /// Executor + restore round trip on a calibration-set archive op (Task
+    /// 14 self-review item: "can a calibration op's restore really rewire
+    /// files.path and clear markers with frames_set_id None end-to-end?").
+    #[test]
+    fn calibration_archive_executor_and_restore_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES (?1)",
+            [dir.path().to_string_lossy()]).unwrap();
+
+        // Master set that supersedes the raw set below.
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (999, 'MasterDark', '2026-06-28', 1)",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO calibration_set
+            (imagetyp, date, instrume, gain, exptime, date_start, date_end, superseded_by_set_id)
+            VALUES ('Dark','2026-06-28','Test Cam',100.0,300.0,
+                    '2026-06-28T20:00:00Z','2026-06-28T21:00:00Z', 999)", []).unwrap();
+        let set = conn.last_insert_rowid();
+
+        let f = dir.path().join("d1.fits");
+        std::fs::write(&f, b"data").unwrap();
+        conn.execute("INSERT INTO files (path, filename, size, modified_at, format)
+                      VALUES (?1,'d1.fits',4,'2026-06-28','FITS')",
+            [f.to_string_lossy()]).unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (?1,'Dark')", [file_id]).unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1,?2)",
+            rusqlite::params![set, frame_id]).unwrap();
+
+        // master_provenance row referencing this set as source — must stay untouched.
+        conn.execute(
+            "INSERT INTO master_provenance
+                (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (999, ?1, '{}', '[]', 'abc123', '2026-06-28T00:00:00Z')",
+            [set],
+        ).unwrap();
+
+        let plan = build_calibration_set_plan(&conn, set, dir.path(), ArchiveCompression::Store).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::archive::executor::run_operation(&conn, op_id, &cancel, &crate::events::NullEmitter).unwrap();
+
+        // Zip exists at the planned path; source deleted (Move disposition).
+        assert!(Path::new(&plan.zips[0].zip_path).is_file(), "{}", plan.zips[0].zip_path);
+        assert!(!f.exists(), "source should have been moved into the zip");
+
+        // files.archive_zip_path / archived_in_operation set.
+        let (archive_zip_path, archived_op): (Option<String>, Option<i64>) = conn.query_row(
+            "SELECT archive_zip_path, archived_in_operation FROM files WHERE id = ?1",
+            [file_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(archived_op, Some(op_id));
+        assert!(archive_zip_path.is_some());
+
+        // frames / calibration_set_frames rows intact.
+        let frame_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1", [set], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(frame_count, 1);
+
+        // master_provenance untouched.
+        let (prov_master, prov_source): (i64, Option<i64>) = conn.query_row(
+            "SELECT master_set_id, source_set_id FROM master_provenance WHERE master_set_id = 999",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(prov_master, 999);
+        assert_eq!(prov_source, Some(set));
+
+        // The operation itself has no frame-set subject; there is no
+        // frame-set-level marker to have touched.
+        let op = adb::get_operation(&conn, op_id).unwrap();
+        assert!(op.frames_set_id.is_none());
+        assert_eq!(op.calibration_set_id, Some(set));
+        assert_eq!(op.status, "completed");
+
+        // --- Restore round trip: file comes back, markers clear, no frame
+        // set anywhere in the picture (frames_set_id stays None throughout).
+        let outcome = crate::archive::restore::run_restore(
+            &conn, op_id, dir.path(), false, false, &cancel, &crate::events::NullEmitter,
+        ).unwrap();
+        assert!(!outcome.has_conflicts(), "{:?}", outcome.conflicts);
+
+        assert!(f.exists(), "file should be restored to its original path");
+        assert_eq!(std::fs::read(&f).unwrap(), b"data");
+
+        let (archive_zip_path_after, archived_op_after): (Option<String>, Option<i64>) = conn.query_row(
+            "SELECT archive_zip_path, archived_in_operation FROM files WHERE id = ?1",
+            [file_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(archive_zip_path_after.is_none(), "archive markers must be cleared after restore");
+        assert!(archived_op_after.is_none());
     }
 }

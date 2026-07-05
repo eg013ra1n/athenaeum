@@ -65,6 +65,15 @@ pub struct MasterRecipe {
     pub combine: Option<CombineMethod>,
     /// Constant-ADU fallback for flat pre-calibration when no darkflat/dark/bias master is linked.
     pub synthetic_bias: Option<f64>,
+    /// Task 14: when true, chain `archive_originals` on the SOURCE
+    /// calibration set right after a successful `New`-target build (i.e.
+    /// after `register_master` supersedes it) — non-fatally: an archive
+    /// failure is logged but never turns a successful master build into a
+    /// reported failure. Has no effect on `BuildTarget::Rebuild` (that path
+    /// never calls `register_master`, so there's no "just superseded" moment
+    /// to chain from — see `rebuild_master`'s own recipe construction).
+    #[serde(default)]
+    pub archive_after: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
@@ -782,7 +791,39 @@ fn run_master_build_thread(
     cancel_flag: Arc<AtomicBool>,
     target: BuildTarget,
 ) {
+    // Captured before `run_build` consumes `target` — only a `New` build
+    // just called `register_master`, which is the "just superseded" moment
+    // `archive_after` chains from. A `Rebuild` never supersedes anything (its
+    // source set was already superseded by a prior build), so it never
+    // chains regardless of `recipe.archive_after`.
+    let was_new_build = matches!(target, BuildTarget::New);
+
     let result = run_build(&ctx, emitter.as_ref(), &app_version, set_id, &recipe, &cancel_flag, target);
+
+    // Task 14: archive_after chaining. Deliberately happens BEFORE the handle
+    // removal / master-build-complete emission below, but its outcome is
+    // NEVER folded into `result` — archiving is a follow-up to a successful
+    // build, not part of the build itself, so a failure here must never turn
+    // a successful master build into a reported failure. Log-and-continue.
+    if was_new_build && recipe.archive_after {
+        if let Ok(_master_set_id) = &result {
+            match archive_originals(ctx.clone(), emitter.clone(), set_id) {
+                Ok(archive_op_id) => {
+                    tracing::info!(
+                        set_id, archive_op_id,
+                        "archive_after: queued archive-of-originals for the just-superseded source set"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        set_id, error = %e,
+                        "archive_after: failed to queue archive-of-originals for the just-superseded \
+                         source set — the master build itself still succeeded; originals were left in place"
+                    );
+                }
+            }
+        }
+    }
 
     ctx.active_master_builds.lock().unwrap().remove(&set_id);
 
@@ -1040,7 +1081,7 @@ pub fn rebuild_master(
         active.insert(source_set_id, MasterBuildHandle { cancel_flag: cancel_flag.clone() });
     }
 
-    let recipe = MasterRecipe { combine: None, synthetic_bias: None };
+    let recipe = MasterRecipe { combine: None, synthetic_bias: None, archive_after: false };
     let target = BuildTarget::Rebuild {
         master_set_id,
         master_file_id,
@@ -1062,6 +1103,116 @@ pub fn rebuild_master(
     }
 
     Ok(())
+}
+
+// ── Archive-of-originals (Task 14) ───────────────────────────────────────────
+
+/// Plan + commit + enqueue archiving of a SUPERSEDED calibration set's
+/// original member frames into a single ZIP, on the shared disk worker
+/// (`ctx.operation_queue` — the same serialized queue frame-set archiving and
+/// file-ops share, so nothing competes for disk bandwidth). Mirrors
+/// `commands/archive.rs::start_archive_operation`'s shape (plan+commit
+/// synchronously, register the cancel handle in `ctx.active_archives`, hand
+/// the real work to the queue with a closure that runs → updates status →
+/// rolls back on error → emits `archive-finished` → cleans up the handle) but
+/// lives in core so both transports AND the `archive_after` build-chain in
+/// `run_master_build_thread` below can call it without a Tauri/Axum
+/// dependency.
+///
+/// No `archive_root_path` parameter (unlike the frame-set flow's UI-driven
+/// override) — this is an automatic follow-up to a build, so it always uses
+/// the configured default archive root (`archive::resolve_archive_root` with
+/// `requested: None`) and the user's configured compression mode. Conflict
+/// resolution is always `AddSuffix`: a follow-up archive is not the moment to
+/// silently clobber an existing zip that happens to share the predicted name.
+///
+/// Returns the new `archive_operations.id` as soon as it's queued — this does
+/// NOT wait for the zip to actually be built. Progress/completion arrive via
+/// the existing `archive-progress` / `archive-finished` events, unchanged —
+/// the frame-set archive UI already listens for these; a calibration-set op
+/// is just another row flowing through the same events.
+pub fn archive_originals(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+    calibration_set_id: i64,
+) -> Result<i64, ApiError> {
+    use crate::archive::models::{ArchiveCompression, ArchiveStatus, ConflictResolution};
+    use crate::archive::{db as adb, executor, planner, rollback};
+    use crate::services::operation_queue::{OperationKind, QueuedJob};
+    use crate::services::ArchiveHandle;
+
+    let op_id = {
+        let db_handle = db(&ctx)?;
+        let conn = db_handle.conn();
+
+        let root = crate::archive::resolve_archive_root(&conn, &ctx.settings, None)?;
+        let compression = ctx
+            .settings
+            .get_archive_compression(&conn)
+            .ok()
+            .and_then(|s| ArchiveCompression::from_str(&s))
+            .unwrap_or(ArchiveCompression::Store);
+
+        let plan = planner::build_calibration_set_plan(
+            &conn, calibration_set_id, Path::new(&root), compression,
+        )?;
+        planner::commit_plan(&conn, &plan, ConflictResolution::AddSuffix)?
+    };
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut map = ctx.active_archives.lock().unwrap();
+        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
+    }
+
+    let ctx_for_worker = ctx.clone();
+    let emitter_for_worker = emitter.clone();
+    ctx.operation_queue.enqueue(QueuedJob {
+        kind: OperationKind::ZipArchive,
+        operation_id: op_id,
+        run: Box::new(move || {
+            let Some(db_handle) = ctx_for_worker.db.get() else {
+                tracing::error!(operation_id = op_id, "db not initialized for calibration archive worker");
+                ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
+                return;
+            };
+            let conn = db_handle.conn();
+            let result = executor::run_operation(&conn, op_id, &cancel_flag, emitter_for_worker.as_ref());
+            let outcome = match result {
+                Ok(()) => {
+                    tracing::info!(operation_id = op_id, "calibration archive operation completed");
+                    "completed"
+                }
+                Err(e) => {
+                    let outcome = if executor::was_cancelled(&e) {
+                        let _ = adb::update_operation_status(&conn, op_id, ArchiveStatus::Cancelled, None);
+                        "cancelled"
+                    } else {
+                        tracing::error!(operation_id = op_id, error = ?e, "calibration archive operation failed");
+                        let msg = format!("{:#}", e);
+                        let _ = adb::update_operation_status(&conn, op_id, ArchiveStatus::Failed, Some(&msg));
+                        "failed"
+                    };
+                    if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, emitter_for_worker.as_ref()) {
+                        tracing::error!(
+                            operation_id = op_id, error = ?rb_err,
+                            "rollback after failed calibration archive operation also failed, \
+                             operation may be left in an inconsistent state"
+                        );
+                    }
+                    outcome
+                }
+            };
+            emit_event(
+                emitter_for_worker.as_ref(),
+                "archive-finished",
+                &serde_json::json!({ "operation_id": op_id, "outcome": outcome }),
+            );
+            ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
+        }),
+    });
+
+    Ok(op_id)
 }
 
 /// Cancel an active master build (queued-in-compute-queue or running).

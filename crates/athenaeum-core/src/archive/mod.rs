@@ -15,5 +15,7 @@ pub mod executor;
 pub mod rollback;
 pub mod resume;
 pub mod restore;
+pub mod root;
 
 pub use models::*;
+pub use root::{migrate_legacy_archive_root, resolve_archive_root};

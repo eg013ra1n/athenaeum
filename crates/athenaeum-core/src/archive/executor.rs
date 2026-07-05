@@ -90,7 +90,7 @@ pub fn run_operation(
 
     // Stage 7: Finalize ------------------------------------------------------
     adb::update_operation_status(conn, operation_id, ArchiveStatus::Finalizing, None)?;
-    finalize_phase(conn, operation_id, &op.frames_set_id, &files, &archive_root, emitter)?;
+    finalize_phase(conn, operation_id, op.frames_set_id, &files, &archive_root, emitter)?;
 
     adb::update_operation_status(conn, operation_id, ArchiveStatus::Completed, None)?;
     Ok(())
@@ -406,17 +406,23 @@ fn delete_sources_phase(
 }
 
 /// Stage 7: update catalog flags + delete staging dir.
+///
+/// `frames_set_id` is `None` for a calibration-set archive op (Task 14) —
+/// there is no frame set to mark, so that step (and its progress tick) is
+/// skipped entirely. Per-file marking (`mark_file_archived` below) is
+/// subject-agnostic and runs identically either way.
 fn finalize_phase(
     conn: &Connection,
     operation_id: i64,
-    frames_set_id: &i64,
+    frames_set_id: Option<i64>,
     files: &[ArchiveOperationFile],
     archive_root: &Path,
     emitter: &dyn ProgressEmitter,
 ) -> Result<()> {
-    // Total work units: one per moved file (catalog update) + 2 (mark frame set + cleanup staging).
+    // Total work units: one per moved file (catalog update) + cleanup staging,
+    // plus one more for marking the frame set archived when there is one.
     let move_count = files.iter().filter(|f| f.disposition == "move").count();
-    let total_units = move_count + 2;
+    let total_units = move_count + if frames_set_id.is_some() { 2 } else { 1 };
     let mut done_units: usize = 0;
 
     emit_event(emitter, "archive-progress", &ArchiveProgress {
@@ -447,15 +453,17 @@ fn finalize_phase(
             });
         }
     }
-    adb::mark_frame_set_archived(conn, *frames_set_id, operation_id)?;
-    done_units += 1;
-    emit_event(emitter, "archive-progress", &ArchiveProgress {
-        operation_id,
-        stage: "finalizing".into(),
-        current: done_units,
-        total: total_units,
-        message: "Marking frame set archived".into(),
-    });
+    if let Some(fs_id) = frames_set_id {
+        adb::mark_frame_set_archived(conn, fs_id, operation_id)?;
+        done_units += 1;
+        emit_event(emitter, "archive-progress", &ArchiveProgress {
+            operation_id,
+            stage: "finalizing".into(),
+            current: done_units,
+            total: total_units,
+            message: "Marking frame set archived".into(),
+        });
+    }
 
     // Cleanup staging
     staging::cleanup_staging(archive_root, operation_id)?;

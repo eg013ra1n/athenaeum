@@ -95,7 +95,10 @@ pub fn rollback_operation(
 
     // 4. Clear zip markers on the frame set, but keep is_archived as-is —
     //    the frame set was in the Archive section before the failed op started.
-    adb::clear_zip_markers(conn, op.frames_set_id)?;
+    //    A calibration-set op (Task 14) has no frame set to clear — skip.
+    if let Some(fs_id) = op.frames_set_id {
+        adb::clear_zip_markers(conn, fs_id)?;
+    }
     for f in &files {
         if let Some(file_id) = f.file_id {
             adb::unmark_file_archived(conn, file_id, None, None, None)?;

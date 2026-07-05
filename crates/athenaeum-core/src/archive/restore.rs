@@ -371,7 +371,11 @@ fn run_restore_inner(
     // For each restored file, sync archive markers + path/mtime/size to match
     // the destination file as it now exists on disk. This is what prevents the
     // scanner's modified-file detection from later wiping these rows.
-    let catalog_total = restored.len() + 1;
+    //
+    // The final "+1" tick below is the frame-set unarchive/keep-archived step
+    // — a calibration-set op (Task 14, `op.frames_set_id: None`) has no frame
+    // set to touch, so that tick is skipped entirely for it.
+    let catalog_total = restored.len() + if op.frames_set_id.is_some() { 1 } else { 0 };
     let mut catalog_done: usize = 0;
     emit(
         emitter,
@@ -418,30 +422,42 @@ fn run_restore_inner(
     // would zip the conflicted file's unverified on-disk bytes and overwrite
     // the still-intact markers, orphaning the zip that holds the only
     // correct copy. See module docs (CONFLICT handling).
-    if conflicts.is_empty() {
-        adb::unmark_frame_set_archived(conn, op.frames_set_id)?;
-        catalog_done += 1;
-        emit(
-            emitter,
-            "update_catalog",
-            catalog_done,
-            catalog_total,
-            "Frame set unarchived".into(),
-        );
-    } else {
+    if let Some(fs_id) = op.frames_set_id {
+        if conflicts.is_empty() {
+            adb::unmark_frame_set_archived(conn, fs_id)?;
+            catalog_done += 1;
+            emit(
+                emitter,
+                "update_catalog",
+                catalog_done,
+                catalog_total,
+                "Frame set unarchived".into(),
+            );
+        } else {
+            tracing::warn!(
+                operation_id,
+                frame_set_id = fs_id,
+                conflicts = conflicts.len(),
+                "restore finished with conflicts, frame set stays archived pending resolution"
+            );
+            catalog_done += 1;
+            emit(
+                emitter,
+                "update_catalog",
+                catalog_done,
+                catalog_total,
+                format!("Frame set stays archived — {} conflict(s) unresolved", conflicts.len()),
+            );
+        }
+    } else if !conflicts.is_empty() {
+        // Calibration-set op (Task 14): no frame set to keep/clear — just
+        // log. The unresolved conflict itself is still reported to the
+        // caller via `RestoreOutcome.conflicts` regardless of subject.
         tracing::warn!(
             operation_id,
-            frame_set_id = op.frames_set_id,
+            calibration_set_id = ?op.calibration_set_id,
             conflicts = conflicts.len(),
-            "restore finished with conflicts, frame set stays archived pending resolution"
-        );
-        catalog_done += 1;
-        emit(
-            emitter,
-            "update_catalog",
-            catalog_done,
-            catalog_total,
-            format!("Frame set stays archived — {} conflict(s) unresolved", conflicts.len()),
+            "calibration archive restore finished with conflicts"
         );
     }
 

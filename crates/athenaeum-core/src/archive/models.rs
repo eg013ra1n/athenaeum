@@ -216,11 +216,16 @@ pub struct Dispositions {
     pub darkflats: Option<ArchiveDisposition>,
 }
 
-/// One row of `archive_operations`.
+/// One row of `archive_operations`. Exactly one of `frames_set_id` /
+/// `calibration_set_id` is set — the operation's "subject" — enforced by
+/// `planner::commit_plan`'s `ensure!` at write time (Task 14: calibration-set
+/// archive-of-originals extends this table alongside the original frame-set
+/// subject).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveOperation {
     pub id: i64,
-    pub frames_set_id: i64,
+    pub frames_set_id: Option<i64>,
+    pub calibration_set_id: Option<i64>,
     pub archive_root_path: String,
     pub flats_disposition: Option<String>,
     pub darks_disposition: Option<String>,
@@ -291,9 +296,21 @@ pub struct ZipFilenameConflict {
 
 /// The complete plan for an archive operation. Returned by `plan_archive_operation`
 /// for the disposition dialog preview, and (after `commit_plan`) used to drive the executor.
+///
+/// `frames_set_id` stays a plain `i64` for wire-compat with existing
+/// consumers rather than becoming `Option<i64>`: a calibration-set plan
+/// (Task 14, `planner::build_calibration_set_plan`) has no frame set, and
+/// fills this field with `0` rather than changing its type. Consumers MUST
+/// check `calibration_set_id` first to tell the two plan subjects apart —
+/// `0` is never a real `frames_set_id` (SQLite `AUTOINCREMENT` ids start at
+/// 1), but treat it as documentation, not type-level protection.
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ArchivePlan {
     pub frames_set_id: i64,
+    /// `Some(id)` for a calibration-set archive-of-originals plan; `None` for
+    /// the original frame-set plan shape. Mutually exclusive with a real
+    /// (non-zero) `frames_set_id` — see the struct doc comment.
+    pub calibration_set_id: Option<i64>,
     pub archive_root_path: String,
     pub dispositions: Dispositions,
     pub compression: ArchiveCompression,
@@ -312,11 +329,15 @@ pub enum ConflictResolution {
     AddSuffix,
 }
 
-/// Summary used by the resume banner + Archive page.
+/// Summary used by the resume banner + Archive page. `frames_set_id` is
+/// `None` and `frame_set_name` is `None` for a calibration-set archive op
+/// (Task 14) — the LEFT JOIN in `db::list_unfinished_operations` still
+/// surfaces the row so an in-flight/interrupted calibration archive isn't
+/// silently dropped from the resume banner.
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 pub struct ArchiveOperationSummary {
     pub id: i64,
-    pub frames_set_id: i64,
+    pub frames_set_id: Option<i64>,
     pub frame_set_name: Option<String>,
     pub status: String,
     pub started_at: String,
