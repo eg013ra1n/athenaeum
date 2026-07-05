@@ -268,10 +268,17 @@ pub fn derive_status(
         }
     }
 
+    // The flat-normalization choice only matters when the row actually applied a
+    // flat. A dark-only row stores `flat_norm_applied = false`; comparing that
+    // against a dialog toggle of `true` would derive Stale forever and make
+    // `only_stale` re-runs recalibrate dark-only frames on every pass.
+    let flat_norm_mismatch =
+        row.flat_set_id.is_some() && row.flat_norm_applied != flat_norm_wanted;
+
     if mismatch
         || master_rebuilt
         || row.engine_version < LIGHT_CAL_ENGINE_VERSION
-        || row.flat_norm_applied != flat_norm_wanted
+        || flat_norm_mismatch
     {
         return Ok(LightCalStatus::Stale);
     }
@@ -595,6 +602,50 @@ mod tests {
         assert_eq!(
             derive_status(&conn, 6, &darkflat_links, false).unwrap(),
             LightCalStatus::Calibrated
+        );
+    }
+
+    /// The flat-normalization toggle must only influence staleness for rows
+    /// that actually applied a flat — a dark-only frame stays Calibrated even
+    /// when the dialog toggle is on, while a flat frame whose stored flag
+    /// disagrees with the wanted value is Stale.
+    #[test]
+    fn derive_status_flat_norm_only_when_flat_applied() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Dark-only row (no flat), caller now wants flat-norm ON → NOT stale.
+        seed_frame(&conn, 1);
+        seed_calibration_set(&conn, 10, "Dark");
+        let mut dark_only = base_row(Some(1), "/lib/1.fits");
+        dark_only.dark_set_id = Some(10);
+        dark_only.flat_set_id = None;
+        dark_only.flat_norm_applied = false; // no flat ⇒ never normalized
+        upsert_light_calibration(&conn, &dark_only).unwrap();
+        let dark_links = vec![link("Dark", 10)];
+        assert_eq!(
+            derive_status(&conn, 1, &dark_links, true).unwrap(),
+            LightCalStatus::Calibrated,
+            "a dark-only frame must not go stale just because flat-norm is toggled on"
+        );
+
+        // Flat row calibrated WITHOUT normalization, caller wants it ON → Stale.
+        seed_frame(&conn, 2);
+        seed_calibration_set(&conn, 11, "Flat");
+        let mut flat_row = base_row(Some(2), "/lib/2.fits");
+        flat_row.flat_set_id = Some(11);
+        flat_row.flat_norm_applied = false;
+        upsert_light_calibration(&conn, &flat_row).unwrap();
+        let flat_links = vec![link("Flat", 11)];
+        assert_eq!(
+            derive_status(&conn, 2, &flat_links, true).unwrap(),
+            LightCalStatus::Stale,
+            "a flat frame built without normalization is stale once the caller wants it"
+        );
+        assert_eq!(
+            derive_status(&conn, 2, &flat_links, false).unwrap(),
+            LightCalStatus::Calibrated,
+            "same flat frame matches when the caller does not want normalization"
         );
     }
 }

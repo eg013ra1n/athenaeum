@@ -36,7 +36,8 @@ use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalC
 use crate::calibration_library::paths::{calibrated_light_relative_path, resolve_collision};
 use crate::db::calibration_links::get_links_for_frame;
 use crate::db::light_calibrations::{
-    derive_status, upsert_light_calibration, LightCalRow, LightCalStatus, LIGHT_CAL_ENGINE_VERSION,
+    derive_status, get_light_calibration_for_frame, upsert_light_calibration, LightCalRow,
+    LightCalStatus, LIGHT_CAL_ENGINE_VERSION,
 };
 use crate::events::{emit_event, ProgressEmitter};
 use crate::fits_parser::stored_header::parse_stored_header_keys;
@@ -582,7 +583,9 @@ fn calibrate_one_inner(
     scratch: &Path,
     cancel: &AtomicBool,
 ) -> Result<bool, CalError> {
-    let resolved = {
+    // Any existing tracking row's `output_path` — a re-calibration overwrites
+    // that file in place (spec §1) instead of minting a `_2` collision suffix.
+    let (resolved, existing_output) = {
         let conn = db.conn();
         if scope.only_stale {
             let links = get_links_for_frame(&conn, frame_id)?;
@@ -590,7 +593,9 @@ fn calibrate_one_inner(
                 return Ok(true);
             }
         }
-        resolve_frame_inputs(&conn, frame_id, flat_norm)?
+        let existing_output =
+            get_light_calibration_for_frame(&conn, frame_id)?.map(|r| r.output_path);
+        (resolve_frame_inputs(&conn, frame_id, flat_norm)?, existing_output)
     };
 
     // Best-effort policy: never write a meaningless raw-scale copy. If nothing
@@ -640,13 +645,22 @@ fn calibrate_one_inner(
     };
     let cards = build_light_cal_cards(&resolved.source_cards, &card_inputs)?;
 
-    let rel = calibrated_light_relative_path(
-        &resolved.object,
-        &resolved.instrume,
-        &resolved.date_obs_date,
-        &output_basename_fits(&resolved.source_filename),
-    );
-    let output_abs = resolve_collision(&library_dir.join(&rel));
+    // Re-calibration overwrites the recorded output in place (the engine write
+    // is atomic tmp+rename); only a first-time calibration allocates a fresh,
+    // collision-suffixed path (spec §1). Without this, every re-run would mint a
+    // `c_<name>_2.fits` and orphan the previous file.
+    let output_abs = match existing_output {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let rel = calibrated_light_relative_path(
+                &resolved.object,
+                &resolved.instrume,
+                &resolved.date_obs_date,
+                &output_basename_fits(&resolved.source_filename),
+            );
+            resolve_collision(&library_dir.join(&rel))
+        }
+    };
     if let Some(parent) = output_abs.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -917,10 +931,39 @@ pub fn start_light_calibration(
     scope: LightCalScope,
     flat_norm: bool,
 ) -> Result<(), ApiError> {
+    // Register the cancel handle FIRST, rejecting a concurrent run for the same
+    // set (mirrors start_master_build's duplicate-run guard). Doing this before
+    // the preflight means a double-click can't kick off a redundant, side-
+    // effecting master-build batch before the second call is rejected.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let job_id_slot = Arc::new(AtomicI64::new(0));
+    {
+        let mut active = ctx.active_light_cal.lock().unwrap();
+        if active.contains_key(&set_id) {
+            return Err(ApiError::Conflict(format!(
+                "a light calibration is already in progress for frame set {set_id}"
+            )));
+        }
+        active.insert(
+            set_id,
+            LightCalHandle {
+                cancel_flag: cancel_flag.clone(),
+                job_id: job_id_slot.clone(),
+            },
+        );
+    }
+
     // Preflight: build masters for every raw calibration set the lights link.
     // Non-fatal — a skipped/failed build just means those lights calibrate
-    // best-effort at run time (§6). Never aborts the light run.
-    let readiness = get_light_calibration_readiness(&ctx, set_id, flat_norm)?;
+    // best-effort at run time (§6). Never aborts the light run. A hard readiness
+    // error must release the handle we just registered before returning.
+    let readiness = match get_light_calibration_readiness(&ctx, set_id, flat_norm) {
+        Ok(r) => r,
+        Err(e) => {
+            ctx.active_light_cal.lock().unwrap().remove(&set_id);
+            return Err(e);
+        }
+    };
     if !readiness.raw_set_ids_to_build.is_empty() {
         let recipe = MasterRecipe {
             combine: None,
@@ -951,26 +994,6 @@ pub fn start_light_calibration(
                 );
             }
         }
-    }
-
-    // Register the cancel handle, rejecting a concurrent run for the same set
-    // (mirrors start_master_build's duplicate-run guard).
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let job_id_slot = Arc::new(AtomicI64::new(0));
-    {
-        let mut active = ctx.active_light_cal.lock().unwrap();
-        if active.contains_key(&set_id) {
-            return Err(ApiError::Conflict(format!(
-                "a light calibration is already in progress for frame set {set_id}"
-            )));
-        }
-        active.insert(
-            set_id,
-            LightCalHandle {
-                cancel_flag: cancel_flag.clone(),
-                job_id: job_id_slot.clone(),
-            },
-        );
     }
 
     let thread_ctx = ctx.clone();
@@ -1026,6 +1049,7 @@ mod orchestration_tests {
     use crate::cache::MemoryImageCache;
     use crate::db::schema::init_db;
     use crate::events::NullEmitter;
+    use crate::fits_writer::write_fits_f32;
     use crate::services::compute_queue::ComputeQueue;
     use crate::services::operation_queue::OperationQueue;
     use crate::settings::SettingsManager;
@@ -1169,6 +1193,342 @@ mod orchestration_tests {
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
         })
+    }
+
+    // ── Real-file fixtures for the end-to-end thread smoke test ──────────────
+
+    fn fnrm_card(v: f64) -> Card {
+        Card::new("ATH_FNRM", CardValue::Real(v)).unwrap()
+    }
+
+    /// Write a constant-valued 32-bit FITS plane to `dir/name`, return its path.
+    fn write_plane(dir: &Path, name: &str, w: usize, h: usize, val: f32, cards: &[Card]) -> PathBuf {
+        let data = vec![val; w * h];
+        let p = dir.join(name);
+        write_fits_f32(&p, w, h, 1, &data, cards).unwrap();
+        p
+    }
+
+    /// A MASTER set whose single member frame's file is a real FITS at `path`.
+    fn seed_master_set_with_file(
+        conn: &Connection,
+        set_id: i64,
+        imagetyp: &str,
+        path: &Path,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2026-07-05', 1)",
+            params![set_id, imagetyp],
+        )
+        .unwrap();
+        let file_id = set_id + 3_000_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                file_id,
+                path.to_string_lossy(),
+                path.file_name().unwrap().to_string_lossy()
+            ],
+        )
+        .unwrap();
+        let frame_id = set_id + 4_000_000;
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?2, ?3, 1)",
+            params![frame_id, file_id, imagetyp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![set_id, frame_id],
+        )
+        .unwrap();
+        set_id
+    }
+
+    /// A LIGHT frame whose file is a real FITS at `path` (OBJECT M31 / camera
+    /// TestCam / 2026-07-05, so the calibrated output layout is deterministic).
+    fn seed_light_with_file(conn: &Connection, frame_id: i64, session_id: i64, path: &Path) {
+        let file_id = frame_id + 2_000_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                file_id,
+                path.to_string_lossy(),
+                path.file_name().unwrap().to_string_lossy()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs)
+             VALUES (?1, ?2, 'Light', 'TestCam', 'M31', '2026-07-05T20:30:00Z')",
+            params![frame_id, file_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+            params![session_id, frame_id],
+        )
+        .unwrap();
+    }
+
+    /// Records every emitted `(event_name, payload)` so a test can assert on the
+    /// real event stream a run produced (the test-side `ProgressEmitter`).
+    #[derive(Default)]
+    struct CollectingEmitter {
+        events: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+    impl ProgressEmitter for CollectingEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((event_name.to_string(), payload));
+        }
+    }
+    impl CollectingEmitter {
+        fn count(&self, name: &str) -> usize {
+            self.events.lock().unwrap().iter().filter(|(n, _)| n == name).count()
+        }
+        fn first(&self, name: &str) -> serde_json::Value {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {name} event emitted"))
+        }
+    }
+
+    /// Sorted final calibrated output basenames in `dir` (`c_*.fits`, excluding
+    /// tmp files) — the file set a re-run must leave unchanged.
+    fn list_calibrated(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("c_") && n.ends_with(".fits") && !n.contains(".tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A frame set with two LIGHT frames on disk, each linked to a BUILT master
+    /// Dark + master Flat (also on disk), a configured calibration-library
+    /// output dir, and a `ServiceContext`. Returns the tempdir guard (keep it
+    /// alive), the ctx, the library dir, the frame-set id, and the light ids.
+    fn build_smoke_fixture() -> (tempfile::TempDir, Arc<ServiceContext>, PathBuf, i64, Vec<i64>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let (w, h) = (8usize, 8usize);
+        let light_ids = {
+            let conn = db.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let session = seed_frame_set(&conn, 1);
+
+            let dark_path = write_plane(&src, "master_dark.fits", w, h, 100.0, &[]);
+            let flat_path = write_plane(&src, "master_flat.fits", w, h, 2.0, &[fnrm_card(2.0)]);
+            let dark = seed_master_set_with_file(&conn, 100, "MasterDark", &dark_path);
+            let flat = seed_master_set_with_file(&conn, 101, "MasterFlat", &flat_path);
+
+            let mut ids = Vec::new();
+            for fid in [1i64, 2] {
+                let lp = write_plane(&src, &format!("light_{fid}.fits"), w, h, 1100.0, &[]);
+                seed_light_with_file(&conn, fid, session, &lp);
+                add_link(&conn, fid, dark, "Dark");
+                add_link(&conn, fid, flat, "Flat");
+                ids.push(fid);
+            }
+            ids
+        };
+        let ctx = test_ctx(db);
+        (tmp, ctx, library_dir, 1, light_ids)
+    }
+
+    /// Register a fresh handle and drive the real `light-cal` thread body on the
+    /// current thread (synchronous), returning the emitter it wrote to so the
+    /// caller can assert on the produced event stream.
+    fn run_thread_body(
+        ctx: &Arc<ServiceContext>,
+        set_id: i64,
+        only_stale: bool,
+    ) -> Arc<CollectingEmitter> {
+        let emitter = Arc::new(CollectingEmitter::default());
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let job_id_slot = Arc::new(AtomicI64::new(0));
+        ctx.active_light_cal.lock().unwrap().insert(
+            set_id,
+            LightCalHandle {
+                cancel_flag: cancel_flag.clone(),
+                job_id: job_id_slot.clone(),
+            },
+        );
+        run_light_cal_thread(
+            ctx.clone(),
+            emitter.clone(),
+            set_id,
+            LightCalScope { only_stale },
+            true,
+            cancel_flag,
+            job_id_slot,
+        );
+        emitter
+    }
+
+    #[test]
+    fn thread_smoke_calibrates_frame_set() {
+        let (_tmp, ctx, _lib, set_id, light_ids) = build_smoke_fixture();
+
+        let emitter = run_thread_body(&ctx, set_id, false);
+
+        // Exactly one finished event, outcome "success".
+        assert_eq!(
+            emitter.count("calibration-finished"),
+            1,
+            "finished must fire exactly once"
+        );
+        let finished = emitter.first("calibration-finished");
+        assert_eq!(finished["outcome"], "success", "finished payload: {finished}");
+        assert_eq!(finished["ok_count"], light_ids.len() as u64);
+        assert_eq!(finished["failed"].as_array().unwrap().len(), 0);
+
+        // One progress event per calibrated light frame.
+        assert_eq!(
+            emitter.count("calibration-progress"),
+            light_ids.len(),
+            "one progress event per calibrated frame"
+        );
+
+        // Tracking rows upserted for every light, each pointing at a real file.
+        let db_handle = db(&ctx).unwrap();
+        let conn = db_handle.conn();
+        for fid in &light_ids {
+            let row = get_light_calibration_for_frame(&conn, *fid)
+                .unwrap()
+                .unwrap_or_else(|| panic!("no tracking row for light {fid}"));
+            assert!(
+                Path::new(&row.output_path).exists(),
+                "calibrated output {} must exist on disk",
+                row.output_path
+            );
+            assert_eq!(row.calstat, "BDF", "dark subtraction + flat division");
+            assert!(row.flat_norm_applied, "flat present and flat_norm requested");
+        }
+
+        // Handle removed at the single exit path.
+        assert!(
+            ctx.active_light_cal.lock().unwrap().get(&set_id).is_none(),
+            "the thread must remove its handle on exit"
+        );
+    }
+
+    #[test]
+    fn recalibration_overwrites_in_place() {
+        let (_tmp, ctx, _lib, set_id, light_ids) = build_smoke_fixture();
+
+        // First calibration.
+        let e1 = run_thread_body(&ctx, set_id, false);
+        assert_eq!(e1.first("calibration-finished")["outcome"], "success");
+
+        // Record the output paths + the leaf-dir file count after run 1.
+        let (out_paths, leaf, count_before) = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            let out_paths: Vec<String> = light_ids
+                .iter()
+                .map(|fid| {
+                    get_light_calibration_for_frame(&conn, *fid)
+                        .unwrap()
+                        .unwrap()
+                        .output_path
+                })
+                .collect();
+            let leaf = Path::new(&out_paths[0]).parent().unwrap().to_path_buf();
+            let names = list_calibrated(&leaf);
+            (out_paths, leaf, names)
+        };
+        assert_eq!(count_before.len(), light_ids.len(), "one output per light after run 1");
+        // A bug (unconditional resolve_collision) would mint c_light_1_2.fits.
+        assert!(
+            count_before.iter().all(|n| !n.contains("_2.fits") || n == "c_light_2.fits"),
+            "no collision suffix expected after the first run: {count_before:?}"
+        );
+
+        // Second calibration — full re-run of the same frames.
+        let e2 = run_thread_body(&ctx, set_id, false);
+        assert_eq!(e2.first("calibration-finished")["outcome"], "success");
+
+        // Tracking rows still point at the SAME files, and the output dir's file
+        // set is byte-for-byte unchanged — overwrite in place, no new collision-
+        // suffixed file, no orphan (spec §1).
+        let db_handle = db(&ctx).unwrap();
+        let conn = db_handle.conn();
+        for (fid, prev) in light_ids.iter().zip(&out_paths) {
+            let now = get_light_calibration_for_frame(&conn, *fid)
+                .unwrap()
+                .unwrap()
+                .output_path;
+            assert_eq!(&now, prev, "re-run must reuse the same output path");
+        }
+        assert_eq!(
+            list_calibrated(&leaf),
+            count_before,
+            "the calibrated-output file set must be identical after a re-run"
+        );
+    }
+
+    #[test]
+    fn thread_partial_outcome_when_one_frame_fails() {
+        let (_tmp, ctx, _lib, set_id, _ids) = build_smoke_fixture();
+
+        // Add a third LIGHT with NO calibration links — it resolves no masters
+        // and fails per-frame (collected, never a batch abort), so the whole
+        // batch reports "partial" while still emitting finished exactly once.
+        {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            let session: i64 = conn
+                .query_row(
+                    "SELECT s.id FROM sessions s
+                     JOIN imaging_nights n ON n.id = s.imaging_night_id
+                     WHERE n.frames_set_id = ?1",
+                    params![set_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            seed_light_with_file(&conn, 3, session, Path::new("/nonexistent/light_3.fits"));
+        }
+
+        let emitter = run_thread_body(&ctx, set_id, false);
+
+        assert_eq!(
+            emitter.count("calibration-finished"),
+            1,
+            "finished must fire exactly once even with a failing frame"
+        );
+        let finished = emitter.first("calibration-finished");
+        assert_eq!(finished["outcome"], "partial", "one failure among successes: {finished}");
+        assert_eq!(finished["ok_count"], 2u64, "the two linked lights still succeed");
+        let failed = finished["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1, "exactly the unlinked light failed");
+        assert_eq!(failed[0]["frame_id"], 3u64);
+
+        // Only the two successful frames emitted progress; the handle is gone.
+        assert_eq!(emitter.count("calibration-progress"), 2);
+        assert!(ctx.active_light_cal.lock().unwrap().get(&set_id).is_none());
     }
 
     #[test]

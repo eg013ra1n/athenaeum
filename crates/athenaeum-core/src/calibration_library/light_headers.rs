@@ -61,13 +61,18 @@ pub struct LightCalCardInputs {
 /// arbitrary-length strings — `Card::new` never errors on length, and
 /// `format_card` transparently emits a CONTINUE chain. So no truncation is
 /// needed here; see `long_master_reference_uses_continue_chain_not_truncation`.
+///
+/// No trailing comment: the value is arbitrary-length, so a comment on the
+/// final continuation record overflows the 80-char card for certain path
+/// lengths (`FitsWriteError::CommentTooLong`) and would hard-fail the whole
+/// output write. The keyword is self-documenting, so the comment is redundant
+/// — dropping it keeps the provenance card robust to any master path length.
 fn master_ref_card(
     keyword: &str,
     uuid: &str,
     path: &str,
-    comment: &str,
 ) -> std::result::Result<Card, FitsWriteError> {
-    Ok(Card::new(keyword, CardValue::Str(format!("{uuid} {path}")))?.with_comment(comment))
+    Card::new(keyword, CardValue::Str(format!("{uuid} {path}")))
 }
 
 /// Build the full header card list for a calibrated-light output (§7):
@@ -85,41 +90,31 @@ pub fn build_light_cal_cards(
         }
     }
 
+    // String-valued provenance cards carry NO comment: their value length is
+    // unbounded (a long filename), so a trailing `/ comment` on the final
+    // CONTINUE record can overflow the 80-char card and hard-fail the write
+    // (`FitsWriteError::CommentTooLong`). The keyword is self-documenting.
     b = b
-        .custom(
-            Card::new("ATH_CSRC", CardValue::Str(inputs.source_uuid.clone()))?
-                .with_comment("source frame uuid"),
-        )
-        .custom(
-            Card::new("ATH_CSRN", CardValue::Str(inputs.source_filename.clone()))?
-                .with_comment("source filename (adoption fallback key)"),
-        );
+        .custom(Card::new("ATH_CSRC", CardValue::Str(inputs.source_uuid.clone()))?)
+        .custom(Card::new(
+            "ATH_CSRN",
+            CardValue::Str(inputs.source_filename.clone()),
+        )?);
 
     if let Some((uuid, path)) = &inputs.dark {
-        b = b.custom(master_ref_card(
-            "ATH_CDRK",
-            uuid,
-            path,
-            "dark master applied: uuid path",
-        )?);
+        b = b.custom(master_ref_card("ATH_CDRK", uuid, path)?);
     }
     if let Some((uuid, path)) = &inputs.flat {
-        b = b.custom(master_ref_card(
-            "ATH_CFLT",
-            uuid,
-            path,
-            "flat master applied: uuid path",
-        )?);
+        b = b.custom(master_ref_card("ATH_CFLT", uuid, path)?);
     }
     if let Some((uuid, path)) = &inputs.bias {
-        b = b.custom(master_ref_card(
-            "ATH_CBIA",
-            uuid,
-            path,
-            "bias master applied: uuid path",
-        )?);
+        b = b.custom(master_ref_card("ATH_CBIA", uuid, path)?);
     }
 
+    // Fixed-width numeric provenance cards keep a short comment — the value is
+    // right-justified to 20 chars, leaving room for a comment up to ~47 chars,
+    // so these must stay well under that (the old ATH_CFNM comment was 51 and
+    // overflowed every write).
     b = b
         .custom(
             Card::new("ATH_CSCL", CardValue::Real(inputs.scale_divisor))?
@@ -127,7 +122,7 @@ pub fn build_light_cal_cards(
         )
         .custom(
             Card::new("ATH_CFNM", CardValue::Real(inputs.flat_norm_divisor))?
-                .with_comment("flat-normalization divisor applied (1.0 = disabled)"),
+                .with_comment("flat-norm divisor (1.0 = off)"),
         )
         .custom(
             Card::new(
@@ -274,5 +269,56 @@ mod tests {
             "expected a multi-record CONTINUE chain, got {}",
             records.len()
         );
+    }
+
+    /// Regression: a master-reference card must render for ANY master-path
+    /// length. Before dropping the decorative comment from `master_ref_card`, a
+    /// path whose length landed the CONTINUE chain's final chunk near the 80-
+    /// char card boundary made the trailing `/ comment` overflow, so
+    /// `format_card` returned `CommentTooLong` and the whole calibrated-light
+    /// write hard-failed. This swept-length loop pins that these cards never
+    /// carry an overflowing comment and always format cleanly.
+    #[test]
+    fn master_reference_cards_format_at_every_path_length() {
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef"; // 36 chars, as real
+        for extra in 0..80usize {
+            let path = format!("/lib/{}/master_dark.fits", "a".repeat(extra));
+            let mut inputs = base_inputs();
+            inputs.dark = Some((uuid.to_string(), path.clone()));
+            inputs.flat = None;
+            inputs.bias = None;
+
+            let cards = build_light_cal_cards(&[], &inputs).unwrap();
+            let dark = cards
+                .iter()
+                .find(|c| c.keyword == "ATH_CDRK")
+                .expect("ATH_CDRK card");
+            assert!(dark.comment.is_none(), "master-ref card must carry no comment");
+            // Every card in the built header must render — the write path formats
+            // them all, so a single overflowing comment fails the whole output.
+            for c in &cards {
+                crate::fits_writer::card::format_card(c).unwrap_or_else(|e| {
+                    panic!(
+                        "format_card failed for {} at path len {}: {e:?}",
+                        c.keyword,
+                        path.len()
+                    )
+                });
+            }
+        }
+    }
+
+    /// The always-present fixed provenance cards (independent of any path
+    /// length) must render — ATH_CFNM in particular carried a 51-char comment
+    /// that overflowed every write before it was shortened.
+    #[test]
+    fn fixed_provenance_cards_never_overflow() {
+        let inputs = base_inputs();
+        let cards = build_light_cal_cards(&[], &inputs).unwrap();
+        for kw in ["ATH_CSRC", "ATH_CSRN", "ATH_CSCL", "ATH_CFNM", "ATH_CVER"] {
+            let card = cards.iter().find(|c| c.keyword == kw).unwrap();
+            crate::fits_writer::card::format_card(card)
+                .unwrap_or_else(|e| panic!("{kw} must format cleanly: {e:?}"));
+        }
     }
 }
