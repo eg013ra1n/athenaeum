@@ -651,8 +651,10 @@ fn process_file(
 /// 3. **Duplicate copy** — a row matches identity and its `output_path` ALSO
 ///    still exists → record the (kept, duplicate) pair, `warn!`; row untouched.
 /// 4. **Unknown** — no row matches → adopt: resolve the source frame by uuid
-///    then filename; resolved → INSERT a tracking row (`info!`); unresolved →
-///    `warn!` and skip so a later scan (once the source is cataloged) succeeds.
+///    then filename (disambiguated by the copied-through OBJECT/DATE-OBS —
+///    filenames collide across nights); resolved to exactly one → INSERT a
+///    tracking row (`info!`); zero or ambiguous → `warn!` and skip so a later
+///    scan (once the source is cataloged / disambiguated) succeeds.
 fn reconcile_calibrated_light(
     conn: &Connection,
     path: &Path,
@@ -704,20 +706,32 @@ fn reconcile_calibrated_light(
     }
 
     // Branch 4: no tracking row — adopt if the source frame is cataloged.
-    let frame_id = resolve_calibrated_source_frame(
-        conn,
-        identity.source_uuid.as_deref(),
-        identity.source_filename.as_deref(),
-    )?;
-    let Some(frame_id) = frame_id else {
-        tracing::warn!(
-            root_id,
-            path = %current_path,
-            source_uuid = identity.source_uuid.as_deref().unwrap_or(""),
-            source_filename = identity.source_filename.as_deref().unwrap_or(""),
-            "calibrated light source not in catalog — deferring adoption"
-        );
-        return Ok(());
+    let frame_id = match resolve_calibrated_source_frame(conn, identity)? {
+        SourceResolution::Resolved(frame_id) => frame_id,
+        SourceResolution::NotFound => {
+            tracing::warn!(
+                root_id,
+                path = %current_path,
+                source_uuid = identity.source_uuid.as_deref().unwrap_or(""),
+                source_filename = identity.source_filename.as_deref().unwrap_or(""),
+                "calibrated light source not in catalog — deferring adoption"
+            );
+            return Ok(());
+        }
+        SourceResolution::Ambiguous(count) => {
+            // Two+ catalog frames share this filename and the copied-through
+            // OBJECT/DATE-OBS didn't narrow it to one. Binding arbitrarily would
+            // pick the wrong frame and (via the ON CONFLICT(frame_id) upsert)
+            // collapse multiple calibrated files onto one row — so defer. A
+            // later scan adopts idempotently once the catalog disambiguates.
+            tracing::warn!(
+                count,
+                filename = identity.source_filename.as_deref().unwrap_or(""),
+                path = %current_path,
+                "ambiguous calibrated-light source, adoption deferred"
+            );
+            return Ok(());
+        }
     };
 
     // Resolve master references (uuid then path) to calibration-set ids where
@@ -761,16 +775,35 @@ fn reconcile_calibrated_light(
     Ok(())
 }
 
-/// Resolve the source LIGHT frame for an adopted calibrated artifact: by
-/// `frames.uuid` first (DB-generated, may not survive a rebuild), then by
-/// `files.filename` (indexed) joined to its frame. Returns the frame id, or
-/// `None` when the source is not yet cataloged.
+/// Outcome of resolving the source LIGHT frame for an adopted calibrated
+/// artifact. `Ambiguous` carries the candidate count so the caller can log it
+/// and defer (idempotent retry once the catalog disambiguates), rather than
+/// binding to an arbitrary frame.
+enum SourceResolution {
+    Resolved(i64),
+    NotFound,
+    Ambiguous(usize),
+}
+
+/// Resolve the source LIGHT frame for an adopted calibrated artifact:
+///
+/// 1. by `frames.uuid` first (unique key; DB-generated, may not survive a
+///    catalog rebuild), then
+/// 2. by `files.filename` (indexed), disambiguated with the OBJECT + DATE-OBS
+///    the calibrated file copied through (design §7).
+///
+/// The bare-filename fallback is nondeterministic on its own: astro filenames
+/// collide across nights/objects (`L_0001.fits`), so a `LIMIT 1` would bind the
+/// wrong frame and, via the `ON CONFLICT(frame_id)` upsert, collapse several
+/// calibrated files onto one row. So candidates are filtered by OBJECT and
+/// DATE-OBS whenever the calibrated header carries them, and the result is
+/// exactly-one → `Resolved`, zero → `NotFound`, more-than-one → `Ambiguous`
+/// (never bound arbitrarily).
 fn resolve_calibrated_source_frame(
     conn: &Connection,
-    source_uuid: Option<&str>,
-    source_filename: Option<&str>,
-) -> anyhow::Result<Option<i64>> {
-    if let Some(uuid) = source_uuid {
+    identity: &CalibratedIdentity,
+) -> anyhow::Result<SourceResolution> {
+    if let Some(uuid) = identity.source_uuid.as_deref() {
         let id: Option<i64> = conn
             .query_row(
                 "SELECT id FROM frames WHERE uuid = ?1 LIMIT 1",
@@ -778,22 +811,71 @@ fn resolve_calibrated_source_frame(
                 |r| r.get(0),
             )
             .optional()?;
-        if id.is_some() {
-            return Ok(id);
+        if let Some(id) = id {
+            return Ok(SourceResolution::Resolved(id));
         }
     }
-    if let Some(filename) = source_filename {
-        let id: Option<i64> = conn
-            .query_row(
-                "SELECT fr.id FROM frames fr JOIN files fi ON fi.id = fr.file_id
-                 WHERE fi.filename = ?1 LIMIT 1",
-                rusqlite::params![filename],
-                |r| r.get(0),
-            )
-            .optional()?;
-        return Ok(id);
+
+    let Some(filename) = identity.source_filename.as_deref() else {
+        return Ok(SourceResolution::NotFound);
+    };
+
+    // Every catalog frame sharing this filename, with the columns we
+    // disambiguate on. Filtering happens in Rust so DATE-OBS can be compared
+    // instant-aware (see `date_obs_matches`).
+    let mut stmt = conn.prepare(
+        "SELECT fr.id, fr.object, fr.date_obs
+         FROM frames fr JOIN files fi ON fi.id = fr.file_id
+         WHERE fi.filename = ?1",
+    )?;
+    let candidates: Vec<(i64, Option<String>, Option<String>)> = stmt
+        .query_map(rusqlite::params![filename], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let matched: Vec<i64> = candidates
+        .into_iter()
+        .filter(|(_, object, date_obs)| {
+            object_matches(identity.source_object.as_deref(), object.as_deref())
+                && date_obs_matches(identity.source_date_obs.as_deref(), date_obs.as_deref())
+        })
+        .map(|(id, _, _)| id)
+        .collect();
+
+    Ok(match matched.as_slice() {
+        [] => SourceResolution::NotFound,
+        [id] => SourceResolution::Resolved(*id),
+        many => SourceResolution::Ambiguous(many.len()),
+    })
+}
+
+/// OBJECT disambiguation predicate. A `None` want (the calibrated file carried
+/// no OBJECT card) never filters; otherwise the candidate must carry the same
+/// trimmed OBJECT (a candidate with no OBJECT can't confidently match).
+fn object_matches(want: Option<&str>, got: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(want) => got.map(|g| g.trim() == want.trim()).unwrap_or(false),
     }
-    Ok(None)
+}
+
+/// DATE-OBS disambiguation predicate, instant-aware. The header carries
+/// DATE-OBS verbatim (e.g. `2025-01-01T22:00:00`, no timezone) while
+/// `frames.date_obs` is stored re-serialized to RFC3339, so a byte compare
+/// would spuriously miss a genuine match. Parse both and compare the instant;
+/// fall back to trimmed string equality only if either side won't parse. A
+/// `None` want never filters.
+fn date_obs_matches(want: Option<&str>, got: Option<&str>) -> bool {
+    let Some(want) = want else { return true };
+    let Some(got) = got else { return false };
+    match (
+        crate::fits_parser::parse_date_obs(want.trim(), None),
+        crate::fits_parser::parse_date_obs(got.trim(), None),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => want.trim() == got.trim(),
+    }
 }
 
 /// Resolve a master reference (`"<uuid> <path>"`) to its calibration-set id —
@@ -2712,7 +2794,7 @@ mod calibrated_light_scan_tests {
     };
     use crate::db::schema::init_db;
     use crate::events::NullEmitter;
-    use crate::fits_writer::write_fits_f32;
+    use crate::fits_writer::{write_fits_f32, Card, CardValue};
     use rusqlite::params;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -2726,20 +2808,95 @@ mod calibrated_light_scan_tests {
         source_filename: &str,
         calstat: &str,
     ) {
+        write_calibrated_light_full(
+            path,
+            source_uuid,
+            source_filename,
+            calstat,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// Full-fidelity calibrated-LIGHT writer: also stamps the copied-through
+    /// OBJECT / DATE-OBS (filename disambiguation, §7) and the applied master
+    /// references (`ATH_CDRK`/`ATH_CFLT`/`ATH_CBIA` as `"<uuid> <path>"`), all
+    /// through the production `build_light_cal_cards`.
+    #[allow(clippy::too_many_arguments)]
+    fn write_calibrated_light_full(
+        path: &Path,
+        source_uuid: &str,
+        source_filename: &str,
+        calstat: &str,
+        object: Option<&str>,
+        date_obs: Option<&str>,
+        dark: Option<(&str, &str)>,
+        flat: Option<(&str, &str)>,
+        bias: Option<(&str, &str)>,
+    ) {
+        // OBJECT / DATE-OBS ride in as source cards; build_light_cal_cards
+        // copies them through its whitelist exactly as the engine would.
+        let mut source_cards: Vec<Card> = Vec::new();
+        if let Some(o) = object {
+            source_cards.push(Card::new("OBJECT", CardValue::Str(o.to_string())).unwrap());
+        }
+        if let Some(d) = date_obs {
+            source_cards.push(Card::new("DATE-OBS", CardValue::Str(d.to_string())).unwrap());
+        }
+        let owned = |p: Option<(&str, &str)>| p.map(|(u, path)| (u.to_string(), path.to_string()));
         let inputs = LightCalCardInputs {
             source_uuid: source_uuid.to_string(),
             source_filename: source_filename.to_string(),
             calstat: calstat.to_string(),
-            dark: None,
-            flat: None,
-            bias: None,
+            dark: owned(dark),
+            flat: owned(flat),
+            bias: owned(bias),
             scale_divisor: 65535.0,
             flat_norm_divisor: 1.0,
         };
-        let cards = build_light_cal_cards(&[], &inputs).unwrap();
+        let cards = build_light_cal_cards(&source_cards, &inputs).unwrap();
         let data = vec![0.5f32; 4 * 4];
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         write_fits_f32(path, 4, 4, 1, &data, &cards).unwrap();
+    }
+
+    /// Seed a master calibration set (`is_master_library`) with one master
+    /// frame at (`id`, `id`), carrying `uuid` on both its file and frame and
+    /// `path` on its file — so an adopted light's master ref can resolve either
+    /// by uuid (frame) or by path (file). Returns the calibration_set id.
+    fn seed_master_set(
+        conn: &Connection,
+        id: i64,
+        uuid: &str,
+        path: &str,
+        imagetyp: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, uuid)
+             VALUES (?1, ?2, 'master.fits', 0, '2025-01-01T00:00:00Z', 'FITS', ?3)",
+            params![id, path, uuid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, uuid, is_master) VALUES (?1, ?1, ?2, 1)",
+            params![id, uuid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library) VALUES (?1, '2025-01-01', 1)",
+            params![imagetyp],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![set_id, id],
+        )
+        .unwrap();
+        set_id
     }
 
     fn fresh_db(root: &Path, root_id: i64) -> Connection {
@@ -2946,6 +3103,147 @@ mod calibrated_light_scan_tests {
             assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: artifact never registered");
             assert_eq!(light_cal_count(&conn), 0, "parallel={parallel}: adoption deferred, no row");
             assert!(result.calibrated_duplicates.is_empty(), "parallel={parallel}");
+        }
+    }
+
+    /// Finding 1 (resolved): two catalog frames share the filename `L_0001.fits`
+    /// (post-rebuild uuids gone, so resolution is by filename). The calibrated
+    /// file carries OBJECT + DATE-OBS matching exactly ONE of them → adopt that
+    /// frame, never the collision. DATE-OBS is carried verbatim (no timezone)
+    /// while the DB row is RFC3339, exercising the instant-aware compare.
+    #[test]
+    fn scan_adopts_disambiguates_same_filename_by_object_and_date() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("M42/c_L_0001.fits");
+            write_calibrated_light_full(
+                &cal,
+                "", // empty uuid -> filename fallback
+                "L_0001.fits",
+                "BDF",
+                Some("M42"),
+                Some("2025-01-01T22:00:00"),
+                None,
+                None,
+                None,
+            );
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            // TWO frames collide on the filename; only #900 matches OBJECT+DATE.
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (900, '/a/L_0001.fits', 'L_0001.fits', 0, '2025-01-01T00:00:00Z', 'FITS'),
+                        (901, '/b/L_0001.fits', 'L_0001.fits', 0, '2025-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, object, date_obs) VALUES
+                    (900, 900, 'M42', '2025-01-01T22:00:00+00:00'),
+                    (901, 901, 'M81', '2025-02-01T22:00:00+00:00')",
+                [],
+            )
+            .unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: artifact never registered");
+
+            let frame_id: i64 = conn
+                .query_row(
+                    "SELECT frame_id FROM light_calibrations WHERE output_path = ?1",
+                    params![cal_str],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(frame_id, 900, "parallel={parallel}: adopted the OBJECT+DATE match, not the collision");
+            assert_eq!(light_cal_count(&conn), 1, "parallel={parallel}: exactly one adopted row");
+        }
+    }
+
+    /// Finding 1 (ambiguous): two catalog frames share the filename and the
+    /// calibrated file carries NO disambiguating cards → adoption is deferred
+    /// (no arbitrary bind, no row-collapse). No row inserted, not registered;
+    /// a later scan adopts once the catalog disambiguates.
+    #[test]
+    fn scan_defers_adoption_when_filename_ambiguous() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("M42/c_L_amb.fits");
+            // No OBJECT / DATE-OBS -> filename alone can't break the tie.
+            write_calibrated_light(&cal, "", "L_amb.fits", "BDF");
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (900, '/a/L_amb.fits', 'L_amb.fits', 0, '2025-01-01T00:00:00Z', 'FITS'),
+                        (901, '/b/L_amb.fits', 'L_amb.fits', 0, '2025-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id, file_id) VALUES (900, 900), (901, 901)", [])
+                .unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: artifact never registered");
+            assert_eq!(light_cal_count(&conn), 0, "parallel={parallel}: ambiguous source -> deferred, no row");
+        }
+    }
+
+    /// Finding 2: master-reference resolution through an adopt scan. The
+    /// calibrated fixture carries a dark ref (uuid hit), a flat ref (uuid miss
+    /// but path hit → path fallback), and a bias ref (both miss → NULL). Assert
+    /// the adopted row's dark/flat/bias set ids.
+    #[test]
+    fn scan_adopts_resolves_master_references() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let conn = fresh_db(root.path(), 1);
+
+            // Source LIGHT frame the calibrated artifact was built from.
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (900, '/src/L_m.fits', 'L_m.fits', 0, '2025-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id, file_id) VALUES (900, 900)", []).unwrap();
+
+            // Seeded master sets: dark resolvable by uuid, flat by path.
+            let dark_set = seed_master_set(&conn, 800, "dark-uuid-1", "/lib/master_dark.fits", "Dark");
+            let flat_set = seed_master_set(&conn, 801, "flat-uuid-real", "/lib/master_flat.fits", "Flat");
+
+            let cal = root.path().join("M42/c_L_m.fits");
+            write_calibrated_light_full(
+                &cal,
+                "",
+                "L_m.fits",
+                "BDF",
+                None,
+                None,
+                Some(("dark-uuid-1", "/lib/master_dark.fits")), // uuid hit
+                Some(("flat-uuid-WRONG", "/lib/master_flat.fits")), // uuid miss, path hit
+                Some(("bias-uuid-unknown", "/lib/nope_bias.fits")), // both miss -> NULL
+            );
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+
+            let (dark_id, flat_id, bias_id): (Option<i64>, Option<i64>, Option<i64>) = conn
+                .query_row(
+                    "SELECT dark_set_id, flat_set_id, bias_set_id
+                     FROM light_calibrations WHERE output_path = ?1",
+                    params![cal_str],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(dark_id, Some(dark_set), "parallel={parallel}: dark resolved by uuid");
+            assert_eq!(flat_id, Some(flat_set), "parallel={parallel}: flat resolved by path fallback");
+            assert_eq!(bias_id, None, "parallel={parallel}: unresolvable bias ref -> NULL");
         }
     }
 }

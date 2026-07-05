@@ -30,6 +30,16 @@ pub struct CalibratedIdentity {
     pub source_uuid: Option<String>,
     /// `ATH_CSRN` — source filename, the adoption fallback key.
     pub source_filename: Option<String>,
+    /// `OBJECT` — target name copied through from the source frame (§7).
+    /// Disambiguates the filename fallback: astro filenames collide across
+    /// nights/objects (`L_0001.fits`), so adoption also matches on OBJECT when
+    /// the calibrated file carries it. `None` when the card is absent/empty.
+    pub source_object: Option<String>,
+    /// `DATE-OBS` — observation timestamp copied through from the source (§7),
+    /// verbatim as it appears in the header. A second filename disambiguator;
+    /// compared instant-aware (the DB stores a re-serialized RFC3339 form), not
+    /// byte-for-byte. `None` when the card is absent/empty.
+    pub source_date_obs: Option<String>,
     /// `CALSTAT` — honest applied-state flags (`"BDF"`, `"BD"`, `"BF"`, `"F"`, …).
     pub calstat: String,
     /// `ATH_CDRK` master reference actually applied, if any.
@@ -78,6 +88,8 @@ pub fn calibrated_light_identity(keys: &HashMap<String, String>) -> Option<Calib
     Some(CalibratedIdentity {
         source_uuid,
         source_filename,
+        source_object: non_empty(keys, "OBJECT"),
+        source_date_obs: non_empty(keys, "DATE-OBS"),
         calstat,
         dark: parse_master_ref(keys, "ATH_CDRK"),
         flat: parse_master_ref(keys, "ATH_CFLT"),
@@ -101,6 +113,8 @@ mod tests {
             ("CALSTAT", "BDF"),
             ("ATH_CSRC", "uuid-1"),
             ("ATH_CSRN", "L_0001.fits"),
+            ("OBJECT", "M42"),
+            ("DATE-OBS", "2025-01-01T22:00:00"),
             ("ATH_CDRK", "dark-uuid /lib/dark.fits"),
             ("ATH_CFLT", "flat-uuid /lib/flat.fits"),
             ("ATH_CFNM", "1234.5"),
@@ -110,6 +124,9 @@ mod tests {
         assert_eq!(id.calstat, "BDF");
         assert_eq!(id.source_uuid.as_deref(), Some("uuid-1"));
         assert_eq!(id.source_filename.as_deref(), Some("L_0001.fits"));
+        // OBJECT + DATE-OBS are captured as filename-disambiguation keys (§7).
+        assert_eq!(id.source_object.as_deref(), Some("M42"));
+        assert_eq!(id.source_date_obs.as_deref(), Some("2025-01-01T22:00:00"));
         assert_eq!(id.dark, Some(MasterRef { uuid: "dark-uuid".into(), path: "/lib/dark.fits".into() }));
         assert_eq!(id.flat, Some(MasterRef { uuid: "flat-uuid".into(), path: "/lib/flat.fits".into() }));
         assert!(id.bias.is_none());
@@ -125,6 +142,9 @@ mod tests {
         let id = calibrated_light_identity(&k).expect("identity present via filename");
         assert!(id.source_uuid.is_none(), "empty ATH_CSRC treated as absent");
         assert_eq!(id.source_filename.as_deref(), Some("L_9.fits"));
+        // No OBJECT/DATE-OBS cards -> no disambiguation keys captured.
+        assert!(id.source_object.is_none());
+        assert!(id.source_date_obs.is_none());
     }
 
     #[test]
