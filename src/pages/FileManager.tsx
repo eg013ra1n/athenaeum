@@ -19,12 +19,13 @@ import { FolderBrowserModal } from '../components/FolderBrowserModal';
 import { MissingMetadataView } from '../components/missing-metadata/MissingMetadataView';
 import { DuplicatesView } from '../components/duplicates/DuplicatesView';
 import { ArchiveFoldersSection } from '../components/archive/ArchiveFoldersSection';
+import { CalibrationFolderSection } from '../components/CalibrationFolderSection';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
 
 export default function FileManager() {
-  const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, toggleMonitorEnabled, relinkScanRoot } = useScanRootsWithAvailability();
+  const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, toggleMonitorEnabled, relinkScanRoot, refresh: refreshScanRoots } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning } = useScanProgressContext();
   const { notify } = useNotifications();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
@@ -680,6 +681,8 @@ export default function FileManager() {
               )}
             </div>
           )}
+
+          <CalibrationFolderSection scanRoots={scanRoots} onRootsChanged={() => void refreshScanRoots()} />
 
           <ArchiveFoldersSection />
         </div>

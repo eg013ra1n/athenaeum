@@ -219,15 +219,131 @@ pub fn add_scan_root(
     })
 }
 
-/// The (single) calibration library root, if configured. Used by the
-/// Settings UI and (Task 12) master-write orchestration to resolve the
-/// destination directory for newly built master calibration frames.
+/// The (single) calibration library root, if configured. Legacy accessor —
+/// kept for the case where the library was created as a dedicated scan root
+/// (folder outside every monitored directory). The effective master-write
+/// destination is resolved by [`get_calibration_library_dir`], which prefers
+/// the `calibration.library_dir` settings key over this root.
 pub fn get_calibration_library_root(ctx: &ServiceContext) -> Result<Option<ScanRoot>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     Ok(crate::db::get_scan_roots(&conn)?
         .into_iter()
         .find(|r| r.kind == "calibration_library"))
+}
+
+/// Effective calibration-library directory — where newly built master
+/// calibration frames are written (`api::masters`). Two sources, in
+/// precedence order:
+///
+/// 1. The `calibration.library_dir` settings key — set when the operator
+///    picks a folder INSIDE an existing monitored directory. No second scan
+///    root is created in that case: the parent root already provides scan
+///    coverage, and overlapping roots are forbidden because root-scoped
+///    maintenance (`delete/recreate_calibration_sets_for_root`,
+///    unique-camera reconcile) matches files by path prefix and two roots
+///    would fight over the shared subtree.
+/// 2. Legacy fallback: the path of the (single) `calibration_library`-kind
+///    scan root — created when the picked folder lies outside every
+///    monitored directory (so the library still gets scan coverage of its
+///    own). Only consulted when the settings key is ABSENT; a
+///    present-but-empty key means "explicitly cleared" and blocks the
+///    fallback.
+pub fn get_calibration_library_dir(ctx: &ServiceContext) -> Result<Option<String>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    resolve_calibration_library_dir(&conn)
+}
+
+/// Connection-level resolver behind [`get_calibration_library_dir`]
+/// (extracted so precedence is testable without a `ServiceContext`).
+pub(crate) fn resolve_calibration_library_dir(
+    conn: &rusqlite::Connection,
+) -> Result<Option<String>, ApiError> {
+    match crate::db::get_setting(conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR)? {
+        Some(dir) if !dir.trim().is_empty() => Ok(Some(dir)),
+        Some(_) => Ok(None), // present-but-empty: explicitly cleared
+        None => Ok(crate::db::get_scan_roots(conn)?
+            .into_iter()
+            .find(|r| r.kind == "calibration_library")
+            .map(|r| r.path)),
+    }
+}
+
+/// Set the calibration-library directory (master-frame write destination).
+///
+/// - Folder inside (or equal to) an existing monitored directory → persists
+///   the `calibration.library_dir` settings key only. The parent root
+///   already provides scan coverage; a nested scan root would violate the
+///   no-overlap invariant (see [`get_calibration_library_dir`]).
+/// - Folder outside every monitored directory → also adds it as the
+///   dedicated `calibration_library`-kind scan root (existing single-library
+///   uniqueness/overlap validation applies), so manually dropped masters
+///   keep being imported by scans.
+///
+/// Returns the normalized path that became effective.
+pub fn set_calibration_library_dir(
+    ctx: &ServiceContext,
+    path: String,
+    policy: &PathPolicy,
+) -> Result<String, ApiError> {
+    let path_buf = Path::new(&path);
+    if !path_buf.exists() {
+        return Err(ApiError::Invalid("Directory does not exist".to_string()));
+    }
+    let new_path = normalize_path(
+        &path_buf
+            .canonicalize()
+            .map_err(|e| ApiError::Internal(format!("Failed to resolve path: {}", e)))?,
+    );
+    policy.check(&new_path)?;
+
+    // Covered by an existing root? (`starts_with` is true for equality too.)
+    let covered = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let existing_roots = crate::db::get_scan_roots(&conn)?;
+        let mut covered = false;
+        for root in existing_roots.iter() {
+            let existing_path = normalize_path(&Path::new(&root.path).canonicalize().map_err(
+                |e| ApiError::Internal(format!("Failed to resolve existing root path: {}", e)),
+            )?);
+            if new_path.starts_with(&existing_path) {
+                covered = true;
+                break;
+            }
+        }
+        covered
+    };
+
+    let path_str = new_path.to_string_lossy().to_string();
+    if !covered {
+        // Standalone folder — becomes the dedicated library scan root
+        // (add_scan_root re-validates overlap + single-library uniqueness).
+        add_scan_root(ctx, path_str.clone(), policy, Some("calibration_library".to_string()))?;
+    }
+
+    let db = db(ctx)?;
+    let conn = db.conn();
+    ctx.settings
+        .persist_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, &path_str)?;
+    tracing::info!(path = %path_str, covered_by_existing_root = covered, "calibration library dir set");
+    Ok(path_str)
+}
+
+/// Clear the calibration-library directory setting. Writes an EMPTY value
+/// (not a delete) so the legacy `calibration_library`-root fallback stays
+/// blocked — see [`get_calibration_library_dir`]. Never deletes any scan
+/// root: if the library was a dedicated root it remains a monitored
+/// directory, removable through the regular scan-root list (which is also
+/// where its catalog-purge consequences are already understood).
+pub fn clear_calibration_library_dir(ctx: &ServiceContext) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    ctx.settings
+        .persist_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, "")?;
+    tracing::info!("calibration library dir cleared");
+    Ok(())
 }
 
 pub fn delete_scan_root(ctx: &ServiceContext, id: i64) -> Result<(), ApiError> {
@@ -816,6 +932,52 @@ mod kind_check_tests {
     fn known_kinds_pass_validation() {
         assert!(validate_scan_root_kind("normal").is_ok());
         assert!(validate_scan_root_kind("calibration_library").is_ok());
+    }
+
+    // ── resolve_calibration_library_dir precedence ───────────────────────
+
+    #[test]
+    fn library_dir_key_wins_over_library_root() {
+        let conn = test_conn();
+        crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+            "/data/masters",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_calibration_library_dir(&conn).unwrap(),
+            Some("/data/masters".to_string())
+        );
+    }
+
+    #[test]
+    fn library_dir_falls_back_to_library_root_when_key_absent() {
+        let conn = test_conn();
+        crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
+        crate::db::upsert_scan_root(&conn, "/data/normal", "normal").unwrap();
+        assert_eq!(
+            resolve_calibration_library_dir(&conn).unwrap(),
+            Some("/lib/a".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_library_dir_key_blocks_root_fallback() {
+        // Present-but-empty = explicitly cleared: the legacy root must NOT
+        // resurface, otherwise "Remove" in the UI would appear to do nothing.
+        let conn = test_conn();
+        crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
+        crate::db::set_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, "").unwrap();
+        assert_eq!(resolve_calibration_library_dir(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn library_dir_none_when_unconfigured() {
+        let conn = test_conn();
+        crate::db::upsert_scan_root(&conn, "/data/normal", "normal").unwrap();
+        assert_eq!(resolve_calibration_library_dir(&conn).unwrap(), None);
     }
 
     #[test]

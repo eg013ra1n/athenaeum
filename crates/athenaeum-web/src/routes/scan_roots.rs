@@ -41,6 +41,11 @@ pub struct DeleteScanRootArgs {
 }
 
 #[derive(serde::Deserialize)]
+pub struct SetCalibrationLibraryDirArgs {
+    pub path: String,
+}
+
+#[derive(serde::Deserialize)]
 pub struct StartScanArgs {
     #[serde(rename = "rootId")]
     pub root_id: i64,
@@ -90,14 +95,52 @@ pub async fn get_scan_roots(
 
 /// POST /api/get_calibration_library_root
 ///
-/// The (single) calibration library root, if configured — used by the
-/// Settings UI's "Calibration Library" section.
+/// The (single) calibration library root, if configured — legacy accessor
+/// for the dedicated-root case; the effective master-write destination is
+/// `get_calibration_library_dir`.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_library_root(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<Option<ScanRoot>>, (StatusCode, String)> {
     api::get_calibration_library_root(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/get_calibration_library_dir
+///
+/// Effective calibration-library directory (master-frame write destination) —
+/// used by the File Manager's "Calibration Folder" section.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_calibration_library_dir(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<Option<String>>, (StatusCode, String)> {
+    api::get_calibration_library_dir(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/set_calibration_library_dir
+///
+/// Folders nested inside an existing monitored directory are stored as a
+/// setting only; standalone folders also become the dedicated
+/// `calibration_library` scan root. Returns the normalized effective path.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_calibration_library_dir(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetCalibrationLibraryDirArgs>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    api::set_calibration_library_dir(&state.ctx, args.path, &policy)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/clear_calibration_library_dir
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn clear_calibration_library_dir(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::clear_calibration_library_dir(&state.ctx).map(Json).map_err(api_err)
 }
 
 /// POST /api/delete_scan_root

@@ -78,6 +78,15 @@ pub mod keys {
     pub const ARCHIVE_ROOT_PATH: &str = "archive.root_path";
     pub const ARCHIVE_COMPRESSION: &str = "archive.compression";
 
+    // Calibration library — master-frame write destination. Set when the
+    // operator picks a folder INSIDE an existing monitored directory (no
+    // second scan root is created there; the parent root already provides
+    // scan coverage). Present-but-empty means "explicitly cleared" (blocks
+    // the legacy calibration_library-root fallback); absent means "never
+    // set" (legacy root fallback applies). See
+    // `api::scan_roots::resolve_calibration_library_dir`.
+    pub const CALIBRATION_LIBRARY_DIR: &str = "calibration.library_dir";
+
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "compute.max_concurrent";
 }

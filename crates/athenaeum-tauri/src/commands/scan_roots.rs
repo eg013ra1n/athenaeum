@@ -31,12 +31,38 @@ pub async fn get_scan_roots(state: State<'_, AppState>) -> Result<Vec<ScanRoot>,
     api::get_scan_roots(&state.ctx).map_err(|e| e.to_string())
 }
 
-/// The (single) calibration library root, if configured — used by the
-/// Settings UI's "Calibration Library" section.
+/// The (single) calibration library root, if configured — legacy accessor
+/// for the dedicated-root case; the effective master-write destination is
+/// `get_calibration_library_dir`.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_library_root(state: State<'_, AppState>) -> Result<Option<ScanRoot>, String> {
     api::get_calibration_library_root(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Effective calibration-library directory (master-frame write destination) —
+/// used by the File Manager's "Calibration Folder" section.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_calibration_library_dir(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    api::get_calibration_library_dir(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Set the calibration-library directory. Folders nested inside an existing
+/// monitored directory are stored as a setting only; standalone folders also
+/// become the dedicated `calibration_library` scan root. Returns the
+/// normalized effective path.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_calibration_library_dir(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    api::set_calibration_library_dir(&state.ctx, path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
+}
+
+/// Clear the calibration-library directory setting (never deletes scan roots).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn clear_calibration_library_dir(state: State<'_, AppState>) -> Result<(), String> {
+    api::clear_calibration_library_dir(&state.ctx).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

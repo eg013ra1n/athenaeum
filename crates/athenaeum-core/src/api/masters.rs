@@ -447,10 +447,15 @@ fn check_rebuild_source_ready(conn: &rusqlite::Connection, source_set_id: i64) -
     }
 }
 
-fn library_root_or_err(ctx: &ServiceContext) -> Result<crate::models::ScanRoot, ApiError> {
-    crate::api::scan_roots::get_calibration_library_root(ctx)?
+/// Effective master-write destination — the `calibration.library_dir`
+/// settings key (folder nested inside a monitored directory) or the legacy
+/// dedicated `calibration_library` scan root. See
+/// `api::scan_roots::get_calibration_library_dir` for the precedence rules.
+fn library_dir_or_err(ctx: &ServiceContext) -> Result<std::path::PathBuf, ApiError> {
+    crate::api::scan_roots::get_calibration_library_dir(ctx)?
+        .map(std::path::PathBuf::from)
         .ok_or_else(|| ApiError::Invalid(
-            "no calibration library root configured — set one before building masters".into(),
+            "no calibration library folder configured — set one before building masters".into(),
         ))
 }
 
@@ -466,7 +471,7 @@ pub fn preview_master_build(
     let conn = db.conn();
 
     let set = load_and_validate_set(&conn, set_id)?;
-    let library_root = library_root_or_err(ctx)?;
+    let library_dir = library_dir_or_err(ctx)?;
 
     let resolved_combine = resolve_combine(recipe.combine, &set.imagetyp, set.frame_count);
     let is_flat = set.imagetyp == "Flat";
@@ -489,7 +494,7 @@ pub fn preview_master_build(
         binning: set.binning.as_deref(),
         date: &set.date,
     });
-    let target_path = resolve_collision(&Path::new(&library_root.path).join(&target_rel))
+    let target_path = resolve_collision(&library_dir.join(&target_rel))
         .to_string_lossy()
         .to_string();
 
@@ -671,7 +676,7 @@ fn run_build(
 
     let target_abs = match &target {
         BuildTarget::New => {
-            let library_root = library_root_or_err(ctx)?;
+            let library_dir = library_dir_or_err(ctx)?;
             let target_rel = master_relative_path(&MasterPathParams {
                 instrume: inputs.instrume.as_deref(),
                 master_kind: inputs.kind,
@@ -682,7 +687,7 @@ fn run_build(
                 binning: set.binning.as_deref(),
                 date: &set.date,
             });
-            resolve_collision(&Path::new(&library_root.path).join(&target_rel))
+            resolve_collision(&library_dir.join(&target_rel))
         }
         // Same path the master already lives at — no collision resolution:
         // `write_fits_f32` replaces the existing file atomically.
@@ -854,7 +859,7 @@ pub fn start_master_build(
         let conn = db.conn();
         load_and_validate_set(&conn, set_id)?;
     }
-    library_root_or_err(&ctx)?;
+    library_dir_or_err(&ctx)?;
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
