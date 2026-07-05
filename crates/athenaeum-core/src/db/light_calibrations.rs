@@ -26,11 +26,18 @@ use super::master_provenance;
 /// path.
 pub use crate::calibration_library::light_cal::LIGHT_CAL_ENGINE_VERSION;
 
+/// The flat-normalization statistic selector — owned by the calibration engine
+/// (`calibration_library::light_cal`), re-used here for the `flat_norm_mode`
+/// column and its staleness comparison. This module already depends on
+/// `light_cal` (see [`LIGHT_CAL_ENGINE_VERSION`] above), so the typed direction
+/// is clean — no dependency cycle.
+pub use crate::calibration_library::light_cal::FlatNormMode;
+
 /// Column list shared by every read query, so `row_from_sql`'s index-based
 /// `row.get(N)` calls can't silently drift out of sync with the SELECT.
 const SELECT_COLS: &str = "id, frame_id, source_uuid, source_filename, output_path, \
-    dark_set_id, flat_set_id, bias_set_id, calstat, flat_norm_applied, output_hash, \
-    engine_version, created_at";
+    dark_set_id, flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, \
+    output_hash, engine_version, created_at";
 
 /// One tracked calibrated-light output.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,8 +53,13 @@ pub struct LightCalRow {
     pub flat_set_id: Option<i64>,
     pub bias_set_id: Option<i64>,
     pub calstat: String,
-    /// true = divided by `ATH_FNRM`, false = plain flat division.
+    /// true = divided by a normalization divisor, false = plain flat division.
     pub flat_norm_applied: bool,
+    /// The normalization statistic actually used, as the [`FlatNormMode`] wire
+    /// string (`"centralThird"` | `"pixinsightTrimmed"`). Meaningful only when
+    /// `flat_norm_applied` is true; `"centralThird"` otherwise (the column
+    /// default). Compared against the wanted mode by [`derive_status`].
+    pub flat_norm_mode: String,
     pub output_hash: String,
     pub engine_version: i64,
     pub created_at: String,
@@ -65,9 +77,10 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LightCalRow> {
         bias_set_id: row.get(7)?,
         calstat: row.get(8)?,
         flat_norm_applied: row.get::<_, i64>(9)? != 0,
-        output_hash: row.get(10)?,
-        engine_version: row.get(11)?,
-        created_at: row.get(12)?,
+        flat_norm_mode: row.get(10)?,
+        output_hash: row.get(11)?,
+        engine_version: row.get(12)?,
+        created_at: row.get(13)?,
     })
 }
 
@@ -88,8 +101,9 @@ pub fn upsert_light_calibration(conn: &Connection, row: &LightCalRow) -> Result<
     let sql = format!(
         "INSERT INTO light_calibrations
          (frame_id, source_uuid, source_filename, output_path, dark_set_id, flat_set_id,
-          bias_set_id, calstat, flat_norm_applied, output_hash, engine_version, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+          bias_set_id, calstat, flat_norm_applied, flat_norm_mode, output_hash, engine_version,
+          created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT({conflict_col}) DO UPDATE SET
             frame_id = excluded.frame_id,
             source_uuid = excluded.source_uuid,
@@ -100,6 +114,7 @@ pub fn upsert_light_calibration(conn: &Connection, row: &LightCalRow) -> Result<
             bias_set_id = excluded.bias_set_id,
             calstat = excluded.calstat,
             flat_norm_applied = excluded.flat_norm_applied,
+            flat_norm_mode = excluded.flat_norm_mode,
             output_hash = excluded.output_hash,
             engine_version = excluded.engine_version,
             created_at = excluded.created_at"
@@ -116,6 +131,7 @@ pub fn upsert_light_calibration(conn: &Connection, row: &LightCalRow) -> Result<
             row.bias_set_id,
             row.calstat,
             flat_norm_applied,
+            row.flat_norm_mode,
             row.output_hash,
             row.engine_version,
             row.created_at,
@@ -234,7 +250,7 @@ pub fn find_by_identity_disambiguated(
     // Every tracking row sharing this filename, LEFT-joined to its source frame
     // so a frameless (adopted-orphan) row surfaces NULL object/date_obs and is
     // filtered out whenever the caller carries a disambiguator. Column indices
-    // 0..12 are the SELECT_COLS in order (read by `row_from_sql`); 13/14 are the
+    // 0..=13 are the SELECT_COLS in order (read by `row_from_sql`); 14/15 are the
     // joined frame's object/date_obs.
     let prefixed = SELECT_COLS
         .split(", ")
@@ -251,8 +267,8 @@ pub fn find_by_identity_disambiguated(
     let candidates = stmt
         .query_map(params![filename], |row| {
             let lc = row_from_sql(row)?;
-            let object: Option<String> = row.get(13)?;
-            let date_obs: Option<String> = row.get(14)?;
+            let object: Option<String> = row.get(14)?;
+            let date_obs: Option<String> = row.get(15)?;
             Ok((lc, object, date_obs))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -346,11 +362,17 @@ pub enum LightCalStatus {
 /// `current_links` is filtered by `calibration_type` — only `"Dark"`,
 /// `"Flat"`, `"Bias"` are considered; a `"DarkFlat"` link never applies to a
 /// light frame directly (it's a Flat's own sub-calibration).
+///
+/// `flat_norm_mode_wanted` is the statistic the caller intends to normalize
+/// with; it only affects staleness when the row actually applied a normalized
+/// flat AND the caller still wants normalization (spec §2 — a norm-off run
+/// ignores the statistic entirely).
 pub fn derive_status(
     conn: &Connection,
     frame_id: i64,
     current_links: &[CalibrationLink],
     flat_norm_wanted: bool,
+    flat_norm_mode_wanted: FlatNormMode,
 ) -> Result<LightCalStatus> {
     let row = match get_light_calibration_for_frame(conn, frame_id)? {
         Some(row) => row,
@@ -394,10 +416,20 @@ pub fn derive_status(
     let flat_norm_mismatch =
         row.flat_set_id.is_some() && row.flat_norm_applied != flat_norm_wanted;
 
+    // The statistic (`flat_norm_mode`) only matters when BOTH the row applied a
+    // normalized flat AND the caller still wants normalization — a norm-off run
+    // ignores the statistic entirely, and a dark-only row (flat_norm_applied =
+    // false) never compares modes (spec §2).
+    let flat_norm_mode_mismatch = row.flat_set_id.is_some()
+        && row.flat_norm_applied
+        && flat_norm_wanted
+        && row.flat_norm_mode != flat_norm_mode_wanted.as_wire_str();
+
     if mismatch
         || master_rebuilt
         || row.engine_version < LIGHT_CAL_ENGINE_VERSION
         || flat_norm_mismatch
+        || flat_norm_mode_mismatch
     {
         return Ok(LightCalStatus::Stale);
     }
@@ -491,6 +523,7 @@ mod tests {
             bias_set_id: None,
             calstat: "BD".to_string(),
             flat_norm_applied: false,
+            flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
             output_hash: "deadbeef".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
@@ -620,7 +653,7 @@ mod tests {
         // ---- no row → NotCalibrated ----
         // frame_id 100 has no light_calibrations row (and isn't even seeded
         // in `frames` — derive_status never needs to insert against it).
-        let status = derive_status(&conn, 100, &[], false).unwrap();
+        let status = derive_status(&conn, 100, &[], false, FlatNormMode::CentralThird).unwrap();
         assert_eq!(status, LightCalStatus::NotCalibrated);
 
         // ---- fresh, everything matches → Calibrated ----
@@ -633,7 +666,7 @@ mod tests {
         upsert_light_calibration(&conn, &fresh).unwrap();
         let links = vec![link("Dark", 10)];
         assert_eq!(
-            derive_status(&conn, 1, &links, false).unwrap(),
+            derive_status(&conn, 1, &links, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Calibrated
         );
 
@@ -642,7 +675,7 @@ mod tests {
         seed_calibration_set(&conn, 11, "Dark");
         let changed_links = vec![link("Dark", 11)];
         assert_eq!(
-            derive_status(&conn, 1, &changed_links, false).unwrap(),
+            derive_status(&conn, 1, &changed_links, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Stale
         );
 
@@ -658,7 +691,7 @@ mod tests {
         upsert_light_calibration(&conn, &rebuilt_case).unwrap();
         let same_links = vec![link("Dark", 12)];
         assert_eq!(
-            derive_status(&conn, 2, &same_links, false).unwrap(),
+            derive_status(&conn, 2, &same_links, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Stale,
             "master rebuilt after the row was written must be stale"
         );
@@ -672,7 +705,7 @@ mod tests {
         upsert_light_calibration(&conn, &old_engine).unwrap();
         let links3 = vec![link("Dark", 10)];
         assert_eq!(
-            derive_status(&conn, 3, &links3, false).unwrap(),
+            derive_status(&conn, 3, &links3, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Stale
         );
 
@@ -686,12 +719,12 @@ mod tests {
         upsert_light_calibration(&conn, &norm_row).unwrap();
         let links4 = vec![link("Flat", 13)];
         assert_eq!(
-            derive_status(&conn, 4, &links4, false).unwrap(),
+            derive_status(&conn, 4, &links4, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Stale,
             "flat_norm_wanted=false must be stale vs a row built with true"
         );
         assert_eq!(
-            derive_status(&conn, 4, &links4, true).unwrap(),
+            derive_status(&conn, 4, &links4, true, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Calibrated,
             "matching flat_norm_wanted must be calibrated"
         );
@@ -705,7 +738,7 @@ mod tests {
         upsert_light_calibration(&conn, &partial_row).unwrap();
         let partial_links = vec![link("Dark", 10), link("Flat", 14)];
         assert_eq!(
-            derive_status(&conn, 5, &partial_links, false).unwrap(),
+            derive_status(&conn, 5, &partial_links, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Partial
         );
 
@@ -719,7 +752,7 @@ mod tests {
         upsert_light_calibration(&conn, &darkflat_row).unwrap();
         let darkflat_links = vec![link("Dark", 10), link("DarkFlat", 15)];
         assert_eq!(
-            derive_status(&conn, 6, &darkflat_links, false).unwrap(),
+            derive_status(&conn, 6, &darkflat_links, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Calibrated
         );
     }
@@ -743,7 +776,7 @@ mod tests {
         upsert_light_calibration(&conn, &dark_only).unwrap();
         let dark_links = vec![link("Dark", 10)];
         assert_eq!(
-            derive_status(&conn, 1, &dark_links, true).unwrap(),
+            derive_status(&conn, 1, &dark_links, true, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Calibrated,
             "a dark-only frame must not go stale just because flat-norm is toggled on"
         );
@@ -757,14 +790,74 @@ mod tests {
         upsert_light_calibration(&conn, &flat_row).unwrap();
         let flat_links = vec![link("Flat", 11)];
         assert_eq!(
-            derive_status(&conn, 2, &flat_links, true).unwrap(),
+            derive_status(&conn, 2, &flat_links, true, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Stale,
             "a flat frame built without normalization is stale once the caller wants it"
         );
         assert_eq!(
-            derive_status(&conn, 2, &flat_links, false).unwrap(),
+            derive_status(&conn, 2, &flat_links, false, FlatNormMode::CentralThird).unwrap(),
             LightCalStatus::Calibrated,
             "same flat frame matches when the caller does not want normalization"
+        );
+    }
+
+    /// The normalization *statistic* (`flat_norm_mode`) makes a normalized-flat
+    /// frame stale on a mismatch, but is ignored entirely for dark-only rows and
+    /// for norm-off runs (spec §2).
+    #[test]
+    fn derive_status_flat_norm_mode_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Flat row built with centralThird + normalization ON.
+        seed_frame(&conn, 1);
+        seed_calibration_set(&conn, 11, "Flat");
+        let mut flat_row = base_row(Some(1), "/lib/1.fits");
+        flat_row.flat_set_id = Some(11);
+        flat_row.flat_norm_applied = true;
+        flat_row.flat_norm_mode = FlatNormMode::CentralThird.as_wire_str().to_string();
+        upsert_light_calibration(&conn, &flat_row).unwrap();
+        let flat_links = vec![link("Flat", 11)];
+
+        // Same mode wanted → Calibrated; different mode wanted → Stale.
+        assert_eq!(
+            derive_status(&conn, 1, &flat_links, true, FlatNormMode::CentralThird).unwrap(),
+            LightCalStatus::Calibrated,
+            "matching statistic must stay calibrated"
+        );
+        assert_eq!(
+            derive_status(&conn, 1, &flat_links, true, FlatNormMode::PixinsightTrimmed).unwrap(),
+            LightCalStatus::Stale,
+            "a centralThird flat is stale once pixinsightTrimmed is wanted"
+        );
+
+        // Dark-only row → the statistic never applies, whatever mode is wanted.
+        seed_frame(&conn, 2);
+        seed_calibration_set(&conn, 10, "Dark");
+        let mut dark_only = base_row(Some(2), "/lib/2.fits");
+        dark_only.dark_set_id = Some(10);
+        dark_only.flat_set_id = None;
+        dark_only.flat_norm_applied = false;
+        upsert_light_calibration(&conn, &dark_only).unwrap();
+        let dark_links = vec![link("Dark", 10)];
+        assert_eq!(
+            derive_status(&conn, 2, &dark_links, true, FlatNormMode::PixinsightTrimmed).unwrap(),
+            LightCalStatus::Calibrated,
+            "a dark-only frame never goes stale on a mode change"
+        );
+
+        // Norm-off run → the statistic is ignored even for a flat frame.
+        seed_frame(&conn, 3);
+        seed_calibration_set(&conn, 12, "Flat");
+        let mut flat_nonorm = base_row(Some(3), "/lib/3.fits");
+        flat_nonorm.flat_set_id = Some(12);
+        flat_nonorm.flat_norm_applied = false; // built without normalization
+        upsert_light_calibration(&conn, &flat_nonorm).unwrap();
+        let flat_links_2 = vec![link("Flat", 12)];
+        assert_eq!(
+            derive_status(&conn, 3, &flat_links_2, false, FlatNormMode::PixinsightTrimmed).unwrap(),
+            LightCalStatus::Calibrated,
+            "normalization off → the statistic is ignored regardless of mode"
         );
     }
 
@@ -905,6 +998,7 @@ mod tests {
                 bias_set_id       INTEGER REFERENCES calibration_set(id),
                 calstat           TEXT NOT NULL,
                 flat_norm_applied INTEGER NOT NULL,
+                flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
                 output_hash       TEXT NOT NULL,
                 engine_version    INTEGER NOT NULL,
                 created_at        TEXT NOT NULL

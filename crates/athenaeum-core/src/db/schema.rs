@@ -1358,6 +1358,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
             calstat           TEXT NOT NULL,
             flat_norm_applied INTEGER NOT NULL,
+            flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
             output_hash       TEXT NOT NULL,
             engine_version    INTEGER NOT NULL,
             created_at        TEXT NOT NULL
@@ -1372,6 +1373,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_light_cal_source_filename ON light_calibrations(source_filename)",
         [],
     )?;
+
+    // B5 (2026-07-06): selectable flat-normalization statistic. v0.2.5 is
+    // unreleased, but the owner's dev DB already carries `light_calibrations`
+    // rows, so ADD COLUMN with a DEFAULT preserves them (an existing row's
+    // statistic was central-third — today's only behavior). Must run BEFORE the
+    // FK rebuild below so that rebuild's explicit-column INSERT..SELECT finds the
+    // column on the source table.
+    if !column_exists(conn, "light_calibrations", "flat_norm_mode")? {
+        conn.execute(
+            "ALTER TABLE light_calibrations ADD COLUMN flat_norm_mode TEXT NOT NULL DEFAULT 'centralThird'",
+            [],
+        )?;
+    }
 
     // Guarded migration for dev DBs created before the `ON DELETE SET NULL`
     // fix (v0.2.5 is unreleased, so only dev DBs can carry the old no-action
@@ -1410,16 +1424,17 @@ pub fn init_db(conn: &Connection) -> Result<()> {
                 bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
                 calstat           TEXT NOT NULL,
                 flat_norm_applied INTEGER NOT NULL,
+                flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
                 output_hash       TEXT NOT NULL,
                 engine_version    INTEGER NOT NULL,
                 created_at        TEXT NOT NULL
              );
              INSERT INTO light_calibrations_new
                 (id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
-                 flat_set_id, bias_set_id, calstat, flat_norm_applied, output_hash,
+                 flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, output_hash,
                  engine_version, created_at)
                 SELECT id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
-                       flat_set_id, bias_set_id, calstat, flat_norm_applied, output_hash,
+                       flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, output_hash,
                        engine_version, created_at
                 FROM light_calibrations;
              DROP TABLE light_calibrations;

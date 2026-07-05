@@ -522,3 +522,5 @@ rawSetIdsToBuild: Array<number>, };
 
 export type LightCalScope = { onlyStale: boolean, };
 
+export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
+

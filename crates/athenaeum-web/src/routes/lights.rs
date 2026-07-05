@@ -14,7 +14,7 @@ use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
 
-pub use athenaeum_core::api::lights::{LightCalReadiness, LightCalScope};
+pub use athenaeum_core::api::lights::{FlatNormMode, LightCalReadiness, LightCalScope};
 
 // ── Request structs ───────────────────────────────────────────────────────
 
@@ -23,6 +23,7 @@ pub use athenaeum_core::api::lights::{LightCalReadiness, LightCalScope};
 pub struct GetLightCalibrationReadinessArgs {
     pub set_id: i64,
     pub flat_norm: bool,
+    pub flat_norm_mode: FlatNormMode,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +32,7 @@ pub struct StartLightCalibrationArgs {
     pub set_id: i64,
     pub scope: LightCalScope,
     pub flat_norm: bool,
+    pub flat_norm_mode: FlatNormMode,
 }
 
 #[derive(Deserialize)]
@@ -52,7 +54,7 @@ pub async fn get_light_calibration_readiness(
 ) -> Result<Json<LightCalReadiness>, (StatusCode, String)> {
     let ctx = state.ctx.clone();
     let result = tokio::task::spawn_blocking(move || {
-        api::get_light_calibration_readiness(&ctx, args.set_id, args.flat_norm)
+        api::get_light_calibration_readiness(&ctx, args.set_id, args.flat_norm, args.flat_norm_mode)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Readiness task panicked: {}", e)))?
@@ -81,6 +83,7 @@ pub async fn start_light_calibration(
         args.set_id,
         args.scope,
         args.flat_norm,
+        args.flat_norm_mode,
     )
     .map(Json)
     .map_err(api_err)

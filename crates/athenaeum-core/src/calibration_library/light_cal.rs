@@ -47,6 +47,45 @@ pub const LIGHT_CAL_ENGINE_VERSION: i64 = 1;
 /// constant so the scale decision lives in exactly one place.
 pub const OUTPUT_SCALE_DIVISOR: f64 = 65535.0;
 
+/// Fraction of pixels discarded from EACH tail by the PixInsight-compatible
+/// trimmed mean (`FlatNormMode::PixinsightTrimmed`). Matches PixInsight
+/// ImageCalibration's `flatScaleClippingFactor = 0.05`, identified empirically
+/// against PI's own arithmetic to 1.7e-6 relative (spec §2). The trim indices
+/// are `lo = floor(n * PI_TRIM_FRACTION)`, `hi = n − floor(n * PI_TRIM_FRACTION)`
+/// and the statistic is the f64 mean of `sorted[lo..hi]` — exactness is the
+/// point, so this lives in exactly one place.
+pub const PI_TRIM_FRACTION: f64 = 0.05;
+
+/// Which statistic normalizes the master flat when normalization is ON
+/// (spec §2, "Normalization statistic is selectable"). Applies only when
+/// `flat_norm` is on; recorded in the tracking row so a mode change makes a
+/// flat-applied frame stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum FlatNormMode {
+    /// Athenaeum convention (default): the flat's central-third mean, read from
+    /// the master's `ATH_FNRM` card and recomputed on the fly when absent.
+    #[default]
+    CentralThird,
+    /// PixInsight-compatible: a two-sided trimmed mean over the WHOLE frame,
+    /// discarding [`PI_TRIM_FRACTION`] of the pixels from each tail. Always
+    /// computed from the flat file — the `ATH_FNRM` card is ignored.
+    PixinsightTrimmed,
+}
+
+impl FlatNormMode {
+    /// The over-the-wire / stored string for this mode — identical to the serde
+    /// camelCase representation and to the `flat_norm_mode` DB column values.
+    /// Kept as a `&'static str` so `db::light_calibrations` can compare a stored
+    /// row's mode against a wanted mode without a serde round-trip.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            FlatNormMode::CentralThird => "centralThird",
+            FlatNormMode::PixinsightTrimmed => "pixinsightTrimmed",
+        }
+    }
+}
+
 /// Everything the engine needs to calibrate one LIGHT frame.
 ///
 /// `dark_path`/`bias_path` are the master subtrahend candidates — a dark is
@@ -62,6 +101,9 @@ pub struct LightCalInputs {
     /// Normalize the master flat by its `ATH_FNRM` constant (spec §2 toggle,
     /// default on). `false` → plain division by the flat as stored.
     pub flat_norm: bool,
+    /// Which statistic computes the normalization divisor when `flat_norm` is on
+    /// (spec §2). Ignored when `flat_norm` is `false` or no flat is applied.
+    pub flat_norm_mode: FlatNormMode,
     pub output_path: PathBuf,
     pub cards: Vec<Card>,
     pub scratch_dir: PathBuf,
@@ -108,7 +150,9 @@ pub fn calibrate_light(
     // (also 1.0 when no flat). Resolved before the read so a missing flat or a
     // bad ATH_FNRM fails fast, before any output work.
     let flat_norm_divisor = match (&inputs.flat_path, inputs.flat_norm) {
-        (Some(flat), true) => flat_norm_constant(flat, &inputs.scratch_dir)?,
+        (Some(flat), true) => {
+            flat_norm_constant(flat, &inputs.scratch_dir, inputs.flat_norm_mode)?
+        }
         _ => 1.0,
     };
 
@@ -183,21 +227,53 @@ pub fn calibrate_light(
     })
 }
 
-/// The flat-normalization divisor for `flat_path`: read the `ATH_FNRM` card an
-/// Athenaeum-built master stamps, or — for a flat imported without it —
-/// recompute the central-third mean on the fly (spec §2), band-reading so
-/// memory stays bounded.
+/// The flat-normalization divisor for `flat_path` under `mode` (spec §2):
+///
+/// - [`FlatNormMode::CentralThird`] (default, Athenaeum convention): read the
+///   `ATH_FNRM` card an Athenaeum-built master stamps, or — for a flat imported
+///   without it — recompute the central-third mean on the fly.
+/// - [`FlatNormMode::PixinsightTrimmed`] (PixInsight-compatible): a two-sided
+///   trimmed mean over the WHOLE frame ([`PI_TRIM_FRACTION`] per tail). ALWAYS
+///   computed from the flat file; the `ATH_FNRM` card is ignored.
+///
+/// Both paths band-read the flat one row-band at a time, so memory stays
+/// bounded regardless of frame size.
 pub fn flat_norm_constant(
     flat_path: &Path,
     scratch_dir: &Path,
+    mode: FlatNormMode,
 ) -> Result<f64, IntegrationError> {
-    if let Some(n) = read_ath_fnrm(flat_path) {
-        tracing::debug!(path = %flat_path.display(), ath_fnrm = n, "flat normalization from ATH_FNRM card");
-        return Ok(n);
+    match mode {
+        FlatNormMode::CentralThird => {
+            if let Some(n) = read_ath_fnrm(flat_path) {
+                tracing::debug!(path = %flat_path.display(), ath_fnrm = n, "flat normalization from ATH_FNRM card");
+                return Ok(n);
+            }
+            // Imported master without the card: recompute the central-third mean.
+            let (w, h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
+            let mean = central_third_mean(&data, w, h);
+            tracing::debug!(path = %flat_path.display(), recomputed = mean, "flat normalization recomputed (ATH_FNRM absent)");
+            Ok(mean)
+        }
+        FlatNormMode::PixinsightTrimmed => {
+            // PixInsight parity: the card's meaning (central-third) does not
+            // match this statistic, so it is deliberately ignored — always
+            // computed from the flat's pixels.
+            let (_w, _h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
+            let mean = pixinsight_trimmed_mean(&data);
+            tracing::debug!(path = %flat_path.display(), trimmed_mean = mean, "flat normalization from full-frame trimmed mean (pixinsightTrimmed)");
+            Ok(mean)
+        }
     }
+}
 
-    // Imported master without the card: recompute the central-third mean on the
-    // fly (spec §2). Band-read into one plane so memory stays bounded.
+/// Band-read the entire flat plane into one `Vec<f32>` (bounded memory: one
+/// row-band at a time, assembled into the single output plane). Shared by both
+/// [`FlatNormMode`] paths that need the raw pixels.
+fn read_full_flat_plane(
+    flat_path: &Path,
+    scratch_dir: &Path,
+) -> Result<(usize, usize, Vec<f32>), IntegrationError> {
     let mut src = BandSource::open(&[flat_path.to_path_buf()], scratch_dir)?;
     let (w, h) = (src.width(), src.height());
     let band_rows = band_rows_for_budget(w, 1, BAND_BUDGET_BYTES).min(h);
@@ -210,9 +286,30 @@ pub fn flat_norm_constant(
         data[y * w..(y + rows) * w].copy_from_slice(&bufs[0]);
         y += rows;
     }
-    let mean = central_third_mean(&data, w, h);
-    tracing::debug!(path = %flat_path.display(), recomputed = mean, "flat normalization recomputed (ATH_FNRM absent)");
-    Ok(mean)
+    Ok((w, h, data))
+}
+
+/// Two-sided trimmed mean over the whole plane, discarding exactly
+/// [`PI_TRIM_FRACTION`] of the pixels from EACH tail (PixInsight's
+/// `flatScaleClippingFactor` semantics, spec §2). Sorts a copy (total order,
+/// NaN-tolerant) and averages the surviving middle in f64:
+/// `lo = floor(n·f)`, `hi = n − floor(n·f)`, mean over `sorted[lo..hi]`.
+///
+/// Degenerate guards: an empty plane returns `1.0` (a harmless divide-by later),
+/// and a frame so small that `lo >= hi` falls back to the full-frame mean rather
+/// than averaging an empty slice.
+fn pixinsight_trimmed_mean(data: &[f32]) -> f64 {
+    let n = data.len();
+    if n == 0 {
+        return 1.0;
+    }
+    let mut sorted: Vec<f32> = data.to_vec();
+    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+    let trim = ((n as f64) * PI_TRIM_FRACTION).floor() as usize;
+    let (lo, hi) = if trim * 2 < n { (trim, n - trim) } else { (0, n) };
+    let slice = &sorted[lo..hi];
+    let sum: f64 = slice.iter().map(|&v| v as f64).sum();
+    sum / (slice.len() as f64)
 }
 
 /// Best-effort read of a flat's `ATH_FNRM` card. Any failure (unreadable
@@ -305,6 +402,7 @@ mod tests {
             bias_path: bias,
             flat_path: flat,
             flat_norm,
+            flat_norm_mode: FlatNormMode::CentralThird,
             output_path: out,
             cards: vec![],
             scratch_dir: dir.to_path_buf(),
@@ -464,14 +562,78 @@ mod tests {
         let expected = central_third_mean(&fdata, w, h);
         assert!(expected > 100.0, "central-third mean must reflect the gradient");
 
-        let got = flat_norm_constant(&flat, dir.path()).unwrap();
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird).unwrap();
         assert!((got - expected).abs() < 1e-9, "recomputed {got}, want central-third mean {expected}");
 
         // And when the card IS present it takes precedence over recomputation,
         // even with identical pixel data (value differs from the mean above).
         let flat_carded = write_fill(dir.path(), "flat_carded.fits", w, h, fill, &[fnrm_card(999.0)]);
-        let carded = flat_norm_constant(&flat_carded, dir.path()).unwrap();
+        let carded = flat_norm_constant(&flat_carded, dir.path(), FlatNormMode::CentralThird).unwrap();
         assert!((carded - 999.0).abs() < 1e-9, "ATH_FNRM card must win over recomputation, got {carded}");
+    }
+
+    #[test]
+    fn pixinsight_trimmed_mean_exact() {
+        // 1000 distinct values 0..=999 → trim floor(1000*0.05)=50 from each
+        // tail → mean of sorted[50..950] = mean(50..=949) = (50+949)/2 = 499.5.
+        let vals: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        let m = pixinsight_trimmed_mean(&vals);
+        assert!((m - 499.5).abs() < 1e-9, "trimmed mean {m}, want 499.5");
+
+        // Order-independent: shuffling the input must not change the statistic
+        // (the fn sorts internally).
+        let mut rev: Vec<f32> = vals.clone();
+        rev.reverse();
+        assert!((pixinsight_trimmed_mean(&rev) - 499.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pixinsight_trimmed_mode_ignores_fnrm_card() {
+        // A 40x25 = 1000-pixel plane of the distinct values 0..=999, stamped
+        // with a BOGUS ATH_FNRM card. PixinsightTrimmed must IGNORE the card and
+        // return the trimmed mean 499.5; CentralThird must read the card (999.0).
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (40usize, 25usize);
+        let flat = write_fill(dir.path(), "flat_trim.fits", w, h, |x, y| (y * w + x) as f32, &[fnrm_card(999.0)]);
+
+        let trimmed = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed).unwrap();
+        assert!((trimmed - 499.5).abs() < 1e-6, "trimmed {trimmed}, want 499.5 (card ignored)");
+
+        let central = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird).unwrap();
+        assert!((central - 999.0).abs() < 1e-9, "central-third must read the card verbatim, got {central}");
+    }
+
+    #[test]
+    fn pixinsight_trimmed_mean_real_shape_matches_formula() {
+        // A realistic (NaN-free) radial-vignetting flat: bright center, dimmer
+        // corners. The engine's band-read path must produce exactly the same
+        // trimmed mean as computing the formula directly over the pixel values.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (64usize, 48usize);
+        let cx = (w as f32 - 1.0) / 2.0;
+        let cy = (h as f32 - 1.0) / 2.0;
+        let fill = |x: usize, y: usize| {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let r2 = (dx * dx + dy * dy) / (cx * cx + cy * cy);
+            20000.0 * (1.0 - 0.3 * r2)
+        };
+        let flat = write_fill(dir.path(), "flat_vig.fits", w, h, fill, &[]);
+
+        let mut data = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = fill(x, y);
+            }
+        }
+        assert!(data.iter().all(|v| v.is_finite()), "fixture must be NaN-free");
+        let expected = pixinsight_trimmed_mean(&data);
+        // Sanity: the trimmed mean sits strictly inside the value range.
+        let (mn, mx) = data.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!((mn as f64) < expected && expected < (mx as f64), "trimmed mean {expected} outside ({mn},{mx})");
+
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed).unwrap();
+        assert!((got - expected).abs() < 1e-3, "engine path {got} vs direct formula {expected}");
     }
 
     #[test]

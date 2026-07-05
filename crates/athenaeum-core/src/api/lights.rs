@@ -33,6 +33,10 @@ use crate::api::{db, ApiError};
 use crate::calibration_library::light_cal::{
     calibrate_light, flat_norm_constant, LightCalInputs, OUTPUT_SCALE_DIVISOR,
 };
+// Re-export the flat-normalization statistic so the thin Tauri/Axum wrappers can
+// name it via `api::lights::FlatNormMode` (its canonical home is the calibration
+// engine). Also brings it into this module's scope.
+pub use crate::calibration_library::light_cal::FlatNormMode;
 use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalCardInputs};
 use crate::calibration_library::paths::{calibrated_light_relative_path, resolve_collision};
 use crate::db::calibration_links::get_links_for_frame;
@@ -187,6 +191,7 @@ fn compute_readiness(
     conn: &Connection,
     set_id: i64,
     flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
 ) -> Result<LightCalReadiness, ApiError> {
     let members = load_light_members(conn, set_id)?;
 
@@ -226,7 +231,7 @@ fn compute_readiness(
             ready_count += 1;
         }
 
-        let status = status_str(derive_status(conn, frame_id, &links, flat_norm)?);
+        let status = status_str(derive_status(conn, frame_id, &links, flat_norm, flat_norm_mode)?);
 
         frames.push(LightFrameReadiness {
             frame_id,
@@ -266,10 +271,11 @@ pub fn get_light_calibration_readiness(
     ctx: &ServiceContext,
     set_id: i64,
     flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
 ) -> Result<LightCalReadiness, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    compute_readiness(&conn, set_id, flat_norm)
+    compute_readiness(&conn, set_id, flat_norm, flat_norm_mode)
 }
 
 // ── Orchestration DTOs (B5 Task 5) ──────────────────────────────────────────
@@ -580,6 +586,7 @@ fn calibrate_one_inner(
     frame_id: i64,
     scope: LightCalScope,
     flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
     library_dir: &Path,
     scratch: &Path,
     cancel: &AtomicBool,
@@ -590,7 +597,9 @@ fn calibrate_one_inner(
         let conn = db.conn();
         if scope.only_stale {
             let links = get_links_for_frame(&conn, frame_id)?;
-            if derive_status(&conn, frame_id, &links, flat_norm)? == LightCalStatus::Calibrated {
+            if derive_status(&conn, frame_id, &links, flat_norm, flat_norm_mode)?
+                == LightCalStatus::Calibrated
+            {
                 return Ok(true);
             }
         }
@@ -618,7 +627,7 @@ fn calibrate_one_inner(
     // engine (which recomputes the identical value) so the card list is complete
     // at write time. 1.0 when normalization is off or no flat applies.
     let flat_norm_divisor = match (&resolved.flat, flat_norm) {
-        (Some(m), true) => flat_norm_constant(Path::new(&m.path), scratch)?,
+        (Some(m), true) => flat_norm_constant(Path::new(&m.path), scratch, flat_norm_mode)?,
         _ => 1.0,
     };
 
@@ -674,6 +683,7 @@ fn calibrate_one_inner(
         bias_path: resolved.bias.as_ref().map(|m| PathBuf::from(&m.path)),
         flat_path: resolved.flat.as_ref().map(|m| PathBuf::from(&m.path)),
         flat_norm,
+        flat_norm_mode,
         output_path: output_abs.clone(),
         cards,
         scratch_dir: scratch.to_path_buf(),
@@ -694,6 +704,14 @@ fn calibrate_one_inner(
         bias_set_id: resolved.bias.as_ref().map(|m| m.set_id),
         calstat: outcome.calstat.clone(),
         flat_norm_applied: flat_applied && flat_norm,
+        // Record the statistic actually used when a normalized flat was applied;
+        // otherwise the column default (the mode is irrelevant when nothing was
+        // normalized, and `derive_status` never compares it in that case).
+        flat_norm_mode: if flat_applied && flat_norm {
+            flat_norm_mode.as_wire_str().to_string()
+        } else {
+            FlatNormMode::CentralThird.as_wire_str().to_string()
+        },
         output_hash: outcome.output_hash.clone(),
         engine_version: LIGHT_CAL_ENGINE_VERSION,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -711,11 +729,21 @@ fn calibrate_one(
     frame_id: i64,
     scope: LightCalScope,
     flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
     library_dir: &Path,
     scratch: &Path,
     cancel: &AtomicBool,
 ) -> FrameOutcome {
-    match calibrate_one_inner(db, frame_id, scope, flat_norm, library_dir, scratch, cancel) {
+    match calibrate_one_inner(
+        db,
+        frame_id,
+        scope,
+        flat_norm,
+        flat_norm_mode,
+        library_dir,
+        scratch,
+        cancel,
+    ) {
         Ok(true) => FrameOutcome::Skipped,
         Ok(false) => FrameOutcome::Done,
         Err(CalError::Cancelled) => FrameOutcome::Cancelled,
@@ -813,6 +841,7 @@ fn run_light_cal(
     set_id: i64,
     scope: LightCalScope,
     flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
     preflight_build_set_ids: &[i64],
     cancel_flag: &Arc<AtomicBool>,
     job_id_slot: &AtomicI64,
@@ -861,7 +890,14 @@ fn run_light_cal(
     let scratch = std::env::temp_dir();
     let total = members.len();
 
-    tracing::info!(set_id, total, only_stale = scope.only_stale, flat_norm, "light calibration batch started");
+    tracing::info!(
+        set_id,
+        total,
+        only_stale = scope.only_stale,
+        flat_norm,
+        flat_norm_mode = flat_norm_mode.as_wire_str(),
+        "light calibration batch started"
+    );
 
     for (index, (frame_id, filename)) in members.iter().enumerate() {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -872,6 +908,7 @@ fn run_light_cal(
             *frame_id,
             scope,
             flat_norm,
+            flat_norm_mode,
             &library_dir,
             &scratch,
             cancel_flag.as_ref(),
@@ -917,6 +954,7 @@ fn run_light_cal_thread(
     set_id: i64,
     scope: LightCalScope,
     flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
     preflight_build_set_ids: Vec<i64>,
     cancel_flag: Arc<AtomicBool>,
     job_id_slot: Arc<AtomicI64>,
@@ -931,6 +969,7 @@ fn run_light_cal_thread(
             set_id,
             scope,
             flat_norm,
+            flat_norm_mode,
             &preflight_build_set_ids,
             &cancel_flag,
             &job_id_slot,
@@ -988,6 +1027,7 @@ pub fn start_light_calibration(
     set_id: i64,
     scope: LightCalScope,
     flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
 ) -> Result<(), ApiError> {
     // Register the cancel handle FIRST, rejecting a concurrent run for the same
     // set (mirrors start_master_build's duplicate-run guard). Doing this before
@@ -1015,7 +1055,7 @@ pub fn start_light_calibration(
     // Non-fatal — a skipped/failed build just means those lights calibrate
     // best-effort at run time (§6). Never aborts the light run. A hard readiness
     // error must release the handle we just registered before returning.
-    let readiness = match get_light_calibration_readiness(&ctx, set_id, flat_norm) {
+    let readiness = match get_light_calibration_readiness(&ctx, set_id, flat_norm, flat_norm_mode) {
         Ok(r) => r,
         Err(e) => {
             ctx.active_light_cal.lock().unwrap().remove(&set_id);
@@ -1071,6 +1111,7 @@ pub fn start_light_calibration(
                 set_id,
                 scope,
                 flat_norm,
+                flat_norm_mode,
                 preflight_build_set_ids,
                 cancel_flag,
                 job_id_slot,
@@ -1448,6 +1489,7 @@ mod orchestration_tests {
             set_id,
             LightCalScope { only_stale },
             true,
+            FlatNormMode::CentralThird,
             Vec::new(), // no preflight builds in this direct-thread harness
             cancel_flag,
             job_id_slot,
@@ -1680,6 +1722,7 @@ mod orchestration_tests {
             1,
             LightCalScope { only_stale: false },
             true,
+            FlatNormMode::CentralThird,
         )
         .unwrap_err();
         assert!(matches!(err, ApiError::Conflict(_)), "expected Conflict, got {err:?}");
@@ -1936,7 +1979,9 @@ mod orchestration_tests {
         );
 
         // ── Readiness: every light must classify dark+flat as rawSet ─────────
-        let readiness = get_light_calibration_readiness(&ctx, frame_set_id, true).unwrap();
+        let readiness =
+            get_light_calibration_readiness(&ctx, frame_set_id, true, FlatNormMode::CentralThird)
+                .unwrap();
         eprintln!(
             "[b5-e2e] readiness: ready={} raw={} missing={} to_build={:?}",
             readiness.ready_count, readiness.raw_set_count, readiness.missing_count,
@@ -1962,6 +2007,7 @@ mod orchestration_tests {
             frame_set_id,
             LightCalScope { only_stale: false },
             true,
+            FlatNormMode::CentralThird,
         )
         .unwrap();
 
@@ -2267,6 +2313,7 @@ mod tests {
                 bias_set_id: Some(102),
                 calstat: "BDF".to_string(),
                 flat_norm_applied: false,
+                flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
                 output_hash: "deadbeef".to_string(),
                 engine_version: LIGHT_CAL_ENGINE_VERSION,
                 created_at: "2026-07-05T00:00:00Z".to_string(),
@@ -2285,7 +2332,7 @@ mod tests {
         add_link(&conn, 3, 100, "Dark");
         add_link(&conn, 3, 102, "Bias");
 
-        let r = compute_readiness(&conn, 1, false).unwrap();
+        let r = compute_readiness(&conn, 1, false, FlatNormMode::CentralThird).unwrap();
         assert_eq!(r.frames.len(), 3);
 
         let f1 = &r.frames[0];
@@ -2336,7 +2383,7 @@ mod tests {
         seed_light(&conn, 4, session);
         add_link(&conn, 4, 300, "Dark");
 
-        let r = compute_readiness(&conn, 1, false).unwrap();
+        let r = compute_readiness(&conn, 1, false, FlatNormMode::CentralThird).unwrap();
 
         assert_eq!(r.frames.len(), 4);
         assert_eq!(r.ready_count, 1, "only light 1 is fully ready");

@@ -664,8 +664,8 @@ fn reconcile_calibrated_light(
     calibrated_duplicates_out: &mut Vec<CalibratedDuplicate>,
 ) -> anyhow::Result<()> {
     use crate::db::light_calibrations::{
-        find_by_identity_disambiguated, update_output_path, upsert_light_calibration, LightCalRow,
-        LIGHT_CAL_ENGINE_VERSION,
+        find_by_identity_disambiguated, update_output_path, upsert_light_calibration, FlatNormMode,
+        LightCalRow, LIGHT_CAL_ENGINE_VERSION,
     };
 
     // Disambiguated identity match (§4): the filename fallback is narrowed by
@@ -770,6 +770,13 @@ fn reconcile_calibrated_light(
         bias_set_id,
         calstat: identity.calstat.clone(),
         flat_norm_applied,
+        // The calibrated file's header carries the normalization DIVISOR
+        // (`ATH_CFNM`) but not the STATISTIC used, so an adopted row can't tell
+        // central-third from trimmed — default to central-third. Harmless for
+        // staleness: `derive_status` only compares the mode when both the row
+        // and the wanted run normalize, and a mode-only mismatch just prompts a
+        // (correct) re-calibrate.
+        flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
         output_hash,
         // Carry the file's own engine version so staleness derivation (§5)
         // correctly flags a file built by an older engine.
@@ -2771,7 +2778,8 @@ mod calibrated_light_scan_tests {
     use super::*;
     use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalCardInputs};
     use crate::db::light_calibrations::{
-        find_by_identity, upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
+        find_by_identity, upsert_light_calibration, FlatNormMode, LightCalRow,
+        LIGHT_CAL_ENGINE_VERSION,
     };
     use crate::db::schema::init_db;
     use crate::events::NullEmitter;
@@ -2905,6 +2913,7 @@ mod calibrated_light_scan_tests {
             bias_set_id: None,
             calstat: "BD".to_string(),
             flat_norm_applied: false,
+            flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
             output_hash: "seed".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
@@ -3258,6 +3267,7 @@ mod calibrated_light_scan_tests {
             bias_set_id: None,
             calstat: "BD".to_string(),
             flat_norm_applied: false,
+            flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
             output_hash: "seed".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
