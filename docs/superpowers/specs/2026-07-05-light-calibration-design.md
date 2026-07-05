@@ -37,6 +37,15 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
 - Master flats are stored illumination-only, normalized to the central-third
   mean stamped as `ATH_FNRM`. Imported masters missing the card get the
   constant recomputed on the fly (same helper Phase 2 uses).
+- **Flat normalization is switchable per run** (owner request): a dialog
+  toggle "Normalize master flat", default ON. OFF → `F_norm = MasterFlat`
+  as stored (plain division, output scale changes by ~`1/mean(F)`). The
+  divisor actually applied is recorded as `ATH_CFNM` (the `ATH_FNRM` value,
+  or `1.0` when disabled) and as `flat_norm_applied` in the tracking row;
+  a frame calibrated with the other setting counts as *stale* for a run
+  started with the current one. Note ON is scale-invariant math
+  (`F/mean(F)` has mean ≈ 1 for any input scale), so it is safe for
+  imported already-normalized flats too.
 - **Fallbacks (owner policy: best-effort, honestly labeled):**
   - dark + flat → `CALSTAT='BDF'`
   - dark only → `(L − D)`, `CALSTAT='BD'`
@@ -120,6 +129,7 @@ New table `light_calibrations`:
 | `output_path` | TEXT NOT NULL UNIQUE | |
 | `dark_set_id` / `flat_set_id` / `bias_set_id` | INTEGER NULL, FK→calibration_set (no action) | what was actually applied |
 | `calstat` | TEXT NOT NULL | honest applied-state flags |
+| `flat_norm_applied` | INTEGER NOT NULL | 1 = divided by `ATH_FNRM`, 0 = plain flat division |
 | `output_hash` | TEXT NOT NULL | xxh3 of the written file |
 | `engine_version` | INTEGER NOT NULL | bump on math changes → everything becomes stale |
 | `created_at` | TEXT NOT NULL | |
@@ -183,6 +193,7 @@ Copied from the source light: WCS, optics, `DATE-OBS`, session cards,
 | `ATH_CSRN` | source filename (adoption fallback key) |
 | `ATH_CDRK` / `ATH_CFLT` / `ATH_CBIA` | uuid + path of each master actually applied |
 | `ATH_CSCL` | numeric-scale divisor (e.g. 65535.0) |
+| `ATH_CFNM` | flat-normalization divisor actually applied (`ATH_FNRM` value, or 1.0 when normalization is off) |
 | `ATH_CVER` | engine version |
 
 All `ATH_*` names respect the 8-char FITS keyword limit and extend the
@@ -203,7 +214,8 @@ UI:
 - **Calibrate Lights** button on the frame-set toolbar → dialog (patterned
   after `CreateMasterDialog`): readiness summary — N lights fully ready, M
   linked to raw sets ("masters will be built automatically", listed), K with
-  missing links (which type is missing); scope selector; start.
+  missing links (which type is missing); scope selector; "Normalize master
+  flat" toggle (default ON, last choice remembered); start.
 - Progress via the existing sidebar ComputeQueue indicator; completion via
   `notify()` with a new `calibration` NotificationKind (union + icon map).
 - Frame table: status badge per light (calibrated / partial / stale / —)
