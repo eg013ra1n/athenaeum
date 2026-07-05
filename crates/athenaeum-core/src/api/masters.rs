@@ -708,15 +708,48 @@ fn run_build(
             }
         },
         BuildTarget::Rebuild { master_set_id, master_file_id, .. } => {
-            let tx = conn.unchecked_transaction()?;
-            crate::db::master_provenance::update_rebuild(&tx, master_set_id, &recipe_json, &member_hash_str)?;
-            let meta = std::fs::metadata(&target_abs)?;
-            let modified_at = chrono::DateTime::<chrono::Utc>::from(meta.modified()?);
-            tx.execute(
-                "UPDATE files SET size = ?1, modified_at = ?2 WHERE id = ?3",
-                rusqlite::params![meta.len() as i64, modified_at.to_rfc3339(), master_file_id],
-            )?;
-            tx.commit()?;
+            // Everything after `write_fits_f32`'s atomic rename, in ONE
+            // closure so every possible failure in this window (tx open,
+            // update_rebuild, metadata read, files UPDATE, commit) funnels
+            // through the single metadata-drift error log below.
+            let finalize = || -> Result<(), BuildStepError> {
+                let tx = conn.unchecked_transaction()?;
+                crate::db::master_provenance::update_rebuild(&tx, master_set_id, &recipe_json, &member_hash_str)?;
+                let meta = std::fs::metadata(&target_abs)?;
+                let modified_at = chrono::DateTime::<chrono::Utc>::from(meta.modified()?);
+                tx.execute(
+                    "UPDATE files SET size = ?1, modified_at = ?2 WHERE id = ?3",
+                    rusqlite::params![meta.len() as i64, modified_at.to_rfc3339(), master_file_id],
+                )?;
+                tx.commit()?;
+                Ok(())
+            };
+            if let Err(e) = finalize() {
+                // METADATA-DRIFT WINDOW: the on-disk master file HAS already
+                // been replaced (atomic rename inside `write_fits_f32`), but
+                // the catalog metadata was NOT refreshed — the
+                // master_provenance row (recipe/hash/created_at) and the
+                // files row (size/modified_at) still describe the PREVIOUS
+                // build, and the `master-build-complete` event will report
+                // failure. The drift is metadata-only (pixels on disk are
+                // the new, valid rebuild) and self-heals on the next
+                // successful rebuild of the same master. Logged loudly here
+                // — this is the one state where DB and disk disagree.
+                let err_msg = match &e {
+                    BuildStepError::Cancelled => "cancelled".to_string(),
+                    BuildStepError::Other(m) => m.clone(),
+                };
+                tracing::error!(
+                    source_set_id = set_id,
+                    master_set_id,
+                    master_path = %target_abs.display(),
+                    error = %err_msg,
+                    "rebuild metadata refresh failed AFTER the on-disk master was atomically replaced — \
+                     the file now holds the rebuilt pixels but master_provenance/files still describe \
+                     the previous build; a subsequent successful rebuild self-heals this drift"
+                );
+                return Err(e);
+            }
             // Deliberately NO remove_file on any error above (unlike the New
             // arm): by this point `write_fits_f32` already atomically
             // replaced the PRE-EXISTING master file with the freshly
@@ -726,7 +759,11 @@ fn run_build(
             // (no master file at all, where there was a perfectly good one
             // moments ago); leaving the rebuilt file in place is strictly
             // better, and the `tx` above is one transaction so
-            // update_rebuild + the files UPDATE can't half-apply.
+            // update_rebuild + the files UPDATE can't half-apply. The COST
+            // of keeping the file is the metadata-drift window logged
+            // above: new pixels on disk, stale provenance/files rows in the
+            // DB until a later rebuild succeeds. That trade (stale metadata
+            // over destroyed data) is intentional.
             Ok(master_set_id)
         }
     }
@@ -873,6 +910,19 @@ fn plan_batch(
 /// failing the whole batch; likewise, a per-set `start_master_build` error
 /// (e.g. a Conflict from a concurrent duplicate-build click) is caught and
 /// folded into `skipped` rather than aborting the remaining sets.
+///
+/// **Concurrency caveat:** the FIFO admission order only *serializes
+/// execution* when `compute.max_concurrent == 1` (the default). At
+/// `max_concurrent > 1` a flat build can be admitted while its
+/// darkflat/dark/bias dependency is still running, in which case
+/// `select_flat_precal` sees the dependency's source set still raw and
+/// **degrades gracefully**: it skips the raw set with a "build its master
+/// first" warning and falls through the spec §9 chain (next precal type ->
+/// synthetic bias -> un-pre-calibrated) — no corruption, just a lesser
+/// recipe recorded in the flat's provenance/warnings. When a batch mixes a
+/// Flat with any rank<2 dependency AND the queue is running concurrent, a
+/// `tracing::warn!` flags the weakened guarantee. Queue semantics are
+/// deliberately NOT changed here.
 pub fn start_master_builds_batch(
     ctx: Arc<ServiceContext>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -885,6 +935,24 @@ pub fn start_master_builds_batch(
         let conn = db.conn();
         plan_batch(&conn, &set_ids)?
     };
+
+    // See the doc comment's concurrency caveat: submission order only
+    // implies completion order at max_concurrent == 1. Only worth flagging
+    // when the batch actually has a flat that could want a rank<2 master
+    // built earlier in the same batch.
+    let has_flat = ready.iter().any(|(_, t)| type_build_rank(t) == 2);
+    let has_precal_rank = ready.iter().any(|(_, t)| type_build_rank(t) < 2);
+    let max_concurrent = ctx.compute_queue.max_concurrent();
+    if has_flat && has_precal_rank && max_concurrent > 1 {
+        tracing::warn!(
+            max_concurrent,
+            batch_size = ready.len(),
+            "batch mixes flats with bias/darkflat/dark builds but compute.max_concurrent > 1 — \
+             dependency ordering is only guaranteed at max_concurrent=1; a flat admitted before its \
+             precal master finishes will fall back to a lesser precal (raw set skipped with a \
+             'build its master first' warning, then synthetic bias / un-pre-calibrated)"
+        );
+    }
 
     let mut started_set_ids = Vec::new();
     for (set_id, _imagetyp) in ready {
