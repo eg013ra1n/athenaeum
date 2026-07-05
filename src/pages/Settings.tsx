@@ -522,7 +522,7 @@ export default function Settings() {
           }`}
         >
           <Crosshair size={18} />
-          Calibration Matching
+          Calibration
         </button>
         <button
           onClick={() => setActiveTab('analysis')}
@@ -548,9 +548,10 @@ export default function Settings() {
         </button>
       </div>
 
-      {/* Calibration Matching Tab */}
+      {/* Calibration Tab — library location first (primary setup step), then matching config */}
+      {activeTab === 'calibration' && <CalibrationLibrarySection />}
       {activeTab === 'calibration' && (
-        <div className="bg-surface-elevated rounded-lg p-6">
+        <div className="bg-surface-elevated rounded-lg p-6 mt-6">
           <h3 className="text-xl font-semibold mb-4">Calibration Matching Configuration</h3>
           <p className="text-content-muted mb-6">
             Configure how calibration frames (Flats, Darks, Bias) are matched to source frames.
@@ -559,7 +560,6 @@ export default function Settings() {
           <CalibrationMatchingConfig />
         </div>
       )}
-      {activeTab === 'calibration' && <CalibrationLibrarySection />}
 
       {/* Analysis Tab */}
       {activeTab === 'analysis' && (
@@ -1372,7 +1372,7 @@ function CalibrationLibrarySection() {
   };
 
   return (
-    <div className="mt-6 bg-surface-elevated rounded-lg p-6">
+    <div className="bg-surface-elevated rounded-lg p-6">
       <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
         <Library size={20} />
         Calibration Library
