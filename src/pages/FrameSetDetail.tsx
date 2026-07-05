@@ -9,7 +9,7 @@ import { AlertDialog } from '../components/AlertDialog';
 import { CalibrationHierarchyView as CalibrationHierarchyViewComponent } from '../components/CalibrationHierarchyView';
 import { LightsAnalysisView } from '../components/LightsAnalysisView';
 import { FindNewImagesDialog } from '../components/FindNewImagesDialog';
-import { CalibrateLightsDialog, readFlatNormPref } from '../components/calibration/CalibrateLightsDialog';
+import { CalibrateLightsDialog, readFlatNormPref, readFlatNormModePref } from '../components/calibration/CalibrateLightsDialog';
 import { useLightCalibrationContext } from '../contexts/LightCalibrationContext';
 import { FrameSetHistoryTab } from '../components/FrameSetHistoryTab';
 import { useBlackholeEvents } from '../hooks/useBlackholeEvents';
@@ -432,6 +432,7 @@ export default function FrameSetDetail() {
       const readiness = await api.invoke<LightCalReadiness>('get_light_calibration_readiness', {
         setId: parseInt(id),
         flatNorm: readFlatNormPref(),
+        flatNormMode: readFlatNormModePref(),
       });
       const map = new Map<number, LightFrameReadiness>();
       for (const f of readiness.frames) map.set(f.frameId, f);

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api';
-import type { LightCalScope } from '../types/models';
+import type { LightCalScope, FlatNormMode } from '../types/models';
 import { useNotifications } from '../contexts/NotificationContext';
 
 /** Backend event payload for `calibration-progress` (snake_case on the wire —
@@ -112,12 +112,12 @@ export function useLightCalibration() {
     };
   }, [notify]);
 
-  const startCalibration = useCallback(async (setId: number, scope: LightCalScope, flatNorm: boolean) => {
+  const startCalibration = useCallback(async (setId: number, scope: LightCalScope, flatNorm: boolean, flatNormMode: FlatNormMode) => {
     const runToken = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     runTokensRef.current.set(setId, runToken);
     setCalStates(prev => new Map(prev).set(setId, { phase: 'starting' }));
     try {
-      await api.invoke('start_light_calibration', { setId, scope, flatNorm });
+      await api.invoke('start_light_calibration', { setId, scope, flatNorm, flatNormMode });
     } catch (err) {
       // The invoke itself rejected — no `calibration-finished` event will arrive,
       // so reconcile the optimistic 'starting' state here. The caller surfaces the

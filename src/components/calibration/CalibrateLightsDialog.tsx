@@ -1,11 +1,14 @@
 import { useState, useEffect, useMemo } from 'react';
 import { X, Wand2, Hammer, AlertTriangle, CheckCircle2, Info, Loader2 } from 'lucide-react';
 import { api } from '../../api';
-import type { LightCalReadiness } from '../../types/models';
+import type { LightCalReadiness, FlatNormMode } from '../../types/models';
 import { useLightCalibrationContext } from '../../contexts/LightCalibrationContext';
 
 /** localStorage key for the "Normalize master flat" preference (default ON). */
 export const LIGHTCAL_FLATNORM_KEY = 'athenaeum.lightcal.flatNorm';
+
+/** localStorage key for the flat-normalization statistic (default centralThird). */
+export const LIGHTCAL_FLATNORM_MODE_KEY = 'athenaeum.lightcal.flatNormMode';
 
 /** Read the persisted flat-norm preference (default ON when unset/corrupt). */
 export function readFlatNormPref(): boolean {
@@ -13,6 +16,19 @@ export function readFlatNormPref(): boolean {
     return localStorage.getItem(LIGHTCAL_FLATNORM_KEY) !== 'false';
   } catch {
     return true;
+  }
+}
+
+/** Read the persisted flat-normalization statistic (default centralThird when
+ *  unset/corrupt — any value other than the exact 'pixinsightTrimmed' token
+ *  falls back to the default). */
+export function readFlatNormModePref(): FlatNormMode {
+  try {
+    return localStorage.getItem(LIGHTCAL_FLATNORM_MODE_KEY) === 'pixinsightTrimmed'
+      ? 'pixinsightTrimmed'
+      : 'centralThird';
+  } catch {
+    return 'centralThird';
   }
 }
 
@@ -26,6 +42,7 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
   const { startCalibration, isCalibrating } = useLightCalibrationContext();
 
   const [flatNorm, setFlatNorm] = useState<boolean>(readFlatNormPref);
+  const [flatNormMode, setFlatNormMode] = useState<FlatNormMode>(readFlatNormModePref);
   const [onlyStale, setOnlyStale] = useState(true);
   const [readiness, setReadiness] = useState<LightCalReadiness | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
@@ -40,17 +57,23 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
     try { localStorage.setItem(LIGHTCAL_FLATNORM_KEY, String(flatNorm)); } catch { /* ignore */ }
   }, [flatNorm]);
 
-  // Re-query readiness on open and whenever flat-norm toggles — the flag feeds
-  // staleness (a frame calibrated with a different flat-norm setting reads Stale).
+  // Persist the normalization-statistic choice whenever it changes.
+  useEffect(() => {
+    try { localStorage.setItem(LIGHTCAL_FLATNORM_MODE_KEY, flatNormMode); } catch { /* ignore */ }
+  }, [flatNormMode]);
+
+  // Re-query readiness on open and whenever the flat-norm flag or statistic
+  // changes — both feed staleness (a frame calibrated with a different flat-norm
+  // setting or statistic reads Stale).
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setReadinessError(null);
-    api.invoke<LightCalReadiness>('get_light_calibration_readiness', { setId, flatNorm })
+    api.invoke<LightCalReadiness>('get_light_calibration_readiness', { setId, flatNorm, flatNormMode })
       .then(r => { if (!cancelled) { setReadiness(r); setLoading(false); } })
       .catch(e => { if (!cancelled) { setReadinessError(String(e)); setLoading(false); } });
     return () => { cancelled = true; };
-  }, [setId, flatNorm]);
+  }, [setId, flatNorm, flatNormMode]);
 
   // Aggregate which calibration steps are genuinely missing (no master AND no raw
   // set to build). Bias-missing is NON-blocking under the raw-master-dark
@@ -81,7 +104,7 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
     setStarting(true);
     setStartError(null);
     try {
-      await startCalibration(setId, { onlyStale }, flatNorm);
+      await startCalibration(setId, { onlyStale }, flatNorm, flatNormMode);
       onClose();
     } catch (e) {
       setStartError(String(e));
@@ -169,10 +192,37 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
         </div>
 
         {/* Options */}
-        <label className="flex items-center gap-2 text-sm text-content-secondary mb-4">
-          <input type="checkbox" checked={flatNorm} onChange={e => setFlatNorm(e.target.checked)} />
-          Normalize master flat (recommended)
-        </label>
+        <div className="mb-4">
+          <label className="flex items-center gap-2 text-sm text-content-secondary">
+            <input type="checkbox" checked={flatNorm} onChange={e => setFlatNorm(e.target.checked)} />
+            Normalize master flat (recommended)
+          </label>
+
+          {/* Normalization statistic — only meaningful while normalization is ON. */}
+          {flatNorm && (
+            <div className="mt-2 ml-6 space-y-1">
+              <div className="text-xs text-content-muted mb-1">Normalization statistic</div>
+              <label className="flex items-center gap-2 text-xs text-content-secondary">
+                <input
+                  type="radio"
+                  name="lightcal-flatnorm-mode"
+                  checked={flatNormMode === 'centralThird'}
+                  onChange={() => setFlatNormMode('centralThird')}
+                />
+                Central third mean (Athenaeum)
+              </label>
+              <label className="flex items-center gap-2 text-xs text-content-secondary">
+                <input
+                  type="radio"
+                  name="lightcal-flatnorm-mode"
+                  checked={flatNormMode === 'pixinsightTrimmed'}
+                  onChange={() => setFlatNormMode('pixinsightTrimmed')}
+                />
+                Full-frame trimmed mean (PixInsight-compatible)
+              </label>
+            </div>
+          )}
+        </div>
 
         {alreadyRunning && (
           <div className="flex items-center gap-1.5 text-xs text-accent mb-2">
