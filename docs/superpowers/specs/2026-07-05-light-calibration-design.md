@@ -84,6 +84,18 @@ already parses every header; on seeing `CALSTAT` + `ATH_CSRC` it takes the
    in the scan-finished notification (warning tone, count + first paths in
    detail), and logged `warn!` with both paths. The tracking row is not
    changed.
+
+   Relationship to the existing duplicates feature: the FileManager →
+   Duplicates screen (`DuplicatesView`, xxHash groups from `duplicates/`)
+   operates on **cataloged `files` rows**. Calibrated lights are artifacts
+   outside the catalog (§3), so they can never appear there — the
+   scan-time signal above is deliberately the sole detection point, not an
+   oversight to be "fixed" by registering the files. The notification
+   panel's persistent history keeps the signal reviewable after the toast
+   expires. If practice shows copies accumulate faster than the
+   notification handles, the follow-up is a calibrated-artifacts section
+   inside `DuplicatesView` fed by persisted sightings — explicitly out of
+   scope for v1.
 4. **Unknown file (broken/rebuilt DB)** — no row matches → **adopt**: resolve
    the source frame by `ATH_CSRC` uuid, falling back to `ATH_CSRN` (source
    filename, `frames.filename` is indexed) since uuids are DB-generated and
