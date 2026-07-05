@@ -478,3 +478,37 @@ export type BatchBuildReport = { startedSetIds: Array<number>, skipped: Array<Ba
 
 export type BatchSkip = { setId: number, reason: string, };
 
+export type LightFrameReadiness = { frameId: number, filename: string, 
+/**
+ * `db::light_calibrations::derive_status` mapped to the frontend's
+ * verbatim strings: `"notCalibrated"` | `"calibrated"` | `"partial"` |
+ * `"stale"`.
+ */
+status: string, 
+/**
+ * Dark-link classification: `"master"` | `"rawSet"` | `"missing"`.
+ */
+dark: string, 
+/**
+ * Flat-link classification: `"master"` | `"rawSet"` | `"missing"`.
+ */
+flat: string, 
+/**
+ * Bias-link classification: `"master"` | `"rawSet"` | `"missing"`.
+ */
+bias: string, 
+/**
+ * Distinct raw (non-master, non-superseded) calibration-set ids this
+ * frame links to — the sets a preflight would have to build masters for.
+ */
+rawSetIds: Array<number>, };
+
+export type LightCalReadiness = { frames: Array<LightFrameReadiness>, readyCount: number, rawSetCount: number, missingCount: number, 
+/**
+ * Distinct raw calibration-set ids across all frames that a preflight
+ * must build masters for, in first-seen order. `raw_set_ids_to_build.len()`
+ * is the number of master builds; `raw_set_count` is the number of
+ * affected frames (a single raw set can serve many frames).
+ */
+rawSetIdsToBuild: Array<number>, };
+

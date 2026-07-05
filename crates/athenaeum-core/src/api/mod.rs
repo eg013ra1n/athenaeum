@@ -9,6 +9,7 @@ pub mod calibration;
 pub mod analysis;
 pub mod compute;
 pub mod masters;
+pub mod lights;
 
 #[derive(Debug)]
 pub enum ApiError {
