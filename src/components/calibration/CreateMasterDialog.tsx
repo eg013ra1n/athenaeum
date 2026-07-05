@@ -334,6 +334,56 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     });
   }, [preview, checkedRawIds]);
 
+  // Whether the "Synthetic bias" field could actually be consumed —
+  // single-set mode: only for a Flat, and only when its precal chain either
+  // already fell through to None, is already resolving via synthetic bias,
+  // or the operator has typed a value. That last clause is the guard
+  // against self-hiding: typing flips `flatPrecal` to "synthetic bias …" on
+  // the next resolved preview, which matches neither the null nor the
+  // already-synthetic branch in the INSTANT before that preview lands, so
+  // without it the field would vanish out from under the operator mid-type.
+  // ANDed with "no checked covering candidate" (mirrors the
+  // `visibleWarnings` suppression condition above) — once a checked raw
+  // candidate covers the chain, a master will be relinked in before this
+  // flat builds and the synthetic value genuinely won't be consulted, so
+  // hiding here (even with a non-empty value already typed) is correct
+  // rather than a self-hiding bug: checking/unchecking a candidate is
+  // independent of the synthetic-bias text, so this branch can't flip due
+  // to the operator's own typing.
+  const showSyntheticBiasSingle = useMemo(() => {
+    if (!preview || preview.imagetyp !== 'Flat') return false;
+    const wouldFallThrough = preview.flatPrecal == null || preview.flatPrecal.startsWith('synthetic bias');
+    const hasCheckedCandidate = preview.rawPrecalSets.some(c => checkedRawIds.has(c.setId));
+    return (wouldFallThrough || syntheticBias.trim() !== '') && !hasCheckedCandidate;
+  }, [preview, checkedRawIds, syntheticBias]);
+
+  // Batch-mode counterpart: shown when at least one resolved Flat row could
+  // consume the value (same per-row rule, using the effective-batch/ok
+  // coverage check already used by `batchVisibleWarnings`/the green line),
+  // OR the operator has typed a value — unconditionally, not per-row, so
+  // typing can't hide the field even if every currently-visible flat
+  // happens to be covered by an in-batch dependency at that instant.
+  const showSyntheticBiasBatch = useMemo(() => {
+    if (syntheticBias.trim() !== '') return true;
+    if (!batchResults) return false;
+    return batchResults.some(row => {
+      if (row.kind !== 'ok' || row.preview.imagetyp !== 'Flat') return false;
+      const wouldFallThrough = row.preview.flatPrecal == null || row.preview.flatPrecal.startsWith('synthetic bias');
+      const hasCoveredCandidate = row.preview.rawPrecalSets.some(c =>
+        effectiveIdSet.has(c.setId) && resultKindBySetId.get(c.setId) === 'ok'
+      );
+      return wouldFallThrough && !hasCoveredCandidate;
+    });
+  }, [batchResults, syntheticBias, effectiveIdSet, resultKindBySetId]);
+
+  // While a fetch is in flight, `preview`/`batchResults` still hold the
+  // last RESOLVED data (neither is cleared at the start of a fetch — see
+  // the debounce effects above), so this stays derived from whatever was
+  // last resolved rather than flickering: hidden before the first preview
+  // ever resolves (both start null), and otherwise unchanged until the next
+  // resolution actually updates the inputs above.
+  const showSyntheticBias = single ? showSyntheticBiasSingle : showSyntheticBiasBatch;
+
   const runBatch = async (ids: number[]) => {
     const report = await startBatch(ids, recipe());
     if (report.skipped.length > 0) {
@@ -410,11 +460,15 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
                      className="w-full bg-surface border border-border rounded px-2 py-1 text-sm" /></label>
           </div>
         )}
-        <label className="block text-xs text-content-muted mb-1 mt-2">
-          Synthetic bias for flats (ADU, optional — used only when no darkflat/dark/bias master is linked)
-        </label>
-        <input value={syntheticBias} onChange={e => setSyntheticBias(e.target.value)} placeholder="e.g. 500"
-               className="w-full bg-surface border border-border rounded px-2 py-1.5 text-sm mb-2" />
+        {showSyntheticBias && (
+          <>
+            <label className="block text-xs text-content-muted mb-1 mt-2">
+              Synthetic bias for flats (ADU, optional — used only when no darkflat/dark/bias master is linked)
+            </label>
+            <input value={syntheticBias} onChange={e => setSyntheticBias(e.target.value)} placeholder="e.g. 500"
+                   className="w-full bg-surface border border-border rounded px-2 py-1.5 text-sm mb-2" />
+          </>
+        )}
         <label className="flex items-center gap-2 text-sm text-content-secondary mb-3">
           <input type="checkbox" checked={archiveAfter} onChange={e => setArchiveAfter(e.target.checked)} />
           Archive originals to zip after the master is built
