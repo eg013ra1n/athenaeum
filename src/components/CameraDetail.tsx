@@ -5,9 +5,11 @@ import DarkLibrary, { LibraryStats } from "./DarkLibrary";
 import MasterDarkLibrary from "./MasterDarkLibrary";
 import MasterFlatLibrary from "./MasterFlatLibrary";
 import DualPaneFileBrowser from "./dualpane/DualPaneFileBrowser";
+import { CreateMasterDialog } from "./calibration/CreateMasterDialog";
 import { api } from '../api';
 import { ImageTypeValues } from "../types/helpers";
 import { useScanRootsWithAvailability } from "../hooks/useTauri";
+import { useMasterBuildContext } from "../contexts/MasterBuildContext";
 import { format } from "date-fns";
 
 interface CalibrationScanResult {
@@ -64,6 +66,18 @@ export default function CameraDetail({ instrume, onClose, initialTab, highlightS
   const [cameraDirsLoaded, setCameraDirsLoaded] = useState(false);
 
   const { scanRoots } = useScanRootsWithAvailability();
+
+  // Create Master dialog — single-set only from this view (batch creation,
+  // if ever surfaced here, would need a multi-select affordance the table
+  // doesn't have yet).
+  const [createMasterSetIds, setCreateMasterSetIds] = useState<number[] | null>(null);
+  const { buildStates } = useMasterBuildContext();
+  const buildingSetIds = useMemo(
+    () => Array.from(buildStates.entries())
+      .filter(([, s]) => s.phase !== 'done')
+      .map(([setId]) => setId),
+    [buildStates],
+  );
 
   // Load camera directories on mount
   useEffect(() => {
@@ -321,6 +335,8 @@ export default function CameraDetail({ instrume, onClose, initialTab, highlightS
             imageTypeFilter={darksFilter}
             onStatsChange={setCurrentStats}
             highlightSetId={pendingHighlightSetId}
+            onCreateMaster={(id) => setCreateMasterSetIds([id])}
+            buildingSetIds={buildingSetIds}
           />
         )}
         {activeTab === "flats" && (
@@ -330,16 +346,36 @@ export default function CameraDetail({ instrume, onClose, initialTab, highlightS
             imageTypeFilter={flatsFilter}
             onStatsChange={setCurrentStats}
             highlightSetId={pendingHighlightSetId}
+            onCreateMaster={(id) => setCreateMasterSetIds([id])}
+            buildingSetIds={buildingSetIds}
           />
         )}
         {activeTab === "master-darks" && (
-          <MasterDarkLibrary instrume={instrume} isTabView={true} highlightSetId={pendingHighlightSetId} />
+          <MasterDarkLibrary
+            instrume={instrume}
+            isTabView={true}
+            highlightSetId={pendingHighlightSetId}
+            onCreateMaster={(id) => setCreateMasterSetIds([id])}
+            buildingSetIds={buildingSetIds}
+          />
         )}
         {activeTab === "master-flats" && (
-          <MasterFlatLibrary instrume={instrume} isTabView={true} highlightSetId={pendingHighlightSetId} />
+          <MasterFlatLibrary
+            instrume={instrume}
+            isTabView={true}
+            highlightSetId={pendingHighlightSetId}
+            onCreateMaster={(id) => setCreateMasterSetIds([id])}
+            buildingSetIds={buildingSetIds}
+          />
         )}
       </div>
 
+      {createMasterSetIds && (
+        <CreateMasterDialog
+          setIds={createMasterSetIds}
+          onClose={() => setCreateMasterSetIds(null)}
+        />
+      )}
     </div>
   );
 }

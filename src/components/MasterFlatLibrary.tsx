@@ -13,9 +13,13 @@ interface MasterFlatLibraryProps {
   isTabView?: boolean;
   /** Calibration set ID to highlight + auto-expand + scroll to in the table. */
   highlightSetId?: number | null;
+  /** Show a "Create Master" action on raw (non-master, non-superseded) sets. */
+  onCreateMaster?: (setId: number) => void;
+  /** Set IDs with an in-flight master build (renders a spinner label). */
+  buildingSetIds?: number[];
 }
 
-export default function MasterFlatLibrary({ instrume, onClose, isTabView = false, highlightSetId }: MasterFlatLibraryProps) {
+export default function MasterFlatLibrary({ instrume, onClose, isTabView = false, highlightSetId, onCreateMaster, buildingSetIds }: MasterFlatLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -272,7 +276,13 @@ export default function MasterFlatLibrary({ instrume, onClose, isTabView = false
 
           {/* Table */}
           {filteredSets.length > 0 ? (
-            <CalibrationSetTable sets={filteredSets} customMetadataSetIds={customMetadataSetIds} highlightSetId={highlightSetId} />
+            <CalibrationSetTable
+              sets={filteredSets}
+              customMetadataSetIds={customMetadataSetIds}
+              highlightSetId={highlightSetId}
+              onCreateMaster={onCreateMaster}
+              buildingSetIds={buildingSetIds}
+            />
           ) : (
             <div className="text-center py-12 bg-surface-elevated rounded-lg">
               <p className="text-content-muted mb-4">

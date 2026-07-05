@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star, Pencil } from "lucide-react";
-import type { CalibrationSetDetail, CalibrationSetConsumer, FileWithFrame } from "../types/models";
+import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star, Pencil, Hammer } from "lucide-react";
+import type { CalibrationSetDetail, CalibrationSetConsumer, FileWithFrame, MasterProvenanceInfo } from "../types/models";
 import { ImageTypeValues, isMasterType } from "../types/helpers";
 import { format } from "date-fns";
 import { api } from '../api';
 import BlinkViewer from "./BlinkViewer";
+import { ArchiveProgress } from "./archive/ArchiveProgress";
 
 const CONSUMER_INITIAL_VISIBLE = 8;
 
@@ -18,12 +19,16 @@ interface CalibrationSetTableProps {
   customMetadataSetIds?: number[];
   /** When set, scroll the matching row into view, highlight it, and auto-expand it. */
   highlightSetId?: number | null;
+  /** Show a "Create Master" action on raw (non-master, non-superseded) sets. */
+  onCreateMaster?: (setId: number) => void;
+  /** Set IDs with an in-flight master build (renders a spinner label). */
+  buildingSetIds?: number[];
 }
 
 type SortField = "id" | "imagetyp" | "filter" | "exptime" | "ccd_temp" | "gain" | "offset" | "binning" | "date_start" | "frame_count";
 type SortDirection = "asc" | "desc";
 
-export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration, customMetadataSetIds = [], highlightSetId }: CalibrationSetTableProps) {
+export default function CalibrationSetTable({ sets, showFilterColumn = false, onEditSubCalibration, customMetadataSetIds = [], highlightSetId, onCreateMaster, buildingSetIds }: CalibrationSetTableProps) {
   const [sortField, setSortField] = useState<SortField>("exptime");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
@@ -305,11 +310,19 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                       : index % 2 === 0
                       ? "bg-surface-elevated"
                       : "bg-surface"
-                  } hover:bg-surface-hover cursor-pointer transition-colors`}
+                  } ${set.superseded_by_set_id != null ? "opacity-50" : ""} hover:bg-surface-hover cursor-pointer transition-colors`}
                 >
                   {/* ID */}
                   <td className="px-4 py-1 text-sm text-content-muted">
                     {set.id ?? "—"}
+                    {set.superseded_by_set_id != null && (
+                      <span
+                        className="text-[10px] text-content-muted ml-1"
+                        title={`Superseded by master set #${set.superseded_by_set_id}`}
+                      >
+                        → M#{set.superseded_by_set_id}
+                      </span>
+                    )}
                   </td>
 
                   {/* Type */}
@@ -424,6 +437,17 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                           Sub-Cal
                         </button>
                       )}
+                      {onCreateMaster && set.id != null && !isMasterType(set.imagetyp) && set.superseded_by_set_id == null && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); onCreateMaster(set.id!); }}
+                          disabled={buildingSetIds?.includes(set.id)}
+                          className="inline-flex items-center gap-1 px-2 py-1 bg-surface-hover hover:brightness-110 text-content text-xs rounded transition-colors disabled:opacity-50"
+                          title="Integrate this set into a master frame"
+                        >
+                          <Hammer size={14} />
+                          {buildingSetIds?.includes(set.id) ? 'Building…' : 'Create Master'}
+                        </button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -479,6 +503,9 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                           </span>
                         </div>
                       </div>
+                      {set.id != null && isMasterType(set.imagetyp) && (
+                        <MasterProvenanceBlock setId={set.id} />
+                      )}
                       {set.id != null && (
                         <ConsumerChipStrip
                           state={consumersBySet.get(set.id) ?? { status: 'idle' }}
@@ -529,6 +556,92 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
           sourceType="calibration"
         />
       )}
+    </div>
+  );
+}
+
+// ── Master provenance block ─────────────────────────────────────────────────
+//
+// Rendered in the expanded row for master-type sets. Lazily fetches
+// `get_master_provenance`; `null` means the master was imported (found on
+// disk / scanned in) rather than built by Athenaeum, so there's no lineage
+// to show. Archiving originals is a queued background op (Task 14) — we
+// reuse the existing `ArchiveProgress` widget (same `archive-progress` /
+// `archive-finished` events as the frame-set archive flow) so the button
+// reflects real in-flight state instead of just the synchronous "queue it"
+// call, and re-fetch provenance once the op finishes so
+// `originalsArchived`/`sourceFramesOnDisk` reflect the new state.
+
+function MasterProvenanceBlock({ setId }: { setId: number }) {
+  const [prov, setProv] = useState<MasterProvenanceInfo | null | 'loading'>('loading');
+  const [archiveOpId, setArchiveOpId] = useState<number | null>(null);
+  const [archiveStartError, setArchiveStartError] = useState<string | null>(null);
+
+  const fetchProvenance = useCallback(() => {
+    let gone = false;
+    api.invoke<MasterProvenanceInfo | null>('get_master_provenance', { masterSetId: setId })
+      .then(p => { if (!gone) setProv(p); })
+      .catch(() => { if (!gone) setProv(null); });
+    return () => { gone = true; };
+  }, [setId]);
+
+  useEffect(() => {
+    setProv('loading');
+    return fetchProvenance();
+  }, [fetchProvenance]);
+
+  if (prov === 'loading') return null;
+  if (prov === null) {
+    return (
+      <div className="mt-2 text-xs">
+        <span className="px-1.5 py-0.5 rounded bg-surface-hover text-content-muted">imported master</span>
+      </div>
+    );
+  }
+
+  const startArchive = async () => {
+    if (prov.sourceSetId == null) return;
+    setArchiveStartError(null);
+    try {
+      const opId = await api.invoke<number>('archive_calibration_originals', { calibrationSetId: prov.sourceSetId });
+      setArchiveOpId(opId);
+    } catch (e) {
+      setArchiveStartError(String(e));
+    }
+  };
+
+  return (
+    <div className="mt-2 text-xs space-y-1">
+      <span className="px-1.5 py-0.5 rounded bg-accent/20 text-accent">built in Athenaeum</span>
+      <div><span className="text-content-muted">Source set:</span> <span className="text-content">#{prov.sourceSetId ?? '—'} ({prov.memberCount} frames)</span></div>
+      <div><span className="text-content-muted">Recipe:</span> <span className="text-content font-mono">{prov.recipeJson}</span></div>
+      <div><span className="text-content-muted">Created:</span> <span className="text-content">{prov.createdAt}</span></div>
+      <div>
+        <span className="text-content-muted">Originals:</span>{' '}
+        {prov.originalsArchived ? (
+          <span className="text-content">archived to zip</span>
+        ) : prov.sourceFramesOnDisk && prov.sourceSetId != null ? (
+          archiveOpId != null ? (
+            <div className="mt-1 max-w-xs" onClick={e => e.stopPropagation()}>
+              <ArchiveProgress
+                operationId={archiveOpId}
+                onFinished={() => fetchProvenance()}
+                onClose={() => setArchiveOpId(null)}
+              />
+            </div>
+          ) : (
+            <button
+              onClick={(e) => { e.stopPropagation(); void startArchive(); }}
+              className="px-2 py-0.5 bg-surface-hover hover:brightness-110 rounded text-content disabled:opacity-50"
+            >
+              Archive originals to zip
+            </button>
+          )
+        ) : (
+          <span className="text-warning">missing on disk</span>
+        )}
+      </div>
+      {archiveStartError && <div className="text-error">{archiveStartError}</div>}
     </div>
   );
 }

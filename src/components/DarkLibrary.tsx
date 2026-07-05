@@ -20,9 +20,13 @@ interface DarkLibraryProps {
   onStatsChange?: (stats: LibraryStats) => void;
   /** Calibration set ID to highlight + auto-expand + scroll to in the table. */
   highlightSetId?: number | null;
+  /** Show a "Create Master" action on raw (non-master, non-superseded) sets. */
+  onCreateMaster?: (setId: number) => void;
+  /** Set IDs with an in-flight master build (renders a spinner label). */
+  buildingSetIds?: number[];
 }
 
-export default function DarkLibrary({ instrume, onClose, isTabView = false, imageTypeFilter, onStatsChange, highlightSetId }: DarkLibraryProps) {
+export default function DarkLibrary({ instrume, onClose, isTabView = false, imageTypeFilter, onStatsChange, highlightSetId, onCreateMaster, buildingSetIds }: DarkLibraryProps) {
   const [sets, setSets] = useState<CalibrationSetDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -226,6 +230,8 @@ export default function DarkLibrary({ instrume, onClose, isTabView = false, imag
               showFilterColumn={imageTypeFilter?.length === 1 && imageTypeFilter[0] === "Flat"}
               onEditSubCalibration={handleEditSubCalibration}
               highlightSetId={highlightSetId}
+              onCreateMaster={onCreateMaster}
+              buildingSetIds={buildingSetIds}
             />
           ) : (
             <div className="text-center py-12 bg-surface-elevated rounded-lg">
