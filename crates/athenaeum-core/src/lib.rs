@@ -50,3 +50,7 @@ pub mod api;
 #[cfg(feature = "render")]
 pub mod integration;
 pub mod calibration_library;
+// Personal-sync transport layer (Stage I). Transport-agnostic trait +
+// in-process mock; ungated so the headless agent build includes it. No
+// render/solver deps.
+pub mod sharing;
