@@ -99,6 +99,39 @@ pub struct LightCalReadiness {
     pub raw_set_ids_to_build: Vec<i64>,
 }
 
+/// Per-frame calibration recipe for the Calibration Coverage lights table
+/// (spec §12.1). Reported only for LIGHT members that already carry a
+/// `light_calibrations` tracking row — the recipe truth comes from that row, not
+/// from readiness classification. The three `*_master` names are the on-disk
+/// FILENAME of each referenced master set's single member file (`None` when the
+/// set id is NULL or the file can't be resolved — a debug log, never an error).
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LightCalDetails {
+    pub frame_id: i64,
+    /// CALSTAT recorded on the calibrated output (`"BDF"`, `"BF"`, `"BD"`, …).
+    pub calstat: String,
+    /// Master-dark filename, or `None` when unlinked/unresolvable.
+    pub dark_master: Option<String>,
+    /// Master-flat filename, or `None`.
+    pub flat_master: Option<String>,
+    /// Master-bias filename, or `None`.
+    pub bias_master: Option<String>,
+    pub flat_norm_applied: bool,
+    /// Normalization statistic wire string (`"centralThird"` |
+    /// `"pixinsightTrimmed"`); meaningful only when `flat_norm_applied`.
+    pub flat_norm_mode: String,
+    /// Canonical JSON of the advanced parameters actually applied.
+    pub cal_params: String,
+    pub engine_version: i64,
+    /// RFC3339 timestamp the tracking row was written.
+    pub calibrated_at: String,
+    pub output_path: String,
+    /// `derive_status` against the caller's wanted preferences resolved to Stale
+    /// or Partial — the coverage view should flag this row for re-calibration.
+    pub stale: bool,
+}
+
 // ── Classification ──────────────────────────────────────────────────────────
 
 const MASTER: &str = "master";
@@ -285,6 +318,104 @@ pub fn get_light_calibration_readiness(
     let db = db(ctx)?;
     let conn = db.conn();
     compute_readiness(&conn, set_id, flat_norm, flat_norm_mode, params)
+}
+
+// ── Per-frame recipe details (spec §12.1) ────────────────────────────────────
+
+/// Human-readable master name for a calibration set: the FILENAME of the set's
+/// single member frame's file. `None` when `set_id` is `None` or the file can't
+/// be resolved (dangling/empty set, missing join) — logged at debug, never an
+/// error, so a missing master name never fails the whole details query.
+fn master_filename(conn: &Connection, set_id: Option<i64>) -> Option<String> {
+    let set_id = set_id?;
+    let resolved = conn
+        .query_row(
+            "SELECT fi.filename
+             FROM calibration_set_frames csf
+             JOIN frames fr ON fr.id = csf.frame_id
+             JOIN files fi ON fi.id = fr.file_id
+             WHERE csf.set_id = ?1
+             LIMIT 1",
+            params![set_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional();
+    match resolved {
+        Ok(Some(name)) => Some(name),
+        Ok(None) => {
+            tracing::debug!(set_id, "no master file to name for light-cal details (empty/dangling set)");
+            None
+        }
+        Err(error) => {
+            tracing::debug!(set_id, %error, "failed to resolve master filename for light-cal details");
+            None
+        }
+    }
+}
+
+/// The per-frame recipe rows for a frame set's calibrated LIGHT members. Pure DB
+/// work — no pixel I/O — so both transports' wrappers can run it inside
+/// `spawn_blocking`, and it is unit-testable against a seeded connection. Reuses
+/// [`load_light_members`] (the same membership join as readiness); a member with
+/// no `light_calibrations` row is omitted (nothing to report yet).
+fn compute_details(
+    conn: &Connection,
+    set_id: i64,
+    flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
+    params: LightCalParams,
+) -> Result<Vec<LightCalDetails>, ApiError> {
+    let members = load_light_members(conn, set_id)?;
+    let mut out = Vec::new();
+    for (frame_id, _filename) in members {
+        // Only LIGHT members with a tracking row have a recipe to report.
+        let Some(row) = get_light_calibration_for_frame(conn, frame_id)? else {
+            continue;
+        };
+
+        // Staleness against the caller's PERSISTED preferences (spec §12.1) —
+        // the same wanted flags readiness uses. Partial (new coverage available)
+        // counts as stale for the coverage view: the row no longer reflects a
+        // full re-calibration.
+        let links = get_links_for_frame(conn, frame_id)?;
+        let status = derive_status(conn, frame_id, &links, flat_norm, flat_norm_mode, &params)?;
+        let stale = matches!(status, LightCalStatus::Stale | LightCalStatus::Partial);
+
+        out.push(LightCalDetails {
+            frame_id,
+            calstat: row.calstat,
+            dark_master: master_filename(conn, row.dark_set_id),
+            flat_master: master_filename(conn, row.flat_set_id),
+            bias_master: master_filename(conn, row.bias_set_id),
+            flat_norm_applied: row.flat_norm_applied,
+            flat_norm_mode: row.flat_norm_mode,
+            cal_params: row.cal_params,
+            engine_version: row.engine_version,
+            calibrated_at: row.created_at,
+            output_path: row.output_path,
+            stale,
+        });
+    }
+
+    tracing::debug!(set_id, reported = out.len() as i64, "light calibration details computed");
+    Ok(out)
+}
+
+/// Per-frame calibration recipe for the Coverage lights table (spec §12.1).
+/// Returns one row per LIGHT member that already has a calibrated output;
+/// uncalibrated members are omitted. `flat_norm` / `flat_norm_mode` / `params`
+/// are the caller's persisted preferences — staleness is derived against them,
+/// exactly like [`get_light_calibration_readiness`].
+pub fn get_light_calibration_details(
+    ctx: &ServiceContext,
+    set_id: i64,
+    flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
+    params: LightCalParams,
+) -> Result<Vec<LightCalDetails>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    compute_details(&conn, set_id, flat_norm, flat_norm_mode, params)
 }
 
 // ── Orchestration DTOs (B5 Task 5) ──────────────────────────────────────────
@@ -2561,6 +2692,110 @@ mod tests {
         assert_eq!(f4.dark, MASTER);
         assert_eq!(f4.flat, MISSING);
         assert!(f4.raw_set_ids.is_empty());
+    }
+
+    /// A MASTER calibration set (`is_master_library = 1`) with exactly one
+    /// member frame + file, so [`master_filename`] can resolve its FILENAME.
+    fn seed_master_with_file(conn: &Connection, set_id: i64, imagetyp: &str, filename: &str) {
+        seed_set(conn, set_id, imagetyp, true);
+        let file_id = set_id + 5_000_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![file_id, format!("/lib/{filename}"), filename],
+        )
+        .unwrap();
+        let frame_id = set_id + 6_000_000;
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?2, ?3, 1)",
+            params![frame_id, file_id, imagetyp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![set_id, frame_id],
+        )
+        .unwrap();
+    }
+
+    /// spec §12.1: details report the tracking-row recipe (calstat, master
+    /// FILENAMES, flat-norm mode) for every calibrated LIGHT member, omit
+    /// members with no tracking row, and flip `stale` when the wanted
+    /// normalization mode differs from what the row recorded.
+    #[test]
+    fn details_reports_recipe_masters_and_staleness() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+
+        // Master dark #100 + master flat #101, each with a member file on disk.
+        seed_master_with_file(&conn, 100, "MasterDark", "master_dark_120s.fits");
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat_Ha.fits");
+
+        // Light 1 — calibrated: a tracking row whose links still match.
+        seed_light(&conn, 1, session);
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+        upsert_light_calibration(
+            &conn,
+            &LightCalRow {
+                id: 0,
+                frame_id: Some(1),
+                source_uuid: None,
+                source_filename: Some("light_1.fits".to_string()),
+                output_path: "/lib/M31/TestCam/2026-07-05/c_light_1.fits".to_string(),
+                dark_set_id: Some(100),
+                flat_set_id: Some(101),
+                bias_set_id: None,
+                calstat: "BDF".to_string(),
+                flat_norm_applied: true,
+                flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
+                cal_params: "{}".to_string(),
+                output_hash: "deadbeef".to_string(),
+                engine_version: LIGHT_CAL_ENGINE_VERSION,
+                created_at: "2026-07-05T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Light 2 — has links but NO tracking row → absent from the result.
+        seed_light(&conn, 2, session);
+        add_link(&conn, 2, 100, "Dark");
+
+        // Fresh: wanted prefs match the row → exactly one detail, not stale, with
+        // the recipe pulled from the row and master FILENAMES resolved.
+        let details = compute_details(
+            &conn,
+            1,
+            true,
+            FlatNormMode::CentralThird,
+            LightCalParams::default(),
+        )
+        .unwrap();
+        assert_eq!(details.len(), 1, "only the calibrated light is reported");
+        let d = &details[0];
+        assert_eq!(d.frame_id, 1);
+        assert_eq!(d.calstat, "BDF");
+        assert_eq!(d.dark_master.as_deref(), Some("master_dark_120s.fits"));
+        assert_eq!(d.flat_master.as_deref(), Some("master_flat_Ha.fits"));
+        assert_eq!(d.bias_master, None, "no bias link → no master name");
+        assert!(d.flat_norm_applied);
+        assert_eq!(d.flat_norm_mode, "centralThird");
+        assert_eq!(d.engine_version, LIGHT_CAL_ENGINE_VERSION);
+        assert_eq!(d.output_path, "/lib/M31/TestCam/2026-07-05/c_light_1.fits");
+        assert!(!d.stale, "matching preferences → fresh");
+
+        // A different wanted normalization statistic makes the row stale (the row
+        // applied a normalized flat in centralThird; caller now wants trimmed).
+        let stale = compute_details(
+            &conn,
+            1,
+            true,
+            FlatNormMode::PixinsightTrimmed,
+            LightCalParams::default(),
+        )
+        .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].stale, "a different flat-norm mode flips stale");
     }
 
     // ── F3: preflight-build handshake ───────────────────────────────────────

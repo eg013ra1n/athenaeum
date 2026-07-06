@@ -520,6 +520,42 @@ export type LightCalReadiness = { frames: Array<LightFrameReadiness>, readyCount
  */
 rawSetIdsToBuild: Array<number>, };
 
+export type LightCalDetails = { frameId: number, 
+/**
+ * CALSTAT recorded on the calibrated output (`"BDF"`, `"BF"`, `"BD"`, …).
+ */
+calstat: string, 
+/**
+ * Master-dark filename, or `None` when unlinked/unresolvable.
+ */
+darkMaster: string | null, 
+/**
+ * Master-flat filename, or `None`.
+ */
+flatMaster: string | null, 
+/**
+ * Master-bias filename, or `None`.
+ */
+biasMaster: string | null, flatNormApplied: boolean, 
+/**
+ * Normalization statistic wire string (`"centralThird"` |
+ * `"pixinsightTrimmed"`); meaningful only when `flat_norm_applied`.
+ */
+flatNormMode: string, 
+/**
+ * Canonical JSON of the advanced parameters actually applied.
+ */
+calParams: string, engineVersion: number, 
+/**
+ * RFC3339 timestamp the tracking row was written.
+ */
+calibratedAt: string, outputPath: string, 
+/**
+ * `derive_status` against the caller's wanted preferences resolved to Stale
+ * or Partial — the coverage view should flag this row for re-calibration.
+ */
+stale: boolean, };
+
 export type LightCalScope = { onlyStale: boolean, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";

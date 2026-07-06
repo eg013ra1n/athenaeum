@@ -138,6 +138,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::masters::BatchSkip,
             crate::api::lights::LightFrameReadiness,
             crate::api::lights::LightCalReadiness,
+            crate::api::lights::LightCalDetails,
             crate::api::lights::LightCalScope,
             crate::api::lights::FlatNormMode,
             crate::api::lights::LightCalParams,

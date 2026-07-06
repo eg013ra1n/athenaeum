@@ -15,7 +15,7 @@ use crate::routes::api_err;
 use crate::WebAppState;
 
 pub use athenaeum_core::api::lights::{
-    FlatNormMode, LightCalParams, LightCalReadiness, LightCalScope,
+    FlatNormMode, LightCalDetails, LightCalParams, LightCalReadiness, LightCalScope,
 };
 
 // ── Request structs ───────────────────────────────────────────────────────
@@ -23,6 +23,18 @@ pub use athenaeum_core::api::lights::{
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetLightCalibrationReadinessArgs {
+    pub set_id: i64,
+    pub flat_norm: bool,
+    pub flat_norm_mode: FlatNormMode,
+    /// Advanced parameters — `#[serde(default)]` so an omitted field decodes to
+    /// `LightCalParams::default()` (the pre-Advanced-UI frontend omits it).
+    #[serde(default)]
+    pub params: LightCalParams,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetLightCalibrationDetailsArgs {
     pub set_id: i64,
     pub flat_norm: bool,
     pub flat_norm_mode: FlatNormMode,
@@ -74,6 +86,33 @@ pub async fn get_light_calibration_readiness(
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Readiness task panicked: {}", e)))?
+    .map_err(api_err)?;
+
+    Ok(Json(result))
+}
+
+/// POST /api/get_light_calibration_details
+///
+/// Read-only per-frame calibration recipe (spec §12.1) for a frame set's
+/// calibrated LIGHT members. Run under `spawn_blocking` so the queries stay off
+/// the async executor (matches the readiness precedent).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_light_calibration_details(
+    State(state): State<WebAppState>,
+    Json(args): Json<GetLightCalibrationDetailsArgs>,
+) -> Result<Json<Vec<LightCalDetails>>, (StatusCode, String)> {
+    let ctx = state.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        api::get_light_calibration_details(
+            &ctx,
+            args.set_id,
+            args.flat_norm,
+            args.flat_norm_mode,
+            args.params,
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Details task panicked: {}", e)))?
     .map_err(api_err)?;
 
     Ok(Json(result))

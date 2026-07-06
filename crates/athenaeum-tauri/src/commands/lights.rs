@@ -15,7 +15,7 @@ use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
 
 pub use athenaeum_core::api::lights::{
-    FlatNormMode, LightCalParams, LightCalReadiness, LightCalScope,
+    FlatNormMode, LightCalDetails, LightCalParams, LightCalReadiness, LightCalScope,
 };
 
 /// Readiness summary + per-frame status for a frame set's LIGHT members.
@@ -41,6 +41,32 @@ pub async fn get_light_calibration_readiness(
     })
     .await
     .map_err(|e| format!("Readiness task panicked: {}", e))?
+    .map_err(|e| e.to_string())
+}
+
+/// Per-frame calibration recipe for a frame set's calibrated LIGHT members
+/// (spec §12.1). Read-only; run under `spawn_blocking` so the queries stay off
+/// the async executor (matches the readiness precedent). `flat_norm` /
+/// `flat_norm_mode` / `params` are the caller's persisted preferences — the
+/// per-frame `stale` flag is derived against them.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_light_calibration_details(
+    state: State<'_, AppState>,
+    set_id: i64,
+    flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
+    params: Option<LightCalParams>,
+) -> Result<Vec<LightCalDetails>, String> {
+    // `params` is optional so the pre-Advanced-UI frontend keeps working — an
+    // omitted arg deserializes to `None` → `LightCalParams::default()`.
+    let params = params.unwrap_or_default();
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        api::get_light_calibration_details(&ctx, set_id, flat_norm, flat_norm_mode, params)
+    })
+    .await
+    .map_err(|e| format!("Details task panicked: {}", e))?
     .map_err(|e| e.to_string())
 }
 

@@ -371,6 +371,7 @@ pub fn run() {
             commands::clear_stale_archive_markers,
             // Light calibration commands
             commands::get_light_calibration_readiness,
+            commands::get_light_calibration_details,
             commands::start_light_calibration,
             commands::cancel_light_calibration,
             // Plate solve commands
