@@ -1,0 +1,136 @@
+//! Round-trip + validation tests for the `package` module (task A3).
+//!
+//! Payloads are tiny but *real* FITS files: fabricated in-test via `fits_writer`
+//! (BITPIX=-32 primary HDU), the sanctioned in-repo way to make a valid FITS
+//! without committing a binary fixture.
+
+use std::path::Path;
+
+use tempfile::tempdir;
+
+use crate::fits_writer::{write_fits_f32, Card, CardValue};
+use crate::models::Frame;
+
+use super::manifest::MANIFEST_VERSION;
+use super::{
+    read_manifest, validate_package, write_package, xxh3_full_file, ManifestRecord, PayloadKind,
+    MANIFEST_FILENAME,
+};
+
+/// Fabricate a tiny valid FITS (4x4 float image) at `path`.
+fn write_fixture_fits(path: &Path) {
+    let data: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+    let cards = vec![
+        Card::new("IMAGETYP", CardValue::Str("Light Frame".into())).unwrap(),
+        Card::new("EXPTIME", CardValue::Real(120.0)).unwrap(),
+    ];
+    write_fits_f32(path, 4, 4, 1, &data, &cards).unwrap();
+}
+
+/// Build a fully-formed manifest record for a source file, mirroring what a
+/// producer would supply (byte_size + full-content xxh3 computed from disk).
+fn sample_record(src: &Path, rel_path: &str) -> ManifestRecord {
+    let byte_size = std::fs::metadata(src).unwrap().len();
+    let xxh3 = xxh3_full_file(src).unwrap();
+    let frame = Frame {
+        object: Some("M42".to_string()),
+        ..Frame::default()
+    };
+    ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: "frame-uuid-0001".to_string(),
+        origin_catalog_uuid: "catalog-uuid-0001".to_string(),
+        origin_device: "ab".repeat(32), // plausible 64-char hex NodeId
+        payload_kind: PayloadKind::RawFrame,
+        rel_path: rel_path.to_string(),
+        byte_size,
+        xxh3,
+        frame_meta: serde_json::to_value(&frame).unwrap(),
+        analysis: None,
+        app_version: "0.4.0".to_string(),
+    }
+}
+
+#[test]
+fn package_roundtrip_manifest_matches() {
+    let src_dir = tempdir().unwrap();
+    let src = src_dir.path().join("light_0001.fits");
+    write_fixture_fits(&src);
+
+    let rel_path = "frames/light_0001.fits";
+    let record = sample_record(&src, rel_path);
+
+    let dest = tempdir().unwrap();
+    let announce = write_package(dest.path(), vec![(src.clone(), record.clone())]).unwrap();
+
+    // Payload copied to its rel_path under the package dir.
+    let copied = dest.path().join(rel_path);
+    assert!(copied.exists(), "payload copied to rel_path");
+
+    // Announce reflects the package.
+    assert_eq!(announce.frame_count, 1);
+    assert_eq!(announce.byte_size, record.byte_size);
+    assert!(!announce.root_hash.is_empty(), "root_hash produced");
+
+    // Manifest reads back byte-for-byte equal to what we wrote.
+    let read = read_manifest(dest.path()).unwrap();
+    assert_eq!(read, vec![record.clone()]);
+
+    // xxh3 recomputes on the copied file.
+    assert_eq!(xxh3_full_file(&copied).unwrap(), record.xxh3);
+
+    // Clean package validates.
+    validate_package(dest.path()).unwrap();
+}
+
+#[test]
+fn validate_catches_corruption() {
+    let src_dir = tempdir().unwrap();
+    let src = src_dir.path().join("light.fits");
+    write_fixture_fits(&src);
+    let rel_path = "frames/light.fits";
+    let record = sample_record(&src, rel_path);
+
+    let dest = tempdir().unwrap();
+    write_package(dest.path(), vec![(src.clone(), record)]).unwrap();
+    validate_package(dest.path()).unwrap(); // healthy first
+
+    // Flip one byte in the copied payload — length unchanged, content differs.
+    let copied = dest.path().join(rel_path);
+    let mut bytes = std::fs::read(&copied).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xff;
+    std::fs::write(&copied, &bytes).unwrap();
+
+    let err = validate_package(dest.path()).unwrap_err();
+    assert!(
+        err.to_string().contains(rel_path),
+        "error must name the corrupt rel_path, got: {err}"
+    );
+}
+
+#[test]
+fn manifest_forward_compat_unknown_field_ok() {
+    let src_dir = tempdir().unwrap();
+    let src = src_dir.path().join("light.fits");
+    write_fixture_fits(&src);
+    let record = sample_record(&src, "frames/light.fits");
+
+    // Serialize the record, then inject an unknown key a future schema might add.
+    let mut value = serde_json::to_value(&record).unwrap();
+    value.as_object_mut().unwrap().insert(
+        "futureField".to_string(),
+        serde_json::json!({ "nested": [1, 2, 3] }),
+    );
+    let line = serde_json::to_string(&value).unwrap();
+
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), format!("{line}\n")).unwrap();
+
+    let read = read_manifest(dir.path()).unwrap();
+    assert_eq!(
+        read,
+        vec![record],
+        "unknown fields ignored; known fields intact"
+    );
+}

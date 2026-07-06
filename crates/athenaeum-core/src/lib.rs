@@ -54,3 +54,6 @@ pub mod calibration_library;
 // in-process mock; ungated so the headless agent build includes it. No
 // render/solver deps.
 pub mod sharing;
+// Portable package format (NDJSON manifest + payload files) for Stage I sync.
+// Ungated — no render/solver deps, compiles in the headless build.
+pub mod package;
