@@ -39,7 +39,7 @@ impl IntegrationRecipe {
         Self { combination: Combination::Median, rejection }
     }
 
-    /// Human summary — "Average · Winsorized sigma (3/3)" style (spec §4).
+    /// Human summary — "Average · Winsorized sigma (3.0/3.0)" style (spec §4).
     pub fn describe(&self) -> String {
         format!("{} · {}", self.combination.label(), self.rejection.label())
     }
@@ -89,19 +89,34 @@ pub enum Rejection {
     LinearFitClip { sigma_low: f64, sigma_high: f64 },
 }
 
+/// Format a rejection parameter for a describe/label string (spec §4). Integer
+/// values render with a trailing `.0` (`3.0` → `"3.0"`, matching the spec's
+/// `(3.0/3.0)` style) while fractional values keep their natural precision
+/// (`0.02` → `"0.02"`) — a flat `{:.1}` would truncate `PercentileClip`'s small
+/// thresholds. Must stay byte-identical to `fmtParam` in `CreateMasterDialog.tsx`.
+fn fmt_param(x: f64) -> String {
+    if x.is_finite() && x == x.trunc() {
+        format!("{x:.1}")
+    } else {
+        format!("{x}")
+    }
+}
+
 impl Rejection {
     fn label(self) -> String {
         match self {
             Rejection::None => "no rejection".to_string(),
-            Rejection::PercentileClip { low, high } => format!("Percentile clip ({low}/{high})"),
+            Rejection::PercentileClip { low, high } => {
+                format!("Percentile clip ({}/{})", fmt_param(low), fmt_param(high))
+            }
             Rejection::SigmaClip { sigma_low, sigma_high } => {
-                format!("Sigma clip ({sigma_low}/{sigma_high})")
+                format!("Sigma clip ({}/{})", fmt_param(sigma_low), fmt_param(sigma_high))
             }
             Rejection::WinsorizedSigma { sigma_low, sigma_high } => {
-                format!("Winsorized sigma ({sigma_low}/{sigma_high})")
+                format!("Winsorized sigma ({}/{})", fmt_param(sigma_low), fmt_param(sigma_high))
             }
             Rejection::LinearFitClip { sigma_low, sigma_high } => {
-                format!("Linear fit clip ({sigma_low}/{sigma_high})")
+                format!("Linear fit clip ({}/{})", fmt_param(sigma_low), fmt_param(sigma_high))
             }
         }
     }
@@ -266,6 +281,15 @@ fn reject_sigma_clip(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
         if w == kept {
             break; // converged
         }
+        if w == 0 {
+            // Everything in the current valid prefix was rejected. Do NOT set
+            // kept = 0: combine_pixel's all-rejected fallback reads the FULL
+            // values[..n], whose tail was overwritten by an earlier iteration's
+            // in-place compaction. Break instead, keeping the previous
+            // iteration's intact survivor prefix (>= 2, or the initial n) for
+            // the combination — never fabricate from corrupted memory.
+            break;
+        }
         kept = w;
         if kept < 2 {
             break; // stddev undefined below 2 survivors
@@ -376,6 +400,12 @@ fn reject_linear_fit(values: &mut [f32], sigma_low: f64, sigma_high: f64) -> (us
         }
         if w == kept {
             break; // stable
+        }
+        if w == 0 {
+            // See reject_sigma_clip: keep the last valid survivor prefix rather
+            // than let combine_pixel fall back over the corrupted-tail full
+            // stack. kept holds the previous survivors (>= 2, or the initial n).
+            break;
         }
         kept = w;
     }
@@ -514,6 +544,44 @@ mod tests {
         assert_eq!(v, 12.0, "median of survivors {{10..14}} is 12");
     }
 
+    #[test]
+    fn sigma_clip_all_rejected_late_iter_uses_survivors_not_corrupted_stack() {
+        // Regression (corrupted-prefix fallback). Symmetric bimodal-of-three
+        // stack. Iteration 1 (m=5, s≈3.77 → ±1.88 band at 0.5σ) keeps only the
+        // {4,4,4,6,6,6} core, compacting it into the prefix and OVERWRITING the
+        // tail in place → array becomes [4,4,4,6,6,6, 6,6,6,10,10,10].
+        // Iteration 2 over that core (m=5, s≈1.10 → ±0.55 band) rejects
+        // EVERYTHING (4<4.45, 6>5.55) → w=0. Before the w==0 guard, kept fell to
+        // 0 and combine_pixel's fallback took the median of that CORRUPTED array
+        // = 6.0. With the guard we keep the iteration-1 survivors {4,4,4,6,6,6},
+        // whose mean is 5.0 — equal to the median of the intact original stack —
+        // and 6 samples are reported rejected.
+        let mut stack = vec![0.0, 0.0, 0.0, 4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 10.0, 10.0, 10.0];
+        let (v, rej) = combine_pixel(
+            &mut stack,
+            IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 0.5, sigma_high: 0.5 }),
+        );
+        assert_eq!(v, 5.0, "combine real iteration-1 survivors, never corrupted memory (was 6.0)");
+        assert_eq!(rej, 6, "the six {{0,0,0,10,10,10}} extremes stay rejected");
+    }
+
+    #[test]
+    fn sigma_clip_all_rejected_first_iter_keeps_intact_stack() {
+        // All-reject on the FIRST iteration → no prior in-place compaction, so
+        // no corruption is possible. Cleanly split stack: m=5, s≈5.22, and even
+        // the tight ±0.5σ band [2.39, 7.61] excludes both the 0s and the 10s, so
+        // w=0 immediately. The guard keeps the intact full stack; its mean is
+        // 5.0 — identical to the pre-fix median-fallback value on this
+        // (symmetric) stack, so this previously-correct path is not regressed.
+        let mut stack = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0];
+        let (v, rej) = combine_pixel(
+            &mut stack,
+            IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 0.5, sigma_high: 0.5 }),
+        );
+        assert_eq!(v, 5.0);
+        assert_eq!(rej, 0, "nothing corrupted; the full intact stack is kept");
+    }
+
     // ── LinearFitClip (spec §5) ─────────────────────────────────────────────
 
     #[test]
@@ -551,6 +619,25 @@ mod tests {
         );
         assert_eq!(rej, 0);
         assert_eq!(v, 42.0);
+    }
+
+    #[test]
+    fn linear_fit_all_rejected_uses_intact_stack_not_corruption() {
+        // Same symmetric reproduction stack as the sigma-clip regression. The
+        // least-squares line over this ramp-like stack leaves every residual
+        // outside the tight ±0.5σ band, so iteration 1 rejects ALL 12 at once
+        // (w=0) BEFORE any in-place compaction — the array is never corrupted
+        // here. With the w==0 guard, kept stays at the initial 12 and the
+        // survivors (== the intact stack) average to 5.0. (Pre-fix, kept fell to
+        // 0 and the fallback median of the still-intact stack was also 5.0 —
+        // value unchanged, now sourced from a real combine over survivors.)
+        let mut stack = vec![0.0, 0.0, 0.0, 4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 10.0, 10.0, 10.0];
+        let (v, rej) = combine_pixel(
+            &mut stack,
+            IntegrationRecipe::average(Rejection::LinearFitClip { sigma_low: 0.5, sigma_high: 0.5 }),
+        );
+        assert_eq!(v, 5.0, "intact-stack combine, no corruption possible");
+        assert_eq!(rej, 0, "guard keeps the full stack when iter 1 rejects everything");
     }
 
     // ── WinsorizedSigma & PercentileClip carried over ───────────────────────
@@ -737,12 +824,12 @@ mod tests {
             "syntheticBias": serde_json::Value::Null,
         })
         .to_string();
-        assert_eq!(describe_recipe_json(&legacy), "Average · Winsorized sigma (3/3)");
+        assert_eq!(describe_recipe_json(&legacy), "Average · Winsorized sigma (3.0/3.0)");
 
         // New blob (combine holds an IntegrationRecipe).
         let recipe = IntegrationRecipe::median(Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 });
         let new_blob = serde_json::json!({ "combine": recipe }).to_string();
-        assert_eq!(describe_recipe_json(&new_blob), "Median · Linear fit clip (5/3.5)");
+        assert_eq!(describe_recipe_json(&new_blob), "Median · Linear fit clip (5.0/3.5)");
 
         // Unparseable → raw passthrough (nothing lost).
         assert_eq!(describe_recipe_json("not json at all"), "not json at all");
