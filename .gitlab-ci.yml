@@ -102,6 +102,30 @@ build:linux:
       - target/release/bundle/deb/*.deb
     expire_in: 30 days
 
+# --- Headless core guard ---
+# Perseus (the headless sync agent) depends on athenaeum-core with
+# `default-features = false`, omitting the rustafits/solvemyastro submodules
+# (which pull nasm/cmake/turbojpeg native builds). This job guards that the
+# core library keeps compiling without them. It deliberately installs NO native
+# build tools — if this job ever needs cmake/nasm, the feature-gating has
+# regressed. Runs on every main commit + tag (not `only: tags`) so a regression
+# is caught before release.
+check:headless-core:
+  stage: build
+  tags:
+    - linux
+  before_script:
+    - source "$HOME/.cargo/env"
+  cache:
+    key: "main-linux"
+    policy: pull
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - target/
+  script:
+    - cargo check -p athenaeum-core --no-default-features
+
 # --- macOS Build (Apple Silicon + Intel) — signed + notarized (Developer ID) ---
 # Secrets come from Protected CI/CD variables; the .p12/.p8 are decoded at
 # runtime into a throwaway per-job keychain and removed in after_script.

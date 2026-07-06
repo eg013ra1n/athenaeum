@@ -8,11 +8,17 @@ pub mod operation_queue;
 
 use crate::cache::MemoryImageCache;
 use crate::db::Database;
+// DsoCatalog lives in the render+solver-gated plate_solve module; the
+// `dso_catalog` cache field below is gated to match.
+#[cfg(all(feature = "render", feature = "solver"))]
 use crate::plate_solve::dso_lookup::DsoCatalog;
 use crate::settings::SettingsManager;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
+// RwLock is used only by the solver-gated cache fields below.
+#[cfg(feature = "solver")]
+use std::sync::RwLock;
 
 /// Handle to track an active scan operation.
 pub struct ScanHandle {
@@ -92,18 +98,22 @@ pub struct ServiceContext {
     pub active_light_cal: Arc<Mutex<HashMap<i64, LightCalHandle>>>,
     /// Lazy-loaded deep-sky object catalog, used to auto-label plate-solve
     /// results (e.g. "M 42", "NGC 7000"). Parsed on first use, then cached.
+    /// Gated to match `DsoCatalog`'s home in the render+solver plate_solve module.
+    #[cfg(all(feature = "render", feature = "solver"))]
     pub dso_catalog: Arc<RwLock<Option<Arc<DsoCatalog>>>>,
     /// Lazy-opened solvemyastro star-cache (`stars.smac`). Loaded on first
     /// solve attempt and shared read-only across all worker threads.
     /// `None` until the cache file is located (opens from the `smac_gaia`
     /// subdir of the app-data catalogs dir). If the file is absent the solve
     /// command returns an actionable error.
+    #[cfg(feature = "solver")]
     pub star_cache: Arc<RwLock<Option<Arc<solvemyastro::StarCache>>>>,
     /// Optional bright sub-catalog (G<16 hybrid floor + density top-up;
     /// built via `solvemyastro build-bright-cache`). When present, the
     /// plate-solve hot path uses it for fast quad matching with
     /// auto-fallback to `star_cache`. `None` if no bright cache is
     /// available — production runs on the deep cache alone.
+    #[cfg(feature = "solver")]
     pub bright_cache: Arc<RwLock<Option<Arc<solvemyastro::StarCache>>>>,
     pub image_pool: Arc<rayon::ThreadPool>,
     /// Single serialized worker queue shared by ZIP archive + file ops.

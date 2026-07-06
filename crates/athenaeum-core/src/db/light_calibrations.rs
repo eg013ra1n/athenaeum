@@ -20,24 +20,20 @@ use super::master_provenance;
 
 /// Bump when the calibration math changes — every existing row becomes
 /// [`LightCalStatus::Stale`] via the `engine_version` check in
-/// [`derive_status`]. The single definition now lives with the calibration
-/// engine ([`crate::calibration_library::light_cal`]); re-exported here so
-/// this module's `derive_status` and callers keep referring to it by the same
-/// path.
-pub use crate::calibration_library::light_cal::LIGHT_CAL_ENGINE_VERSION;
+/// [`derive_status`]. The single definition lives in [`crate::models`] (so this
+/// ungated module compiles without the render-gated engine); re-exported here
+/// so callers keep referring to it by the same path.
+pub use crate::models::LIGHT_CAL_ENGINE_VERSION;
 
-/// The flat-normalization statistic selector — owned by the calibration engine
-/// (`calibration_library::light_cal`), re-used here for the `flat_norm_mode`
-/// column and its staleness comparison. This module already depends on
-/// `light_cal` (see [`LIGHT_CAL_ENGINE_VERSION`] above), so the typed direction
-/// is clean — no dependency cycle.
-pub use crate::calibration_library::light_cal::FlatNormMode;
+/// The flat-normalization statistic selector — defined in [`crate::models`] and
+/// re-used here for the `flat_norm_mode` column and its staleness comparison.
+pub use crate::models::FlatNormMode;
 
-/// The advanced per-run parameters — owned by the calibration engine
-/// (`calibration_library::light_cal`), re-used here for the `cal_params` column
-/// and its staleness comparison (parsed, not string-compared, so an old row's
-/// `'{}'` normalizes to [`LightCalParams::default`]).
-pub use crate::calibration_library::light_cal::{BiasFallback, LightCalParams};
+/// The advanced per-run parameters — defined in [`crate::models`] and re-used
+/// here for the `cal_params` column and its staleness comparison (parsed, not
+/// string-compared, so an old row's `'{}'` normalizes to
+/// [`LightCalParams::default`]).
+pub use crate::models::{BiasFallback, LightCalParams};
 
 /// Column list shared by every read query, so `row_from_sql`'s index-based
 /// `row.get(N)` calls can't silently drift out of sync with the SELECT.

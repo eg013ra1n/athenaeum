@@ -18,10 +18,13 @@ anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.36"
 uuid = { version = "1", features = ["v4"] }
-rustafits = { path = "../../rustafits", features = ["debug-pipeline"] }
+# Optional submodule path deps (pull turbojpeg/nasm/cmake native builds). Gated
+# behind the `render`/`solver` features so headless consumers (e.g. Perseus) can
+# depend on athenaeum-core with `default-features = false` and skip them.
+rustafits = { path = "../../rustafits", features = ["debug-pipeline"], optional = true }
 # Standalone plate solver (clean-room quad-matching implementation). Path dep like
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.
-solvemyastro = { path = "../../solvemyastro" }
+solvemyastro = { path = "../../solvemyastro", optional = true }
 sha2 = "0.10"
 md-5 = "0.10"
 jpeg-encode = { path = "../jpeg-encode" }
@@ -40,6 +43,14 @@ tracing-appender = "0.2"
 # the generated-output diff in tests/ts_contract.rs is the real guard.
 ts-rs = { version = "10", features = ["chrono-impl", "no-serde-warnings"] }
 base64 = "0.22"
+
+[features]
+# `render` pulls the rustafits image pipeline; `solver` pulls the plate-solver.
+# Default keeps today's full behavior for the desktop/web builds. Headless
+# consumers build with `--no-default-features` to omit both native-heavy deps.
+default = ["render", "solver"]
+render = ["dep:rustafits"]
+solver = ["dep:solvemyastro"]
 
 [dev-dependencies]
 tempfile = "3"

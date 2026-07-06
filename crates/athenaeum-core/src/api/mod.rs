@@ -6,9 +6,14 @@ use std::path::{Path, PathBuf};
 pub mod scan_roots;
 pub mod files;
 pub mod calibration;
+// These handler modules drive the render-only image pipeline (analysis,
+// master integration, light calibration) and are gated with it.
+#[cfg(feature = "render")]
 pub mod analysis;
 pub mod compute;
+#[cfg(feature = "render")]
 pub mod masters;
+#[cfg(feature = "render")]
 pub mod lights;
 
 #[derive(Debug)]

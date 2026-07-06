@@ -21,18 +21,32 @@ pub mod scanner;
 pub mod monitor;
 pub mod auto_merge;
 pub mod export;
+// rustafits (lib name `astroimage`) image pipeline — `render` feature.
+#[cfg(feature = "render")]
 pub mod rustafits_processor;
 pub mod cache;
+#[cfg(feature = "render")]
 pub mod analysis;
+#[cfg(feature = "render")]
 pub mod flat_analysis;
 pub mod orientation;
+// catalog/gaia builds on both astroimage (proper-motion) and solvemyastro (cache).
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod catalog;
+// plate_solve + registration consume both astroimage and solvemyastro.
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod plate_solve;
 pub mod services;
 pub mod archive;
 pub mod file_op;
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod registration;
+// ts_export references types from every render/solver-gated module; it is a
+// build-time TS-generation harness driven only by tests/ts_contract.rs.
+#[cfg(all(feature = "render", feature = "solver"))]
 pub mod ts_export;
 pub mod api;
+// integration/banded reads raw pixels via astroimage — `render` feature.
+#[cfg(feature = "render")]
 pub mod integration;
 pub mod calibration_library;

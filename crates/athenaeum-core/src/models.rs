@@ -1095,3 +1095,112 @@ pub struct CatalogMeta {
     pub schema_version: i64,
     pub created_at: String,
 }
+
+// ---------------------------------------------------------------------------
+// Light-calibration shared types.
+//
+// These plain data types + consts are used by BOTH the render-gated
+// light-calibration engine (`calibration_library::light_cal`) and ungated
+// consumers (`db::light_calibrations`, `scanner`, `export`). They live here in
+// `models` so the ungated side compiles with `--no-default-features` while the
+// engine (gated behind the `render` feature) re-exports them for its callers.
+// ---------------------------------------------------------------------------
+
+/// Bump when the calibration math changes — every existing tracking row then
+/// derives as stale (see `crate::db::light_calibrations::derive_status`, which
+/// re-exports this constant). Single definition lives here.
+pub const LIGHT_CAL_ENGINE_VERSION: i64 = 1;
+
+/// Fraction of pixels discarded from EACH tail by the PixInsight-compatible
+/// trimmed mean (`FlatNormMode::PixinsightTrimmed`). Matches PixInsight
+/// ImageCalibration's `flatScaleClippingFactor = 0.05`, identified empirically
+/// against PI's own arithmetic to 1.7e-6 relative (spec §2). The trim indices
+/// are `lo = floor(n * PI_TRIM_FRACTION)`, `hi = n − floor(n * PI_TRIM_FRACTION)`
+/// and the statistic is the f64 mean of `sorted[lo..hi]` — exactness is the
+/// point, so this lives in exactly one place.
+pub const PI_TRIM_FRACTION: f64 = 0.05;
+
+/// Which statistic normalizes the master flat when normalization is ON
+/// (spec §2, "Normalization statistic is selectable"). Applies only when
+/// `flat_norm` is on; recorded in the tracking row so a mode change makes a
+/// flat-applied frame stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum FlatNormMode {
+    /// Athenaeum convention (default): the flat's central-third mean, read from
+    /// the master's `ATH_FNRM` card and recomputed on the fly when absent.
+    #[default]
+    CentralThird,
+    /// PixInsight-compatible: a two-sided trimmed mean over the WHOLE frame,
+    /// discarding [`PI_TRIM_FRACTION`] of the pixels from each tail. Always
+    /// computed from the flat file — the `ATH_FNRM` card is ignored.
+    PixinsightTrimmed,
+}
+
+impl FlatNormMode {
+    /// The over-the-wire / stored string for this mode — identical to the serde
+    /// camelCase representation and to the `flat_norm_mode` DB column values.
+    /// Kept as a `&'static str` so `db::light_calibrations` can compare a stored
+    /// row's mode against a wanted mode without a serde round-trip.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            FlatNormMode::CentralThird => "centralThird",
+            FlatNormMode::PixinsightTrimmed => "pixinsightTrimmed",
+        }
+    }
+}
+
+/// What to do for a LIGHT frame that has NO dark master (spec §2 "Advanced
+/// parameters"). Default = current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum BiasFallback {
+    /// Current behavior: subtract the linked master bias (`(L − B)`).
+    #[default]
+    SubtractBias,
+    /// Refuse bias-only calibration — a light with no dark master is a per-frame
+    /// failure ("no dark master (bias fallback disabled)"), no output written.
+    SkipFrame,
+}
+
+/// serde default for [`LightCalParams::trim_fraction`] — the current per-tail
+/// discard fraction ([`PI_TRIM_FRACTION`] = 0.05), so an omitted wire field or a
+/// stored `'{}'` decodes to today's behavior.
+fn default_trim_fraction() -> f64 {
+    PI_TRIM_FRACTION
+}
+
+/// Advanced per-run light-calibration parameters (spec §2 "Advanced
+/// parameters"). Every field is optional on the wire (`#[serde(default)]`) with
+/// a default equal to the current behavior, so an omitted field — or the
+/// `cal_params = '{}'` a pre-feature tracking row carries — decodes to
+/// [`LightCalParams::default`]. Recorded verbatim in the tracking row and
+/// compared for staleness (`db::light_calibrations::derive_status`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LightCalParams {
+    /// Per-tail discard fraction for the `pixinsightTrimmed` statistic
+    /// (default [`PI_TRIM_FRACTION`] = 0.05). Only meaningful when the flat is
+    /// normalized in `pixinsightTrimmed` mode; stamped as `ATH_CTRM` then.
+    #[serde(default = "default_trim_fraction")]
+    pub trim_fraction: f64,
+    /// DN added to the output AFTER the scale divide (`out += pedestal_dn /
+    /// OUTPUT_SCALE_DIVISOR`, default 0 = off), for consumers that clip
+    /// negatives. Stamped as `ATH_CPED` (the DN value) always; `CALSTAT`
+    /// unchanged — a pedestal is not a calibration step.
+    #[serde(default)]
+    pub pedestal_dn: f64,
+    /// What to do for a light with no dark master (default `subtractBias`).
+    #[serde(default)]
+    pub bias_fallback: BiasFallback,
+}
+
+impl Default for LightCalParams {
+    fn default() -> Self {
+        Self {
+            trim_fraction: PI_TRIM_FRACTION,
+            pedestal_dn: 0.0,
+            bias_fallback: BiasFallback::SubtractBias,
+        }
+    }
+}
