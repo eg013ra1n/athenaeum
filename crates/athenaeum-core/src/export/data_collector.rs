@@ -195,6 +195,20 @@ pub fn apply_export_mode(
     }
 }
 
+/// Resolve the effective export mode for one export invocation.
+///
+/// An `explicit` per-invocation override always wins over the persisted
+/// [`WbppExportConfig::export_mode`]; `None` falls back to the config (the
+/// historical behavior). The mode used to travel *only* via the persisted
+/// config, which the frontend loads asynchronously and can present as `null`
+/// (slow/failed fetch) — in that window the mode-sync was skipped and the
+/// backend silently exported the stale/default mode. Passing the selected mode
+/// as an explicit arg closes that gap; both hosts (Tauri + web) resolve through
+/// this one place so they stay in lockstep.
+pub fn resolve_export_mode(explicit: Option<ExportMode>, config: &WbppExportConfig) -> ExportMode {
+    explicit.unwrap_or(config.export_mode)
+}
+
 /// `is_master_library = 1` for `set_id`? A missing row (dangling link) counts as
 /// not-a-master so its frames are dropped and reported, never silently kept.
 fn is_master_set(conn: &Connection, set_id: i64) -> Result<bool> {
@@ -2196,13 +2210,41 @@ mod tests {
 /// Export-mode transform (spec §12.2) against a seeded in-memory catalog.
 #[cfg(test)]
 mod export_mode_tests {
-    use super::{apply_export_mode, collect_export_data};
+    use super::{apply_export_mode, collect_export_data, resolve_export_mode};
     use crate::db::light_calibrations::{
         upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
     };
     use crate::db::schema::init_db;
-    use crate::export::models::ExportMode;
+    use crate::export::models::{ExportMode, WbppExportConfig};
     use rusqlite::{params, Connection};
+
+    /// Regression: the export mode used to travel only via the persisted
+    /// `WbppExportConfig`, so a stale/unloaded config on the frontend silently
+    /// exported the wrong mode. An explicit per-invocation override must win
+    /// over a differing persisted mode; `None` still falls back to the config.
+    #[test]
+    fn explicit_export_mode_overrides_persisted_config() {
+        let config = WbppExportConfig {
+            export_mode: ExportMode::RawWithCalibrationSets,
+            ..WbppExportConfig::default()
+        };
+
+        // Explicit override wins over a differing persisted mode.
+        assert_eq!(
+            resolve_export_mode(Some(ExportMode::CalibratedLights), &config),
+            ExportMode::CalibratedLights,
+        );
+        assert_eq!(
+            resolve_export_mode(Some(ExportMode::RawWithMasters), &config),
+            ExportMode::RawWithMasters,
+        );
+
+        // None falls back to the persisted config (historical behavior).
+        assert_eq!(
+            resolve_export_mode(None, &config),
+            ExportMode::RawWithCalibrationSets,
+        );
+    }
 
     fn mem() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

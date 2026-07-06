@@ -5,6 +5,7 @@
 use crate::commands::{AppState, ExportHandle};
 use crate::export::{
     apply_export_mode, collect_export_data, collect_export_summary, organize_files_wbpp,
+    resolve_export_mode,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
         ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent, ExportResult,
@@ -450,12 +451,15 @@ pub async fn get_export_readiness(
 ///             └── (light frames)
 /// ```
 ///
-/// The `export_mode` in the persisted [`WbppExportConfig`] controls what the
-/// lights + calibration side put on disk (spec §12.2). `flat_norm` /
-/// `flat_norm_mode` / `params` are the caller's calibration preferences, used
-/// only by the `calibratedLights` strict gate; they are optional so the
-/// pre-mode-UI frontend keeps working (defaults: normalize ON, central-third,
-/// default advanced params).
+/// `export_mode` selects what the lights + calibration side put on disk
+/// (spec §12.2). It is optional: `Some` is an explicit per-invocation override
+/// (what the mode selector sends), `None` falls back to the persisted
+/// [`WbppExportConfig`]'s mode — the frontend loads that config asynchronously
+/// and could present it as `null`, so the mode is now passed explicitly rather
+/// than relying on a best-effort config sync. `flat_norm` / `flat_norm_mode` /
+/// `params` are the caller's calibration preferences, used only by the
+/// `calibratedLights` strict gate; they are optional so the pre-mode-UI frontend
+/// keeps working (defaults: normalize ON, central-third, default advanced params).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn export_to_wbpp(
@@ -464,6 +468,7 @@ pub async fn export_to_wbpp(
     frame_set_id: i64,
     output_dir: String,
     use_symlinks: bool,
+    export_mode: Option<ExportMode>,
     flat_norm: Option<bool>,
     flat_norm_mode: Option<FlatNormMode>,
     params: Option<LightCalParams>,
@@ -498,7 +503,8 @@ pub async fn export_to_wbpp(
         let cfg = load_wbpp_config(&conn).unwrap_or_default();
         (data, cfg)
     };
-    let mode = config.export_mode;
+    // Explicit per-invocation override wins over the persisted config's mode.
+    let mode = resolve_export_mode(export_mode, &config);
 
     let output_path = PathBuf::from(&output_dir);
 

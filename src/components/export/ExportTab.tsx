@@ -269,17 +269,22 @@ export function ExportTab({ frameSetId, frameSetName: _frameSetName }: ExportTab
   const handleExport = useCallback(async () => {
     if (!frameSetId || !outputDir) return;
     setExportError(null);
+    // Best-effort: persist the selected mode into the WbppExportConfig so it
+    // survives reloads. No longer correctness-bearing — the mode now travels as
+    // an explicit invoke arg below, so a slow/failed/unloaded config can't make
+    // the backend export the wrong mode. Fire-and-forget: a persistence error
+    // must never block or fail an otherwise-correct export.
+    if (wbppConfig && wbppConfig.exportMode !== exportMode) {
+      void saveWbppConfig({ ...wbppConfig, exportMode }).catch((err) => {
+        console.error('Failed to persist export mode (non-fatal):', err);
+      });
+    }
     try {
-      // The backend reads the export mode from the persisted WbppExportConfig,
-      // so sync the selected mode into it before the export reads it back.
-      if (wbppConfig && wbppConfig.exportMode !== exportMode) {
-        await saveWbppConfig({ ...wbppConfig, exportMode });
-      }
       await startExport(frameSetId, outputDir, useSymlinks, {
         flatNorm: readFlatNormPref(),
         flatNormMode: readFlatNormModePref(),
         params: readLightCalParamsPref(),
-      });
+      }, exportMode);
     } catch (err) {
       console.error('Failed to start export:', err);
       setExportError(typeof err === 'string' ? err : (err as Error)?.message ?? String(err));

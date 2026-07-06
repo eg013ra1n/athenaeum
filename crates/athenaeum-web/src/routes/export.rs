@@ -8,6 +8,7 @@ use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams}
 use athenaeum_core::events::{emit_event, ProgressEmitter};
 use athenaeum_core::export::{
     apply_export_mode, collect_export_data, collect_export_summary, organize_files_wbpp,
+    resolve_export_mode,
 };
 use athenaeum_core::export::models::{
     CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
@@ -81,6 +82,11 @@ pub struct ExportToWbppArgs {
     pub frame_set_id: i64,
     pub output_dir: String,
     pub use_symlinks: bool,
+    /// Explicit per-invocation export mode. `Some` overrides the persisted
+    /// [`WbppExportConfig`]'s mode; `None` falls back to it (mirrors the Tauri
+    /// command). Optional so pre-mode-UI callers keep working.
+    #[serde(default)]
+    pub export_mode: Option<ExportMode>,
     /// Calibration preferences used only by the `calibratedLights` strict gate
     /// (spec §12.2); optional so the pre-mode-UI frontend keeps working
     /// (default: normalize ON).
@@ -605,7 +611,8 @@ pub async fn export_to_wbpp(
         let cfg = load_wbpp_config(&conn).unwrap_or_default();
         (data, cfg)
     }; // DB lock released here
-    let mode = config.export_mode;
+    // Explicit per-invocation override wins over the persisted config's mode.
+    let mode = resolve_export_mode(args.export_mode, &config);
 
     let output_path = PathBuf::from(&args.output_dir);
 

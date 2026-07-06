@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
 import { api, type UnlistenFn } from '../api';
-import type { ExportProgressEvent, ExportCompleteEvent, ExportResult } from '../types/export';
+import type { ExportProgressEvent, ExportCompleteEvent, ExportResult, ExportMode } from '../types/export';
 import type { FlatNormMode, LightCalParams } from '../types/models';
 import { useNotifications } from '../contexts/NotificationContext';
 
@@ -107,6 +107,10 @@ export function useExportProgress() {
       outputDir: string,
       useSymlinks: boolean,
       lightCalPrefs?: ExportLightCalPrefs,
+      // Explicit export mode. Correctness-bearing: the backend uses this over
+      // the persisted WbppExportConfig's mode when provided (the config sync is
+      // now only best-effort persistence). Omitted → backend config fallback.
+      exportMode?: ExportMode,
     ): Promise<ExportResult> => {
       // Register export in state immediately (shows toast before api.invoke)
       flushSync(() => {
@@ -132,6 +136,9 @@ export function useExportProgress() {
           frameSetId,
           outputDir,
           useSymlinks,
+          // Explicit export mode overrides the persisted config on the backend.
+          // Omitted → backend falls back to the persisted WbppExportConfig.
+          ...(exportMode ? { exportMode } : {}),
           // Forwarded only for the `calibratedLights` strict gate; ignored by
           // the backend in the other two modes. Omitted keys → backend defaults.
           ...(lightCalPrefs
