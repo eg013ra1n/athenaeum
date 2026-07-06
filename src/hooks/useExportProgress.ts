@@ -2,7 +2,17 @@ import { useState, useEffect, useCallback } from 'react';
 import { flushSync } from 'react-dom';
 import { api, type UnlistenFn } from '../api';
 import type { ExportProgressEvent, ExportCompleteEvent, ExportResult } from '../types/export';
+import type { FlatNormMode, LightCalParams } from '../types/models';
 import { useNotifications } from '../contexts/NotificationContext';
+
+/** Calibration preferences forwarded to `export_to_wbpp`. Only consumed by the
+ *  backend's `calibratedLights` strict gate (spec §12.2); harmless in the other
+ *  modes. Optional so pre-mode-selector callers keep working. */
+export interface ExportLightCalPrefs {
+  flatNorm: boolean;
+  flatNormMode: FlatNormMode;
+  params: LightCalParams;
+}
 
 export interface ActiveExport {
   frameSetId: number;
@@ -92,7 +102,12 @@ export function useExportProgress() {
   }, []);
 
   const startExport = useCallback(
-    async (frameSetId: number, outputDir: string, useSymlinks: boolean): Promise<ExportResult> => {
+    async (
+      frameSetId: number,
+      outputDir: string,
+      useSymlinks: boolean,
+      lightCalPrefs?: ExportLightCalPrefs,
+    ): Promise<ExportResult> => {
       // Register export in state immediately (shows toast before api.invoke)
       flushSync(() => {
         setActiveExports((prev) => {
@@ -117,6 +132,15 @@ export function useExportProgress() {
           frameSetId,
           outputDir,
           useSymlinks,
+          // Forwarded only for the `calibratedLights` strict gate; ignored by
+          // the backend in the other two modes. Omitted keys → backend defaults.
+          ...(lightCalPrefs
+            ? {
+                flatNorm: lightCalPrefs.flatNorm,
+                flatNormMode: lightCalPrefs.flatNormMode,
+                params: lightCalPrefs.params,
+              }
+            : {}),
         });
 
         // Update state with final result
