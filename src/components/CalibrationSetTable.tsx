@@ -5,6 +5,7 @@ import type { CalibrationSetDetail, CalibrationSetConsumer, FileWithFrame, Maste
 import { ImageTypeValues, isMasterType } from "../types/helpers";
 import { format } from "date-fns";
 import { api } from '../api';
+import { describeRecipeJson } from '../utils/recipeFormat';
 import BlinkViewer from "./BlinkViewer";
 import { ArchiveProgress } from "./archive/ArchiveProgress";
 
@@ -664,7 +665,7 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
     <div className="mt-2 text-xs space-y-1">
       <span className="px-1.5 py-0.5 rounded bg-accent/20 text-accent">built in Athenaeum</span>
       <div><span className="text-content-muted">Source set:</span> <span className="text-content">#{prov.sourceSetId ?? '—'} ({prov.memberCount} frames)</span></div>
-      <div><span className="text-content-muted">Recipe:</span> <span className="text-content font-mono">{prov.recipeJson}</span></div>
+      <div><span className="text-content-muted">Recipe:</span> <span className="text-content" title={prov.recipeJson}>{describeRecipeJson(prov.recipeJson)}</span></div>
       <div><span className="text-content-muted">Created:</span> <span className="text-content">{prov.createdAt}</span></div>
       <div>
         <span className="text-content-muted">Originals:</span>{' '}

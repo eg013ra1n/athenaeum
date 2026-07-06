@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
 import { X, Hammer, AlertTriangle, Loader2, XCircle, CheckCircle2 } from 'lucide-react';
 import { api } from '../../api';
-import type { MasterBuildPreview, MasterRecipe, IntegrationRecipe, RawPrecalSetDto } from '../../types/models';
+import type { MasterBuildPreview, MasterRecipe, IntegrationRecipe, Combination, Rejection, RawPrecalSetDto } from '../../types/models';
+import { formatCombine } from '../../utils/recipeFormat';
 import { useMasterBuildContext } from '../../contexts/MasterBuildContext';
 import { useNotifications } from '../../contexts/NotificationContext';
 
@@ -10,22 +11,105 @@ interface CreateMasterDialogProps {
   onClose: () => void;
 }
 
-type CombineChoice = 'auto' | 'mean' | 'median' | 'winsorized' | 'percentile';
+// Two-axis integration recipe (spec §4): Combination × Rejection algorithm,
+// matching PixInsight's ImageIntegration mental model.
+type CombinationChoice = 'auto' | Combination;   // 'auto' | 'average' | 'median'
+type RejectionChoice = Rejection['method'];       // 'none' | 'percentile_clip' | 'sigma_clip' | …
 
-// Adapts the current dropdown to the two-axis IntegrationRecipe model
-// (Combination × Rejection). The full spec §4 UI (a separate Rejection
-// dropdown exposing sigma-clip / linear-fit) lands in the follow-up UI task;
-// this keeps the existing single-select producing valid recipes in the
-// meantime. 'mean' → Average+none, 'median' → Median+none, 'winsorized' →
-// Average+winsorized, 'percentile' → Average+percentile.
-function toRecipe(c: CombineChoice, sigLo: number, sigHi: number, pLo: number, pHi: number): IntegrationRecipe | null {
-  switch (c) {
-    case 'auto': return null;
-    case 'mean': return { combination: 'average', rejection: { method: 'none' } };
-    case 'median': return { combination: 'median', rejection: { method: 'none' } };
-    case 'winsorized': return { combination: 'average', rejection: { method: 'winsorized_sigma', sigma_low: sigLo, sigma_high: sigHi } };
-    case 'percentile': return { combination: 'average', rejection: { method: 'percentile_clip', low: pLo, high: pHi } };
+// Per-algorithm parameters, kept independently so switching rejection algorithm
+// preserves each one's last-used low/high rather than clobbering a shared pair.
+interface RejectionParams {
+  percentile: { low: number; high: number };
+  sigma: { low: number; high: number };
+  winsorized: { low: number; high: number };
+  linearFit: { low: number; high: number };
+}
+
+// PixInsight panel defaults (spec §1/§4). Percentile uses the dialog default
+// 0.2/0.1 — Auto keeps its own tuned 0.2/0.02 server-side (spec §2), not here.
+const DEFAULT_PARAMS: RejectionParams = {
+  percentile: { low: 0.2, high: 0.1 },
+  sigma: { low: 4.0, high: 3.0 },
+  winsorized: { low: 3.0, high: 3.0 },
+  linearFit: { low: 5.0, high: 3.5 },
+};
+
+// Persist last axis choices + per-algorithm params so the dialog reopens with
+// what the operator last used. Corrupt / absent / hand-edited blobs degrade to
+// defaults field-by-field, never throwing.
+const RECIPE_STORAGE_KEY = 'athenaeum.master.recipe';
+
+interface PersistedRecipe {
+  combination: CombinationChoice;
+  rejection: RejectionChoice;
+  params: RejectionParams;
+}
+
+function coerceNum(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
+
+function coercePair(v: unknown, d: { low: number; high: number }): { low: number; high: number } {
+  const p = (v ?? {}) as { low?: unknown; high?: unknown };
+  return { low: coerceNum(p.low, d.low), high: coerceNum(p.high, d.high) };
+}
+
+function loadPersistedRecipe(): PersistedRecipe {
+  const combinations: CombinationChoice[] = ['auto', 'average', 'median'];
+  const rejections: RejectionChoice[] = ['none', 'percentile_clip', 'sigma_clip', 'winsorized_sigma', 'linear_fit_clip'];
+  try {
+    const raw = localStorage.getItem(RECIPE_STORAGE_KEY);
+    if (!raw) throw new Error('empty');
+    const p = JSON.parse(raw) as Partial<PersistedRecipe>;
+    return {
+      combination: combinations.includes(p.combination as CombinationChoice) ? (p.combination as CombinationChoice) : 'auto',
+      rejection: rejections.includes(p.rejection as RejectionChoice) ? (p.rejection as RejectionChoice) : 'winsorized_sigma',
+      params: {
+        percentile: coercePair(p.params?.percentile, DEFAULT_PARAMS.percentile),
+        sigma: coercePair(p.params?.sigma, DEFAULT_PARAMS.sigma),
+        winsorized: coercePair(p.params?.winsorized, DEFAULT_PARAMS.winsorized),
+        linearFit: coercePair(p.params?.linearFit, DEFAULT_PARAMS.linearFit),
+      },
+    };
+  } catch {
+    return { combination: 'auto', rejection: 'winsorized_sigma', params: DEFAULT_PARAMS };
   }
+}
+
+// Build the wire recipe. Auto → null (backend resolves per type & frame count,
+// spec §2); otherwise pair the chosen combination with the selected rejection
+// algorithm and its current parameters.
+function toRecipe(combination: CombinationChoice, rejection: RejectionChoice, params: RejectionParams): IntegrationRecipe | null {
+  if (combination === 'auto') return null;
+  let rej: Rejection;
+  switch (rejection) {
+    case 'none': rej = { method: 'none' }; break;
+    case 'percentile_clip': rej = { method: 'percentile_clip', low: params.percentile.low, high: params.percentile.high }; break;
+    case 'sigma_clip': rej = { method: 'sigma_clip', sigma_low: params.sigma.low, sigma_high: params.sigma.high }; break;
+    case 'winsorized_sigma': rej = { method: 'winsorized_sigma', sigma_low: params.winsorized.low, sigma_high: params.winsorized.high }; break;
+    case 'linear_fit_clip': rej = { method: 'linear_fit_clip', sigma_low: params.linearFit.low, sigma_high: params.linearFit.high }; break;
+  }
+  return { combination, rejection: rej };
+}
+
+// A labelled low/high number-input pair for a rejection algorithm's parameters.
+function ParamPair({ loLabel, hiLabel, lo, hi, onLo, onHi, step, min, max }: {
+  loLabel: string; hiLabel: string; lo: number; hi: number;
+  onLo: (v: number) => void; onHi: (v: number) => void;
+  step: number; min?: number; max?: number;
+}) {
+  return (
+    <div className="flex gap-2 mb-2">
+      <label className="flex-1 text-xs text-content-muted">{loLabel}
+        <input type="number" step={step} min={min} max={max} value={lo}
+               onChange={e => onLo(Number(e.target.value))}
+               className="w-full bg-surface border border-border rounded px-2 py-1 text-sm" /></label>
+      <label className="flex-1 text-xs text-content-muted">{hiLabel}
+        <input type="number" step={step} min={min} max={max} value={hi}
+               onChange={e => onHi(Number(e.target.value))}
+               className="w-full bg-surface border border-border rounded px-2 py-1 text-sm" /></label>
+    </div>
+  );
 }
 
 // Batch preview fan-out is capped at this many concurrent `preview_master_build`
@@ -95,28 +179,6 @@ function typeBadgeClass(imagetyp: string): string {
   }
 }
 
-// Mirror of `fmt_param` in crates/athenaeum-core/src/integration/combine.rs:
-// integer thresholds render with a trailing `.0` (`3` → `"3.0"`, matching spec
-// §4's `(3.0/3.0)` style) while fractional ones keep their precision (`0.02` →
-// `"0.02"`). Must stay byte-identical to the Rust `describe` output.
-function fmtParam(x: number): string {
-  return Number.isInteger(x) ? x.toFixed(1) : String(x);
-}
-
-function formatCombine(r: IntegrationRecipe): string {
-  const comb = r.combination === 'average' ? 'Average' : 'Median';
-  const rej = r.rejection;
-  let rejLabel: string;
-  switch (rej.method) {
-    case 'none': rejLabel = 'no rejection'; break;
-    case 'percentile_clip': rejLabel = `Percentile clip (${fmtParam(rej.low)}/${fmtParam(rej.high)})`; break;
-    case 'sigma_clip': rejLabel = `Sigma clip (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
-    case 'winsorized_sigma': rejLabel = `Winsorized sigma (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
-    case 'linear_fit_clip': rejLabel = `Linear fit clip (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
-  }
-  return `${comb} · ${rejLabel}`;
-}
-
 function basename(path: string): string {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
@@ -146,18 +208,38 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   // below. See the defaulting effect further down for how this gets
   // seeded from the original setIds' previews.
   const [extraRawIds, setExtraRawIds] = useState<Set<number>>(new Set());
-  const [combine, setCombine] = useState<CombineChoice>('auto');
-  const [sigLo, setSigLo] = useState(3.0);
-  const [sigHi, setSigHi] = useState(3.0);
-  const [pLo, setPLo] = useState(0.2);
-  const [pHi, setPHi] = useState(0.02);
+  const persisted = useMemo(loadPersistedRecipe, []);
+  const [combination, setCombination] = useState<CombinationChoice>(persisted.combination);
+  const [rejection, setRejection] = useState<RejectionChoice>(persisted.rejection);
+  const [params, setParams] = useState<RejectionParams>(persisted.params);
   const [syntheticBias, setSyntheticBias] = useState<string>('');
   const [archiveAfter, setArchiveAfter] = useState(false);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
 
+  const setParam = (algo: keyof RejectionParams, side: 'low' | 'high', value: number) =>
+    setParams(prev => ({ ...prev, [algo]: { ...prev[algo], [side]: value } }));
+
+  // Persist axis choices + per-algorithm params (spec §4). Wrapped so a
+  // storage/quota/serialization failure never breaks the dialog.
+  useEffect(() => {
+    try {
+      localStorage.setItem(RECIPE_STORAGE_KEY, JSON.stringify({ combination, rejection, params }));
+    } catch {
+      /* ignore — persistence is best-effort */
+    }
+  }, [combination, rejection, params]);
+
+  const recipeObj = useMemo(
+    () => toRecipe(combination, rejection, params),
+    [combination, rejection, params],
+  );
+  // Stable content key for the preview effects' dependency arrays — `recipeObj`
+  // is a fresh object on every param edit, so key on its serialized content.
+  const recipeKey = useMemo(() => JSON.stringify(recipeObj), [recipeObj]);
+
   const recipe = (): MasterRecipe => ({
-    combine: toRecipe(combine, sigLo, sigHi, pLo, pHi),
+    combine: recipeObj,
     syntheticBias: syntheticBias.trim() === '' ? null : Number(syntheticBias),
     archiveAfter,
   });
@@ -180,7 +262,7 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     }, 250);
     return () => { cancelled = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setIds, combine, sigLo, sigHi, pLo, pHi, syntheticBias]);
+  }, [setIds, recipeKey, syntheticBias]);
 
   // Re-derive default-checked raw-precal candidates whenever a new preview
   // resolves. A recipe change (e.g. toggling synthetic bias) can change
@@ -235,7 +317,7 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
     }, 250);
     return () => { cancelled = true; clearTimeout(t); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveIds, combine, sigLo, sigHi, pLo, pHi, syntheticBias]);
+  }, [effectiveIds, recipeKey, syntheticBias]);
 
   // Discover raw precal candidates from the ORIGINAL setIds' previews only
   // (never from a candidate row's own preview — darks/bias always report an
@@ -487,35 +569,48 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
           <button onClick={onClose} className="text-content-muted hover:text-content"><X size={16} /></button>
         </div>
 
-        {/* Recipe */}
+        {/* Recipe — two-axis (spec §4): Combination × Rejection algorithm */}
         <label className="block text-xs text-content-muted mb-1">Combination</label>
-        <select value={combine} onChange={e => setCombine(e.target.value as CombineChoice)}
+        <select value={combination} onChange={e => setCombination(e.target.value as CombinationChoice)}
                 className="w-full bg-surface border border-border rounded px-2 py-1.5 text-sm mb-2">
           <option value="auto">Auto (recommended — per type & frame count)</option>
-          <option value="winsorized">Winsorized sigma clip</option>
-          <option value="percentile">Percentile clip</option>
+          <option value="average">Average</option>
           <option value="median">Median</option>
-          <option value="mean">Mean</option>
         </select>
-        {combine === 'winsorized' && (
-          <div className="flex gap-2 mb-2">
-            <label className="text-xs text-content-muted">σ low
-              <input type="number" step="0.1" value={sigLo} onChange={e => setSigLo(Number(e.target.value))}
-                     className="w-full bg-surface border border-border rounded px-2 py-1 text-sm" /></label>
-            <label className="text-xs text-content-muted">σ high
-              <input type="number" step="0.1" value={sigHi} onChange={e => setSigHi(Number(e.target.value))}
-                     className="w-full bg-surface border border-border rounded px-2 py-1 text-sm" /></label>
-          </div>
-        )}
-        {combine === 'percentile' && (
-          <div className="flex gap-2 mb-2">
-            <label className="text-xs text-content-muted">low
-              <input type="number" step="0.01" value={pLo} onChange={e => setPLo(Number(e.target.value))}
-                     className="w-full bg-surface border border-border rounded px-2 py-1 text-sm" /></label>
-            <label className="text-xs text-content-muted">high
-              <input type="number" step="0.01" value={pHi} onChange={e => setPHi(Number(e.target.value))}
-                     className="w-full bg-surface border border-border rounded px-2 py-1 text-sm" /></label>
-          </div>
+
+        {combination !== 'auto' && (
+          <>
+            <label className="block text-xs text-content-muted mb-1">Rejection algorithm</label>
+            <select value={rejection} onChange={e => setRejection(e.target.value as RejectionChoice)}
+                    className="w-full bg-surface border border-border rounded px-2 py-1.5 text-sm mb-2">
+              <option value="none">No rejection</option>
+              <option value="percentile_clip">Percentile clipping</option>
+              <option value="sigma_clip">Sigma clipping</option>
+              <option value="winsorized_sigma">Winsorized sigma clipping</option>
+              <option value="linear_fit_clip">Linear fit clipping</option>
+            </select>
+
+            {rejection === 'percentile_clip' && (
+              <ParamPair loLabel="low" hiLabel="high" step={0.01} min={0} max={1}
+                         lo={params.percentile.low} hi={params.percentile.high}
+                         onLo={v => setParam('percentile', 'low', v)} onHi={v => setParam('percentile', 'high', v)} />
+            )}
+            {rejection === 'sigma_clip' && (
+              <ParamPair loLabel="σ low" hiLabel="σ high" step={0.1}
+                         lo={params.sigma.low} hi={params.sigma.high}
+                         onLo={v => setParam('sigma', 'low', v)} onHi={v => setParam('sigma', 'high', v)} />
+            )}
+            {rejection === 'winsorized_sigma' && (
+              <ParamPair loLabel="σ low" hiLabel="σ high" step={0.1}
+                         lo={params.winsorized.low} hi={params.winsorized.high}
+                         onLo={v => setParam('winsorized', 'low', v)} onHi={v => setParam('winsorized', 'high', v)} />
+            )}
+            {rejection === 'linear_fit_clip' && (
+              <ParamPair loLabel="σ low" hiLabel="σ high" step={0.1}
+                         lo={params.linearFit.low} hi={params.linearFit.high}
+                         onLo={v => setParam('linearFit', 'low', v)} onHi={v => setParam('linearFit', 'high', v)} />
+            )}
+          </>
         )}
         {showSyntheticBias && (
           <>
