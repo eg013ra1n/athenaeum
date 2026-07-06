@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS master_provenance (
 
 ## Pillar C — P2P collaboration (group imaging campaigns)
 
+> **2026-07-05 update:** product requirements are now defined in `2026-07-05-sync-collaboration-brd.md`, which **extends this pillar significantly** (accounts + central coordination service, web portal, personal observatory→home sync with retention, roles, quality gates, Discord). The BRD supersedes the product assumptions below (serverless, account-less); the exchange-layer design in this section (manifests, append-only contributions, Syncthing folders) remains the candidate technical substrate and gets revised against the BRD before Phase 5 build.
+
 ### What exists
 
 Nothing network-facing. The 2026-06-10 collaboration-readiness plan (Stages 1–4) is written but **0/4 implemented**: integer PKs collide across catalogs, paths are absolute+UNIQUE, no change journal, no catalog identity, hand-mirrored types. Runtime architecture is already multi-client-shaped (verdict unchanged).
