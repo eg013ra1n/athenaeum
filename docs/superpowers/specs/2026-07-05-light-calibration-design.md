@@ -85,6 +85,11 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
   central-third mean. Irrelevant for integration (WBPP normalizes frames).
   Also observed: PI clips negatives to 0 in its output; our
   negatives-preserved f32 is consumed without issue.
+
+  **Follow-up (2026-07-06):** with `FlatNormMode::PixinsightTrimmed` the
+  gain difference vanishes — same 60s pair: gain 1.000299, median(B/A)
+  0.999955, 0.3% rms residual (the noise floor of two independently
+  stacked master flats). PI parity confirmed end-to-end.
 - OSC/CFA: calibrated **un-debayered** (CFA mosaic preserved), `BAYERPAT` /
   `XBAYROFF`/`YBAYROFF` copied through. Global flat normalization (the single
   `ATH_FNRM`) preserves channel ratios; per-CFA-plane normalization is
