@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
-import { X, Wand2, Hammer, AlertTriangle, CheckCircle2, Info, Loader2 } from 'lucide-react';
+import { X, Wand2, Hammer, AlertTriangle, CheckCircle2, Info, Loader2, ChevronDown, ChevronRight, SlidersHorizontal } from 'lucide-react';
 import { api } from '../../api';
-import type { LightCalReadiness, FlatNormMode } from '../../types/models';
+import type { LightCalReadiness, FlatNormMode, LightCalParams, BiasFallback } from '../../types/models';
 import { useLightCalibrationContext } from '../../contexts/LightCalibrationContext';
 
 /** localStorage key for the "Normalize master flat" preference (default ON). */
@@ -9,6 +9,42 @@ export const LIGHTCAL_FLATNORM_KEY = 'athenaeum.lightcal.flatNorm';
 
 /** localStorage key for the flat-normalization statistic (default centralThird). */
 export const LIGHTCAL_FLATNORM_MODE_KEY = 'athenaeum.lightcal.flatNormMode';
+
+/** localStorage key for the Advanced calibration parameters (JSON). */
+export const LIGHTCAL_PARAMS_KEY = 'athenaeum.lightcal.params';
+
+/** Advanced-parameter defaults — these reproduce the engine's current behavior
+ *  (see `LightCalParams::default` in `calibration_library/light_cal.rs`). */
+export const DEFAULT_LIGHTCAL_PARAMS: LightCalParams = {
+  trimFraction: 0.05,
+  pedestalDn: 0,
+  biasFallback: 'subtractBias',
+};
+
+/** Read the persisted Advanced parameters, coercing every field into range and
+ *  falling back to {@link DEFAULT_LIGHTCAL_PARAMS} when unset/corrupt. Exported so
+ *  the badge/details readiness fetches in FrameSetDetail resolve staleness against
+ *  the exact params the dialog would submit. */
+export function readLightCalParamsPref(): LightCalParams {
+  try {
+    const raw = localStorage.getItem(LIGHTCAL_PARAMS_KEY);
+    if (!raw) return { ...DEFAULT_LIGHTCAL_PARAMS };
+    const parsed = JSON.parse(raw) as Partial<LightCalParams>;
+    const trimFraction =
+      typeof parsed.trimFraction === 'number' && Number.isFinite(parsed.trimFraction)
+        ? Math.min(0.25, Math.max(0, parsed.trimFraction))
+        : DEFAULT_LIGHTCAL_PARAMS.trimFraction;
+    const pedestalDn =
+      typeof parsed.pedestalDn === 'number' && Number.isFinite(parsed.pedestalDn)
+        ? Math.max(0, parsed.pedestalDn)
+        : DEFAULT_LIGHTCAL_PARAMS.pedestalDn;
+    const biasFallback: BiasFallback =
+      parsed.biasFallback === 'skipFrame' ? 'skipFrame' : 'subtractBias';
+    return { trimFraction, pedestalDn, biasFallback };
+  } catch {
+    return { ...DEFAULT_LIGHTCAL_PARAMS };
+  }
+}
 
 /** Read the persisted flat-norm preference (default ON when unset/corrupt). */
 export function readFlatNormPref(): boolean {
@@ -44,6 +80,26 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
   const [flatNorm, setFlatNorm] = useState<boolean>(readFlatNormPref);
   const [flatNormMode, setFlatNormMode] = useState<FlatNormMode>(readFlatNormModePref);
   const [onlyStale, setOnlyStale] = useState(true);
+
+  // Advanced parameters (spec §2). `params` is the committed numeric source of
+  // truth (persisted + submitted); the two `*Input` strings back the number
+  // fields so partial edits like "0." don't get clobbered by re-parse.
+  const [params, setParams] = useState<LightCalParams>(readLightCalParamsPref);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [trimInput, setTrimInput] = useState(() => String(params.trimFraction));
+  const [pedestalInput, setPedestalInput] = useState(() => String(params.pedestalDn));
+
+  const onTrimChange = (v: string) => {
+    setTrimInput(v);
+    const n = parseFloat(v);
+    if (!Number.isNaN(n)) setParams(p => ({ ...p, trimFraction: Math.min(0.25, Math.max(0, n)) }));
+  };
+  const onPedestalChange = (v: string) => {
+    setPedestalInput(v);
+    const n = parseFloat(v);
+    if (!Number.isNaN(n)) setParams(p => ({ ...p, pedestalDn: Math.max(0, n) }));
+  };
+
   const [readiness, setReadiness] = useState<LightCalReadiness | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -62,18 +118,23 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
     try { localStorage.setItem(LIGHTCAL_FLATNORM_MODE_KEY, flatNormMode); } catch { /* ignore */ }
   }, [flatNormMode]);
 
-  // Re-query readiness on open and whenever the flat-norm flag or statistic
-  // changes — both feed staleness (a frame calibrated with a different flat-norm
-  // setting or statistic reads Stale).
+  // Persist the Advanced parameters whenever they change.
+  useEffect(() => {
+    try { localStorage.setItem(LIGHTCAL_PARAMS_KEY, JSON.stringify(params)); } catch { /* ignore */ }
+  }, [params]);
+
+  // Re-query readiness on open and whenever the flat-norm flag, statistic, or
+  // Advanced parameters change — all feed staleness (a frame calibrated with a
+  // different flat-norm setting, statistic, or advanced param reads Stale).
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setReadinessError(null);
-    api.invoke<LightCalReadiness>('get_light_calibration_readiness', { setId, flatNorm, flatNormMode })
+    api.invoke<LightCalReadiness>('get_light_calibration_readiness', { setId, flatNorm, flatNormMode, params })
       .then(r => { if (!cancelled) { setReadiness(r); setLoading(false); } })
       .catch(e => { if (!cancelled) { setReadinessError(String(e)); setLoading(false); } });
     return () => { cancelled = true; };
-  }, [setId, flatNorm, flatNormMode]);
+  }, [setId, flatNorm, flatNormMode, params]);
 
   // Aggregate which calibration steps are genuinely missing (no master AND no raw
   // set to build). Bias-missing is NON-blocking under the raw-master-dark
@@ -104,7 +165,7 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
     setStarting(true);
     setStartError(null);
     try {
-      await startCalibration(setId, { onlyStale }, flatNorm, flatNormMode);
+      await startCalibration(setId, { onlyStale }, flatNorm, flatNormMode, params);
       onClose();
     } catch (e) {
       setStartError(String(e));
@@ -220,6 +281,88 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
                 />
                 Full-frame trimmed mean (PixInsight-compatible)
               </label>
+            </div>
+          )}
+        </div>
+
+        {/* Advanced parameters (spec §2) — collapsed by default. */}
+        <div className="mb-4 border-t border-border/60 pt-3">
+          <button
+            type="button"
+            onClick={() => setAdvancedOpen(o => !o)}
+            className="flex items-center gap-1.5 text-xs font-medium text-content-secondary hover:text-content transition-colors"
+          >
+            {advancedOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            <SlidersHorizontal size={12} className="text-content-muted" />
+            Advanced
+          </button>
+
+          {advancedOpen && (
+            <div className="mt-3 ml-1 space-y-3">
+              {/* Trim fraction — only meaningful in the PixInsight-trimmed statistic. */}
+              {flatNorm && flatNormMode === 'pixinsightTrimmed' && (
+                <div>
+                  <label className="block text-xs text-content-secondary mb-1">
+                    Flat trim fraction (per tail)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={0.25}
+                    step={0.01}
+                    value={trimInput}
+                    onChange={e => onTrimChange(e.target.value)}
+                    className="w-28 px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent"
+                  />
+                  <p className="text-[11px] text-content-muted mt-1">
+                    Fraction discarded from each tail of the trimmed mean (default 0.05).
+                  </p>
+                </div>
+              )}
+
+              {/* Output pedestal. */}
+              <div>
+                <label className="block text-xs text-content-secondary mb-1">
+                  Output pedestal (DN)
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={pedestalInput}
+                  onChange={e => onPedestalChange(e.target.value)}
+                  className="w-28 px-2 py-1 text-sm bg-surface text-content rounded border border-border focus:outline-none focus:border-accent"
+                />
+                <p className="text-[11px] text-content-muted mt-1">
+                  Added after the scale divide, for consumers that clip negatives. 0 = negatives preserved.
+                </p>
+              </div>
+
+              {/* Bias fallback policy for dark-less lights. */}
+              <div>
+                <div className="text-xs text-content-secondary mb-1">Lights with no dark master</div>
+                <label className="flex items-center gap-2 text-xs text-content-secondary mb-1">
+                  <input
+                    type="radio"
+                    name="lightcal-bias-fallback"
+                    checked={params.biasFallback === 'subtractBias'}
+                    onChange={() => setParams(p => ({ ...p, biasFallback: 'subtractBias' }))}
+                  />
+                  Subtract bias (calibrate best-effort)
+                </label>
+                <label className="flex items-center gap-2 text-xs text-content-secondary">
+                  <input
+                    type="radio"
+                    name="lightcal-bias-fallback"
+                    checked={params.biasFallback === 'skipFrame'}
+                    onChange={() => setParams(p => ({ ...p, biasFallback: 'skipFrame' }))}
+                  />
+                  Skip the frame (never bias-only)
+                </label>
+                <p className="text-[11px] text-content-muted mt-1">
+                  When a light has no matched dark master, either subtract its linked bias or fail that frame.
+                </p>
+              </div>
             </div>
           )}
         </div>

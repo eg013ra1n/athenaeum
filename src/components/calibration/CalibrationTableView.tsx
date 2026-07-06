@@ -1300,6 +1300,20 @@ export function CalibrationTableView({
     setHighlightedBiasIds(new Set());
   }, []);
 
+  // Re-assign preselection (spec §12.4): entering Re-assign mode with a light row
+  // already highlighted in the table loads that row straight into the slide-out
+  // panel, instead of starting empty. Only fires on the false→true transition and
+  // only when nothing is selected yet, so it never overrides a manual pick.
+  const prevReassignModeRef = useRef(reassignMode);
+  useEffect(() => {
+    if (reassignMode && !prevReassignModeRef.current && !selectedLightRow && highlightedLightKeys.size > 0) {
+      const key = [...highlightedLightKeys][0];
+      const row = lightRows.find(r => r.rowKey === key);
+      if (row) setSelectedLightRow(row);
+    }
+    prevReassignModeRef.current = reassignMode;
+  }, [reassignMode, highlightedLightKeys, lightRows, selectedLightRow]);
+
   // Click a light row: highlight it + flat + dark; in reassign mode also select it
   const handleLightRowClick = useCallback((row: LightRow) => {
     if (reassignMode) {

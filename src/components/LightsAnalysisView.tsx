@@ -6,6 +6,7 @@ import type {
   FrameAnalysis,
   FrameSetReference,
   LightFrameReadiness,
+  LightCalDetails,
 } from '../types/models';
 import { useNotifications } from '../contexts/NotificationContext';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
@@ -40,9 +41,12 @@ interface LightsAnalysisViewProps {
   /** Per-frame light-calibration readiness (keyed by frame_id), fetched once by
    *  the parent. Drives the "Calib" status column in the table. */
   readinessByFrameId?: Map<number, LightFrameReadiness>;
+  /** Per-frame calibration recipe (keyed by frame_id), fetched once by the
+   *  parent. Feeds the status-badge tooltip in the table (spec §12.1). */
+  detailsByFrameId?: Map<number, LightCalDetails>;
 }
 
-export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, readinessByFrameId }: LightsAnalysisViewProps) {
+export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackholedFileIds, onRefresh, onBlink, onSplit, onCreateCustomSet, hideLocateColumn, onReferenceChanged, referenceFrameId: referenceFrameIdProp, readinessByFrameId, detailsByFrameId }: LightsAnalysisViewProps) {
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-camera');
 
@@ -893,6 +897,7 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
                   onSetReference={onReferenceChanged !== undefined ? handleSetReference : undefined}
                   settingReference={settingReference}
                   readinessByFrameId={readinessByFrameId}
+                  detailsByFrameId={detailsByFrameId}
                 />
               </div>
             ) : (

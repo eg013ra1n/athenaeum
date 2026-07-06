@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { api } from '../api';
-import { Scissors, Plus, Calendar, Camera, X, ScanSearch } from 'lucide-react';
+import { Scissors, Plus, Calendar, Camera, X, ScanSearch, Wand2 } from 'lucide-react';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
@@ -15,6 +15,7 @@ import { CalibrationFinderButton } from './CalibrationFinderButton';
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { CreateMasterDialog } from './calibration/CreateMasterDialog';
 import { useMasterBuildContext } from '../contexts/MasterBuildContext';
+import { useLightCalibrationContext } from '../contexts/LightCalibrationContext';
 
 interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
@@ -38,6 +39,10 @@ interface CalibrationHierarchyViewProps {
   highlightCalSet?: { setId: number; kind: 'flat' | 'dark' | 'bias' } | null;
   /** Called once the highlight has been forwarded to the table view. */
   onHighlightConsumed?: () => void;
+  /** Opens the Calibrate Lights dialog. When provided (and the set has frames),
+   *  a "Calibrate Lights" button is shown in the toolbar next to "Create all
+   *  masters" (spec §12.3). Omitted for archived sets whose sources are gone. */
+  onCalibrateLights?: () => void;
 }
 
 export function CalibrationHierarchyView({
@@ -55,9 +60,13 @@ export function CalibrationHierarchyView({
   onCreateCustomSet,
   highlightCalSet,
   onHighlightConsumed,
+  onCalibrateLights,
 }: CalibrationHierarchyViewProps) {
   // Re-assign mode toggle
   const [reassignMode, setReassignMode] = useState(false);
+
+  const { isCalibrating } = useLightCalibrationContext();
+  const calibratingLights = frameSetId != null && isCalibrating(frameSetId);
 
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-night');
@@ -395,6 +404,17 @@ export function CalibrationHierarchyView({
                 >
                   Create all masters ({rawCalSetIds.length})
                 </button>
+                {onCalibrateLights && data.total_frames > 0 && (
+                  <button
+                    onClick={onCalibrateLights}
+                    disabled={calibratingLights}
+                    title="Apply linked master darks & flats and write calibrated copies to the calibration library"
+                    className="h-7 inline-flex items-center gap-1.5 px-3 border border-accent/40 bg-accent/10 text-accent text-sm rounded hover:bg-accent/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <Wand2 size={12} />
+                    {calibratingLights ? 'Calibrating…' : 'Calibrate Lights'}
+                  </button>
+                )}
               </div>
             )}
 

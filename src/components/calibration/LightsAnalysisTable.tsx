@@ -1,7 +1,7 @@
 import { useState, useMemo, useCallback } from 'react';
 import { FolderOpen, AlertTriangle, CheckCircle, MapPin, Crosshair, Star } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import type { LightFrameWithCalibration, FrameAnalysis, LightFrameReadiness } from '../../types/models';
+import type { LightFrameWithCalibration, FrameAnalysis, LightFrameReadiness, LightCalDetails } from '../../types/models';
 import { LightCalStatusBadge } from './LightCalStatusBadge';
 
 type SortField = 'date' | 'filter' | 'camera' | 'focallen' | 'exptime' | 'stars' | 'fwhm' | 'eccentricity' | 'median_snr' | 'frame_snr' | 'psf_signal' | 'snr_weight' | 'trail' | 'beta';
@@ -37,6 +37,9 @@ interface LightsAnalysisTableProps {
   /** Per-frame light-calibration readiness (keyed by frame_id). When present and
    *  non-empty, a "Calib" status column is shown. */
   readinessByFrameId?: Map<number, LightFrameReadiness>;
+  /** Per-frame calibration recipe (keyed by frame_id). Enriches the status
+   *  badge's tooltip with the applied masters / normalization / params. */
+  detailsByFrameId?: Map<number, LightCalDetails>;
 }
 
 function formatDateTime(dateStr: string | null): string {
@@ -116,6 +119,7 @@ export function LightsAnalysisTable({
   onSetReference,
   settingReference,
   readinessByFrameId,
+  detailsByFrameId,
 }: LightsAnalysisTableProps) {
   const navigate = useNavigate();
   const showCalib = !!readinessByFrameId && readinessByFrameId.size > 0;
@@ -436,7 +440,10 @@ export function LightsAnalysisTable({
                 )}
                 {showCalib && (
                   <td className="w-24 px-1.5 py-1 text-center">
-                    <LightCalStatusBadge frame={readinessByFrameId!.get(frame.frame_id)} />
+                    <LightCalStatusBadge
+                      frame={readinessByFrameId!.get(frame.frame_id)}
+                      detail={detailsByFrameId?.get(frame.frame_id)}
+                    />
                   </td>
                 )}
                 <td className="w-16 px-1.5 py-1 text-center">
