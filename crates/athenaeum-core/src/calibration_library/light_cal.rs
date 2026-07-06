@@ -5,12 +5,14 @@
 //!
 //! Math (spec §2, verbatim):
 //! ```text
-//! L_c = ((L − S) / (F / divisor)) / OUTPUT_SCALE_DIVISOR
+//! L_c = ((L − S) / (F / divisor)) / OUTPUT_SCALE_DIVISOR + pedestal_dn / OUTPUT_SCALE_DIVISOR
 //! ```
 //! where `S` = master dark if linked, else master bias, else no subtraction;
 //! `F` = master flat when linked (division skipped otherwise); `divisor` =
-//! the flat-normalization constant when normalization is on, else `1.0`; and
-//! `OUTPUT_SCALE_DIVISOR = 65535.0` normalizes 16-bit sources to ~[0,1].
+//! the flat-normalization constant when normalization is on, else `1.0`;
+//! `OUTPUT_SCALE_DIVISOR = 65535.0` normalizes 16-bit sources to ~[0,1]; and
+//! `pedestal_dn` (advanced param, default 0 = off) is a DN offset added AFTER
+//! the scale divide for consumers that clip negatives.
 //!
 //! Memory is bounded: the source frames are streamed one row-band at a time
 //! (same budget policy as the master-integration engine), and only the single
@@ -86,6 +88,61 @@ impl FlatNormMode {
     }
 }
 
+/// What to do for a LIGHT frame that has NO dark master (spec §2 "Advanced
+/// parameters"). Default = current behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum BiasFallback {
+    /// Current behavior: subtract the linked master bias (`(L − B)`).
+    #[default]
+    SubtractBias,
+    /// Refuse bias-only calibration — a light with no dark master is a per-frame
+    /// failure ("no dark master (bias fallback disabled)"), no output written.
+    SkipFrame,
+}
+
+/// serde default for [`LightCalParams::trim_fraction`] — the current per-tail
+/// discard fraction ([`PI_TRIM_FRACTION`] = 0.05), so an omitted wire field or a
+/// stored `'{}'` decodes to today's behavior.
+fn default_trim_fraction() -> f64 {
+    PI_TRIM_FRACTION
+}
+
+/// Advanced per-run light-calibration parameters (spec §2 "Advanced
+/// parameters"). Every field is optional on the wire (`#[serde(default)]`) with
+/// a default equal to the current behavior, so an omitted field — or the
+/// `cal_params = '{}'` a pre-feature tracking row carries — decodes to
+/// [`LightCalParams::default`]. Recorded verbatim in the tracking row and
+/// compared for staleness (`db::light_calibrations::derive_status`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct LightCalParams {
+    /// Per-tail discard fraction for the `pixinsightTrimmed` statistic
+    /// (default [`PI_TRIM_FRACTION`] = 0.05). Only meaningful when the flat is
+    /// normalized in `pixinsightTrimmed` mode; stamped as `ATH_CTRM` then.
+    #[serde(default = "default_trim_fraction")]
+    pub trim_fraction: f64,
+    /// DN added to the output AFTER the scale divide (`out += pedestal_dn /
+    /// OUTPUT_SCALE_DIVISOR`, default 0 = off), for consumers that clip
+    /// negatives. Stamped as `ATH_CPED` (the DN value) always; `CALSTAT`
+    /// unchanged — a pedestal is not a calibration step.
+    #[serde(default)]
+    pub pedestal_dn: f64,
+    /// What to do for a light with no dark master (default `subtractBias`).
+    #[serde(default)]
+    pub bias_fallback: BiasFallback,
+}
+
+impl Default for LightCalParams {
+    fn default() -> Self {
+        Self {
+            trim_fraction: PI_TRIM_FRACTION,
+            pedestal_dn: 0.0,
+            bias_fallback: BiasFallback::SubtractBias,
+        }
+    }
+}
+
 /// Everything the engine needs to calibrate one LIGHT frame.
 ///
 /// `dark_path`/`bias_path` are the master subtrahend candidates — a dark is
@@ -104,6 +161,12 @@ pub struct LightCalInputs {
     /// Which statistic computes the normalization divisor when `flat_norm` is on
     /// (spec §2). Ignored when `flat_norm` is `false` or no flat is applied.
     pub flat_norm_mode: FlatNormMode,
+    /// Advanced per-run parameters (spec §2). The engine acts on
+    /// `trim_fraction` (feeds `pixinsightTrimmed` normalization) and
+    /// `pedestal_dn` (added after the scale divide); `bias_fallback` is enforced
+    /// by the orchestration layer BEFORE the engine runs, so the engine is
+    /// agnostic to it.
+    pub params: LightCalParams,
     pub output_path: PathBuf,
     pub cards: Vec<Card>,
     pub scratch_dir: PathBuf,
@@ -150,11 +213,19 @@ pub fn calibrate_light(
     // (also 1.0 when no flat). Resolved before the read so a missing flat or a
     // bad ATH_FNRM fails fast, before any output work.
     let flat_norm_divisor = match (&inputs.flat_path, inputs.flat_norm) {
-        (Some(flat), true) => {
-            flat_norm_constant(flat, &inputs.scratch_dir, inputs.flat_norm_mode)?
-        }
+        (Some(flat), true) => flat_norm_constant(
+            flat,
+            &inputs.scratch_dir,
+            inputs.flat_norm_mode,
+            inputs.params.trim_fraction,
+        )?,
         _ => 1.0,
     };
+
+    // Output pedestal (spec §2): DN added AFTER the scale divide. Precomputed in
+    // output units once; the add is skipped entirely when the pedestal is 0.
+    let add_pedestal = inputs.params.pedestal_dn != 0.0;
+    let pedestal_offset = inputs.params.pedestal_dn / OUTPUT_SCALE_DIVISOR;
 
     // One BandSource over light + subtrahend? + flat?, remembering each frame's
     // index. BandSource::open validates geometry itself and rejects mixed
@@ -194,6 +265,9 @@ pub fn calibrate_light(
                 v /= band_bufs[fi][idx] as f64 / flat_norm_divisor;
             }
             v /= OUTPUT_SCALE_DIVISOR;
+            if add_pedestal {
+                v += pedestal_offset;
+            }
             *out_px = v as f32;
         }
         y += rows;
@@ -233,8 +307,13 @@ pub fn calibrate_light(
 ///   `ATH_FNRM` card an Athenaeum-built master stamps, or — for a flat imported
 ///   without it — recompute the central-third mean on the fly.
 /// - [`FlatNormMode::PixinsightTrimmed`] (PixInsight-compatible): a two-sided
-///   trimmed mean over the WHOLE frame ([`PI_TRIM_FRACTION`] per tail). ALWAYS
-///   computed from the flat file; the `ATH_FNRM` card is ignored.
+///   trimmed mean over the WHOLE frame (`trim_fraction` per tail, default
+///   [`PI_TRIM_FRACTION`]). ALWAYS computed from the flat file; the `ATH_FNRM`
+///   card is ignored.
+///
+/// `trim_fraction` is only consulted in `PixinsightTrimmed` mode (the
+/// central-third path never trims); callers in central-third mode may pass
+/// [`PI_TRIM_FRACTION`].
 ///
 /// Both paths band-read the flat one row-band at a time, so memory stays
 /// bounded regardless of frame size.
@@ -242,6 +321,7 @@ pub fn flat_norm_constant(
     flat_path: &Path,
     scratch_dir: &Path,
     mode: FlatNormMode,
+    trim_fraction: f64,
 ) -> Result<f64, IntegrationError> {
     match mode {
         FlatNormMode::CentralThird => {
@@ -260,8 +340,8 @@ pub fn flat_norm_constant(
             // match this statistic, so it is deliberately ignored — always
             // computed from the flat's pixels.
             let (_w, _h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
-            let mean = pixinsight_trimmed_mean(&data);
-            tracing::debug!(path = %flat_path.display(), trimmed_mean = mean, "flat normalization from full-frame trimmed mean (pixinsightTrimmed)");
+            let mean = pixinsight_trimmed_mean(&data, trim_fraction);
+            tracing::debug!(path = %flat_path.display(), trimmed_mean = mean, trim_fraction, "flat normalization from full-frame trimmed mean (pixinsightTrimmed)");
             Ok(mean)
         }
     }
@@ -290,22 +370,23 @@ fn read_full_flat_plane(
 }
 
 /// Two-sided trimmed mean over the whole plane, discarding exactly
-/// [`PI_TRIM_FRACTION`] of the pixels from EACH tail (PixInsight's
-/// `flatScaleClippingFactor` semantics, spec §2). Sorts a copy (total order,
-/// NaN-tolerant) and averages the surviving middle in f64:
+/// `trim_fraction` of the pixels from EACH tail (PixInsight's
+/// `flatScaleClippingFactor` semantics, spec §2; `trim_fraction` defaults to
+/// [`PI_TRIM_FRACTION`], the advanced param exposes it). Sorts a copy (total
+/// order, NaN-tolerant) and averages the surviving middle in f64:
 /// `lo = floor(n·f)`, `hi = n − floor(n·f)`, mean over `sorted[lo..hi]`.
 ///
 /// Degenerate guards: an empty plane returns `1.0` (a harmless divide-by later),
 /// and a frame so small that `lo >= hi` falls back to the full-frame mean rather
 /// than averaging an empty slice.
-fn pixinsight_trimmed_mean(data: &[f32]) -> f64 {
+fn pixinsight_trimmed_mean(data: &[f32], trim_fraction: f64) -> f64 {
     let n = data.len();
     if n == 0 {
         return 1.0;
     }
     let mut sorted: Vec<f32> = data.to_vec();
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-    let trim = ((n as f64) * PI_TRIM_FRACTION).floor() as usize;
+    let trim = ((n as f64) * trim_fraction).floor() as usize;
     let (lo, hi) = if trim * 2 < n { (trim, n - trim) } else { (0, n) };
     let slice = &sorted[lo..hi];
     let sum: f64 = slice.iter().map(|&v| v as f64).sum();
@@ -375,6 +456,12 @@ mod tests {
     /// Mirror the engine's per-pixel math exactly (f64 throughout, cast at the
     /// end) so tests can assert bit-exact f32 output.
     fn expect_px(l: f64, s: Option<f64>, f: Option<f64>, divisor: f64) -> f32 {
+        expect_px_ped(l, s, f, divisor, 0.0)
+    }
+
+    /// [`expect_px`] with an output pedestal (DN) added after the scale divide,
+    /// mirroring the engine's `add_pedestal` step exactly (f64 throughout).
+    fn expect_px_ped(l: f64, s: Option<f64>, f: Option<f64>, divisor: f64, pedestal_dn: f64) -> f32 {
         let mut v = l;
         if let Some(s) = s {
             v -= s;
@@ -383,6 +470,9 @@ mod tests {
             v /= f / divisor;
         }
         v /= OUTPUT_SCALE_DIVISOR;
+        if pedestal_dn != 0.0 {
+            v += pedestal_dn / OUTPUT_SCALE_DIVISOR;
+        }
         v as f32
     }
 
@@ -403,6 +493,7 @@ mod tests {
             flat_path: flat,
             flat_norm,
             flat_norm_mode: FlatNormMode::CentralThird,
+            params: LightCalParams::default(),
             output_path: out,
             cards: vec![],
             scratch_dir: dir.to_path_buf(),
@@ -562,13 +653,13 @@ mod tests {
         let expected = central_third_mean(&fdata, w, h);
         assert!(expected > 100.0, "central-third mean must reflect the gradient");
 
-        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird).unwrap();
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
         assert!((got - expected).abs() < 1e-9, "recomputed {got}, want central-third mean {expected}");
 
         // And when the card IS present it takes precedence over recomputation,
         // even with identical pixel data (value differs from the mean above).
         let flat_carded = write_fill(dir.path(), "flat_carded.fits", w, h, fill, &[fnrm_card(999.0)]);
-        let carded = flat_norm_constant(&flat_carded, dir.path(), FlatNormMode::CentralThird).unwrap();
+        let carded = flat_norm_constant(&flat_carded, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
         assert!((carded - 999.0).abs() < 1e-9, "ATH_FNRM card must win over recomputation, got {carded}");
     }
 
@@ -577,14 +668,72 @@ mod tests {
         // 1000 distinct values 0..=999 → trim floor(1000*0.05)=50 from each
         // tail → mean of sorted[50..950] = mean(50..=949) = (50+949)/2 = 499.5.
         let vals: Vec<f32> = (0..1000).map(|i| i as f32).collect();
-        let m = pixinsight_trimmed_mean(&vals);
+        let m = pixinsight_trimmed_mean(&vals, PI_TRIM_FRACTION);
         assert!((m - 499.5).abs() < 1e-9, "trimmed mean {m}, want 499.5");
 
         // Order-independent: shuffling the input must not change the statistic
         // (the fn sorts internally).
         let mut rev: Vec<f32> = vals.clone();
         rev.reverse();
-        assert!((pixinsight_trimmed_mean(&rev) - 499.5).abs() < 1e-9);
+        assert!((pixinsight_trimmed_mean(&rev, PI_TRIM_FRACTION) - 499.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trim_fraction_changes_divisor() {
+        // A right-skewed distribution (quadratic ramp) so a wider trim actually
+        // changes the two-sided trimmed mean — a symmetric set would give the
+        // same statistic at any fraction.
+        let data: Vec<f32> = (0..1000).map(|i| (i * i) as f32).collect();
+        let m05 = pixinsight_trimmed_mean(&data, 0.05);
+        let m10 = pixinsight_trimmed_mean(&data, 0.10);
+        assert!(
+            (m05 - m10).abs() > 1.0,
+            "a wider trim must change the skewed statistic: {m05} vs {m10}"
+        );
+
+        // The 0.10 value equals the exact formula: lo=floor(1000*0.10)=100,
+        // hi=900, mean over the already-sorted middle 800 samples.
+        let expected: f64 = data[100..900].iter().map(|&v| v as f64).sum::<f64>() / 800.0;
+        assert!((m10 - expected).abs() < 1e-6, "trim 0.10 {m10}, want {expected}");
+
+        // And the engine's band-read path honors the fraction end-to-end.
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (40usize, 25usize); // 1000 pixels, values 0..=999
+        let flat = write_fill(dir.path(), "flat_skew.fits", w, h, |x, y| {
+            let i = (y * w + x) as f32;
+            i * i
+        }, &[]);
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed, 0.10).unwrap();
+        assert!((got - expected).abs() < 1e-2, "engine trim-0.10 path {got} vs formula {expected}");
+    }
+
+    #[test]
+    fn pedestal_adds_after_scale_divide() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (8usize, 9usize);
+        let light = write_plane(dir.path(), "light.fits", w, h, 1100.0, &[]);
+        let dark = write_plane(dir.path(), "dark.fits", w, h, 100.0, &[]);
+
+        // Zero-pedestal run must be bit-identical to the pre-feature output.
+        let out0 = dir.path().join("out0.fits");
+        let cfg0 = inputs(dir.path(), light.clone(), Some(dark.clone()), None, None, true, out0.clone());
+        calibrate_light(&cfg0, &AtomicBool::new(false)).unwrap();
+        let (_, _, d0) = read_all(&out0, dir.path());
+        let base = expect_px(1100.0, Some(100.0), None, 1.0);
+        assert!(d0.iter().all(|&v| v == base), "zero pedestal must match legacy output");
+
+        // +100 DN must add exactly 100/65535 to every pixel (in f64, cast once).
+        let out1 = dir.path().join("out1.fits");
+        let mut cfg1 = inputs(dir.path(), light, Some(dark), None, None, true, out1.clone());
+        cfg1.params.pedestal_dn = 100.0;
+        calibrate_light(&cfg1, &AtomicBool::new(false)).unwrap();
+        let (_, _, d1) = read_all(&out1, dir.path());
+        let expected = expect_px_ped(1100.0, Some(100.0), None, 1.0, 100.0);
+        assert!(d1.iter().all(|&v| v == expected), "got {}, want {expected}", d1[0]);
+        assert!(
+            (expected as f64 - base as f64 - 100.0 / OUTPUT_SCALE_DIVISOR).abs() < 1e-9,
+            "pedestal must shift output by exactly pedestal_dn/scale"
+        );
     }
 
     #[test]
@@ -596,10 +745,10 @@ mod tests {
         let (w, h) = (40usize, 25usize);
         let flat = write_fill(dir.path(), "flat_trim.fits", w, h, |x, y| (y * w + x) as f32, &[fnrm_card(999.0)]);
 
-        let trimmed = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed).unwrap();
+        let trimmed = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed, PI_TRIM_FRACTION).unwrap();
         assert!((trimmed - 499.5).abs() < 1e-6, "trimmed {trimmed}, want 499.5 (card ignored)");
 
-        let central = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird).unwrap();
+        let central = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
         assert!((central - 999.0).abs() < 1e-9, "central-third must read the card verbatim, got {central}");
     }
 
@@ -627,12 +776,12 @@ mod tests {
             }
         }
         assert!(data.iter().all(|v| v.is_finite()), "fixture must be NaN-free");
-        let expected = pixinsight_trimmed_mean(&data);
+        let expected = pixinsight_trimmed_mean(&data, PI_TRIM_FRACTION);
         // Sanity: the trimmed mean sits strictly inside the value range.
         let (mn, mx) = data.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
         assert!((mn as f64) < expected && expected < (mx as f64), "trimmed mean {expected} outside ({mn},{mx})");
 
-        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed).unwrap();
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed, PI_TRIM_FRACTION).unwrap();
         assert!((got - expected).abs() < 1e-3, "engine path {got} vs direct formula {expected}");
     }
 

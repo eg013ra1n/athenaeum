@@ -140,6 +140,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::lights::LightCalReadiness,
             crate::api::lights::LightCalScope,
             crate::api::lights::FlatNormMode,
+            crate::api::lights::LightCalParams,
+            crate::api::lights::BiasFallback,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::archive::models::ArchiveDisposition,

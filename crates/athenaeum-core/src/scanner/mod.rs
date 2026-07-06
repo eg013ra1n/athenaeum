@@ -777,6 +777,13 @@ fn reconcile_calibrated_light(
         // and the wanted run normalize, and a mode-only mismatch just prompts a
         // (correct) re-calibrate.
         flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
+        // The advanced parameters aren't fully recoverable from the file:
+        // `bias_fallback` was never stamped (it's a build-time decision, not a
+        // card), so a faithful reconstruction is impossible. Default to `'{}'`,
+        // which normalizes to `LightCalParams::default()` in `derive_status` —
+        // same harmless-for-staleness tradeoff as `flat_norm_mode` above; a real
+        // divergence just prompts a (correct) re-calibrate.
+        cal_params: "{}".to_string(),
         output_hash,
         // Carry the file's own engine version so staleness derivation (§5)
         // correctly flags a file built by an older engine.
@@ -2845,6 +2852,8 @@ mod calibrated_light_scan_tests {
             bias: owned(bias),
             scale_divisor: 65535.0,
             flat_norm_divisor: 1.0,
+            pedestal_dn: 0.0,
+            trim_fraction: None,
         };
         let cards = build_light_cal_cards(&source_cards, &inputs).unwrap();
         let data = vec![0.5f32; 4 * 4];
@@ -2914,6 +2923,7 @@ mod calibrated_light_scan_tests {
             calstat: "BD".to_string(),
             flat_norm_applied: false,
             flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
+            cal_params: "{}".to_string(),
             output_hash: "seed".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
@@ -3268,6 +3278,7 @@ mod calibrated_light_scan_tests {
             calstat: "BD".to_string(),
             flat_norm_applied: false,
             flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
+            cal_params: "{}".to_string(),
             output_hash: "seed".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),

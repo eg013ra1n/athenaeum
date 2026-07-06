@@ -524,3 +524,24 @@ export type LightCalScope = { onlyStale: boolean, };
 
 export type FlatNormMode = "centralThird" | "pixinsightTrimmed";
 
+export type LightCalParams = { 
+/**
+ * Per-tail discard fraction for the `pixinsightTrimmed` statistic
+ * (default [`PI_TRIM_FRACTION`] = 0.05). Only meaningful when the flat is
+ * normalized in `pixinsightTrimmed` mode; stamped as `ATH_CTRM` then.
+ */
+trimFraction: number, 
+/**
+ * DN added to the output AFTER the scale divide (`out += pedestal_dn /
+ * OUTPUT_SCALE_DIVISOR`, default 0 = off), for consumers that clip
+ * negatives. Stamped as `ATH_CPED` (the DN value) always; `CALSTAT`
+ * unchanged — a pedestal is not a calibration step.
+ */
+pedestalDn: number, 
+/**
+ * What to do for a light with no dark master (default `subtractBias`).
+ */
+biasFallback: BiasFallback, };
+
+export type BiasFallback = "subtractBias" | "skipFrame";
+

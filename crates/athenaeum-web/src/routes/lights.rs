@@ -14,7 +14,9 @@ use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
 
-pub use athenaeum_core::api::lights::{FlatNormMode, LightCalReadiness, LightCalScope};
+pub use athenaeum_core::api::lights::{
+    FlatNormMode, LightCalParams, LightCalReadiness, LightCalScope,
+};
 
 // ── Request structs ───────────────────────────────────────────────────────
 
@@ -24,6 +26,10 @@ pub struct GetLightCalibrationReadinessArgs {
     pub set_id: i64,
     pub flat_norm: bool,
     pub flat_norm_mode: FlatNormMode,
+    /// Advanced parameters — `#[serde(default)]` so an omitted field decodes to
+    /// `LightCalParams::default()` (the pre-Advanced-UI frontend omits it).
+    #[serde(default)]
+    pub params: LightCalParams,
 }
 
 #[derive(Deserialize)]
@@ -33,6 +39,10 @@ pub struct StartLightCalibrationArgs {
     pub scope: LightCalScope,
     pub flat_norm: bool,
     pub flat_norm_mode: FlatNormMode,
+    /// Advanced parameters — `#[serde(default)]` so an omitted field decodes to
+    /// `LightCalParams::default()` (the pre-Advanced-UI frontend omits it).
+    #[serde(default)]
+    pub params: LightCalParams,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +64,13 @@ pub async fn get_light_calibration_readiness(
 ) -> Result<Json<LightCalReadiness>, (StatusCode, String)> {
     let ctx = state.ctx.clone();
     let result = tokio::task::spawn_blocking(move || {
-        api::get_light_calibration_readiness(&ctx, args.set_id, args.flat_norm, args.flat_norm_mode)
+        api::get_light_calibration_readiness(
+            &ctx,
+            args.set_id,
+            args.flat_norm,
+            args.flat_norm_mode,
+            args.params,
+        )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Readiness task panicked: {}", e)))?
@@ -84,6 +100,7 @@ pub async fn start_light_calibration(
         args.scope,
         args.flat_norm,
         args.flat_norm_mode,
+        args.params,
     )
     .map(Json)
     .map_err(api_err)

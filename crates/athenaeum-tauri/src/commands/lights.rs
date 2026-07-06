@@ -14,7 +14,9 @@ use crate::tauri_events::TauriProgressEmitter;
 
 use super::AppState;
 
-pub use athenaeum_core::api::lights::{FlatNormMode, LightCalReadiness, LightCalScope};
+pub use athenaeum_core::api::lights::{
+    FlatNormMode, LightCalParams, LightCalReadiness, LightCalScope,
+};
 
 /// Readiness summary + per-frame status for a frame set's LIGHT members.
 /// Pure DB work (no pixel I/O) but run under `spawn_blocking` so the queries
@@ -28,10 +30,14 @@ pub async fn get_light_calibration_readiness(
     set_id: i64,
     flat_norm: bool,
     flat_norm_mode: FlatNormMode,
+    params: Option<LightCalParams>,
 ) -> Result<LightCalReadiness, String> {
+    // `params` is optional so the pre-Advanced-UI frontend keeps working — an
+    // omitted arg deserializes to `None` → `LightCalParams::default()`.
+    let params = params.unwrap_or_default();
     let ctx = state.ctx.clone();
     tokio::task::spawn_blocking(move || {
-        api::get_light_calibration_readiness(&ctx, set_id, flat_norm, flat_norm_mode)
+        api::get_light_calibration_readiness(&ctx, set_id, flat_norm, flat_norm_mode, params)
     })
     .await
     .map_err(|e| format!("Readiness task panicked: {}", e))?
@@ -52,7 +58,11 @@ pub async fn start_light_calibration(
     scope: LightCalScope,
     flat_norm: bool,
     flat_norm_mode: FlatNormMode,
+    params: Option<LightCalParams>,
 ) -> Result<(), String> {
+    // `params` is optional so the pre-Advanced-UI frontend keeps working — an
+    // omitted arg deserializes to `None` → `LightCalParams::default()`.
+    let params = params.unwrap_or_default();
     let emitter = Arc::new(TauriProgressEmitter(app_handle));
     api::start_light_calibration(
         state.ctx.clone(),
@@ -62,6 +72,7 @@ pub async fn start_light_calibration(
         scope,
         flat_norm,
         flat_norm_mode,
+        params,
     )
     .map_err(|e| e.to_string())
 }

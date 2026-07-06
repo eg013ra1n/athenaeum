@@ -1359,6 +1359,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             calstat           TEXT NOT NULL,
             flat_norm_applied INTEGER NOT NULL,
             flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
+            cal_params        TEXT NOT NULL DEFAULT '{}',
             output_hash       TEXT NOT NULL,
             engine_version    INTEGER NOT NULL,
             created_at        TEXT NOT NULL
@@ -1383,6 +1384,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "light_calibrations", "flat_norm_mode")? {
         conn.execute(
             "ALTER TABLE light_calibrations ADD COLUMN flat_norm_mode TEXT NOT NULL DEFAULT 'centralThird'",
+            [],
+        )?;
+    }
+
+    // B5 (2026-07-06): advanced per-run parameters (trim fraction / output
+    // pedestal / bias-fallback policy) as one JSON blob. Same rationale as the
+    // flat_norm_mode ADD COLUMN above — v0.2.5 is unreleased but the owner's dev
+    // DB already carries `light_calibrations` rows, so DEFAULT '{}' preserves
+    // them (an existing row predates every advanced param, so '{}' decodes to
+    // `LightCalParams::default()` = today's behavior). Must run BEFORE the FK
+    // rebuild below so that rebuild's explicit-column INSERT..SELECT finds the
+    // column on the source table.
+    if !column_exists(conn, "light_calibrations", "cal_params")? {
+        conn.execute(
+            "ALTER TABLE light_calibrations ADD COLUMN cal_params TEXT NOT NULL DEFAULT '{}'",
             [],
         )?;
     }
@@ -1425,17 +1441,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
                 calstat           TEXT NOT NULL,
                 flat_norm_applied INTEGER NOT NULL,
                 flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
+                cal_params        TEXT NOT NULL DEFAULT '{}',
                 output_hash       TEXT NOT NULL,
                 engine_version    INTEGER NOT NULL,
                 created_at        TEXT NOT NULL
              );
              INSERT INTO light_calibrations_new
                 (id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
-                 flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, output_hash,
-                 engine_version, created_at)
+                 flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, cal_params,
+                 output_hash, engine_version, created_at)
                 SELECT id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
-                       flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, output_hash,
-                       engine_version, created_at
+                       flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, cal_params,
+                       output_hash, engine_version, created_at
                 FROM light_calibrations;
              DROP TABLE light_calibrations;
              ALTER TABLE light_calibrations_new RENAME TO light_calibrations;

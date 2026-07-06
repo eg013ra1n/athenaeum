@@ -52,6 +52,13 @@ pub struct LightCalCardInputs {
     pub bias: Option<(String, String)>,
     pub scale_divisor: f64,
     pub flat_norm_divisor: f64,
+    /// Output pedestal in DN (advanced param, spec §2). Stamped as `ATH_CPED`
+    /// ALWAYS — even when 0 — so the value that produced this file is on record.
+    pub pedestal_dn: f64,
+    /// Per-tail trim fraction, `Some` only when the `pixinsightTrimmed`
+    /// statistic was actually used (normalization on + PI mode + a flat
+    /// applied); stamped as `ATH_CTRM` then, omitted otherwise.
+    pub trim_fraction: Option<f64>,
 }
 
 /// `ATH_CDRK`/`ATH_CFLT`/`ATH_CBIA` value shape: a single Text card holding
@@ -125,12 +132,25 @@ pub fn build_light_cal_cards(
                 .with_comment("flat-norm divisor (1.0 = off)"),
         )
         .custom(
+            Card::new("ATH_CPED", CardValue::Real(inputs.pedestal_dn))?
+                .with_comment("output pedestal (DN)"),
+        )
+        .custom(
             Card::new(
                 "ATH_CVER",
                 CardValue::Integer(crate::db::light_calibrations::LIGHT_CAL_ENGINE_VERSION),
             )?
             .with_comment("calibration engine version"),
         );
+
+    // The per-tail trim fraction is provenance only in pixinsightTrimmed mode —
+    // stamped only when that statistic was actually used (spec §2).
+    if let Some(trim) = inputs.trim_fraction {
+        b = b.custom(
+            Card::new("ATH_CTRM", CardValue::Real(trim))?
+                .with_comment("flat-norm trim fraction per tail"),
+        );
+    }
 
     Ok(b.build()?)
 }
@@ -149,6 +169,8 @@ mod tests {
             bias: None,
             scale_divisor: 65535.0,
             flat_norm_divisor: 1234.5,
+            pedestal_dn: 0.0,
+            trim_fraction: None,
         }
     }
 
@@ -190,12 +212,39 @@ mod tests {
             Some(CardValue::Integer(v)) if v == crate::db::light_calibrations::LIGHT_CAL_ENGINE_VERSION
         ));
 
+        // ATH_CPED is stamped ALWAYS (0.0 here); ATH_CTRM only in PI mode (absent).
+        let ped = find("ATH_CPED").expect("ATH_CPED card always present");
+        assert!(matches!(ped.value, Some(CardValue::Real(v)) if v.abs() < 1e-9));
+        assert!(find("ATH_CTRM").is_none(), "trim_fraction None -> no ATH_CTRM card");
+
         // Every new keyword respects the 8-char FITS limit.
         for kw in [
             "CALSTAT", "ATH_CSRC", "ATH_CSRN", "ATH_CDRK", "ATH_CFLT", "ATH_CBIA", "ATH_CSCL",
-            "ATH_CFNM", "ATH_CVER",
+            "ATH_CFNM", "ATH_CPED", "ATH_CTRM", "ATH_CVER",
         ] {
             assert!(kw.len() <= 8, "{kw}");
+        }
+    }
+
+    #[test]
+    fn pedestal_and_trim_cards() {
+        // Non-zero pedestal + PI-mode trim → both cards present with their values.
+        let mut inputs = base_inputs();
+        inputs.pedestal_dn = 200.0;
+        inputs.trim_fraction = Some(0.1);
+        let cards = build_light_cal_cards(&[], &inputs).unwrap();
+        let find = |k: &str| cards.iter().find(|c| c.keyword == k);
+
+        let ped = find("ATH_CPED").expect("ATH_CPED card");
+        assert!(matches!(ped.value, Some(CardValue::Real(v)) if (v - 200.0).abs() < 1e-9));
+        let trm = find("ATH_CTRM").expect("ATH_CTRM card in PI mode");
+        assert!(matches!(trm.value, Some(CardValue::Real(v)) if (v - 0.1).abs() < 1e-9));
+
+        // Both must render cleanly (short comments, well under the fixed-card
+        // comment budget).
+        for kw in ["ATH_CPED", "ATH_CTRM"] {
+            crate::fits_writer::card::format_card(find(kw).unwrap())
+                .unwrap_or_else(|e| panic!("{kw} must format cleanly: {e:?}"));
         }
     }
 
@@ -315,7 +364,7 @@ mod tests {
     fn fixed_provenance_cards_never_overflow() {
         let inputs = base_inputs();
         let cards = build_light_cal_cards(&[], &inputs).unwrap();
-        for kw in ["ATH_CSRC", "ATH_CSRN", "ATH_CSCL", "ATH_CFNM", "ATH_CVER"] {
+        for kw in ["ATH_CSRC", "ATH_CSRN", "ATH_CSCL", "ATH_CFNM", "ATH_CPED", "ATH_CVER"] {
             let card = cards.iter().find(|c| c.keyword == kw).unwrap();
             crate::fits_writer::card::format_card(card)
                 .unwrap_or_else(|e| panic!("{kw} must format cleanly: {e:?}"));
