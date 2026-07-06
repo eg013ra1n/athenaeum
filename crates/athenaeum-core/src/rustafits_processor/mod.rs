@@ -156,6 +156,12 @@ pub struct AnnotationSettings {
     pub color_scheme: String,
     /// Draw a direction tick along the elongation axis
     pub show_direction_tick: bool,
+    /// Ellipse semi-axis scale in units of FWHM (semi-major = fwhm_x × scale).
+    /// The historic hardcoded 2.5 drew ~50px lassos on oversampled frames,
+    /// making clean single stars read as blends. Absent in stored JSON from
+    /// older versions → serde default.
+    #[serde(default = "default_ellipse_scale")]
+    pub ellipse_scale: f32,
     /// Minimum ellipse semi-axis radius in output pixels
     pub min_radius: f32,
     /// Maximum ellipse semi-axis radius in output pixels
@@ -172,11 +178,16 @@ pub struct AnnotationSettings {
     pub fwhm_warn: f32,
 }
 
+fn default_ellipse_scale() -> f32 {
+    1.2
+}
+
 impl Default for AnnotationSettings {
     fn default() -> Self {
         Self {
             color_scheme: "eccentricity".to_string(),
             show_direction_tick: true,
+            ellipse_scale: default_ellipse_scale(),
             min_radius: 6.0,
             max_radius: 60.0,
             line_width: 2,

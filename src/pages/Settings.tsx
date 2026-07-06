@@ -1126,6 +1126,16 @@ export default function Settings() {
                 />
               </div>
               <div>
+                <label className="block text-xs text-content-secondary mb-1">Ellipse Scale (&times;FWHM)</label>
+                <input
+                  type="number"
+                  value={annotationSettings.ellipse_scale}
+                  onChange={e => setAnnotationSettings(prev => ({ ...prev, ellipse_scale: parseFloat(e.target.value) || 1.2 }))}
+                  min="0.5" max="4" step="0.1"
+                  className="w-full bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
+                />
+              </div>
+              <div>
                 <label className="block text-xs text-content-secondary mb-1">Min Radius (px)</label>
                 <input
                   type="number"

@@ -62,6 +62,13 @@ color_scheme: string,
  */
 show_direction_tick: boolean, 
 /**
+ * Ellipse semi-axis scale in units of FWHM (semi-major = fwhm_x × scale).
+ * The historic hardcoded 2.5 drew ~50px lassos on oversampled frames,
+ * making clean single stars read as blends. Absent in stored JSON from
+ * older versions → serde default.
+ */
+ellipse_scale: number, 
+/**
  * Minimum ellipse semi-axis radius in output pixels
  */
 min_radius: number, 

@@ -735,6 +735,7 @@ export const DEFAULT_ANALYSIS_CONFIG: AnalysisConfig = {
 export const DEFAULT_ANNOTATION_SETTINGS: AnnotationSettings = {
   color_scheme: 'eccentricity',
   show_direction_tick: true,
+  ellipse_scale: 1.2,
   min_radius: 6.0,
   max_radius: 60.0,
   line_width: 2,

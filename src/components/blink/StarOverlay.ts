@@ -52,7 +52,7 @@ function starColor(star: StarMetric, settings: AnnotationSettings): string {
  * Mirrors the coordinate transform in rustafits annotate.rs compute_annotations():
  *   scale_x = output_width / result.width
  *   x_out   = star.x * scale_x
- *   semi_a  = (fwhm_x * scale_x * 2.5).clamp(min_radius, max_radius)
+ *   semi_a  = (fwhm_x * scale_x * ellipse_scale).clamp(min_radius, max_radius)
  *
  * In the canvas context, "output" space is the rendered image rectangle
  * (offsetX..offsetX+renderWidth, offsetY..offsetY+renderHeight), and
@@ -77,10 +77,11 @@ export function drawStarOverlay(
       ? transform.offsetY + transform.renderHeight - 1 - star.y * scaleY
       : transform.offsetY + star.y * scaleY;
 
-    // Semi-axes: match rustafits — fwhm * scale * 2.5, clamped to fixed canvas-pixel limits.
-    // min_radius / max_radius are in canvas pixels (not analysis pixels).
-    const rawA = star.fwhm_x * scaleX * 2.5;
-    const rawB = star.fwhm_y * scaleY * 2.5;
+    // Semi-axes: match rustafits — fwhm * scale * ellipse_scale, clamped to
+    // fixed canvas-pixel limits (min_radius / max_radius are canvas pixels).
+    const ellipseScale = settings.ellipse_scale ?? 1.2;
+    const rawA = star.fwhm_x * scaleX * ellipseScale;
+    const rawB = star.fwhm_y * scaleY * ellipseScale;
     const semiMajor = Math.max(settings.min_radius, Math.min(settings.max_radius, rawA));
     const semiMinor = Math.max(settings.min_radius, Math.min(settings.max_radius, rawB));
 
