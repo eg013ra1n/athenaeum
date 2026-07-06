@@ -520,6 +520,8 @@ export type LightCalReadiness = { frames: Array<LightFrameReadiness>, readyCount
  */
 rawSetIdsToBuild: Array<number>, };
 
+export type ExportReadiness = { total: number, calibrated: number, stale: number, missing: number, };
+
 export type LightCalDetails = { frameId: number, 
 /**
  * CALSTAT recorded on the calibrated output (`"BDF"`, `"BF"`, `"BD"`, …).

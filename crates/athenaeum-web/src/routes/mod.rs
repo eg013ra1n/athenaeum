@@ -161,6 +161,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_export_preview", post(export::get_export_preview))
         .route("/api/get_exportable_frame_sets", post(export::get_exportable_frame_sets))
         .route("/api/get_calibration_route", post(export::get_calibration_route))
+        .route("/api/get_export_readiness", post(export::get_export_readiness))
         .route("/api/export_to_wbpp", post(export::export_to_wbpp))
         .route("/api/cancel_export", post(export::cancel_export))
         .route("/api/get_export_summary", post(export::get_export_summary))

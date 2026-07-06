@@ -3,16 +3,18 @@
 //! Collects light frames from a frame set and their linked calibrations
 //! to prepare data for export.
 
+use crate::db::light_calibrations::get_light_calibration_for_frame;
 use crate::export::models::{
     CalibrationDetail, CalibrationSetInfo, CalibrationSubgroup, CalibrationSummary, CameraType,
-    DetailedWarning, ExportCalibrationSet, ExportData, ExportFrame, ExportGroup, ExportSummary,
-    ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode, FolderNodeType,
-    FolderPreview, FrameDetail, MasterCreationPlan, MasterInfo, WarningSeverity, WarningType,
-    WbppExportConfig,
+    DetailedWarning, ExportCalibrationSet, ExportData, ExportFrame, ExportGroup, ExportMode,
+    ExportSummary, ExposureGroup, FilterExportGroup, FilterGroupSummary, FolderNode,
+    FolderNodeType, FolderPreview, FrameDetail, MasterCreationPlan, MasterInfo, WarningSeverity,
+    WarningType, WbppExportConfig,
 };
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// Collect all export data for a frame set
 ///
@@ -159,6 +161,148 @@ pub fn collect_export_data(conn: &Connection, frame_set_id: i64) -> Result<Expor
         total_light_frames,
         total_exposure_seconds,
     })
+}
+
+// ============================================================================
+// Export Mode transform (spec §12.2)
+// ============================================================================
+
+/// Rewrite an already-collected [`ExportData`] for the chosen [`ExportMode`],
+/// returning per-set omission warnings to fold into the export summary.
+///
+/// - [`ExportMode::RawWithCalibrationSets`] (default): no change — the caller
+///   gets today's behavior bit-for-bit (zero-regression path).
+/// - [`ExportMode::RawWithMasters`]: lights stay raw; every linked calibration
+///   set that is NOT a built master-library set (`is_master_library = 1`) has
+///   its frames dropped so only master files are placed, and each dropped set
+///   contributes one warning.
+/// - [`ExportMode::CalibratedLights`]: each light's raw file is swapped for its
+///   `light_calibrations.output_path` artifact (`c_*.fits`) and ALL calibration
+///   nodes are dropped (WBPP runs with calibration disabled). Errors if any
+///   in-scope light has no tracking row — the strict readiness gate (§12.2) must
+///   run first at the API layer; this is the defensive backstop that guarantees
+///   we never write a partial silent export.
+pub fn apply_export_mode(
+    conn: &Connection,
+    data: &mut ExportData,
+    mode: ExportMode,
+) -> Result<Vec<String>> {
+    tracing::debug!(frame_set_id = data.frame_set_id, ?mode, "applying export mode");
+    match mode {
+        ExportMode::RawWithCalibrationSets => Ok(Vec::new()),
+        ExportMode::RawWithMasters => apply_raw_with_masters(conn, data),
+        ExportMode::CalibratedLights => apply_calibrated_lights(conn, data),
+    }
+}
+
+/// `is_master_library = 1` for `set_id`? A missing row (dangling link) counts as
+/// not-a-master so its frames are dropped and reported, never silently kept.
+fn is_master_set(conn: &Connection, set_id: i64) -> Result<bool> {
+    let flag: Option<i64> = conn
+        .query_row(
+            "SELECT is_master_library FROM calibration_set WHERE id = ?1",
+            [set_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(flag == Some(1))
+}
+
+fn apply_raw_with_masters(conn: &Connection, data: &mut ExportData) -> Result<Vec<String>> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut omitted: HashSet<i64> = HashSet::new();
+    for group in &mut data.groups {
+        for subgroup in &mut group.subgroups {
+            for node in [
+                subgroup.flat.as_mut(),
+                subgroup.dark.as_mut(),
+                subgroup.bias.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                filter_masters_recursive(conn, node, &mut warnings, &mut omitted)?;
+            }
+        }
+    }
+    tracing::debug!(
+        frame_set_id = data.frame_set_id,
+        omitted = omitted.len(),
+        "raw+masters mode: raw calibration sets dropped"
+    );
+    Ok(warnings)
+}
+
+/// Drop the frames of every non-master set in one calibration subtree, recording
+/// a one-per-set warning. Master nodes keep their (single) master file.
+fn filter_masters_recursive(
+    conn: &Connection,
+    info: &mut CalibrationSetInfo,
+    warnings: &mut Vec<String>,
+    omitted: &mut HashSet<i64>,
+) -> Result<()> {
+    if !is_master_set(conn, info.set_id)? {
+        if !info.frames.is_empty() && omitted.insert(info.set_id) {
+            warnings.push(format!(
+                "Raw {} set #{} omitted — no master built (Raw + Masters mode exports master files only)",
+                info.imagetyp, info.set_id
+            ));
+        }
+        info.frames.clear();
+        info.frame_count = 0;
+    }
+    if let Some(node) = info.dark_flat.as_mut() {
+        filter_masters_recursive(conn, node, warnings, omitted)?;
+    }
+    if let Some(node) = info.dark.as_mut() {
+        filter_masters_recursive(conn, node, warnings, omitted)?;
+    }
+    if let Some(node) = info.bias.as_mut() {
+        filter_masters_recursive(conn, node, warnings, omitted)?;
+    }
+    Ok(())
+}
+
+fn apply_calibrated_lights(conn: &Connection, data: &mut ExportData) -> Result<Vec<String>> {
+    let mut missing: Vec<i64> = Vec::new();
+    let mut total = 0usize;
+    for group in &mut data.groups {
+        for subgroup in &mut group.subgroups {
+            // No calibration frames are exported — WBPP runs with calibration
+            // disabled, so the BIAS/DARKS/FLAT nesting is dropped entirely and
+            // the lights land directly under the camera folder.
+            subgroup.flat = None;
+            subgroup.dark = None;
+            subgroup.bias = None;
+            for frame in &mut subgroup.frames {
+                total += 1;
+                match get_light_calibration_for_frame(conn, frame.frame_id)? {
+                    Some(row) => {
+                        let filename = Path::new(&row.output_path)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| format!("c_{}", frame.filename));
+                        frame.file_path = row.output_path;
+                        frame.filename = filename;
+                    }
+                    None => missing.push(frame.frame_id),
+                }
+            }
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
+            missing.len(),
+            total
+        );
+    }
+    tracing::debug!(
+        frame_set_id = data.frame_set_id,
+        lights = total,
+        "calibrated-lights mode: substituted artifact paths"
+    );
+    Ok(Vec::new())
 }
 
 /// Get frame set name and object name
@@ -2046,5 +2190,266 @@ mod tests {
             bias_id: None,
         };
         assert_eq!(links_none.subgroup_key(), "fnone_dnone_bnone");
+    }
+}
+
+/// Export-mode transform (spec §12.2) against a seeded in-memory catalog.
+#[cfg(test)]
+mod export_mode_tests {
+    use super::{apply_export_mode, collect_export_data};
+    use crate::db::light_calibrations::{
+        upsert_light_calibration, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
+    };
+    use crate::db::schema::init_db;
+    use crate::export::models::ExportMode;
+    use rusqlite::{params, Connection};
+
+    fn mem() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    /// Frame set + one imaging night + one session; returns `session_id`.
+    fn seed_frame_set(conn: &Connection, fs_id: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (?1, ?2)",
+            params![fs_id, format!("Obj {fs_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
+             VALUES (?1, '2026-07-05T20:00:00Z', '2026-07-05T23:00:00Z')",
+            params![fs_id],
+        )
+        .unwrap();
+        let night_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'TestCam')",
+            params![night_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn seed_light(conn: &Connection, frame_id: i64, session_id: i64, filter: Option<&str>) {
+        let file_id = frame_id + 2_000_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                file_id,
+                format!("/test/light_{frame_id}.fits"),
+                format!("light_{frame_id}.fits")
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs, filter)
+             VALUES (?1, ?2, 'Light', 'TestCam', 'M31', '2026-07-05T20:30:00Z', ?3)",
+            params![frame_id, file_id, filter],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+            params![session_id, frame_id],
+        )
+        .unwrap();
+    }
+
+    /// A raw (non-master) calibration set with `n` member frames on disk.
+    fn seed_raw_set(conn: &Connection, set_id: i64, imagetyp: &str, n: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2026-07-05', 0)",
+            params![set_id, imagetyp],
+        )
+        .unwrap();
+        for i in 0..n {
+            let file_id = set_id * 100 + i + 5_000_000;
+            let frame_id = set_id * 100 + i + 6_000_000;
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+                params![
+                    file_id,
+                    format!("/raw/{imagetyp}_{set_id}_{i}.fits"),
+                    format!("{imagetyp}_{set_id}_{i}.fits")
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, ?3)",
+                params![frame_id, file_id, imagetyp],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// A MASTER calibration set (`is_master_library = 1`) with one member file.
+    fn seed_master_set(conn: &Connection, set_id: i64, imagetyp: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2026-07-05', 1)",
+            params![set_id, imagetyp],
+        )
+        .unwrap();
+        let file_id = set_id + 3_000_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                file_id,
+                format!("/lib/master_{set_id}.fits"),
+                format!("master_{set_id}.fits")
+            ],
+        )
+        .unwrap();
+        let frame_id = set_id + 4_000_000;
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, is_master) VALUES (?1, ?2, ?3, 1)",
+            params![frame_id, file_id, imagetyp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![set_id, frame_id],
+        )
+        .unwrap();
+        set_id
+    }
+
+    fn add_link(conn: &Connection, frame_id: i64, set_id: i64, cal_type: &str) {
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (?1, 'frame', ?2, ?3, '2026-07-05T00:00:00Z')",
+            params![frame_id, set_id, cal_type],
+        )
+        .unwrap();
+    }
+
+    fn track_row(frame_id: i64, output_path: &str, dark_set_id: Option<i64>) -> LightCalRow {
+        LightCalRow {
+            id: 0,
+            frame_id: Some(frame_id),
+            source_uuid: None,
+            source_filename: Some(format!("light_{frame_id}.fits")),
+            output_path: output_path.to_string(),
+            dark_set_id,
+            flat_set_id: None,
+            bias_set_id: None,
+            calstat: "BD".to_string(),
+            flat_norm_applied: false,
+            flat_norm_mode: "centralThird".to_string(),
+            output_hash: "hash".to_string(),
+            engine_version: LIGHT_CAL_ENGINE_VERSION,
+            created_at: "2026-07-05T21:00:00Z".to_string(),
+            cal_params: "{}".to_string(),
+        }
+    }
+
+    /// Regression pin: the default mode never touches the collected data.
+    #[test]
+    fn default_mode_is_bit_for_bit_noop() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        add_link(&conn, 10, dark, "Dark");
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let before = serde_json::to_value(&data).unwrap();
+        let warnings =
+            apply_export_mode(&conn, &mut data, ExportMode::RawWithCalibrationSets).unwrap();
+        assert!(warnings.is_empty(), "default mode emits no warnings");
+        assert_eq!(
+            serde_json::to_value(&data).unwrap(),
+            before,
+            "default mode must leave ExportData unchanged"
+        );
+    }
+
+    /// Raw+Masters keeps master files, drops raw-set frames, and reports the omission.
+    #[test]
+    fn raw_with_masters_drops_raw_and_reports() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2); // raw → dropped
+        let flat = seed_master_set(&conn, 200, "Flat"); // master → kept
+        add_link(&conn, 10, dark, "Dark");
+        add_link(&conn, 10, flat, "Flat");
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        // Sanity: collection captured the raw dark (2) and master flat (1).
+        {
+            let sg = &data.groups[0].subgroups[0];
+            assert_eq!(sg.dark.as_ref().unwrap().frames.len(), 2);
+            assert_eq!(sg.flat.as_ref().unwrap().frames.len(), 1);
+        }
+
+        let warnings = apply_export_mode(&conn, &mut data, ExportMode::RawWithMasters).unwrap();
+
+        let sg = &data.groups[0].subgroups[0];
+        assert_eq!(sg.dark.as_ref().unwrap().frames.len(), 0, "raw dark frames dropped");
+        assert_eq!(sg.dark.as_ref().unwrap().frame_count, 0);
+        assert_eq!(sg.flat.as_ref().unwrap().frames.len(), 1, "master flat retained");
+        assert!(
+            warnings.iter().any(|w| w.contains("#100")),
+            "omitted raw set reported, got {warnings:?}"
+        );
+    }
+
+    /// CalibratedLights swaps the raw light for its artifact and drops calibration.
+    #[test]
+    fn calibrated_lights_substitutes_artifact_paths() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha"));
+        let dark = seed_raw_set(&conn, 100, "Dark", 2);
+        add_link(&conn, 10, dark, "Dark");
+        upsert_light_calibration(
+            &conn,
+            &track_row(10, "/lib/M31/TestCam/2026-07-05/c_light_10.fits", Some(dark)),
+        )
+        .unwrap();
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let warnings =
+            apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights).unwrap();
+        assert!(warnings.is_empty());
+
+        let sg = &data.groups[0].subgroups[0];
+        assert!(sg.flat.is_none() && sg.dark.is_none() && sg.bias.is_none(), "no calibration frames");
+        assert_eq!(sg.frames.len(), 1);
+        assert_eq!(
+            sg.frames[0].file_path,
+            "/lib/M31/TestCam/2026-07-05/c_light_10.fits",
+            "light source is the calibrated artifact"
+        );
+        assert_eq!(sg.frames[0].filename, "c_light_10.fits");
+    }
+
+    /// The strict gate errors (never a partial silent export) when a light has no
+    /// calibrated output.
+    #[test]
+    fn calibrated_lights_gate_errors_on_missing_output() {
+        let conn = mem();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 10, session, Some("Ha")); // no tracking row
+
+        let mut data = collect_export_data(&conn, 1).unwrap();
+        let err = apply_export_mode(&conn, &mut data, ExportMode::CalibratedLights).unwrap_err();
+        assert!(
+            err.to_string().contains("lack a fresh calibrated output"),
+            "gate message, got: {err}"
+        );
     }
 }

@@ -341,6 +341,7 @@ pub fn run() {
             commands::get_export_preview,
             commands::get_exportable_frame_sets,
             commands::get_calibration_route,
+            commands::get_export_readiness,
             commands::export_to_wbpp,
             commands::cancel_export,
             commands::get_export_summary,

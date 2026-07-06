@@ -4,13 +4,15 @@
 
 use crate::commands::{AppState, ExportHandle};
 use crate::export::{
-    collect_export_data, collect_export_summary, organize_files_wbpp,
+    apply_export_mode, collect_export_data, collect_export_summary, organize_files_wbpp,
     models::{
         CalibrationRoute, CalibrationRouteGroup, CalibrationRouteSummary, CalibrationTreeNode,
-        ExportCompleteEvent, ExportData, ExportProgressEvent, ExportResult, ExportSummary,
-        WbppExportConfig,
+        ExportCompleteEvent, ExportData, ExportMode, ExportProgressEvent, ExportResult,
+        ExportSummary, WbppExportConfig,
     },
 };
+use athenaeum_core::api::lights::get_export_readiness as api_get_export_readiness;
+use athenaeum_core::api::lights::{ExportReadiness, FlatNormMode, LightCalParams};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -410,6 +412,31 @@ pub async fn get_calibration_route(
     })
 }
 
+/// Export-readiness tallies for the WBPP export dialog's mode selector
+/// (spec §12.2). Read-only; run under `spawn_blocking` so the derived-status
+/// queries stay off the async executor. `params` is optional so the pre-mode-UI
+/// frontend keeps compiling — an omitted arg defaults to
+/// [`LightCalParams::default`].
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_export_readiness(
+    state: State<'_, AppState>,
+    set_id: i64,
+    mode: ExportMode,
+    flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
+    params: Option<LightCalParams>,
+) -> Result<ExportReadiness, String> {
+    let params = params.unwrap_or_default();
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        api_get_export_readiness(&ctx, set_id, mode, flat_norm, flat_norm_mode, params)
+    })
+    .await
+    .map_err(|e| format!("Export readiness task panicked: {}", e))?
+    .map_err(|e| e.to_string())
+}
+
 /// Export a frame set to PixInsight WBPP folder structure
 ///
 /// Creates a folder structure optimized for PixInsight's Weighted Batch Preprocessing (WBPP):
@@ -422,6 +449,13 @@ pub async fn get_calibration_route(
 ///         └── lights/
 ///             └── (light frames)
 /// ```
+///
+/// The `export_mode` in the persisted [`WbppExportConfig`] controls what the
+/// lights + calibration side put on disk (spec §12.2). `flat_norm` /
+/// `flat_norm_mode` / `params` are the caller's calibration preferences, used
+/// only by the `calibratedLights` strict gate; they are optional so the
+/// pre-mode-UI frontend keeps working (defaults: normalize ON, central-third,
+/// default advanced params).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn export_to_wbpp(
@@ -430,6 +464,9 @@ pub async fn export_to_wbpp(
     frame_set_id: i64,
     output_dir: String,
     use_symlinks: bool,
+    flat_norm: Option<bool>,
+    flat_norm_mode: Option<FlatNormMode>,
+    params: Option<LightCalParams>,
 ) -> Result<ExportResult, String> {
     // Create cancel flag and register export
     let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -454,68 +491,98 @@ pub async fn export_to_wbpp(
     );
 
     // Collect export data and config
-    let (export_data, config) = {
+    let (mut export_data, config) = {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
         let data = collect_export_data(&conn, frame_set_id).map_err(|e| e.to_string())?;
         let cfg = load_wbpp_config(&conn).unwrap_or_default();
         (data, cfg)
     };
+    let mode = config.export_mode;
 
     let output_path = PathBuf::from(&output_dir);
+
+    let make_fail = |error: String| ExportResult {
+        success: false,
+        output_dir: output_dir.clone(),
+        files_organized: 0,
+        scripts_generated: Vec::new(),
+        warnings: Vec::new(),
+        error: Some(error),
+    };
+
+    // Strict gate (spec §12.2) + mode transform. `prepare` returns the
+    // per-set omission warnings to fold into the final result, or an Err
+    // message that aborts the export before any file is written.
+    let prepare = |export_data: &mut ExportData| -> Result<Vec<String>, String> {
+        if mode == ExportMode::CalibratedLights {
+            let readiness = api_get_export_readiness(
+                &state.ctx,
+                frame_set_id,
+                mode,
+                flat_norm.unwrap_or(true),
+                flat_norm_mode.unwrap_or(FlatNormMode::CentralThird),
+                params.clone().unwrap_or_default(),
+            )
+            .map_err(|e| e.to_string())?;
+            let not_ready = readiness.missing + readiness.stale;
+            if not_ready > 0 {
+                return Err(format!(
+                    "{} of {} lights lack a fresh calibrated output — run Calibrate Lights first",
+                    not_ready, readiness.total
+                ));
+            }
+        }
+        let db = state.ctx.db.get().ok_or("Database not initialized")?;
+        let conn = db.conn();
+        apply_export_mode(&conn, export_data, mode).map_err(|e| e.to_string())
+    };
 
     // Organize files into WBPP structure (with progress events + cancel support)
     let cancelled = cancel_flag.load(Ordering::Relaxed);
     let result = if cancelled {
-        ExportResult {
-            success: false,
-            output_dir: output_dir.clone(),
-            files_organized: 0,
-            scripts_generated: Vec::new(),
-            warnings: Vec::new(),
-            error: Some("Export cancelled".to_string()),
-        }
+        make_fail("Export cancelled".to_string())
     } else {
-        let export_emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
-        match organize_files_wbpp(
-            &output_path,
-            &export_data,
-            use_symlinks,
-            &config,
-            Some(&export_emitter as &dyn athenaeum_core::events::ProgressEmitter),
-            frame_set_id,
-            &cancel_flag,
-        ) {
-            Ok(org_result) => {
-                let was_cancelled = cancel_flag.load(Ordering::Relaxed);
-                if was_cancelled {
-                    ExportResult {
-                        success: false,
-                        output_dir: output_dir.clone(),
-                        files_organized: org_result.files_organized,
-                        scripts_generated: Vec::new(),
-                        warnings: org_result.warnings,
-                        error: Some("Export cancelled".to_string()),
+        match prepare(&mut export_data) {
+            Err(e) => make_fail(e),
+            Ok(mode_warnings) => {
+                let export_emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
+                match organize_files_wbpp(
+                    &output_path,
+                    &export_data,
+                    use_symlinks,
+                    &config,
+                    Some(&export_emitter as &dyn athenaeum_core::events::ProgressEmitter),
+                    frame_set_id,
+                    &cancel_flag,
+                ) {
+                    Ok(org_result) => {
+                        let was_cancelled = cancel_flag.load(Ordering::Relaxed);
+                        let mut warnings = org_result.warnings;
+                        warnings.extend(mode_warnings);
+                        if was_cancelled {
+                            ExportResult {
+                                success: false,
+                                output_dir: output_dir.clone(),
+                                files_organized: org_result.files_organized,
+                                scripts_generated: Vec::new(),
+                                warnings,
+                                error: Some("Export cancelled".to_string()),
+                            }
+                        } else {
+                            ExportResult {
+                                success: true,
+                                output_dir: output_dir.clone(),
+                                files_organized: org_result.files_organized,
+                                scripts_generated: Vec::new(),
+                                warnings,
+                                error: None,
+                            }
+                        }
                     }
-                } else {
-                    ExportResult {
-                        success: true,
-                        output_dir: output_dir.clone(),
-                        files_organized: org_result.files_organized,
-                        scripts_generated: Vec::new(),
-                        warnings: org_result.warnings,
-                        error: None,
-                    }
+                    Err(e) => make_fail(format!("Failed to organize files: {}", e)),
                 }
-            },
-            Err(e) => ExportResult {
-                success: false,
-                output_dir: output_dir.clone(),
-                files_organized: 0,
-                scripts_generated: Vec::new(),
-                warnings: Vec::new(),
-                error: Some(format!("Failed to organize files: {}", e)),
-            },
+            }
         }
     };
 

@@ -45,6 +45,7 @@ use crate::db::light_calibrations::{
     LightCalStatus, LIGHT_CAL_ENGINE_VERSION,
 };
 use crate::events::{emit_event, ProgressEmitter};
+use crate::export::models::ExportMode;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::{Card, CardValue};
 use crate::integration::IntegrationError;
@@ -97,6 +98,21 @@ pub struct LightCalReadiness {
     /// is the number of master builds; `raw_set_count` is the number of
     /// affected frames (a single raw set can serve many frames).
     pub raw_set_ids_to_build: Vec<i64>,
+}
+
+/// Export-readiness tallies for the WBPP export dialog's mode selector
+/// (spec §12.2). Reported per frame set: `total` = in-scope LIGHT members,
+/// `calibrated` = fresh calibrated outputs, `stale` = has an output but its
+/// derived status is Stale/Partial, `missing` = no calibrated output at all.
+/// The dialog blocks the `calibratedLights` mode (and the export command
+/// re-checks) while `stale + missing > 0`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportReadiness {
+    pub total: i64,
+    pub calibrated: i64,
+    pub stale: i64,
+    pub missing: i64,
 }
 
 /// Per-frame calibration recipe for the Calibration Coverage lights table
@@ -318,6 +334,74 @@ pub fn get_light_calibration_readiness(
     let db = db(ctx)?;
     let conn = db.conn();
     compute_readiness(&conn, set_id, flat_norm, flat_norm_mode, params)
+}
+
+// ── Export readiness gate (spec §12.2) ───────────────────────────────────────
+
+/// Tally per-frame calibration status for a frame set's LIGHT members, in the
+/// four buckets the export dialog's `calibratedLights` gate needs. Pure DB work
+/// (no pixel I/O). For the two raw modes there is nothing to gate — the raw
+/// lights are always on hand — so everything counts as `calibrated` and the
+/// caller never blocks.
+fn compute_export_readiness(
+    conn: &Connection,
+    set_id: i64,
+    mode: ExportMode,
+    flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
+    params: LightCalParams,
+) -> Result<ExportReadiness, ApiError> {
+    let members = load_light_members(conn, set_id)?;
+    let total = members.len() as i64;
+
+    if mode != ExportMode::CalibratedLights {
+        return Ok(ExportReadiness {
+            total,
+            calibrated: total,
+            stale: 0,
+            missing: 0,
+        });
+    }
+
+    let mut calibrated = 0i64;
+    let mut stale = 0i64;
+    let mut missing = 0i64;
+    for (frame_id, _filename) in members {
+        let links = get_links_for_frame(conn, frame_id)?;
+        match derive_status(conn, frame_id, &links, flat_norm, flat_norm_mode, &params)? {
+            LightCalStatus::Calibrated => calibrated += 1,
+            // Partial (new coverage available) is not a fresh full output — for
+            // an export it must be recalibrated, so it groups with Stale.
+            LightCalStatus::Stale | LightCalStatus::Partial => stale += 1,
+            LightCalStatus::NotCalibrated => missing += 1,
+        }
+    }
+
+    tracing::debug!(set_id, total, calibrated, stale, missing, "export readiness computed");
+    Ok(ExportReadiness {
+        total,
+        calibrated,
+        stale,
+        missing,
+    })
+}
+
+/// Export-readiness tallies for the WBPP export dialog + the `calibratedLights`
+/// strict gate (spec §12.2). `flat_norm` / `flat_norm_mode` / `params` are the
+/// caller's calibration preferences; staleness is derived against them exactly
+/// like [`get_light_calibration_readiness`], so a frame calibrated with settings
+/// the user has since changed reads as stale and blocks the export.
+pub fn get_export_readiness(
+    ctx: &ServiceContext,
+    set_id: i64,
+    mode: ExportMode,
+    flat_norm: bool,
+    flat_norm_mode: FlatNormMode,
+    params: LightCalParams,
+) -> Result<ExportReadiness, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    compute_export_readiness(&conn, set_id, mode, flat_norm, flat_norm_mode, params)
 }
 
 // ── Per-frame recipe details (spec §12.1) ────────────────────────────────────

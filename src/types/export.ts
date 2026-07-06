@@ -764,12 +764,20 @@ phase: string, };
 
 export type ExportCompleteEvent = { frameSetId: number, success: boolean, filesOrganized: number, warnings: Array<string>, error: string | null, outputDir: string, };
 
+export type ExportMode = "calibratedLights" | "rawWithMasters" | "rawWithCalibrationSets";
+
 export type WbppExportConfig = { 
 /**
  * Keyword nesting order (outermost first).
  * Default: ["CAMERA", "BIAS", "DARKS", "FLAT"]
  */
-keywordOrder: Array<string>, };
+keywordOrder: Array<string>, 
+/**
+ * What the export writes for lights + calibration (spec §12.2). Defaults
+ * to [`ExportMode::RawWithCalibrationSets`] (today's behavior) so a config
+ * persisted before this field existed loads unchanged.
+ */
+exportMode: ExportMode, };
 
 export type WbppSetupInstructions = { 
 /**

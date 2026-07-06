@@ -691,6 +691,34 @@ pub enum WarningSeverity {
 // WBPP Export Configuration
 // ============================================================================
 
+/// What a WBPP export puts on disk for the lights + calibration side (spec §12.2).
+///
+/// The default ([`ExportMode::RawWithCalibrationSets`]) reproduces the historical
+/// behavior bit-for-bit, so an existing config (which never carried this field)
+/// deserializes via `#[serde(default)]` into zero behavioral change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportMode {
+    /// Export the `c_*.fits` calibrated-light artifacts in place of the raw
+    /// lights, with NO calibration frames at all (WBPP runs with its own
+    /// calibration disabled). Strictly gated: every in-scope light must have a
+    /// fresh calibrated output first.
+    CalibratedLights,
+    /// Raw lights as today, but the calibration side exports ONLY built master
+    /// files (`calibration_set.is_master_library = 1`); raw non-master sets are
+    /// omitted, each reported as an export warning.
+    RawWithMasters,
+    /// Current behavior (default): raw lights plus whatever raw calibration sets
+    /// are linked.
+    RawWithCalibrationSets,
+}
+
+impl Default for ExportMode {
+    fn default() -> Self {
+        ExportMode::RawWithCalibrationSets
+    }
+}
+
 /// Configuration for WBPP export folder hierarchy
 ///
 /// Controls the keyword nesting order used to build the folder structure.
@@ -702,6 +730,11 @@ pub struct WbppExportConfig {
     /// Keyword nesting order (outermost first).
     /// Default: ["CAMERA", "BIAS", "DARKS", "FLAT"]
     pub keyword_order: Vec<String>,
+    /// What the export writes for lights + calibration (spec §12.2). Defaults
+    /// to [`ExportMode::RawWithCalibrationSets`] (today's behavior) so a config
+    /// persisted before this field existed loads unchanged.
+    #[serde(default)]
+    pub export_mode: ExportMode,
 }
 
 impl Default for WbppExportConfig {
@@ -713,6 +746,7 @@ impl Default for WbppExportConfig {
                 "DARKS".to_string(),
                 "FLAT".to_string(),
             ],
+            export_mode: ExportMode::default(),
         }
     }
 }
