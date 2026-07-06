@@ -12,16 +12,25 @@
 //!
 //! # Transitions
 //!
-//! - `enqueue → Queued` (handle, synchronously) → the worker `serve`s + announces
-//!   → `Announced` → `Transferring`.
+//! - `enqueue → Queued` (the worker inserts the row) → the worker `serve`s +
+//!   announces → `Announced` → `Transferring`.
+//! - A **first-attempt** build / `serve` / `announce` failure — the normal
+//!   "peer is asleep when we queue" case — is retryable, not fatal. The package
+//!   keeps a pending retry slot with a deadline and stays `Queued` until an
+//!   announce succeeds, so [`handle_timeouts`](Worker::handle_timeouts) walks it
+//!   toward [`SyncConfig::max_attempts`] → `Failed`. It either eventually
+//!   announces (peer came online) or terminalizes — it is never left
+//!   non-terminal with no retry slot.
 //! - The sender observes no `FetchProgress` on loopback (fetch is
-//!   receiver-driven), so `Transferring` is marked immediately after a
-//!   successful announce — the in-flight window during which we await the ack.
-//!   A `FetchProgress` arm remains for real transports and is a no-op here.
+//!   receiver-driven), so `Transferring` is marked on the first *successful*
+//!   announce — the in-flight window during which we await the ack. A
+//!   `FetchProgress` arm remains for real transports and is a no-op here.
 //! - `AckReceived → Confirmed` (idempotent: a second ack for a package no longer
 //!   in the in-flight map is logged at debug and dropped).
-//! - Per-package ack timeout → `bump_attempts` + re-announce, until
-//!   [`SyncConfig::max_attempts`] → `Failed`.
+//! - Per-package ack/retry timeout → `bump_attempts` + re-announce, until
+//!   [`SyncConfig::max_attempts`] → `Failed`. A persistently-erroring
+//!   re-announce re-arms its deadline every time, so it advances toward `Failed`
+//!   rather than busy-spinning.
 //! - [`cancel`](SyncEngineHandle::cancel) → `Failed` with a `cancelled` history
 //!   outcome.
 
@@ -90,16 +99,26 @@ enum Command {
     Shutdown,
 }
 
-/// In-flight bookkeeping for one package awaiting its ack. Keyed in the worker's
-/// map by the (per-session) `package_id` the peer will ack with.
+/// In-flight bookkeeping for one package. Keyed in the worker's map by the
+/// durable row `id` (not the per-session `package_id`) so a slot can exist even
+/// before an announce has been successfully minted — the retry safety net for a
+/// first-attempt failure against an offline peer.
 struct Pending {
     id: i64,
     dir: PathBuf,
-    announce: PackageAnnounce,
+    /// The announce minted for this package. `None` until the first successful
+    /// build (a prior build failure leaves it `None` and the next attempt
+    /// rebuilds); once `Some`, its `package_id` is stable across retries and is
+    /// what an [`AckReceived`](TransportEvent::AckReceived) correlates against.
+    announce: Option<PackageAnnounce>,
+    /// Whether the transfer-start milestone (`→ Transferring` + the `sent`
+    /// history rows) has been recorded. `false` while the first announce has not
+    /// yet succeeded (peer offline); the first successful announce records it.
+    started: bool,
     /// When the transfer-start history row was written, reused as `started_at`
     /// on the confirm/terminal rows.
     started_at: String,
-    /// When to give up waiting for the ack and retry.
+    /// When to give up waiting (for the ack, or to retry a failed announce).
     deadline: Instant,
 }
 
@@ -212,7 +231,7 @@ struct Worker {
     transport: Arc<dyn SharingTransport>,
     peer: NodeId,
     config: SyncConfig,
-    pending: HashMap<String, Pending>,
+    pending: HashMap<i64, Pending>,
 }
 
 impl Worker {
@@ -305,55 +324,139 @@ impl Worker {
             .unwrap_or_else(|| Instant::now() + IDLE_SLEEP)
     }
 
-    /// Serve + announce a package and record the transfer-start milestone (only
-    /// the first time it reaches `Transferring`; a resume just re-announces).
+    /// Begin driving a package: install its pending slot, then make the first
+    /// serve+announce attempt.
+    ///
+    /// The slot is inserted **before** the attempt so that a first-attempt
+    /// build/serve/announce failure (typically the peer being offline at send
+    /// time) can never leave the row non-terminal with no retry slot — the C1
+    /// wedge. [`attempt`](Self::attempt) arms the real deadline (ack-wait on
+    /// success, retry on failure); until then the slot is due immediately.
     async fn start_package(
         &mut self,
         id: i64,
         dir: PathBuf,
         prior_state: OutboundState,
     ) -> Result<()> {
-        let announce =
-            announce_for_dir(&dir).with_context(|| format!("build announce for {}", dir.display()))?;
+        // A prior engine already recorded the transfer-start milestone iff the
+        // row is past Queued/Announced (crash-resume of a `Transferring` row).
+        let started = !matches!(prior_state, OutboundState::Queued | OutboundState::Announced);
+        self.pending.insert(
+            id,
+            Pending {
+                id,
+                dir,
+                announce: None,
+                started,
+                started_at: String::new(),
+                deadline: Instant::now(),
+            },
+        );
+        self.attempt(id).await
+    }
+
+    /// (Re)serve + (re)announce the pending package `id`, then arm its next
+    /// deadline. This is the single attempt path shared by the first drive
+    /// ([`start_package`](Self::start_package)) and every retry
+    /// ([`handle_timeouts`](Self::handle_timeouts)).
+    ///
+    /// On success it records the transfer-start milestone the first time and
+    /// arms the ack-wait deadline. On a build/serve/announce failure it logs and
+    /// arms a *retry* deadline instead of returning `Err`, so the row keeps its
+    /// slot and `handle_timeouts` walks it toward `max_attempts` rather than
+    /// wedging (C1). Because it always re-arms a deadline, a persistently
+    /// failing re-announce cannot busy-spin (M1).
+    async fn attempt(&mut self, id: i64) -> Result<()> {
+        // Snapshot from the slot; drop the borrow before any await / mutation.
+        let Some((dir, existing, started)) = self
+            .pending
+            .get(&id)
+            .map(|p| (p.dir.clone(), p.announce.clone(), p.started))
+        else {
+            // Slot gone (cancelled/confirmed concurrently) — nothing to do.
+            return Ok(());
+        };
+
+        // Reuse the minted announce across retries (stable `package_id` for ack
+        // correlation) or build a fresh one if we don't have one yet.
+        let announce = match existing {
+            Some(a) => a,
+            None => match announce_for_dir(&dir) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::error!(package_id = id, error = %e, "sync build announce failed; will retry");
+                    self.arm_retry(id);
+                    return Ok(());
+                }
+            },
+        };
 
         // Provider side: register the served dir, then advertise it to the peer.
-        self.transport
-            .serve(&announce, &dir)
-            .await
-            .context("serve package")?;
-        self.transport
-            .announce(self.peer, &announce)
-            .await
-            .context("announce package")?;
+        // A failure here (e.g. the peer is offline) is retryable, not fatal:
+        // remember the announce and arm a retry deadline.
+        let serve_announce = async {
+            self.transport
+                .serve(&announce, &dir)
+                .await
+                .context("serve package")?;
+            self.transport
+                .announce(self.peer, &announce)
+                .await
+                .context("announce package")
+        }
+        .await;
+        if let Err(e) = serve_announce {
+            tracing::error!(package_id = id, error = %e, "sync serve/announce failed; will retry");
+            if let Some(p) = self.pending.get_mut(&id) {
+                p.announce = Some(announce);
+            }
+            self.arm_retry(id);
+            return Ok(());
+        }
 
-        let started_at = now_iso();
-        if matches!(prior_state, OutboundState::Queued | OutboundState::Announced) {
+        // Success. Record the transfer-start milestone the first time only.
+        let record_started = !started;
+        let started_at = if record_started {
+            now_iso()
+        } else {
+            let existing_ts = self
+                .pending
+                .get(&id)
+                .map(|p| p.started_at.clone())
+                .unwrap_or_default();
+            if existing_ts.is_empty() {
+                now_iso()
+            } else {
+                existing_ts
+            }
+        };
+        if record_started {
             self.store.set_state(id, OutboundState::Announced)?;
             tracing::info!(package_id = id, state = "announced", "sync state");
             self.store.set_state(id, OutboundState::Transferring)?;
             tracing::info!(package_id = id, state = "transferring", "sync state");
             self.append_started_history(id, &dir, &started_at)?;
         } else {
-            // Resume: the row is already Transferring — re-announce only.
-            tracing::info!(
-                package_id = id,
-                state = prior_state.as_str(),
-                "sync resume re-announce"
-            );
+            tracing::info!(package_id = id, state = "transferring", "sync resume/retry re-announce");
         }
 
-        let deadline = Instant::now() + self.config.ack_timeout;
-        self.pending.insert(
-            announce.package_id.0.clone(),
-            Pending {
-                id,
-                dir,
-                announce,
-                started_at,
-                deadline,
-            },
-        );
+        // Arm the ack-wait deadline and persist the announce/milestone on the slot.
+        if let Some(p) = self.pending.get_mut(&id) {
+            p.announce = Some(announce);
+            p.started = true;
+            p.started_at = started_at;
+            p.deadline = Instant::now() + self.config.ack_timeout;
+        }
         Ok(())
+    }
+
+    /// Arm a retry deadline on a still-pending package after a failed
+    /// build/serve/announce attempt. Leaves the milestone untouched — the row
+    /// stays `Queued` until an announce actually succeeds.
+    fn arm_retry(&mut self, id: i64) {
+        if let Some(p) = self.pending.get_mut(&id) {
+            p.deadline = Instant::now() + self.config.ack_timeout;
+        }
     }
 
     /// Dispatch a transport event. Synchronous — no `.await` — so a package can
@@ -390,10 +493,17 @@ impl Worker {
     /// Confirm a package on ack. Idempotent: an ack for a package no longer in
     /// the in-flight map (already confirmed, or unknown) is dropped at debug.
     fn on_ack(&mut self, package_id: PackageId, receipts: Vec<FrameReceipt>) -> Result<()> {
-        let Some(pending) = self.pending.remove(&package_id.0) else {
+        // The map is keyed by row id, so locate the slot whose minted announce
+        // carries this `package_id`.
+        let key = self.pending.iter().find_map(|(k, p)| match &p.announce {
+            Some(a) if a.package_id == package_id => Some(*k),
+            _ => None,
+        });
+        let Some(key) = key else {
             tracing::debug!(package_id = %package_id.0, "duplicate/late ack ignored");
             return Ok(());
         };
+        let pending = self.pending.remove(&key).expect("key from live find");
         self.store
             .confirm(pending.id, &receipts)
             .context("confirm outbound")?;
@@ -402,41 +512,32 @@ impl Worker {
         Ok(())
     }
 
-    /// Handle every in-flight package whose ack deadline has elapsed: bump its
-    /// attempt count, then either fail it (attempts exhausted) or re-announce.
+    /// Handle every in-flight package whose deadline has elapsed (an ack that
+    /// never came, or a retry of a failed announce): bump its attempt count,
+    /// then either fail it (attempts exhausted) or re-attempt.
     async fn handle_timeouts(&mut self) -> Result<()> {
         let now = Instant::now();
-        let due: Vec<String> = self
+        let due: Vec<i64> = self
             .pending
             .iter()
             .filter(|(_, p)| p.deadline <= now)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| *k)
             .collect();
 
-        for key in due {
-            let Some((id, dir, announce)) = self
-                .pending
-                .get(&key)
-                .map(|p| (p.id, p.dir.clone(), p.announce.clone()))
-            else {
-                continue;
-            };
-
+        for id in due {
             let attempts = self.store.bump_attempts(id).context("bump attempts")?;
             if attempts >= self.config.max_attempts {
-                self.fail_package(&key, id, &dir, "max_attempts_exhausted")?;
+                self.fail_package(id)?;
             } else {
-                tracing::warn!(package_id = id, attempts, "sync ack timeout; re-announcing");
-                self.transport
-                    .serve(&announce, &dir)
-                    .await
-                    .context("re-serve package")?;
-                self.transport
-                    .announce(self.peer, &announce)
-                    .await
-                    .context("re-announce package")?;
-                if let Some(p) = self.pending.get_mut(&key) {
-                    p.deadline = Instant::now() + self.config.ack_timeout;
+                tracing::warn!(package_id = id, attempts, "sync timeout; re-attempting");
+                // `attempt` always re-arms a deadline (ack-wait on success, retry
+                // on failure), so a re-announce that keeps erroring can no longer
+                // busy-spin (M1) and still advances toward max_attempts. Guard the
+                // rare store-error path with a retry so the deadline is never left
+                // stale.
+                if let Err(e) = self.attempt(id).await {
+                    tracing::error!(package_id = id, error = %e, "sync re-attempt failed");
+                    self.arm_retry(id);
                 }
             }
         }
@@ -445,11 +546,13 @@ impl Worker {
 
     /// Mark a package `Failed` after exhausting attempts and record a `failed`
     /// history outcome.
-    fn fail_package(&mut self, key: &str, id: i64, dir: &Path, _reason: &str) -> Result<()> {
-        self.pending.remove(key);
+    fn fail_package(&mut self, id: i64) -> Result<()> {
+        let dir = self.pending.remove(&id).map(|p| p.dir);
         self.store.set_state(id, OutboundState::Failed)?;
         tracing::error!(package_id = id, state = "failed", "sync state");
-        self.append_terminal_history(id, dir, "failed")?;
+        if let Some(dir) = dir {
+            self.append_terminal_history(id, &dir, "failed")?;
+        }
         Ok(())
     }
 
@@ -457,8 +560,9 @@ impl Worker {
     /// no-op if the package is already terminal / unknown.
     fn cancel_package(&mut self, id: i64) -> Result<()> {
         // Resolve the package dir: prefer the in-flight entry, else a live row.
-        let dir = if let Some(p) = self.pending.values().find(|p| p.id == id) {
-            Some(p.dir.clone())
+        // Removing the slot also ensures no later timeout fires for this id.
+        let dir = if let Some(p) = self.pending.remove(&id) {
+            Some(p.dir)
         } else {
             self.store
                 .non_terminal()?
@@ -466,17 +570,6 @@ impl Worker {
                 .find(|r| r.id == id)
                 .map(|r| PathBuf::from(r.package_ref))
         };
-
-        // Drop any in-flight entries for this id so no timeout fires later.
-        let keys: Vec<String> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.id == id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in keys {
-            self.pending.remove(&k);
-        }
 
         let Some(dir) = dir else {
             tracing::debug!(package_id = id, "cancel ignored (already terminal or unknown)");

@@ -135,6 +135,10 @@ fn state_of(store: &StandaloneSyncStore, id: i64) -> Option<OutboundState> {
     store.get_outbound(id).unwrap().map(|r| r.state)
 }
 
+fn attempts_of(store: &StandaloneSyncStore, id: i64) -> u32 {
+    store.get_outbound(id).unwrap().map(|r| r.attempts).unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // The five named acceptance tests.
 // ---------------------------------------------------------------------------
@@ -363,6 +367,146 @@ async fn failed_after_max_attempts_with_error_outcome_in_history() {
     assert!(
         history.iter().any(|h| h.outcome == "failed"),
         "a failed outcome must be recorded in history"
+    );
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the first-attempt "peer offline at send time" wedge
+// (review findings C1 + M1).
+// ---------------------------------------------------------------------------
+
+/// C1: enqueue while the peer endpoint is NOT started. The very first announce
+/// fails ("peer not started"); the engine must treat that as a retryable
+/// attempt — retry (attempts climb) and terminalize `Failed` after
+/// `max_attempts`, with a `failed` outcome in history — instead of leaving the
+/// row wedged in `Queued` with no retry slot.
+#[tokio::test]
+async fn first_attempt_peer_offline_retries_then_fails() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Peer endpoint is minted (so we have a stable node id to announce *to*) but
+    // never started → its mailbox is absent → every announce fails.
+    let receiver = net.endpoint();
+    let receiver_id = receiver.node_id();
+
+    let pkg = build_package(&tmp.path().join("src6"), "uuid-6", "frame6.fits", "IC1396", 1024);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(40),
+            max_attempts: 5,
+        },
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+
+    // The peer never comes online: the row must reach terminal Failed.
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert_eq!(row.state, OutboundState::Failed);
+    assert_eq!(
+        row.attempts, 5,
+        "a first-attempt offline failure must be retried up to max_attempts, not wedged"
+    );
+    assert!(
+        row.attempts >= 2,
+        "retry machinery must have re-attempted (attempts observable >= 2)"
+    );
+
+    let history = store
+        .search_history(HistoryQuery {
+            filename: Some("frame6.fits".to_string()),
+            object: None,
+            limit: 100,
+        })
+        .unwrap();
+    assert!(
+        history.iter().any(|h| h.outcome == "failed"),
+        "a failed outcome must be recorded in history"
+    );
+
+    engine.shutdown().await;
+}
+
+/// C1 companion: enqueue while the peer is offline (first announce fails), then
+/// bring the peer online before `max_attempts` is exhausted. A retry's announce
+/// then succeeds, the peer fetches + acks, and the row completes to `Confirmed`
+/// with the correct two-event history.
+#[tokio::test]
+async fn first_attempt_peer_offline_then_online_completes() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Not started yet → offline. We keep the endpoint so we can start it later.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.node_id();
+
+    let pkg = build_package(&tmp.path().join("src7"), "uuid-7", "frame7.fits", "M27", 4096);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            // Fast retry cadence, generous cap so the peer has time to come up.
+            ack_timeout: Duration::from_millis(50),
+            max_attempts: 20,
+        },
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+
+    // Prove it retried at least once while the peer was offline (each retry bumps
+    // attempts; the initial failed attempt does not).
+    wait_until(|| attempts_of(&store, id) >= 1, WAIT).await;
+    assert_ne!(
+        state_of(&store, id),
+        Some(OutboundState::Confirmed),
+        "must not be confirmed while the peer is still offline"
+    );
+
+    // Bring the peer online: register its mailbox and start acking.
+    receiver.start().await.unwrap();
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    // The next retry's announce now lands → fetch → ack → Confirmed.
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert_eq!(row.state, OutboundState::Confirmed);
+    assert!(row.confirmed_at.is_some(), "confirmed_at must be stamped");
+
+    let history = store
+        .search_history(HistoryQuery {
+            filename: Some("frame7.fits".to_string()),
+            object: None,
+            limit: 100,
+        })
+        .unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|h| h.finished_at.is_none() && h.outcome == "sent"),
+        "expected a 'sent' start event once the announce finally lands"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|h| h.finished_at.is_some() && h.outcome == "ingested"),
+        "expected an 'ingested' confirm event"
     );
 
     engine.shutdown().await;

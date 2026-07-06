@@ -98,6 +98,13 @@ pub struct LoopbackTransport {
 }
 
 impl LoopbackTransport {
+    /// This endpoint's node id. Available *before* [`start`](SharingTransport::start),
+    /// so a test can address a peer that is not yet online (its mailbox is not
+    /// registered until `start`), then bring it up later.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
     /// Replace this endpoint's fault plan (test-only knob).
     pub fn set_fault(&self, plan: FaultPlan) {
         *self.fault.lock().expect("fault mutex poisoned") = plan;
