@@ -279,7 +279,7 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
                   checked={flatNormMode === 'pixinsightTrimmed'}
                   onChange={() => setFlatNormMode('pixinsightTrimmed')}
                 />
-                Full-frame trimmed mean (PixInsight-compatible)
+                Full-frame trimmed mean (5% per tail)
               </label>
             </div>
           )}
