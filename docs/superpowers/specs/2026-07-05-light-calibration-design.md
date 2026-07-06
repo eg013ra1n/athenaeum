@@ -19,10 +19,10 @@ Decisions in this spec were settled with the owner on 2026-07-05.
 - Re-calibration is a first-class operation: re-running overwrites outputs
   in place (tmp + atomic rename) and refreshes the tracking row.
 
-Out of scope for v1: WBPP-export integration (export referencing calibrated
-files — follow-up ticket), cosmetic correction / hot-pixel maps, dark
+Out of scope for v1: cosmetic correction / hot-pixel maps, dark
 scaling/optimization (harmful on modern CMOS, same stance as Phase 2),
-output pedestal, XISF output.
+XISF output. (WBPP-export integration and an optional output pedestal were
+promoted into scope on 2026-07-06 — see §12 and §2 Advanced parameters.)
 
 ## 2. Math
 
@@ -62,6 +62,20 @@ L_c = (L − MasterDark) / F_norm        F_norm = MasterFlat / ATH_FNRM
   tracking row (`flat_norm_mode`) and a mode mismatch makes a flat-applied
   frame *stale*. Masters keep stamping `ATH_FNRM` as central-third at build
   time regardless — the card's meaning does not change.
+- **Advanced parameters** (owner request 2026-07-06, collapsible "Advanced"
+  section in the dialog, defaults = current behavior, all recorded in the
+  tracking row and compared for staleness; each stamped as a card):
+  - `trim_fraction` (default 0.05) — the per-tail discard fraction of the
+    `pixinsightTrimmed` statistic; card `ATH_CTRM`. Only meaningful in PI
+    mode.
+  - `pedestal_dn` (default 0 = off) — DN added to the output AFTER the
+    scale divide (`out += pedestal_dn / 65535`), for consumers that clip
+    negatives; card `ATH_CPED`. `CALSTAT` unchanged (pedestal is not a
+    calibration step); negative results remain permitted when 0.
+  - `bias_fallback` (default `subtractBias`) — what to do for a light with
+    no dark master: `subtractBias` (current behavior, `(L−B)`) or
+    `skipFrame` (per-frame failure "no dark master", for owners who never
+    want bias-only calibration).
 - **Fallbacks (owner policy: best-effort, honestly labeled):**
   - dark + flat → `CALSTAT='BDF'`
   - dark only → `(L − D)`, `CALSTAT='BD'`
@@ -163,6 +177,7 @@ New table `light_calibrations`:
 | `calstat` | TEXT NOT NULL | honest applied-state flags |
 | `flat_norm_applied` | INTEGER NOT NULL | 1 = normalization divisor applied, 0 = plain flat division |
 | `flat_norm_mode` | TEXT NOT NULL DEFAULT 'centralThird' | statistic used when normalizing: 'centralThird' \| 'pixinsightTrimmed' |
+| `cal_params` | TEXT NOT NULL DEFAULT '{}' | JSON of the Advanced parameters actually applied (`trim_fraction`, `pedestal_dn`, `bias_fallback`); any difference vs the requested run's params → *stale* |
 | `output_hash` | TEXT NOT NULL | xxh3 of the written file |
 | `engine_version` | INTEGER NOT NULL | bump on math changes → everything becomes stale |
 | `created_at` | TEXT NOT NULL | |
@@ -296,3 +311,28 @@ UI:
 - `src/components/calibration/CalibrateLightsDialog.tsx`, frame-table badge,
   `calibration` notification kind.
 - Mirrors: `commands/…` + `routes/…` per the two-backend rule.
+
+## 12. UI integration round (owner review, 2026-07-06)
+
+1. **Coverage shows calibration recipe.** The Calibration Coverage lights
+   table marks each calibrated light and exposes its recipe on
+   hover/expand: `CALSTAT`, the applied master names (dark/flat/bias),
+   normalization mode + divisor, engine version, calibrated-at. Backed by a
+   new read command `get_light_calibration_details(set_id)` (both backends)
+   returning the tracking rows joined with master set/file names — recipe
+   truth comes from the row, not from readiness classification.
+2. **Export mode selector** in the WBPP export dialog:
+   - `calibratedLights` — export the `c_*.fits` artifacts; no calibration
+     frames are exported (WBPP runs with calibration disabled). **Strict
+     gate:** the dialog shows per-set readiness (N of M calibrated, K
+     stale) and refuses to start while any in-scope light lacks a fresh
+     calibrated output, pointing the user to Calibrate Lights first.
+   - `rawWithMasters` — raw lights + the linked MASTER calibration files
+     only (no raw calibration singles).
+   - `rawWithCalibrationSets` — current behavior: raw lights + whatever
+     raw calibration sets are linked.
+3. **Calibrate Lights button moves** next to "Create All Masters" (same
+   toolbar group), replacing its current standalone placement.
+4. **Re-assign preselection:** when rows are selected in the lights table,
+   opening Re-assign immediately loads those lights into the slide-out
+   panel instead of starting empty.
