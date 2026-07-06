@@ -4,6 +4,8 @@ import { Scissors, Plus, Calendar, Camera, X, ScanSearch, Wand2 } from 'lucide-r
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
   FrameAnalysis,
+  LightFrameReadiness,
+  LightCalDetails,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
@@ -43,6 +45,11 @@ interface CalibrationHierarchyViewProps {
    *  a "Calibrate Lights" button is shown in the toolbar next to "Create all
    *  masters" (spec §12.3). Omitted for archived sets whose sources are gone. */
   onCalibrateLights?: () => void;
+  /** Per-frame light-calibration readiness (keyed by frame_id), fetched once per
+   *  set view by the parent. Feeds the Coverage lights table's "Calib" column. */
+  readinessByFrameId?: Map<number, LightFrameReadiness>;
+  /** Per-frame calibration recipe (keyed by frame_id) for the Calib tooltip. */
+  detailsByFrameId?: Map<number, LightCalDetails>;
 }
 
 export function CalibrationHierarchyView({
@@ -61,6 +68,8 @@ export function CalibrationHierarchyView({
   highlightCalSet,
   onHighlightConsumed,
   onCalibrateLights,
+  readinessByFrameId,
+  detailsByFrameId,
 }: CalibrationHierarchyViewProps) {
   // Re-assign mode toggle
   const [reassignMode, setReassignMode] = useState(false);
@@ -430,6 +439,8 @@ export function CalibrationHierarchyView({
               onHighlightConsumed={onHighlightConsumed}
               onCreateMaster={(setId) => setBatchDialogIds([setId])}
               buildStatusBySet={buildStatusBySet}
+              readinessByFrameId={readinessByFrameId}
+              detailsByFrameId={detailsByFrameId}
             />
             <BlackholedFramesSection frames={blackholedFrames} />
 

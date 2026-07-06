@@ -8,8 +8,11 @@ import type {
   CalibrationSetWithFrameCount,
   SubCalibrationDetail,
   FrameAnalysis,
+  LightFrameReadiness,
+  LightCalDetails,
 } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
+import { LightCalAggregateBadge } from './LightCalStatusBadge';
 import { ReassignFramePanel } from './ReassignFramePanel';
 
 type CalSetKind = 'Flat' | 'Dark' | 'Bias';
@@ -35,6 +38,14 @@ interface CalibrationTableViewProps {
   onCreateMaster?: (setId: number) => void;
   /** Live build phase per source set id, from `useMasterBuildContext().buildStates`. */
   buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
+  /** Per-frame light-calibration readiness (keyed by frame_id). When present and
+   *  non-empty, the lights table gains a "Calib" status column (aggregated per
+   *  grouped row). Threaded from the same single fetch that feeds the analysis
+   *  table's per-frame badge. */
+  readinessByFrameId?: Map<number, LightFrameReadiness>;
+  /** Per-frame calibration recipe (keyed by frame_id). Enriches the Calib
+   *  column's hover tooltip with the applied masters / normalization / params. */
+  detailsByFrameId?: Map<number, LightCalDetails>;
 }
 
 // ── Section colors (per spec) ──────────────────────────────────────────────
@@ -642,6 +653,9 @@ function LightsTable({
   onFlatClick,
   onDarkClick,
   compact,
+  showCalib,
+  readinessByFrameId,
+  detailsByFrameId,
 }: {
   rows: LightRow[];
   highlightedRowKeys: Set<string>;
@@ -650,6 +664,9 @@ function LightsTable({
   onFlatClick: (flatSetId: number) => void;
   onDarkClick: (darkSetId: number) => void;
   compact?: boolean;
+  showCalib?: boolean;
+  readinessByFrameId?: Map<number, LightFrameReadiness>;
+  detailsByFrameId?: Map<number, LightCalDetails>;
 }) {
   const [sortField, setSortField] = useState<LightSortField | null>('sortDate');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
@@ -689,6 +706,11 @@ function LightsTable({
             <SortTh field="focallen" label="FL" {...thProps} />
             <SortTh field="flatSetId" label="Flat" {...thProps} />
             <SortTh field="darkSetId" label="Dark" {...thProps} />
+            {showCalib && (
+              <th className="px-1.5 py-1.5 text-left text-xs font-semibold text-content-secondary whitespace-nowrap sticky top-0 z-10 bg-surface-elevated">
+                Calib
+              </th>
+            )}
             {!compact && <SortTh field="avgFwhm" label="FWHM" {...thProps} />}
             {!compact && <SortTh field="avgEcc" label="Ecc" {...thProps} />}
             {!compact && <SortTh field="avgSnr" label="SNR" {...thProps} />}
@@ -744,6 +766,15 @@ function LightsTable({
                     />
                   ) : <MissingMark />}
                 </td>
+                {showCalib && (
+                  <td className="px-1.5 py-1 text-sm">
+                    <LightCalAggregateBadge
+                      frameIds={row.allFrameIds}
+                      readinessByFrameId={readinessByFrameId}
+                      detailsByFrameId={detailsByFrameId}
+                    />
+                  </td>
+                )}
                 {!compact && (
                   <td className="px-1.5 py-1 text-sm text-content-secondary">
                     {row.avgFwhm != null ? row.avgFwhm.toFixed(2) : '—'}
@@ -1228,8 +1259,16 @@ export function CalibrationTableView({
   onHighlightConsumed,
   onCreateMaster,
   buildStatusBySet,
+  readinessByFrameId,
+  detailsByFrameId,
 }: CalibrationTableViewProps) {
   const navigate = useNavigate();
+
+  // A "Calib" column is shown in the lights table only when the parent has
+  // fetched per-frame readiness/recipe data for this set view.
+  const showCalib =
+    (!!readinessByFrameId && readinessByFrameId.size > 0) ||
+    (!!detailsByFrameId && detailsByFrameId.size > 0);
 
   // Cross-page jump: open the matching camera + tab on the Equipment page,
   // with the row scrolled into view, highlighted, and auto-expanded.
@@ -1521,6 +1560,9 @@ export function CalibrationTableView({
             onFlatClick={handleFlatClick}
             onDarkClick={handleDarkClick}
             compact={reassignMode}
+            showCalib={showCalib}
+            readinessByFrameId={readinessByFrameId}
+            detailsByFrameId={detailsByFrameId}
           />
         </div>
       </div>

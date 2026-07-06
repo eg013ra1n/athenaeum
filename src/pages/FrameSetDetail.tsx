@@ -921,6 +921,8 @@ export default function FrameSetDetail() {
                   ? () => setShowCalibrateDialog(true)
                   : undefined
               }
+              readinessByFrameId={lightCalReadiness}
+              detailsByFrameId={lightCalDetails}
             />
           ) : (
             <LightsAnalysisView
