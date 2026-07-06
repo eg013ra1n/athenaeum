@@ -3,7 +3,7 @@
 //! pixels of the current band via the shared image pool.
 
 use super::banded::{band_rows_for_budget, BandSource};
-use super::combine::{combine_pixel, CombineMethod};
+use super::combine::{combine_pixel, IntegrationRecipe};
 use super::IntegrationError;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,7 +54,7 @@ fn run_banded(
     src: &mut BandSource,
     scales: &[f32],
     precal: Option<&FlatPrecal>,
-    method: CombineMethod,
+    recipe: IntegrationRecipe,
     pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
     progress: &EngineProgress<'_>,
@@ -105,7 +105,7 @@ fn run_banded(
                             v *= scales[i];
                             column.push(v);
                         }
-                        let (val, rej) = combine_pixel(&mut column, method);
+                        let (val, rej) = combine_pixel(&mut column, recipe);
                         *out_px = val;
                         if rej > 0 { rejected.fetch_add(rej, Ordering::Relaxed); }
                     }
@@ -126,18 +126,18 @@ fn run_banded(
 
 pub fn integrate_bias_like(
     paths: &[PathBuf],
-    method: CombineMethod,
+    recipe: IntegrationRecipe,
     pool: &rayon::ThreadPool,
     scratch_dir: &Path,
     cancel: &AtomicBool,
     progress: EngineProgress<'_>,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    integrate_bias_like_inner(paths, method, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
+    integrate_bias_like_inner(paths, recipe, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
 }
 
 fn integrate_bias_like_inner(
     paths: &[PathBuf],
-    method: CombineMethod,
+    recipe: IntegrationRecipe,
     pool: &rayon::ThreadPool,
     scratch_dir: &Path,
     cancel: &AtomicBool,
@@ -146,26 +146,26 @@ fn integrate_bias_like_inner(
 ) -> Result<IntegrationOutput, IntegrationError> {
     let mut src = BandSource::open(paths, scratch_dir)?;
     let scales = vec![1.0f32; src.frame_count()];
-    run_banded(&mut src, &scales, None, method, pool, cancel, &progress, band_budget_bytes)
+    run_banded(&mut src, &scales, None, recipe, pool, cancel, &progress, band_budget_bytes)
 }
 
 pub fn integrate_flat(
     paths: &[PathBuf],
     precal: &FlatPrecal,
-    method: CombineMethod,
+    recipe: IntegrationRecipe,
     pool: &rayon::ThreadPool,
     scratch_dir: &Path,
     cancel: &AtomicBool,
     progress: EngineProgress<'_>,
 ) -> Result<IntegrationOutput, IntegrationError> {
-    integrate_flat_inner(paths, precal, method, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
+    integrate_flat_inner(paths, precal, recipe, pool, scratch_dir, cancel, progress, BAND_BUDGET_BYTES)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn integrate_flat_inner(
     paths: &[PathBuf],
     precal: &FlatPrecal,
-    method: CombineMethod,
+    recipe: IntegrationRecipe,
     pool: &rayon::ThreadPool,
     scratch_dir: &Path,
     cancel: &AtomicBool,
@@ -227,7 +227,7 @@ fn integrate_flat_inner(
     // Pass 2: full combine with precal + scale applied. `BandSource::read_band`
     // takes `&mut self`, so pass 1 (above) and pass 2 reuse the SAME `src` —
     // readers just seek back to the start and stream again; no need to reopen.
-    let mut out = run_banded(&mut src, &scales, Some(precal), method, pool, cancel, &progress, band_budget_bytes)?;
+    let mut out = run_banded(&mut src, &scales, Some(precal), recipe, pool, cancel, &progress, band_budget_bytes)?;
     out.flat_norm = Some(central_third_mean(&out.data, w, h));
     Ok(out)
 }
@@ -236,7 +236,7 @@ fn integrate_flat_inner(
 mod tests {
     use super::*;
     use crate::fits_writer::write_fits_f32;
-    use crate::integration::combine::CombineMethod;
+    use crate::integration::combine::{IntegrationRecipe, Rejection};
     use std::sync::atomic::AtomicBool;
 
     fn pool() -> rayon::ThreadPool {
@@ -264,7 +264,7 @@ mod tests {
         let on_band = nop();
         let out = integrate_bias_like(
             &paths,
-            CombineMethod::WinsorizedSigmaClip { sigma_low: 3.0, sigma_high: 3.0 },
+            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
         ).unwrap();
@@ -288,7 +288,7 @@ mod tests {
         ];
         let on_band = nop();
         let out = integrate_flat(
-            &paths, &FlatPrecal::None, CombineMethod::Median,
+            &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
         ).unwrap();
@@ -314,7 +314,7 @@ mod tests {
         let precal = FlatPrecal::MasterFrame { data: vec![500.0; w * h], width: w, height: h };
         let on_band = nop();
         let out = integrate_flat(
-            &paths, &precal, CombineMethod::Median,
+            &paths, &precal, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
         ).unwrap();
@@ -333,7 +333,7 @@ mod tests {
         ];
         let on_band = nop();
         let out = integrate_flat(
-            &paths, &FlatPrecal::SyntheticBias(100.0), CombineMethod::Median,
+            &paths, &FlatPrecal::SyntheticBias(100.0), IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
         ).unwrap();
@@ -347,7 +347,7 @@ mod tests {
         let cancel = AtomicBool::new(true); // pre-set: first band check trips
         let on_band = nop();
         let r = integrate_bias_like(
-            &paths, CombineMethod::Mean, &pool(), dir.path(), &cancel,
+            &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &cancel,
             EngineProgress { on_band: &on_band },
         );
         assert!(matches!(r, Err(IntegrationError::Cancelled)));
@@ -364,7 +364,7 @@ mod tests {
         ];
         let on_band = nop();
         let out = integrate_bias_like(
-            &paths, CombineMethod::Mean, &pool(), dir.path(), &AtomicBool::new(false),
+            &paths, IntegrationRecipe::average(Rejection::None), &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
         ).unwrap();
         assert!(out.data.iter().all(|&v| v == -5.0), "no clipping policy");
@@ -391,7 +391,7 @@ mod tests {
         let precal = FlatPrecal::MasterFrame { data: master, width: w, height: h };
         let on_band = nop();
         let out = integrate_flat_inner(
-            &paths, &precal, CombineMethod::Median,
+            &paths, &precal, IntegrationRecipe::median(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
             1, // band_rows_for_budget(..).max(16) => 16-row bands => 3 bands
@@ -424,7 +424,7 @@ mod tests {
         ];
         let on_band = nop();
         let out = integrate_flat_inner(
-            &paths, &FlatPrecal::SyntheticBias(500.0), CombineMethod::Mean,
+            &paths, &FlatPrecal::SyntheticBias(500.0), IntegrationRecipe::average(Rejection::None),
             &pool(), dir.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
             BAND_BUDGET_BYTES,

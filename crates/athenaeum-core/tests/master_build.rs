@@ -15,7 +15,8 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-use athenaeum_core::api::masters::resolve_combine;
+use athenaeum_core::api::masters::resolve_recipe;
+use athenaeum_core::integration::combine::{IntegrationRecipe, Rejection};
 use athenaeum_core::calibration_library::headers::{build_master_cards, load_header_inputs};
 use athenaeum_core::calibration_library::paths::{master_relative_path, resolve_collision, MasterPathParams};
 use athenaeum_core::calibration_library::register::{member_hash, register_master};
@@ -99,7 +100,7 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
     assert_eq!(paths.len(), 3);
 
     // Resolve -> integrate (n=3 < 15 => plain Median for a non-flat type).
-    let combine = resolve_combine(None, "Dark", 3);
+    let combine = resolve_recipe(None, "Dark", 3);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
     let on_band = |_current: usize, _total: usize| {};
     let out = integrate_bias_like(
@@ -204,7 +205,7 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_frames_untouc
         let on_band = |_c: usize, _t: usize| {};
         integrate_bias_like(
             paths,
-            athenaeum_core::integration::combine::CombineMethod::Mean,
+            IntegrationRecipe::average(Rejection::None),
             &pool, scratch.path(), &AtomicBool::new(false),
             EngineProgress { on_band: &on_band },
         ).unwrap()

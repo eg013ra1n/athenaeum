@@ -408,13 +408,18 @@ export type ComputeJobState = "queued" | "running";
 
 export type ComputeQueueEntry = { jobId: number, kind: ComputeJobKind, label: string, state: ComputeJobState, queuedAt: string, };
 
-export type CombineMethod = { "method": "mean" } | { "method": "median" } | { "method": "winsorized_sigma_clip", sigma_low: number, sigma_high: number, } | { "method": "percentile_clip", low: number, high: number, };
+export type Combination = "average" | "median";
+
+export type Rejection = { "method": "none" } | { "method": "percentile_clip", low: number, high: number, } | { "method": "sigma_clip", sigma_low: number, sigma_high: number, } | { "method": "winsorized_sigma", sigma_low: number, sigma_high: number, } | { "method": "linear_fit_clip", sigma_low: number, sigma_high: number, };
+
+export type IntegrationRecipe = { combination: Combination, rejection: Rejection, };
 
 export type MasterRecipe = { 
 /**
- * None => Auto (per-type/per-N rule from spec §9).
+ * None => Auto (per-type/per-N rule from spec §2/§9). Field name kept
+ * (`combine`) across the CombineMethod → IntegrationRecipe migration.
  */
-combine: CombineMethod | null, 
+combine: IntegrationRecipe | null, 
 /**
  * Constant-ADU fallback for flat pre-calibration when no darkflat/dark/bias master is linked.
  */
@@ -430,7 +435,7 @@ syntheticBias: number | null,
  */
 archiveAfter: boolean, };
 
-export type MasterBuildPreview = { setId: number, imagetyp: string, frameCount: number, resolvedCombine: CombineMethod, 
+export type MasterBuildPreview = { setId: number, imagetyp: string, frameCount: number, resolvedCombine: IntegrationRecipe, 
 /**
  * Human description: "master darkflat #12" | "synthetic bias 500 ADU" | null.
  */

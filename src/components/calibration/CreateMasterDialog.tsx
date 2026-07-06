@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { X, Hammer, AlertTriangle, Loader2, XCircle, CheckCircle2 } from 'lucide-react';
 import { api } from '../../api';
-import type { MasterBuildPreview, MasterRecipe, CombineMethod, RawPrecalSetDto } from '../../types/models';
+import type { MasterBuildPreview, MasterRecipe, IntegrationRecipe, RawPrecalSetDto } from '../../types/models';
 import { useMasterBuildContext } from '../../contexts/MasterBuildContext';
 import { useNotifications } from '../../contexts/NotificationContext';
 
@@ -12,13 +12,19 @@ interface CreateMasterDialogProps {
 
 type CombineChoice = 'auto' | 'mean' | 'median' | 'winsorized' | 'percentile';
 
-function toCombineMethod(c: CombineChoice, sigLo: number, sigHi: number, pLo: number, pHi: number): CombineMethod | null {
+// Adapts the current dropdown to the two-axis IntegrationRecipe model
+// (Combination × Rejection). The full spec §4 UI (a separate Rejection
+// dropdown exposing sigma-clip / linear-fit) lands in the follow-up UI task;
+// this keeps the existing single-select producing valid recipes in the
+// meantime. 'mean' → Average+none, 'median' → Median+none, 'winsorized' →
+// Average+winsorized, 'percentile' → Average+percentile.
+function toRecipe(c: CombineChoice, sigLo: number, sigHi: number, pLo: number, pHi: number): IntegrationRecipe | null {
   switch (c) {
     case 'auto': return null;
-    case 'mean': return { method: 'mean' };
-    case 'median': return { method: 'median' };
-    case 'winsorized': return { method: 'winsorized_sigma_clip', sigma_low: sigLo, sigma_high: sigHi };
-    case 'percentile': return { method: 'percentile_clip', low: pLo, high: pHi };
+    case 'mean': return { combination: 'average', rejection: { method: 'none' } };
+    case 'median': return { combination: 'median', rejection: { method: 'none' } };
+    case 'winsorized': return { combination: 'average', rejection: { method: 'winsorized_sigma', sigma_low: sigLo, sigma_high: sigHi } };
+    case 'percentile': return { combination: 'average', rejection: { method: 'percentile_clip', low: pLo, high: pHi } };
   }
 }
 
@@ -89,13 +95,18 @@ function typeBadgeClass(imagetyp: string): string {
   }
 }
 
-function formatCombine(cm: CombineMethod): string {
-  switch (cm.method) {
-    case 'mean': return 'mean';
-    case 'median': return 'median';
-    case 'winsorized_sigma_clip': return `winsorized σ ${cm.sigma_low}/${cm.sigma_high}`;
-    case 'percentile_clip': return `percentile ${cm.low}/${cm.high}`;
+function formatCombine(r: IntegrationRecipe): string {
+  const comb = r.combination === 'average' ? 'Average' : 'Median';
+  const rej = r.rejection;
+  let rejLabel: string;
+  switch (rej.method) {
+    case 'none': rejLabel = 'no rejection'; break;
+    case 'percentile_clip': rejLabel = `Percentile clip (${rej.low}/${rej.high})`; break;
+    case 'sigma_clip': rejLabel = `Sigma clip (${rej.sigma_low}/${rej.sigma_high})`; break;
+    case 'winsorized_sigma': rejLabel = `Winsorized sigma (${rej.sigma_low}/${rej.sigma_high})`; break;
+    case 'linear_fit_clip': rejLabel = `Linear fit clip (${rej.sigma_low}/${rej.sigma_high})`; break;
   }
+  return `${comb} · ${rejLabel}`;
 }
 
 function basename(path: string): string {
@@ -138,7 +149,7 @@ export function CreateMasterDialog({ setIds, onClose }: CreateMasterDialogProps)
   const [startError, setStartError] = useState<string | null>(null);
 
   const recipe = (): MasterRecipe => ({
-    combine: toCombineMethod(combine, sigLo, sigHi, pLo, pHi),
+    combine: toRecipe(combine, sigLo, sigHi, pLo, pHi),
     syntheticBias: syntheticBias.trim() === '' ? null : Number(syntheticBias),
     archiveAfter,
   });

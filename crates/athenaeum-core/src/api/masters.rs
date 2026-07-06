@@ -45,7 +45,7 @@ use crate::calibration_library::paths::{master_relative_path, resolve_collision,
 use crate::calibration_library::register::{member_hash, register_master};
 use crate::events::{emit_event, ProgressEmitter};
 use crate::fits_writer::write_fits_f32;
-use crate::integration::combine::CombineMethod;
+use crate::integration::combine::{IntegrationRecipe, Rejection};
 use crate::integration::engine::{integrate_bias_like, integrate_flat, EngineProgress, FlatPrecal};
 use crate::integration::IntegrationError;
 use crate::services::compute_queue::ComputeJobKind;
@@ -61,8 +61,9 @@ pub const MIN_MASTER_FRAMES: i64 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterRecipe {
-    /// None => Auto (per-type/per-N rule from spec §9).
-    pub combine: Option<CombineMethod>,
+    /// None => Auto (per-type/per-N rule from spec §2/§9). Field name kept
+    /// (`combine`) across the CombineMethod → IntegrationRecipe migration.
+    pub combine: Option<IntegrationRecipe>,
     /// Constant-ADU fallback for flat pre-calibration when no darkflat/dark/bias master is linked.
     pub synthetic_bias: Option<f64>,
     /// Task 14: when true, chain `archive_originals` on the SOURCE
@@ -82,7 +83,7 @@ pub struct MasterBuildPreview {
     pub set_id: i64,
     pub imagetyp: String,
     pub frame_count: i64,
-    pub resolved_combine: CombineMethod,
+    pub resolved_combine: IntegrationRecipe,
     /// Human description: "master darkflat #12" | "synthetic bias 500 ADU" | null.
     pub flat_precal: Option<String>,
     /// Absolute, collision-resolved.
@@ -199,19 +200,19 @@ struct MasterBuildCompleteEvent {
 
 // ── Recipe resolution (pure, unit-tested) ────────────────────────────────────
 
-/// spec §9: bias-like N>=15 winsorized else median; flat N>=15 winsorized
-/// else percentile. Explicit override always wins.
-pub fn resolve_combine(explicit: Option<CombineMethod>, imagetyp: &str, n: i64) -> CombineMethod {
-    if let Some(m) = explicit {
-        return m;
+/// spec §2/§9: bias-like N>=15 Average+Winsorized else Median; flat N>=15
+/// Average+Winsorized else Average+Percentile. Explicit override always wins.
+pub fn resolve_recipe(explicit: Option<IntegrationRecipe>, imagetyp: &str, n: i64) -> IntegrationRecipe {
+    if let Some(recipe) = explicit {
+        return recipe;
     }
     let is_flat = imagetyp == "Flat";
     if n >= 15 {
-        CombineMethod::WinsorizedSigmaClip { sigma_low: 3.0, sigma_high: 3.0 }
+        IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 })
     } else if is_flat {
-        CombineMethod::PercentileClip { low: 0.2, high: 0.02 }
+        IntegrationRecipe::average(Rejection::PercentileClip { low: 0.2, high: 0.02 })
     } else {
-        CombineMethod::Median
+        IntegrationRecipe::median(Rejection::None)
     }
 }
 
@@ -380,15 +381,8 @@ fn load_precal_pixels(choice: &PrecalChoice, scratch: &Path) -> Result<FlatPreca
     }
 }
 
-fn recipe_summary_string(method: CombineMethod, n: i64) -> String {
-    match method {
-        CombineMethod::Mean => format!("mean n={n}"),
-        CombineMethod::Median => format!("median n={n}"),
-        CombineMethod::WinsorizedSigmaClip { sigma_low, sigma_high } => {
-            format!("winsorized({sigma_low},{sigma_high}) n={n}")
-        }
-        CombineMethod::PercentileClip { low, high } => format!("percentile({low},{high}) n={n}"),
-    }
+fn recipe_summary_string(recipe: IntegrationRecipe, n: i64) -> String {
+    format!("{} n={n}", recipe.describe())
 }
 
 // ── Shared validation (preview and start must reject IDENTICALLY) ───────────
@@ -578,7 +572,7 @@ pub fn preview_master_build(
     let set = load_and_validate_set(&conn, set_id)?;
     let library_dir = library_dir_or_err(&conn)?;
 
-    let resolved_combine = resolve_combine(recipe.combine, &set.imagetyp, set.frame_count);
+    let resolved_combine = resolve_recipe(recipe.combine, &set.imagetyp, set.frame_count);
     let is_flat = set.imagetyp == "Flat";
     // Selection only (pure DB) — preview never loads precal pixels.
     let (flat_precal, warnings, raw_precal_sets) = if is_flat {
@@ -740,7 +734,7 @@ fn run_build(
     drop(stmt);
 
     let is_flat = set.imagetyp == "Flat";
-    let resolved_combine = resolve_combine(recipe.combine, &set.imagetyp, set.frame_count);
+    let resolved_combine = resolve_recipe(recipe.combine, &set.imagetyp, set.frame_count);
     // The build thread only cares about the resolved choice — `raw_candidates`
     // is a preview-only affordance (the "build its master first" checkboxes);
     // by build time any raw dependency the operator wanted addressed was
@@ -1162,7 +1156,7 @@ pub fn start_master_builds_batch(
 /// (`MasterRecipe { combine: None, synthetic_bias: None }`) rather than
 /// replaying whatever explicit override built the original: the persisted
 /// `recipe_json.combine` is already-RESOLVED (not the original
-/// `Option<CombineMethod>` input), so treating it as a future override would
+/// `Option<IntegrationRecipe>` input), so treating it as a future override would
 /// freeze the recipe forever instead of picking up a since-built precal
 /// master (spec §9 fallback chain) or a frame-count change that shifts the
 /// Auto combine method — exactly the kind of drift a rebuild exists to
@@ -1715,23 +1709,24 @@ pub fn clear_stale_archive_markers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integration::combine::CombineMethod;
+    use crate::integration::combine::Rejection;
     use rusqlite::Connection;
 
     #[test]
     fn auto_recipe_rules() {
-        // spec §9: bias-like N>=15 winsorized else median; flat N>=15 winsorized
-        // else percentile
-        assert_eq!(resolve_combine(None, "Dark", 20),
-            CombineMethod::WinsorizedSigmaClip { sigma_low: 3.0, sigma_high: 3.0 });
-        assert_eq!(resolve_combine(None, "Dark", 5), CombineMethod::Median);
-        assert_eq!(resolve_combine(None, "Bias", 14), CombineMethod::Median);
-        assert_eq!(resolve_combine(None, "Flat", 20),
-            CombineMethod::WinsorizedSigmaClip { sigma_low: 3.0, sigma_high: 3.0 });
-        assert_eq!(resolve_combine(None, "Flat", 6),
-            CombineMethod::PercentileClip { low: 0.2, high: 0.02 });
+        // spec §2/§9: bias-like N>=15 Average+Winsorized else Median; flat
+        // N>=15 Average+Winsorized else Average+Percentile.
+        assert_eq!(resolve_recipe(None, "Dark", 20),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }));
+        assert_eq!(resolve_recipe(None, "Dark", 5), IntegrationRecipe::median(Rejection::None));
+        assert_eq!(resolve_recipe(None, "Bias", 14), IntegrationRecipe::median(Rejection::None));
+        assert_eq!(resolve_recipe(None, "Flat", 20),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }));
+        assert_eq!(resolve_recipe(None, "Flat", 6),
+            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.2, high: 0.02 }));
         // explicit override wins
-        assert_eq!(resolve_combine(Some(CombineMethod::Mean), "Flat", 6), CombineMethod::Mean);
+        let override_recipe = IntegrationRecipe::average(Rejection::None);
+        assert_eq!(resolve_recipe(Some(override_recipe), "Flat", 6), override_recipe);
     }
 
     #[test]
