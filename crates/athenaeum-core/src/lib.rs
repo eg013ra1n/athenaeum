@@ -57,3 +57,7 @@ pub mod sharing;
 // Portable package format (NDJSON manifest + payload files) for Stage I sync.
 // Ungated — no render/solver deps, compiles in the headless build.
 pub mod package;
+// Sender-side sync engine (Stage I, task A4): SyncStore + outbound state machine
+// + worker over a SharingTransport. Ungated — pure rusqlite/tokio, no
+// render/solver deps, compiles in the headless build.
+pub mod sync;
