@@ -1,6 +1,6 @@
 [package]
 name = "athenaeum-core"
-version = "0.2.4"
+version = "0.3.0"
 description = "Athenaeum core library - shared business logic for desktop and web"
 authors = ["you"]
 edition = "2021"
@@ -35,7 +35,10 @@ tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-ts-rs = { version = "10", features = ["chrono-impl"] }
+# no-serde-warnings: ts-rs cannot parse type-irrelevant serde attrs
+# (deserialize_with, skip_serializing_if, alias) and warns on every build;
+# the generated-output diff in tests/ts_contract.rs is the real guard.
+ts-rs = { version = "10", features = ["chrono-impl", "no-serde-warnings"] }
 base64 = "0.22"
 
 [dev-dependencies]
