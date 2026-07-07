@@ -39,6 +39,20 @@ tokio = { version = "1", features = ["sync", "time", "macros", "rt", "fs", "io-u
 # feature). Sanctioned mechanism per the Stage I sync plan; ungated so the
 # headless build (`--no-default-features`) includes the sharing module.
 async-trait = "0.1"
+# iroh peer-to-peer transport for Stage I personal sync (task A5). Pinned to the
+# current 1.x line; iroh-blobs 0.103 pairs with iroh ^1.0. NON-optional and
+# ungated so the headless (`--no-default-features`) build still carries the
+# `sharing::iroh` transport (Perseus needs it). Default features keep the
+# pure-Rust `tls-ring` crypto backend (no cmake/aws-lc-rs) — ARM-friendly, pulls
+# no rustafits/solver/native-heavy deps.
+iroh = "=1.0.2"
+iroh-blobs = "=0.103.0"
+# Addressing ticket (EndpointTicket) used as the out-of-band pairing_ticket;
+# pinned to iroh's 1.x ticket crate. Transitive under iroh-blobs, named directly
+# so the transport can build/parse pairing tickets.
+iroh-tickets = "=1.0.0"
+# postcard wire encoding for the announce/ack control protocol (uni QUIC stream).
+postcard = { version = "1", features = ["use-std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"

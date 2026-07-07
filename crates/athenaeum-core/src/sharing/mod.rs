@@ -16,6 +16,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+pub mod iroh;
 pub mod loopback;
 pub mod types;
 
