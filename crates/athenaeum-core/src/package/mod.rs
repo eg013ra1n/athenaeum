@@ -39,7 +39,7 @@ mod tests;
 
 pub use manifest::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
 pub use reader::{read_manifest, validate_package};
-pub use writer::write_package;
+pub use writer::{write_package, write_package_with_root_hash, RootHashProvider};
 
 /// Name of the manifest file inside a package directory.
 pub const MANIFEST_FILENAME: &str = "manifest.ndjson";

@@ -13,9 +13,35 @@ use crate::sharing::types::{PackageAnnounce, PackageId};
 use super::manifest::ManifestRecord;
 use super::MANIFEST_FILENAME;
 
+/// A hook that computes the package's `root_hash` from the fully-written package
+/// directory (payload files + `manifest.ndjson`).
+///
+/// The default writer path uses an xxh3 placeholder (see [`compute_root_hash`]).
+/// Task A5's iroh transport substitutes the iroh-blobs **collection hash** behind
+/// this same opaque string field: the caller imports the package directory into
+/// its blob store (an async operation), obtains the collection hash, and supplies
+/// a closure that returns it. The provider is intentionally synchronous — a
+/// caller with an already-computed hash returns it directly; the engine's live
+/// send path does not use this hook at all (it overrides `root_hash` with the
+/// collection hash at announce time, see `sharing::iroh`).
+pub type RootHashProvider<'a> = dyn Fn(&Path) -> Result<String> + 'a;
+
 /// Write a package into `dest_dir`: copy each source file to its `rel_path`,
 /// emit `manifest.ndjson` (one compact record per line), and return the
-/// [`PackageAnnounce`] describing the bundle.
+/// [`PackageAnnounce`] describing the bundle. Uses the built-in xxh3 placeholder
+/// for `root_hash`; call [`write_package_with_root_hash`] to substitute a
+/// different digest (e.g. the iroh collection hash).
+pub fn write_package(
+    dest_dir: &Path,
+    records: Vec<(PathBuf, ManifestRecord)>,
+) -> Result<PackageAnnounce> {
+    write_package_with_root_hash(dest_dir, records, None)
+}
+
+/// Like [`write_package`], but lets the caller override how `root_hash` is
+/// computed via an optional [`RootHashProvider`] hook (`None` reproduces the
+/// built-in xxh3 placeholder exactly). The hook runs after the package directory
+/// — including `manifest.ndjson` — is fully written, receiving the package dir.
 ///
 /// The caller supplies fully-formed records (including `byte_size` and the
 /// full-content `xxh3`); this function writes them verbatim so
@@ -23,9 +49,10 @@ use super::MANIFEST_FILENAME;
 ///
 /// `rel_path`s must be relative and free of `..` / root / prefix components — a
 /// package must never let a record escape its own directory.
-pub fn write_package(
+pub fn write_package_with_root_hash(
     dest_dir: &Path,
     records: Vec<(PathBuf, ManifestRecord)>,
+    root_hash: Option<&RootHashProvider<'_>>,
 ) -> Result<PackageAnnounce> {
     fs::create_dir_all(dest_dir)
         .with_context(|| format!("create package dir {}", dest_dir.display()))?;
@@ -68,9 +95,14 @@ pub fn write_package(
     fs::write(&manifest_path, buf.as_bytes())
         .with_context(|| format!("write manifest {}", manifest_path.display()))?;
 
+    let root_hash = match root_hash {
+        Some(provider) => provider(dest_dir).context("root-hash provider failed")?,
+        None => compute_root_hash(&manifest_records),
+    };
+
     let announce = PackageAnnounce {
         package_id: PackageId(Uuid::new_v4().to_string()),
-        root_hash: compute_root_hash(&manifest_records),
+        root_hash,
         byte_size: total_bytes,
         frame_count: manifest_records.len() as u32,
     };
@@ -88,8 +120,9 @@ pub fn write_package(
 /// Placeholder root hash: xxh3 over the payload content-hashes in sorted order.
 ///
 /// Sorting makes it order-independent — reordering members can't change the
-/// package's identity. Task A5 replaces this with the iroh collection hash; the
-/// field stays an opaque, producer-defined string either way.
+/// package's identity. Task A5 replaces this with the iroh collection hash (via
+/// [`RootHashProvider`] or the transport's announce-time override); the field
+/// stays an opaque, producer-defined string either way.
 fn compute_root_hash(records: &[ManifestRecord]) -> String {
     let mut hashes: Vec<&str> = records.iter().map(|r| r.xxh3.as_str()).collect();
     hashes.sort_unstable();

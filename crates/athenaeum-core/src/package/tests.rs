@@ -13,8 +13,8 @@ use crate::models::Frame;
 
 use super::manifest::MANIFEST_VERSION;
 use super::{
-    read_manifest, validate_package, write_package, xxh3_full_file, ManifestRecord, PayloadKind,
-    MANIFEST_FILENAME,
+    read_manifest, validate_package, write_package, write_package_with_root_hash, xxh3_full_file,
+    ManifestRecord, PayloadKind, MANIFEST_FILENAME,
 };
 
 /// Fabricate a tiny valid FITS (4x4 float image) at `path`.
@@ -107,6 +107,29 @@ fn validate_catches_corruption() {
         err.to_string().contains(rel_path),
         "error must name the corrupt rel_path, got: {err}"
     );
+}
+
+#[test]
+fn root_hash_provider_overrides_placeholder() {
+    let src_dir = tempdir().unwrap();
+    let src = src_dir.path().join("light.fits");
+    write_fixture_fits(&src);
+    let record = sample_record(&src, "frames/light.fits");
+
+    let dest = tempdir().unwrap();
+    // The provider sees the fully-written package dir (manifest present) and
+    // supplies the opaque root_hash — this is the seam A5's iroh transport uses
+    // to inject the collection hash.
+    let provider = |dir: &std::path::Path| {
+        assert!(dir.join(MANIFEST_FILENAME).exists(), "manifest written before provider runs");
+        Ok("collection-hash-stub".to_string())
+    };
+    let announce =
+        write_package_with_root_hash(dest.path(), vec![(src, record)], Some(&provider)).unwrap();
+
+    assert_eq!(announce.root_hash, "collection-hash-stub");
+    // The package still validates — the provider only changes the announce field.
+    validate_package(dest.path()).unwrap();
 }
 
 #[test]
