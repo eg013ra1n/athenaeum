@@ -13,13 +13,17 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use athenaeum_core::fits_parser::{parse_fits_with_header, parse_xisf};
 use athenaeum_core::package::{
-    self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION,
+    self, read_manifest, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION,
 };
 use athenaeum_core::sharing::iroh::{random_secret, BlobStore, IrohTransport};
 use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
-use athenaeum_core::sync::{OutboundRow, SyncEngine, SyncEngineHandle};
+use athenaeum_core::sync::{
+    evaluate_and_apply, Direction, HistoryRow, OutboundRow, RetentionOutcome, SyncEngine,
+    SyncEngineHandle,
+};
+use chrono::{DateTime, Utc};
 use iroh::RelayMode;
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
@@ -204,6 +208,7 @@ pub struct Agent {
     origin_device: String,
     watcher: Option<WatcherHandle>,
     enqueue_task: Option<JoinHandle<()>>,
+    retention_task: Option<JoinHandle<()>>,
 }
 
 impl Agent {
@@ -273,14 +278,19 @@ impl Agent {
         ));
         let origin_device = node_id_hex(&node_id);
 
-        // Retention is parsed + validated but inert until task A8.
+        // Retention is now ACTIVE (task A8) — but dry-run stays the enforced
+        // default until the M-Perseus-MVP soak gate lifts (config rejects
+        // dry_run = false), so no files are deleted in this build.
         tracing::info!(
             retention_policy = ?config.retention.policy,
             dry_run = config.retention.dry_run,
-            "retention is inert in this build (evaluator ships in A8); no files will be deleted"
+            interval_secs = config.retention.interval_secs,
+            keep_days = config.retention.keep_days,
+            disk_max_pct = config.retention.disk_max_pct,
+            "retention active"
         );
 
-        let (watcher, enqueue_task) = if watch {
+        let (watcher, enqueue_task, retention_task) = if watch {
             let (stable_tx, stable_rx) = mpsc::channel::<PathBuf>(64);
             let watcher = watcher::spawn_watcher(
                 config.capture_dir.clone(),
@@ -296,9 +306,14 @@ impl Agent {
                 config.clone(),
                 origin_device.clone(),
             );
-            (Some(watcher), Some(enqueue_task))
+            let retention_task = spawn_retention_task(
+                Arc::clone(&store),
+                Arc::clone(&seen),
+                config.clone(),
+            );
+            (Some(watcher), Some(enqueue_task), Some(retention_task))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         Ok(Self {
@@ -309,6 +324,7 @@ impl Agent {
             origin_device,
             watcher,
             enqueue_task,
+            retention_task,
         })
     }
 
@@ -321,7 +337,7 @@ impl Agent {
         let pkg_dir = build_package_for_file(&self.config, file_path, &self.origin_device)?;
         let id = self.engine.enqueue_package(&pkg_dir).await?;
         tracing::info!(id, path = %file_path.display(), "enqueued capture file");
-        record_seen(&self.seen, file_path);
+        record_seen(&self.seen, file_path, &pkg_dir.to_string_lossy());
         Ok(id)
     }
 
@@ -343,6 +359,11 @@ impl Agent {
     /// Gracefully stop the watcher, drain the enqueue consumer, and shut the
     /// engine down (awaiting its worker).
     pub async fn shutdown(self) {
+        // The retention loop is an independent timer task with no channel to
+        // close; abort it directly (it holds only Arc clones, nothing to drain).
+        if let Some(t) = self.retention_task {
+            t.abort();
+        }
         if let Some(w) = self.watcher {
             w.shutdown().await;
         }
@@ -374,18 +395,23 @@ impl Agent {
         if let Some(t) = self.enqueue_task {
             t.abort();
         }
+        if let Some(t) = self.retention_task {
+            t.abort();
+        }
         // `self.engine` (and `self.store`/`self.seen`) drop here, at end of scope.
     }
 }
 
-/// Record `path`'s current `(size, mtime)` in the seen store. Best-effort: a
-/// failure here only means a possible harmless re-send on a future restart —
-/// it must never fail the enqueue itself (the file is already durably queued).
-fn record_seen(seen: &SeenStore, path: &Path) {
+/// Record `path`'s current `(size, mtime)` and its `package_ref` in the seen
+/// store. Best-effort: a failure here only means a possible harmless re-send on a
+/// future restart — it must never fail the enqueue itself (the file is already
+/// durably queued). The `package_ref` linkage is what retention later joins on to
+/// map a confirmed package back to this source capture file.
+fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
     match std::fs::metadata(path) {
         Ok(m) => {
             let mtime_ms = crate::seen::mtime_millis(m.modified().ok());
-            if let Err(error) = seen.mark_enqueued(path, m.len(), mtime_ms) {
+            if let Err(error) = seen.mark_enqueued(path, m.len(), mtime_ms, package_ref) {
                 tracing::warn!(%error, path = %path.display(), "failed to record seen-store entry");
             }
         }
@@ -409,7 +435,7 @@ fn spawn_enqueue_consumer(
                 Ok(pkg_dir) => match engine.enqueue_package(&pkg_dir).await {
                     Ok(id) => {
                         tracing::info!(id, path = %path.display(), "enqueued capture file");
-                        record_seen(&seen, &path);
+                        record_seen(&seen, &path, &pkg_dir.to_string_lossy());
                     }
                     Err(error) => {
                         tracing::error!(%error, path = %path.display(), "enqueue failed")
@@ -421,6 +447,167 @@ fn spawn_enqueue_consumer(
             }
         }
         tracing::debug!("enqueue consumer stopped");
+    })
+}
+
+/// RFC3339 UTC millisecond timestamp — the sync tables' canonical rendering.
+fn now_iso() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Current disk usage of the volume holding `path`, as a whole percent
+/// (`0..=100`). Only the `disk_pct` retention policy consults it.
+///
+/// Fails **safe**: any error, or a platform without `statvfs`, returns `0`
+/// ("empty disk") so retention's disk-pressure gate can never *trigger* a
+/// deletion off a bad reading — it can only ever decline to delete.
+#[cfg(unix)]
+fn disk_usage_pct(path: &Path) -> u8 {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+        return 0;
+    };
+    // SAFETY: `stat` is zero-initialised and only read after a successful call;
+    // `cpath` is a valid NUL-terminated C string living for the call's duration.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
+    if rc != 0 {
+        tracing::warn!(path = %path.display(), "statvfs failed; disk probe returns 0%");
+        return 0;
+    }
+    let total = stat.f_blocks as u128;
+    let avail = stat.f_bavail as u128;
+    if total == 0 {
+        return 0;
+    }
+    let used = total.saturating_sub(avail);
+    ((used * 100) / total).min(100) as u8
+}
+
+#[cfg(not(unix))]
+fn disk_usage_pct(_path: &Path) -> u8 {
+    // No statvfs; treat as empty so retention never deletes on disk pressure.
+    0
+}
+
+/// The retention deleter (fs remove + audit history + seen-store update) for one
+/// confirmed package. `pkg_ref` is `sync_outbound.package_ref` (the package
+/// directory) — the abstract deletable subject core hands us; here we resolve it
+/// back to the *original source capture file* and remove that.
+///
+/// Idempotent and safe by construction: if there is no *live* source linkage
+/// (already retention-deleted, or the path was re-enqueued under a newer
+/// package), it is a logged no-op — never an error, never a stray delete.
+fn retention_delete_source(
+    store: &StandaloneSyncStore,
+    seen: &SeenStore,
+    pkg_ref: &Path,
+) -> Result<()> {
+    let pkg_ref_str = pkg_ref.to_string_lossy();
+
+    let Some(source) = seen.source_for_package(&pkg_ref_str)? else {
+        tracing::warn!(
+            package_ref = %pkg_ref.display(),
+            "retention: no live source linkage for confirmed package; skipping (already deleted or superseded)"
+        );
+        return Ok(());
+    };
+
+    // Audit metadata comes from the package manifest (frame uuid / filename /
+    // bytes / object) — never from the perseus_seen row, keeping core's history
+    // schema the single source of truth for a transfer record.
+    let records = read_manifest(pkg_ref).unwrap_or_else(|error| {
+        tracing::warn!(package_ref = %pkg_ref.display(), %error, "retention: manifest unreadable; history rows will be minimal");
+        Vec::new()
+    });
+
+    // Remove the source capture file (idempotent: absent = goal already met).
+    if source.exists() {
+        std::fs::remove_file(&source)
+            .with_context(|| format!("retention delete source {}", source.display()))?;
+    }
+
+    // One audit row per manifest record (one-file packages → one row).
+    for r in &records {
+        let object = r
+            .frame_meta
+            .get("object")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        store.append_history(HistoryRow {
+            frame_uuid: r.frame_uuid.clone(),
+            filename: r.rel_path.clone(),
+            object,
+            peer_device: r.origin_device.clone(),
+            direction: Direction::Sent,
+            bytes: r.byte_size,
+            started_at: now_iso(),
+            finished_at: Some(now_iso()),
+            outcome: "retention_deleted".to_string(),
+        })?;
+    }
+
+    // Stamp the seen row deleted so it never surfaces to retention again.
+    seen.mark_deleted(&source)?;
+    Ok(())
+}
+
+/// Run one retention pass synchronously: map the config policy onto core's
+/// evaluator and apply it with the fs-deleter. Split out from the tick loop so
+/// it is directly unit-testable (inject `now` + a `disk_probe`).
+///
+/// The `store` reference serves double duty — it is both core's candidate source
+/// (`&dyn SyncStore`) and the deleter's history sink; both are shared borrows, so
+/// this composes without contention.
+pub fn run_retention_once(
+    config: &Config,
+    store: &StandaloneSyncStore,
+    seen: &SeenStore,
+    now: DateTime<Utc>,
+    disk_probe: &dyn Fn() -> u8,
+) -> Result<RetentionOutcome> {
+    let policy = config.retention.to_core_policy();
+    let dry_run = config.retention.dry_run;
+    let mut deleter = |pkg_ref: &Path| retention_delete_source(store, seen, pkg_ref);
+    evaluate_and_apply(store, &policy, dry_run, now, disk_probe, &mut deleter)
+}
+
+/// Spawn the hourly (config-driven) retention timer. Each tick runs a full
+/// evaluate-and-apply pass on a blocking thread (SQLite + fs), then logs the
+/// outcome. Aborted on shutdown; holds only `Arc` clones, so there is nothing to
+/// drain.
+fn spawn_retention_task(
+    store: Arc<StandaloneSyncStore>,
+    seen: Arc<SeenStore>,
+    config: Config,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = config.retention.interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            let store = Arc::clone(&store);
+            let seen = Arc::clone(&seen);
+            let config = config.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                let capture_dir = config.capture_dir.clone();
+                let disk_probe = move || disk_usage_pct(&capture_dir);
+                run_retention_once(&config, &store, &seen, Utc::now(), &disk_probe)
+            })
+            .await;
+            match res {
+                Ok(Ok(outcome)) => tracing::info!(
+                    dry_run = outcome.dry_run,
+                    eligible = outcome.eligible.len(),
+                    deleted = outcome.deleted.len(),
+                    would_warn_disk_pressure = outcome.would_warn_disk_pressure,
+                    "retention tick complete"
+                ),
+                Ok(Err(error)) => tracing::error!(%error, "retention tick failed"),
+                Err(error) => tracing::error!(%error, "retention tick task panicked"),
+            }
+        }
     })
 }
 
@@ -535,5 +722,188 @@ mod tests {
         load_or_create_device_key(&path).expect("create key");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+}
+
+/// End-to-end retention tests over real files: the confirmed → source-capture
+/// mapping (`perseus_seen.package_ref` join) plus the fs-deleter + audit-history
+/// side effects, in dry-run and real-delete mode. These exercise
+/// [`run_retention_once`] — the exact composition the hourly tick runs.
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    use athenaeum_core::sync::{HistoryQuery, SyncStore};
+
+    use crate::config::RetentionPolicy as CfgPolicy;
+
+    const PEER: NodeId = [3u8; 32];
+
+    /// A config over fresh tempdirs with an existing `capture_dir` (validate()
+    /// requires it). Returns the tempdir guard so the dirs outlive the test.
+    fn setup() -> (tempfile::TempDir, Config, StandaloneSyncStore, SeenStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = tmp.path().join("capture");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&capture).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let toml = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"on_confirm\"\ndry_run=true\n",
+            capture.display(),
+            data.display()
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+        // Store + seen share the one perseus.db file (WAL) — the production wiring.
+        let store = StandaloneSyncStore::open(config.db_path()).unwrap();
+        let seen = SeenStore::open(config.db_path()).unwrap();
+        (tmp, config, store, seen)
+    }
+
+    /// Hand-build a one-file package (no FITS parsing) whose manifest carries a
+    /// minimal `frame_meta`, and return its directory (== the `package_ref`).
+    fn make_package(packages_dir: &Path, src: &Path, object: &str) -> PathBuf {
+        let uuid = Uuid::new_v4().to_string();
+        let filename = src.file_name().unwrap().to_str().unwrap().to_string();
+        let byte_size = std::fs::metadata(src).unwrap().len();
+        let record = ManifestRecord {
+            v: MANIFEST_VERSION,
+            frame_uuid: uuid.clone(),
+            origin_catalog_uuid: uuid.clone(),
+            origin_device: "test-device".to_string(),
+            payload_kind: PayloadKind::RawFrame,
+            rel_path: filename,
+            byte_size,
+            xxh3: "0".repeat(16),
+            frame_meta: serde_json::json!({ "object": object }),
+            analysis: None,
+            app_version: "test".to_string(),
+        };
+        let pkg_dir = packages_dir.join(&uuid);
+        write_package(&pkg_dir, vec![(src.to_path_buf(), record)]).unwrap();
+        pkg_dir
+    }
+
+    /// Register a source file → package: enqueue the outbound row, link the seen
+    /// row, return `(package_ref, outbound_id)`.
+    fn register(
+        config: &Config,
+        store: &StandaloneSyncStore,
+        seen: &SeenStore,
+        src: &Path,
+    ) -> (PathBuf, i64) {
+        let pkg = make_package(&config.packages_dir(), src, "M42");
+        let id = store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        seen.mark_enqueued(src, 4, 1, &pkg.to_string_lossy()).unwrap();
+        (pkg, id)
+    }
+
+    fn history_deleted_count(store: &StandaloneSyncStore) -> usize {
+        store
+            .search_history(HistoryQuery {
+                filename: None,
+                object: None,
+                limit: 1000,
+            })
+            .unwrap()
+            .iter()
+            .filter(|h| h.outcome == "retention_deleted")
+            .count()
+    }
+
+    /// Real-delete mode: a confirmed package's source is deleted, an audit row is
+    /// written, the seen row is stamped deleted; the unconfirmed source is
+    /// untouched and stays resolvable.
+    #[test]
+    fn run_retention_once_deletes_only_confirmed_sources() {
+        let (_tmp, mut config, store, seen) = setup();
+        // Test-only: bypass the config validator's dry_run guard to exercise the
+        // real deletion path (production still refuses dry_run = false).
+        config.retention.dry_run = false;
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        let s2 = config.capture_dir.join("light-0002.fits");
+        let su = config.capture_dir.join("light-0003.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        std::fs::write(&s2, b"bbbb").unwrap();
+        std::fs::write(&su, b"cccc").unwrap();
+
+        let (pkg1, id1) = register(&config, &store, &seen, &s1);
+        let (_pkg2, id2) = register(&config, &store, &seen, &s2);
+        let (pku, _idu) = register(&config, &store, &seen, &su);
+
+        store.confirm(id1, &[]).unwrap();
+        store.confirm(id2, &[]).unwrap();
+
+        let probe = || 0u8;
+        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &probe).unwrap();
+
+        assert_eq!(outcome.deleted.len(), 2, "both confirmed sources deleted");
+        assert!(!s1.exists() && !s2.exists(), "confirmed source files removed");
+        assert!(su.exists(), "the unconfirmed source is never touched");
+        assert_eq!(history_deleted_count(&store), 2, "one audit row per deletion");
+        assert_eq!(
+            seen.source_for_package(&pkg1.to_string_lossy()).unwrap(),
+            None,
+            "a deleted source no longer resolves"
+        );
+        assert_eq!(
+            seen.source_for_package(&pku.to_string_lossy()).unwrap(),
+            Some(su.clone()),
+            "the unconfirmed package's source stays live and resolvable"
+        );
+    }
+
+    /// Dry-run mode (the default): nothing is deleted, no audit rows, files and
+    /// seen linkage intact — but the pass still reports what it would delete.
+    #[test]
+    fn run_retention_once_dry_run_reports_but_deletes_nothing() {
+        let (_tmp, config, store, seen) = setup(); // dry_run = true from TOML
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        let (pkg1, id1) = register(&config, &store, &seen, &s1);
+        store.confirm(id1, &[]).unwrap();
+
+        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.eligible.len(), 1, "reports the confirmed candidate");
+        assert!(outcome.deleted.is_empty(), "dry-run deletes nothing");
+        assert!(s1.exists(), "the file remains on disk");
+        assert_eq!(history_deleted_count(&store), 0, "no audit rows in dry-run");
+        assert_eq!(
+            seen.source_for_package(&pkg1.to_string_lossy()).unwrap(),
+            Some(s1),
+            "the seen linkage is untouched"
+        );
+    }
+
+    /// The hard invariant at the Perseus composition level: an UNCONFIRMED
+    /// source is never deleted, even in real mode under maximum disk pressure,
+    /// and never surfaces as eligible.
+    #[test]
+    fn unconfirmed_source_never_surfaces_even_under_disk_pressure() {
+        let (_tmp, mut config, store, seen) = setup();
+        config.retention.policy = CfgPolicy::DiskPct;
+        config.retention.disk_max_pct = 50;
+        config.retention.dry_run = false; // real mode — still must not delete
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        // Enqueued + linked but NEVER confirmed.
+        let (pkg1, _id1) = register(&config, &store, &seen, &s1);
+
+        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 99u8).unwrap();
+
+        assert!(outcome.eligible.is_empty(), "unconfirmed never eligible");
+        assert!(outcome.deleted.is_empty());
+        assert!(outcome.would_warn_disk_pressure, "full disk + nothing to free warns");
+        assert!(s1.exists(), "the unconfirmed source survives a full disk");
+        assert_eq!(history_deleted_count(&store), 0);
+        assert_eq!(
+            seen.source_for_package(&pkg1.to_string_lossy()).unwrap(),
+            Some(s1),
+            "the source is still live (never deleted)"
+        );
     }
 }

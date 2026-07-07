@@ -85,6 +85,19 @@ pub trait SyncStore: Send + Sync {
     /// Every non-terminal outbound row — the crash-resume enumeration.
     fn non_terminal(&self) -> Result<Vec<OutboundRow>>;
 
+    /// Every package currently in [`Confirmed`](OutboundState::Confirmed),
+    /// oldest-confirmed-first (`confirmed_at ASC, id ASC`).
+    ///
+    /// This is the retention evaluator's **sole** source of deletable
+    /// candidates (task A8) — the single chokepoint that enforces the hard
+    /// invariant that only *confirmed* (fully received) data is ever eligible
+    /// for deletion. A package in any non-confirmed state (`queued`,
+    /// `announced`, `transferring`, `failed`, …) is NEVER returned here and so
+    /// can never reach a deleter, regardless of policy or disk pressure. The
+    /// oldest-first ordering is what `DiskPct` retention relies on to delete
+    /// the oldest confirmed data first.
+    fn confirmed(&self) -> Result<Vec<OutboundRow>>;
+
     /// Mark a package [`Confirmed`](OutboundState::Confirmed) (idempotent: a
     /// no-op if already confirmed). `receipts` are the peer's per-frame verdicts;
     /// A4 records them as [`HistoryRow`]s via [`append_history`](Self::append_history)
@@ -215,6 +228,37 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
         .collect::<rusqlite::Result<Vec<HistoryRaw>>>()
         .context("collect search_history")?;
     raws.into_iter().map(to_history).collect()
+}
+
+/// Load every `sync_outbound` row in the terminal `confirmed` state,
+/// oldest-confirmed-first (`confirmed_at ASC, id ASC`). Defined once here so
+/// both store implementations share the retention-candidate query verbatim; the
+/// SQL filters on `state = 'confirmed'` so no non-confirmed row is ever
+/// returned. See [`SyncStore::confirmed`].
+pub fn confirmed_outbound_rows(conn: &Connection) -> Result<Vec<OutboundRow>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {OUTBOUND_COLS} FROM sync_outbound
+             WHERE state = 'confirmed'
+             ORDER BY confirmed_at ASC, id ASC"
+        ))
+        .context("prepare confirmed_outbound_rows")?;
+    let raws = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })
+        .context("query confirmed_outbound_rows")?
+        .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
+        .context("collect confirmed_outbound_rows")?;
+    raws.into_iter().map(to_outbound).collect()
 }
 
 /// Stable text encoding of a [`ReceiptOutcome`] for the `sync_receipts.outcome`
@@ -447,6 +491,11 @@ impl SyncStore for StandaloneSyncStore {
         raws.into_iter().map(to_outbound).collect()
     }
 
+    fn confirmed(&self) -> Result<Vec<OutboundRow>> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        confirmed_outbound_rows(&conn)
+    }
+
     fn confirm(&self, id: i64, receipts: &[FrameReceipt]) -> Result<()> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         // Idempotent: only a non-confirmed row transitions (guards a duplicate
@@ -621,6 +670,11 @@ impl SyncStore for CatalogSyncStore {
             .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
             .context("collect non_terminal")?;
         raws.into_iter().map(to_outbound).collect()
+    }
+
+    fn confirmed(&self) -> Result<Vec<OutboundRow>> {
+        let conn = self.lock_conn();
+        confirmed_outbound_rows(&conn)
     }
 
     fn confirm(&self, id: i64, receipts: &[FrameReceipt]) -> Result<()> {

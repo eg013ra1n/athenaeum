@@ -32,6 +32,13 @@ pub const DEFAULT_STABILITY_SECS: u64 = 10;
 /// Default re-stat cadence (seconds) for pending capture files.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 
+/// Default `keep_days` threshold (days) for the `keep_days` policy.
+pub const DEFAULT_KEEP_DAYS: u32 = 30;
+/// Default disk-usage cap (percent) for the `disk_pct` policy.
+pub const DEFAULT_DISK_MAX_PCT: u8 = 90;
+/// Default retention evaluation cadence (seconds) — hourly.
+pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
+
 fn default_stability_secs() -> u64 {
     DEFAULT_STABILITY_SECS
 }
@@ -40,6 +47,15 @@ fn default_poll_interval_secs() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_keep_days() -> u32 {
+    DEFAULT_KEEP_DAYS
+}
+fn default_disk_max_pct() -> u8 {
+    DEFAULT_DISK_MAX_PCT
+}
+fn default_retention_interval_secs() -> u64 {
+    DEFAULT_RETENTION_INTERVAL_SECS
 }
 
 /// Agent operating mode. MVP has a single value; the enum exists so an unknown
@@ -71,11 +87,23 @@ pub enum RetentionPolicy {
 pub struct RetentionConfig {
     pub policy: RetentionPolicy,
     /// Dry-run flag. Hard invariant (plan Global Constraints): dry-run is the
-    /// default and stays on until the M-Perseus-MVP gate passes. A6 therefore
-    /// rejects `dry_run = false` — there is no deletion evaluator yet (A8), so
-    /// turning it off could only mislead.
+    /// default and stays on until the M-Perseus-MVP gate passes. Perseus
+    /// therefore still rejects `dry_run = false` — even though A8 now ships the
+    /// evaluator, live deletion stays gated behind the soak sign-off.
     #[serde(default = "default_true")]
     pub dry_run: bool,
+    /// `keep_days` threshold in days (only consulted by the `keep_days` policy).
+    /// Additive/defaulted; absent from the contract sample.
+    #[serde(default = "default_keep_days")]
+    pub keep_days: u32,
+    /// Disk-usage cap in percent (only consulted by the `disk_pct` policy).
+    /// Additive/defaulted; absent from the contract sample.
+    #[serde(default = "default_disk_max_pct")]
+    pub disk_max_pct: u8,
+    /// How often the retention evaluator runs, in seconds (default hourly).
+    /// Additive/defaulted; absent from the contract sample.
+    #[serde(default = "default_retention_interval_secs")]
+    pub interval_secs: u64,
 }
 
 impl Default for RetentionConfig {
@@ -83,7 +111,33 @@ impl Default for RetentionConfig {
         Self {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
+            keep_days: DEFAULT_KEEP_DAYS,
+            disk_max_pct: DEFAULT_DISK_MAX_PCT,
+            interval_secs: DEFAULT_RETENTION_INTERVAL_SECS,
         }
+    }
+}
+
+impl RetentionConfig {
+    /// Map the parsed config policy onto the core evaluator's parameterised
+    /// [`athenaeum_core::sync::RetentionPolicy`], injecting the configured
+    /// `keep_days` / `disk_max_pct` tuning values. This is the single seam
+    /// between Perseus's flat TOML enum and core's carrying enum.
+    pub fn to_core_policy(&self) -> athenaeum_core::sync::RetentionPolicy {
+        use athenaeum_core::sync::RetentionPolicy as Core;
+        match self.policy {
+            RetentionPolicy::KeepEverything => Core::KeepEverything,
+            RetentionPolicy::OnConfirm => Core::OnConfirm,
+            RetentionPolicy::KeepDays => Core::KeepDays(self.keep_days),
+            RetentionPolicy::DiskPct => Core::DiskPct {
+                max_pct: self.disk_max_pct,
+            },
+        }
+    }
+
+    /// Retention evaluation cadence as a [`Duration`].
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval_secs)
     }
 }
 
@@ -164,6 +218,21 @@ impl Config {
         }
         if self.poll_interval_secs == 0 {
             bail!("poll_interval_secs must be >= 1");
+        }
+        // Retention tuning: only meaningful for keep_days / disk_pct, but
+        // validate unconditionally so a bad value is caught early, not on the
+        // first tick after a policy change.
+        if self.retention.keep_days == 0 {
+            bail!("retention.keep_days must be >= 1");
+        }
+        if self.retention.disk_max_pct < 1 || self.retention.disk_max_pct > 100 {
+            bail!(
+                "retention.disk_max_pct must be between 1 and 100 (got {})",
+                self.retention.disk_max_pct
+            );
+        }
+        if self.retention.interval_secs == 0 {
+            bail!("retention.interval_secs must be >= 1");
         }
         Ok(())
     }
@@ -378,6 +447,80 @@ mode = "auto"
             err.chain().any(|c| c.to_string().contains("capture_dir")),
             "error should mention capture_dir: {err:#}"
         );
+    }
+
+    #[test]
+    fn retention_tuning_defaults_when_omitted() {
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).unwrap();
+        assert_eq!(cfg.retention.keep_days, DEFAULT_KEEP_DAYS);
+        assert_eq!(cfg.retention.disk_max_pct, DEFAULT_DISK_MAX_PCT);
+        assert_eq!(cfg.retention.interval_secs, DEFAULT_RETENTION_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn retention_tuning_parses_when_present() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"
+capture_dir = "{}"
+data_dir = "/d"
+pairing_ticket = "t"
+mode = "auto"
+[retention]
+policy = "keep_days"
+dry_run = true
+keep_days = 7
+disk_max_pct = 80
+interval_secs = 600
+"#,
+            capture.path().display()
+        );
+        let cfg = Config::from_toml_str(&text).expect("valid config");
+        assert_eq!(cfg.retention.keep_days, 7);
+        assert_eq!(cfg.retention.disk_max_pct, 80);
+        assert_eq!(cfg.retention.interval_secs, 600);
+    }
+
+    #[test]
+    fn to_core_policy_carries_tuning_values() {
+        use athenaeum_core::sync::RetentionPolicy as Core;
+        let mut r = RetentionConfig {
+            policy: RetentionPolicy::KeepDays,
+            dry_run: true,
+            keep_days: 14,
+            disk_max_pct: 85,
+            interval_secs: 3600,
+        };
+        assert_eq!(r.to_core_policy(), Core::KeepDays(14));
+        r.policy = RetentionPolicy::DiskPct;
+        assert_eq!(r.to_core_policy(), Core::DiskPct { max_pct: 85 });
+        r.policy = RetentionPolicy::OnConfirm;
+        assert_eq!(r.to_core_policy(), Core::OnConfirm);
+        r.policy = RetentionPolicy::KeepEverything;
+        assert_eq!(r.to_core_policy(), Core::KeepEverything);
+    }
+
+    #[test]
+    fn zero_keep_days_is_rejected() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"/d\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_days\"\ndry_run=true\nkeep_days=0\n",
+            capture.path().display()
+        );
+        let err = Config::from_toml_str(&text).expect_err("keep_days=0 must fail");
+        assert!(err.chain().any(|c| c.to_string().contains("keep_days")));
+    }
+
+    #[test]
+    fn out_of_range_disk_max_pct_is_rejected() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"/d\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"disk_pct\"\ndry_run=true\ndisk_max_pct=150\n",
+            capture.path().display()
+        );
+        let err = Config::from_toml_str(&text).expect_err("disk_max_pct=150 must fail");
+        assert!(err.chain().any(|c| c.to_string().contains("disk_max_pct")));
     }
 
     #[test]

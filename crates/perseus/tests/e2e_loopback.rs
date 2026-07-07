@@ -59,6 +59,7 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
+            ..RetentionConfig::default()
         },
         stability_secs: 1,
         poll_interval_secs: 1,

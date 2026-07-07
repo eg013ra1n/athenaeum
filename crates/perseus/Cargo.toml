@@ -50,6 +50,11 @@ chrono = "0.4"
 # ticket. Pinned to the exact versions athenaeum-core uses so cargo unifies them.
 iroh = "=1.0.2"
 iroh-tickets = "=1.0.0"
+# Unix `statvfs` for the retention disk-usage probe (disk_pct policy). Already in
+# the workspace lock as a transitive dep; named here so run.rs can call it
+# directly. On non-unix the probe is a safe stub (0% → never triggers deletion).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

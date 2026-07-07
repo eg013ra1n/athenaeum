@@ -94,8 +94,12 @@ async fn cmd_status(config: Config) -> Result<()> {
     println!("  mode              : {:?}", config.mode);
     println!("  retention.policy  : {:?}", config.retention.policy);
     println!(
-        "  retention.dry_run : {} (retention is inert until task A8)",
+        "  retention.dry_run : {} (dry-run enforced until the M-Perseus-MVP gate)",
         config.retention.dry_run
+    );
+    println!(
+        "  retention.every   : {}s  keep_days={}  disk_max_pct={}",
+        config.retention.interval_secs, config.retention.keep_days, config.retention.disk_max_pct
     );
 
     let db_path = config.db_path();
