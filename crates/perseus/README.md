@@ -153,11 +153,16 @@ the systemd back-off.
 
 Perseus writes structured JSONL logs to `<data_dir>/logs/perseus.<date>.jsonl`
 (daily rotation, 14 files retained), plus a human line to stderr (captured by
-journald / launchd log files). Raise the level without editing the config via
-`ATHENAEUM_LOG` (full [`EnvFilter`] syntax, overrides the default `info`):
+journald / launchd log files). The default filter keeps Perseus's own modules at
+`info` but quiets iroh's internals (`iroh`, `iroh_relay`, `iroh_blobs`,
+`net_report`, `portmapper`, `netwatch`, `noq_udp`) to `warn` — otherwise their
+transport/probe span-close events are >99% of the log volume. Raise the level
+without editing the config via `ATHENAEUM_LOG` (full [`EnvFilter`] syntax, which
+overrides the default entirely — including the iroh quieting):
 
 ```bash
-ATHENAEUM_LOG=info,perseus=debug perseus --config perseus.toml run
+ATHENAEUM_LOG=info,perseus=debug perseus --config perseus.toml run   # more of our own detail
+ATHENAEUM_LOG=info,iroh=debug  perseus --config perseus.toml run     # un-quiet iroh internals
 ```
 
 Only `status` output and `--help` go to stdout; everything operational is a

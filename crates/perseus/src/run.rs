@@ -734,10 +734,22 @@ pub fn backlog_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// process lifetime. Drop it (at process exit) to flush.
 pub struct LogGuard(#[allow(dead_code)] tracing_appender::non_blocking::WorkerGuard);
 
+/// Default tracing filter when `ATHENAEUM_LOG` is unset. Perseus's own modules
+/// (and the shared `athenaeum_core::sync` engine) stay at `info`; iroh's
+/// transport/relay/blob internals and its network-probe dependencies
+/// (`portmapper`, `netwatch`, `noq_udp`, `net_report`) are quieted to `warn`.
+/// Left at `info` they bury the handful of real sync events — a single evening
+/// run produced ~71k `iroh::socket::transports` span-close events (>99% of log
+/// volume). Raise any of them explicitly via `ATHENAEUM_LOG`, which overrides
+/// this default entirely, e.g. `ATHENAEUM_LOG=info,iroh=debug`.
+const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,iroh_relay=warn,iroh_blobs=warn,net_report=warn,portmapper=warn,netwatch=warn,noq_udp=warn";
+
 /// Initialize tracing: rolling JSONL files under `<data_dir>/logs` with a
 /// `perseus.*` filename prefix (daily rotation, 14 files retained), plus a
-/// human line to stderr for foreground / journald. `ATHENAEUM_LOG` overrides the
-/// default `info` filter (shared convention with the desktop/web hosts).
+/// human line to stderr for foreground / journald. `ATHENAEUM_LOG` overrides
+/// the default filter entirely (shared convention with the desktop/web hosts);
+/// the default ([`DEFAULT_LOG_FILTER`]) keeps our modules at `info` while
+/// quieting iroh's verbose transport/probe internals to `warn`.
 ///
 /// Built directly on `tracing-appender` rather than `athenaeum_core::logging`:
 /// that module hardcodes a `Process` enum (Desktop/Web only, no Perseus prefix)
@@ -761,7 +773,7 @@ pub fn init_logging(log_dir: &Path) -> Result<LogGuard> {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = EnvFilter::try_from_env("ATHENAEUM_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
 
     let file_layer = tracing_subscriber::fmt::layer()
         .json()

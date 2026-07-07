@@ -4,6 +4,25 @@ use std::collections::BTreeMap;
 pub const SETTINGS_KEY: &str = "logging.config";
 const LEVELS: [&str; 4] = ["error", "warn", "info", "debug"]; // trace is env-only by spec
 
+/// Noisy third-party transport crates quieted to `warn` as a baseline in every
+/// generated filter. Both hosts run iroh in-process (the sync receiver), and its
+/// transport/relay/blob internals plus network-probe deps (`portmapper`,
+/// `netwatch`, `noq_udp`, `net_report`) log so verbosely at `info` that they
+/// bury our own events (a single Perseus evening run produced ~71k
+/// `iroh::socket::transports` span-close events). This is only the DEFAULT
+/// baseline — the user's per-module overrides below still apply on top, and
+/// `ATHENAEUM_LOG` (which bypasses `to_directives` entirely) can raise them,
+/// e.g. `ATHENAEUM_LOG=info,iroh=debug`.
+const THIRD_PARTY_QUIET: [&str; 7] = [
+    "iroh",
+    "iroh_relay",
+    "iroh_blobs",
+    "net_report",
+    "portmapper",
+    "netwatch",
+    "noq_udp",
+];
+
 /// UI module key -> tracing filter targets.
 const MODULE_TARGETS: [(&str, &[&str]); 4] = [
     ("scanner", &["athenaeum_core::scanner"]),
@@ -39,6 +58,12 @@ impl LoggingConfig {
             "info"
         };
         let mut out = base.to_string();
+        // Baseline: quiet noisy third-party transport crates (iroh & its network
+        // deps). Appended before the user's module overrides so a future iroh
+        // module key would win over this via EnvFilter's last-directive-wins.
+        for t in THIRD_PARTY_QUIET {
+            out.push_str(&format!(",{t}=warn"));
+        }
         for (key, level) in &self.modules {
             if !LEVELS.contains(&level.as_str()) {
                 continue;
@@ -98,9 +123,35 @@ pub struct LoggingConfigResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `,iroh=warn,...` baseline suffix that `to_directives()` appends after
+    /// the base level (see `THIRD_PARTY_QUIET`), so assertions read against the
+    /// same source of truth as the implementation.
+    fn quiet_suffix() -> String {
+        THIRD_PARTY_QUIET.iter().map(|t| format!(",{t}=warn")).collect()
+    }
+
     #[test]
-    fn default_config_is_info() {
-        assert_eq!(LoggingConfig::default().to_directives(), "info");
+    fn default_config_is_info_plus_third_party_quiet() {
+        assert_eq!(
+            LoggingConfig::default().to_directives(),
+            format!("info{}", quiet_suffix())
+        );
+    }
+    #[test]
+    fn third_party_transport_crates_default_to_warn() {
+        // The whole point of this change: iroh & its network-probe deps are
+        // quieted to warn in the default filter so their span-close spam can't
+        // bury our own info events.
+        let d = LoggingConfig::default().to_directives();
+        for t in THIRD_PARTY_QUIET {
+            assert!(
+                d.contains(&format!("{t}=warn")),
+                "default filter must quiet {t} to warn; got {d:?}"
+            );
+        }
+        // The default directives must still parse as a valid EnvFilter.
+        assert!(d.parse::<tracing_subscriber::EnvFilter>().is_ok());
     }
     #[test]
     fn module_overrides_map_to_targets() {
@@ -108,23 +159,27 @@ mod tests {
         cfg.level = "warn".into();
         cfg.modules.insert("scanner".into(), "debug".into());
         cfg.modules.insert("solver".into(), "debug".into());
-        // solver expands to BOTH the core plate_solve target and the solvemyastro crate
+        // solver expands to BOTH the core plate_solve target and the solvemyastro
+        // crate; the third-party quiet baseline sits between base and overrides.
         assert_eq!(
             cfg.to_directives(),
-            "warn,athenaeum_core::scanner=debug,athenaeum_core::plate_solve=debug,solvemyastro=debug"
+            format!(
+                "warn{},athenaeum_core::scanner=debug,athenaeum_core::plate_solve=debug,solvemyastro=debug",
+                quiet_suffix()
+            )
         );
     }
     #[test]
     fn unknown_module_key_is_skipped_not_fatal() {
         let mut cfg = LoggingConfig::default();
         cfg.modules.insert("bogus".into(), "debug".into());
-        assert_eq!(cfg.to_directives(), "info");
+        assert_eq!(cfg.to_directives(), format!("info{}", quiet_suffix()));
     }
     #[test]
     fn invalid_level_falls_back_to_info() {
         let mut cfg = LoggingConfig::default();
         cfg.level = "chatty".into();
-        assert_eq!(cfg.to_directives(), "info");
+        assert_eq!(cfg.to_directives(), format!("info{}", quiet_suffix()));
     }
 
     #[test]
