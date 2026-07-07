@@ -28,6 +28,10 @@ pub struct AppState {
     /// iroh transport + receiver behind the dev pairing flag. Held here (not in
     /// `ctx`) because starting it needs a Tauri-built `ProgressEmitter`.
     pub sync: Arc<athenaeum_core::sync::SyncRuntime>,
+    /// Personal-sync send-side runtime (task M2). Lazily builds the sender engine
+    /// on the first enqueue (manual send / auto mode). Held here alongside `sync`
+    /// for the same reason — the transport is built with host-provided plumbing.
+    pub sync_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
 }
 
 pub mod core;

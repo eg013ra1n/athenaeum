@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 
 use athenaeum_core::api::sync as api;
-use athenaeum_core::api::sync::SyncHistoryQuery;
+use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
 use athenaeum_core::sync::{HistoryRow, SyncStatus};
 
 use crate::tauri_events::TauriProgressEmitter;
@@ -45,4 +45,31 @@ pub async fn list_sync_history(
     query: SyncHistoryQuery,
 ) -> Result<Vec<HistoryRow>, String> {
     api::list_history(&state.ctx, query).map_err(|e| e.to_string())
+}
+
+/// Manual send (task M2): enqueue the eligible frames of a selection to the
+/// paired primary as one package. Ineligible frames come back in the result.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn enqueue_sync_selection(
+    state: State<'_, AppState>,
+    frame_ids: Vec<i64>,
+) -> Result<EnqueueSelectionResult, String> {
+    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, frame_ids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Whether full-app capture-node auto mode is enabled.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_sync_auto_mode(state: State<'_, AppState>) -> Result<bool, String> {
+    api::get_sync_auto_mode(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Toggle full-app capture-node auto mode.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_sync_auto_mode(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    api::set_sync_auto_mode(&state.ctx, enabled).map_err(|e| e.to_string())
 }

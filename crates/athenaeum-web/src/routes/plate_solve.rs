@@ -884,6 +884,7 @@ mod plate_solve_config_tests {
             max_blink_threads: 1,
             monitor: athenaeum_core::monitor::MonitorService::new(),
             sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
+            sync_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
         }
     }
 

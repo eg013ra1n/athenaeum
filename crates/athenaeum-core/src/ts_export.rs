@@ -152,6 +152,8 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::sync::receiver::SyncProgressEvent,
             crate::sync::receiver::SyncFinishedEvent,
             crate::api::sync::SyncHistoryQuery,
+            crate::api::sync::IneligibleFrame,
+            crate::api::sync::EnqueueSelectionResult,
             crate::account::DeviceRole,
             crate::account::AccountDevice,
             crate::account::AccountStatus,

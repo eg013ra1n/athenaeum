@@ -243,6 +243,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))
         .route("/api/list_sync_history", post(sync::list_sync_history))
+        .route("/api/enqueue_sync_selection", post(sync::enqueue_sync_selection))
+        .route("/api/get_sync_auto_mode", post(sync::get_sync_auto_mode))
+        .route("/api/set_sync_auto_mode", post(sync::set_sync_auto_mode))
         // Account (Stage II, task B4)
         .route("/api/account_sign_in_start", post(account::account_sign_in_start))
         .route("/api/account_sign_in_verify", post(account::account_sign_in_verify))
@@ -441,6 +444,7 @@ mod tests {
             max_blink_threads: 1,
             monitor: athenaeum_core::monitor::MonitorService::new(),
             sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
+            sync_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
         }
     }
 

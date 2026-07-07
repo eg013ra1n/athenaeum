@@ -96,6 +96,7 @@ pub fn run() {
                 max_blink_threads: max_threads,
                 monitor: athenaeum_core::monitor::MonitorService::new(),
                 sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
+                sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
             }
         })
         .setup(|app| {
@@ -418,6 +419,9 @@ pub fn run() {
             commands::get_sync_pairing_ticket,
             commands::get_sync_status,
             commands::list_sync_history,
+            commands::enqueue_sync_selection,
+            commands::get_sync_auto_mode,
+            commands::set_sync_auto_mode,
             commands::account_sign_in_start,
             commands::account_sign_in_verify,
             commands::account_status,

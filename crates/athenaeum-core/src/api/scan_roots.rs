@@ -35,6 +35,10 @@ pub struct ScanResultDto {
     pub frames_renamed: usize,
     pub calibration_sets_deleted: usize,
     pub sessions_updated: usize,
+    /// File ids freshly ingested by this scan — consumed by the command layer to
+    /// drive the personal-sync auto-mode enqueue (task M2). Empty for the
+    /// non-progress `start_scan` path.
+    pub new_file_ids: Vec<i64>,
 }
 
 #[derive(serde::Serialize)]
@@ -510,6 +514,7 @@ pub fn start_scan(ctx: &ServiceContext, root_id: i64) -> Result<ScanResultDto, A
         frames_renamed: reconcile.frames_renamed,
         calibration_sets_deleted: reconcile.calibration_sets_deleted,
         sessions_updated: reconcile.sessions_updated,
+        new_file_ids: result.new_file_ids,
     })
 }
 
@@ -958,6 +963,7 @@ pub fn start_scan_with_progress<E: crate::events::ProgressEmitter>(
         frames_renamed: reconcile.frames_renamed,
         calibration_sets_deleted: reconcile.calibration_sets_deleted,
         sessions_updated: reconcile.sessions_updated,
+        new_file_ids: result.new_file_ids,
     })
 }
 

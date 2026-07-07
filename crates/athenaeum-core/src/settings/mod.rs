@@ -40,6 +40,12 @@ pub mod defaults {
     // receiver + iroh transport only start when this is explicitly enabled.
     pub const SYNC_DEV_TICKET_PAIRING: &str = "false";
 
+    // Full-app capture-node auto mode (task M2). When enabled on a signed-in
+    // `capture` device, files newly ingested by a scan are enqueued to the
+    // paired primary automatically. Default off — sending is manual until the
+    // operator opts in.
+    pub const SYNC_AUTO_MODE: &str = "false";
+
     // Account layer (task B4). Base URL of the athenaeum-hub. Overridable so a
     // dev build can point at a local/staging hub. The device token lives in the
     // OS keychain (never here); only non-secret account state is persisted.
@@ -89,6 +95,11 @@ pub mod keys {
     /// Dev-only gate for personal-sync ticket pairing (task A7). When `"true"`,
     /// `get_sync_pairing_ticket` lazily starts the receiver + iroh transport.
     pub const SYNC_DEV_TICKET_PAIRING: &str = "sync.dev_ticket_pairing";
+
+    /// Full-app capture-node auto mode (task M2). `"true"` → a signed-in
+    /// `capture` device enqueues freshly-scanned files to its paired primary
+    /// automatically at scan-finished. Default `"false"` (manual send only).
+    pub const SYNC_AUTO_MODE: &str = "sync.auto_mode";
 
     // Account layer (task B4). Non-secret account state persisted so
     // `account_status` works offline. The device TOKEN is never here — it lives

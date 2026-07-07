@@ -168,6 +168,7 @@ pub fn scan_directory(
         calibration_sets_created: 0,
         cancelled: false,
         calibrated_duplicates: Vec::new(),
+        new_file_ids: Vec::new(),
     };
 
     // Find all FITS/XISF files. max_depth caps recursion in case follow_links
@@ -1221,6 +1222,10 @@ pub struct ScanResult {
     pub cancelled: bool,
     // Duplicate calibrated-LIGHT sightings (design §4.3); never registered.
     pub calibrated_duplicates: Vec<CalibratedDuplicate>,
+    // File ids of rows freshly INSERTED by this scan (not re-parses/moves). Drives
+    // the personal-sync auto-mode enqueue (task M2). Populated by the parallel
+    // scan path only; empty on the non-parallel `scan_directory` path.
+    pub new_file_ids: Vec<i64>,
 }
 
 #[allow(dead_code)]
@@ -1413,6 +1418,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         calibration_sets_created: 0,
         cancelled: false,
         calibrated_duplicates: Vec::new(),
+        new_file_ids: Vec::new(),
     };
 
     // Phase 1a: Discovery - collect all file paths with progress updates
@@ -1684,6 +1690,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     let mut lights_count: usize = 0;
     // Duplicate calibrated-LIGHT sightings collected during this scan (§4.3).
     let mut calibrated_duplicates: Vec<CalibratedDuplicate> = Vec::new();
+    // File ids freshly inserted by this scan — drives personal-sync auto mode.
+    let mut new_file_ids: Vec<i64> = Vec::new();
 
     // Begin transaction for batch insert
     tracing::debug!(root_id, count = processed_results.len(), stage = "inserting", "starting DB inserts");
@@ -1922,6 +1930,8 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                 match insert_frame(conn, &file_result.frame) {
                     Ok(frame_id) => {
                         result.files_processed += 1;
+                        // A genuinely new file+frame row — eligible for auto-mode sync.
+                        new_file_ids.push(file_id);
 
                         // Track by image type
                         if let Some(ref imagetyp) = file_result.imagetyp {
@@ -2015,6 +2025,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     result.bias_count = bias_frame_ids.len();
     result.darkflats_count = darkflat_frame_ids.len();
     result.calibrated_duplicates = calibrated_duplicates;
+    result.new_file_ids = new_file_ids;
 
     // Skip calibration and caching phases if cancelled
     if !result.cancelled {

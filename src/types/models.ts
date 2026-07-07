@@ -654,6 +654,26 @@ object: string | null,
  */
 limit: number, };
 
+export type IneligibleFrame = { frameId: number, reason: string, };
+
+export type EnqueueSelectionResult = { 
+/**
+ * Frames actually enqueued for send (equals `eligible_count`).
+ */
+enqueuedCount: number, 
+/**
+ * Eligible frames — present on disk and resolvable in the catalog. The `N`.
+ */
+eligibleCount: number, 
+/**
+ * Total frames requested. The `M` in `(N of M)`.
+ */
+totalCount: number, 
+/**
+ * Frames that could not be sent, each with a reason. Never silently dropped.
+ */
+ineligible: Array<IneligibleFrame>, };
+
 export type DeviceRole = "primary" | "capture";
 
 export type AccountDevice = { id: string, name: string, 

@@ -74,6 +74,9 @@ pub struct WebAppState {
     /// Personal-sync receive-side runtime (Stage I, task A7). Lazily starts the
     /// iroh transport + receiver behind the dev pairing flag.
     pub sync: Arc<athenaeum_core::sync::SyncRuntime>,
+    /// Personal-sync send-side runtime (task M2). Lazily builds the sender engine
+    /// on the first enqueue (manual send / auto mode).
+    pub sync_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
 }
 
 #[tokio::main]
@@ -231,6 +234,7 @@ async fn main() {
         max_blink_threads: max_threads,
         monitor: athenaeum_core::monitor::MonitorService::new(),
         sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
+        sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
     };
 
     // Personal sync (Stage I, task A7): start the receiver + iroh transport at
