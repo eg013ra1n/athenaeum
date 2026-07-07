@@ -74,7 +74,7 @@ export interface Notification {
   link?: string;
 }
 
-interface NotifyInput {
+export interface NotifyInput {
   title: string;
   detail: string;
   tone?: 'info' | 'warning' | 'success';
@@ -86,6 +86,9 @@ interface NotifyInput {
   /** When set, suppress duplicates with the same key (e.g. an operation id). */
   dedupeKey?: string;
 }
+
+/** The `notify` callable — exported so helpers can accept it as a parameter. */
+export type NotifyLike = (input: NotifyInput) => void;
 
 interface NotificationContextValue {
   toasts: Toast[];

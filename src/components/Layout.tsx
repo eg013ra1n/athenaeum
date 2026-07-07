@@ -20,6 +20,9 @@ import { NotificationProvider } from '../contexts/NotificationContext';
 import { NotificationBell } from './NotificationBell';
 import { ToastStack } from './Toast';
 import { NotificationPanel } from './NotificationPanel';
+import { TransfersProvider } from '../contexts/TransfersContext';
+import { TransferIndicator } from './transfers/TransferIndicator';
+import { TransfersPanel } from './transfers/TransfersPanel';
 import { AutoUpdateCheck } from './AutoUpdateCheck';
 import Logo from '../assets/athenaeum.png';
 
@@ -45,6 +48,7 @@ export default function Layout() {
 
   return (
     <NotificationProvider>
+    <TransfersProvider>
     <ScanProgressProvider>
       <ExportProgressProvider>
         <AnalysisProgressProvider>
@@ -89,6 +93,7 @@ export default function Layout() {
 
             <AnalysisQueueIndicator collapsed={collapsed} />
             <ComputeQueueIndicator collapsed={collapsed} />
+            <TransferIndicator collapsed={collapsed} />
             <PlateSolveQueueIndicator collapsed={collapsed} />
             <RegistrationQueueIndicator collapsed={collapsed} />
             <NotificationBell collapsed={collapsed} />
@@ -120,6 +125,7 @@ export default function Layout() {
           <PlateSolveIndexMissingModal />
           <ToastStack />
           <NotificationPanel />
+          <TransfersPanel />
           <AutoUpdateCheck />
         </div>
         </LightCalibrationProvider>
@@ -129,6 +135,7 @@ export default function Layout() {
         </AnalysisProgressProvider>
       </ExportProgressProvider>
     </ScanProgressProvider>
+    </TransfersProvider>
     </NotificationProvider>
   );
 }
