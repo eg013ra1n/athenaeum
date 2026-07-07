@@ -60,6 +60,39 @@ pub const DDL_RECEIPTS: &str = "CREATE TABLE IF NOT EXISTS sync_receipts (
     PRIMARY KEY (package_id, frame_uuid)
 )";
 
+/// `sync_sources` — the app sender's package → source-file linkage (task M4).
+///
+/// The app-side equivalent of Perseus's `perseus_seen`: it maps a
+/// `sync_outbound.package_ref` back to the ORIGINAL catalog source file(s) the
+/// package was built from, so retention can resolve a *confirmed package* to the
+/// disk files it may reclaim. Unlike Perseus (one file per package), an app
+/// selection/scan-batch package carries MANY files, so this is a one-package →
+/// many-rows table keyed on `(package_ref, path)`.
+///
+/// Columns mirror `perseus_seen`'s retention semantics:
+/// - `file_id` — the catalog `files.id`, so retention can do a *catalog-consistent*
+///   delete (remove the `files` row → CASCADE to `frames`) alongside the disk file.
+///   Nullable only defensively (every app package is built from catalog frames).
+/// - `size` / `mtime` — the stat recorded at package-build time; retention's
+///   last-line TOCTOU guard re-stats the file and requires an exact match before
+///   deleting, so a since-rewritten path is never destroyed.
+/// - `deleted_at` — stamped once retention has handled the linkage, so it never
+///   surfaces again (the row is kept as a durable audit trail).
+///
+/// Receiver-agnostic and app-only: Perseus keeps its own `perseus_seen`. The DDL
+/// lives here beside the other sync tables so `db/schema.rs` materialises it in
+/// the app catalog through the one shared definition.
+pub const DDL_SYNC_SOURCES: &str = "CREATE TABLE IF NOT EXISTS sync_sources (
+    package_ref TEXT NOT NULL,
+    file_id INTEGER,
+    path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    deleted_at TEXT,
+    PRIMARY KEY (package_ref, path)
+)";
+
 /// Search indexes for [`SyncStore::search_history`].
 pub const DDL_INDEXES: [&str; 3] = [
     "CREATE INDEX IF NOT EXISTS idx_sync_history_filename ON sync_history(filename)",
@@ -267,6 +300,90 @@ pub fn confirmed_outbound_rows(conn: &Connection) -> Result<Vec<OutboundRow>> {
         .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
         .context("collect confirmed_outbound_rows")?;
     raws.into_iter().map(to_outbound).collect()
+}
+
+/// One `sync_sources` row: a live (or historic) linkage from an app package back
+/// to one catalog source file it was built from. See [`DDL_SYNC_SOURCES`].
+///
+/// `size`/`mtime_ms` are the stat recorded when the package was built — the
+/// retention deleter's last-line TOCTOU guard re-stats the file and requires an
+/// exact match before removal, so a since-rewritten path is never destroyed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSourceRow {
+    pub package_ref: String,
+    pub file_id: Option<i64>,
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
+/// Record (insert or overwrite) one source-file linkage for `package_ref` at
+/// build time. Idempotent by `(package_ref, path)`: a rebuild of the same
+/// selection overwrites the recorded stat and clears any prior `deleted_at` (the
+/// file is a live source again). See [`SyncSourceRow`].
+pub fn insert_sync_source(
+    conn: &Connection,
+    package_ref: &str,
+    file_id: Option<i64>,
+    path: &str,
+    size: u64,
+    mtime_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_sources (package_ref, file_id, path, size, mtime, enqueued_at, deleted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+         ON CONFLICT(package_ref, path) DO UPDATE SET
+             file_id = excluded.file_id,
+             size = excluded.size,
+             mtime = excluded.mtime,
+             enqueued_at = excluded.enqueued_at,
+             deleted_at = NULL",
+        params![package_ref, file_id, path, size as i64, mtime_ms, now_iso()],
+    )
+    .context("insert sync_sources")?;
+    Ok(())
+}
+
+/// Every *live* (`deleted_at IS NULL`) source linkage for `package_ref`, ordered
+/// by path for a deterministic pass. Retention resolves a confirmed package to
+/// exactly the source files it may reclaim through this call.
+pub fn live_sources_for_package(conn: &Connection, package_ref: &str) -> Result<Vec<SyncSourceRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT package_ref, file_id, path, size, mtime FROM sync_sources
+             WHERE package_ref = ?1 AND deleted_at IS NULL
+             ORDER BY path ASC",
+        )
+        .context("prepare live_sources_for_package")?;
+    let rows = stmt
+        .query_map(params![package_ref], |r| {
+            Ok(SyncSourceRow {
+                package_ref: r.get(0)?,
+                file_id: r.get(1)?,
+                path: r.get(2)?,
+                size: {
+                    let s: i64 = r.get(3)?;
+                    s.max(0) as u64
+                },
+                mtime_ms: r.get(4)?,
+            })
+        })
+        .context("query live_sources_for_package")?
+        .collect::<rusqlite::Result<Vec<SyncSourceRow>>>()
+        .context("collect live_sources_for_package")?;
+    Ok(rows)
+}
+
+/// Stamp a source linkage `deleted_at = now` after retention has handled it, so
+/// it never surfaces via [`live_sources_for_package`] again (the row survives as
+/// a durable audit trail).
+pub fn mark_sync_source_deleted(conn: &Connection, package_ref: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_sources SET deleted_at = ?3 WHERE package_ref = ?1 AND path = ?2",
+        params![package_ref, path, now_iso()],
+    )
+    .context("mark sync_sources row deleted")?;
+    Ok(())
 }
 
 /// Stable text encoding of a [`ReceiptOutcome`] for the `sync_receipts.outcome`
@@ -570,6 +687,7 @@ impl CatalogSyncStore {
         conn.execute(DDL_OUTBOUND, []).context("create sync_outbound")?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
         conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
+        conn.execute(DDL_SYNC_SOURCES, []).context("create sync_sources")?;
         for idx in DDL_INDEXES {
             conn.execute(idx, []).context("create sync_history index")?;
         }

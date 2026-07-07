@@ -24,7 +24,18 @@
 //! [retention]
 //! policy = "keep_everything"                # keep_everything | on_confirm | keep_days | disk_pct
 //! dry_run = true                            # MUST stay true until M-Perseus-MVP sign-off
+//! # i_have_verified_the_soak = true         # REQUIRED to allow dry_run = false (task M4)
 //! ```
+//!
+//! # The soak opt-in (task M4)
+//!
+//! Live deletion (`dry_run = false`) is only accepted when the config ALSO sets
+//! the explicit, greppable flag `i_have_verified_the_soak = true`. The two-key
+//! handshake is deliberate: `dry_run = false` alone is treated as a
+//! misconfiguration and rejected with an actionable error, so no operator can
+//! enable irreversible source deletion without having consciously typed the soak
+//! acknowledgement. Both default to the safe value (`dry_run = true`,
+//! `i_have_verified_the_soak = false`), so a fresh config never deletes anything.
 //!
 //! Two optional tuning fields are additive (defaulted, absent from the contract
 //! sample): `stability_secs` (write-stability quiet window, default 10) and
@@ -100,11 +111,23 @@ pub enum RetentionPolicy {
 pub struct RetentionConfig {
     pub policy: RetentionPolicy,
     /// Dry-run flag. Hard invariant (plan Global Constraints): dry-run is the
-    /// default and stays on until the M-Perseus-MVP gate passes. Perseus
-    /// therefore still rejects `dry_run = false` — even though A8 now ships the
-    /// evaluator, live deletion stays gated behind the soak sign-off.
+    /// default and stays on until the M-Perseus-MVP gate passes. Setting it to
+    /// `false` is a **gated** action (task M4): it is only accepted when
+    /// [`i_have_verified_the_soak`](Self::i_have_verified_the_soak) is also
+    /// `true`; otherwise validation rejects the config. This keeps live deletion
+    /// impossible-by-accident while making the go-live an explicit two-key edit
+    /// the owner performs after the A9 soak sign-off.
     #[serde(default = "default_true")]
     pub dry_run: bool,
+    /// Explicit soak opt-in (task M4). Live deletion (`dry_run = false`) is only
+    /// permitted when this is `true`. The flag name is deliberately long,
+    /// unmistakable, and greppable — it is the operator's typed acknowledgement
+    /// that the M-Perseus-MVP soak has been observed and real, irreversible
+    /// deletion of confirmed source frames may begin. Defaults to `false`, so a
+    /// config that merely sets `dry_run = false` is rejected as a
+    /// misconfiguration rather than silently going live.
+    #[serde(default)]
+    pub i_have_verified_the_soak: bool,
     /// `keep_days` threshold in days (only consulted by the `keep_days` policy).
     /// Additive/defaulted; absent from the contract sample.
     #[serde(default = "default_keep_days")]
@@ -124,6 +147,7 @@ impl Default for RetentionConfig {
         Self {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
+            i_have_verified_the_soak: false,
             keep_days: DEFAULT_KEEP_DAYS,
             disk_max_pct: DEFAULT_DISK_MAX_PCT,
             interval_secs: DEFAULT_RETENTION_INTERVAL_SECS,
@@ -291,13 +315,17 @@ impl Config {
             }
         }
         // `mode` is an enum, so any non-`auto` value already failed to parse.
-        // Hard invariant: no deletion path exists before A8; refuse to run with
-        // dry-run disabled so the config can never imply live deletion.
-        if !self.retention.dry_run {
+        // Hard invariant (plan Global Constraints): dry-run is the default and
+        // live deletion is a GATED, explicit action. `dry_run = false` is only
+        // accepted alongside the soak opt-in — otherwise it is a
+        // misconfiguration, refused with an actionable message, so the config
+        // can never quietly imply irreversible source deletion (task M4).
+        if !self.retention.dry_run && !self.retention.i_have_verified_the_soak {
             bail!(
-                "retention.dry_run = false is not allowed yet: the retention \
-                 evaluator ships in a later task and deletion stays disabled \
-                 until the M-Perseus-MVP gate passes. Set dry_run = true"
+                "retention.dry_run = false requires the explicit soak opt-in: \
+                 also set `i_have_verified_the_soak = true` in the [retention] \
+                 table once the M-Perseus-MVP soak has been signed off. Until \
+                 then, keep dry_run = true (the safe default)"
             );
         }
         if self.stability_secs == 0 {
@@ -458,6 +486,48 @@ mode = "auto"
                 || err.chain().any(|c| c.to_string().contains("dry_run")),
             "error should mention dry_run: {err:#}"
         );
+    }
+
+    /// Task M4: `dry_run = false` WITHOUT the soak opt-in is rejected, and the
+    /// error names the exact flag the operator must add — actionable, not cryptic.
+    #[test]
+    fn dry_run_false_without_soak_optin_is_rejected_with_actionable_message() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace("dry_run = true", "dry_run = false");
+        let err = Config::from_toml_str(&text).expect_err("dry_run=false without opt-in must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("i_have_verified_the_soak"),
+            "error must name the soak opt-in flag: {msg}"
+        );
+    }
+
+    /// Task M4: `dry_run = false` WITH `i_have_verified_the_soak = true` is the
+    /// only accepted live-deletion configuration — it parses and validates.
+    #[test]
+    fn dry_run_false_with_soak_optin_is_accepted() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path())
+            .replace("dry_run = true", "dry_run = false\ni_have_verified_the_soak = true");
+        let cfg = Config::from_toml_str(&text).expect("dry_run=false + opt-in must be accepted");
+        assert!(!cfg.retention.dry_run, "live mode is enabled");
+        assert!(cfg.retention.i_have_verified_the_soak, "the opt-in is recorded");
+    }
+
+    /// Task M4: the soak opt-in defaults to `false` and, on its own (with the
+    /// safe `dry_run = true`), changes nothing — it is inert until paired with
+    /// `dry_run = false`.
+    #[test]
+    fn soak_optin_defaults_false_and_is_inert_under_dry_run() {
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).unwrap();
+        assert!(!cfg.retention.i_have_verified_the_soak, "opt-in defaults to false");
+        assert!(cfg.retention.dry_run, "dry-run stays the default");
+        // opt-in true while dry_run stays true is still valid (inert).
+        let text = good_toml(capture.path())
+            .replace("dry_run = true", "dry_run = true\ni_have_verified_the_soak = true");
+        let cfg = Config::from_toml_str(&text).expect("opt-in with dry_run stays valid");
+        assert!(cfg.retention.dry_run, "dry-run wins — nothing is deleted");
     }
 
     #[test]
@@ -649,6 +719,7 @@ interval_secs = 600
         let mut r = RetentionConfig {
             policy: RetentionPolicy::KeepDays,
             dry_run: true,
+            i_have_verified_the_soak: false,
             keep_days: 14,
             disk_max_pct: 85,
             interval_secs: 3600,

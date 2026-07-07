@@ -273,12 +273,17 @@ impl Agent {
         ));
         let origin_device = node_id_hex(&node_id);
 
-        // Retention is now ACTIVE (task A8) — but dry-run stays the enforced
-        // default until the M-Perseus-MVP soak gate lifts (config rejects
-        // dry_run = false), so no files are deleted in this build.
+        // Retention is ACTIVE (task A8). Live deletion is GATED behind the
+        // two-key soak opt-in (task M4): `dry_run = false` is only accepted when
+        // `i_have_verified_the_soak = true` (config validation enforces this), so
+        // no files are deleted unless the owner has explicitly gone live. The
+        // startup banner records policy + dry-run + opt-in state so the running
+        // mode is unambiguous in the logs.
         tracing::info!(
             retention_policy = ?config.retention.policy,
             dry_run = config.retention.dry_run,
+            soak_opt_in = config.retention.i_have_verified_the_soak,
+            live_deletion = !config.retention.dry_run,
             interval_secs = config.retention.interval_secs,
             keep_days = config.retention.keep_days,
             disk_max_pct = config.retention.disk_max_pct,

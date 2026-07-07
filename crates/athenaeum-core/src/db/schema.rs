@@ -1646,10 +1646,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // receiver (task A7) can record outbound state, transfer history, and
     // per-frame receipts alongside the catalog it ingests into.
     {
-        use crate::sync::store::{DDL_HISTORY, DDL_INDEXES, DDL_OUTBOUND, DDL_RECEIPTS};
+        use crate::sync::store::{
+            DDL_HISTORY, DDL_INDEXES, DDL_OUTBOUND, DDL_RECEIPTS, DDL_SYNC_SOURCES,
+        };
         conn.execute(DDL_OUTBOUND, [])?;
         conn.execute(DDL_HISTORY, [])?;
         conn.execute(DDL_RECEIPTS, [])?;
+        conn.execute(DDL_SYNC_SOURCES, [])?;
         for idx in DDL_INDEXES {
             conn.execute(idx, [])?;
         }

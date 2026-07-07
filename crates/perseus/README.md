@@ -24,9 +24,12 @@ the package format, the sync engine, and the iroh transport come along.
    Delivery is durable — an unfinished transfer resumes after a crash or restart
    (state lives in `<data_dir>/perseus.db`).
 
-Retention (deleting local frames after the peer confirms them) is **not** active
-in this build. The config is parsed and validated, but the evaluator ships in a
-later task; deletion stays disabled (`dry_run = true`, enforced) until then.
+Retention (deleting local frames after the peer confirms them) is active, but
+**dry-run by default** and gated behind an explicit soak opt-in. In dry-run every
+would-delete is logged and nothing is removed. Real deletion begins only when the
+owner sets BOTH `dry_run = false` AND `i_have_verified_the_soak = true` after the
+M-Perseus-MVP soak sign-off. Only *confirmed* (fully received by the primary)
+source frames are ever eligible — under any policy, at any disk pressure.
 
 ## Install
 
@@ -59,11 +62,15 @@ mode = "auto"                            # only value in the MVP
 
 [retention]
 policy = "keep_everything"               # keep_everything | on_confirm | keep_days | disk_pct
-dry_run = true                           # MUST stay true (deletion is not implemented yet)
+dry_run = true                           # safe default; see the go-live note below
+# i_have_verified_the_soak = true        # REQUIRED to allow dry_run = false
 
 # Optional tuning (defaults shown; omit to accept them):
 # stability_secs = 10                    # write-quiet window before a file is sent
 # poll_interval_secs = 2                 # how often pending files are re-checked
+# keep_days = 30                         # only for policy = "keep_days"
+# disk_max_pct = 90                      # only for policy = "disk_pct"
+# interval_secs = 3600                   # retention evaluation cadence (hourly)
 ```
 
 Notes:
@@ -72,10 +79,15 @@ Notes:
   first `run`, Perseus generates a device key at `<data_dir>/device_key` (mode
   `0600`) and derives its own node identity from it. Both keys persist, so the
   pairing survives restarts.
-- **`dry_run = false` is rejected.** There is no deletion path yet, so the config
-  refuses to imply one.
+- **Going live is a two-key edit.** `dry_run = false` is rejected on its own —
+  the config must ALSO set `i_have_verified_the_soak = true`. This makes enabling
+  irreversible deletion a conscious, greppable acknowledgement that the
+  M-Perseus-MVP soak has been signed off. Until you add both, retention runs in
+  dry-run (logs would-deletes, removes nothing).
+- **Only confirmed frames are ever deleted.** No policy and no disk-pressure
+  setting can ever delete a frame the primary has not fully received.
 - The `[retention]` table may be omitted entirely — it defaults to
-  `keep_everything` / `dry_run = true`.
+  `keep_everything` / `dry_run = true` / `i_have_verified_the_soak = false`.
 
 ## Run
 

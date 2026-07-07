@@ -621,8 +621,13 @@ fn build_selection_package(
     let mut eligible: Vec<i64> = Vec::new();
     let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::new();
     let mut used_rel_paths: HashSet<String> = HashSet::new();
+    // Per-eligible source linkage recorded into `sync_sources` after the package
+    // is written: (catalog file_id, absolute path, size, mtime_ms). This is what
+    // retention (task M4) later joins on to resolve a confirmed package back to
+    // the disk files it may reclaim, with the recorded stat as the TOCTOU guard.
+    let mut source_links: Vec<(i64, String, u64, i64)> = Vec::new();
 
-    for (_file_id, file, frame) in &rows {
+    for (file_id, file, frame) in &rows {
         let Some(frame_id) = frame.id else { continue };
         resolved.insert(frame_id);
 
@@ -631,13 +636,15 @@ fn build_selection_package(
             ineligible.push(IneligibleFrame { frame_id, reason: "file missing on disk".to_string() });
             continue;
         }
-        let byte_size = match std::fs::metadata(path) {
-            Ok(m) => m.len(),
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
             Err(e) => {
                 ineligible.push(IneligibleFrame { frame_id, reason: format!("cannot stat file: {e}") });
                 continue;
             }
         };
+        let byte_size = meta.len();
+        let mtime_ms = crate::api::retention::mtime_millis(meta.modified().ok());
         let xxh3 = match package::xxh3_full_file(path) {
             Ok(h) => h,
             Err(e) => {
@@ -688,6 +695,7 @@ fn build_selection_package(
             },
         ));
         eligible.push(frame_id);
+        source_links.push((*file_id, file.path.clone(), byte_size, mtime_ms));
     }
 
     // Requested ids that never resolved to a catalog row at all.
@@ -707,6 +715,22 @@ fn build_selection_package(
     let pkg_dir = packages_dir.join(uuid::Uuid::new_v4().to_string());
     package::write_package(&pkg_dir, records)
         .map_err(|e| ApiError::Internal(format!("write selection package: {e:#}")))?;
+
+    // Record the package → source-file linkage for retention (task M4). Written
+    // AFTER the package exists (so a failed write never leaves a dangling
+    // linkage) and keyed on the same `package_ref` the engine stores in
+    // `sync_outbound`. Best-effort: a failure here only means retention can't
+    // reclaim these files later (they stay on disk — the safe direction), so it
+    // is logged, never fatal to the send.
+    let pkg_ref = pkg_dir.to_string_lossy();
+    for (file_id, path, size, mtime_ms) in &source_links {
+        if let Err(e) =
+            crate::sync::insert_sync_source(conn, &pkg_ref, Some(*file_id), path, *size, *mtime_ms)
+        {
+            tracing::warn!(error = %e, path = %path, "failed to record sync_sources retention linkage");
+        }
+    }
+
     Ok(BuiltSelection { pkg_dir: Some(pkg_dir), eligible, ineligible, total })
 }
 
@@ -1108,6 +1132,34 @@ mod tests {
         let af: crate::models::Frame =
             serde_json::from_value(analyzed[0].frame_meta.clone()).unwrap();
         assert_eq!(af.id, Some(f1), "the analysis is attached to the analyzed frame");
+    }
+
+    /// Task M4: building a selection package records the retention linkage in
+    /// `sync_sources` — one live row per eligible frame, keyed on the SAME
+    /// `package_ref` the engine stores in `sync_outbound`, carrying the catalog
+    /// `file_id` + the file's `(size, mtime)`. This is exactly what
+    /// `api::retention` later resolves to reclaim the source. Ineligible frames
+    /// (missing on disk) never get a linkage row.
+    #[test]
+    fn build_selection_writes_sync_sources_linkage() {
+        let (tmp, ctx) = test_ctx();
+        let dir = tmp.path();
+        let f1 = insert_fixture_frame(&ctx, dir, "light-0001.fits", "M42", false);
+        let f2 = insert_fixture_frame(&ctx, dir, "light-0002.fits", "M42", false);
+        std::fs::remove_file(dir.join("light-0002.fits")).unwrap(); // f2 → missing on disk
+
+        let pkg_root = tmp.path().join("packages");
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let built = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2]).unwrap();
+        let pkg_ref = built.pkg_dir.clone().expect("a package was written").to_string_lossy().to_string();
+
+        let sources = crate::sync::live_sources_for_package(&conn, &pkg_ref).unwrap();
+        assert_eq!(sources.len(), 1, "one linkage row for the single eligible frame (f2 was missing)");
+        let row = &sources[0];
+        assert_eq!(row.path, dir.join("light-0001.fits").to_string_lossy(), "linkage points at the source path");
+        assert!(row.file_id.is_some(), "the catalog file_id is recorded for a catalog-consistent delete");
+        assert_eq!(row.size, std::fs::metadata(dir.join("light-0001.fits")).unwrap().len(), "recorded size matches disk");
     }
 
     /// Step 1: ineligible files (missing on disk, or an unknown id) are reported

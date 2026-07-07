@@ -79,7 +79,10 @@ pub use sender::{StartedSender, SyncSenderRuntime};
 pub use status::{
     OutboundSummary, SyncPairingSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus,
 };
-pub use store::{CatalogSyncStore, StandaloneSyncStore, SyncStore};
+pub use store::{
+    insert_sync_source, live_sources_for_package, mark_sync_source_deleted, CatalogSyncStore,
+    StandaloneSyncStore, SyncSourceRow, SyncStore,
+};
 
 /// Canonical timestamp rendering for the sync tables: RFC3339 UTC, millisecond
 /// precision, `Z` suffix. Sortable as text, unambiguous across time zones.

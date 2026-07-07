@@ -255,6 +255,23 @@ async fn main() {
         });
     }
 
+    // Full-app capture-node retention loop (task M4). Hourly; gated inside the
+    // tick (no-op unless this is a signed-in `capture` node with a policy set)
+    // and dry-run by default — live deletion needs the explicit
+    // `sync.retention.live_confirmed` opt-in. Mirrors the desktop wiring.
+    {
+        let ctx_for_retention = Arc::clone(&state.ctx);
+        tokio::spawn(async move {
+            athenaeum_core::api::retention::run_app_retention_loop(
+                ctx_for_retention,
+                std::time::Duration::from_secs(
+                    athenaeum_core::api::retention::DEFAULT_RETENTION_INTERVAL_SECS,
+                ),
+            )
+            .await;
+        });
+    }
+
     // Auto-reconcile abandoned cross-volume moves — enqueue this as the
     // FIRST job on the operation queue so it serializes ahead of any file op
     // a client triggers. Unlike the desktop app, the DB is already

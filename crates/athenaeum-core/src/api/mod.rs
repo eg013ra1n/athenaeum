@@ -8,6 +8,8 @@ pub mod files;
 pub mod calibration;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
+// Full-app capture-node retention (task M4). Ungated: db/settings/sync only.
+pub mod retention;
 // Account commands (Stage II, task B4). Ungated: db/settings/account only.
 pub mod account;
 // These handler modules drive the render-only image pipeline (analysis,

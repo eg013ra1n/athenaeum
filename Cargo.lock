@@ -441,6 +441,7 @@ dependencies = [
  "iroh-tickets",
  "jpeg-encode",
  "keyring",
+ "libc",
  "md-5",
  "memmap2",
  "postcard",
