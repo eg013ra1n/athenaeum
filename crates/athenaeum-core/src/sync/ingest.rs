@@ -15,24 +15,52 @@
 //!    `duplicate`. Either way the receipt is [`Duplicate`](ReceiptOutcome::Duplicate)
 //!    and nothing is written to `files`/`frames`. A same-uuid frame whose content
 //!    hash differs is logged at `warn` and still kept (v1 keeps existing).
-//! 3. **Dedup by content hash** — a payload whose bytes already exist in the
-//!    catalog (matching `files.content_hash`, the sampling hash) under a
-//!    different/absent uuid is also a `Duplicate`, no write.
+//! 3. **Dedup by content hash** — a payload whose full-content xxh3 was already
+//!    recorded as [`Ingested`](ReceiptOutcome::Ingested) in `sync_receipts` for
+//!    some earlier frame is also a `Duplicate`, no write. This compares the
+//!    manifest's *full* xxh3 (already verified in step 1) against previously
+//!    ingested full hashes — **not** `files.content_hash` (`duplicates::compute_xxhash`
+//!    3-position sampling hash, intentional for fast move-verify but wrong for
+//!    a dedupe *decision*: two distinct files can share all three sampled
+//!    windows and differ only outside them, which would falsely mark a
+//!    genuinely new frame `Duplicate` and lose it). Caveat: a frame the
+//!    **scanner** ingested (not via sync) has no full hash recorded anywhere,
+//!    so it is not a secondary-dedupe candidate — `frames.uuid` (step 2)
+//!    remains the primary key for those; acceptable v1.
 //! 4. **Ingest** — otherwise land the payload (tmp/rename into
 //!    `<incoming_root>/<origin_device_short>/<date>/`) and insert `files` +
 //!    `frames` + `fits_header` rows (reusing the scanner primitives), carrying
 //!    the manifest's `frame_uuid` onto `frames.uuid` so a later redelivery
-//!    dedups. Receipt [`Ingested`](ReceiptOutcome::Ingested).
+//!    dedups. Receipt [`Ingested`](ReceiptOutcome::Ingested). If the catalog
+//!    write fails after the payload has already been landed, the landed file
+//!    is removed (best-effort) so a failed frame never leaves an orphan with
+//!    no catalog row pointing at it.
 //!
 //! Every frame — ingested, duplicate, or rejected — writes a `sync_receipts` row
 //! (the ack-replay log) and a `sync_history` row (`direction = received`). All
 //! writes for one frame happen in a single transaction on the caller-supplied
 //! connection, so the receipt/history never drift from the catalog rows.
 //!
+//! # Redelivery (partial/rejected ack)
+//!
+//! The sender only confirms a package once every receipt is non-`Rejected`
+//! (task A7 fix-review). A package with a rejected frame therefore gets
+//! re-announced (redelivered) by the sender's normal retry path. On redelivery,
+//! [`ingest_package`] does **not** blindly reprocess every frame: for each
+//! manifest record it first checks the existing `sync_receipts` row for
+//! `(package_id, frame_uuid)`. A prior `Ingested`/`Duplicate` receipt is reused
+//! verbatim (no re-hash I/O, and — importantly — no risk of an already-ingested
+//! frame being re-classified as `Duplicate` of itself on the next pass); only a
+//! frame with no receipt yet, or a prior `Rejected` receipt, is actually
+//! reprocessed through [`process_frame`]. This is what makes "repair the source
+//! file, then redeliver" converge to exactly one ingest per frame (see
+//! `ingest_tests::transit_corruption_repaired_then_redelivery_confirms`).
+//!
 //! This module is deliberately ungated: it depends only on `db`, `package`,
 //! `sharing`, `fits_parser`, `duplicates`, and `models`, so it compiles in the
 //! headless (`--no-default-features`) build.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -43,7 +71,7 @@ use crate::package::{self, ManifestRecord};
 use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome};
 
 use super::now_iso;
-use super::store::{insert_history_row, insert_receipt};
+use super::store::{insert_history_row, insert_receipt, load_receipts, receipt_outcome_to_db};
 use super::models::{Direction, HistoryRow};
 
 /// Aggregate result of ingesting one package: the per-frame receipts to ack back
@@ -107,7 +135,38 @@ pub fn ingest_package(
     let mut outcome = IngestOutcome::default();
 
     let package_id = &announce.package_id.0;
+
+    // Redelivery optimization: load whatever this package already has on
+    // record and reuse any non-Rejected receipt verbatim instead of
+    // reprocessing. This avoids needless re-hash I/O AND avoids a subtle
+    // correctness trap: reprocessing an already-Ingested frame would re-run
+    // the uuid dedup, find the frame it itself inserted, and reclassify it as
+    // `Duplicate` — losing the original `Ingested` receipt for no reason. Only
+    // a frame with no receipt yet, or a prior `Rejected` one, is reprocessed.
+    let existing_receipts: HashMap<String, FrameReceipt> = load_receipts(conn, package_id)?
+        .into_iter()
+        .map(|r| (r.frame_uuid.clone(), r))
+        .collect();
+
     for record in &records {
+        if let Some(prior) = existing_receipts.get(&record.frame_uuid) {
+            if !matches!(prior.outcome, ReceiptOutcome::Rejected(_)) {
+                tracing::debug!(
+                    frame_uuid = %record.frame_uuid,
+                    "sync ingest: reusing prior non-rejected receipt (redelivery skip)"
+                );
+                match prior.outcome {
+                    ReceiptOutcome::Ingested => outcome.ingested += 1,
+                    ReceiptOutcome::Duplicate => outcome.duplicate += 1,
+                    ReceiptOutcome::Rejected(_) => unreachable!("guarded above"),
+                }
+                outcome.receipts.push(prior.clone());
+                continue;
+            }
+            // Prior receipt was Rejected: fall through and actually reprocess
+            // — the source may have been repaired since the last attempt.
+        }
+
         let verdict = match process_frame(conn, incoming_root, package_dir, record, package_id, peer_device, &started_at) {
             Ok(v) => v,
             Err(e) => {
@@ -197,7 +256,11 @@ fn process_frame(
         let history_outcome = primary_wins_outcome(existing.updated_at.as_deref(), snapshot.updated_at.as_deref());
 
         // Same uuid but different bytes → keep existing, flag it. (v1: no
-        // overwrite; documented in the module header.)
+        // overwrite; documented in the module header.) Advisory only — this
+        // sampling-hash comparison never decides a skip (that would repeat the
+        // fix-review's sampling-collision loss risk); it exists purely to log a
+        // signal for operators, comparing against the same `files.content_hash`
+        // sampling hash the scanner's own Duplicates view already stores.
         if let Ok(incoming_hash) = crate::duplicates::compute_xxhash(&payload) {
             if existing.content_hash.as_deref() != Some(incoming_hash.as_str()) {
                 tracing::warn!(
@@ -213,11 +276,18 @@ fn process_frame(
         return Ok(FrameVerdict { receipt, history_outcome });
     }
 
-    // 3. Dedup by content hash (same bytes, different/absent uuid).
-    let content_hash = crate::duplicates::compute_xxhash(&payload)
-        .with_context(|| format!("hash payload {}", payload.display()))?;
-    if content_hash_exists(conn, &content_hash)? {
-        tracing::debug!(frame_uuid = %record.frame_uuid, "sync ingest duplicate by content hash");
+    // 3. Dedup by FULL content hash (same bytes, different/absent uuid).
+    // Compares the manifest's full-content xxh3 (`record.xxh3`, already
+    // verified against the payload in step 1) against previously *ingested*
+    // full hashes recorded in `sync_receipts` — deliberately NOT
+    // `files.content_hash` (the 3-position sampling hash): two distinct files
+    // can share every sampled window and differ only outside them, which would
+    // falsely mark a genuinely new frame `Duplicate` and lose it (see module
+    // docs). A frame the scanner ingested directly (no full hash on record) is
+    // not a secondary-dedupe candidate here — `frames.uuid` (step 2) remains
+    // the primary key for those; acceptable v1.
+    if full_hash_already_ingested(conn, &record.xxh3)? {
+        tracing::debug!(frame_uuid = %record.frame_uuid, "sync ingest duplicate by full content hash");
         let receipt = duplicate_receipt(record);
         record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "duplicate")?;
         return Ok(FrameVerdict { receipt, history_outcome: "duplicate" });
@@ -226,14 +296,33 @@ fn process_frame(
     // 4. Ingest: land the payload, then insert catalog rows in one transaction.
     let landed = land_payload(incoming_root, &payload, record, &snapshot)
         .with_context(|| format!("land payload {}", record.rel_path))?;
-
-    let tx = conn.unchecked_transaction().context("begin ingest tx")?;
-    insert_ingested_rows(&tx, &landed, record, &snapshot, &content_hash)?;
+    // The sampling hash is computed here purely to populate `files.content_hash`
+    // (the unrelated scanner-side Duplicates view) — it never decides a skip.
+    let sampling_hash = crate::duplicates::compute_xxhash(&landed)
+        .with_context(|| format!("hash landed payload {}", landed.display()))?;
 
     let receipt = ingested_receipt(record);
-    insert_receipt(&tx, package_id, &receipt, started_at)?;
-    insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested"))?;
-    tx.commit().context("commit ingest tx")?;
+    let write_result: Result<()> = (|| {
+        let tx = conn.unchecked_transaction().context("begin ingest tx")?;
+        insert_ingested_rows(&tx, &landed, record, &snapshot, &sampling_hash)?;
+        insert_receipt(&tx, package_id, &receipt, started_at)?;
+        insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested"))?;
+        tx.commit().context("commit ingest tx")
+    })();
+
+    if let Err(e) = write_result {
+        // The file was already landed (renamed into its final location) before
+        // the transaction ran; a failed insert/commit must not leave it behind
+        // with no catalog row pointing at it. Best-effort cleanup — logged,
+        // never masks the original error.
+        if let Err(rm_err) = std::fs::remove_file(&landed) {
+            tracing::warn!(
+                path = %landed.display(), error = %rm_err,
+                "sync ingest: failed to remove orphaned landed file after tx error"
+            );
+        }
+        return Err(e).with_context(|| format!("ingest catalog write for frame {}", record.frame_uuid));
+    }
 
     tracing::info!(frame_uuid = %record.frame_uuid, path = %landed.display(), "sync ingest frame landed");
     Ok(FrameVerdict { receipt, history_outcome: "ingested" })
@@ -261,15 +350,21 @@ fn find_frame_by_uuid(conn: &Connection, frame_uuid: &str) -> Result<Option<Exis
     .context("dedup lookup by frames.uuid")
 }
 
-/// True if any file already carries this (sampling) content hash.
-fn content_hash_exists(conn: &Connection, content_hash: &str) -> Result<bool> {
+/// True if `xxh3` (a manifest's full-content hash, already verified against
+/// its payload in step 1) was already recorded as
+/// [`Ingested`](ReceiptOutcome::Ingested) for some earlier frame. Queries
+/// `sync_receipts`, deliberately NOT `files.content_hash` — see the module
+/// docs and the step-3 comment at the call site for why the sampling hash is
+/// unsafe to use for this decision.
+fn full_hash_already_ingested(conn: &Connection, xxh3: &str) -> Result<bool> {
+    let ingested = receipt_outcome_to_db(&ReceiptOutcome::Ingested);
     let n: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM files WHERE content_hash = ?1",
-            params![content_hash],
+            "SELECT COUNT(*) FROM sync_receipts WHERE xxh3 = ?1 AND outcome = ?2",
+            params![xxh3, ingested],
             |r| r.get(0),
         )
-        .context("dedup lookup by content_hash")?;
+        .context("dedup lookup by full content hash")?;
     Ok(n > 0)
 }
 

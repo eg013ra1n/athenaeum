@@ -24,12 +24,13 @@ use crate::fits_writer::write_fits_f32;
 use crate::models::{Frame, ImageType};
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::sharing::loopback::{LoopbackNetwork, LoopbackTransport};
-use crate::sharing::types::{FrameReceipt, NodeId, PackageAnnounce, ReceiptOutcome, TransportEvent};
+use crate::sharing::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent};
 use crate::sharing::SharingTransport;
 
 use super::ingest::ingest_package;
-use super::store::CatalogSyncStore;
+use super::store::{count_satisfied_receipts, insert_receipt, CatalogSyncStore, SyncStore};
 use super::receiver::SyncReceiver;
+use super::{SyncConfig, SyncEngine, StandaloneSyncStore};
 
 const ORIGIN_DEVICE: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
 const PEER_HEX: &str = "1122334455667788112233445566778811223344556677881122334455667788";
@@ -60,6 +61,13 @@ fn fixture_frame(uuid: &str, object: &str, updated_at: &str) -> Frame {
 /// Write a minimal real FITS file at `path` (4x4 mono, no user cards).
 fn write_fits(path: &Path) {
     write_fits_f32(path, 4, 4, 1, &[0.0f32; 16], &[]).unwrap();
+}
+
+/// Write a minimal real FITS file at `path` with every pixel set to `val` — lets
+/// a test build two payloads with genuinely different full-content hashes
+/// (`write_fits` alone would make every fixture byte-identical).
+fn write_fits_val(path: &Path, val: f32) {
+    write_fits_f32(path, 4, 4, 1, &[val; 16], &[]).unwrap();
 }
 
 /// Build a one-frame fixture package under `root` and return `(pkg_dir, announce)`.
@@ -95,6 +103,84 @@ fn build_fixture_package(
         app_version: "test".to_string(),
     };
 
+    let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
+    let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
+    (pkg_dir, announce)
+}
+
+/// Build a two-frame fixture package (one `pkg_dir`, one announce/`package_id`
+/// covering both frames) with genuinely distinct pixel content per frame — used
+/// by the transit-corruption test so corrupting one payload cannot coincidentally
+/// collide with the other's hash. Returns `(pkg_dir, [uuid_a, uuid_b], path_of_b_in_pkg_dir)`.
+fn build_two_frame_package(root: &Path) -> (PathBuf, [String; 2], PathBuf) {
+    let src_dir = root.join("src_pair");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let path_a = src_dir.join("L_a.fits");
+    write_fits_val(&path_a, 0.0);
+    let path_b = src_dir.join("L_b.fits");
+    write_fits_val(&path_b, 1.0);
+
+    let uuid_a = "frame-uuid-pair-a".to_string();
+    let uuid_b = "frame-uuid-pair-b".to_string();
+
+    let record_of = |path: &Path, uuid: &str, object: &str| ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: uuid.to_string(),
+        origin_catalog_uuid: "catalog-uuid".to_string(),
+        origin_device: ORIGIN_DEVICE.to_string(),
+        payload_kind: PayloadKind::RawFrame,
+        rel_path: path.file_name().unwrap().to_str().unwrap().to_string(),
+        byte_size: std::fs::metadata(path).unwrap().len(),
+        xxh3: package::xxh3_full_file(path).unwrap(),
+        frame_meta: serde_json::to_value(&fixture_frame(uuid, object, "2026-01-16T10:00:00.000Z")).unwrap(),
+        analysis: None,
+        app_version: "test".to_string(),
+    };
+    let record_a = record_of(&path_a, &uuid_a, "PAIR_A");
+    let record_b = record_of(&path_b, &uuid_b, "PAIR_B");
+
+    let pkg_dir = root.join("pkg-pair");
+    package::write_package(&pkg_dir, vec![(path_a, record_a), (path_b, record_b)]).unwrap();
+    let path_b_in_pkg = pkg_dir.join("L_b.fits");
+    (pkg_dir, [uuid_a, uuid_b], path_b_in_pkg)
+}
+
+/// Flip a few bytes at `offset` in place — simulates transit/storage
+/// corruption of an already-written payload file.
+fn corrupt_at(path: &Path, offset: u64) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+}
+
+/// Build a single-frame package whose payload is `bytes` verbatim (not a real
+/// FITS file) — used by the sampling-hash-collision test, which only cares
+/// about byte layout, not FITS structure. Header extraction on ingest is
+/// tolerant of non-FITS content (logs a warning, inserts an empty header row).
+fn build_raw_package(root: &Path, frame_uuid: &str, filename: &str, bytes: &[u8]) -> (PathBuf, PackageAnnounce) {
+    let src_dir = root.join(format!("src-{frame_uuid}"));
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join(filename);
+    std::fs::write(&src, bytes).unwrap();
+
+    let byte_size = bytes.len() as u64;
+    let xxh3 = package::xxh3_full_file(&src).unwrap();
+    let frame = fixture_frame(frame_uuid, "RAW", "2026-01-16T10:00:00.000Z");
+    let record = ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: frame_uuid.to_string(),
+        origin_catalog_uuid: "catalog-uuid".to_string(),
+        origin_device: ORIGIN_DEVICE.to_string(),
+        payload_kind: PayloadKind::RawFrame,
+        rel_path: filename.to_string(),
+        byte_size,
+        xxh3,
+        frame_meta: serde_json::to_value(&frame).unwrap(),
+        analysis: None,
+        app_version: "test".to_string(),
+    };
     let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
     let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
     (pkg_dir, announce)
@@ -327,5 +413,259 @@ async fn ack_replay_from_receipt_log() {
         assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 1, "replay did not re-ingest a file");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "replay wrote no history row");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "replay wrote no receipt row");
+    }
+}
+
+// ── Fix-review regression tests (reject-aware ack + full-hash secondary dedupe) ──
+
+/// Required test #2: the ack-replay guard (`count_satisfied_receipts`) must
+/// exclude `Rejected` receipts from its "fully receipted" count — a package
+/// with a pending rejection is NOT short-circuited (it needs a real
+/// redelivery), but once every receipt is non-rejected, the guard IS satisfied.
+#[test]
+fn replay_guard_excludes_rejected_receipts() {
+    let tmp = TempDir::new().unwrap();
+    let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+    let package_id = "pkg-replay-guard";
+    let frame_count = 2u32;
+
+    // Two frames: one Ingested, one Rejected — NOT fully satisfied.
+    {
+        let conn = store.lock_conn();
+        insert_receipt(
+            &conn, package_id,
+            &FrameReceipt { frame_uuid: "f1".into(), xxh3: "h1".into(), outcome: ReceiptOutcome::Ingested },
+            "2026-01-01T00:00:00.000Z",
+        ).unwrap();
+        insert_receipt(
+            &conn, package_id,
+            &FrameReceipt { frame_uuid: "f2".into(), xxh3: "h2".into(), outcome: ReceiptOutcome::Rejected("xxh3 mismatch".into()) },
+            "2026-01-01T00:00:00.000Z",
+        ).unwrap();
+    }
+    let total = store.count_receipts(&PackageId(package_id.to_string())).unwrap();
+    assert_eq!(total, 2, "both receipts recorded");
+    let satisfied = { let conn = store.lock_conn(); count_satisfied_receipts(&conn, package_id).unwrap() };
+    assert_eq!(satisfied, 1, "a Rejected receipt must not count as satisfied");
+    assert_ne!(satisfied, frame_count, "guard must NOT short-circuit while a rejection is pending");
+
+    // Upgrade f2's receipt to Ingested (simulating a successful redelivery) —
+    // the package is now fully satisfied.
+    {
+        let conn = store.lock_conn();
+        insert_receipt(
+            &conn, package_id,
+            &FrameReceipt { frame_uuid: "f2".into(), xxh3: "h2".into(), outcome: ReceiptOutcome::Ingested },
+            "2026-01-01T00:01:00.000Z",
+        ).unwrap();
+    }
+    let satisfied2 = { let conn = store.lock_conn(); count_satisfied_receipts(&conn, package_id).unwrap() };
+    assert_eq!(satisfied2, frame_count, "once every receipt is non-rejected, the guard IS satisfied");
+}
+
+/// Required test #3: two distinct 4MB payloads whose 3-position *sampling*
+/// hash (`duplicates::compute_xxhash`) collides because they are byte-identical
+/// in all three sampled windows, differing only at an offset in the un-sampled
+/// gap between window 1 and window 2. Window math (verified against
+/// `duplicates::compute_xxhash`'s source for `SIZE = 4 MiB`):
+/// window1 = `[0, 524288)`, window2 = `[1835008, 2359296)`, window3 =
+/// `[3670016, 4194304)` — `DIVERGE_OFFSET = 1_000_000` sits in the gap
+/// `[524288, 1835008)`, outside all three. Before the fix-review's fix, this
+/// second (distinct-uuid, distinct-full-hash) file was wrongly skipped as a
+/// content-hash `Duplicate`; after the fix (secondary dedupe compares the
+/// manifest's full xxh3 against `sync_receipts`, never the sampling hash) it
+/// must be genuinely ingested.
+#[test]
+fn sampling_collision_is_not_treated_as_duplicate() {
+    const SIZE: usize = 4 * 1024 * 1024;
+    const DIVERGE_OFFSET: usize = 1_000_000;
+
+    let buf_a = vec![0u8; SIZE];
+    let mut buf_b = buf_a.clone();
+    buf_b[DIVERGE_OFFSET] = 0xFF;
+
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+
+    let (pkg_a, announce_a) = build_raw_package(tmp.path(), "frame-collide-a", "A.bin", &buf_a);
+    let (pkg_b, announce_b) = build_raw_package(tmp.path(), "frame-collide-b", "B.bin", &buf_b);
+
+    // Sanity-check the premise itself: sampling hash collides, full hash
+    // differs. If a future change to `compute_xxhash`'s window math breaks
+    // this, the test must fail here with a clear message, not silently pass
+    // for the wrong reason.
+    let sampling_a = crate::duplicates::compute_xxhash(&pkg_a.join("A.bin")).unwrap();
+    let sampling_b = crate::duplicates::compute_xxhash(&pkg_b.join("B.bin")).unwrap();
+    assert_eq!(sampling_a, sampling_b, "test premise: sampling hashes must collide");
+    assert_ne!(announce_a.root_hash, announce_b.root_hash, "sanity: packages are not identical");
+    assert_ne!(
+        package::xxh3_full_file(&pkg_a.join("A.bin")).unwrap(),
+        package::xxh3_full_file(&pkg_b.join("B.bin")).unwrap(),
+        "test premise: full content hash must differ"
+    );
+
+    let out_a = ingest_package(&conn, &incoming, &pkg_a, &announce_a, PEER_HEX).unwrap();
+    assert_eq!(out_a.ingested, 1);
+
+    let out_b = ingest_package(&conn, &incoming, &pkg_b, &announce_b, PEER_HEX).unwrap();
+    assert_eq!(
+        out_b.ingested, 1,
+        "distinct content must ingest despite a sampling-hash collision with an already-ingested frame"
+    );
+    assert!(matches!(out_b.receipts[0].outcome, ReceiptOutcome::Ingested));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "both frames land as separate files");
+}
+
+/// Required test #1 (the e2e repair scenario): a two-frame package where one
+/// payload is corrupted post-write. The receiver rejects that frame and
+/// ingests its sibling; the sender must NOT confirm (any Rejected receipt
+/// blocks confirmation) and keeps retrying. The test then repairs the source
+/// file; the next redelivery reprocesses ONLY the previously-rejected frame
+/// (the sibling's already-Ingested receipt is reused, not touched again) and
+/// the sender finally confirms once every receipt is non-rejected.
+#[tokio::test]
+async fn transit_corruption_repaired_then_redelivery_confirms() {
+    let tmp = TempDir::new().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Build the two-frame package, then corrupt frame B's SERVED payload
+    // (pkg_dir is what the sender re-serves on every retry, so repairing it
+    // later is what a redelivery actually picks up).
+    let (pkg_dir, [uuid_a, uuid_b], path_b_in_pkg) = build_two_frame_package(tmp.path());
+    corrupt_at(&path_b_in_pkg, 100);
+
+    // Receiver: a real SyncReceiver over a catalog DB.
+    let catalog_path = tmp.path().join("catalog.db");
+    let assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+    let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+    let incoming = tmp.path().join("incoming");
+
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+    let (_info, _handle) = SyncReceiver::spawn(
+        Arc::clone(&store),
+        incoming,
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .unwrap();
+
+    // Sender: a real SyncEngine with a short ack-timeout so retries happen
+    // quickly and deterministically within the test's wait budget.
+    let sync_store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        sync_store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_node,
+        SyncConfig { ack_timeout: Duration::from_millis(60), max_attempts: 30 },
+    );
+
+    let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+
+    // First delivery: frame A ingests, frame B is rejected (corrupted) — the
+    // sender must NOT confirm. Wait for the good frame to land, then assert the
+    // package stays non-Confirmed across at least one retry cycle.
+    wait_until(
+        || count(&assert_db.conn(), "SELECT COUNT(*) FROM files") == 1,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_until(|| attempts_of(&sync_store, id) >= 1, Duration::from_secs(5)).await;
+    assert_ne!(
+        state_of(&sync_store, id),
+        Some(super::OutboundState::Confirmed),
+        "a package with a rejected frame must not be confirmed"
+    );
+    assert_eq!(
+        count(&assert_db.conn(), "SELECT COUNT(*) FROM files"),
+        1,
+        "only the good frame ingested so far"
+    );
+
+    // Repair the source: restore frame B's original (uncorrupted) bytes at the
+    // path the sender re-serves on every retry.
+    write_fits_val(&path_b_in_pkg, 1.0);
+
+    // Redelivery: the engine keeps re-announcing (same package_id) until the
+    // receiver acks with zero rejections, at which point the sender confirms.
+    wait_until(
+        || state_of(&sync_store, id) == Some(super::OutboundState::Confirmed),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(state_of(&sync_store, id), Some(super::OutboundState::Confirmed));
+
+    // Single catalog row per frame — the good frame was never reprocessed, and
+    // the repaired frame was ingested exactly once on the redelivery attempt
+    // that finally verified.
+    let conn = assert_db.conn();
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "one files row per frame, no duplicates");
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 2, "one frames row per frame, no duplicates");
+
+    // Receipt for the repaired frame was upserted from Rejected to Ingested.
+    let b_outcome: String = conn
+        .query_row(
+            "SELECT outcome FROM sync_receipts WHERE frame_uuid = ?1",
+            rusqlite::params![uuid_b],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(b_outcome, "ingested", "the repaired frame's receipt was upserted to ingested");
+
+    // History shows the reject-then-ingest trail for the repaired frame, and
+    // exactly one ingested row for the never-touched-again good frame.
+    let b_history_outcomes: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT outcome FROM sync_history WHERE frame_uuid = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(rusqlite::params![uuid_b], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    };
+    assert!(
+        b_history_outcomes.iter().any(|o| o.starts_with("rejected")),
+        "history must show the initial rejection: {b_history_outcomes:?}"
+    );
+    assert!(
+        b_history_outcomes.iter().any(|o| o == "ingested"),
+        "history must show the eventual ingest: {b_history_outcomes:?}"
+    );
+
+    let a_history_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_history WHERE frame_uuid = ?1",
+            rusqlite::params![uuid_a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(a_history_count, 1, "the good frame's history is not touched again on redelivery");
+
+    engine.shutdown().await;
+}
+
+fn state_of(store: &StandaloneSyncStore, id: i64) -> Option<super::OutboundState> {
+    store.get_outbound(id).unwrap().map(|r| r.state)
+}
+
+fn attempts_of(store: &StandaloneSyncStore, id: i64) -> u32 {
+    store.get_outbound(id).unwrap().map(|r| r.attempts).unwrap_or(0)
+}
+
+/// Poll a sync predicate every 10ms until true, panicking after `timeout`.
+/// Local copy of `engine_tests::wait_until` (private to its own module, so this
+/// file needs its own).
+async fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pred() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("wait_until timed out after {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

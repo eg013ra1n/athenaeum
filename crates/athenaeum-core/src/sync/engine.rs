@@ -120,6 +120,11 @@ struct Pending {
     started_at: String,
     /// When to give up waiting (for the ack, or to retry a failed announce).
     deadline: Instant,
+    /// Frame uuids the most recent ack rejected, if any (task A7 fix-review).
+    /// Empty until a partial ack arrives; overwritten (not accumulated) by each
+    /// subsequent partial ack so it always reflects the latest verdict. Named
+    /// in the terminal history outcome if the package is eventually `Failed`.
+    last_rejected: Vec<String>,
 }
 
 /// Factory + namespace for the sync engine. Holds no state itself — [`spawn`]
@@ -350,6 +355,7 @@ impl Worker {
                 started,
                 started_at: String::new(),
                 deadline: Instant::now(),
+                last_rejected: Vec::new(),
             },
         );
         self.attempt(id).await
@@ -490,8 +496,17 @@ impl Worker {
         }
     }
 
-    /// Confirm a package on ack. Idempotent: an ack for a package no longer in
-    /// the in-flight map (already confirmed, or unknown) is dropped at debug.
+    /// Handle an ack: confirm the package ONLY if every receipt is non-`Rejected`
+    /// (task A7 fix-review — `Confirmed` means "all frames ingested-or-duplicate").
+    /// An ack carrying any `Rejected` receipt is a partial delivery: log the
+    /// rejected frame uuids and leave the package's pending slot untouched (no
+    /// confirm, no history, deadline unchanged) — the existing ack-timeout
+    /// deadline elapses normally and `handle_timeouts`' ordinary retry path
+    /// re-announces (redelivery) or, once `max_attempts` is exhausted, fails the
+    /// package with a history outcome naming the rejected frame(s).
+    ///
+    /// Idempotent for a fully-accepted ack: one for a package no longer in the
+    /// in-flight map (already confirmed, or unknown) is dropped at debug.
     fn on_ack(&mut self, package_id: PackageId, receipts: Vec<FrameReceipt>) -> Result<()> {
         // The map is keyed by row id, so locate the slot whose minted announce
         // carries this `package_id`.
@@ -503,6 +518,24 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "duplicate/late ack ignored");
             return Ok(());
         };
+
+        let rejected: Vec<&str> = receipts
+            .iter()
+            .filter_map(|r| matches!(r.outcome, ReceiptOutcome::Rejected(_)).then_some(r.frame_uuid.as_str()))
+            .collect();
+
+        if !rejected.is_empty() {
+            tracing::warn!(
+                package_id = key,
+                rejected = %rejected.join(","),
+                "sync ack has rejected frame(s); package stays in flight for retry"
+            );
+            if let Some(p) = self.pending.get_mut(&key) {
+                p.last_rejected = rejected.into_iter().map(str::to_string).collect();
+            }
+            return Ok(());
+        }
+
         let pending = self.pending.remove(&key).expect("key from live find");
         self.store
             .confirm(pending.id, &receipts)
@@ -545,13 +578,25 @@ impl Worker {
     }
 
     /// Mark a package `Failed` after exhausting attempts and record a `failed`
-    /// history outcome.
+    /// history outcome. When the package's last known ack rejected one or more
+    /// frames, the outcome names them (task A7 fix-review) instead of the bare
+    /// `failed` string — the recorded reason for terminal failure was the
+    /// receiver's rejection, not just an unreachable peer.
     fn fail_package(&mut self, id: i64) -> Result<()> {
-        let dir = self.pending.remove(&id).map(|p| p.dir);
+        let removed = self.pending.remove(&id);
+        let (dir, last_rejected) = match removed {
+            Some(p) => (Some(p.dir), p.last_rejected),
+            None => (None, Vec::new()),
+        };
         self.store.set_state(id, OutboundState::Failed)?;
-        tracing::error!(package_id = id, state = "failed", "sync state");
+        tracing::error!(package_id = id, state = "failed", rejected = ?last_rejected, "sync state");
         if let Some(dir) = dir {
-            self.append_terminal_history(id, &dir, "failed")?;
+            let outcome = if last_rejected.is_empty() {
+                "failed".to_string()
+            } else {
+                format!("failed: rejected frame(s) {}", last_rejected.join(","))
+            };
+            self.append_terminal_history(id, &dir, &outcome)?;
         }
         Ok(())
     }

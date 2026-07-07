@@ -142,19 +142,22 @@ async fn handle_announce(
     });
 
     // Ack-replay guard: a fully-receipted package is re-acked from the log,
-    // skipping the fetch and ingest entirely.
-    let receipt_count = store.count_receipts(&announce.package_id)?;
-    if announce.frame_count > 0 && receipt_count == announce.frame_count {
+    // skipping the fetch and ingest entirely. Counts only non-Rejected
+    // receipts as "satisfied" — a package with a pending Rejected receipt must
+    // fall through to fetch+ingest below so that frame gets a real redelivery
+    // attempt, not a replay of its stale rejection (fix-review finding #1).
+    let satisfied_count = store.count_satisfied_receipts(&announce.package_id)?;
+    if announce.frame_count > 0 && satisfied_count == announce.frame_count {
         let receipts = store.load_receipts(&announce.package_id)?;
         transport
             .ack(from, &announce.package_id, receipts)
             .await
             .context("ack (replayed)")?;
-        tracing::info!(package_id = %package_id, count = receipt_count, "sync receiver replayed ack from receipt log");
+        tracing::info!(package_id = %package_id, count = satisfied_count, "sync receiver replayed ack from receipt log");
         emit_event(emitter, "sync-finished", &SyncFinishedEvent {
             package_id,
             outcome: "replayed".to_string(),
-            ok_count: receipt_count,
+            ok_count: satisfied_count,
             failed: Vec::new(),
         });
         return Ok(());

@@ -258,9 +258,11 @@ pub fn insert_receipt(
     Ok(())
 }
 
-/// Count the receipt rows recorded for `package_id` (the ack-replay guard: a
-/// package whose receipt count equals its announced `frame_count` is fully
-/// receipted and can be re-acked from the log).
+/// Count every receipt row recorded for `package_id`, regardless of outcome.
+/// NOT the ack-replay guard (a `Rejected` receipt must never count as
+/// "satisfied") — see [`count_satisfied_receipts`] for that. Kept as a plain
+/// total for callers that want raw coverage (e.g. "has this package been
+/// touched at all").
 pub fn count_receipts(conn: &Connection, package_id: &str) -> Result<u32> {
     let n: i64 = conn
         .query_row(
@@ -269,6 +271,27 @@ pub fn count_receipts(conn: &Connection, package_id: &str) -> Result<u32> {
             |r| r.get(0),
         )
         .context("count sync_receipts")?;
+    Ok(n.max(0) as u32)
+}
+
+/// Count the receipt rows recorded for `package_id` whose outcome is NOT a
+/// rejection (the ack-replay guard: a package whose *satisfied* receipt count
+/// equals its announced `frame_count` is fully receipted — every frame
+/// ingested or duplicate — and can be re-acked from the log).
+///
+/// A `Rejected` receipt must never count toward this total: a package with any
+/// rejected frame still needs a redelivery attempt for that frame, so treating
+/// it as "fully receipted" would permanently strand the rejected frame behind
+/// the replay guard, re-acking the same stale `Rejected` verdict forever
+/// instead of ever re-fetching and re-ingesting it.
+pub fn count_satisfied_receipts(conn: &Connection, package_id: &str) -> Result<u32> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_receipts WHERE package_id = ?1 AND outcome NOT LIKE 'rejected:%'",
+            params![package_id],
+            |r| r.get(0),
+        )
+        .context("count satisfied sync_receipts")?;
     Ok(n.max(0) as u32)
 }
 
@@ -505,10 +528,21 @@ impl CatalogSyncStore {
         self.conn.lock().expect("catalog sync store mutex poisoned")
     }
 
-    /// Number of receipts already recorded for `package_id` (ack-replay guard).
+    /// Total receipts recorded for `package_id`, any outcome. See
+    /// [`count_satisfied_receipts`](Self::count_satisfied_receipts) for the
+    /// actual ack-replay guard.
     pub fn count_receipts(&self, package_id: &PackageId) -> Result<u32> {
         let conn = self.lock_conn();
         count_receipts(&conn, &package_id.0)
+    }
+
+    /// Number of non-`Rejected` receipts recorded for `package_id` — the
+    /// ack-replay guard. A package is only "fully receipted" when this equals
+    /// the announced `frame_count`; a pending `Rejected` receipt must never be
+    /// counted as satisfied (it needs a redelivery, not a replay).
+    pub fn count_satisfied_receipts(&self, package_id: &PackageId) -> Result<u32> {
+        let conn = self.lock_conn();
+        count_satisfied_receipts(&conn, &package_id.0)
     }
 
     /// Every receipt recorded for `package_id`, ready to replay in an ack.

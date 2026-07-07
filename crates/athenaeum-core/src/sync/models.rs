@@ -31,9 +31,17 @@ pub enum OutboundState {
     /// Reserved (v1-unused): a distinct "peer finished pulling, not yet acked"
     /// signal that loopback/iroh do not surface to the sender.
     Delivered,
-    /// Peer acked receipt — terminal success.
+    /// Peer acked receipt — terminal success. **Requires every frame's receipt
+    /// to be non-`Rejected`** (task A7 fix-review): `Confirmed` means "all
+    /// frames ingested-or-duplicate". An ack carrying any `Rejected` receipt is
+    /// a partial delivery — the engine does NOT confirm; the package stays in
+    /// flight so the normal ack-timeout/retry path re-announces (redelivery)
+    /// until the peer accepts every frame, or `max_attempts` exhausts to
+    /// `Failed`.
     Confirmed,
-    /// Retries exhausted or cancelled — terminal failure.
+    /// Retries exhausted or cancelled — terminal failure. Also reached when a
+    /// package keeps receiving a partial/rejected ack past `max_attempts`; the
+    /// recorded history names the frame(s) that were still rejected.
     Failed,
 }
 
