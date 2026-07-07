@@ -137,6 +137,15 @@ pub struct AppRetentionConfig {
     pub live_confirmed: bool,
 }
 
+/// Parse the raw `sync.retention.dry_run` setting fail-safe: dry-run stays ON
+/// unless the value is *explicitly* `"false"` (case-insensitive). Any other
+/// string — empty, garbage, a typo like `"flase"`, `"0"` — leans to dry-run
+/// (`true`), never toward live deletion. Pairs with the `live_confirmed` opt-in
+/// gate in [`AppRetentionConfig::effective_dry_run`].
+fn parse_dry_run(value: &str) -> bool {
+    !value.eq_ignore_ascii_case("false")
+}
+
 impl AppRetentionConfig {
     /// The dry-run mode actually applied. Live deletion (returns `false`) only
     /// when the operator has BOTH disabled dry-run AND set the explicit opt-in;
@@ -165,8 +174,8 @@ impl AppRetentionConfig {
             .ok()
             .filter(|p| (1..=100).contains(p))
             .unwrap_or_else(|| defaults::SYNC_RETENTION_DISK_MAX_PCT.parse().unwrap_or(90));
-        let raw_dry_run = get(keys::SYNC_RETENTION_DRY_RUN, defaults::SYNC_RETENTION_DRY_RUN)?
-            .eq_ignore_ascii_case("true");
+        let raw_dry_run =
+            parse_dry_run(&get(keys::SYNC_RETENTION_DRY_RUN, defaults::SYNC_RETENTION_DRY_RUN)?);
         let live_confirmed =
             get(keys::SYNC_RETENTION_LIVE_CONFIRMED, defaults::SYNC_RETENTION_LIVE_CONFIRMED)?
                 .eq_ignore_ascii_case("true");
@@ -637,6 +646,25 @@ mod tests {
             !cfg(RetentionPolicy::OnConfirm, false, true).effective_dry_run(),
             "only dry_run=false + opt-in goes live"
         );
+    }
+
+    /// The raw `dry_run` setting parses fail-safe: ONLY an explicit `"false"`
+    /// (any case) disables dry-run. Every other value — empty, garbage, a typo,
+    /// `"0"` — must resolve to dry-run (`true`) so a corrupt/unexpected setting
+    /// never leans toward live deletion.
+    #[test]
+    fn dry_run_parse_defaults_to_dry_on_garbage() {
+        // Only explicit "false" (case-insensitive) disables dry-run.
+        assert!(!parse_dry_run("false"), "explicit false disables dry-run");
+        assert!(!parse_dry_run("FALSE"), "case-insensitive false");
+        assert!(!parse_dry_run("False"), "mixed-case false");
+        // Everything else stays dry-run.
+        assert!(parse_dry_run("true"), "true is dry-run");
+        assert!(parse_dry_run(""), "empty stays dry-run");
+        assert!(parse_dry_run("garbage"), "garbage stays dry-run");
+        assert!(parse_dry_run("flase"), "a typo of false stays dry-run");
+        assert!(parse_dry_run("0"), "a numeric 0 stays dry-run");
+        assert!(parse_dry_run(" false "), "untrimmed 'false' stays dry-run (not an exact match)");
     }
 
     // ── BRD B6: catalog-consistent delete + two searchable events ────────────

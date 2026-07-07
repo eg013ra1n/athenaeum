@@ -69,6 +69,7 @@ export default function SyncSection() {
   const [ticketError, setTicketError] = useState<string | null>(null);
   const [ticketLoading, setTicketLoading] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
 
   const signedIn = status?.signedIn ?? false;
   const role = status?.role ?? null;
@@ -158,14 +159,43 @@ export default function SyncSection() {
 
   const handleCopyTicket = async () => {
     if (!ticket) return;
+    // `navigator.clipboard?.writeText` short-circuits to `undefined` when the
+    // API is absent (insecure context / older webview) — awaiting it resolves
+    // successfully and would falsely report "Copied". Require the real method,
+    // fall back to the legacy execCommand path, and surface an honest failure
+    // when neither works. Never claim success without actually copying.
+    setCopyFailed(false);
+    let ok = false;
     try {
-      await navigator.clipboard?.writeText(ticket);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(ticket);
+        ok = true;
+      } else if (typeof document !== 'undefined' && document.execCommand) {
+        const ta = document.createElement('textarea');
+        ta.value = ticket;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+    } catch (err) {
+      console.error('[sync] copy ticket failed:', err);
+      ok = false;
+    }
+    if (!mounted.current) return;
+    if (ok) {
       setCopied(true);
       setTimeout(() => {
         if (mounted.current) setCopied(false);
       }, 2000);
-    } catch (err) {
-      console.error('[sync] copy ticket failed:', err);
+    } else {
+      console.error('[sync] copy ticket failed: clipboard unavailable');
+      setCopyFailed(true);
+      setTimeout(() => {
+        if (mounted.current) setCopyFailed(false);
+      }, 2000);
     }
   };
 
@@ -305,11 +335,21 @@ export default function SyncSection() {
                     <button
                       type="button"
                       onClick={handleCopyTicket}
-                      title="Copy ticket"
-                      className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-border px-2 py-1.5 text-xs text-content-secondary hover:bg-surface-hover transition-colors"
+                      title={copyFailed ? 'Copy failed — select the ticket and copy manually' : 'Copy ticket'}
+                      className={`flex-shrink-0 inline-flex items-center gap-1 rounded-md border px-2 py-1.5 text-xs transition-colors ${
+                        copyFailed
+                          ? 'border-warning/50 text-warning hover:bg-warning-muted'
+                          : 'border-border text-content-secondary hover:bg-surface-hover'
+                      }`}
                     >
-                      {copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
-                      {copied ? 'Copied' : 'Copy'}
+                      {copyFailed ? (
+                        <AlertTriangle size={13} className="text-warning" />
+                      ) : copied ? (
+                        <Check size={13} className="text-success" />
+                      ) : (
+                        <Copy size={13} />
+                      )}
+                      {copyFailed ? 'Copy failed' : copied ? 'Copied' : 'Copy'}
                     </button>
                   </div>
                 </div>

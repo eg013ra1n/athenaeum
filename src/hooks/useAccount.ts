@@ -35,6 +35,12 @@ export interface UseAccount {
   /** `null` until the first status poll resolves. */
   status: AccountStatus | null;
   loading: boolean;
+  /**
+   * The last status-poll error, or `null`. Set when a poll rejects (e.g. the
+   * hub is unreachable). Paired with a `null` `status` this means the initial
+   * load failed — render an error + Retry, never a dead spinner.
+   */
+  statusError: string | null;
   devices: AccountDevice[];
   devicesLoading: boolean;
   devicesError: string | null;
@@ -61,6 +67,7 @@ export interface UseAccount {
 export function useAccount(): UseAccount {
   const [status, setStatus] = useState<AccountStatus | null>(null);
   const [loading, setLoading] = useState(true);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [devices, setDevices] = useState<AccountDevice[]>([]);
   const [devicesLoading, setDevicesLoading] = useState(false);
   const [devicesError, setDevicesError] = useState<string | null>(null);
@@ -76,12 +83,17 @@ export function useAccount(): UseAccount {
   const refreshStatus = useCallback(async (): Promise<AccountStatus | null> => {
     try {
       const s = await api.invoke<AccountStatus>('account_status');
-      if (mounted.current) setStatus(s);
+      if (mounted.current) {
+        setStatus(s);
+        setStatusError(null);
+      }
       return s;
     } catch (err) {
       // Status is offline-resolvable in the backend, so a failure here is
-      // unexpected — log, never swallow silently.
+      // unexpected — log, never swallow silently. Record it so a failed first
+      // poll surfaces an error + Retry instead of an eternal spinner.
       console.error('[account] status poll failed:', err);
+      if (mounted.current) setStatusError(accountErrMsg(err));
       return null;
     }
   }, []);
@@ -208,6 +220,7 @@ export function useAccount(): UseAccount {
   return {
     status,
     loading,
+    statusError,
     devices,
     devicesLoading,
     devicesError,

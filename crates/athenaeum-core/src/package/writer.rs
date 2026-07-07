@@ -69,8 +69,21 @@ pub fn write_package_with_root_hash(
             fs::create_dir_all(parent)
                 .with_context(|| format!("create payload dir {}", parent.display()))?;
         }
-        fs::copy(&src, &dest)
+        let copied = fs::copy(&src, &dest)
             .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
+        // Integrity guard: the copied file must match the manifest's declared
+        // size, else the package advertises a `byte_size`/`xxh3` that its own
+        // payload no longer satisfies (truncated read, racing writer, wrong
+        // record). Fail loudly here rather than ship a package that fails
+        // validation on the receiver.
+        if copied != record.byte_size {
+            anyhow::bail!(
+                "package copy size mismatch for {}: copied {} bytes, manifest byte_size {}",
+                record.rel_path,
+                copied,
+                record.byte_size
+            );
+        }
 
         total_bytes = total_bytes.saturating_add(record.byte_size);
         manifest_records.push(record);

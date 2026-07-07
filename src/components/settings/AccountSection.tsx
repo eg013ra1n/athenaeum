@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Mail,
   KeyRound,
@@ -11,6 +11,7 @@ import {
   Trash2,
   Loader2,
   AlertTriangle,
+  RefreshCw,
 } from 'lucide-react';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { useNotifications } from '../../contexts/NotificationContext';
@@ -58,9 +59,11 @@ export default function AccountSection() {
   const {
     status,
     loading,
+    statusError,
     devices,
     devicesLoading,
     devicesError,
+    refreshStatus,
     sendCode,
     verifyCode,
     signOut,
@@ -83,6 +86,15 @@ export default function AccountSection() {
   const [roleSaving, setRoleSaving] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
+  const [retryingStatus, setRetryingStatus] = useState(false);
+
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const signedIn = status?.signedIn ?? false;
   const deviceId = status?.deviceId ?? null;
@@ -258,13 +270,51 @@ export default function AccountSection() {
     }
   };
 
+  const handleRetryStatus = async () => {
+    if (retryingStatus) return;
+    setRetryingStatus(true);
+    try {
+      await refreshStatus();
+    } finally {
+      if (mounted.current) setRetryingStatus(false);
+    }
+  };
+
   // ── render ───────────────────────────────────────────────────────────────────
 
-  if (loading || !status) {
+  if (loading) {
     return (
       <div className="flex items-center gap-2 text-sm text-content-muted">
         <Loader2 size={16} className="animate-spin" />
         Loading account…
+      </div>
+    );
+  }
+
+  // The first status poll resolved but returned nothing — the hub is
+  // unreachable (or the command failed). Never leave a dead "Loading…" spinner:
+  // surface the error and a Retry, mirroring the devices-list error treatment.
+  if (!status) {
+    return (
+      <div className="max-w-md space-y-3">
+        <div className="flex items-start gap-2 rounded-lg border border-error/50 bg-error-muted p-3">
+          <AlertTriangle size={16} className="text-error flex-shrink-0 mt-0.5" />
+          <p className="text-sm text-error">
+            Couldn&apos;t load your account{statusError ? `: ${statusError}` : '.'}
+          </p>
+        </div>
+        <button
+          onClick={handleRetryStatus}
+          disabled={retryingStatus}
+          className="inline-flex items-center gap-2 px-4 py-2 border border-border rounded-lg text-sm text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
+        >
+          {retryingStatus ? (
+            <Loader2 size={16} className="animate-spin" />
+          ) : (
+            <RefreshCw size={16} />
+          )}
+          Retry
+        </button>
       </div>
     );
   }

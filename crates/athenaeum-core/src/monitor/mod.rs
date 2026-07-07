@@ -210,9 +210,12 @@ impl MonitorService {
     async fn tick<E: ProgressEmitter + 'static>(&self, ctx: Arc<ServiceContext>, emitter: Arc<E>) {
         let offline_roots = Arc::clone(&self.offline_roots);
         let hook = self.scan_completion_hook();
-        let _ = tokio::task::spawn_blocking(move || {
+        if let Err(e) = tokio::task::spawn_blocking(move || {
             orchestrator::run_cycle(&ctx, &*emitter, &offline_roots, hook.as_deref());
         })
-        .await;
+        .await
+        {
+            tracing::error!(error = %e, "monitor cycle task panicked or was cancelled");
+        }
     }
 }
