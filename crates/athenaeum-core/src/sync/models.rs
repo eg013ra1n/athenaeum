@@ -19,7 +19,7 @@ use crate::sharing::types::NodeId;
 /// ack. Terminal states are [`Confirmed`](Self::Confirmed) and
 /// [`Failed`](Self::Failed); everything else is non-terminal and re-driven on
 /// crash-resume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum OutboundState {
     /// Persisted, not yet advertised to the peer.
@@ -147,11 +147,18 @@ pub struct HistoryRow {
 
 /// Minimal query surface for [`SyncStore::search_history`](super::store::SyncStore::search_history).
 ///
-/// YAGNI by design (task A4): exact-match filters on `filename` and/or `object`
-/// (both optional; `None` = unfiltered), newest-first, capped at `limit`.
+/// Exact-match filters on `filename`, `object`, `direction`, and/or `peer_device`
+/// (all optional; `None` = unfiltered), newest-first, capped at `limit`. Every
+/// filter is applied SQL-side in [`search_history_rows`](super::store::search_history_rows)
+/// (task M3 added `direction`/`peer` so the Transfers UI can split the log by
+/// send/receive and by peer without post-filtering in the client).
 #[derive(Debug, Clone, Default)]
 pub struct HistoryQuery {
     pub filename: Option<String>,
     pub object: Option<String>,
+    /// Restrict to one transfer direction (`Sent` / `Received`).
+    pub direction: Option<Direction>,
+    /// Exact peer node id (hex) to restrict to.
+    pub peer: Option<String>,
     pub limit: u32,
 }

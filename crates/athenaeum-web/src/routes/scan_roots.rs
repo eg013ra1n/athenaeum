@@ -172,9 +172,16 @@ pub async fn start_scan_with_progress(
         let ctx = state.ctx.clone();
         let sender = state.sync_sender.clone();
         let file_ids = dto.new_file_ids.clone();
+        let sync_emitter: std::sync::Arc<dyn athenaeum_core::events::ProgressEmitter> =
+            std::sync::Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
         tokio::spawn(async move {
-            if let Err(e) =
-                athenaeum_core::api::sync::auto_enqueue_scanned_files(&ctx, &sender, file_ids).await
+            if let Err(e) = athenaeum_core::api::sync::auto_enqueue_scanned_files(
+                &ctx,
+                &sender,
+                file_ids,
+                Some(sync_emitter),
+            )
+            .await
             {
                 tracing::warn!(error = %e, "auto-mode sync enqueue after scan failed");
             }

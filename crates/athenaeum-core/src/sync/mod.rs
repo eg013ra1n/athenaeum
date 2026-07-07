@@ -54,6 +54,7 @@ pub mod pairing;
 pub mod receiver;
 pub mod retention;
 pub mod sender;
+pub mod status;
 pub mod store;
 
 #[cfg(test)]
@@ -72,9 +73,12 @@ pub use pairing::{
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
 pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{
-    SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime, SyncStatus,
+    SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime,
 };
 pub use sender::{StartedSender, SyncSenderRuntime};
+pub use status::{
+    OutboundSummary, SyncPairingSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus,
+};
 pub use store::{CatalogSyncStore, StandaloneSyncStore, SyncStore};
 
 /// Canonical timestamp rendering for the sync tables: RFC3339 UTC, millisecond

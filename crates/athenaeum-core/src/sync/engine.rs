@@ -44,6 +44,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::events::{emit_event, ProgressEmitter};
 use crate::package::{self, ManifestRecord};
 use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
@@ -51,6 +52,7 @@ use crate::sharing::types::{
 use crate::sharing::SharingTransport;
 
 use super::models::{Direction, HistoryRow, OutboundRow, OutboundState};
+use super::receiver::{SyncFinishedEvent, SyncProgressEvent};
 use super::store::SyncStore;
 use super::{node_id_hex, now_iso};
 
@@ -144,13 +146,39 @@ impl SyncEngine {
     }
 
     /// Spawn the engine with an explicit [`SyncConfig`] (tests use short
-    /// timeouts). Starts a tokio task running the worker loop and returns a
-    /// handle to it.
+    /// timeouts) and no progress emitter (log-only).
     pub fn spawn_with_config(
         store: Arc<dyn SyncStore>,
         transport: Arc<dyn SharingTransport>,
         peer: NodeId,
         config: SyncConfig,
+    ) -> SyncEngineHandle {
+        Self::spawn_with_config_and_emitter(store, transport, peer, config, None)
+    }
+
+    /// Spawn with an optional host [`ProgressEmitter`] (task M3). The app-side
+    /// sender passes one so each package's coarse state transitions surface as
+    /// `sync-progress` / `sync-finished` events for the Transfers UI; Perseus
+    /// and every test pass `None`, keeping the transport-agnostic engine
+    /// UI-agnostic (log-only, exactly as before). Events are discrete per
+    /// package-state change — never per byte.
+    pub fn spawn_with_emitter(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        emitter: Option<Arc<dyn ProgressEmitter>>,
+    ) -> SyncEngineHandle {
+        Self::spawn_with_config_and_emitter(store, transport, peer, SyncConfig::default(), emitter)
+    }
+
+    /// The full constructor both convenience spawners delegate to. Starts a
+    /// tokio task running the worker loop and returns a handle to it.
+    pub fn spawn_with_config_and_emitter(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        config: SyncConfig,
+        emitter: Option<Arc<dyn ProgressEmitter>>,
     ) -> SyncEngineHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let worker = Worker {
@@ -159,6 +187,7 @@ impl SyncEngine {
             peer,
             config,
             pending: HashMap::new(),
+            emitter,
         };
         let join = tokio::spawn(async move {
             if let Err(e) = worker.run(cmd_rx).await {
@@ -237,6 +266,9 @@ struct Worker {
     peer: NodeId,
     config: SyncConfig,
     pending: HashMap<i64, Pending>,
+    /// Optional host sink for the send-side `sync-progress` / `sync-finished`
+    /// events (task M3). `None` for Perseus + tests → the engine is log-only.
+    emitter: Option<Arc<dyn ProgressEmitter>>,
 }
 
 impl Worker {
@@ -289,6 +321,7 @@ impl Worker {
                         match self.store.enqueue(&dir.to_string_lossy(), self.peer) {
                             Ok(id) => {
                                 tracing::info!(package_id = id, state = "queued", "sync state");
+                                self.emit_progress(id, "queued", 0);
                                 let _ = reply.send(Ok(id));
                                 if let Err(e) = self.start_package(id, dir, OutboundState::Queued).await {
                                     tracing::error!(package_id = id, error = %e, "sync start package failed");
@@ -327,6 +360,35 @@ impl Worker {
             .map(|p| p.deadline)
             .min()
             .unwrap_or_else(|| Instant::now() + IDLE_SLEEP)
+    }
+
+    /// Emit a coarse send-side `sync-progress` tick (task M3). No-op without a
+    /// host emitter. Keyed on the durable row `id` (stable across the package's
+    /// lifecycle) so the Transfers UI can correlate it to the Active-tab row.
+    fn emit_progress(&self, id: i64, stage: &str, frame_count: u32) {
+        if let Some(em) = &self.emitter {
+            emit_event(em.as_ref(), "sync-progress", &SyncProgressEvent {
+                package_id: id.to_string(),
+                direction: Direction::Sent,
+                stage: stage.to_string(),
+                peer_device: node_id_hex(&self.peer),
+                frame_count,
+            });
+        }
+    }
+
+    /// Emit the single send-side `sync-finished` event for a package (task M3).
+    fn emit_finished(&self, id: i64, outcome: &str, ok_count: u32, failed: Vec<String>) {
+        if let Some(em) = &self.emitter {
+            emit_event(em.as_ref(), "sync-finished", &SyncFinishedEvent {
+                package_id: id.to_string(),
+                direction: Direction::Sent,
+                outcome: outcome.to_string(),
+                peer_device: node_id_hex(&self.peer),
+                ok_count,
+                failed,
+            });
+        }
     }
 
     /// Begin driving a package: install its pending slot, then make the first
@@ -442,6 +504,10 @@ impl Worker {
             self.store.set_state(id, OutboundState::Transferring)?;
             tracing::info!(package_id = id, state = "transferring", "sync state");
             self.append_started_history(id, &dir, &started_at)?;
+            // One coarse in-flight tick per package (the first successful
+            // announce); retries re-announce but do NOT re-emit — bounded, never
+            // per-byte.
+            self.emit_progress(id, "transferring", announce.frame_count);
         } else {
             tracing::info!(package_id = id, state = "transferring", "sync resume/retry re-announce");
         }
@@ -542,6 +608,7 @@ impl Worker {
             .context("confirm outbound")?;
         self.append_confirmed_history(&pending, &receipts)?;
         tracing::info!(package_id = pending.id, state = "confirmed", "sync state");
+        self.emit_finished(pending.id, "confirmed", receipts.len() as u32, Vec::new());
         Ok(())
     }
 
@@ -590,14 +657,15 @@ impl Worker {
         };
         self.store.set_state(id, OutboundState::Failed)?;
         tracing::error!(package_id = id, state = "failed", rejected = ?last_rejected, "sync state");
+        let outcome = if last_rejected.is_empty() {
+            "failed".to_string()
+        } else {
+            format!("failed: rejected frame(s) {}", last_rejected.join(","))
+        };
         if let Some(dir) = dir {
-            let outcome = if last_rejected.is_empty() {
-                "failed".to_string()
-            } else {
-                format!("failed: rejected frame(s) {}", last_rejected.join(","))
-            };
             self.append_terminal_history(id, &dir, &outcome)?;
         }
+        self.emit_finished(id, &outcome, 0, last_rejected);
         Ok(())
     }
 
@@ -629,6 +697,7 @@ impl Worker {
             "sync state"
         );
         self.append_terminal_history(id, &dir, "cancelled")?;
+        self.emit_finished(id, "cancelled", 0, Vec::new());
         Ok(())
     }
 

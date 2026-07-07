@@ -205,6 +205,14 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
         sql.push_str(" AND object = ?");
         args.push(Box::new(object.clone()));
     }
+    if let Some(direction) = &q.direction {
+        sql.push_str(" AND direction = ?");
+        args.push(Box::new(direction.as_str().to_string()));
+    }
+    if let Some(peer) = &q.peer {
+        sql.push_str(" AND peer_device = ?");
+        args.push(Box::new(peer.clone()));
+    }
     sql.push_str(" ORDER BY started_at DESC, id DESC LIMIT ?");
     args.push(Box::new(q.limit as i64));
 

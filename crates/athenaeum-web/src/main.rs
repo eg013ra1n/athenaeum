@@ -314,6 +314,7 @@ async fn main() {
     state.monitor.set_scan_completion_hook(Arc::new(routes::sync::WebScanCompletionHook {
         ctx: Arc::clone(&state.ctx),
         sender: Arc::clone(&state.sync_sender),
+        emitter: Arc::new(events::SseProgressEmitter::new(state.event_tx.clone())),
     }));
 
     // Spawn background folder-monitoring service (no startup delay — the

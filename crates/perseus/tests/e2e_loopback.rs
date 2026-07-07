@@ -133,6 +133,8 @@ fn history_for(agent: &Agent, filename: &str) -> Vec<HistoryRow> {
         .search_history(HistoryQuery {
             filename: Some(filename.to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .expect("search history")
@@ -203,6 +205,8 @@ async fn two_fixtures_are_enqueued_once_and_confirmed() {
         .search_history(HistoryQuery {
             filename: None,
             object: Some("M42".to_string()),
+            direction: None,
+            peer: None,
             limit: 10,
         })
         .unwrap();

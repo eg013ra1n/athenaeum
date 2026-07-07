@@ -590,6 +590,8 @@ export type BiasFallback = "subtractBias" | "skipFrame";
 
 export type Direction = "sent" | "received";
 
+export type OutboundState = "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed";
+
 export type HistoryRow = { frameUuid: string, filename: string, object: string | null, 
 /**
  * Peer node id, hex-encoded.
@@ -601,40 +603,138 @@ peerDevice: string, direction: Direction, bytes: number, startedAt: string, fini
  */
 outcome: string, };
 
+export type SyncPairingSummary = { 
+/**
+ * One of: `paired`, `disabled`, `devTicket`, `signedOut`.
+ */
+kind: string, 
+/**
+ * Short peer id (for display) when `kind == "paired"`.
+ */
+peerShort: string | null, 
+/**
+ * Actionable reason when `kind == "disabled"`.
+ */
+reason: string | null, };
+
+export type OutboundSummary = { 
+/**
+ * Durable `sync_outbound` row id (stable across the package's lifecycle;
+ * the sender's `sync-progress`/`sync-finished` events key on it too).
+ */
+id: number, 
+/**
+ * Short, human-readable package handle (basename of the package dir).
+ */
+packageShort: string, state: OutboundState, attempts: number, createdAt: string, 
+/**
+ * Destination peer node id (hex), shortened for display.
+ */
+peerShort: string, };
+
+export type SyncSenderStatus = { 
+/**
+ * Whether the sender engine has been lazily started this session.
+ */
+started: boolean, 
+/**
+ * Non-terminal packages not yet in the transferring window (`queued` /
+ * `announced`).
+ */
+queued: number, 
+/**
+ * Packages in the in-flight transferring window (awaiting the peer ack).
+ */
+transferring: number, 
+/**
+ * Terminal `confirmed` package count (all frames ingested-or-duplicate).
+ */
+confirmedTotal: number, 
+/**
+ * Terminal `failed` package count.
+ */
+failedTotal: number, 
+/**
+ * The in-flight rows for the Active tab.
+ */
+active: Array<OutboundSummary>, };
+
+export type SyncReceiverStatus = { 
+/**
+ * Whether the receiver transport is running (a ticket has been minted).
+ */
+active: boolean, 
+/**
+ * Total frames received (history rows with `direction = received`).
+ */
+receivedTotal: number, };
+
 export type SyncStatus = { 
 /**
  * Whether the dev pairing flag (`sync.dev_ticket_pairing`) is enabled.
  */
 devPairingEnabled: boolean, 
 /**
- * Whether the transport + receiver are running (a ticket has been minted).
+ * Whether the receiver transport is running (a ticket has been minted).
  */
 transportStarted: boolean, 
 /**
- * This device's pairing ticket, once started.
+ * This device's pairing ticket, once the receiver has started.
  */
 pairingTicket: string | null, 
 /**
  * Total frames received (history rows with `direction = received`).
  */
-receivedTotal: number, };
+receivedTotal: number, 
+/**
+ * This machine's account role, when signed in and assigned.
+ */
+machineRole: DeviceRole | null, 
+/**
+ * Network-free pairing summary (see the module honesty note).
+ */
+pairing: SyncPairingSummary, 
+/**
+ * Send-side rollup.
+ */
+sender: SyncSenderStatus, 
+/**
+ * Receive-side rollup.
+ */
+receiver: SyncReceiverStatus, };
 
 export type SyncProgressEvent = { packageId: string, 
 /**
- * Coarse stage: `received`, `fetching`, `ingesting`.
+ * Which half emitted this tick (`received` = inbound, `sent` = outbound).
+ */
+direction: Direction, 
+/**
+ * Coarse stage: receiver `received`/`fetching`/`ingesting`, or sender
+ * `queued`/`transferring`.
  */
 stage: string, 
 /**
- * Sending peer node id (hex).
+ * The other peer's node id (hex): the sending peer for a receive tick, the
+ * destination peer for a send tick.
  */
 peerDevice: string, frameCount: number, };
 
 export type SyncFinishedEvent = { packageId: string, 
 /**
- * `ingested` (all accepted), `partial` (some rejected), `failed` (all
- * rejected), or `replayed` (re-acked from the receipt log, no ingest).
+ * Which half finished (`received` = inbound, `sent` = outbound), so the UI
+ * can raise the right notification ("frames arrived" vs "package delivered").
  */
-outcome: string, okCount: number, 
+direction: Direction, 
+/**
+ * Receiver: `ingested` (all accepted), `partial` (some rejected), `failed`
+ * (all rejected), or `replayed` (re-acked from the receipt log, no ingest).
+ * Sender: `confirmed`, `failed[: …]`, or `cancelled`.
+ */
+outcome: string, 
+/**
+ * The other peer's node id (hex).
+ */
+peerDevice: string, okCount: number, 
 /**
  * Frame uuids the receiver rejected (integrity failure).
  */
@@ -649,6 +749,14 @@ filename: string | null,
  * Exact `object` filter (unfiltered when absent).
  */
 object: string | null, 
+/**
+ * Restrict to one direction (`sent` / `received`); unfiltered when absent.
+ */
+direction: Direction | null, 
+/**
+ * Exact peer node id (hex) filter; unfiltered when absent.
+ */
+peer: string | null, 
 /**
  * Newest-first cap. `0` is treated as the default cap.
  */

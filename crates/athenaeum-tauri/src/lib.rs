@@ -218,6 +218,7 @@ pub fn run() {
                 commands::sync::DesktopScanCompletionHook {
                     ctx: Arc::clone(&state.ctx),
                     sender: Arc::clone(&state.sync_sender),
+                    emitter: Arc::new(tauri_events::TauriProgressEmitter(app_handle.clone())),
                 },
             ));
 

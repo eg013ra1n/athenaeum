@@ -8,6 +8,7 @@ use axum::{extract::State, http::StatusCode, Json};
 
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
+use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::monitor::ScanCompletionHook;
 use athenaeum_core::services::ServiceContext;
 use athenaeum_core::sync::{HistoryRow, SyncSenderRuntime, SyncStatus};
@@ -40,16 +41,29 @@ pub async fn get_sync_status(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
 ) -> Result<Json<SyncStatus>, (StatusCode, String)> {
-    api::get_status(&state.ctx, &state.sync).await.map(Json).map_err(api_err)
+    api::get_status(&state.ctx, &state.sync, &state.sync_sender)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListHistoryArgs {
+    pub query: SyncHistoryQuery,
 }
 
 /// POST /api/list_sync_history
+///
+/// Body mirrors the Tauri command's single named `query` param
+/// (`{ "query": { … } }`), so both backends accept the identical
+/// `api.invoke('list_sync_history', { query })` payload.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_sync_history(
     State(state): State<WebAppState>,
-    Json(query): Json<SyncHistoryQuery>,
+    Json(args): Json<ListHistoryArgs>,
 ) -> Result<Json<Vec<HistoryRow>>, (StatusCode, String)> {
-    api::list_history(&state.ctx, query).map(Json).map_err(api_err)
+    api::list_history(&state.ctx, args.query).map(Json).map_err(api_err)
 }
 
 #[derive(Deserialize)]
@@ -64,7 +78,10 @@ pub async fn enqueue_sync_selection(
     State(state): State<WebAppState>,
     Json(args): Json<EnqueueSelectionArgs>,
 ) -> Result<Json<EnqueueSelectionResult>, (StatusCode, String)> {
-    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, args.frame_ids)
+    // The host emitter, captured into the sender engine on its first spawn, so
+    // send-side state transitions surface as `sync-progress`/`sync-finished`.
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, args.frame_ids, Some(emitter))
         .await
         .map(Json)
         .map_err(api_err)
@@ -107,14 +124,20 @@ pub async fn set_sync_auto_mode(
 pub struct WebScanCompletionHook {
     pub ctx: Arc<ServiceContext>,
     pub sender: Arc<SyncSenderRuntime>,
+    /// Host emitter captured into the sender engine on its first spawn so an
+    /// unattended (monitor-triggered) auto-enqueue also emits transfer events.
+    pub emitter: Arc<dyn ProgressEmitter>,
 }
 
 impl ScanCompletionHook for WebScanCompletionHook {
     fn on_scan_completed(&self, new_file_ids: Vec<i64>) {
         let ctx = Arc::clone(&self.ctx);
         let sender = Arc::clone(&self.sender);
+        let emitter = Arc::clone(&self.emitter);
         tokio::spawn(async move {
-            if let Err(e) = api::auto_enqueue_scanned_files(&ctx, &sender, new_file_ids).await {
+            if let Err(e) =
+                api::auto_enqueue_scanned_files(&ctx, &sender, new_file_ids, Some(emitter)).await
+            {
                 tracing::warn!(error = %e, "auto-mode sync enqueue after monitor scan failed");
             }
         });

@@ -943,6 +943,8 @@ mod retention_tests {
             .search_history(HistoryQuery {
                 filename: None,
                 object: None,
+                direction: None,
+                peer: None,
                 limit: 1000,
             })
             .unwrap()

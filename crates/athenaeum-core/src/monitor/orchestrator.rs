@@ -403,9 +403,10 @@ mod tests {
             let sender = Arc::clone(&self.sender);
             let tx = self.done_tx.lock().unwrap().take();
             tokio::spawn(async move {
-                let result = crate::api::sync::auto_enqueue_scanned_files(&ctx, &sender, new_file_ids)
-                    .await
-                    .unwrap_or(None);
+                let result =
+                    crate::api::sync::auto_enqueue_scanned_files(&ctx, &sender, new_file_ids, None)
+                        .await
+                        .unwrap_or(None);
                 if let Some(tx) = tx {
                     let _ = tx.send(result);
                 }

@@ -30,8 +30,10 @@ use crate::sharing::types::NodeId;
 use crate::sharing::SharingTransport;
 use crate::sync::store::search_history_rows;
 use crate::sync::{
-    node_id_hex, pairing, CatalogSyncStore, HistoryQuery, HistoryRow, PeerResolution, StartedSender,
-    SyncEngine, SyncEngineHandle, SyncRuntime, SyncSenderRuntime, SyncStatus, SyncStore,
+    node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, OutboundRow,
+    OutboundState, OutboundSummary, PeerResolution, StartedSender, SyncEngine, SyncEngineHandle,
+    SyncPairingSummary, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus,
+    SyncStatus, SyncStore,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -43,6 +45,10 @@ pub struct SyncHistoryQuery {
     pub filename: Option<String>,
     /// Exact `object` filter (unfiltered when absent).
     pub object: Option<String>,
+    /// Restrict to one direction (`sent` / `received`); unfiltered when absent.
+    pub direction: Option<Direction>,
+    /// Exact peer node id (hex) filter; unfiltered when absent.
+    pub peer: Option<String>,
     /// Newest-first cap. `0` is treated as the default cap.
     pub limit: u32,
 }
@@ -248,28 +254,191 @@ pub async fn get_pairing_ticket(
     Ok(ticket)
 }
 
-/// Snapshot of the receive side for the Transfers UI.
-pub async fn get_status(ctx: &ServiceContext, sync: &SyncRuntime) -> Result<SyncStatus, ApiError> {
-    let dev_pairing_enabled = dev_pairing_enabled(ctx)?;
-    let received_total = {
+/// Shorten an identifier for display (peer hex / package uuid) — the leading 10
+/// chars, enough to disambiguate at a glance without a wall of hex.
+fn short_id(s: &str) -> String {
+    let t = s.trim();
+    if t.chars().count() <= 10 {
+        t.to_string()
+    } else {
+        t.chars().take(10).collect()
+    }
+}
+
+/// Short display handle for an outbound package (the basename of its dir).
+fn short_pkg(package_ref: &str) -> String {
+    let base = std::path::Path::new(package_ref)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(package_ref);
+    short_id(base)
+}
+
+/// Count `sync_outbound` rows in a given terminal `state`.
+fn count_outbound_state(conn: &rusqlite::Connection, state: &str) -> Result<u32, ApiError> {
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_outbound WHERE state = ?1", [state], |r| r.get(0))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(n.max(0) as u32)
+}
+
+/// Total frames received (history rows with `direction = received`).
+fn received_total(ctx: &ServiceContext) -> Result<u32, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'", [], |r| r.get(0))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(n.max(0) as u32)
+}
+
+/// This machine's persisted account role (network-free).
+fn machine_role(ctx: &ServiceContext) -> Result<Option<crate::account::DeviceRole>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(crate::db::get_setting(&conn, keys::ACCOUNT_ROLE)?
+        .and_then(|s| crate::account::DeviceRole::parse(&s)))
+}
+
+/// The persisted paired-primary hub device id, if any (network-free).
+fn peer_device_id(ctx: &ServiceContext) -> Result<Option<String>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(crate::db::get_setting(&conn, keys::ACCOUNT_PEER_DEVICE_ID)?.filter(|s| !s.is_empty()))
+}
+
+/// Whether a device token is present locally (signed in). Reads the keychain,
+/// never the network — same source the `account_status` command uses.
+fn is_signed_in(ctx: &ServiceContext) -> bool {
+    crate::api::account::hub_credentials(ctx).ok().flatten().is_some()
+}
+
+/// Derive the network-free pairing summary (see [`crate::sync::status`] for the
+/// honesty limit — this never contacts the hub). `Paired` wins for a signed-in
+/// capture node with a persisted primary; a signed-in device that can't send
+/// (primary / unassigned / no peer) is `Disabled` with an actionable reason;
+/// the dev-ticket flag maps to `DevTicket`; otherwise `SignedOut`.
+fn derive_pairing_summary(ctx: &ServiceContext) -> Result<SyncPairingSummary, ApiError> {
+    let signed = is_signed_in(ctx);
+    let dev = dev_pairing_enabled(ctx)?;
+    let role = machine_role(ctx)?;
+    let peer_id = peer_device_id(ctx)?;
+    // Prefer the last resolved peer node id (what the history rows show) for the
+    // display short id; fall back to the hub device id when nothing has resolved.
+    let cached_short = cached_peer(ctx)?.map(|p| short_id(&node_id_hex(&p)));
+    Ok(pairing_summary_from(signed, dev, role, peer_id, cached_short))
+}
+
+/// The pure pairing-summary decision, extracted from [`derive_pairing_summary`]
+/// so it is unit-testable without the keychain / settings plumbing. `Paired`
+/// wins for a signed-in capture node with a persisted primary; the dev-ticket
+/// flag maps to `DevTicket`; a signed-in device that cannot send is `Disabled`
+/// with an actionable reason; otherwise `SignedOut`.
+fn pairing_summary_from(
+    signed: bool,
+    dev: bool,
+    role: Option<crate::account::DeviceRole>,
+    peer_id: Option<String>,
+    cached_short: Option<String>,
+) -> SyncPairingSummary {
+    use crate::account::DeviceRole;
+    if signed && role == Some(DeviceRole::Capture) {
+        if let Some(peer_id) = peer_id {
+            let short = cached_short.unwrap_or_else(|| short_id(&peer_id));
+            return SyncPairingSummary::paired(short);
+        }
+        return SyncPairingSummary::disabled(
+            "capture role set but no paired primary — pair one in Settings",
+        );
+    }
+    if dev {
+        return SyncPairingSummary::dev_ticket();
+    }
+    if signed {
+        let reason = match role {
+            Some(DeviceRole::Primary) => {
+                "this machine is a primary (it receives); sending is not configured"
+            }
+            _ => "role not set — choose this machine's role in Settings",
+        };
+        return SyncPairingSummary::disabled(reason);
+    }
+    SyncPairingSummary::signed_out()
+}
+
+/// The send-side rollup: live in-flight counts + rows from the engine's
+/// non-terminal snapshot, plus terminal totals counted from `sync_outbound`.
+async fn build_sender_status(
+    ctx: &ServiceContext,
+    sender: &SyncSenderRuntime,
+) -> Result<SyncSenderStatus, ApiError> {
+    let started = sender.is_started().await;
+    let active_rows: Vec<OutboundRow> = match sender.current().await {
+        Some((engine, _)) => engine
+            .status_snapshot()
+            .map_err(|e| ApiError::Internal(format!("sender status snapshot: {e:#}")))?,
+        None => Vec::new(),
+    };
+
+    let mut queued = 0u32;
+    let mut transferring = 0u32;
+    let mut active = Vec::with_capacity(active_rows.len());
+    for row in &active_rows {
+        match row.state {
+            OutboundState::Transferring | OutboundState::Delivered => transferring += 1,
+            _ => queued += 1, // Queued / Announced
+        }
+        active.push(OutboundSummary {
+            id: row.id,
+            package_short: short_pkg(&row.package_ref),
+            state: row.state,
+            attempts: row.attempts,
+            created_at: row.created_at.clone(),
+            peer_short: short_id(&node_id_hex(&row.peer)),
+        });
+    }
+
+    let (confirmed_total, failed_total) = {
         let db = db(ctx)?;
         let conn = db.conn();
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_history WHERE direction = 'received'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        n.max(0) as u32
+        (count_outbound_state(&conn, "confirmed")?, count_outbound_state(&conn, "failed")?)
     };
+
+    Ok(SyncSenderStatus {
+        started,
+        queued,
+        transferring,
+        confirmed_total,
+        failed_total,
+        active,
+    })
+}
+
+/// Enriched snapshot for the Transfers UI (task M3): pairing summary + send-side
+/// rollup + receive-side rollup, all resolved without any network I/O so a
+/// 10-second UI poll never hits the hub.
+pub async fn get_status(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+    sender: &SyncSenderRuntime,
+) -> Result<SyncStatus, ApiError> {
+    let dev_pairing_enabled = dev_pairing_enabled(ctx)?;
+    let received_total = received_total(ctx)?;
     let transport_started = sync.is_started().await;
     let pairing_ticket = sync.ticket().await;
+    let machine_role = machine_role(ctx)?;
+    let pairing = derive_pairing_summary(ctx)?;
+    let sender_status = build_sender_status(ctx, sender).await?;
+
     Ok(SyncStatus {
         dev_pairing_enabled,
         transport_started,
         pairing_ticket,
         received_total,
+        machine_role,
+        pairing,
+        sender: sender_status,
+        receiver: SyncReceiverStatus { active: transport_started, received_total },
     })
 }
 
@@ -279,6 +448,8 @@ pub fn list_history(ctx: &ServiceContext, query: SyncHistoryQuery) -> Result<Vec
     let q = HistoryQuery {
         filename: query.filename,
         object: query.object,
+        direction: query.direction,
+        peer: query.peer,
         limit,
     };
     let db = db(ctx)?;
@@ -325,9 +496,16 @@ fn sender_packages_dir(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
 ///
 /// The runtime mutex is held across the whole build so two concurrent enqueues
 /// can never spawn two engines (the second blocks, then sees the populated slot).
+///
+/// `emitter` is the host's progress sink (Tauri/SSE); it is captured at spawn so
+/// the engine's per-package state transitions surface as `sync-progress` /
+/// `sync-finished` events for the Transfers UI (task M3). It is only used on the
+/// very first (spawning) call — subsequent enqueues reuse the cached engine and
+/// its captured emitter (a process-global sink, identical regardless of caller).
 pub async fn ensure_sender_engine(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<(Arc<SyncEngineHandle>, String), ApiError> {
     let mut guard = sender.lock_inner().await;
     if let Some(started) = guard.as_ref() {
@@ -366,7 +544,12 @@ pub async fn ensure_sender_engine(
         CatalogSyncStore::open(&db_path)
             .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?,
     );
-    let engine = Arc::new(SyncEngine::spawn(store as Arc<dyn SyncStore>, transport, peer));
+    let engine = Arc::new(SyncEngine::spawn_with_emitter(
+        store as Arc<dyn SyncStore>,
+        transport,
+        peer,
+        emitter,
+    ));
 
     tracing::info!(peer = %node_id_hex(&peer), origin = %origin_device, "sync sender engine started");
     *guard = Some(StartedSender {
@@ -570,6 +753,7 @@ pub async fn enqueue_sync_selection(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
     frame_ids: Vec<i64>,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
     if frame_ids.is_empty() {
         return Ok(EnqueueSelectionResult {
@@ -579,7 +763,7 @@ pub async fn enqueue_sync_selection(
             ineligible: Vec::new(),
         });
     }
-    let (engine, origin_device) = ensure_sender_engine(ctx, sender).await?;
+    let (engine, origin_device) = ensure_sender_engine(ctx, sender, emitter).await?;
     let packages_dir = sender_packages_dir(ctx)?;
     let result =
         build_and_enqueue_selection(ctx, &engine, &origin_device, &packages_dir, &frame_ids).await?;
@@ -646,6 +830,7 @@ pub async fn auto_enqueue_scanned_files(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
     file_ids: Vec<i64>,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<Option<EnqueueSelectionResult>, ApiError> {
     if !auto_mode_ready(ctx)? {
         return Ok(None);
@@ -663,7 +848,7 @@ pub async fn auto_enqueue_scanned_files(
     if frame_ids.is_empty() {
         return Ok(None);
     }
-    match enqueue_sync_selection(ctx, sender, frame_ids).await {
+    match enqueue_sync_selection(ctx, sender, frame_ids, emitter).await {
         Ok(result) => {
             tracing::info!(enqueued = result.enqueued_count, "auto-mode sync enqueued scanned files");
             Ok(Some(result))
@@ -978,13 +1163,13 @@ mod tests {
 
         // auto OFF → nothing enqueued, no engine built.
         set_sync_auto_mode(&ctx, false).unwrap();
-        let none = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone()).await.unwrap();
+        let none = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone(), None).await.unwrap();
         assert!(none.is_none(), "auto off → nothing");
         assert!(!sender.is_started().await, "no engine when auto off");
 
         // auto ON but role != capture (unset) → nothing, still no engine.
         set_sync_auto_mode(&ctx, true).unwrap();
-        let none = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone()).await.unwrap();
+        let none = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone(), None).await.unwrap();
         assert!(none.is_none(), "non-capture role → nothing");
         assert!(!sender.is_started().await, "no engine for a non-capture device");
 
@@ -996,7 +1181,7 @@ mod tests {
             crate::db::set_setting(&conn, keys::ACCOUNT_PEER_DEVICE_ID, "primary-1").unwrap();
         }
         inject_loopback_sender(&ctx, &sender).await; // stand in for ensure_sender_engine
-        let result = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone())
+        let result = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone(), None)
             .await
             .unwrap()
             .expect("capture + auto on enqueues");
@@ -1047,7 +1232,7 @@ mod tests {
                 .unwrap();
         }
         let sender = SyncSenderRuntime::new();
-        let err = enqueue_sync_selection(&ctx, &sender, vec![1, 2, 3]).await.unwrap_err();
+        let err = enqueue_sync_selection(&ctx, &sender, vec![1, 2, 3], None).await.unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "unconfigured pairing → typed error, got {err:?}");
         assert!(!sender.is_started().await, "no engine started on a Disabled pairing");
     }
@@ -1071,7 +1256,7 @@ mod tests {
         }
         let sender = SyncSenderRuntime::new();
 
-        let result = enqueue_sync_selection(&ctx, &sender, Vec::new()).await.unwrap();
+        let result = enqueue_sync_selection(&ctx, &sender, Vec::new(), None).await.unwrap();
         assert_eq!(result.enqueued_count, 0);
         assert_eq!(result.eligible_count, 0);
         assert_eq!(result.total_count, 0);
@@ -1080,5 +1265,100 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         assert!(requests.is_empty(), "empty selection must never resolve the peer against the hub");
+    }
+
+    // ── Status enrichment (task M3) ──────────────────────────────────────────
+
+    /// The pure pairing-summary decision covers every branch and its precedence
+    /// (paired capture wins over the dev flag; a signed-in non-sender is
+    /// `disabled`; signed out with no dev flag is `signedOut`).
+    #[test]
+    fn pairing_summary_branches_and_precedence() {
+        use crate::account::DeviceRole;
+
+        assert_eq!(pairing_summary_from(false, false, None, None, None).kind, "signedOut");
+        assert_eq!(pairing_summary_from(false, true, None, None, None).kind, "devTicket");
+
+        // Signed-in capture with a peer → paired; the cached short id wins.
+        let paired = pairing_summary_from(
+            true,
+            false,
+            Some(DeviceRole::Capture),
+            Some("primary-1".into()),
+            Some("abcdef0123".into()),
+        );
+        assert_eq!(paired.kind, "paired");
+        assert_eq!(paired.peer_short.as_deref(), Some("abcdef0123"));
+
+        // No cached peer → falls back to the (shortened) hub device id.
+        let fallback = pairing_summary_from(
+            true,
+            false,
+            Some(DeviceRole::Capture),
+            Some("primary-device-long-id".into()),
+            None,
+        );
+        assert_eq!(fallback.peer_short.as_deref(), Some("primary-de"));
+
+        // Capture with no paired primary, and a signed-in primary, are disabled.
+        assert_eq!(
+            pairing_summary_from(true, false, Some(DeviceRole::Capture), None, None).kind,
+            "disabled"
+        );
+        assert_eq!(
+            pairing_summary_from(true, false, Some(DeviceRole::Primary), None, None).kind,
+            "disabled"
+        );
+
+        // Paired capture wins even when the dev flag is also on.
+        assert_eq!(
+            pairing_summary_from(true, true, Some(DeviceRole::Capture), Some("p".into()), None).kind,
+            "paired"
+        );
+    }
+
+    /// `list_history` applies the new `direction` / `peer` filters SQL-side,
+    /// including the two combined.
+    #[test]
+    fn list_history_filters_by_direction_and_peer() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let mk = |uuid: &str, dir: Direction, peer: &str, outcome: &str| HistoryRow {
+                frame_uuid: uuid.into(),
+                filename: format!("{uuid}.fits"),
+                object: Some("M42".into()),
+                peer_device: peer.into(),
+                direction: dir,
+                bytes: 100,
+                started_at: "2026-07-06T00:00:00.000Z".into(),
+                finished_at: None,
+                outcome: outcome.into(),
+            };
+            let ins = crate::sync::store::insert_history_row;
+            ins(&conn, &mk("s1", Direction::Sent, "peerA", "sent")).unwrap();
+            ins(&conn, &mk("r1", Direction::Received, "peerB", "ingested")).unwrap();
+            ins(&conn, &mk("s2", Direction::Sent, "peerB", "confirmed")).unwrap();
+        }
+        let q = |direction, peer| SyncHistoryQuery {
+            filename: None,
+            object: None,
+            direction,
+            peer,
+            limit: 0,
+        };
+
+        let sent = list_history(&ctx, q(Some(Direction::Sent), None)).unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|h| h.direction == Direction::Sent));
+
+        let peer_b = list_history(&ctx, q(None, Some("peerB".into()))).unwrap();
+        assert_eq!(peer_b.len(), 2);
+        assert!(peer_b.iter().all(|h| h.peer_device == "peerB"));
+
+        let combined = list_history(&ctx, q(Some(Direction::Sent), Some("peerB".into()))).unwrap();
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].frame_uuid, "s2");
     }
 }

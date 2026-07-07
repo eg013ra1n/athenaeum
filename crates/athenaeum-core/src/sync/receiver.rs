@@ -35,13 +35,22 @@ use super::store::CatalogSyncStore;
 
 /// `sync-progress` payload: a per-package stage tick (never per-frame — discrete
 /// stages only, per the plan's "notify on outcomes, don't spam progress" rule).
+///
+/// Shared by both transfer halves (task M3): `direction` discriminates a
+/// receive-side tick (`received`/`fetching`/`ingesting`) from a send-side tick
+/// (`queued`/`transferring`), so the Transfers UI can route one event stream to
+/// the right pane without a second channel.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProgressEvent {
     pub package_id: String,
-    /// Coarse stage: `received`, `fetching`, `ingesting`.
+    /// Which half emitted this tick (`received` = inbound, `sent` = outbound).
+    pub direction: super::Direction,
+    /// Coarse stage: receiver `received`/`fetching`/`ingesting`, or sender
+    /// `queued`/`transferring`.
     pub stage: String,
-    /// Sending peer node id (hex).
+    /// The other peer's node id (hex): the sending peer for a receive tick, the
+    /// destination peer for a send tick.
     pub peer_device: String,
     pub frame_count: u32,
 }
@@ -51,9 +60,15 @@ pub struct SyncProgressEvent {
 #[serde(rename_all = "camelCase")]
 pub struct SyncFinishedEvent {
     pub package_id: String,
-    /// `ingested` (all accepted), `partial` (some rejected), `failed` (all
-    /// rejected), or `replayed` (re-acked from the receipt log, no ingest).
+    /// Which half finished (`received` = inbound, `sent` = outbound), so the UI
+    /// can raise the right notification ("frames arrived" vs "package delivered").
+    pub direction: super::Direction,
+    /// Receiver: `ingested` (all accepted), `partial` (some rejected), `failed`
+    /// (all rejected), or `replayed` (re-acked from the receipt log, no ingest).
+    /// Sender: `confirmed`, `failed[: …]`, or `cancelled`.
     pub outcome: String,
+    /// The other peer's node id (hex).
+    pub peer_device: String,
     pub ok_count: u32,
     /// Frame uuids the receiver rejected (integrity failure).
     pub failed: Vec<String>,
@@ -136,6 +151,7 @@ async fn handle_announce(
     let package_id = announce.package_id.0.clone();
     emit_event(emitter, "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
+        direction: super::Direction::Received,
         stage: "received".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
@@ -156,7 +172,9 @@ async fn handle_announce(
         tracing::info!(package_id = %package_id, count = satisfied_count, "sync receiver replayed ack from receipt log");
         emit_event(emitter, "sync-finished", &SyncFinishedEvent {
             package_id,
+            direction: super::Direction::Received,
             outcome: "replayed".to_string(),
+            peer_device: peer_device.clone(),
             ok_count: satisfied_count,
             failed: Vec::new(),
         });
@@ -167,6 +185,7 @@ async fn handle_announce(
     let staging = incoming_root.join(".staging").join(&package_id);
     emit_event(emitter, "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
+        direction: super::Direction::Received,
         stage: "fetching".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
@@ -179,6 +198,7 @@ async fn handle_announce(
     // Ingest on a blocking thread (file I/O + SQLite); never block the runtime.
     emit_event(emitter, "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
+        direction: super::Direction::Received,
         stage: "ingesting".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
@@ -223,7 +243,9 @@ async fn handle_announce(
     };
     emit_event(emitter, "sync-finished", &SyncFinishedEvent {
         package_id,
+        direction: super::Direction::Received,
         outcome: finished_outcome.to_string(),
+        peer_device,
         ok_count: outcome.ok_count(),
         failed,
     });
@@ -240,20 +262,6 @@ fn hex32(id: &NodeId) -> String {
 }
 
 // ── App-lifecycle runtime holder ────────────────────────────────────────────
-
-/// Snapshot of the receiver runtime for the `get_sync_status` command.
-#[derive(Debug, Clone, Serialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncStatus {
-    /// Whether the dev pairing flag (`sync.dev_ticket_pairing`) is enabled.
-    pub dev_pairing_enabled: bool,
-    /// Whether the transport + receiver are running (a ticket has been minted).
-    pub transport_started: bool,
-    /// This device's pairing ticket, once started.
-    pub pairing_ticket: Option<String>,
-    /// Total frames received (history rows with `direction = received`).
-    pub received_total: u32,
-}
 
 /// One started-transport bundle held by [`SyncRuntime`]. `_transport` /
 /// `_receiver` are lifetime anchors — kept so the endpoint and its event loop

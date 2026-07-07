@@ -176,6 +176,8 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
         .search_history(HistoryQuery {
             filename: Some("frame1.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();
@@ -196,6 +198,71 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
             .any(|h| h.finished_at.is_some() && h.outcome == "ingested"),
         "expected an 'ingested' confirm event"
     );
+
+    engine.shutdown().await;
+}
+
+/// A [`ProgressEmitter`](crate::events::ProgressEmitter) that records every
+/// emitted `(event_name, payload)` for assertions (task M3 sender events).
+struct CapturingEmitter(Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>);
+impl crate::events::ProgressEmitter for CapturingEmitter {
+    fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+        self.0.lock().unwrap().push((event_name.to_string(), payload));
+    }
+}
+
+/// Task M3: the app-side engine (spawned WITH an emitter) surfaces coarse
+/// send-side `sync-progress` + a single `sync-finished` per package — discrete
+/// per state change, `direction = "sent"`, never per-byte spam.
+#[tokio::test]
+async fn sender_emits_coarse_progress_and_finished_events() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("src_evt"), "uuid-evt", "evt.fits", "M42", 2048);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    // Let the confirm event flush onto the emitter.
+    wait_until(
+        || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, p)| n == "sync-finished" && p["outcome"].as_str() == Some("confirmed"))
+        },
+        WAIT,
+    )
+    .await;
+
+    let evts = events.lock().unwrap();
+    let finished = evts.iter().find(|(n, _)| n == "sync-finished").expect("a sync-finished event");
+    assert_eq!(finished.1["direction"].as_str(), Some("sent"));
+    assert_eq!(finished.1["outcome"].as_str(), Some("confirmed"));
+    assert_eq!(finished.1["okCount"].as_u64(), Some(1));
+    assert!(
+        evts.iter().any(|(n, p)| n == "sync-progress"
+            && p["stage"].as_str() == Some("transferring")
+            && p["direction"].as_str() == Some("sent")),
+        "expected a coarse 'transferring' progress tick, got {evts:?}"
+    );
+    assert!(evts.len() <= 4, "coarse per-package events only, got {}: {evts:?}", evts.len());
+    drop(evts);
 
     engine.shutdown().await;
 }
@@ -311,6 +378,8 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
         .search_history(HistoryQuery {
             filename: Some("frame3.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();
@@ -361,6 +430,8 @@ async fn failed_after_max_attempts_with_error_outcome_in_history() {
         .search_history(HistoryQuery {
             filename: Some("frame4.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();
@@ -425,6 +496,8 @@ async fn first_attempt_peer_offline_retries_then_fails() {
         .search_history(HistoryQuery {
             filename: Some("frame6.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();
@@ -493,6 +566,8 @@ async fn first_attempt_peer_offline_then_online_completes() {
         .search_history(HistoryQuery {
             filename: Some("frame7.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();
@@ -550,6 +625,8 @@ async fn cancel_moves_to_failed_cancelled() {
         .search_history(HistoryQuery {
             filename: Some("frame5.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();

@@ -369,6 +369,8 @@ async fn engine_suite_over_iroh() {
         .search_history(HistoryQuery {
             filename: Some("frame_e1.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();
@@ -422,6 +424,8 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
         .search_history(HistoryQuery {
             filename: Some("frame_e2.fits".to_string()),
             object: None,
+            direction: None,
+            peer: None,
             limit: 100,
         })
         .unwrap();
