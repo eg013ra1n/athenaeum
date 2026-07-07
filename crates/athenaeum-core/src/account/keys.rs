@@ -92,32 +92,93 @@ fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
             .with_context(|| format!("create device key dir {}", parent.display()))?;
     }
     let secret = crate::sharing::iroh::random_secret();
-    match write_secret_0600(path, &secret) {
+    create_device_key_atomically(path, &secret)
+}
+
+/// Atomically create the device key at `path` with content `secret`,
+/// arbitrating a concurrent first-run race (two callers — e.g.
+/// `account_sign_in_verify` and the sync transport's `ensure_started` — both
+/// calling `load_or_create` before either has written the file).
+///
+/// # Protocol
+///
+/// A plain `create_new` + `write_all` directly on `path` is NOT atomic: the
+/// name becomes visible (0 bytes) at `create_new`, and the 32 secret bytes
+/// land in a SEPARATE `write_all` syscall after. A concurrent loser whose
+/// existence check lands in that window sees a real, present, but genuinely
+/// incomplete file — reading it back trips the 32-byte validation as a hard
+/// error. (This is not hypothetical: it is the exact root cause of a flake
+/// this fn's previous version had under full-suite load/scheduling pressure.)
+///
+/// So instead: the FULL content is written to a private, uniquely-named temp
+/// file in the same directory first — created 0600, then `sync_all`'d so it
+/// is complete and durable on disk before anything else can observe it. ONLY
+/// THEN is the final name claimed, via [`std::fs::hard_link`] (`tmp -> path`).
+/// Hard-linking, like `create_new`, is atomic and fails with `AlreadyExists`
+/// if `path` already exists — but unlike a `rename`, it never REPLACES an
+/// existing target. That distinction is load-bearing: a naive tmp-then-RENAME
+/// scheme is actively wrong here, because two concurrent first-runs would each
+/// finish their own tmp file and then EACH rename would unconditionally
+/// succeed, with the second one silently clobbering the first — two racing
+/// processes would walk away disagreeing about which key is "the" identity.
+/// `hard_link`'s fail-if-exists semantics keep exactly one winner: whichever
+/// call lands first wins the name; every other call errors without touching
+/// the winner's file. (`renameat2(RENAME_NOREPLACE)` gives the same
+/// fail-if-exists guarantee as a plain rename, but is Linux-only, no macOS
+/// equivalent; `hard_link` is the POSIX-portable primitive with that
+/// guarantee, and is also supported on Windows.)
+///
+/// On loss (`AlreadyExists`), the loser's own tmp file is unlinked — it never
+/// owned the final name — and it reads `path` back instead. That read is now
+/// genuinely, unconditionally complete: the winner's `hard_link` could only
+/// have succeeded after its tmp file's content was fully written and synced,
+/// so there is no window in which `path` exists but is incomplete. The 32-byte
+/// validation in [`read_device_key`] therefore stays a hard error — it is now
+/// truly impossible to hit here, not a race to retry around.
+fn create_device_key_atomically(path: &Path, secret: &[u8; 32]) -> Result<[u8; 32]> {
+    let tmp = tmp_path_for(path);
+    let write_result = write_new_key_file(&tmp, secret);
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    match std::fs::hard_link(&tmp, path) {
         Ok(()) => {
+            // Two links to the same inode now (`tmp` and `path`); drop ours —
+            // `path` is all that matters going forward.
+            let _ = std::fs::remove_file(&tmp);
             tracing::info!(path = %path.display(), "generated new device key");
-            Ok(secret)
+            Ok(*secret)
         }
-        Err(create_err) => {
-            // First-run race: another caller (e.g. `account_sign_in_verify`
-            // and the sync transport's `ensure_started` both racing to create
-            // the SAME shared key on a fresh install) won `create_new` between
-            // our `path.exists()` check above and this write. Read its key
-            // back rather than erroring — there is still exactly one file /
-            // one identity, just authored by whichever caller got there
-            // first. Only treated as a race when the file is now actually
-            // present; any other create failure (permissions, disk full, …)
-            // still propagates.
-            if path.exists() {
-                tracing::debug!(
-                    path = %path.display(),
-                    "device key created concurrently by another caller; reading back"
-                );
-                read_device_key(path)
-            } else {
-                Err(create_err)
-            }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::debug!(
+                path = %path.display(),
+                "device key created concurrently by another caller; reading back"
+            );
+            read_device_key(path)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("claim device key {}", path.display()))
         }
     }
+}
+
+/// A unique, sibling temp-file path for `path` (same directory, required for
+/// [`std::fs::hard_link`] — hard links cannot cross filesystems, and a sibling
+/// path is guaranteed to be on the same one). Mirrors the pid+sequence
+/// unique-suffix pattern used by `fits_writer`'s atomic-rename writer: the
+/// pid disambiguates across processes, the monotonic per-process counter
+/// disambiguates concurrent threads within one process (exactly what the
+/// concurrency test below hammers).
+fn tmp_path_for(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    path.with_file_name(format!("{file_name}.tmp.{}.{}", std::process::id(), seq))
 }
 
 /// Read + validate an existing device key file, tightening loose permissions
@@ -152,8 +213,12 @@ fn tighten_permissions_if_needed(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create `path` (a tmp file — always a fresh, uniquely-named path, so
+/// `create_new` here is just defense-in-depth, not the race arbiter), write
+/// the full secret, and `sync_all` before returning — so by the time the
+/// caller hard-links it into place, its content is complete and durable.
 #[cfg(unix)]
-fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
+fn write_new_key_file(path: &Path, secret: &[u8; 32]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -161,16 +226,26 @@ fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .with_context(|| format!("create device key {}", path.display()))?;
+        .with_context(|| format!("create device key tmp {}", path.display()))?;
     f.write_all(secret)
-        .with_context(|| format!("write device key {}", path.display()))?;
+        .with_context(|| format!("write device key tmp {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("sync device key tmp {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
-    std::fs::write(path, secret)
-        .with_context(|| format!("write device key {}", path.display()))?;
+fn write_new_key_file(path: &Path, secret: &[u8; 32]) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create device key tmp {}", path.display()))?;
+    f.write_all(secret)
+        .with_context(|| format!("write device key tmp {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("sync device key tmp {}", path.display()))?;
     Ok(())
 }
 
