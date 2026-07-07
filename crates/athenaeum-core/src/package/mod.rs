@@ -25,9 +25,9 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Component, Path};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use xxhash_rust::xxh3::Xxh3;
 
 mod manifest;
@@ -43,6 +43,37 @@ pub use writer::{write_package, write_package_with_root_hash, RootHashProvider};
 
 /// Name of the manifest file inside a package directory.
 pub const MANIFEST_FILENAME: &str = "manifest.ndjson";
+
+/// Validate that `rel_path` is safe to join onto a base directory: relative,
+/// with no root/prefix component and no `..` (parent-dir escape).
+///
+/// Shared by every path in the codebase that joins an **untrusted, wire- or
+/// record-supplied** relative path onto a base directory — a value must never
+/// be allowed to resolve outside that base:
+/// - [`writer::write_package_with_root_hash`] validates each manifest
+///   record's `rel_path` before copying the source file to `dest_dir.join(rel)`.
+/// - `sharing::iroh::blobs::fetch_collection_to_dir` validates each downloaded
+///   collection's entry name before exporting to `dest_dir.join(name)` — the
+///   collection is peer-supplied, so its names are exactly as untrusted as a
+///   manifest record's `rel_path`.
+///
+/// A single check, not duplicated: `Path::join` on Unix silently **replaces**
+/// the base when the joined component is absolute (e.g.
+/// `dest.join("/etc/x")` == `/etc/x`), and does nothing to stop `../../x`
+/// climbing out of `dest` — both must be rejected before the join, not after.
+pub fn validate_rel_path(rel_path: &str) -> Result<()> {
+    let rel = Path::new(rel_path);
+    if rel
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        bail!(
+            "rel_path must be relative with no '..'/root components: {}",
+            rel_path
+        );
+    }
+    Ok(())
+}
 
 /// Full-content xxh3-64 of a file, lowercase 16-char hex.
 ///

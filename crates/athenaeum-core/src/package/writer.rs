@@ -2,16 +2,16 @@
 //! NDJSON manifest, and produce the [`PackageAnnounce`] that advertises it.
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use uuid::Uuid;
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::sharing::types::{PackageAnnounce, PackageId};
 
 use super::manifest::ManifestRecord;
-use super::MANIFEST_FILENAME;
+use super::{validate_rel_path, MANIFEST_FILENAME};
 
 /// A hook that computes the package's `root_hash` from the fully-written package
 /// directory (payload files + `manifest.ndjson`).
@@ -61,16 +61,8 @@ pub fn write_package_with_root_hash(
     let mut total_bytes: u64 = 0;
 
     for (src, record) in records {
+        validate_rel_path(&record.rel_path)?;
         let rel = Path::new(&record.rel_path);
-        if rel
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-        {
-            bail!(
-                "rel_path must be relative with no '..'/root components: {}",
-                record.rel_path
-            );
-        }
 
         let dest = dest_dir.join(rel);
         if let Some(parent) = dest.parent() {

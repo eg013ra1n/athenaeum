@@ -18,6 +18,8 @@ use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::{Hash, HashAndFormat};
 
+use crate::package::validate_rel_path;
+
 /// A payload file discovered under a package directory.
 struct PkgFile {
     /// Absolute path on disk.
@@ -107,6 +109,13 @@ pub async fn import_package_collection(store: &Store, pkg_dir: &Path) -> Result<
 /// store, so a re-invocation after an interrupted transfer only fetches what is
 /// missing. `provider` is resolved to a dialable address via the endpoint's
 /// address lookup (populated at pairing time).
+///
+/// Collection entry names are peer-supplied and therefore untrusted, exactly
+/// like a manifest record's `rel_path` on the write side — every name is
+/// validated with [`crate::package::validate_rel_path`] *before* touching
+/// `dest_dir` (not even created) so a malicious entry (`../x`, an absolute
+/// path) can neither escape `dest_dir` nor overwrite an arbitrary path; the
+/// whole fetch errors instead.
 pub async fn fetch_collection_to_dir(
     store: &Store,
     endpoint: &Endpoint,
@@ -125,6 +134,13 @@ pub async fn fetch_collection_to_dir(
     let collection = Collection::load(root_hash, store)
         .await
         .with_context(|| format!("load collection {root_hash}"))?;
+
+    // Validate every entry name before writing anything at all — `dest_dir`
+    // isn't even created yet, so a rejected entry leaves no trace on disk.
+    for (name, _) in collection.iter() {
+        validate_rel_path(name)
+            .with_context(|| format!("collection entry name failed validation: {name}"))?;
+    }
 
     tokio::fs::create_dir_all(dest_dir)
         .await

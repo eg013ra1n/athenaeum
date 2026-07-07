@@ -10,16 +10,22 @@
 //! - [`iroh_roundtrip_two_endpoints_localhost`] — the loopback round-trip's
 //!   assertions (announce → fetch → ack), over iroh.
 //! - [`iroh_resume_after_endpoint_restart`] — interrupt a fetch, drop + recreate
-//!   the receiving endpoint over the same persistent blob store, re-fetch
-//!   completes and hash-verifies.
+//!   the receiving endpoint over the same persistent blob store; re-fetch
+//!   completes and hash-verifies. Proves restart-then-complete, not partial-range
+//!   resume specifically — see the test's inline comment.
 //! - [`engine_suite_over_iroh`] (+ [`engine_dup_ack_confirms_once_over_iroh`]) —
 //!   the A4 engine's happy-path and duplicate-ack scenarios driven over iroh.
+//!
+//! Plus [`fetch_rejects_traversal_entry_names`] — a peer-supplied collection
+//! entry name must never escape `dest_dir` (the fetch-side counterpart of the
+//! A3 write-side `rel_path` guard).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::RelayMode;
+use iroh::{EndpointId, RelayMode};
+use iroh_blobs::format::collection::Collection;
 use tempfile::tempdir;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
@@ -254,8 +260,12 @@ async fn iroh_resume_after_endpoint_restart() {
     // Drop the receiving endpoint + store, releasing the fs blob dir.
     receiver.shutdown().await;
 
-    // Recreate a fresh endpoint over the SAME persistent blob store; re-fetch
-    // resumes what was already verified and completes.
+    // Recreate a fresh endpoint over the SAME persistent blob store and
+    // re-fetch. This proves the operation completes and hash-verifies after a
+    // restart over a persistent store; it does not itself measure bytes
+    // re-transferred, so it is not proof that only the missing ranges moved —
+    // genuine partial-range resume over a real interrupted transfer is what the
+    // manual two-machine validation gate (task brief step 3) observes.
     let receiver2 = IrohTransport::new(
         random_secret(),
         RelayMode::Disabled,
@@ -423,4 +433,84 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
     );
 
     engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Path-traversal guard: a peer-supplied collection entry name must never
+//    escape dest_dir. Mirrors package::validate_rel_path on the write side.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_rejects_traversal_entry_names() {
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (provider_info, _receiver_info) = start_and_pair(&provider, &receiver).await;
+
+    // Build a malicious collection directly via the blobs API — bypassing
+    // write_package, which already guards `rel_path` on the write side. The
+    // point of this test is that a *peer* controls collection entry names, and
+    // nothing on the write side can stop them from sending anything.
+    let tt = provider
+        .store
+        .blobs()
+        .add_bytes(b"malicious payload".to_vec())
+        .temp_tag()
+        .await
+        .unwrap();
+
+    // An absolute path under the OS temp dir: writable in practice (unlike
+    // /etc), so a vulnerable implementation would actually write there,
+    // proving the escape rather than merely failing on a permission error.
+    let abs_target = std::env::temp_dir().join(format!(
+        "athenaeum_a5_traversal_probe_{}.bin",
+        uuid::Uuid::new_v4()
+    ));
+    let items = vec![
+        ("../escape_relative.bin".to_string(), tt.hash()),
+        (abs_target.to_string_lossy().to_string(), tt.hash()),
+    ];
+    let collection = Collection::from_iter(items);
+    let collection_tag = collection.store(&provider.store).await.unwrap();
+    provider
+        .store
+        .tags()
+        .create(collection_tag.hash_and_format())
+        .await
+        .unwrap();
+    let root_hash = collection_tag.hash();
+
+    let dest_parent = tempdir().unwrap();
+    let dest = dest_parent.path().join("dest");
+    let provider_id = EndpointId::from_bytes(&provider_info.node_id).unwrap();
+
+    let err = super::blobs::fetch_collection_to_dir(
+        &receiver.store,
+        &receiver.endpoint,
+        provider_id,
+        root_hash,
+        &dest,
+    )
+    .await
+    .expect_err("a malicious collection entry name must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("rel_path") || msg.contains("validation"),
+        "error should name the path-validation failure, got: {msg}"
+    );
+
+    // Nothing must have been written anywhere: validation runs before dest_dir
+    // is even created, so neither the traversal entry nor the absolute-path
+    // entry — nor dest_dir itself — should exist on disk.
+    assert!(!dest.exists(), "dest_dir must not be created on a rejected entry");
+    assert!(
+        !dest_parent.path().join("escape_relative.bin").exists(),
+        "traversal entry must not write outside dest_dir"
+    );
+    assert!(
+        !abs_target.exists(),
+        "absolute-path entry must not write to an arbitrary path"
+    );
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
 }

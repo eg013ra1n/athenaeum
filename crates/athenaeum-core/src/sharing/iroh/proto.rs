@@ -44,7 +44,7 @@ impl Msg {
         postcard::to_stdvec(self).context("postcard-encode sync control message")
     }
 
-    /// Decode a message from postcard bytes read off a uni stream.
+    /// Decode a message from postcard bytes read off the control stream.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         postcard::from_bytes(bytes).context("postcard-decode sync control message")
     }
