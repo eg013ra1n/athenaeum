@@ -1,6 +1,7 @@
 //! Single polling-cycle orchestration, extracted for testability.
 
 use crate::events::{emit_event, ProgressEmitter};
+use crate::monitor::ScanCompletionHook;
 use crate::scanner;
 use crate::services::ServiceContext;
 use chrono::Utc;
@@ -45,6 +46,12 @@ pub struct AutoMergeCompleteEvent {
 /// - Skip if a scan is already active for this root (no queuing).
 /// - Otherwise, run `scanner::run_registered_scan` and emit a
 ///   `monitor-detected` event if it processed any files.
+/// - If that scan ingested any new files AND a [`ScanCompletionHook`] is
+///   installed, invoke it with those file ids (task M2) — this is what lets
+///   personal-sync auto mode fire on unattended monitor scans, not just
+///   human-clicked ones. `hook` is `None` for hosts/tests that never call
+///   `MonitorService::set_scan_completion_hook`; a monitor cycle runs exactly
+///   the same either way, just silently skipping that one call.
 ///
 /// This function is synchronous and intended to be called from inside
 /// `tokio::task::spawn_blocking`. `offline_roots` persists across ticks to
@@ -53,6 +60,7 @@ pub fn run_cycle<E: ProgressEmitter>(
     ctx: &ServiceContext,
     emitter: &E,
     offline_roots: &Arc<Mutex<HashSet<i64>>>,
+    hook: Option<&dyn ScanCompletionHook>,
 ) {
     let cycle_id = Uuid::new_v4().to_string();
 
@@ -128,6 +136,17 @@ pub fn run_cycle<E: ProgressEmitter>(
                         timestamp: Utc::now().to_rfc3339(),
                     };
                     emit_event(emitter, "monitor-detected", &payload);
+                }
+
+                // Personal-sync auto mode (task M2): let the installed hook
+                // react to newly-ingested files from this UNATTENDED scan.
+                // Guards (auto-mode toggle, role, signed-in) live inside the
+                // hook's implementation, read fresh on every fire — never
+                // decided here.
+                if !result.new_file_ids.is_empty() {
+                    if let Some(h) = hook {
+                        h.on_scan_completed(result.new_file_ids);
+                    }
                 }
             }
             Err(e) => {
@@ -250,5 +269,229 @@ fn run_auto_merge_pass<E: ProgressEmitter>(ctx: &ServiceContext, emitter: &E) {
                 tracing::warn!(set_id, error = %e, "auto-merge: merge_candidates failed, will retry next cycle");
             }
         }
+    }
+}
+
+/// Task M2 review finding: the monitor cycle IS the unattended-capture path
+/// (BRD B2 P0 — "every newly scanned file") — auto mode must fire here, not
+/// only on human-clicked scans. These tests drive `run_cycle` directly against
+/// a real-DB `ServiceContext` with a monitor-enabled scan root, proving the
+/// `ScanCompletionHook` seam: the hook receives exactly the new file ids, the
+/// personal-sync guards live inside the hook implementation (not the
+/// orchestrator), and a missing hook never blocks or panics a cycle.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::NullEmitter;
+    use crate::services::ServiceContext;
+    use crate::settings::keys;
+    use crate::sharing::loopback::LoopbackNetwork;
+    use crate::sharing::types::NodeId;
+    use crate::sharing::SharingTransport;
+    use crate::sync::{CatalogSyncStore, StartedSender, SyncEngine, SyncSenderRuntime, SyncStore};
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::oneshot;
+
+    /// A minimal real-`Database` `ServiceContext` (tempdir SQLite), mirroring
+    /// the construction pattern in `api::sync`/`api::account` tests.
+    fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        #[cfg(all(feature = "render", feature = "solver"))]
+        use std::sync::RwLock;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(database);
+        let ctx = ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            dso_catalog: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            star_cache: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+        };
+        (tmp, ctx)
+    }
+
+    /// A `ServiceContext` with `n_files` minimal FITS fixtures under a
+    /// monitor-enabled scan root, and personal-sync settings pre-populated for
+    /// a `capture` device with a paired primary (`auto_mode` as requested).
+    fn test_ctx_with_scan_root(n_files: usize, auto_mode: bool) -> (tempfile::TempDir, ServiceContext) {
+        let (tmp, ctx) = test_ctx();
+        let capture_dir = tmp.path().join("capture");
+        std::fs::create_dir_all(&capture_dir).unwrap();
+        for i in 0..n_files {
+            let f = capture_dir.join(format!("light-{i:04}.fits"));
+            crate::archive::restore::tests::write_minimal_fits(&f);
+        }
+
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO scan_roots (path, enabled, monitor_enabled) VALUES (?1, 1, 1)",
+            rusqlite::params![capture_dir.to_str().unwrap()],
+        )
+        .unwrap();
+        crate::db::set_setting(
+            &conn,
+            keys::SYNC_AUTO_MODE,
+            if auto_mode { "true" } else { "false" },
+        )
+        .unwrap();
+        crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "capture").unwrap();
+        crate::db::set_setting(&conn, keys::ACCOUNT_PEER_DEVICE_ID, "primary-1").unwrap();
+        drop(conn);
+        (tmp, ctx)
+    }
+
+    /// Inject a loopback-backed engine into `sender` as though
+    /// `ensure_sender_engine` had already built it — no hub, no iroh. Mirrors
+    /// the helper in `api::sync::tests`.
+    async fn inject_loopback_sender(ctx: &ServiceContext, sender: &SyncSenderRuntime) {
+        let db_path = ctx.db.get().unwrap().path().to_path_buf();
+        let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
+        let net = LoopbackNetwork::new();
+        let transport: Arc<dyn SharingTransport> = Arc::new(net.endpoint());
+        let peer: NodeId = [9u8; 32];
+        let engine = Arc::new(SyncEngine::spawn(store as Arc<dyn SyncStore>, transport, peer));
+        let mut guard = sender.lock_inner().await;
+        *guard = Some(StartedSender { engine, origin_device: "aa".repeat(32), peer });
+    }
+
+    fn outbound_count(ctx: &ServiceContext) -> i64 {
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+        conn.query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0)).unwrap()
+    }
+
+    /// A `ScanCompletionHook` that forwards to `auto_enqueue_scanned_files` on
+    /// its own spawned task (fire-and-forget, per the trait contract),
+    /// recording the ids it was called with synchronously (no race with the
+    /// assertion below) and signaling the test via a oneshot once the spawned
+    /// task completes.
+    struct TestHook {
+        ctx: Arc<ServiceContext>,
+        sender: Arc<SyncSenderRuntime>,
+        received: Arc<StdMutex<Vec<i64>>>,
+        done_tx: StdMutex<Option<oneshot::Sender<Option<crate::api::sync::EnqueueSelectionResult>>>>,
+    }
+
+    impl ScanCompletionHook for TestHook {
+        fn on_scan_completed(&self, new_file_ids: Vec<i64>) {
+            *self.received.lock().unwrap() = new_file_ids.clone();
+            let ctx = Arc::clone(&self.ctx);
+            let sender = Arc::clone(&self.sender);
+            let tx = self.done_tx.lock().unwrap().take();
+            tokio::spawn(async move {
+                let result = crate::api::sync::auto_enqueue_scanned_files(&ctx, &sender, new_file_ids)
+                    .await
+                    .unwrap_or(None);
+                if let Some(tx) = tx {
+                    let _ = tx.send(result);
+                }
+            });
+        }
+    }
+
+    /// The monitor path enqueues newly-scanned files exactly like a
+    /// human-clicked scan: the hook receives exactly the new file ids, and
+    /// `auto_enqueue_scanned_files` builds ONE batch package for all of them.
+    #[tokio::test]
+    async fn monitor_cycle_invokes_hook_and_auto_enqueues_new_files() {
+        let (_tmp, ctx) = test_ctx_with_scan_root(2, true);
+        let ctx = Arc::new(ctx);
+        let sender = Arc::new(SyncSenderRuntime::new());
+        inject_loopback_sender(&ctx, &sender).await;
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let received = Arc::new(StdMutex::new(Vec::new()));
+        let hook = Arc::new(TestHook {
+            ctx: Arc::clone(&ctx),
+            sender: Arc::clone(&sender),
+            received: Arc::clone(&received),
+            done_tx: StdMutex::new(Some(done_tx)),
+        });
+
+        let offline_roots = Arc::new(Mutex::new(HashSet::new()));
+        run_cycle(&ctx, &NullEmitter, &offline_roots, Some(hook.as_ref()));
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("hook's spawned task completed within timeout")
+            .expect("hook sent a result")
+            .expect("capture + auto-on must enqueue");
+
+        assert_eq!(received.lock().unwrap().len(), 2, "hook received exactly the 2 new file ids");
+        assert_eq!(result.enqueued_count, 2, "both new files enqueued");
+        assert_eq!(outbound_count(&ctx), 1, "one per-scan-batch package, not per-file");
+    }
+
+    /// Auto mode off: the hook still fires (the orchestrator doesn't decide
+    /// this), but `auto_enqueue_scanned_files`'s internal guard enqueues
+    /// nothing.
+    #[tokio::test]
+    async fn auto_mode_off_hook_fires_but_enqueues_nothing() {
+        let (_tmp, ctx) = test_ctx_with_scan_root(1, false);
+        let ctx = Arc::new(ctx);
+        let sender = Arc::new(SyncSenderRuntime::new());
+        inject_loopback_sender(&ctx, &sender).await;
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let received = Arc::new(StdMutex::new(Vec::new()));
+        let hook = Arc::new(TestHook {
+            ctx: Arc::clone(&ctx),
+            sender: Arc::clone(&sender),
+            received: Arc::clone(&received),
+            done_tx: StdMutex::new(Some(done_tx)),
+        });
+
+        let offline_roots = Arc::new(Mutex::new(HashSet::new()));
+        run_cycle(&ctx, &NullEmitter, &offline_roots, Some(hook.as_ref()));
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("hook's spawned task completed within timeout")
+            .expect("hook sent a result");
+
+        assert_eq!(received.lock().unwrap().len(), 1, "hook still fires with the new file id");
+        assert!(result.is_none(), "auto mode off → nothing enqueued");
+        assert_eq!(outbound_count(&ctx), 0, "no outbound package when auto mode is off");
+    }
+
+    /// No hook installed (Perseus has no monitor at all; a bare
+    /// `MonitorService` in a test): the cycle completes normally — no panic,
+    /// no block — and the scan itself still ingests the file.
+    #[test]
+    fn no_hook_registered_scan_completes_without_panicking() {
+        let (_tmp, ctx) = test_ctx_with_scan_root(1, true);
+        let offline_roots = Arc::new(Mutex::new(HashSet::new()));
+
+        run_cycle(&ctx, &NullEmitter, &offline_roots, None);
+
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+        let frames: i64 = conn.query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0)).unwrap();
+        assert_eq!(frames, 1, "the scan still ingests normally with no hook installed");
+        assert_eq!(outbound_count(&ctx), 0, "nothing to enqueue with no hook");
     }
 }

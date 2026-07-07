@@ -8,7 +8,9 @@ use tauri::{AppHandle, State};
 
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
-use athenaeum_core::sync::{HistoryRow, SyncStatus};
+use athenaeum_core::monitor::ScanCompletionHook;
+use athenaeum_core::services::ServiceContext;
+use athenaeum_core::sync::{HistoryRow, SyncSenderRuntime, SyncStatus};
 
 use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
@@ -72,4 +74,29 @@ pub async fn get_sync_auto_mode(state: State<'_, AppState>) -> Result<bool, Stri
 #[tracing::instrument(skip_all, err)]
 pub async fn set_sync_auto_mode(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     api::set_sync_auto_mode(&state.ctx, enabled).map_err(|e| e.to_string())
+}
+
+/// The desktop-side [`ScanCompletionHook`] (task M2 review finding): the
+/// background `MonitorService` lives in `athenaeum-core` with only a
+/// `ServiceContext`, but the personal-sync sender runtime (`AppState.sync_sender`)
+/// is host state — this closes over both and is installed once at startup via
+/// `state.monitor.set_scan_completion_hook(...)` (see `lib.rs`), so a
+/// monitor-triggered (unattended) scan auto-enqueues exactly like an
+/// interactive one. Auto-mode guards (role/signed-in/toggle) are NOT decided
+/// here — they live inside `auto_enqueue_scanned_files`, read fresh every fire.
+pub struct DesktopScanCompletionHook {
+    pub ctx: Arc<ServiceContext>,
+    pub sender: Arc<SyncSenderRuntime>,
+}
+
+impl ScanCompletionHook for DesktopScanCompletionHook {
+    fn on_scan_completed(&self, new_file_ids: Vec<i64>) {
+        let ctx = Arc::clone(&self.ctx);
+        let sender = Arc::clone(&self.sender);
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = api::auto_enqueue_scanned_files(&ctx, &sender, new_file_ids).await {
+                tracing::warn!(error = %e, "auto-mode sync enqueue after monitor scan failed");
+            }
+        });
+    }
 }

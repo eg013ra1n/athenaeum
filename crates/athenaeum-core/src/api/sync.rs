@@ -561,11 +561,24 @@ async fn build_and_enqueue_selection(
 /// selection to the paired primary as ONE package. Ineligible frames come back in
 /// the result. Starting the engine is the send path's hard pairing guard — a
 /// Disabled/Invalidated peer errors here before anything is built.
+///
+/// An empty selection is a benign no-op checked FIRST (task M2 review minor):
+/// there is nothing to resolve or send, so it must never surface a pairing
+/// error on an otherwise-unconfigured device just because the caller happened
+/// to pass zero ids.
 pub async fn enqueue_sync_selection(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
     frame_ids: Vec<i64>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
+    if frame_ids.is_empty() {
+        return Ok(EnqueueSelectionResult {
+            enqueued_count: 0,
+            eligible_count: 0,
+            total_count: 0,
+            ineligible: Vec::new(),
+        });
+    }
     let (engine, origin_device) = ensure_sender_engine(ctx, sender).await?;
     let packages_dir = sender_packages_dir(ctx)?;
     let result =
@@ -1037,5 +1050,35 @@ mod tests {
         let err = enqueue_sync_selection(&ctx, &sender, vec![1, 2, 3]).await.unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "unconfigured pairing → typed error, got {err:?}");
         assert!(!sender.is_started().await, "no engine started on a Disabled pairing");
+    }
+
+    /// Task M2 review minor: an empty selection is a benign no-op checked
+    /// BEFORE `ensure_sender_engine` — it must return the zero result rather
+    /// than surfacing a pairing error, and it must never even attempt to
+    /// resolve the peer. Proven two ways: (1) the call succeeds with a
+    /// zero-valued result and no engine is started, where the OLD ordering
+    /// (empty check after `ensure_sender_engine`) would have returned
+    /// `Err(ApiError::Invalid)` for this same signed-out device; (2) a
+    /// wiremock hub records zero requests.
+    #[tokio::test]
+    async fn enqueue_with_empty_selection_returns_zero_result_without_starting_engine() {
+        let (_tmp, ctx) = test_ctx();
+        let server = wiremock::MockServer::start().await;
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::ACCOUNT_HUB_URL, &server.uri()).unwrap();
+        }
+        let sender = SyncSenderRuntime::new();
+
+        let result = enqueue_sync_selection(&ctx, &sender, Vec::new()).await.unwrap();
+        assert_eq!(result.enqueued_count, 0);
+        assert_eq!(result.eligible_count, 0);
+        assert_eq!(result.total_count, 0);
+        assert!(result.ineligible.is_empty());
+        assert!(!sender.is_started().await, "no engine started for an empty selection");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.is_empty(), "empty selection must never resolve the peer against the hub");
     }
 }

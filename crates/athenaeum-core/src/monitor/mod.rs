@@ -23,6 +23,34 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
+/// Host-installed hook invoked after a *registered* scan (interactive OR
+/// monitor-triggered) completes with newly-ingested files (task M2 review
+/// finding: personal-sync auto mode must fire on unattended monitor scans, not
+/// just human-clicked ones — the monitor cycle IS the unattended-capture path).
+///
+/// Kept as a trait — rather than a concrete host type — so core never depends
+/// on `AppState`/Tauri/Axum: both hosts implement it once at startup, closing
+/// over their own `ServiceContext` + personal-sync sender runtime, and install
+/// it via [`MonitorService::set_scan_completion_hook`]. The monitor
+/// orchestrator (this module's `orchestrator::run_cycle`) calls it with the
+/// scan's `new_file_ids`; the interactive `start_scan_with_progress` command
+/// wrappers call the equivalent `auto_enqueue_scanned_files` directly (they
+/// already have host-specific state in scope) — this hook exists purely to
+/// give the *monitor* path, which runs deep in host-agnostic core, the same
+/// capability without a dependency inversion.
+///
+/// Personal-sync auto-mode guards (role / signed-in / toggle) are NOT decided
+/// here or cached at registration time — they are read fresh on every fire,
+/// inside the implementation, exactly like the interactive path.
+///
+/// Fire-and-forget by contract: `on_scan_completed` runs synchronously on the
+/// monitor's blocking-pool thread ([`MonitorService::tick`]) and must not
+/// block on I/O — an async implementation spawns its own task and returns
+/// immediately.
+pub trait ScanCompletionHook: Send + Sync {
+    fn on_scan_completed(&self, new_file_ids: Vec<i64>);
+}
+
 /// Configuration for the monitor service, read from DB settings at start.
 #[derive(Debug, Clone)]
 pub struct MonitorConfig {
@@ -80,6 +108,11 @@ pub struct MonitorService {
     /// availability transitions exactly once per outage instead of once
     /// per tick.
     offline_roots: Arc<Mutex<HashSet<i64>>>,
+    /// Optional host-installed post-scan hook (task M2). `None` until a host
+    /// calls [`set_scan_completion_hook`](Self::set_scan_completion_hook) — a
+    /// bare `MonitorService` (unit tests, or a host that never wires one up)
+    /// simply never fires it.
+    scan_completion_hook: Arc<Mutex<Option<Arc<dyn ScanCompletionHook>>>>,
 }
 
 impl Default for MonitorService {
@@ -94,7 +127,21 @@ impl MonitorService {
             shutdown: Arc::new(Notify::new()),
             kick: Arc::new(Notify::new()),
             offline_roots: Arc::new(Mutex::new(HashSet::new())),
+            scan_completion_hook: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install the post-scan hook (task M2). Both hosts call this once at
+    /// startup — alongside where they spawn `run_loop` — closing over their own
+    /// `ServiceContext` + personal-sync sender runtime. There is only ever one
+    /// hook per process; a second call overwrites the first.
+    pub fn set_scan_completion_hook(&self, hook: Arc<dyn ScanCompletionHook>) {
+        *self.scan_completion_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// The currently-installed hook, if any.
+    fn scan_completion_hook(&self) -> Option<Arc<dyn ScanCompletionHook>> {
+        self.scan_completion_hook.lock().unwrap().clone()
     }
 
     /// Trigger a graceful shutdown of any running `run_loop`.
@@ -162,8 +209,9 @@ impl MonitorService {
     /// Scanner work is CPU-bound and not itself async, so we hand it off.
     async fn tick<E: ProgressEmitter + 'static>(&self, ctx: Arc<ServiceContext>, emitter: Arc<E>) {
         let offline_roots = Arc::clone(&self.offline_roots);
+        let hook = self.scan_completion_hook();
         let _ = tokio::task::spawn_blocking(move || {
-            orchestrator::run_cycle(&ctx, &*emitter, &offline_roots);
+            orchestrator::run_cycle(&ctx, &*emitter, &offline_roots, hook.as_deref());
         })
         .await;
     }

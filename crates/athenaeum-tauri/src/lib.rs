@@ -210,6 +210,17 @@ pub fn run() {
                 }
             });
 
+            // Personal-sync auto mode (task M2 review finding): install the
+            // post-scan hook BEFORE the monitor loop starts ticking, so the
+            // very first (deferred) cycle can already auto-enqueue newly
+            // ingested files on an unattended (monitor-triggered) scan.
+            state.monitor.set_scan_completion_hook(Arc::new(
+                commands::sync::DesktopScanCompletionHook {
+                    ctx: Arc::clone(&state.ctx),
+                    sender: Arc::clone(&state.sync_sender),
+                },
+            ));
+
             // Spawn background folder-monitoring service. Deferred 3s so the
             // initial UI render doesn't compete with scanner I/O. The handle
             // lives in AppState so commands can `kick()` it when relevant

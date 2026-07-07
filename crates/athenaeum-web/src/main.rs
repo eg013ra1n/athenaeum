@@ -307,6 +307,15 @@ async fn main() {
         });
     }
 
+    // Personal-sync auto mode (task M2 review finding): install the post-scan
+    // hook BEFORE the monitor loop starts ticking, so the very first cycle can
+    // already auto-enqueue newly ingested files on an unattended
+    // (monitor-triggered) scan.
+    state.monitor.set_scan_completion_hook(Arc::new(routes::sync::WebScanCompletionHook {
+        ctx: Arc::clone(&state.ctx),
+        sender: Arc::clone(&state.sync_sender),
+    }));
+
     // Spawn background folder-monitoring service (no startup delay — the
     // server has typically been running continuously in web mode). The
     // handle lives in WebAppState so routes can `kick()` it; we run a clone.

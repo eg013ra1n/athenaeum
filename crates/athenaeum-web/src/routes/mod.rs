@@ -34,7 +34,7 @@ mod registration;
 mod archive;
 mod masters;
 mod lights;
-mod sync;
+pub(crate) mod sync;
 mod account;
 
 /// Build the complete Axum router.
