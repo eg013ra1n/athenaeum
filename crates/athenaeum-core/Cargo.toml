@@ -33,7 +33,13 @@ byteorder = "1"
 cdshealpix = "0.9"
 flate2 = "1.0"
 zip = { version = "2", default-features = false, features = ["deflate", "time"] }
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+# OS keychain for the hub device-token (task B4). Only the apple/windows native
+# stores are enabled — no secret-service/dbus backend, so the Linux (web/Docker)
+# and headless builds compile without any system D-Bus lib and simply use the
+# file-0600 fallback in `account::token_store` (see that module). The token is
+# NEVER written to logs or DB.
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "fs", "io-util"] }
 # Trait-object async methods for the transport-agnostic SharingTransport (sync
 # feature). Sanctioned mechanism per the Stage I sync plan; ungated so the
@@ -74,3 +80,5 @@ solver = ["dep:solvemyastro"]
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 imageproc = { version = "0.25", default-features = false }
+# Mock HTTP server for the account hub-client tests (task B4).
+wiremock = "0.6"

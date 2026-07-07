@@ -39,6 +39,11 @@ pub mod defaults {
     // Personal sync (Stage I). Dev-only ticket pairing gate — the primary-side
     // receiver + iroh transport only start when this is explicitly enabled.
     pub const SYNC_DEV_TICKET_PAIRING: &str = "false";
+
+    // Account layer (task B4). Base URL of the athenaeum-hub. Overridable so a
+    // dev build can point at a local/staging hub. The device token lives in the
+    // OS keychain (never here); only non-secret account state is persisted.
+    pub const ACCOUNT_HUB_URL: &str = "https://projects.artfrom.space";
 }
 
 /// Setting keys used throughout the application
@@ -84,6 +89,18 @@ pub mod keys {
     /// Dev-only gate for personal-sync ticket pairing (task A7). When `"true"`,
     /// `get_sync_pairing_ticket` lazily starts the receiver + iroh transport.
     pub const SYNC_DEV_TICKET_PAIRING: &str = "sync.dev_ticket_pairing";
+
+    // Account layer (task B4). Non-secret account state persisted so
+    // `account_status` works offline. The device TOKEN is never here — it lives
+    // in the OS keychain (`account::token_store`). Cleared on sign-out.
+    /// Base URL of the athenaeum-hub the app authenticates against.
+    pub const ACCOUNT_HUB_URL: &str = "account.hub_url";
+    /// Email of the signed-in account (display only).
+    pub const ACCOUNT_EMAIL: &str = "account.email";
+    /// This device's hub-assigned device id.
+    pub const ACCOUNT_DEVICE_ID: &str = "account.device_id";
+    /// This device's role: `"primary"` | `"capture"` | empty (unassigned).
+    pub const ACCOUNT_ROLE: &str = "account.role";
 }
 
 /// Runtime overrides for settings (session-specific)

@@ -418,6 +418,13 @@ pub fn run() {
             commands::get_sync_pairing_ticket,
             commands::get_sync_status,
             commands::list_sync_history,
+            commands::account_sign_in_start,
+            commands::account_sign_in_verify,
+            commands::account_status,
+            commands::account_sign_out,
+            commands::list_account_devices,
+            commands::revoke_account_device,
+            commands::set_machine_role,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

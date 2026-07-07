@@ -8,6 +8,8 @@ pub mod files;
 pub mod calibration;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
+// Account commands (Stage II, task B4). Ungated: db/settings/account only.
+pub mod account;
 // These handler modules drive the render-only image pipeline (analysis,
 // master integration, light calibration) and are gated with it.
 #[cfg(feature = "render")]
@@ -25,13 +27,18 @@ pub enum ApiError {
     Conflict(String),
     Forbidden(String),
     Internal(String),
+    /// No local account session (no device token, or the hub revoked it). Maps
+    /// to HTTP 401 at the web boundary; the frontend re-shows the sign-in flow.
+    SignedOut(String),
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::NotFound(m) | ApiError::Invalid(m) | ApiError::Conflict(m)
-            | ApiError::Forbidden(m) | ApiError::Internal(m) => f.write_str(m),
+            | ApiError::Forbidden(m) | ApiError::Internal(m) | ApiError::SignedOut(m) => {
+                f.write_str(m)
+            }
         }
     }
 }

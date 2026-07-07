@@ -61,3 +61,6 @@ pub mod package;
 // + worker over a SharingTransport. Ungated — pure rusqlite/tokio, no
 // render/solver deps, compiles in the headless build.
 pub mod sync;
+// App account layer (Stage II, task B4): hub client, the shared iroh device
+// identity, OS-keychain token store. Ungated — no render/solver deps.
+pub mod account;

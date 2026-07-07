@@ -35,6 +35,7 @@ mod archive;
 mod masters;
 mod lights;
 mod sync;
+mod account;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -242,6 +243,14 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
         .route("/api/get_sync_status", post(sync::get_sync_status))
         .route("/api/list_sync_history", post(sync::list_sync_history))
+        // Account (Stage II, task B4)
+        .route("/api/account_sign_in_start", post(account::account_sign_in_start))
+        .route("/api/account_sign_in_verify", post(account::account_sign_in_verify))
+        .route("/api/account_status", post(account::account_status))
+        .route("/api/account_sign_out", post(account::account_sign_out))
+        .route("/api/list_account_devices", post(account::list_account_devices))
+        .route("/api/revoke_account_device", post(account::revoke_account_device))
+        .route("/api/set_machine_role", post(account::set_machine_role))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))
@@ -285,6 +294,7 @@ pub(crate) fn api_err(e: athenaeum_core::api::ApiError) -> (StatusCode, String) 
         E::Conflict(_) => S::CONFLICT,
         E::Forbidden(_) => S::FORBIDDEN,
         E::Internal(_) => S::INTERNAL_SERVER_ERROR,
+        E::SignedOut(_) => S::UNAUTHORIZED,
     };
     (code, e.to_string())
 }

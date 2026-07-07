@@ -152,6 +152,9 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::sync::receiver::SyncProgressEvent,
             crate::sync::receiver::SyncFinishedEvent,
             crate::api::sync::SyncHistoryQuery,
+            crate::account::DeviceRole,
+            crate::account::AccountDevice,
+            crate::account::AccountStatus,
         ]))),
         ("archive.ts", js_safe_ints(format!("{HEADER}{}", decls![
             crate::archive::models::ArchiveDisposition,

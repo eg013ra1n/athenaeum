@@ -306,7 +306,13 @@ impl SyncRuntime {
 
         std::fs::create_dir_all(&sync_dir)
             .with_context(|| format!("create sync dir {}", sync_dir.display()))?;
-        let secret = load_or_create_device_key(&sync_dir.join("device_key"))?;
+        // The ONE device identity (task B4, spec D-5): the account layer and the
+        // transport share this exact key file. Loaded through `account::keys` so
+        // a second identity can never be minted.
+        let secret = crate::account::keys::DeviceKey::load_or_create(
+            &crate::account::keys::device_key_path(&sync_dir),
+        )?
+        .secret_bytes();
         let transport = crate::sharing::iroh::IrohTransport::new(
             secret,
             iroh::RelayMode::Default,
@@ -338,65 +344,4 @@ impl Default for SyncRuntime {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Load the persisted 32-byte device secret, creating it (mode 0600 on unix) on
-/// first run. Mirrors the Perseus loader — the identity secret must never be
-/// group/world-readable.
-fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
-    if path.exists() {
-        #[cfg(unix)]
-        tighten_permissions_if_needed(path)?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read device key {}", path.display()))?;
-        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "device key {} is {} bytes, expected 32 — delete it to regenerate",
-                path.display(),
-                bytes.len()
-            )
-        })?;
-        Ok(arr)
-    } else {
-        let secret = crate::sharing::iroh::random_secret();
-        write_secret_0600(path, &secret)?;
-        tracing::info!(path = %path.display(), "generated new sync device key");
-        Ok(secret)
-    }
-}
-
-#[cfg(unix)]
-fn tighten_permissions_if_needed(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat device key {}", path.display()))?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("tighten device key permissions {}", path.display()))?;
-        tracing::warn!(path = %path.display(), old_mode = format!("{mode:o}"), "sync device key permissions tightened");
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("create device key {}", path.display()))?;
-    f.write_all(secret)
-        .with_context(|| format!("write device key {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
-    std::fs::write(path, secret)
-        .with_context(|| format!("write device key {}", path.display()))?;
-    Ok(())
 }

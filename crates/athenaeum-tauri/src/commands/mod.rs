@@ -51,6 +51,7 @@ pub mod archive;
 pub mod masters;
 pub mod lights;
 pub mod sync;
+pub mod account;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -72,3 +73,4 @@ pub use archive::*;
 pub use masters::*;
 pub use lights::*;
 pub use sync::*;
+pub use account::*;

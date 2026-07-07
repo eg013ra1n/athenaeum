@@ -654,3 +654,37 @@ object: string | null,
  */
 limit: number, };
 
+export type DeviceRole = "primary" | "capture";
+
+export type AccountDevice = { id: string, name: string, 
+/**
+ * Base64 of the device's 32-byte ed25519 public key (== its node id).
+ */
+pubkey: string, role: DeviceRole | null, 
+/**
+ * The paired primary for a `capture` device (else `None`).
+ */
+peerDeviceId: string | null, createdAt: string, lastSeenAt: string | null, };
+
+export type AccountStatus = { 
+/**
+ * Whether a device token is present locally.
+ */
+signedIn: boolean, 
+/**
+ * Signed-in email (display only); `None` when signed out.
+ */
+email: string | null, 
+/**
+ * This device's hub-assigned id; `None` when signed out.
+ */
+deviceId: string | null, 
+/**
+ * This device's role; `None` when unassigned or signed out.
+ */
+role: DeviceRole | null, 
+/**
+ * The hub this device authenticates against.
+ */
+hubUrl: string, };
+
