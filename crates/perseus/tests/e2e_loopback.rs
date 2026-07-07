@@ -6,9 +6,13 @@
 //!   exactly once (write-stability window respected via a short config),
 //!   packaged with header-derived `frame_meta`, and driven to `Confirmed`
 //!   against an in-test receiver stub that fetches + acks.
-//! - Unclean shutdown mid-transfer (drop the agent while a row rests in
-//!   `Transferring`) followed by restart over the same `data_dir` resumes and
-//!   completes.
+//! - Unclean shutdown mid-transfer (hard-kill the agent's background tasks
+//!   while a row rests in `Transferring`) followed by restart over the same
+//!   `data_dir` resumes and completes.
+//! - Store-aware dedup (review IMPORTANT #2): a frame written while the agent
+//!   is NOT running is not lost on restart (the money test); an unchanged
+//!   already-sent file is never re-enqueued across a restart; a genuinely
+//!   modified file (same path, different content) IS re-enqueued.
 //!
 //! Fixtures are generated in-test with core's sanctioned `fits_writer`.
 
@@ -255,9 +259,15 @@ async fn unclean_shutdown_mid_transfer_resumes_on_restart() {
     )
     .await;
 
-    // Unclean shutdown: drop the agent without awaiting shutdown. The durable
-    // row stays Transferring in <data_dir>/perseus.db.
-    drop(agent_a);
+    // Unclean shutdown: hard-kill agent A's background tasks (watcher, enqueue
+    // consumer) and drop its engine handle, rather than a bare `drop(agent_a)`.
+    // A bare drop only *detaches* those tokio tasks — they keep running, and
+    // since the injected fault is one-shot (disarms after the first failure),
+    // the zombie agent A could quietly finish the transfer itself on its own
+    // retry, making this test pass for the wrong reason instead of proving
+    // agent B's crash-resume is what completes it. The durable row stays
+    // Transferring in <data_dir>/perseus.db either way.
+    agent_a.kill_for_test();
 
     // Agent B: fresh sender endpoint on the same net, same peer, same data_dir.
     // No watcher needed — crash-resume re-drives the persisted row.
@@ -276,6 +286,165 @@ async fn unclean_shutdown_mid_transfer_resumes_on_restart() {
         "resume must have triggered a second fetch"
     );
     wait_until(|| agent_b.status_snapshot().unwrap().is_empty(), WAIT).await;
+
+    agent_b.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Store-aware dedup (review IMPORTANT #2): perseus_seen must close the
+// restart-window gap without either losing a frame or re-sending forever.
+// ---------------------------------------------------------------------------
+
+/// The money test: a frame written while the agent is NOT running must not be
+/// silently lost. The pre-fix baseline marked every file present at startup as
+/// already-handled unconditionally, so this file would never be enqueued; the
+/// fix (`perseus_seen`-backed dedup) treats an unrecorded file as a genuine new
+/// arrival regardless of when it appeared.
+#[tokio::test]
+async fn file_written_while_agent_down_is_enqueued_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture = tmp.path().join("capture");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&capture).unwrap();
+
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    // The agent has never run: this frame lands in the capture dir "during
+    // downtime", before Perseus starts for the first time.
+    write_fixture_fits(&capture.join("during_downtime.fits"), "M1");
+
+    let sender = net.endpoint();
+    let sender_id = sender.node_id();
+    let transport: Arc<dyn SharingTransport> = Arc::new(sender);
+    let cfg = test_config(&capture, &data);
+    let agent = Agent::start_with_transport(cfg, transport, receiver_id, sender_id, true)
+        .await
+        .expect("start agent");
+
+    wait_until(
+        || is_confirmed(&history_for(&agent, "during_downtime.fits")),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        sent_starts(&history_for(&agent, "during_downtime.fits")),
+        1,
+        "the downtime frame must be enqueued exactly once, not lost"
+    );
+
+    agent.shutdown().await;
+}
+
+/// A file already confirmed in a prior run, left untouched on disk, must NOT
+/// be re-packaged and re-sent just because the agent restarted.
+#[tokio::test]
+async fn confirmed_unchanged_file_is_not_reenqueued_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture = tmp.path().join("capture");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&capture).unwrap();
+
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    // Agent A: enqueues + confirms the frame, then shuts down cleanly.
+    let sender_a = net.endpoint();
+    let sender_a_id = sender_a.node_id();
+    let transport_a: Arc<dyn SharingTransport> = Arc::new(sender_a);
+    let cfg_a = test_config(&capture, &data);
+    let agent_a = Agent::start_with_transport(cfg_a, transport_a, receiver_id, sender_a_id, true)
+        .await
+        .expect("start agent A");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    write_fixture_fits(&capture.join("frame.fits"), "M51");
+    wait_until(|| is_confirmed(&history_for(&agent_a, "frame.fits")), WAIT).await;
+    assert_eq!(sent_starts(&history_for(&agent_a, "frame.fits")), 1);
+    agent_a.shutdown().await;
+
+    // Agent B: same data_dir/capture_dir, file untouched on disk since A wrote it.
+    let sender_b = net.endpoint();
+    let sender_b_id = sender_b.node_id();
+    let transport_b: Arc<dyn SharingTransport> = Arc::new(sender_b);
+    let cfg_b = test_config(&capture, &data);
+    let agent_b = Agent::start_with_transport(cfg_b, transport_b, receiver_id, sender_b_id, true)
+        .await
+        .expect("start agent B");
+
+    // Give the watcher several stability+poll cycles to (not) rediscover it.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        sent_starts(&history_for(&agent_b, "frame.fits")),
+        1,
+        "an unchanged, already-confirmed file must not be re-sent after restart"
+    );
+
+    agent_b.shutdown().await;
+}
+
+/// A file genuinely rewritten between runs (same path, different content/size,
+/// so a different `(size, mtime)`) must be re-enqueued — the stat drift proves
+/// it isn't the same frame anymore.
+#[tokio::test]
+async fn modified_file_is_reenqueued_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture = tmp.path().join("capture");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&capture).unwrap();
+    let path = capture.join("frame.fits");
+
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    // Agent A: enqueues + confirms the frame, then shuts down cleanly.
+    let sender_a = net.endpoint();
+    let sender_a_id = sender_a.node_id();
+    let transport_a: Arc<dyn SharingTransport> = Arc::new(sender_a);
+    let cfg_a = test_config(&capture, &data);
+    let agent_a = Agent::start_with_transport(cfg_a, transport_a, receiver_id, sender_a_id, true)
+        .await
+        .expect("start agent A");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    write_fixture_fits(&path, "M81");
+    wait_until(|| is_confirmed(&history_for(&agent_a, "frame.fits")), WAIT).await;
+    assert_eq!(sent_starts(&history_for(&agent_a, "frame.fits")), 1);
+    agent_a.shutdown().await;
+
+    // Rewrite the file in place: different dimensions guarantee a different
+    // byte size regardless of filesystem mtime resolution.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cards = HeaderBuilder::new(FrameKind::Light)
+        .object("M81")
+        .exptime(120.0)
+        .filter("Ha")
+        .instrume("TestCam")
+        .build()
+        .expect("build header");
+    let data_px = vec![0.0f32; 16 * 16];
+    write_fits_f32(&path, 16, 16, 1, &data_px, &cards).expect("rewrite fixture fits");
+
+    // Agent B: same data_dir/capture_dir; the changed stat must re-enqueue.
+    let sender_b = net.endpoint();
+    let sender_b_id = sender_b.node_id();
+    let transport_b: Arc<dyn SharingTransport> = Arc::new(sender_b);
+    let cfg_b = test_config(&capture, &data);
+    let agent_b = Agent::start_with_transport(cfg_b, transport_b, receiver_id, sender_b_id, true)
+        .await
+        .expect("start agent B");
+
+    wait_until(
+        || sent_starts(&history_for(&agent_b, "frame.fits")) >= 2,
+        WAIT,
+    )
+    .await;
 
     agent_b.shutdown().await;
 }

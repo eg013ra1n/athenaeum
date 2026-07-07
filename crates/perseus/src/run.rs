@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::seen::SeenStore;
 use crate::watcher::{self, WatcherHandle};
 
 /// Lowercase-hex (64 char) rendering of a 32-byte node id — the same format the
@@ -39,17 +40,31 @@ fn node_id_hex(id: &NodeId) -> String {
     s
 }
 
+/// Parse a pairing ticket string into its `EndpointTicket`. Factored out so the
+/// string is only ever parsed once per call site: [`Agent::start`] derives both
+/// the peer [`NodeId`] and its dialable address from a single parse and hands
+/// the address to the transport directly (`add_peer`, not the
+/// re-parsing `add_peer_ticket`).
+fn parse_ticket(ticket: &str) -> Result<EndpointTicket> {
+    ticket
+        .parse()
+        .context("parse pairing_ticket as an iroh endpoint ticket")
+}
+
 /// Derive the peer's [`NodeId`] from a pairing ticket (an iroh `EndpointTicket`).
 pub fn peer_node_id_from_ticket(ticket: &str) -> Result<NodeId> {
-    let ticket: EndpointTicket = ticket
-        .parse()
-        .context("parse pairing_ticket as an iroh endpoint ticket")?;
+    let ticket = parse_ticket(ticket)?;
     Ok(*ticket.endpoint_addr().id.as_bytes())
 }
 
-/// Load the persisted 32-byte device secret, creating it (mode 0600) on first run.
+/// Load the persisted 32-byte device secret, creating it (mode 0600) on first
+/// run. On every load of an existing key, permissions are re-checked and
+/// tightened back to 0600 if a group/world bit has crept in (backup restore,
+/// a loose umask, manual copy) — the identity secret must never be readable
+/// by anyone but the service user.
 pub fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
     if path.exists() {
+        tighten_permissions_if_needed(path)?;
         let bytes = std::fs::read(path)
             .with_context(|| format!("read device key {}", path.display()))?;
         let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
@@ -66,6 +81,32 @@ pub fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
         tracing::info!(path = %path.display(), "generated new device key");
         Ok(secret)
     }
+}
+
+/// Re-check an existing device key's permissions and tighten to 0600 if any
+/// group/other bit is set. No-op on non-Unix (no POSIX mode bits to check).
+#[cfg(unix)]
+fn tighten_permissions_if_needed(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("stat device key {}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("tighten device key permissions {}", path.display()))?;
+        tracing::warn!(
+            path = %path.display(),
+            old_mode = format!("{mode:o}"),
+            "device key permissions tightened"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten_permissions_if_needed(_path: &Path) -> Result<()> {
+    // No POSIX permission bits on this platform; nothing to tighten.
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -152,11 +193,13 @@ fn parse_frame(path: &Path) -> Result<athenaeum_core::models::Frame> {
     }
 }
 
-/// A running capture agent. Owns the sync engine, the durable store, and
-/// (optionally) the capture watcher + its enqueue consumer.
+/// A running capture agent. Owns the sync engine, the durable store, the
+/// stat-aware seen store, and (optionally) the capture watcher + its enqueue
+/// consumer.
 pub struct Agent {
     config: Config,
     store: Arc<StandaloneSyncStore>,
+    seen: Arc<SeenStore>,
     engine: Arc<SyncEngineHandle>,
     origin_device: String,
     watcher: Option<WatcherHandle>,
@@ -171,7 +214,13 @@ impl Agent {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
-        let peer = peer_node_id_from_ticket(&config.pairing_ticket)?;
+        // Parse the pairing ticket exactly once: derive both the peer NodeId
+        // and its dialable address, then register the address directly via
+        // `add_peer` — `add_peer_ticket` would re-parse the same string.
+        let ticket = parse_ticket(&config.pairing_ticket)?;
+        let peer_addr = ticket.endpoint_addr().clone();
+        let peer: NodeId = *peer_addr.id.as_bytes();
+
         let secret = load_or_create_device_key(&config.device_key_path())?;
 
         let transport = IrohTransport::new(
@@ -181,9 +230,7 @@ impl Agent {
         )
         .await
         .context("build iroh transport")?;
-        transport
-            .add_peer_ticket(&config.pairing_ticket)
-            .context("register peer from pairing ticket")?;
+        transport.add_peer(peer_addr);
         let node_id = transport.node_id();
         tracing::info!(
             node_id = %node_id_hex(&node_id),
@@ -213,6 +260,12 @@ impl Agent {
             StandaloneSyncStore::open(config.db_path())
                 .with_context(|| format!("open sync store {}", config.db_path().display()))?,
         );
+        // Perseus's own store-aware dedup table, opened as a second connection
+        // into the same `perseus.db` file (safe under WAL — see `crate::seen`).
+        let seen = Arc::new(
+            SeenStore::open(config.db_path())
+                .with_context(|| format!("open seen store {}", config.db_path().display()))?,
+        );
         let engine = Arc::new(SyncEngine::spawn(
             Arc::clone(&store) as Arc<dyn SyncStore>,
             transport,
@@ -234,10 +287,12 @@ impl Agent {
                 config.stability(),
                 config.poll_interval(),
                 stable_tx,
+                Arc::clone(&seen),
             )?;
             let enqueue_task = spawn_enqueue_consumer(
                 stable_rx,
                 Arc::clone(&engine),
+                Arc::clone(&seen),
                 config.clone(),
                 origin_device.clone(),
             );
@@ -249,6 +304,7 @@ impl Agent {
         Ok(Self {
             config,
             store,
+            seen,
             engine,
             origin_device,
             watcher,
@@ -258,11 +314,14 @@ impl Agent {
 
     /// Build a package for `file_path` and enqueue it for sending; returns the
     /// durable outbound row id. Used by `enqueue-backlog` and reused by the
-    /// watcher consumer.
+    /// watcher consumer. Records the file's current `(size, mtime)` in the seen
+    /// store once the durable `Queued` row exists, so a later restart never
+    /// re-packages this exact, unchanged file.
     pub async fn enqueue_file(&self, file_path: &Path) -> Result<i64> {
         let pkg_dir = build_package_for_file(&self.config, file_path, &self.origin_device)?;
         let id = self.engine.enqueue_package(&pkg_dir).await?;
         tracing::info!(id, path = %file_path.display(), "enqueued capture file");
+        record_seen(&self.seen, file_path);
         Ok(id)
     }
 
@@ -294,12 +353,53 @@ impl Agent {
         }
         self.engine.shutdown().await;
     }
+
+    /// Hard-kill: abort the watcher and enqueue-consumer tasks immediately (no
+    /// graceful handshake), then drop this agent's engine handle. Once the
+    /// aborted enqueue task's own handle clone is also gone, the engine's
+    /// command channel closes and its worker notices and exits on its own —
+    /// the same mechanism [`shutdown`](Self::shutdown) relies on, just without
+    /// the cooperative command-and-await round trip.
+    ///
+    /// Test-only: simulates a killed process (SIGKILL, power loss) for the
+    /// crash-resume e2e test, where a plain `drop(agent)` would merely detach
+    /// the background tasks — they keep running, which would let the "old"
+    /// agent quietly finish the transfer itself and make the test pass for the
+    /// wrong reason instead of proving the *new* agent's crash-resume works.
+    #[doc(hidden)]
+    pub fn kill_for_test(self) {
+        if let Some(w) = self.watcher {
+            w.abort_for_test();
+        }
+        if let Some(t) = self.enqueue_task {
+            t.abort();
+        }
+        // `self.engine` (and `self.store`/`self.seen`) drop here, at end of scope.
+    }
+}
+
+/// Record `path`'s current `(size, mtime)` in the seen store. Best-effort: a
+/// failure here only means a possible harmless re-send on a future restart —
+/// it must never fail the enqueue itself (the file is already durably queued).
+fn record_seen(seen: &SeenStore, path: &Path) {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let mtime_ms = crate::seen::mtime_millis(m.modified().ok());
+            if let Err(error) = seen.mark_enqueued(path, m.len(), mtime_ms) {
+                tracing::warn!(%error, path = %path.display(), "failed to record seen-store entry");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "failed to stat file for seen-store entry");
+        }
+    }
 }
 
 /// Spawn the task that turns stable capture files into enqueued packages.
 fn spawn_enqueue_consumer(
     mut stable_rx: mpsc::Receiver<PathBuf>,
     engine: Arc<SyncEngineHandle>,
+    seen: Arc<SeenStore>,
     config: Config,
     origin_device: String,
 ) -> JoinHandle<()> {
@@ -307,7 +407,10 @@ fn spawn_enqueue_consumer(
         while let Some(path) = stable_rx.recv().await {
             match build_package_for_file(&config, &path, &origin_device) {
                 Ok(pkg_dir) => match engine.enqueue_package(&pkg_dir).await {
-                    Ok(id) => tracing::info!(id, path = %path.display(), "enqueued capture file"),
+                    Ok(id) => {
+                        tracing::info!(id, path = %path.display(), "enqueued capture file");
+                        record_seen(&seen, &path);
+                    }
                     Err(error) => {
                         tracing::error!(%error, path = %path.display(), "enqueue failed")
                     }
@@ -383,4 +486,54 @@ pub fn init_logging(log_dir: &Path) -> Result<LogGuard> {
         .context("install tracing subscriber")?;
 
     Ok(LogGuard(guard))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// IMPORTANT #1 (review): an existing device key with group/world-readable
+    /// permissions (backup restore, loose umask) must be tightened back to
+    /// 0600 on load, not silently trusted.
+    #[test]
+    fn insecure_existing_key_permissions_are_tightened_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("device_key");
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let key = load_or_create_device_key(&path).expect("load existing key");
+        assert_eq!(key, [7u8; 32], "the key's bytes must be unchanged");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "permissions must be tightened to 0600 on load");
+    }
+
+    /// A key already at 0600 is left alone (no spurious rewrite/log noise).
+    #[test]
+    fn already_secure_key_permissions_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("device_key");
+        std::fs::write(&path, [9u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let key = load_or_create_device_key(&path).expect("load existing key");
+        assert_eq!(key, [9u8; 32]);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// A freshly created key is written 0600 (existing behavior, guarded here
+    /// too so a regression in either path is caught).
+    #[test]
+    fn newly_created_key_is_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("device_key");
+        assert!(!path.exists());
+
+        load_or_create_device_key(&path).expect("create key");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

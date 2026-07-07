@@ -36,6 +36,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
+# perseus_seen: Perseus's own store-aware dedup table, opened as a second
+# connection into the SAME `<data_dir>/perseus.db` file athenaeum-core's
+# StandaloneSyncStore uses (safe: WAL mode, an explicitly supported SQLite
+# pattern for multiple connections to one file). Version pinned to match
+# athenaeum-core's rusqlite so cargo unifies the dependency.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Timestamp formatting for perseus_seen.enqueued_at; version matches
+# athenaeum-core's chrono so cargo unifies the dependency.
+chrono = "0.4"
 # iroh types named directly at the transport-wiring seam (run.rs): RelayMode for
 # IrohTransport::new, EndpointTicket to derive the peer NodeId from the pairing
 # ticket. Pinned to the exact versions athenaeum-core uses so cargo unifies them.

@@ -133,6 +133,13 @@ impl Config {
         if self.capture_dir.as_os_str().is_empty() {
             bail!("capture_dir must not be empty");
         }
+        if !self.capture_dir.exists() {
+            bail!(
+                "capture_dir {} does not exist — create it (or point at the \
+                 right path) before starting Perseus",
+                self.capture_dir.display()
+            );
+        }
         if self.data_dir.as_os_str().is_empty() {
             bail!("data_dir must not be empty");
         }
@@ -196,20 +203,31 @@ impl Config {
 mod tests {
     use super::*;
 
-    const GOOD: &str = r#"
-capture_dir = "/data/capture"
+    /// The contract-shape TOML with `capture_dir` interpolated. `capture_dir`
+    /// must exist on disk (validate() now enforces that — see
+    /// `nonexistent_capture_dir_is_rejected`), so every test that needs a
+    /// *valid* config builds this against a live [`tempfile::TempDir`] kept
+    /// alive for the test's duration.
+    fn good_toml(capture_dir: &Path) -> String {
+        format!(
+            r#"
+capture_dir = "{}"
 data_dir = "/var/lib/perseus"
 pairing_ticket = "ticket-abc"
 mode = "auto"
 [retention]
 policy = "keep_everything"
 dry_run = true
-"#;
+"#,
+            capture_dir.display()
+        )
+    }
 
     #[test]
     fn parses_the_contract_shape() {
-        let cfg = Config::from_toml_str(GOOD).expect("valid config");
-        assert_eq!(cfg.capture_dir, PathBuf::from("/data/capture"));
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).expect("valid config");
+        assert_eq!(cfg.capture_dir, capture.path());
         assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/perseus"));
         assert_eq!(cfg.pairing_ticket, "ticket-abc");
         assert_eq!(cfg.mode, Mode::Auto);
@@ -222,33 +240,42 @@ dry_run = true
 
     #[test]
     fn dry_run_defaults_to_true_when_omitted() {
-        let text = r#"
-capture_dir = "/c"
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"
+capture_dir = "{}"
 data_dir = "/d"
 pairing_ticket = "t"
 mode = "auto"
 [retention]
 policy = "on_confirm"
-"#;
-        let cfg = Config::from_toml_str(text).expect("valid config");
+"#,
+            capture.path().display()
+        );
+        let cfg = Config::from_toml_str(&text).expect("valid config");
         assert!(cfg.retention.dry_run, "dry_run must default to true");
     }
 
     #[test]
     fn retention_table_defaults_when_omitted() {
-        let text = r#"
-capture_dir = "/c"
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"
+capture_dir = "{}"
 data_dir = "/d"
 pairing_ticket = "t"
 mode = "auto"
-"#;
-        let cfg = Config::from_toml_str(text).expect("valid config");
+"#,
+            capture.path().display()
+        );
+        let cfg = Config::from_toml_str(&text).expect("valid config");
         assert_eq!(cfg.retention.policy, RetentionPolicy::KeepEverything);
         assert!(cfg.retention.dry_run);
     }
 
     #[test]
     fn all_retention_policies_parse() {
+        let capture = tempfile::tempdir().unwrap();
         for (s, want) in [
             ("keep_everything", RetentionPolicy::KeepEverything),
             ("on_confirm", RetentionPolicy::OnConfirm),
@@ -256,7 +283,8 @@ mode = "auto"
             ("disk_pct", RetentionPolicy::DiskPct),
         ] {
             let text = format!(
-                "capture_dir=\"/c\"\ndata_dir=\"/d\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"{s}\"\ndry_run=true\n"
+                "capture_dir=\"{}\"\ndata_dir=\"/d\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"{s}\"\ndry_run=true\n",
+                capture.path().display()
             );
             let cfg = Config::from_toml_str(&text).expect("valid");
             assert_eq!(cfg.retention.policy, want, "policy {s}");
@@ -265,7 +293,8 @@ mode = "auto"
 
     #[test]
     fn dry_run_false_is_rejected() {
-        let text = GOOD.replace("dry_run = true", "dry_run = false");
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace("dry_run = true", "dry_run = false");
         let err = Config::from_toml_str(&text).expect_err("dry_run=false must fail");
         assert!(
             err.to_string().contains("dry_run")
@@ -276,7 +305,8 @@ mode = "auto"
 
     #[test]
     fn unknown_mode_is_rejected() {
-        let text = GOOD.replace("mode = \"auto\"", "mode = \"manual\"");
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace("mode = \"auto\"", "mode = \"manual\"");
         assert!(
             Config::from_toml_str(&text).is_err(),
             "only mode = auto is accepted in the MVP"
@@ -285,13 +315,15 @@ mode = "auto"
 
     #[test]
     fn unknown_retention_policy_is_rejected() {
-        let text = GOOD.replace("keep_everything", "delete_all_now");
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace("keep_everything", "delete_all_now");
         assert!(Config::from_toml_str(&text).is_err());
     }
 
     #[test]
     fn empty_pairing_ticket_is_rejected() {
-        let text = GOOD.replace("ticket-abc", "   ");
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace("ticket-abc", "   ");
         let err = Config::from_toml_str(&text).expect_err("blank ticket must fail");
         assert!(
             err.chain().any(|c| c.to_string().contains("pairing_ticket")),
@@ -303,8 +335,10 @@ mode = "auto"
     fn zero_stability_is_rejected() {
         // stability_secs is a top-level key, so it must precede the [retention]
         // table (a trailing append would nest under [retention] and be ignored).
-        let text = r#"
-capture_dir = "/c"
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"
+capture_dir = "{}"
 data_dir = "/d"
 pairing_ticket = "t"
 mode = "auto"
@@ -312,8 +346,10 @@ stability_secs = 0
 [retention]
 policy = "keep_everything"
 dry_run = true
-"#;
-        assert!(Config::from_toml_str(text).is_err());
+"#,
+            capture.path().display()
+        );
+        assert!(Config::from_toml_str(&text).is_err());
     }
 
     #[test]
@@ -329,9 +365,25 @@ mode = "auto"
         );
     }
 
+    /// Review minor (a): a `capture_dir` that doesn't exist on disk must be
+    /// rejected with an actionable message, not silently accepted (the watcher
+    /// would otherwise fail confusingly later, or watch nothing).
+    #[test]
+    fn nonexistent_capture_dir_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let text = good_toml(&missing);
+        let err = Config::from_toml_str(&text).expect_err("missing capture_dir must fail");
+        assert!(
+            err.chain().any(|c| c.to_string().contains("capture_dir")),
+            "error should mention capture_dir: {err:#}"
+        );
+    }
+
     #[test]
     fn derived_paths_hang_off_data_dir() {
-        let cfg = Config::from_toml_str(GOOD).unwrap();
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).unwrap();
         assert_eq!(cfg.db_path(), PathBuf::from("/var/lib/perseus/perseus.db"));
         assert_eq!(
             cfg.device_key_path(),

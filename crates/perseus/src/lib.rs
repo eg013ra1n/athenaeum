@@ -17,9 +17,13 @@
 //!   [`watcher::StabilityTracker`].
 //! - [`run`] — the [`run::Agent`]: store + transport + engine + watcher, plus
 //!   package building, the device key, and logging setup.
+//! - [`seen`] — durable, stat-aware "already enqueued this exact file" dedup
+//!   (`perseus_seen` table), so a restart never re-baselines an un-synced
+//!   frame into oblivion.
 
 pub mod config;
 pub mod run;
+pub mod seen;
 pub mod watcher;
 
 pub use config::Config;

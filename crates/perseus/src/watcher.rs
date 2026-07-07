@@ -30,11 +30,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use notify::{Event, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
+
+use crate::seen::{mtime_millis, SeenStore};
 
 /// Filesystem identity of a payload file at one instant — the pair the stability
 /// check compares across observations.
@@ -193,16 +196,32 @@ impl WatcherHandle {
         let _ = self.shutdown_tx.send(()).await;
         let _ = self.join.await;
     }
+
+    /// Hard-kill: abort the watcher task immediately, no graceful handshake.
+    /// Test-only — production shutdown should always go through
+    /// [`shutdown`](Self::shutdown). Used by the crash-resume e2e test to
+    /// simulate a killed process rather than a detached-but-still-running task.
+    #[doc(hidden)]
+    pub fn abort_for_test(self) {
+        self.join.abort();
+    }
 }
 
 /// Start watching `capture_dir` (recursively). Stable capture files are sent on
 /// `stable_tx`; the consumer builds a package and enqueues it. Returns once the
 /// `notify` watcher is armed.
+///
+/// `seen_store` is the durable, stat-aware "already enqueued this exact file"
+/// record (see [`crate::seen`]) — it, not an in-process baseline, decides
+/// whether a file discovered at startup or mid-run is a genuinely new arrival.
+/// A file recorded with a matching `(size, mtime)` is skipped; anything new,
+/// changed, or never recorded flows through the normal stability pipeline.
 pub fn spawn_watcher(
     capture_dir: PathBuf,
     stability: Duration,
     poll_interval: Duration,
     stable_tx: mpsc::Sender<PathBuf>,
+    seen_store: Arc<SeenStore>,
 ) -> Result<WatcherHandle> {
     // Canonicalize the watched root so both discovery sources — `notify` events
     // and the directory poll — speak the same path spelling. Without this, macOS
@@ -239,13 +258,35 @@ pub fn spawn_watcher(
         let mut tracker = StabilityTracker::new(stability);
         let mut candidates: HashSet<PathBuf> = HashSet::new();
 
-        // Baseline: files already present when we start are NOT new arrivals.
-        // Mark them handled so neither the directory-poll fallback below nor a
-        // service restart re-sends the whole capture directory. Use
-        // `enqueue-backlog` to send pre-existing files deliberately.
+        // Baseline: files already present when we start are checked against the
+        // durable seen store, NOT assumed handled. A file recorded there with a
+        // matching (size, mtime) is a genuine repeat — skip it (hot-cache via
+        // mark_emitted). Anything unrecorded or changed (e.g. written during a
+        // crash/restart window) is left untouched here and falls through to the
+        // normal per-tick discovery below, so it is enqueued exactly like a
+        // brand-new arrival. This is what closes the restart-window gap: the
+        // old code marked every baseline file emitted unconditionally, silently
+        // losing anything captured while the agent was down.
         let baseline = scan_eligible(&capture_dir);
+        let mut baseline_new = 0usize;
         for path in &baseline {
-            tracker.mark_emitted(path);
+            if let Ok(m) = std::fs::metadata(path) {
+                if m.is_file() {
+                    let stat = FileStat::from_metadata(&m);
+                    match seen_store.should_enqueue(path, stat.size, mtime_millis(stat.mtime)) {
+                        Ok(false) => tracker.mark_emitted(path),
+                        Ok(true) => baseline_new += 1,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                path = %path.display(),
+                                "seen-store lookup failed at startup; will enqueue to be safe"
+                            );
+                            baseline_new += 1;
+                        }
+                    }
+                }
+            }
         }
 
         let mut tick = tokio::time::interval(poll_interval);
@@ -254,6 +295,7 @@ pub fn spawn_watcher(
             path = %capture_dir.display(),
             stability_secs = stability.as_secs(),
             baseline = baseline.len(),
+            baseline_new,
             "capture watcher armed"
         );
 
@@ -287,7 +329,10 @@ pub fn spawn_watcher(
                     }
 
                     // Re-stat every candidate: a growing file resets its window,
-                    // a vanished (or already-handled) one leaves the set.
+                    // a vanished (or already-handled) one leaves the set. Before
+                    // tracking it for stability, consult the durable seen store —
+                    // this is the authoritative "already enqueued this exact
+                    // file" check (across restarts, not just within this run).
                     let snapshot: Vec<PathBuf> = candidates.iter().cloned().collect();
                     for path in snapshot {
                         if tracker.contains_emitted(&path) {
@@ -296,7 +341,23 @@ pub fn spawn_watcher(
                         }
                         match std::fs::metadata(&path) {
                             Ok(m) if m.is_file() => {
-                                tracker.observe(&path, FileStat::from_metadata(&m), now);
+                                let stat = FileStat::from_metadata(&m);
+                                let mtime_ms = mtime_millis(stat.mtime);
+                                match seen_store.should_enqueue(&path, stat.size, mtime_ms) {
+                                    Ok(true) => tracker.observe(&path, stat, now),
+                                    Ok(false) => {
+                                        tracker.mark_emitted(&path);
+                                        candidates.remove(&path);
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            path = %path.display(),
+                                            "seen-store lookup failed; enqueueing to be safe"
+                                        );
+                                        tracker.observe(&path, stat, now);
+                                    }
+                                }
                             }
                             _ => {
                                 tracker.forget(&path);
