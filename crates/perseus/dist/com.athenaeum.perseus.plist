@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.athenaeum.perseus</string>
+
+    <!-- Adjust the binary + config paths to your install. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/perseus</string>
+        <string>--config</string>
+        <string>/usr/local/etc/perseus/perseus.toml</string>
+        <string>run</string>
+    </array>
+
+    <!-- Start at load and keep it running; launchd restarts on crash. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- Back off between restarts (mirrors systemd RestartSec). -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Perseus writes structured JSONL under <data_dir>/logs; these capture the
+         stderr human line and any early startup output. -->
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/perseus.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/perseus.err.log</string>
+
+    <!-- Optional: raise verbosity without editing the config (full EnvFilter
+         syntax; overrides the config's default `info`). -->
+    <!--
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ATHENAEUM_LOG</key>
+        <string>info,perseus=debug</string>
+    </dict>
+    -->
+</dict>
+</plist>

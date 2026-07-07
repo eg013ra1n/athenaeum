@@ -1,0 +1,40 @@
+[Unit]
+Description=Perseus — Athenaeum headless capture-node agent
+Documentation=https://artfrom.space
+# Wait for the network and any mount holding the capture directory.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to the user that owns the capture directory (created beforehand).
+User=perseus
+Group=perseus
+
+# Config path is passed explicitly; keep it and the data dir on persistent storage.
+ExecStart=/usr/local/bin/perseus --config /etc/perseus/perseus.toml run
+
+# Restart on any non-clean exit (crash-resume re-drives unfinished transfers
+# from <data_dir>/perseus.db on the next start).
+Restart=on-failure
+RestartSec=10
+
+# Give in-flight transfers a moment to stop cleanly on SIGINT (Ctrl-C path).
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Structured logs also go to <data_dir>/logs; the stderr line lands in journald.
+StandardOutput=journal
+StandardError=journal
+
+# Hardening (loosen if your capture/data dirs sit outside these defaults).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+PrivateTmp=true
+# Grant write access to the data dir and (if separate) the capture dir:
+#   ReadWritePaths=/var/lib/perseus /data/capture
+ReadWritePaths=/var/lib/perseus
+
+[Install]
+WantedBy=multi-user.target

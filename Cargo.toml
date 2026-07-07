@@ -6,6 +6,7 @@ members = [
     "crates/athenaeum-web",
     "crates/catalog-builder",
     "crates/log-mcp",
+    "crates/perseus",
     "rustafits",
     "solvemyastro",
 ]

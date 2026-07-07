@@ -1,0 +1,46 @@
+[package]
+name = "perseus"
+version = "0.4.0"
+description = "Perseus — headless capture-node agent that watches a capture directory and syncs new frames to a paired primary over iroh"
+authors = ["you"]
+edition = "2021"
+license = "Apache-2.0"
+
+# Library + binary: the library exposes the agent internals (config, watcher,
+# stability tracker, run/Agent) so the integration test in tests/ — a separate
+# crate that can only see the public API — can wire an in-process transport.
+[lib]
+name = "perseus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "perseus"
+path = "src/main.rs"
+
+[dependencies]
+# Headless dependency on the shared library: default-features = false omits the
+# `render` (rustafits) and `solver` (solvemyastro) native-heavy features. Perseus
+# needs only the ungated modules: sharing (iroh transport + loopback), package,
+# sync, fits_parser, fits_writer, models.
+athenaeum-core = { path = "../athenaeum-core", default-features = false }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+notify = "6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+# iroh types named directly at the transport-wiring seam (run.rs): RelayMode for
+# IrohTransport::new, EndpointTicket to derive the peer NodeId from the pairing
+# ticket. Pinned to the exact versions athenaeum-core uses so cargo unifies them.
+iroh = "=1.0.2"
+iroh-tickets = "=1.0.0"
+
+[dev-dependencies]
+tempfile = "3"
