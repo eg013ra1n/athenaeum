@@ -11,7 +11,12 @@
 //!   uses: it feeds the account/ticket inputs into the **single** shared resolver
 //!   ([`athenaeum_core::sync::pairing`]) so Perseus and the app agree on the
 //!   order (account → ticket → error) and both get the hub relay map with an
-//!   offline cache fallback.
+//!   offline cache fallback. Falling back further, to iroh's public default
+//!   relays, requires the dev-only `[account].allow_default_relays` opt-in
+//!   (default `false`) — otherwise an empty/unreachable relay map with no cache
+//!   is a loud, actionable error (review finding #1). A hub that
+//!   *authoritatively* says the paired primary is gone or demoted is likewise
+//!   never served from the cache — it invalidates it (review finding #2).
 //! - [`PairingCache`] — the persisted `perseus login` result + last successful
 //!   resolutions (`data_dir/pairing_cache.json`), so an offline restart still
 //!   resolves. The token is NOT in it (that is the 0600 [`TokenStore`] file).
@@ -23,7 +28,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use athenaeum_core::account::{DeviceKey, DeviceRole, HubClient, TokenStore};
 use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sync::pairing::{self, AccountPairing};
-use athenaeum_core::sync::PeerResolution;
+use athenaeum_core::sync::{node_id_from_hex, node_id_hex, PeerResolution};
 use iroh::RelayMode;
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +86,7 @@ impl PairingCache {
 }
 
 /// The resolved sync peer + relays for one agent start.
+#[derive(Debug)]
 pub struct ResolvedPairing {
     /// The peer to send to.
     pub peer: NodeId,
@@ -189,7 +195,13 @@ async fn verify_and_register(
 ///
 /// Order (task M1): account pairing (signed-in capture device → primary from the
 /// hub device list, with the cached peer as the offline fallback) → dev ticket →
-/// error. Successful resolutions refresh the offline cache.
+/// error. Successful resolutions refresh the offline cache; a hub-confirmed
+/// gone/demoted peer clears the cached peer instead (review finding #2).
+///
+/// Peer resolution happens FIRST and a `Disabled`/`Invalidated` outcome bails
+/// immediately, before the relay map is resolved (review minor (b)) — there is
+/// no point spending a second hub round trip on relays when there is nothing to
+/// sync to yet.
 pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
     let mut cache = PairingCache::load(&config.data_dir);
 
@@ -202,12 +214,34 @@ pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
     let cached_peer = cache
         .peer_node_id_hex
         .as_deref()
-        .and_then(node_id_from_hex);
+        .and_then(|s| node_id_from_hex(s).ok());
 
     let resolution = pairing::resolve_peer(account_inputs.as_ref(), dev_ticket, cached_peer).await;
+    let (peer, ticket) = match resolution {
+        PeerResolution::Account { peer, fresh } => {
+            if fresh {
+                cache.peer_node_id_hex = Some(node_id_hex(&peer));
+            }
+            (peer, None)
+        }
+        PeerResolution::Ticket { peer } => (peer, dev_ticket.map(str::to_string)),
+        PeerResolution::Invalidated { reason } => {
+            cache.peer_node_id_hex = None;
+            cache.save(&config.data_dir);
+            bail!(
+                "cannot resolve a sync peer — the hub says the pairing is no longer valid: {reason}"
+            );
+        }
+        PeerResolution::Disabled { reason } => {
+            cache.save(&config.data_dir);
+            bail!("cannot resolve a sync peer — {reason}");
+        }
+    };
 
-    // Relays: hub map when signed in, cached map otherwise, iroh default as a
-    // last resort. Cache a fresh map for the next offline start.
+    // Relays: hub map when signed in, cached map otherwise. Falling back to
+    // iroh's public default relays beyond that requires the dev-only opt-in
+    // (review finding #1) — only relevant when actually signed in (an
+    // account-less ticket run is inherently dev/test already).
     let relay_account = account_inputs
         .as_ref()
         .map(|a| (a.hub_url.as_str(), a.token.as_str()));
@@ -215,27 +249,21 @@ pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
     if relays.fresh {
         cache.relay_urls = relays.urls.clone();
     }
-    let relay_mode = pairing::relay_mode_from_urls(&relays.urls);
-
-    let resolved = match resolution {
-        PeerResolution::Account { peer, fresh } => {
-            if fresh {
-                cache.peer_node_id_hex = Some(node_id_hex(&peer));
-            }
-            ResolvedPairing { peer, relay_mode, ticket: None }
-        }
-        PeerResolution::Ticket { peer } => ResolvedPairing {
-            peer,
-            relay_mode,
-            ticket: dev_ticket.map(str::to_string),
-        },
-        PeerResolution::Disabled { reason } => {
+    let allow_default_relays = if account_inputs.is_some() {
+        config.account.as_ref().is_some_and(|a| a.allow_default_relays)
+    } else {
+        true
+    };
+    let relay_mode = match pairing::relay_mode_for(&relays.urls, allow_default_relays) {
+        Ok(mode) => mode,
+        Err(reason) => {
             cache.save(&config.data_dir);
-            bail!("cannot resolve a sync peer — {reason}");
+            bail!("cannot start the sync transport — {reason}");
         }
     };
+
     cache.save(&config.data_dir);
-    Ok(resolved)
+    Ok(ResolvedPairing { peer, relay_mode, ticket })
 }
 
 /// Build the account-pairing inputs, or `None` when Perseus is not signed in
@@ -352,23 +380,6 @@ fn prompt(label: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
-/// Lowercase-hex (64 char) rendering of a node id.
-fn node_id_hex(id: &NodeId) -> String {
-    id.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Parse the 64-char lowercase-hex node id form; `None` on any malformed input.
-fn node_id_from_hex(s: &str) -> Option<NodeId> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,8 +396,8 @@ mod tests {
         let id = [9u8; 32];
         let hex = node_id_hex(&id);
         assert_eq!(hex.len(), 64);
-        assert_eq!(node_id_from_hex(&hex), Some(id));
-        assert_eq!(node_id_from_hex("too-short"), None);
+        assert_eq!(node_id_from_hex(&hex).unwrap(), id);
+        assert!(node_id_from_hex("too-short").is_err());
     }
 
     #[test]
@@ -412,8 +423,25 @@ mod tests {
 
     /// A minimal `[account]`-based Config over a fresh data dir. `capture_dir`
     /// need not exist here — these tests never call `validate()`, only the
-    /// account helpers.
+    /// account helpers. `allow_default_relays` defaults to `false` (production
+    /// default); callers that need the dev-only opt-in use
+    /// [`account_config_allowing_default_relays`].
     fn account_config(data_dir: &Path, hub_url: &str, primary: Option<&str>) -> Config {
+        account_config_with(data_dir, hub_url, primary, false)
+    }
+
+    /// As [`account_config`], but with the dev-only relay opt-in set — for the
+    /// gating-matrix tests (review finding #1).
+    fn account_config_allowing_default_relays(data_dir: &Path, hub_url: &str, primary: Option<&str>) -> Config {
+        account_config_with(data_dir, hub_url, primary, true)
+    }
+
+    fn account_config_with(
+        data_dir: &Path,
+        hub_url: &str,
+        primary: Option<&str>,
+        allow_default_relays: bool,
+    ) -> Config {
         Config {
             capture_dir: data_dir.join("capture"),
             data_dir: data_dir.to_path_buf(),
@@ -422,6 +450,7 @@ mod tests {
                 hub_url: hub_url.to_string(),
                 email: Some("me@example.com".into()),
                 primary_device_id: primary.map(str::to_string),
+                allow_default_relays,
             }),
             mode: Mode::Auto,
             retention: RetentionConfig::default(),
@@ -474,6 +503,7 @@ mod tests {
             hub_url: server.uri(),
             email: Some("me@example.com".into()),
             primary_device_id: None, // exercise auto-pick
+            allow_default_relays: false,
         };
         let config = account_config(tmp.path(), &server.uri(), None);
         let client = HubClient::new(&account.hub_url).unwrap();
@@ -576,6 +606,166 @@ mod tests {
             matches!(resolved.relay_mode, RelayMode::Custom(_)),
             "the cached relay map is used offline"
         );
+    }
+
+    /// Review finding #2: the hub is reachable and answers successfully, but
+    /// the pinned primary is simply not in the device list anymore (unpaired on
+    /// the hub side). `resolve_pairing` must error (not silently resolve to a
+    /// stale cached peer) AND must clear the cached peer so a later hub outage
+    /// can't resurrect the dead pairing.
+    #[tokio::test]
+    async fn resolve_pairing_peer_gone_from_hub_invalidates_and_clears_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "some-other-device", "name": "Laptop", "pubkey": "b3RoZXI=",
+                    "role": null, "peerDeviceId": null,
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), Some("primary-1"));
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        // A prior cache exists — it must NOT be used or left behind.
+        let mut cache = PairingCache::default();
+        cache.primary_device_id = Some("primary-1".into());
+        cache.peer_node_id_hex = Some(node_id_hex(&[11u8; 32]));
+        cache.save(tmp.path());
+
+        let err = resolve_pairing(&config)
+            .await
+            .expect_err("a hub-confirmed-gone peer must not resolve");
+        assert!(
+            format!("{err:#}").to_lowercase().contains("no longer valid"),
+            "error should explain the pairing is invalid: {err:#}"
+        );
+
+        let reloaded = PairingCache::load(tmp.path());
+        assert_eq!(reloaded.peer_node_id_hex, None, "the cached peer must be cleared");
+    }
+
+    /// Review finding #2: the pinned device is present but demoted (role is no
+    /// longer `primary`) — same Invalidated treatment and cache-clear as fully
+    /// absent.
+    #[tokio::test]
+    async fn resolve_pairing_peer_demoted_invalidates_and_clears_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let primary_key = DeviceKey::load_or_create_in(&tmp.path().join("primary")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "primary-1", "name": "Demoted", "pubkey": primary_key.pubkey_base64(),
+                    "role": "capture", "peerDeviceId": null,
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), Some("primary-1"));
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let mut cache = PairingCache::default();
+        cache.primary_device_id = Some("primary-1".into());
+        cache.peer_node_id_hex = Some(node_id_hex(&[11u8; 32]));
+        cache.save(tmp.path());
+
+        let err = resolve_pairing(&config).await.expect_err("a demoted peer must not resolve");
+        assert!(format!("{err:#}").to_lowercase().contains("no longer valid"));
+
+        let reloaded = PairingCache::load(tmp.path());
+        assert_eq!(reloaded.peer_node_id_hex, None, "the cached peer must be cleared");
+    }
+
+    /// Review finding #1: signed in, the hub's relay map is explicitly empty,
+    /// and there is no cached relay map — without the dev-only opt-in this must
+    /// be an actionable error, NOT a silent fallback to iroh's public relays.
+    #[tokio::test]
+    async fn resolve_pairing_empty_relay_map_no_optin_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let primary_key = DeviceKey::load_or_create_in(&tmp.path().join("primary")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "primary-1", "name": "Studio", "pubkey": primary_key.pubkey_base64(),
+                    "role": "primary", "peerDeviceId": null,
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "relays": [] })))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), Some("primary-1")); // allow_default_relays: false
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let err = resolve_pairing(&config)
+            .await
+            .expect_err("an empty hub relay map with no cache and no opt-in must be refused");
+        assert!(
+            format!("{err:#}").contains("refusing"),
+            "error should explain the refusal: {err:#}"
+        );
+    }
+
+    /// Review finding #1: the SAME empty-relay-map scenario, but with
+    /// `[account].allow_default_relays = true` — the dev-only opt-in allows
+    /// falling back to iroh's public default relays.
+    #[tokio::test]
+    async fn resolve_pairing_empty_relay_map_with_optin_uses_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let primary_key = DeviceKey::load_or_create_in(&tmp.path().join("primary")).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "primary-1", "name": "Studio", "pubkey": primary_key.pubkey_base64(),
+                    "role": "primary", "peerDeviceId": null,
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "relays": [] })))
+            .mount(&server)
+            .await;
+
+        let config = account_config_allowing_default_relays(tmp.path(), &server.uri(), Some("primary-1"));
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let resolved = resolve_pairing(&config)
+            .await
+            .expect("the dev-only opt-in must allow the default-relay fallback");
+        assert!(matches!(resolved.relay_mode, RelayMode::Default));
     }
 
     #[test]

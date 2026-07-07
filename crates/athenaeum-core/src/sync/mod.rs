@@ -65,7 +65,7 @@ mod retention_tests;
 pub use engine::{SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS};
 pub use ingest::{ingest_package, IngestOutcome};
 pub use pairing::{
-    node_id_from_ticket, relay_mode_from_urls, resolve_peer, resolve_relays, AccountPairing,
+    node_id_from_ticket, relay_mode_for, resolve_peer, resolve_relays, AccountPairing,
     PeerResolution, RelayResolution,
 };
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
@@ -82,8 +82,10 @@ pub(crate) fn now_iso() -> String {
 }
 
 /// Lowercase-hex rendering of a 32-byte node id (64 chars), used as the stored
-/// `peer` / `peer_device` column value.
-pub(crate) fn node_id_hex(id: &NodeId) -> String {
+/// `peer` / `peer_device` column value. `pub` (not `pub(crate)`) so Perseus (an
+/// external crate) shares this one implementation instead of a local copy
+/// (task M1 review minor (c)).
+pub fn node_id_hex(id: &NodeId) -> String {
     let mut s = String::with_capacity(64);
     for b in id {
         s.push_str(&format!("{b:02x}"));
@@ -92,8 +94,9 @@ pub(crate) fn node_id_hex(id: &NodeId) -> String {
 }
 
 /// Parse the 64-char lowercase-hex form produced by [`node_id_hex`] back into a
-/// [`NodeId`]. Errors on wrong length or non-hex input.
-pub(crate) fn node_id_from_hex(s: &str) -> Result<NodeId> {
+/// [`NodeId`]. Errors on wrong length or non-hex input. `pub` for the same
+/// reason as [`node_id_hex`].
+pub fn node_id_from_hex(s: &str) -> Result<NodeId> {
     if s.len() != 64 {
         return Err(anyhow!("node id hex must be 64 chars, got {}", s.len()));
     }

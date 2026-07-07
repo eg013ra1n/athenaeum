@@ -16,6 +16,7 @@
 //! hub_url = "https://projects.artfrom.space"
 //! email = "me@example.com"                  # optional; prompted at login if absent
 //! primary_device_id = "dev-abc"             # optional; auto-picks the single primary
+//! allow_default_relays = false              # dev only; see AccountConfig docs
 //!
 //! # Route B — dev ticket (offline dev / tests). Optional now that [account] exists.
 //! pairing_ticket = "<paste from primary Settings → Sync (dev)>"
@@ -176,6 +177,15 @@ pub struct AccountConfig {
     /// auto-picks the account's single `primary` device.
     #[serde(default)]
     pub primary_device_id: Option<String>,
+    /// **Dev only.** When the hub's relay map is empty/unreachable and there is
+    /// no cached relay map yet, allow falling back to iroh's public default
+    /// relays (task M1 review finding #1). Defaults to `false` — a signed-in
+    /// production Perseus agent must not silently start riding the public n0
+    /// relays just because the hub is misconfigured; that failure should be
+    /// loud. Set `true` only for dev/test environments without a hub relay
+    /// deployment.
+    #[serde(default)]
+    pub allow_default_relays: bool,
 }
 
 impl Default for AccountConfig {
@@ -184,6 +194,7 @@ impl Default for AccountConfig {
             hub_url: default_hub_url(),
             email: None,
             primary_device_id: None,
+            allow_default_relays: false,
         }
     }
 }
@@ -501,6 +512,10 @@ dry_run = true
         assert_eq!(account.hub_url, DEFAULT_HUB_URL, "hub_url defaults to the production hub");
         assert_eq!(account.email.as_deref(), Some("me@example.com"));
         assert!(account.primary_device_id.is_none(), "primary auto-picked when omitted");
+        assert!(
+            !account.allow_default_relays,
+            "allow_default_relays must default to false (task M1 review finding #1)"
+        );
     }
 
     /// Task M1: account + explicit hub_url + primary_device_id all parse.
@@ -516,6 +531,7 @@ mode = "auto"
 hub_url = "https://staging.example.org"
 email = "me@example.com"
 primary_device_id = "dev-primary-1"
+allow_default_relays = true
 [retention]
 policy = "keep_everything"
 dry_run = true
@@ -525,6 +541,7 @@ dry_run = true
         let account = Config::from_toml_str(&text).unwrap().account.unwrap();
         assert_eq!(account.hub_url, "https://staging.example.org");
         assert_eq!(account.primary_device_id.as_deref(), Some("dev-primary-1"));
+        assert!(account.allow_default_relays, "explicit true must parse through");
     }
 
     /// Task M1: neither a pairing route present → rejected with an actionable

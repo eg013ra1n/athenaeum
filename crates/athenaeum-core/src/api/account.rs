@@ -128,6 +128,17 @@ fn clear_local_session(ctx: &ServiceContext, cfg: &AccountConfig) -> Result<(), 
     clear_state(ctx, keys::ACCOUNT_DEVICE_ID)?;
     clear_state(ctx, keys::ACCOUNT_ROLE)?;
     clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?;
+    clear_sync_caches(ctx)?;
+    Ok(())
+}
+
+/// Clear the sync pairing caches (peer + relay map; task M1 review minor (a)).
+/// A signed-out device must not keep offering a stale peer/relay-map cache to
+/// the next sign-in's resolution. Extracted into its own function so it is
+/// unit-testable without exercising [`clear_local_session`]'s keychain call.
+fn clear_sync_caches(ctx: &ServiceContext) -> Result<(), ApiError> {
+    clear_state(ctx, keys::SYNC_CACHED_PEER)?;
+    clear_state(ctx, keys::SYNC_CACHED_RELAYS)?;
     Ok(())
 }
 
@@ -467,5 +478,67 @@ mod tests {
             ApiError::Conflict(msg) => assert_eq!(msg, "device public key already registered"),
             other => panic!("expected ApiError::Conflict, got {other:?}"),
         }
+    }
+
+    /// Task M1 review minor (a): sign-out (via `clear_sync_caches`, the piece of
+    /// `clear_local_session` that doesn't touch the keychain) must also drop the
+    /// sync pairing caches — a signed-out device must not keep offering a stale
+    /// peer/relay-map cache to whatever signs in next.
+    #[test]
+    fn clear_sync_caches_removes_peer_and_relay_settings() {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        #[cfg(all(feature = "render", feature = "solver"))]
+        use std::sync::RwLock;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        {
+            let conn = database.conn();
+            crate::db::set_setting(&conn, keys::SYNC_CACHED_PEER, &"aa".repeat(32)).unwrap();
+            crate::db::set_setting(&conn, keys::SYNC_CACHED_RELAYS, "https://relay1.example.org").unwrap();
+        }
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(database);
+        let ctx = ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            dso_catalog: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            star_cache: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+        };
+
+        clear_sync_caches(&ctx).unwrap();
+
+        let conn = db(&ctx).unwrap().conn();
+        assert_eq!(
+            crate::db::get_setting(&conn, keys::SYNC_CACHED_PEER).unwrap(),
+            None,
+            "the cached peer setting must be gone"
+        );
+        assert_eq!(
+            crate::db::get_setting(&conn, keys::SYNC_CACHED_RELAYS).unwrap(),
+            None,
+            "the cached relay map setting must be gone"
+        );
     }
 }

@@ -20,8 +20,8 @@ use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
 use athenaeum_core::sync::{
-    evaluate_and_apply, DeleteOutcome, Direction, HistoryRow, OutboundRow, RetentionOutcome,
-    SyncEngine, SyncEngineHandle,
+    evaluate_and_apply, node_id_hex, DeleteOutcome, Direction, HistoryRow, OutboundRow,
+    RetentionOutcome, SyncEngine, SyncEngineHandle,
 };
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
@@ -32,16 +32,6 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::seen::{SeenStore, SourceLink};
 use crate::watcher::{self, WatcherHandle};
-
-/// Lowercase-hex (64 char) rendering of a 32-byte node id — the same format the
-/// sync store uses for its `peer`/`origin_device` columns.
-fn node_id_hex(id: &NodeId) -> String {
-    let mut s = String::with_capacity(64);
-    for b in id {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
 
 /// Parse a pairing ticket string into its `EndpointTicket`. Factored out so the
 /// string is only ever parsed once per call site: [`Agent::start`] derives both

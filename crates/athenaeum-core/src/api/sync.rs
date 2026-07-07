@@ -111,11 +111,25 @@ fn store_cached_peer(ctx: &ServiceContext, peer: &crate::sharing::types::NodeId)
     }
 }
 
+/// Clear the cached peer (task M1 review finding #2): the hub authoritatively
+/// said the paired primary is gone or demoted, so a stale cached peer must not
+/// keep being served on a later hub outage. Best-effort — a failure here just
+/// means a possible one-time stale resolution on the next offline start.
+fn clear_cached_peer(ctx: &ServiceContext) {
+    if let Ok(db) = db(ctx) {
+        let conn = db.conn();
+        if let Err(e) = crate::db::delete_setting(&conn, keys::SYNC_CACHED_PEER) {
+            tracing::warn!(error = %e, "failed to clear invalidated cached peer");
+        }
+    }
+}
+
 /// Resolve the [`iroh::RelayMode`] for the transport: the hub's relay map when
-/// signed in (persisting it as the offline cache), else the last cached map, else
-/// iroh's default relays. Never fails — a resolution problem degrades to default
-/// relays, so the transport always builds.
-async fn resolve_relay_mode(ctx: &ServiceContext) -> iroh::RelayMode {
+/// signed in (persisting it as the offline cache), else the last cached map.
+/// Falling back to iroh's default relays beyond that requires the dev flag
+/// (task M1 review finding #1) — otherwise this returns an actionable error
+/// rather than silently starting the transport on public infrastructure.
+async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<iroh::RelayMode, ApiError> {
     let creds = crate::api::account::hub_credentials(ctx).unwrap_or(None);
     let cached = cached_relays(ctx).unwrap_or_default();
     let account = creds.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
@@ -123,14 +137,17 @@ async fn resolve_relay_mode(ctx: &ServiceContext) -> iroh::RelayMode {
     if res.fresh {
         store_cached_relays(ctx, &res.urls);
     }
-    pairing::relay_mode_from_urls(&res.urls)
+    let allow_default = dev_pairing_enabled(ctx)?;
+    pairing::relay_mode_for(&res.urls, allow_default).map_err(ApiError::Internal)
 }
 
 /// Resolve this device's sync peer following the documented order (task M1):
 /// account pairing (capture role + paired primary, resolved from the hub, with
 /// the last cached peer as an offline fallback) → dev-flag ticket → disabled.
 /// The single seam shared by the app's capture-role sender and Perseus. A fresh
-/// account resolution is cached for the next offline start.
+/// account resolution is cached for the next offline start; a hub-confirmed
+/// gone/demoted peer ([`PeerResolution::Invalidated`]) clears that cache instead
+/// (review finding #2) so a later hub outage can't resurrect a dead pairing.
 pub async fn resolve_capture_peer(ctx: &ServiceContext) -> Result<PeerResolution, ApiError> {
     let account = crate::api::account::account_pairing(ctx)?;
     // The app has no *peer* ticket to dial: the dev flag only makes the app's own
@@ -138,10 +155,21 @@ pub async fn resolve_capture_peer(ctx: &ServiceContext) -> Result<PeerResolution
     // sole capture-send route. Perseus keeps the ticket path (it holds one).
     let cached = cached_peer(ctx)?;
     let resolution = pairing::resolve_peer(account.as_ref(), None, cached).await;
-    if let PeerResolution::Account { peer, fresh: true } = &resolution {
-        store_cached_peer(ctx, peer);
-    }
+    persist_peer_resolution(ctx, &resolution);
     Ok(resolution)
+}
+
+/// The cache side effects of a peer resolution (task M1 review finding #2): a
+/// fresh account resolution refreshes the cache; a hub-confirmed
+/// gone/demoted peer clears it instead, so a later hub outage can't resurrect a
+/// pairing the hub already invalidated. Extracted from [`resolve_capture_peer`]
+/// so it is unit-testable without exercising the account/keychain plumbing.
+fn persist_peer_resolution(ctx: &ServiceContext, resolution: &PeerResolution) {
+    match resolution {
+        PeerResolution::Account { peer, fresh: true } => store_cached_peer(ctx, peer),
+        PeerResolution::Invalidated { .. } => clear_cached_peer(ctx),
+        _ => {}
+    }
 }
 
 /// Boot-time autostart: if the dev flag is enabled, start the receiver +
@@ -158,7 +186,7 @@ pub async fn autostart_if_enabled(
         return Ok(false);
     }
     let (sync_dir, db_path) = sync_paths(ctx)?;
-    let relay_mode = resolve_relay_mode(ctx).await;
+    let relay_mode = resolve_relay_mode(ctx).await?;
     sync.ensure_started(sync_dir, db_path, relay_mode, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
@@ -181,7 +209,7 @@ pub async fn get_pairing_ticket(
         ));
     }
     let (sync_dir, db_path) = sync_paths(ctx)?;
-    let relay_mode = resolve_relay_mode(ctx).await;
+    let relay_mode = resolve_relay_mode(ctx).await?;
 
     let ticket = sync
         .ensure_started(sync_dir, db_path, relay_mode, emitter)
@@ -226,4 +254,123 @@ pub fn list_history(ctx: &ServiceContext, query: SyncHistoryQuery) -> Result<Vec
     let db = db(ctx)?;
     let conn = db.conn();
     search_history_rows(&conn, &q).map_err(|e| ApiError::Internal(format!("{e:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
+    /// involved anywhere) for exercising the settings-backed sync caches
+    /// directly. Mirrors the construction pattern in `api::masters` tests.
+    fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        #[cfg(all(feature = "render", feature = "solver"))]
+        use std::sync::RwLock;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(database);
+        let ctx = ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            dso_catalog: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            star_cache: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+        };
+        (tmp, ctx)
+    }
+
+    /// The peer cache round-trips: store → read back → clear → gone. Proves the
+    /// exact mechanic [`persist_peer_resolution`] relies on for the
+    /// `Invalidated` case (review finding #2's "assert the setting is gone").
+    #[test]
+    fn cached_peer_store_then_clear_removes_the_setting() {
+        let (_tmp, ctx) = test_ctx();
+        let peer = [7u8; 32];
+        assert_eq!(cached_peer(&ctx).unwrap(), None, "nothing cached yet");
+
+        store_cached_peer(&ctx, &peer);
+        assert_eq!(cached_peer(&ctx).unwrap(), Some(peer));
+
+        clear_cached_peer(&ctx);
+        assert_eq!(cached_peer(&ctx).unwrap(), None, "the cached peer setting must be gone");
+    }
+
+    /// Review finding #2: `PeerResolution::Invalidated` clears an existing
+    /// cached peer (not "leave it, next resolve wins") — a subsequent hub
+    /// outage must not resurrect a pairing the hub already said is dead.
+    #[test]
+    fn invalidated_resolution_clears_an_existing_cache() {
+        let (_tmp, ctx) = test_ctx();
+        store_cached_peer(&ctx, &[1u8; 32]);
+        assert!(cached_peer(&ctx).unwrap().is_some(), "precondition: a cache exists");
+
+        persist_peer_resolution(
+            &ctx,
+            &PeerResolution::Invalidated { reason: "gone".to_string() },
+        );
+        assert_eq!(cached_peer(&ctx).unwrap(), None, "Invalidated must clear the cache");
+    }
+
+    /// A fresh account resolution stores the new peer as the cache.
+    #[test]
+    fn fresh_account_resolution_stores_the_cache() {
+        let (_tmp, ctx) = test_ctx();
+        let peer = [2u8; 32];
+        persist_peer_resolution(&ctx, &PeerResolution::Account { peer, fresh: true });
+        assert_eq!(cached_peer(&ctx).unwrap(), Some(peer));
+    }
+
+    /// A non-fresh (cached-fallback) resolution must NOT rewrite the cache —
+    /// it already came FROM the cache, re-storing it is a harmless no-op at
+    /// best and a footgun if the semantics ever drift.
+    #[test]
+    fn stale_account_resolution_does_not_touch_the_cache() {
+        let (_tmp, ctx) = test_ctx();
+        let original = [3u8; 32];
+        store_cached_peer(&ctx, &original);
+
+        persist_peer_resolution(
+            &ctx,
+            &PeerResolution::Account { peer: [9u8; 32], fresh: false },
+        );
+        assert_eq!(
+            cached_peer(&ctx).unwrap(),
+            Some(original),
+            "a non-fresh resolution must not overwrite the existing cache"
+        );
+    }
+
+    /// The relay-map cache round-trips through settings the same way.
+    #[test]
+    fn cached_relays_round_trip() {
+        let (_tmp, ctx) = test_ctx();
+        assert_eq!(cached_relays(&ctx).unwrap(), Vec::<String>::new());
+
+        let urls = vec!["https://relay1.example.org".to_string(), "https://relay2.example.org".to_string()];
+        store_cached_relays(&ctx, &urls);
+        assert_eq!(cached_relays(&ctx).unwrap(), urls);
+    }
 }
