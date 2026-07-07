@@ -73,6 +73,24 @@ pub fn mtime_millis(t: Option<SystemTime>) -> i64 {
         .unwrap_or(0)
 }
 
+/// A resolved *live* source-file linkage for a confirmed package: the capture
+/// file path plus the `(size, mtime_ms)` perseus recorded when it enqueued that
+/// file.
+///
+/// The recorded stat is retention's last-line TOCTOU guard (review IMPORTANT
+/// #2): a concurrent re-enqueue could rewrite the same path between resolving
+/// this linkage and actually removing the file, so the caller must re-stat the
+/// file immediately before deletion and compare against `size`/`mtime_ms` —
+/// carried here so [`source_for_package`](SeenStore::source_for_package) is the
+/// single place that reads both facts together (no separate round-trip that
+/// could itself race).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLink {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
 /// Durable "have we already enqueued exactly this file?" record.
 pub struct SeenStore {
     conn: Mutex<Connection>,
@@ -167,7 +185,9 @@ impl SeenStore {
 
     /// Resolve the *live* source capture file for a confirmed package
     /// (`package_ref` = `sync_outbound.package_ref`), or `None` when there is no
-    /// live linkage.
+    /// live linkage. Returns the recorded `(size, mtime_ms)` alongside the path
+    /// (see [`SourceLink`]) — the caller's last-line guard against a concurrent
+    /// re-enqueue rewriting this exact path before the delete happens.
     ///
     /// "Live" means `deleted_at IS NULL`: a row whose source retention has
     /// already deleted, or whose path was since re-enqueued under a **newer**
@@ -175,17 +195,21 @@ impl SeenStore {
     /// package), does not surface. This is exactly the safety property retention
     /// needs — it will only ever be handed a source that (a) belongs to this
     /// confirmed package and (b) has not already been handled.
-    pub fn source_for_package(&self, package_ref: &str) -> Result<Option<PathBuf>> {
+    pub fn source_for_package(&self, package_ref: &str) -> Result<Option<SourceLink>> {
         let conn = self.conn.lock().expect("seen store mutex poisoned");
-        let row: Option<String> = conn
+        let row: Option<(String, i64, i64)> = conn
             .query_row(
-                "SELECT path FROM perseus_seen WHERE package_ref = ?1 AND deleted_at IS NULL",
+                "SELECT path, size, mtime FROM perseus_seen WHERE package_ref = ?1 AND deleted_at IS NULL",
                 params![package_ref],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .context("query source_for_package")?;
-        Ok(row.map(PathBuf::from))
+        Ok(row.map(|(path, size, mtime_ms)| SourceLink {
+            path: PathBuf::from(path),
+            size: size.max(0) as u64,
+            mtime_ms,
+        }))
     }
 
     /// Stamp a source row `deleted_at = now` after retention removed it, so it
@@ -280,8 +304,8 @@ mod tests {
         store.mark_enqueued(&p, 100, 111, "/data/packages/uuid-1").unwrap();
         assert_eq!(
             store.source_for_package("/data/packages/uuid-1").unwrap(),
-            Some(p),
-            "a confirmed package's source capture file must be resolvable"
+            Some(SourceLink { path: p, size: 100, mtime_ms: 111 }),
+            "a confirmed package's source capture file (with its recorded stat) must be resolvable"
         );
     }
 
@@ -321,7 +345,7 @@ mod tests {
         store.mark_enqueued(&p, 200, 222, "/data/packages/uuid-2").unwrap();
         assert_eq!(
             store.source_for_package("/data/packages/uuid-2").unwrap(),
-            Some(p),
+            Some(SourceLink { path: p, size: 200, mtime_ms: 222 }),
             "a re-enqueue clears deleted_at and relinks to the new package"
         );
         assert_eq!(

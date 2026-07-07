@@ -64,7 +64,7 @@ mod retention_tests;
 pub use engine::{SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS};
 pub use ingest::{ingest_package, IngestOutcome};
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
-pub use retention::{evaluate_and_apply, RetentionOutcome, RetentionPolicy};
+pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{
     SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime, SyncStatus,
 };

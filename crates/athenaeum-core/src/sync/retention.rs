@@ -50,14 +50,39 @@
 //! # The deleter seam
 //!
 //! Actual removal is abstracted behind `deleter: &mut dyn FnMut(&Path) ->
-//! Result<()>`. Perseus supplies a closure that maps the confirmed package back
-//! to its original capture file (via its own `perseus_seen` table — see the
-//! crate-external plumbing), removes it, and writes a `sync_history` audit row
-//! (`outcome = "retention_deleted"`). The app shell (task M4) will instead route
-//! deletion through the `file_op` pipeline. Core stays agnostic: it decides
-//! *which* confirmed subjects are eligible and logs the decision; the deleter
-//! performs the side effect and owns any audit write, because only it has the
-//! frame metadata.
+//! Result<DeleteOutcome>`. Perseus supplies a closure that maps the confirmed
+//! package back to its original capture file (via its own `perseus_seen` table —
+//! see the crate-external plumbing), removes it, and writes a `sync_history`
+//! audit row (`outcome = "retention_deleted"`). The app shell (task M4) will
+//! instead route deletion through the `file_op` pipeline. Core stays agnostic:
+//! it decides *which* confirmed subjects are eligible and logs the decision; the
+//! deleter performs the side effect and owns any audit write, because only it
+//! has the frame metadata.
+//!
+//! **Deleter contract (binding on every implementation, not just Perseus's):**
+//!
+//! 1. **Audit before the destructive action.** The deleter must persist its
+//!    audit trail (a `sync_history` row, or whatever the host's equivalent is)
+//!    *before* removing the file, and must return `Err` — leaving the file in
+//!    place — if that persistence fails. A delete is only allowed to happen once
+//!    it is durably discoverable that it happened; "file gone, audit missing" is
+//!    the one outcome this contract forbids.
+//! 2. **Report what actually happened.** Return
+//!    [`DeleteOutcome::Removed`] only when a real removal occurred;
+//!    [`DeleteOutcome::SkippedNoop`] for any legitimate no-op (the source was
+//!    already gone, the linkage was already superseded, a last-line guard
+//!    declined). [`evaluate_and_apply`] only counts `Removed` toward
+//!    [`RetentionOutcome::deleted`] and only logs `retention_deleted` at `info`
+//!    for `Removed` — a `SkippedNoop` logs at `debug` and never inflates the
+//!    reported deletion count.
+//! 3. **Re-verify immediately before removal (TOCTOU guard).** Core resolves
+//!    *which package* to delete, but never touches a filesystem itself — only
+//!    the deleter can check that the subject hasn't changed since it was
+//!    resolved. A concurrent re-enqueue rewriting the same path between
+//!    resolution and removal must cause the deleter to skip, not delete new
+//!    (unconfirmed) content. Perseus's `retention_delete_source` implements this
+//!    by comparing the file's current `(size, mtime)` against what was recorded
+//!    at enqueue time, immediately before `remove_file`.
 //!
 //! # Clock injection (signature note)
 //!
@@ -101,6 +126,22 @@ impl RetentionPolicy {
             RetentionPolicy::DiskPct { .. } => "disk_pct",
         }
     }
+}
+
+/// What one `deleter` invocation actually did to its subject.
+///
+/// See the deleter-contract section of the [module docs](self). Distinguishing
+/// a real removal from a legitimate no-op is what lets [`evaluate_and_apply`]
+/// report [`RetentionOutcome::deleted`] and log `retention_deleted` **only** for
+/// a file that truly left disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The subject was actually removed. By contract the deleter has already
+    /// persisted its audit trail before returning this.
+    Removed,
+    /// Nothing was removed — already handled, guard declined, or any other
+    /// legitimate no-op. Never counted toward `deleted`, logged at `debug`.
+    SkippedNoop,
 }
 
 /// The result of one retention pass.
@@ -161,7 +202,7 @@ pub fn evaluate_and_apply(
     dry_run: bool,
     now: DateTime<Utc>,
     disk_probe: &dyn Fn() -> u8,
-    deleter: &mut dyn FnMut(&Path) -> Result<()>,
+    deleter: &mut dyn FnMut(&Path) -> Result<DeleteOutcome>,
 ) -> Result<RetentionOutcome> {
     // ── THE SINGLE CHOKEPOINT ────────────────────────────────────────────────
     // The ONLY source of deletable paths in this function. `confirmed()` returns
@@ -232,7 +273,7 @@ pub fn evaluate_and_apply(
         }
 
         match deleter(path) {
-            Ok(()) => {
+            Ok(DeleteOutcome::Removed) => {
                 tracing::info!(
                     path = %path.display(),
                     policy = policy.label(),
@@ -240,6 +281,13 @@ pub fn evaluate_and_apply(
                     "retention deleted"
                 );
                 outcome.deleted.push(path.clone());
+            }
+            Ok(DeleteOutcome::SkippedNoop) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    policy = policy.label(),
+                    "retention: candidate skipped (no-op — already handled or guard declined)"
+                );
             }
             Err(error) => {
                 // Never swallow: a delete failure is logged and the file simply

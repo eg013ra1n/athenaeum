@@ -20,8 +20,8 @@ use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
 use athenaeum_core::sync::{
-    evaluate_and_apply, Direction, HistoryRow, OutboundRow, RetentionOutcome, SyncEngine,
-    SyncEngineHandle,
+    evaluate_and_apply, DeleteOutcome, Direction, HistoryRow, OutboundRow, RetentionOutcome,
+    SyncEngine, SyncEngineHandle,
 };
 use chrono::{DateTime, Utc};
 use iroh::RelayMode;
@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::seen::SeenStore;
+use crate::seen::{SeenStore, SourceLink};
 use crate::watcher::{self, WatcherHandle};
 
 /// Lowercase-hex (64 char) rendering of a 32-byte node id — the same format the
@@ -492,66 +492,172 @@ fn disk_usage_pct(_path: &Path) -> u8 {
     0
 }
 
+/// Pure guard: does `current_size`/`current_mtime_ms` match the `(size,
+/// mtime_ms)` perseus recorded for this source at enqueue time? Extracted as a
+/// free function purely so the TOCTOU-guard test can drive the comparison
+/// directly rather than depending on real filesystem race timing.
+fn source_stat_unchanged(link: &SourceLink, current_size: u64, current_mtime_ms: i64) -> bool {
+    link.size == current_size && link.mtime_ms == current_mtime_ms
+}
+
+/// Build the `sync_history` audit row(s) for deleting `source`. The package
+/// manifest is the source of truth for frame identity/bytes/object; when it
+/// can't be read (or is unexpectedly empty) this falls back to one minimal row
+/// (blank identity fields, `bytes` from the live file stat) — a degraded audit
+/// beats no audit at all, but there is always at least one row to persist.
+fn build_retention_history_rows(pkg_ref: &Path, source: &Path, byte_size: u64) -> Vec<HistoryRow> {
+    let records = match read_manifest(pkg_ref) {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(
+                package_ref = %pkg_ref.display(),
+                %error,
+                "retention: manifest unreadable; writing a minimal fallback audit row"
+            );
+            Vec::new()
+        }
+    };
+
+    if records.is_empty() {
+        let filename = source
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        return vec![HistoryRow {
+            frame_uuid: String::new(),
+            filename,
+            object: None,
+            peer_device: String::new(),
+            direction: Direction::Sent,
+            bytes: byte_size,
+            started_at: now_iso(),
+            finished_at: Some(now_iso()),
+            outcome: "retention_deleted".to_string(),
+        }];
+    }
+
+    records
+        .iter()
+        .map(|r| {
+            let object = r
+                .frame_meta
+                .get("object")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            HistoryRow {
+                frame_uuid: r.frame_uuid.clone(),
+                filename: r.rel_path.clone(),
+                object,
+                peer_device: r.origin_device.clone(),
+                direction: Direction::Sent,
+                bytes: r.byte_size,
+                started_at: now_iso(),
+                finished_at: Some(now_iso()),
+                outcome: "retention_deleted".to_string(),
+            }
+        })
+        .collect()
+}
+
 /// The retention deleter (fs remove + audit history + seen-store update) for one
 /// confirmed package. `pkg_ref` is `sync_outbound.package_ref` (the package
 /// directory) — the abstract deletable subject core hands us; here we resolve it
 /// back to the *original source capture file* and remove that.
 ///
-/// Idempotent and safe by construction: if there is no *live* source linkage
-/// (already retention-deleted, or the path was re-enqueued under a newer
-/// package), it is a logged no-op — never an error, never a stray delete.
+/// Implements the deleter contract from `sync::retention`'s module docs:
+///
+/// - **Audit before delete.** The `sync_history` row(s) are persisted BEFORE
+///   `remove_file` runs; if persistence fails, the `?` below propagates and the
+///   file is never touched — a delete only ever happens once it is durably
+///   discoverable that it happened.
+/// - **Honest [`DeleteOutcome`].** Only a real `remove_file` reports `Removed`;
+///   every legitimate no-op (no live linkage, already gone out-of-band, stat
+///   drift since confirmation) reports `SkippedNoop` and is never mistaken for
+///   an actual deletion by the caller.
+/// - **Last-line TOCTOU guard.** Immediately before removal, the source is
+///   re-stat'd and compared against what was recorded when it was enqueued — a
+///   concurrent re-enqueue rewriting this exact path since confirmation aborts
+///   the delete rather than destroying new, unconfirmed content.
+///
+/// `store` is `&dyn SyncStore` (not the concrete `StandaloneSyncStore`) purely
+/// for testability: it lets a test inject a store whose `append_history`
+/// deliberately fails, proving the audit-before-delete refusal.
 fn retention_delete_source(
-    store: &StandaloneSyncStore,
+    store: &dyn SyncStore,
     seen: &SeenStore,
     pkg_ref: &Path,
-) -> Result<()> {
+) -> Result<DeleteOutcome> {
     let pkg_ref_str = pkg_ref.to_string_lossy();
 
-    let Some(source) = seen.source_for_package(&pkg_ref_str)? else {
-        tracing::warn!(
+    let Some(link) = seen.source_for_package(&pkg_ref_str)? else {
+        tracing::debug!(
             package_ref = %pkg_ref.display(),
             "retention: no live source linkage for confirmed package; skipping (already deleted or superseded)"
         );
-        return Ok(());
+        return Ok(DeleteOutcome::SkippedNoop);
     };
+    let source = link.path.clone();
 
-    // Audit metadata comes from the package manifest (frame uuid / filename /
-    // bytes / object) — never from the perseus_seen row, keeping core's history
-    // schema the single source of truth for a transfer record.
-    let records = read_manifest(pkg_ref).unwrap_or_else(|error| {
-        tracing::warn!(package_ref = %pkg_ref.display(), %error, "retention: manifest unreadable; history rows will be minimal");
-        Vec::new()
-    });
-
-    // Remove the source capture file (idempotent: absent = goal already met).
-    if source.exists() {
-        std::fs::remove_file(&source)
-            .with_context(|| format!("retention delete source {}", source.display()))?;
+    // Out-of-band removal: something other than retention already removed the
+    // file (manual cleanup, external tool). Stamp the linkage dead so it stops
+    // being offered again, but this was never a retention deletion — no audit
+    // row, and a distinct, honest outcome tag in the log.
+    if !source.exists() {
+        tracing::info!(
+            path = %source.display(),
+            package_ref = %pkg_ref.display(),
+            outcome = "retention_source_missing",
+            "retention: source already gone out-of-band; marking linkage dead"
+        );
+        seen.mark_deleted(&source)?;
+        return Ok(DeleteOutcome::SkippedNoop);
     }
 
-    // One audit row per manifest record (one-file packages → one row).
-    for r in &records {
-        let object = r
-            .frame_meta
-            .get("object")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        store.append_history(HistoryRow {
-            frame_uuid: r.frame_uuid.clone(),
-            filename: r.rel_path.clone(),
-            object,
-            peer_device: r.origin_device.clone(),
-            direction: Direction::Sent,
-            bytes: r.byte_size,
-            started_at: now_iso(),
-            finished_at: Some(now_iso()),
-            outcome: "retention_deleted".to_string(),
-        })?;
+    // TOCTOU last-line guard: re-stat immediately before removal and require an
+    // exact match against what was recorded when this source was enqueued. A
+    // mismatch means a concurrent re-enqueue rewrote this path with new
+    // (unconfirmed) content since the package was confirmed — deleting it would
+    // destroy live, never-synced data.
+    let current_meta = std::fs::metadata(&source)
+        .with_context(|| format!("stat source before delete {}", source.display()))?;
+    let current_mtime_ms = crate::seen::mtime_millis(current_meta.modified().ok());
+    if !source_stat_unchanged(&link, current_meta.len(), current_mtime_ms) {
+        tracing::warn!(
+            path = %source.display(),
+            package_ref = %pkg_ref.display(),
+            "retention skip: source changed since confirmation"
+        );
+        return Ok(DeleteOutcome::SkippedNoop);
     }
 
-    // Stamp the seen row deleted so it never surfaces to retention again.
-    seen.mark_deleted(&source)?;
-    Ok(())
+    // ── Audit BEFORE the destructive action ─────────────────────────────────
+    // If even the fallback row can't be persisted, the `?` propagates and the
+    // delete is refused entirely this tick — `source` is never touched.
+    let history_rows = build_retention_history_rows(pkg_ref, &source, current_meta.len());
+    for h in &history_rows {
+        store
+            .append_history(h.clone())
+            .with_context(|| format!("persist retention audit for {}", source.display()))?;
+    }
+
+    // Only now, with the audit durably persisted, perform the destructive
+    // action.
+    std::fs::remove_file(&source)
+        .with_context(|| format!("retention delete source {}", source.display()))?;
+
+    // Best-effort: a failure here is logged but never rolled back — the audit
+    // row already exists, so "this was deleted and audited" is already the
+    // durable fact; only the seen-store's own bookkeeping would be stale.
+    if let Err(error) = seen.mark_deleted(&source) {
+        tracing::error!(
+            path = %source.display(),
+            %error,
+            "retention: failed to stamp seen row deleted after a successful delete"
+        );
+    }
+
+    Ok(DeleteOutcome::Removed)
 }
 
 /// Run one retention pass synchronously: map the config policy onto core's
@@ -733,11 +839,46 @@ mod tests {
 mod retention_tests {
     use super::*;
 
-    use athenaeum_core::sync::{HistoryQuery, SyncStore};
+    use athenaeum_core::package::MANIFEST_FILENAME;
+    use athenaeum_core::sharing::types::FrameReceipt;
+    use athenaeum_core::sync::{HistoryQuery, OutboundState, SyncStore};
 
     use crate::config::RetentionPolicy as CfgPolicy;
 
     const PEER: NodeId = [3u8; 32];
+
+    /// Test-only store wrapper that fails every `append_history` call,
+    /// delegating everything else to the wrapped real store. Proves the
+    /// audit-before-delete refusal (review IMPORTANT #1): if the audit can't be
+    /// persisted, the source file must survive.
+    struct FailingAppendHistoryStore<'a>(&'a StandaloneSyncStore);
+
+    impl SyncStore for FailingAppendHistoryStore<'_> {
+        fn enqueue(&self, package_ref: &str, peer: NodeId) -> Result<i64> {
+            self.0.enqueue(package_ref, peer)
+        }
+        fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
+            self.0.set_state(id, s)
+        }
+        fn bump_attempts(&self, id: i64) -> Result<u32> {
+            self.0.bump_attempts(id)
+        }
+        fn non_terminal(&self) -> Result<Vec<OutboundRow>> {
+            self.0.non_terminal()
+        }
+        fn confirmed(&self) -> Result<Vec<OutboundRow>> {
+            self.0.confirmed()
+        }
+        fn confirm(&self, id: i64, receipts: &[FrameReceipt]) -> Result<()> {
+            self.0.confirm(id, receipts)
+        }
+        fn append_history(&self, _h: HistoryRow) -> Result<()> {
+            Err(anyhow::anyhow!("simulated append_history failure"))
+        }
+        fn search_history(&self, q: HistoryQuery) -> Result<Vec<HistoryRow>> {
+            self.0.search_history(q)
+        }
+    }
 
     /// A config over fresh tempdirs with an existing `capture_dir` (validate()
     /// requires it). Returns the tempdir guard so the dirs outlive the test.
@@ -784,7 +925,10 @@ mod retention_tests {
     }
 
     /// Register a source file → package: enqueue the outbound row, link the seen
-    /// row, return `(package_ref, outbound_id)`.
+    /// row (with the file's REAL current `(size, mtime)`, exactly as
+    /// `record_seen` does in production — this is what makes the TOCTOU
+    /// stat-match guard meaningful in these tests), return `(package_ref,
+    /// outbound_id)`.
     fn register(
         config: &Config,
         store: &StandaloneSyncStore,
@@ -793,11 +937,13 @@ mod retention_tests {
     ) -> (PathBuf, i64) {
         let pkg = make_package(&config.packages_dir(), src, "M42");
         let id = store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
-        seen.mark_enqueued(src, 4, 1, &pkg.to_string_lossy()).unwrap();
+        let meta = std::fs::metadata(src).unwrap();
+        let mtime_ms = crate::seen::mtime_millis(meta.modified().ok());
+        seen.mark_enqueued(src, meta.len(), mtime_ms, &pkg.to_string_lossy()).unwrap();
         (pkg, id)
     }
 
-    fn history_deleted_count(store: &StandaloneSyncStore) -> usize {
+    fn history_outcome_count(store: &StandaloneSyncStore, outcome: &str) -> usize {
         store
             .search_history(HistoryQuery {
                 filename: None,
@@ -806,8 +952,12 @@ mod retention_tests {
             })
             .unwrap()
             .iter()
-            .filter(|h| h.outcome == "retention_deleted")
+            .filter(|h| h.outcome == outcome)
             .count()
+    }
+
+    fn history_deleted_count(store: &StandaloneSyncStore) -> usize {
+        history_outcome_count(store, "retention_deleted")
     }
 
     /// Real-delete mode: a confirmed package's source is deleted, an audit row is
@@ -847,7 +997,7 @@ mod retention_tests {
             "a deleted source no longer resolves"
         );
         assert_eq!(
-            seen.source_for_package(&pku.to_string_lossy()).unwrap(),
+            seen.source_for_package(&pku.to_string_lossy()).unwrap().map(|l| l.path),
             Some(su.clone()),
             "the unconfirmed package's source stays live and resolvable"
         );
@@ -872,7 +1022,7 @@ mod retention_tests {
         assert!(s1.exists(), "the file remains on disk");
         assert_eq!(history_deleted_count(&store), 0, "no audit rows in dry-run");
         assert_eq!(
-            seen.source_for_package(&pkg1.to_string_lossy()).unwrap(),
+            seen.source_for_package(&pkg1.to_string_lossy()).unwrap().map(|l| l.path),
             Some(s1),
             "the seen linkage is untouched"
         );
@@ -901,9 +1051,153 @@ mod retention_tests {
         assert!(s1.exists(), "the unconfirmed source survives a full disk");
         assert_eq!(history_deleted_count(&store), 0);
         assert_eq!(
-            seen.source_for_package(&pkg1.to_string_lossy()).unwrap(),
+            seen.source_for_package(&pkg1.to_string_lossy()).unwrap().map(|l| l.path),
             Some(s1),
             "the source is still live (never deleted)"
+        );
+    }
+
+    // ── review fixes (audit-before-delete + TOCTOU guard) ────────────────────
+
+    /// IMPORTANT #1(a): an unreadable manifest must not silence the audit trail
+    /// — the delete still proceeds via a minimal fallback `retention_deleted`
+    /// row rather than zero history rows.
+    #[test]
+    fn manifest_unreadable_falls_back_to_minimal_audit_row() {
+        let (_tmp, mut config, store, seen) = setup();
+        config.retention.dry_run = false;
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        let (pkg1, id1) = register(&config, &store, &seen, &s1);
+        store.confirm(id1, &[]).unwrap();
+
+        // Corrupt the package: remove its manifest so `read_manifest` fails.
+        std::fs::remove_file(pkg1.join(MANIFEST_FILENAME)).unwrap();
+
+        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+
+        assert_eq!(outcome.deleted.len(), 1, "the delete still proceeds via a fallback audit row");
+        assert!(!s1.exists());
+        assert_eq!(
+            history_deleted_count(&store),
+            1,
+            "a minimal fallback retention_deleted row is written even without a readable manifest"
+        );
+    }
+
+    /// IMPORTANT #1(b): if even the fallback audit row can't be persisted, the
+    /// delete must be refused entirely this tick — the source survives and the
+    /// seen linkage stays live. Proven with an injected store whose
+    /// `append_history` always fails.
+    #[test]
+    fn fallback_audit_insert_failure_prevents_delete() {
+        let (_tmp, config, store, seen) = setup();
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        let (pkg1, id1) = register(&config, &store, &seen, &s1);
+        store.confirm(id1, &[]).unwrap();
+
+        let failing = FailingAppendHistoryStore(&store);
+        let result = retention_delete_source(&failing, &seen, &pkg1);
+
+        assert!(result.is_err(), "an unpersistable audit must refuse the delete");
+        assert!(s1.exists(), "the source survives when the audit can't be written");
+        assert_eq!(
+            seen.source_for_package(&pkg1.to_string_lossy()).unwrap().map(|l| l.path),
+            Some(s1),
+            "the seen linkage stays live — nothing was actually removed"
+        );
+    }
+
+    /// IMPORTANT #2: a concurrent re-enqueue that rewrites the source path
+    /// between confirmation and the retention pass must abort the delete — the
+    /// stat-match guard compares the file's current `(size, mtime)` against
+    /// what was recorded at enqueue time.
+    #[test]
+    fn source_changed_since_confirmation_is_skipped() {
+        let (_tmp, mut config, store, seen) = setup();
+        config.retention.dry_run = false;
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        let (_pkg1, id1) = register(&config, &store, &seen, &s1);
+        store.confirm(id1, &[]).unwrap();
+
+        // Simulate a concurrent re-write at the same path: a NEW, unconfirmed
+        // file lands here after confirmation but before retention runs.
+        std::fs::write(&s1, b"brand-new-unconfirmed-content").unwrap();
+
+        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+
+        assert!(outcome.deleted.is_empty(), "a stat-mismatched source must not be deleted");
+        assert!(s1.exists(), "the rewritten (unconfirmed) content survives");
+        assert_eq!(history_deleted_count(&store), 0, "no audit row for a guard-skipped delete");
+    }
+
+    /// Minor #3: a package whose linkage was already handled by an earlier
+    /// pass (already `deleted_at`-stamped) is a legitimate no-op — it must not
+    /// be recounted as a deletion or write a duplicate audit row.
+    #[test]
+    fn already_deleted_linkage_skip_writes_no_history_and_is_not_counted_deleted() {
+        let (_tmp, mut config, store, seen) = setup();
+        config.retention.dry_run = false;
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        let (_pkg1, id1) = register(&config, &store, &seen, &s1);
+        store.confirm(id1, &[]).unwrap();
+
+        // Simulate this package's linkage already handled by an earlier pass.
+        seen.mark_deleted(&s1).unwrap();
+
+        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+
+        assert!(
+            outcome.deleted.is_empty(),
+            "an already-handled package must never be recounted as deleted"
+        );
+        assert_eq!(history_deleted_count(&store), 0, "no duplicate audit row is written");
+        assert!(s1.exists(), "the file — already logically gone — is left untouched again");
+    }
+
+    /// Minor #4: a source removed out-of-band (not by retention) must be
+    /// stamped dead so it stops being offered, but must NOT produce a
+    /// `retention_deleted` audit row — retention never touched it.
+    #[test]
+    fn out_of_band_removed_source_is_stamped_without_audit_row() {
+        let (_tmp, mut config, store, seen) = setup();
+        config.retention.dry_run = false;
+
+        let s1 = config.capture_dir.join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        let (pkg1, id1) = register(&config, &store, &seen, &s1);
+        store.confirm(id1, &[]).unwrap();
+
+        // Out-of-band removal: something other than retention deleted the file.
+        std::fs::remove_file(&s1).unwrap();
+
+        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+
+        assert!(
+            outcome.deleted.is_empty(),
+            "a file gone out-of-band is not counted as a retention deletion"
+        );
+        assert_eq!(
+            history_deleted_count(&store),
+            0,
+            "no retention_deleted row for an out-of-band removal"
+        );
+        assert_eq!(
+            history_outcome_count(&store, "retention_source_missing"),
+            0,
+            "the outcome tag is a log field, not a history row — no row of any kind is written"
+        );
+        assert_eq!(
+            seen.source_for_package(&pkg1.to_string_lossy()).unwrap(),
+            None,
+            "the dead linkage is stamped so it stops being offered"
         );
     }
 }

@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 
 use crate::sharing::types::NodeId;
 
-use super::retention::{evaluate_and_apply, RetentionPolicy};
+use super::retention::{evaluate_and_apply, DeleteOutcome, RetentionPolicy};
 use super::store::{StandaloneSyncStore, SyncStore};
 
 const PEER: NodeId = [7u8; 32];
@@ -54,14 +54,14 @@ fn set_confirmed_at(db_path: &Path, id: i64, ts: &str) {
     .unwrap();
 }
 
-/// A call-counting deleter that really removes the file. `calls` is a `Cell` so
-/// the count can be read after the closure is done borrowing (interior
-/// mutability, no lingering `&mut`).
-fn counting_deleter(calls: &Cell<usize>) -> impl FnMut(&Path) -> anyhow::Result<()> + '_ {
+/// A call-counting deleter that really removes the file and reports
+/// `DeleteOutcome::Removed`. `calls` is a `Cell` so the count can be read after
+/// the closure is done borrowing (interior mutability, no lingering `&mut`).
+fn counting_deleter(calls: &Cell<usize>) -> impl FnMut(&Path) -> anyhow::Result<DeleteOutcome> + '_ {
     move |p: &Path| {
         calls.set(calls.get() + 1);
         std::fs::remove_file(p)?;
-        Ok(())
+        Ok(DeleteOutcome::Removed)
     }
 }
 
@@ -293,11 +293,11 @@ fn dry_run_deletes_nothing_but_reports() {
     store.confirm(id2, &[]).unwrap();
 
     let probe = || 0u8;
-    // A deleter that would panic-loud if ever called (it only bumps the count).
+    // A deleter whose call count must stay 0 in dry-run (it only bumps the count).
     let calls = Cell::new(0usize);
-    let mut deleter = |_p: &Path| -> anyhow::Result<()> {
+    let mut deleter = |_p: &Path| -> anyhow::Result<DeleteOutcome> {
         calls.set(calls.get() + 1);
-        Ok(())
+        Ok(DeleteOutcome::Removed)
     };
 
     let outcome = evaluate_and_apply(
@@ -315,6 +315,43 @@ fn dry_run_deletes_nothing_but_reports() {
     assert_eq!(outcome.eligible.len(), 2, "but it reports what it would delete");
     assert!(outcome.dry_run);
     assert!(c1.exists() && c2.exists(), "the files remain on disk");
+}
+
+// ── skipped_noop_delete_is_not_counted_as_deleted ────────────────────────────
+
+/// Review fix (minor #3): a deleter reporting `SkippedNoop` (e.g. the subject
+/// was already handled by a prior pass, or a last-line guard declined) must NOT
+/// inflate `outcome.deleted` — it is still reported as `eligible` (a genuine
+/// confirmed candidate this pass), but the count of files actually removed must
+/// stay honest.
+#[test]
+fn skipped_noop_delete_is_not_counted_as_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (store, _path) = open_store(&tmp);
+
+    let c1 = make_file(&tmp, "c1.fits");
+    let id1 = enqueue(&store, &c1);
+    store.confirm(id1, &[]).unwrap();
+
+    let probe = || 0u8;
+    let mut deleter = |_p: &Path| -> anyhow::Result<DeleteOutcome> { Ok(DeleteOutcome::SkippedNoop) };
+
+    let outcome = evaluate_and_apply(
+        &store,
+        &RetentionPolicy::OnConfirm,
+        false,
+        Utc::now(),
+        &probe,
+        &mut deleter,
+    )
+    .unwrap();
+
+    assert_eq!(outcome.eligible.len(), 1, "still reported as a genuine candidate");
+    assert!(
+        outcome.deleted.is_empty(),
+        "a no-op skip must never be counted as an actual deletion"
+    );
+    assert!(c1.exists(), "the file is untouched by a no-op deleter");
 }
 
 // ── keep_everything_never_eligible (defensive extra) ─────────────────────────
