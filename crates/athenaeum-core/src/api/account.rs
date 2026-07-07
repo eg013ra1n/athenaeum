@@ -140,9 +140,21 @@ fn map_client_err(e: AccountClientError) -> ApiError {
             ApiError::SignedOut("Signed out or device revoked — sign in again.".into())
         }
         AccountClientError::SecondPrimary(m) => ApiError::Conflict(m),
+        AccountClientError::DeviceConflict(m) => ApiError::Conflict(m),
         AccountClientError::PeerValidation(m) => ApiError::Invalid(m),
         AccountClientError::BadRequest(m) => ApiError::Invalid(m),
         AccountClientError::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
+    }
+}
+
+/// As [`map_client_err`], but tuned for the `/auth/verify` response: a 401
+/// there means "wrong or expired code" — the caller is mid sign-in, not
+/// signed-out-and-revoked, so the generic [`ApiError::SignedOut`] message
+/// would be actively misleading (there is no session to be "out" of yet).
+fn map_verify_err(e: AccountClientError) -> ApiError {
+    match e {
+        AccountClientError::Unauthorized => ApiError::Invalid("Wrong or expired code.".into()),
+        other => map_client_err(other),
     }
 }
 
@@ -204,7 +216,7 @@ pub async fn sign_in_verify(
     let resp = client
         .verify(&email, &code, &key.pubkey_base64(), &device_name())
         .await
-        .map_err(map_client_err)?;
+        .map_err(map_verify_err)?;
 
     cfg.token_store()
         .store(&resp.device_token)
@@ -308,4 +320,45 @@ pub async fn set_machine_role(
     write_state(ctx, keys::ACCOUNT_ROLE, role.as_str())?;
     tracing::info!(hub = %cfg.hub_host, device_id = %device_id, role = %role.as_str(), "machine role set");
     build_status(ctx, &cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix (B4 review, minor #1): a wrong/expired OTP code must read as a
+    /// code problem, not "you're signed out" — the user is mid sign-in, there
+    /// is no session to be out of. Guards against `map_verify_err` regressing
+    /// back to a bare `map_client_err` delegation (its pre-fix RED state).
+    #[test]
+    fn verify_401_maps_to_wrong_code_message_not_signed_out() {
+        let err = map_verify_err(AccountClientError::Unauthorized);
+        match err {
+            ApiError::Invalid(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("code"),
+                    "verify-401 message should mention the code, got: {msg}"
+                );
+            }
+            other => panic!("expected ApiError::Invalid (wrong-code), got {other:?}"),
+        }
+    }
+
+    /// The generic (non-verify) 401 mapping is unchanged: any OTHER authed call
+    /// (list_devices/revoke/set_role) still reads as SignedOut.
+    #[test]
+    fn generic_401_still_maps_to_signed_out() {
+        assert!(matches!(map_client_err(AccountClientError::Unauthorized), ApiError::SignedOut(_)));
+    }
+
+    /// Cross-account pubkey conflict on verify still surfaces as a conflict,
+    /// carrying the hub's message.
+    #[test]
+    fn verify_409_maps_to_conflict_with_message() {
+        let err = map_verify_err(AccountClientError::DeviceConflict("device public key already registered".into()));
+        match err {
+            ApiError::Conflict(msg) => assert_eq!(msg, "device public key already registered"),
+            other => panic!("expected ApiError::Conflict, got {other:?}"),
+        }
+    }
 }

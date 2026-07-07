@@ -85,28 +85,57 @@ impl DeviceKey {
 /// existing file with loose bits is tightened on load.
 fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
     if path.exists() {
-        #[cfg(unix)]
-        tighten_permissions_if_needed(path)?;
-        let bytes =
-            std::fs::read(path).with_context(|| format!("read device key {}", path.display()))?;
-        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "device key {} is {} bytes, expected 32 — delete it to regenerate",
-                path.display(),
-                bytes.len()
-            )
-        })?;
-        Ok(arr)
-    } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create device key dir {}", parent.display()))?;
-        }
-        let secret = crate::sharing::iroh::random_secret();
-        write_secret_0600(path, &secret)?;
-        tracing::info!(path = %path.display(), "generated new device key");
-        Ok(secret)
+        return read_device_key(path);
     }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create device key dir {}", parent.display()))?;
+    }
+    let secret = crate::sharing::iroh::random_secret();
+    match write_secret_0600(path, &secret) {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "generated new device key");
+            Ok(secret)
+        }
+        Err(create_err) => {
+            // First-run race: another caller (e.g. `account_sign_in_verify`
+            // and the sync transport's `ensure_started` both racing to create
+            // the SAME shared key on a fresh install) won `create_new` between
+            // our `path.exists()` check above and this write. Read its key
+            // back rather than erroring — there is still exactly one file /
+            // one identity, just authored by whichever caller got there
+            // first. Only treated as a race when the file is now actually
+            // present; any other create failure (permissions, disk full, …)
+            // still propagates.
+            if path.exists() {
+                tracing::debug!(
+                    path = %path.display(),
+                    "device key created concurrently by another caller; reading back"
+                );
+                read_device_key(path)
+            } else {
+                Err(create_err)
+            }
+        }
+    }
+}
+
+/// Read + validate an existing device key file, tightening loose permissions
+/// first (unix). Shared by the normal load path and the first-run-race
+/// read-back in [`load_or_create_device_key`].
+fn read_device_key(path: &Path) -> Result<[u8; 32]> {
+    #[cfg(unix)]
+    tighten_permissions_if_needed(path)?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read device key {}", path.display()))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "device key {} is {} bytes, expected 32 — delete it to regenerate",
+            path.display(),
+            bytes.len()
+        )
+    })?;
+    Ok(arr)
 }
 
 #[cfg(unix)]
@@ -167,6 +196,48 @@ mod tests {
             .decode(k1.pubkey_base64())
             .unwrap();
         assert_eq!(decoded.as_slice(), &k1.node_id()[..]);
+    }
+
+    /// Fix (B4 review, minor #2): two callers racing to create the device key
+    /// on a truly fresh install (e.g. `account_sign_in_verify` and the sync
+    /// transport's `ensure_started`, both calling `load_or_create` before
+    /// either has written the file) must NOT error — exactly one caller's
+    /// `create_new` wins the file, and every other caller reads that winner's
+    /// key back instead of propagating an `AlreadyExists` I/O error. A
+    /// `Barrier` maximizes the chance every thread's `path.exists()` check
+    /// misses before any of them writes, so this reliably exercises the race.
+    #[test]
+    fn concurrent_first_run_race_all_agree_on_one_key() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(device_key_path(dir.path()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        const N: usize = 8;
+        let barrier = Arc::new(Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    DeviceKey::load_or_create(&path).map(|k| k.secret_bytes())
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = results[0]
+            .as_ref()
+            .unwrap_or_else(|e| panic!("thread 0 failed under concurrent first-run race: {e:#}"))
+            .to_owned();
+        for (i, r) in results.into_iter().enumerate() {
+            let bytes = r.unwrap_or_else(|e| {
+                panic!("thread {i} failed under concurrent first-run race: {e:#}")
+            });
+            assert_eq!(bytes, first, "all concurrent first-run callers must agree on ONE key");
+        }
     }
 
     /// Unification with the transport: the node id `DeviceKey` derives from the

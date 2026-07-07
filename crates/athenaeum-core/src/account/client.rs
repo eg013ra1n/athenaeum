@@ -8,7 +8,9 @@
 //! Endpoint contract (base = `account.hub_url`):
 //! - `POST /api/v1/auth/otp {email}` → 204 (429 rate-limited)
 //! - `POST /api/v1/auth/verify {email, code, devicePubkey, deviceName}`
-//!   → 200 `{deviceToken, deviceId}` | 401 | 400
+//!   → 200 `{deviceToken, deviceId}` | 400 (malformed pubkey) | 401 (wrong/
+//!   expired code) | 409 (pubkey already owned by a DIFFERENT account —
+//!   same-account re-verify/re-sign-in is a 200 on the hub, not a conflict)
 //! - `GET  /api/v1/devices` → `[AccountDevice]`
 //! - `POST /api/v1/devices/{id}/revoke` → 204
 //! - `POST /api/v1/devices/{id}/role {role, peerDeviceId?}` → 200 | 400 | 409
@@ -30,6 +32,10 @@ pub enum AccountClientError {
     Unauthorized,
     /// 409 — a second primary device was rejected (message from the hub).
     SecondPrimary(String),
+    /// 409 on `/auth/verify` — the device pubkey already belongs to a
+    /// DIFFERENT account's device (cross-account theft guard). Same-account
+    /// re-verify (re-sign-in) no longer 409s on the hub — see the module docs.
+    DeviceConflict(String),
     /// 400 on the role endpoint — peer validation failed (message from the hub).
     PeerValidation(String),
     /// 400 elsewhere — malformed request (e.g. bad pubkey, bad code shape).
@@ -48,6 +54,7 @@ impl std::fmt::Display for AccountClientError {
                 f.write_str("signed out or device revoked; sign in again")
             }
             AccountClientError::SecondPrimary(m)
+            | AccountClientError::DeviceConflict(m)
             | AccountClientError::PeerValidation(m)
             | AccountClientError::BadRequest(m)
             | AccountClientError::Network(m) => f.write_str(m),
@@ -58,11 +65,23 @@ impl std::fmt::Display for AccountClientError {
 impl std::error::Error for AccountClientError {}
 
 /// Successful `/auth/verify` payload.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is hand-implemented (not derived) to redact `device_token` — a live
+/// bearer credential that must never appear in an ad-hoc `{:?}` log/assert.
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerifyResponse {
     pub device_token: String,
     pub device_id: String,
+}
+
+impl std::fmt::Debug for VerifyResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifyResponse")
+            .field("device_token", &"<redacted>")
+            .field("device_id", &self.device_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +154,7 @@ impl HubClient {
                 .map_err(|e| AccountClientError::Network(format!("decode verify response: {e}"))),
             StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
             StatusCode::BAD_REQUEST => Err(AccountClientError::BadRequest(body_message(resp).await)),
+            StatusCode::CONFLICT => Err(AccountClientError::DeviceConflict(body_message(resp).await)),
             s => Err(unexpected(s, resp).await),
         }
     }
@@ -393,6 +413,49 @@ mod tests {
             }
             other => panic!("expected PeerValidation, got {other:?}"),
         }
+    }
+
+    /// Fix (B4 review): the hub still 409s `/auth/verify` when the pubkey
+    /// belongs to a DIFFERENT account's device (cross-account theft guard —
+    /// same-account re-verify now 200s on the hub side instead). The client
+    /// must surface that as a distinct typed error, not the generic `Network`
+    /// bucket, so the api layer can give an actionable message.
+    #[tokio::test]
+    async fn verify_409_maps_to_device_conflict() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/verify"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "device public key already registered",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = HubClient::new(server.uri()).unwrap();
+        let err = client
+            .verify("a@b.com", "123456", "cHVia2V5", "test-device")
+            .await
+            .unwrap_err();
+        match err {
+            AccountClientError::DeviceConflict(msg) => {
+                assert!(msg.contains("already registered"), "message surfaced: {msg}");
+            }
+            other => panic!("expected DeviceConflict, got {other:?}"),
+        }
+    }
+
+    /// Fix (B4 review, minor #4): `VerifyResponse`'s `Debug` must never print
+    /// the bearer token — it is a live credential, and `Debug` output ends up
+    /// in ad-hoc `{:?}` logging/asserts far more easily than `Display`.
+    #[test]
+    fn verify_response_debug_redacts_token() {
+        let resp = VerifyResponse {
+            device_token: "super-secret-live-token".to_string(),
+            device_id: "dev-1".to_string(),
+        };
+        let debug = format!("{resp:?}");
+        assert!(!debug.contains("super-secret-live-token"), "token leaked into Debug: {debug}");
+        assert!(debug.contains("dev-1"), "device_id should still be visible: {debug}");
     }
 
     #[tokio::test]
