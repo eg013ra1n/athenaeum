@@ -95,6 +95,15 @@ pub struct ResolvedPairing {
     /// `Some` only on the dev-ticket path — the caller registers the peer's
     /// dialable address from this ticket (the account path resolves by node id).
     pub ticket: Option<String>,
+    /// The raw relay URLs `relay_mode` was built from (fix-review, production
+    /// bug: account-mode dial failure). On the account path (`ticket = None`)
+    /// the caller must attach these to the peer's `EndpointAddr`
+    /// ([`pairing::peer_addr_with_relays`]) before `add_peer` — a bare node id
+    /// is undialable with `IrohTransport`'s discovery-free preset. Whatever
+    /// `resolve_relays` resolved (fresh from the hub, or the offline cache
+    /// fallback) ends up here, so the cached-relay offline start dials
+    /// correctly too, with no extra plumbing.
+    pub relay_urls: Vec<String>,
 }
 
 /// Interactive `perseus login`: request an OTP for the account email, verify it,
@@ -263,7 +272,12 @@ pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
     };
 
     cache.save(&config.data_dir);
-    Ok(ResolvedPairing { peer, relay_mode, ticket })
+    Ok(ResolvedPairing {
+        peer,
+        relay_mode,
+        ticket,
+        relay_urls: relays.urls.clone(),
+    })
 }
 
 /// Build the account-pairing inputs, or `None` when Perseus is not signed in

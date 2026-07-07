@@ -223,12 +223,24 @@ impl Agent {
         .await
         .context("build iroh transport")?;
         // On the ticket path, register the peer's full dialable address from the
-        // ticket. On the account path the peer is a bare node id — the transport
-        // reaches it via the resolved relays / discovery.
+        // ticket (it embeds relay + direct addresses). On the account path the
+        // peer is a bare node id: `IrohTransport` has NO discovery services
+        // (`presets::Minimal`, task A5), so without a dial hint `announce`
+        // fails instantly with "No addressing information available"
+        // (fix-review, production bug). Attach our own resolved relay URL(s) —
+        // the same ones this endpoint itself binds with — as the peer's dial
+        // hint; account devices on the same hub share the same published relay
+        // set, so this is the correct minimal hint, no separate address
+        // exchange needed.
         if let Some(ticket) = &resolved.ticket {
             transport
                 .add_peer_ticket(ticket)
                 .context("register peer address from pairing ticket")?;
+        } else {
+            let peer_addr =
+                athenaeum_core::sync::pairing::peer_addr_with_relays(resolved.peer, &resolved.relay_urls)
+                    .context("construct account-resolved peer address")?;
+            transport.add_peer(peer_addr);
         }
         let peer = resolved.peer;
         let node_id = transport.node_id();

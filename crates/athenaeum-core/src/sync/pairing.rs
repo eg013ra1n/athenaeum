@@ -327,6 +327,43 @@ pub fn node_id_from_ticket(ticket: &str) -> Result<NodeId> {
     Ok(*ticket.endpoint_addr().id.as_bytes())
 }
 
+/// Construct the dialable [`iroh::EndpointAddr`] for an account-resolved peer:
+/// the bare node id plus the SAME relay URL(s) resolved for our own endpoint
+/// (fix-review, production bug: account-mode dial failure).
+///
+/// `IrohTransport` binds with `presets::Minimal` — no discovery services, by
+/// design (task A5) — so a bare-node-id `EndpointAddr` (no relay, no direct
+/// addresses) is undialable: `endpoint.connect()` fails instantly with "No
+/// addressing information available". The dev-ticket path never hit this
+/// because an `EndpointTicket` embeds its holder's addresses directly; account
+/// pairing only ever resolves a peer's *identity* (its pubkey from the hub's
+/// device list), never its address. Devices on the same hub account share the
+/// same published relay set (`GET /relay-map`), so attaching OUR OWN resolved
+/// relay URL(s) to the peer's address is the correct, minimal dial hint — no
+/// separate address-exchange channel needed. This is also why the cached-relay
+/// offline path (`SYNC_CACHED_RELAYS` / Perseus's `pairing_cache.json`) still
+/// dials correctly: callers pass through whatever `resolve_relays` resolved,
+/// fresh or cached, so the cache fallback composes for free.
+///
+/// An unparsable URL is logged and skipped (never fails the whole
+/// resolution — the caller may still have other usable relays); an empty
+/// `relay_urls` yields a bare `EndpointAddr` (same as before this fix — still
+/// undialable, but no worse, and every real caller has a non-empty resolved
+/// list by the time it gets here).
+pub fn peer_addr_with_relays(peer: NodeId, relay_urls: &[String]) -> Result<iroh::EndpointAddr> {
+    let id = iroh::EndpointId::from_bytes(&peer).map_err(|e| anyhow!("invalid peer node id: {e}"))?;
+    let mut addr = iroh::EndpointAddr::new(id);
+    for url in relay_urls {
+        match url.parse::<iroh::RelayUrl>() {
+            Ok(relay_url) => addr = addr.with_relay_url(relay_url),
+            Err(error) => {
+                tracing::warn!(%url, %error, "invalid relay url in peer address hint; skipping")
+            }
+        }
+    }
+    Ok(addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +718,95 @@ mod tests {
         };
         let dbg = format!("{acc:?}");
         assert!(!dbg.contains("super-secret-token"), "token leaked into Debug: {dbg}");
+    }
+
+    // ── peer_addr_with_relays (fix-review: account-mode dial failure) ───────
+    //
+    // Production bug: account-mode pairing resolved the peer to a bare node id
+    // and handed it straight to the transport, which — bound with no discovery
+    // services (`presets::Minimal`) — could not dial it:
+    // "connect sync control channel: No addressing information available: All
+    // address lookup services failed or produced no results". The negative
+    // test pinning that exact failure lives in
+    // `sharing::iroh::tests::bare_node_id_without_a_peer_address_is_undialable`
+    // (needs two real endpoints); these test the pure address-construction seam.
+
+    /// A valid ed25519 public key's raw bytes for a test peer — NOT an arbitrary
+    /// byte pattern. `EndpointId::from_bytes` (used internally by
+    /// `peer_addr_with_relays`) validates the bytes decode to a real curve
+    /// point; a hand-picked pattern like `[7u8; 32]` fails that validation
+    /// (the crate's OTHER pairing tests get away with such patterns only
+    /// because they never construct a real `PublicKey`/`EndpointId` from them —
+    /// they just compare raw bytes for equality).
+    fn valid_peer_bytes() -> [u8; 32] {
+        *iroh::SecretKey::generate().public().as_bytes()
+    }
+
+    /// A URL's canonical round-tripped form (what `RelayUrl::to_string()`
+    /// actually produces) — `url::Url` normalizes a bare-authority URL like
+    /// `https://relay1.example.org` to `https://relay1.example.org/` (trailing
+    /// slash). Tests compare against this, not the raw input string.
+    fn normalized(url: &str) -> String {
+        url.parse::<iroh::RelayUrl>().unwrap().to_string()
+    }
+
+    /// Required test #1: a resolved relay list `[X]` produces an `EndpointAddr`
+    /// whose `relay_urls()` contains exactly `X`, with the peer's identity
+    /// preserved.
+    #[test]
+    fn peer_addr_with_relays_attaches_the_resolved_relay_url() {
+        let peer = valid_peer_bytes();
+        let addr = peer_addr_with_relays(peer, &["https://relay1.example.org".to_string()]).unwrap();
+
+        assert_eq!(addr.id.as_bytes(), &peer, "the peer's identity is preserved");
+        let urls: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
+        assert_eq!(
+            urls,
+            vec![normalized("https://relay1.example.org")],
+            "the resolved relay url must be attached as a dial hint"
+        );
+    }
+
+    /// Multiple resolved relays all get attached (iroh's `EndpointAddr` supports
+    /// more than one; "attach all" per the fix-review guidance).
+    #[test]
+    fn peer_addr_with_relays_attaches_multiple_urls() {
+        let peer = valid_peer_bytes();
+        let urls_in = vec![
+            "https://relay1.example.org".to_string(),
+            "https://relay2.example.org".to_string(),
+        ];
+        let addr = peer_addr_with_relays(peer, &urls_in).unwrap();
+        let mut urls_out: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
+        urls_out.sort();
+        let mut expected: Vec<String> = urls_in.iter().map(|u| normalized(u)).collect();
+        expected.sort();
+        assert_eq!(urls_out, expected, "every resolved relay url is attached");
+    }
+
+    /// An unparsable relay URL is logged and skipped — never fails the whole
+    /// resolution — while any other, valid URL in the same list is still
+    /// attached.
+    #[test]
+    fn peer_addr_with_relays_skips_invalid_urls_but_keeps_valid_ones() {
+        let peer = valid_peer_bytes();
+        let addr = peer_addr_with_relays(
+            peer,
+            &["not a url".to_string(), "https://relay2.example.org".to_string()],
+        )
+        .unwrap();
+        let urls: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
+        assert_eq!(urls, vec![normalized("https://relay2.example.org")]);
+    }
+
+    /// An empty relay list yields a bare `EndpointAddr` — the same
+    /// (undialable-without-discovery) shape as before this fix. Documents that
+    /// the fix cannot manufacture connectivity out of nothing; it only stops
+    /// throwing away a relay hint the caller already resolved.
+    #[test]
+    fn peer_addr_with_relays_empty_list_yields_bare_addr() {
+        let peer = valid_peer_bytes();
+        let addr = peer_addr_with_relays(peer, &[]).unwrap();
+        assert!(addr.is_empty(), "no relay urls -> bare addr, same as pre-fix");
     }
 }

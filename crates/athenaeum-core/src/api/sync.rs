@@ -179,13 +179,16 @@ fn allow_default_relays(signed_in: bool, dev_flag: bool) -> bool {
     !signed_in && dev_flag
 }
 
-/// Resolve the [`iroh::RelayMode`] for the transport: the hub's relay map when
-/// signed in (persisting it as the offline cache), else the last cached map.
-/// Falling back to iroh's default relays beyond that requires the dev flag AND
-/// being signed out ([`allow_default_relays`]) — otherwise this returns an
+/// Resolve the [`iroh::RelayMode`] for the transport — and the raw relay URLs
+/// it was built from, needed by [`ensure_sender_engine`] to attach a dial hint
+/// to an account-resolved peer (fix-review: a bare node id is undialable, see
+/// [`pairing::peer_addr_with_relays`]). The hub's relay map when signed in
+/// (persisting it as the offline cache), else the last cached map. Falling
+/// back to iroh's default relays beyond that requires the dev flag AND being
+/// signed out ([`allow_default_relays`]) — otherwise this returns an
 /// actionable error rather than silently starting the transport on public
 /// infrastructure (or, worse, mixed relay networks with a signed-in peer).
-async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<iroh::RelayMode, ApiError> {
+async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<(iroh::RelayMode, Vec<String>), ApiError> {
     let creds = crate::api::account::hub_credentials(ctx).unwrap_or(None);
     let cached = cached_relays(ctx).unwrap_or_default();
     let account = creds.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
@@ -194,7 +197,8 @@ async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<iroh::RelayMode, Api
         store_cached_relays(ctx, &res.urls);
     }
     let allow_default = allow_default_relays(creds.is_some(), dev_pairing_enabled(ctx)?);
-    pairing::relay_mode_for(&res.urls, allow_default).map_err(ApiError::Internal)
+    let mode = pairing::relay_mode_for(&res.urls, allow_default).map_err(ApiError::Internal)?;
+    Ok((mode, res.urls))
 }
 
 /// Resolve this device's sync peer following the documented order (task M1):
@@ -274,7 +278,9 @@ pub async fn autostart_if_enabled(
     }
     tracing::debug!(dev, account_primary, "sync autostart condition met");
     let (sync_dir, db_path) = sync_paths(ctx)?;
-    let relay_mode = resolve_relay_mode(ctx).await?;
+    // The receiver only listens; it never dials a peer for announce, so the raw
+    // relay URLs (needed only to construct a dial hint) are irrelevant here.
+    let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
     sync.ensure_started(sync_dir, db_path, relay_mode, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
@@ -304,7 +310,9 @@ pub async fn get_pairing_ticket(
         ));
     }
     let (sync_dir, db_path) = sync_paths(ctx)?;
-    let relay_mode = resolve_relay_mode(ctx).await?;
+    // Same reasoning as `autostart_if_enabled`: the receiver never dials out
+    // for announce, so the raw relay URLs are not needed here.
+    let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
 
     let ticket = sync
         .ensure_started(sync_dir, db_path, relay_mode, emitter)
@@ -575,7 +583,7 @@ pub async fn ensure_sender_engine(
     // engine started, no transport bound, no package built.
     let resolution = resolve_capture_peer(ctx).await?;
     let peer = peer_from_resolution(resolution)?;
-    let relay_mode = resolve_relay_mode(ctx).await?;
+    let (relay_mode, relay_urls) = resolve_relay_mode(ctx).await?;
     let (sync_dir, db_path) = sync_paths(ctx)?;
 
     std::fs::create_dir_all(&sync_dir)
@@ -597,6 +605,18 @@ pub async fn ensure_sender_engine(
     .await
     .map_err(|e| ApiError::Internal(format!("build iroh transport for sender: {e:#}")))?;
     let origin_device = node_id_hex(&transport.node_id());
+
+    // Fix-review: the app's capture-role sender ALWAYS resolves its peer via
+    // account pairing (`resolve_capture_peer` never returns a ticket — that
+    // path is Perseus-only), which yields a bare node id. `IrohTransport` has
+    // no discovery services, so without a dial hint `announce` fails instantly
+    // with "No addressing information available". Attach our own resolved
+    // relay URL(s) — the same ones this endpoint itself binds with — as the
+    // peer's dial hint before the first announce ever goes out.
+    let peer_addr = pairing::peer_addr_with_relays(peer, &relay_urls)
+        .map_err(|e| ApiError::Internal(format!("construct peer address: {e:#}")))?;
+    transport.add_peer(peer_addr);
+
     let transport: Arc<dyn SharingTransport> = Arc::new(transport);
 
     let store = Arc::new(

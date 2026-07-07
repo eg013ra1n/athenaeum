@@ -440,6 +440,48 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Fix-review, production bug: a bare node id (no relay, no direct
+//     addresses) is undialable — pins the exact production failure mode.
+// ---------------------------------------------------------------------------
+
+/// Required test #3: a peer registered with NO address (the pre-fix shape
+/// account-mode resolution used to hand the transport) fails to dial with the
+/// exact addressing error the production incident hit — `IrohTransport` binds
+/// with `presets::Minimal` (no discovery services), so `endpoint.connect()` on
+/// a bare `EndpointAddr` has nothing to try. Documents the invariant
+/// `sync::pairing::peer_addr_with_relays` exists to satisfy: a bare node id
+/// must never reach `add_peer`/`announce` without a relay (or direct address)
+/// hint attached.
+#[tokio::test]
+async fn bare_node_id_without_a_peer_address_is_undialable() {
+    let sender = mem_transport().await;
+    let receiver = mem_transport().await;
+    sender.start().await.unwrap();
+    let receiver_info = receiver.start().await.unwrap();
+
+    // Deliberately skip add_peer/add_peer_ticket: `receiver_info.node_id` is a
+    // bare identity with no registered address — exactly the pre-fix
+    // account-mode resolution's shape.
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce) =
+        build_package(&tmp.path().join("src"), "uuid-bare", "frame_bare.fits", "M1", 4096);
+    sender.serve(&announce, &pkg_dir).await.unwrap();
+
+    let err = sender
+        .announce(receiver_info.node_id, &announce)
+        .await
+        .expect_err("a bare node id with no relay/direct address must fail to dial");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("addressing information") || msg.contains("address lookup"),
+        "error should name the addressing failure (the production symptom), got: {msg}"
+    );
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 4. Path-traversal guard: a peer-supplied collection entry name must never
 //    escape dest_dir. Mirrors package::validate_rel_path on the write side.
 // ---------------------------------------------------------------------------
