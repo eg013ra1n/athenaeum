@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText } from 'lucide-react';
+import { Save, AlertCircle, CheckCircle, RefreshCw, Settings as SettingsIcon, Crosshair, BarChart3, ScanSearch, Archive as ArchiveIcon, FolderOpen, Info, ScrollText, UserCircle } from 'lucide-react';
 import { revealItemInDir, openPath } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import LoggingSettings from '../components/settings/LoggingSettings';
+import AccountSection from '../components/settings/AccountSection';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
@@ -606,6 +607,20 @@ export default function Settings() {
               </div>
             </div>
           )}
+
+          {/* Account — identity-level, kept at the top. Fully self-contained
+              (see AccountSection / useAccount); the app runs signed-out. */}
+          <div className="mb-6 bg-surface-elevated rounded-lg p-6">
+            <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+              <UserCircle size={20} />
+              Account
+            </h3>
+            <p className="text-xs text-content-muted mb-4">
+              Sign in to link this machine to your account for syncing frames between devices.
+              Optional — every feature works without an account.
+            </p>
+            <AccountSection />
+          </div>
 
           <div className="bg-surface-elevated rounded-lg p-6 space-y-6">
 
