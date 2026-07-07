@@ -34,6 +34,7 @@ mod registration;
 mod archive;
 mod masters;
 mod lights;
+mod sync;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -237,6 +238,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_light_calibration_details", post(lights::get_light_calibration_details))
         .route("/api/start_light_calibration", post(lights::start_light_calibration))
         .route("/api/cancel_light_calibration", post(lights::cancel_light_calibration))
+        // Personal sync (Stage I, task A7)
+        .route("/api/get_sync_pairing_ticket", post(sync::get_sync_pairing_ticket))
+        .route("/api/get_sync_status", post(sync::get_sync_status))
+        .route("/api/list_sync_history", post(sync::list_sync_history))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))
@@ -425,6 +430,7 @@ mod tests {
             image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
             max_blink_threads: 1,
             monitor: athenaeum_core::monitor::MonitorService::new(),
+            sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
         }
     }
 

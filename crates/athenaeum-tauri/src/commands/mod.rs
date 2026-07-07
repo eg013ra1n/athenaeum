@@ -24,6 +24,10 @@ pub struct AppState {
     /// to `kick()` the loop awake when settings change so the user doesn't
     /// have to wait for the next scheduled tick.
     pub monitor: athenaeum_core::monitor::MonitorService,
+    /// Personal-sync receive-side runtime (Stage I, task A7). Lazily starts the
+    /// iroh transport + receiver behind the dev pairing flag. Held here (not in
+    /// `ctx`) because starting it needs a Tauri-built `ProgressEmitter`.
+    pub sync: Arc<athenaeum_core::sync::SyncRuntime>,
 }
 
 pub mod core;
@@ -46,6 +50,7 @@ pub mod utils;
 pub mod archive;
 pub mod masters;
 pub mod lights;
+pub mod sync;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -66,3 +71,4 @@ pub use registration::*;
 pub use archive::*;
 pub use masters::*;
 pub use lights::*;
+pub use sync::*;

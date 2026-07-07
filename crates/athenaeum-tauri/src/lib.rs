@@ -95,6 +95,7 @@ pub fn run() {
                 )),
                 max_blink_threads: max_threads,
                 monitor: athenaeum_core::monitor::MonitorService::new(),
+                sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
             }
         })
         .setup(|app| {
@@ -414,6 +415,9 @@ pub fn run() {
             commands::cancel_frame_set_registration,
             commands::set_frame_set_reference,
             commands::get_frame_set_reference,
+            commands::get_sync_pairing_ticket,
+            commands::get_sync_status,
+            commands::list_sync_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -18,13 +18,19 @@
 //! - [`models`] — the persisted row types ([`OutboundRow`], [`HistoryRow`]) and
 //!   the [`OutboundState`] lifecycle enum.
 //! - [`store`] — the [`SyncStore`](store::SyncStore) trait (one DDL, defined
-//!   once as consts) and the [`StandaloneSyncStore`](store::StandaloneSyncStore)
-//!   rusqlite implementation (own WAL SQLite file). The catalog-backed
-//!   implementation (`CatalogSyncStore`) is deliberately deferred to task A7 so
-//!   this task never touches `db/schema.rs`.
+//!   once as consts), the [`StandaloneSyncStore`](store::StandaloneSyncStore)
+//!   rusqlite implementation (own WAL SQLite file, used by Perseus), and the
+//!   catalog-backed [`CatalogSyncStore`](store::CatalogSyncStore) (task A7) over
+//!   the app catalog DB — the sync DDL now lives in `db/schema.rs::init_db` too,
+//!   sharing these consts.
 //! - [`engine`] — [`SyncEngine`](engine::SyncEngine) / its
 //!   [`SyncEngineHandle`](engine::SyncEngineHandle) and the tokio worker task
-//!   that implements the state machine.
+//!   that implements the sender-side state machine.
+//! - [`ingest`] / [`receiver`] — the primary-side receive pipeline (task A7):
+//!   [`ingest_package`](ingest::ingest_package) turns a fetched package into
+//!   catalog rows + receipts, and [`SyncReceiver`](receiver::SyncReceiver) /
+//!   [`SyncRuntime`](receiver::SyncRuntime) drive fetch → ingest → ack over a
+//!   transport.
 //!
 //! # State machine (v1, collapsed)
 //!
@@ -42,15 +48,23 @@ use chrono::Utc;
 use crate::sharing::types::NodeId;
 
 pub mod engine;
+pub mod ingest;
 pub mod models;
+pub mod receiver;
 pub mod store;
 
 #[cfg(test)]
 mod engine_tests;
+#[cfg(test)]
+mod ingest_tests;
 
 pub use engine::{SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS};
+pub use ingest::{ingest_package, IngestOutcome};
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
-pub use store::{StandaloneSyncStore, SyncStore};
+pub use receiver::{
+    SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime, SyncStatus,
+};
+pub use store::{CatalogSyncStore, StandaloneSyncStore, SyncStore};
 
 /// Canonical timestamp rendering for the sync tables: RFC3339 UTC, millisecond
 /// precision, `Z` suffix. Sortable as text, unambiguous across time zones.

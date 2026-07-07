@@ -35,6 +35,10 @@ pub mod defaults {
 
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "1";
+
+    // Personal sync (Stage I). Dev-only ticket pairing gate — the primary-side
+    // receiver + iroh transport only start when this is explicitly enabled.
+    pub const SYNC_DEV_TICKET_PAIRING: &str = "false";
 }
 
 /// Setting keys used throughout the application
@@ -76,6 +80,10 @@ pub mod keys {
 
     // Compute queue (global FIFO admission for heavy CPU jobs)
     pub const COMPUTE_MAX_CONCURRENT: &str = "compute.max_concurrent";
+
+    /// Dev-only gate for personal-sync ticket pairing (task A7). When `"true"`,
+    /// `get_sync_pairing_ticket` lazily starts the receiver + iroh transport.
+    pub const SYNC_DEV_TICKET_PAIRING: &str = "sync.dev_ticket_pairing";
 }
 
 /// Runtime overrides for settings (session-specific)

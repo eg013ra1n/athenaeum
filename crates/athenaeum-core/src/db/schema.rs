@@ -1640,6 +1640,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ],
     )?;
 
+    // Personal-sync tables (Stage I). The DDL text is owned by `sync::store`
+    // (single source, shared with the standalone Perseus store) — this call
+    // just materialises those tables in the app catalog so the primary-side
+    // receiver (task A7) can record outbound state, transfer history, and
+    // per-frame receipts alongside the catalog it ingests into.
+    {
+        use crate::sync::store::{DDL_HISTORY, DDL_INDEXES, DDL_OUTBOUND, DDL_RECEIPTS};
+        conn.execute(DDL_OUTBOUND, [])?;
+        conn.execute(DDL_HISTORY, [])?;
+        conn.execute(DDL_RECEIPTS, [])?;
+        for idx in DDL_INDEXES {
+            conn.execute(idx, [])?;
+        }
+    }
+
     // Add uuid and updated_at columns to the 7 entity tables
     for t in UUID_TABLES {
         if !column_exists(conn, t, "uuid")? {

@@ -74,7 +74,7 @@ impl OutboundState {
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task
 /// only ever writes [`Sent`](Self::Sent); [`Received`](Self::Received) is for
 /// the receiver task (A7) writing into the same table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum Direction {
     Sent,
@@ -120,7 +120,7 @@ pub struct OutboundRow {
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame
 /// transfer event (transfer started, confirmed, failed, or cancelled).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryRow {
     pub frame_uuid: String,

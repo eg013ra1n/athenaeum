@@ -71,6 +71,9 @@ pub struct WebAppState {
     /// Handle to the background folder-monitoring service. Routes use this
     /// to `kick()` the loop awake when monitor-relevant settings change.
     pub monitor: athenaeum_core::monitor::MonitorService,
+    /// Personal-sync receive-side runtime (Stage I, task A7). Lazily starts the
+    /// iroh transport + receiver behind the dev pairing flag.
+    pub sync: Arc<athenaeum_core::sync::SyncRuntime>,
 }
 
 #[tokio::main]
@@ -227,7 +230,26 @@ async fn main() {
         image_semaphore,
         max_blink_threads: max_threads,
         monitor: athenaeum_core::monitor::MonitorService::new(),
+        sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
     };
+
+    // Personal sync (Stage I, task A7): start the receiver + iroh transport at
+    // boot when the dev flag is on. The web backend's DB is already initialised
+    // here (unlike desktop, where the receiver starts lazily on the first
+    // `get_sync_pairing_ticket`). Best-effort in a spawned task — a transport
+    // build failure is logged, never fatal to the server.
+    {
+        let ctx_for_sync = Arc::clone(&state.ctx);
+        let sync_for_sync = Arc::clone(&state.sync);
+        let emitter = Arc::new(events::SseProgressEmitter::new(state.event_tx.clone()));
+        tokio::spawn(async move {
+            match athenaeum_core::api::sync::autostart_if_enabled(&ctx_for_sync, &sync_for_sync, emitter).await {
+                Ok(true) => tracing::info!("personal sync receiver autostarted (dev pairing enabled)"),
+                Ok(false) => tracing::debug!("personal sync disabled; receiver not started"),
+                Err(e) => tracing::error!(error = %e, "personal sync autostart failed"),
+            }
+        });
+    }
 
     // Auto-reconcile abandoned cross-volume moves — enqueue this as the
     // FIRST job on the operation queue so it serializes ahead of any file op

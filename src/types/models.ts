@@ -588,3 +588,69 @@ biasFallback: BiasFallback, };
 
 export type BiasFallback = "subtractBias" | "skipFrame";
 
+export type Direction = "sent" | "received";
+
+export type HistoryRow = { frameUuid: string, filename: string, object: string | null, 
+/**
+ * Peer node id, hex-encoded.
+ */
+peerDevice: string, direction: Direction, bytes: number, startedAt: string, finishedAt: string | null, 
+/**
+ * Short outcome tag: `sent`, `ingested`, `duplicate`, `rejected`, `failed`,
+ * or `cancelled`.
+ */
+outcome: string, };
+
+export type SyncStatus = { 
+/**
+ * Whether the dev pairing flag (`sync.dev_ticket_pairing`) is enabled.
+ */
+devPairingEnabled: boolean, 
+/**
+ * Whether the transport + receiver are running (a ticket has been minted).
+ */
+transportStarted: boolean, 
+/**
+ * This device's pairing ticket, once started.
+ */
+pairingTicket: string | null, 
+/**
+ * Total frames received (history rows with `direction = received`).
+ */
+receivedTotal: number, };
+
+export type SyncProgressEvent = { packageId: string, 
+/**
+ * Coarse stage: `received`, `fetching`, `ingesting`.
+ */
+stage: string, 
+/**
+ * Sending peer node id (hex).
+ */
+peerDevice: string, frameCount: number, };
+
+export type SyncFinishedEvent = { packageId: string, 
+/**
+ * `ingested` (all accepted), `partial` (some rejected), `failed` (all
+ * rejected), or `replayed` (re-acked from the receipt log, no ingest).
+ */
+outcome: string, okCount: number, 
+/**
+ * Frame uuids the receiver rejected (integrity failure).
+ */
+failed: Array<string>, };
+
+export type SyncHistoryQuery = { 
+/**
+ * Exact `filename` filter (unfiltered when absent).
+ */
+filename: string | null, 
+/**
+ * Exact `object` filter (unfiltered when absent).
+ */
+object: string | null, 
+/**
+ * Newest-first cap. `0` is treated as the default cap.
+ */
+limit: number, };
+

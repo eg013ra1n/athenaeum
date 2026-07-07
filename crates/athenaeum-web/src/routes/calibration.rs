@@ -507,6 +507,7 @@ mod calibration_config_tests {
             image_semaphore: Arc::new(RwLock::new(Arc::new(tokio::sync::Semaphore::new(1)))),
             max_blink_threads: 1,
             monitor: athenaeum_core::monitor::MonitorService::new(),
+            sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
         }
     }
 

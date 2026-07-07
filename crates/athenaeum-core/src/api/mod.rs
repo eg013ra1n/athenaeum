@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub mod scan_roots;
 pub mod files;
 pub mod calibration;
+// Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
+pub mod sync;
 // These handler modules drive the render-only image pipeline (analysis,
 // master integration, light calibration) and are gated with it.
 #[cfg(feature = "render")]
