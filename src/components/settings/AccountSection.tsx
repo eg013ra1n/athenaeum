@@ -13,10 +13,14 @@ import {
   AlertTriangle,
   RefreshCw,
 } from 'lucide-react';
+import { api } from '../../api';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useAccount, accountErrMsg, SIGNED_OUT_HEALED } from '../../hooks/useAccount';
 import type { AccountDevice, DeviceRole } from '../../types/models';
+
+/** Default hub the app points sign-in at when `account.hub_url` is unset. */
+const DEFAULT_HUB_URL = 'https://projects.artfrom.space';
 
 /** Compact display for a hub-assigned device id (opaque, can be long). */
 function shortId(id: string): string {
@@ -43,6 +47,93 @@ function RoleBadge({ role }: { role: DeviceRole | null }) {
     <span className="inline-flex items-center rounded-full bg-surface-hover px-2 py-0.5 text-xs font-medium text-content-muted">
       Unassigned
     </span>
+  );
+}
+
+/**
+ * Dev-only editor for `account.hub_url` — lets a developer point sign-in at a
+ * different hub before signing in. Gated on `import.meta.env.DEV` by the caller,
+ * so it is statically tree-shaken out of production builds. Reads the current
+ * value on mount; saves on an explicit button (never per-keystroke). Empty input
+ * + Save resets to the default hub. After a save it re-polls status via
+ * `onSaved` so the signed-in card's read-only hub URL reflects the change.
+ */
+function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
+  const [value, setValue] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    (async () => {
+      try {
+        const raw = await api.invoke<string | null>('get_setting', { key: 'account.hub_url' });
+        // null/empty → leave the field blank so the placeholder shows the default.
+        if (mounted.current && raw != null && raw !== '') setValue(raw);
+      } catch (err) {
+        console.error('[account] load hub url failed:', err);
+      }
+    })();
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const handleSave = async () => {
+    if (saving) return;
+    const trimmed = value.trim();
+    // Empty + Save resets to the default hub URL.
+    const next = trimmed === '' ? DEFAULT_HUB_URL : trimmed;
+    if (!next.startsWith('http://') && !next.startsWith('https://')) {
+      setError('Hub URL must start with http:// or https://');
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await api.invoke('set_setting', { key: 'account.hub_url', value: next });
+      if (mounted.current) setValue(next);
+      await onSaved(); // re-poll account_status so the displayed hubUrl refreshes
+    } catch (err) {
+      console.error('[account] save hub url failed:', err);
+      if (mounted.current) setError(accountErrMsg(err));
+    } finally {
+      if (mounted.current) setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-1.5 border-t border-border/50 pt-4">
+      <label className="block text-xs text-content-muted">Hub URL (dev)</label>
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setError(null);
+          }}
+          placeholder={DEFAULT_HUB_URL}
+          spellCheck={false}
+          autoComplete="off"
+          className="flex-1 min-w-0 bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-xs font-mono text-content focus:outline-none focus:border-accent"
+        />
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : null}
+          Save
+        </button>
+      </div>
+      {error && <p className="text-xs text-error">{error}</p>}
+      <p className="text-xs text-content-muted">
+        Dev only. Points sign-in at a different hub. Empty + Save resets to the default.
+      </p>
+    </div>
   );
 }
 
@@ -420,6 +511,8 @@ export default function AccountSection() {
             </div>
           </form>
         )}
+
+        {import.meta.env.DEV && <HubUrlDevEditor onSaved={refreshStatus} />}
       </div>
     );
   }
