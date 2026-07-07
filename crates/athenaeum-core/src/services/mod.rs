@@ -123,3 +123,54 @@ pub struct ServiceContext {
     /// builds). See compute_queue module docs.
     pub compute_queue: compute_queue::ComputeQueue,
 }
+
+impl ServiceContext {
+    /// Test-support constructor: a minimal, fully real `ServiceContext` backed by
+    /// a fresh SQLite catalog at `db_path` (schema initialised by
+    /// [`Database::new`]), every active-operation map empty, single-threaded
+    /// pools, and default (empty) settings. It mirrors what the desktop/web hosts
+    /// build at startup, minus the host-specific wiring (no `AppHandle`, no SSE
+    /// channel, no persisted-settings load).
+    ///
+    /// This is the ONE test-support surface exposed for the two-instance sync
+    /// E2E harness (`tests/sync_e2e.rs`, task M5): an out-of-crate integration
+    /// test cannot reach the private `#[cfg(test)]` `test_ctx()` helpers, and the
+    /// alternative — a hand-written struct literal in the test — would have to
+    /// name the feature-gated solver/render cache fields and break on every field
+    /// addition. Kept `#[doc(hidden)]` because it is not part of the app's public
+    /// API and must never be reached from production host code (both hosts build
+    /// their own `ServiceContext` inline).
+    #[doc(hidden)]
+    pub fn new_for_tests(db_path: std::path::PathBuf) -> Self {
+        let database = Database::new(db_path).expect("open test catalog db");
+        let db = OnceLock::new();
+        let _ = db.set(database);
+        ServiceContext {
+            db,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            dso_catalog: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            star_cache: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .expect("build test image pool"),
+            ),
+            operation_queue: operation_queue::OperationQueue::start(),
+            compute_queue: compute_queue::ComputeQueue::new(),
+        }
+    }
+}
