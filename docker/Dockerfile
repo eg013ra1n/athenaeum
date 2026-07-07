@@ -1,7 +1,7 @@
 # ── Stage 1: Build Rust backend ────────────────────────────────────────────────
 # 1.87+ required: cdshealpix 0.9 uses str::from_utf8_unchecked (stab. 1.87);
 # pinned to match the workspace's local toolchain.
-FROM rust:1.90-bookworm AS rust-builder
+FROM rust:1.96-bookworm AS rust-builder
 
 WORKDIR /build
 

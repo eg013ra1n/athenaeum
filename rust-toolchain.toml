@@ -1,0 +1,4 @@
+[toolchain]
+# iroh 1.x (sharing transport) requires rustc >= 1.91; pin what dev machines,
+# CI runners, and the Docker rust-builder stage must all agree on.
+channel = "1.96.1"
