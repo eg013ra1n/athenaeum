@@ -130,6 +130,30 @@ pub async fn initialize_database(
         }
     }
 
+    // Personal sync (Stage I/II, task A7 fix-review): autostart the receiver +
+    // iroh transport once the DB is actually ready. Desktop's DB is populated
+    // lazily by the frontend (this call), not at Tauri `setup()` — mirrors the
+    // web host's `main.rs` boot-time wiring, just anchored to desktop's true
+    // "DB ready" moment instead of a literal `setup()` spawn that would always
+    // race an empty `ctx.db`. Starts for the dev pairing flag OR a signed-in
+    // `primary` (production account mode — the bug this fix closes: a signed-in
+    // primary previously never listened without someone opening the dev-ticket
+    // disclosure). Best-effort in a spawned task — a transport build failure is
+    // logged, never fatal to the frontend's init call.
+    {
+        let ctx_for_sync = Arc::clone(&state.ctx);
+        let sync_for_sync = Arc::clone(&state.sync);
+        let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+            Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle.clone()));
+        tauri::async_runtime::spawn(async move {
+            match athenaeum_core::api::sync::autostart_if_enabled(&ctx_for_sync, &sync_for_sync, emitter).await {
+                Ok(true) => tracing::info!("personal sync receiver autostarted"),
+                Ok(false) => tracing::debug!("personal sync disabled; receiver not started"),
+                Err(e) => tracing::error!(error = %e, "personal sync autostart failed"),
+            }
+        });
+    }
+
     tracing::info!(path = %db_path.display(), "database initialized");
     Ok(db_path.to_string_lossy().to_string())
 }

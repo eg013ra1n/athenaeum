@@ -20,9 +20,11 @@
 //! from any authed call additionally clears the local session automatically.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::account::{AccountClientError, AccountDevice, AccountStatus, DeviceKey, DeviceRole, HubClient, TokenStore};
 use crate::api::{db, ApiError};
+use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 use crate::settings::{defaults, keys};
 
@@ -366,10 +368,22 @@ pub async fn revoke_device(ctx: &ServiceContext, device_id: String) -> Result<()
 /// Set THIS machine's role. `peer_device_id = None` clears any peer link (the
 /// hub rejects a `primary` with a peer, and a missing / cross-account / revoked
 /// peer, with a 400 whose message is surfaced).
+///
+/// **Role-change reactivity (task A7 fix-review):** a successful switch to
+/// `primary` best-effort autostarts the receive-side transport right here
+/// (mirroring `api::sync::autostart_if_enabled`'s boot-time gate — same
+/// pattern the M2a sender wiring established: the runtime handle + host
+/// emitter are passed in explicitly, not pulled from `ServiceContext`) so the
+/// device starts listening immediately instead of only on the next app
+/// restart or the dev-ticket disclosure. Never fails the role-set call: a
+/// transport hiccup here is logged and surfaced via the normal Sync status
+/// UI, not thrown back at the Account settings screen the user is looking at.
 pub async fn set_machine_role(
     ctx: &ServiceContext,
     role: DeviceRole,
     peer_device_id: Option<String>,
+    sync: &crate::sync::SyncRuntime,
+    emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<AccountStatus, ApiError> {
     let cfg = resolve_config(ctx)?;
     let token = require_token(&cfg)?;
@@ -390,6 +404,15 @@ pub async fn set_machine_role(
         _ => clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?,
     }
     tracing::info!(hub = %cfg.hub_host, device_id = %device_id, role = %role.as_str(), "machine role set");
+
+    if role == DeviceRole::Primary {
+        match crate::api::sync::autostart_if_enabled(ctx, sync, emitter).await {
+            Ok(true) => tracing::info!("sync receiver autostarted after role change to primary"),
+            Ok(false) => tracing::debug!("sync receiver autostart gate not met right after role change"),
+            Err(e) => tracing::warn!(error = %e, "sync receiver autostart after role change failed"),
+        }
+    }
+
     build_status(ctx, &cfg)
 }
 

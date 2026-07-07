@@ -160,11 +160,31 @@ fn clear_cached_peer(ctx: &ServiceContext) {
     }
 }
 
+/// Whether the dev-only default-relay fallback ([`pairing::relay_mode_for`]'s
+/// `allow_default`) is permitted, given whether this device has hub credentials
+/// (`signed_in`) and whether the dev pairing flag is on (`dev_flag`).
+///
+/// **Signed-in always wins, even with the dev flag on** (fix-review addendum):
+/// a signed-in device must never end up on iroh's public n0 default relays —
+/// observed in production, toggling the dev flag as a workaround put a
+/// signed-in app node on n0 while its account-mode Perseus peer sat on the
+/// hub's relay map, so dial-by-node-id failed instantly (different relay
+/// networks). The dev-only Default fallback is for **pure ticket/dev mode**
+/// only: no account at all. A transient "signed in but nothing resolved yet"
+/// moment (hub blip + empty cache) must refuse loudly instead of silently
+/// building a transport on the wrong relays — [`SyncRuntime::ensure_started`]
+/// caches whatever it builds for the process lifetime, so a wrong first choice
+/// would otherwise stick until restart.
+fn allow_default_relays(signed_in: bool, dev_flag: bool) -> bool {
+    !signed_in && dev_flag
+}
+
 /// Resolve the [`iroh::RelayMode`] for the transport: the hub's relay map when
 /// signed in (persisting it as the offline cache), else the last cached map.
-/// Falling back to iroh's default relays beyond that requires the dev flag
-/// (task M1 review finding #1) — otherwise this returns an actionable error
-/// rather than silently starting the transport on public infrastructure.
+/// Falling back to iroh's default relays beyond that requires the dev flag AND
+/// being signed out ([`allow_default_relays`]) — otherwise this returns an
+/// actionable error rather than silently starting the transport on public
+/// infrastructure (or, worse, mixed relay networks with a signed-in peer).
 async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<iroh::RelayMode, ApiError> {
     let creds = crate::api::account::hub_credentials(ctx).unwrap_or(None);
     let cached = cached_relays(ctx).unwrap_or_default();
@@ -173,7 +193,7 @@ async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<iroh::RelayMode, Api
     if res.fresh {
         store_cached_relays(ctx, &res.urls);
     }
-    let allow_default = dev_pairing_enabled(ctx)?;
+    let allow_default = allow_default_relays(creds.is_some(), dev_pairing_enabled(ctx)?);
     pairing::relay_mode_for(&res.urls, allow_default).map_err(ApiError::Internal)
 }
 
@@ -208,25 +228,64 @@ fn persist_peer_resolution(ctx: &ServiceContext, resolution: &PeerResolution) {
     }
 }
 
-/// Boot-time autostart: if the dev flag is enabled, start the receiver +
-/// transport now and return `true`; otherwise a no-op returning `false`. Called
-/// at app start where the DB is already initialised (the web backend). On
-/// desktop the DB is lazy, so the receiver instead starts on the first
-/// [`get_pairing_ticket`] call.
+/// Local-state-only "signed-in primary" check for [`autostart_if_enabled`]:
+/// the persisted `account.*` settings the app writes on sign-in / role-set
+/// (`ACCOUNT_DEVICE_ID` presence as the signed-in proxy, cleared on sign-out by
+/// `clear_local_session` — the same network-free pattern [`auto_mode_ready`]
+/// already uses for the capture side). Deliberately settings-only: never
+/// touches the hub or the OS keychain, so the boot path can decide "should the
+/// receiver even try to start" without a network round-trip or a keychain call.
+fn account_primary_ready(ctx: &ServiceContext) -> Result<bool, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let has_identity = crate::db::get_setting(&conn, keys::ACCOUNT_DEVICE_ID)?
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let role = crate::db::get_setting(&conn, keys::ACCOUNT_ROLE)?
+        .and_then(|s| crate::account::DeviceRole::parse(&s));
+    Ok(has_identity && role == Some(crate::account::DeviceRole::Primary))
+}
+
+/// Boot-time autostart: start the receiver + transport when EITHER the dev
+/// pairing flag is enabled OR this device is a signed-in `primary`
+/// ([`account_primary_ready`], task A7 fix-review — a production account-mode
+/// primary must listen without anyone opening the dev-ticket disclosure).
+/// Returns `true` iff it (re)confirmed the receiver is running, `false` when
+/// neither condition holds. The condition check is local-state-only (no hub
+/// call to decide *whether* to start); `resolve_relay_mode` may still reach the
+/// hub for a fresh relay map once the decision is "yes", falling back to the
+/// cached map (or refusing — never iroh's public defaults for a signed-in
+/// device, see [`allow_default_relays`]) if it's unreachable.
+///
+/// Called at app start where the DB is already initialised (the web backend,
+/// and — since this fix — the desktop host right after `initialize_database`
+/// succeeds, as desktop's DB is populated lazily by the frontend rather than at
+/// Tauri `setup()`). Idempotent regardless of call site:
+/// [`SyncRuntime::ensure_started`] only ever builds the transport once.
 pub async fn autostart_if_enabled(
     ctx: &ServiceContext,
     sync: &SyncRuntime,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<bool, ApiError> {
-    if !dev_pairing_enabled(ctx)? {
+    let dev = dev_pairing_enabled(ctx)?;
+    let account_primary = account_primary_ready(ctx)?;
+    if !autostart_gate(dev, account_primary) {
         return Ok(false);
     }
+    tracing::debug!(dev, account_primary, "sync autostart condition met");
     let (sync_dir, db_path) = sync_paths(ctx)?;
     let relay_mode = resolve_relay_mode(ctx).await?;
     sync.ensure_started(sync_dir, db_path, relay_mode, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(true)
+}
+
+/// The pure condition [`autostart_if_enabled`] gates on: the dev pairing flag,
+/// OR this device being a signed-in `primary`. Factored out for a fast,
+/// network-free unit test of the exact matrix (task A7 fix-review).
+fn autostart_gate(dev: bool, account_primary: bool) -> bool {
+    dev || account_primary
 }
 
 /// Dev-flagged: lazily start the transport + receiver and return this device's
@@ -1412,5 +1471,141 @@ mod tests {
         let combined = list_history(&ctx, q(Some(Direction::Sent), Some("peerB".into()))).unwrap();
         assert_eq!(combined.len(), 1);
         assert_eq!(combined[0].frame_uuid, "s2");
+    }
+
+    // ── Production account-mode autostart (task A7 fix-review) ──────────────
+    //
+    // Bug: a signed-in PRIMARY without the dev flag never started the receiver
+    // (Perseus in production account mode resolved its peer + relay map fine,
+    // enqueued, then `serve/announce failed` forever because the app-side node
+    // wasn't listening). `autostart_gate` + `account_primary_ready` are the
+    // exact local-state-only condition the fix broadens to; `allow_default_relays`
+    // is the companion fix for the addendum (dev flag must never put a
+    // signed-in node on iroh's public relays, mixing relay networks with an
+    // account-mode peer).
+
+    /// The condition matrix `autostart_if_enabled` gates on: dev flag alone
+    /// starts it, signed-in-primary alone starts it, both starts it, neither
+    /// does not.
+    #[test]
+    fn autostart_gate_matrix() {
+        assert!(autostart_gate(true, false), "dev flag alone must start");
+        assert!(autostart_gate(false, true), "signed-in primary alone must start");
+        assert!(autostart_gate(true, true), "both true still starts");
+        assert!(!autostart_gate(false, false), "neither condition: must not start");
+    }
+
+    /// `account_primary_ready` derives "signed-in primary" purely from
+    /// persisted settings (never the hub, never the keychain): no identity yet
+    /// → false; signed-in but role=capture → false; signed-in role=primary →
+    /// true; clearing the identity (sign-out) revokes readiness even if a role
+    /// setting is somehow left behind.
+    #[test]
+    fn account_primary_ready_matrix() {
+        let (_tmp, ctx) = test_ctx();
+        assert!(!account_primary_ready(&ctx).unwrap(), "no identity/role yet -> not ready");
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
+            crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "capture").unwrap();
+        }
+        assert!(!account_primary_ready(&ctx).unwrap(), "signed-in capture -> not ready");
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "primary").unwrap();
+        }
+        assert!(account_primary_ready(&ctx).unwrap(), "signed-in primary -> ready");
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::delete_setting(&conn, keys::ACCOUNT_DEVICE_ID).unwrap();
+        }
+        assert!(
+            !account_primary_ready(&ctx).unwrap(),
+            "no identity -> not ready even with role=primary lingering"
+        );
+    }
+
+    /// `autostart_if_enabled`'s two negative paths never touch relay
+    /// resolution or the transport: signed-out + dev off, and signed-in
+    /// capture + dev off, both return `Ok(false)` with the receiver never
+    /// started (fast — no hub, no iroh).
+    #[tokio::test]
+    async fn autostart_negative_paths_never_start_the_receiver() {
+        use crate::sync::SyncRuntime;
+
+        let (_tmp, ctx) = test_ctx();
+        let sync = SyncRuntime::new();
+
+        let started = autostart_if_enabled(&ctx, &sync, Arc::new(crate::events::NullEmitter))
+            .await
+            .unwrap();
+        assert!(!started, "signed-out + dev off must not start");
+        assert!(!sync.is_started().await);
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
+            crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "capture").unwrap();
+        }
+        let started = autostart_if_enabled(&ctx, &sync, Arc::new(crate::events::NullEmitter))
+            .await
+            .unwrap();
+        assert!(!started, "a signed-in capture device must not autostart the receiver");
+        assert!(!sync.is_started().await);
+    }
+
+    /// Fix-review addendum: a signed-in device must never get the dev-only
+    /// Default-relay fallback, even with the dev flag on — the app-side node
+    /// must stay on the account's hub relay map so an account-mode peer
+    /// (Perseus) can still dial it. Only a signed-OUT session (pure dev/ticket
+    /// mode) may fall back to Default.
+    #[test]
+    fn allow_default_relays_signed_in_always_refuses_even_with_dev_flag() {
+        assert!(!allow_default_relays(true, true), "signed-in + dev flag: still refused");
+        assert!(!allow_default_relays(true, false), "signed-in, no dev flag: refused");
+        assert!(allow_default_relays(false, true), "signed-out + dev flag: pure dev/ticket mode allowed");
+        assert!(!allow_default_relays(false, false), "signed-out, no dev flag: refused");
+    }
+
+    /// Fix-review addendum, pinned end to end: dev flag ON + signed in + the
+    /// hub answers with a real relay map → the resolved `RelayMode` uses the
+    /// hub's relays (`Custom`), never `Default`. This is the exact production
+    /// scenario that broke — toggling the dev flag as a troubleshooting
+    /// workaround while ALSO signed in must not put the app on iroh's public
+    /// n0 relays while an account-mode peer sits on the hub's relay map
+    /// (different relay networks → dial-by-node-id fails instantly).
+    #[tokio::test]
+    async fn signed_in_with_dev_flag_on_still_prefers_hub_relay_map_over_default() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v1/relay-map"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "relays": ["https://relay1.example.org"]
+            })))
+            .mount(&server)
+            .await;
+
+        let res = pairing::resolve_relays(Some((server.uri().as_str(), "tok")), &[]).await;
+        assert_eq!(res.urls, vec!["https://relay1.example.org".to_string()]);
+        assert!(res.fresh, "a live hub answer is fresh");
+
+        // Signed in (creds present) AND the dev flag on: the Default fallback
+        // must be refused regardless — composing exactly what `resolve_relay_mode`
+        // does internally.
+        let allow_default = allow_default_relays(true, true);
+        assert!(!allow_default, "a signed-in device must never get the Default-relay opt-in");
+
+        let mode = pairing::relay_mode_for(&res.urls, allow_default).unwrap();
+        assert!(
+            matches!(mode, iroh::RelayMode::Custom(_)),
+            "must use the hub's relay map, not iroh's public defaults, got {mode:?}"
+        );
     }
 }

@@ -452,7 +452,10 @@ impl Worker {
             None => match announce_for_dir(&dir) {
                 Ok(a) => a,
                 Err(e) => {
-                    tracing::error!(package_id = id, error = %e, "sync build announce failed; will retry");
+                    // `{e:#}` (alternate Display) — a bare `%e` prints only the
+                    // outermost `.context(...)` layer, hiding the actual cause
+                    // (fix-review: field diagnosis shouldn't need a debugger).
+                    tracing::error!(package_id = id, error = %format!("{e:#}"), "sync build announce failed; will retry");
                     self.arm_retry(id);
                     return Ok(());
                 }
@@ -474,7 +477,10 @@ impl Worker {
         }
         .await;
         if let Err(e) = serve_announce {
-            tracing::error!(package_id = id, error = %e, "sync serve/announce failed; will retry");
+            // `{e:#}` — same rationale as the build-announce branch above: the
+            // bare `.context("announce package")` layer alone hid the real
+            // cause (e.g. "peer not started: <hex>") in production logs.
+            tracing::error!(package_id = id, error = %format!("{e:#}"), "sync serve/announce failed; will retry");
             if let Some(p) = self.pending.get_mut(&id) {
                 p.announce = Some(announce);
             }
