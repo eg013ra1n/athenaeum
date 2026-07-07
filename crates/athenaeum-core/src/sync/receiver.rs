@@ -293,10 +293,15 @@ impl SyncRuntime {
     /// ingests into the catalog at `db_path`, and return the pairing ticket.
     /// Idempotent — a second call returns the existing ticket without starting a
     /// second transport.
+    ///
+    /// `relay_mode` is resolved by the caller (task M1): the hub's relay map when
+    /// signed in, the last cached map for an offline start, or iroh's default
+    /// relays as the ultimate fallback (see [`crate::sync::pairing`]).
     pub async fn ensure_started(
         &self,
         sync_dir: PathBuf,
         db_path: PathBuf,
+        relay_mode: iroh::RelayMode,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<String> {
         let mut guard = self.inner.lock().await;
@@ -315,7 +320,7 @@ impl SyncRuntime {
         .secret_bytes();
         let transport = crate::sharing::iroh::IrohTransport::new(
             secret,
-            iroh::RelayMode::Default,
+            relay_mode,
             crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs")),
         )
         .await

@@ -50,6 +50,7 @@ use crate::sharing::types::NodeId;
 pub mod engine;
 pub mod ingest;
 pub mod models;
+pub mod pairing;
 pub mod receiver;
 pub mod retention;
 pub mod store;
@@ -63,6 +64,10 @@ mod retention_tests;
 
 pub use engine::{SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS};
 pub use ingest::{ingest_package, IngestOutcome};
+pub use pairing::{
+    node_id_from_ticket, relay_mode_from_urls, resolve_peer, resolve_relays, AccountPairing,
+    PeerResolution, RelayResolution,
+};
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
 pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{

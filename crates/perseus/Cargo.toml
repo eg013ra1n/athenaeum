@@ -58,3 +58,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Mock HTTP hub for the account login / pairing-resolution tests (task M1).
+wiremock = "0.6"

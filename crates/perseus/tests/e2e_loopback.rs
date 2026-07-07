@@ -53,8 +53,10 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         capture_dir: capture_dir.to_path_buf(),
         data_dir: data_dir.to_path_buf(),
         // Loopback path never parses this as an iroh ticket; any non-empty value
-        // passes structural validation.
-        pairing_ticket: "loopback-test".to_string(),
+        // passes structural validation. No [account] table — the loopback e2e
+        // exercises the dev-ticket path (task M1).
+        pairing_ticket: Some("loopback-test".to_string()),
+        account: None,
         mode: Mode::Auto,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,

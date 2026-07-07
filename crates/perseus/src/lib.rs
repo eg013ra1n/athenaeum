@@ -13,6 +13,8 @@
 //! # Module map
 //!
 //! - [`config`] — the `perseus.toml` contract: parse + actionable validation.
+//! - [`account`] — hub account pairing (task M1): the `perseus login` OTP flow,
+//!   the pairing cache, and the run-time peer/relay resolution.
 //! - [`watcher`] — `notify` watcher + the pure, clock-injectable
 //!   [`watcher::StabilityTracker`].
 //! - [`run`] — the [`run::Agent`]: store + transport + engine + watcher, plus
@@ -21,6 +23,7 @@
 //!   (`perseus_seen` table), so a restart never re-baselines an un-synced
 //!   frame into oblivion.
 
+pub mod account;
 pub mod config;
 pub mod run;
 pub mod seen;

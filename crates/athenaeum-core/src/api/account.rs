@@ -127,6 +127,7 @@ fn clear_local_session(ctx: &ServiceContext, cfg: &AccountConfig) -> Result<(), 
     clear_state(ctx, keys::ACCOUNT_EMAIL)?;
     clear_state(ctx, keys::ACCOUNT_DEVICE_ID)?;
     clear_state(ctx, keys::ACCOUNT_ROLE)?;
+    clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?;
     Ok(())
 }
 
@@ -224,11 +225,64 @@ pub async fn sign_in_verify(
 
     write_state(ctx, keys::ACCOUNT_EMAIL, &email)?;
     write_state(ctx, keys::ACCOUNT_DEVICE_ID, &resp.device_id)?;
-    // A freshly registered device has no role until `set_machine_role`.
+    // A freshly registered device has no role until `set_machine_role`. But on a
+    // plain *re-sign-in* the hub still holds this device's role + peer from before
+    // (the token/pubkey are unchanged) — clearing them locally here would drop the
+    // capture pairing until the next manual role set. Refresh from the hub
+    // (best-effort, one extra call) so the persisted role/peer match the hub
+    // again; a fresh device simply gets nothing back and stays unassigned.
     clear_state(ctx, keys::ACCOUNT_ROLE)?;
+    clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?;
+    refresh_persisted_role(ctx, &cfg, &resp.device_id, &resp.device_token).await;
 
     tracing::info!(hub = %cfg.hub_host, device_id = %resp.device_id, "device signed in");
     build_status(ctx, &cfg)
+}
+
+/// Best-effort: re-read this device's hub row and persist its current `role` +
+/// `peer_device_id` locally. Called after a successful sign-in/verify so a
+/// re-sign-in restores the role the hub already holds (the known B4 gap). Never
+/// fails sign-in — a hub hiccup just leaves the role unassigned until the next
+/// [`list_devices`] / [`set_machine_role`].
+async fn refresh_persisted_role(
+    ctx: &ServiceContext,
+    cfg: &AccountConfig,
+    device_id: &str,
+    token: &str,
+) {
+    let client = match HubClient::new(&cfg.hub_url) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "role refresh: could not build hub client");
+            return;
+        }
+    };
+    let devices = match client.list_devices(token).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "role refresh: list_devices failed; role left unassigned");
+            return;
+        }
+    };
+    let Some(me) = devices.iter().find(|d| d.id == device_id) else {
+        return;
+    };
+    if let Some(role) = me.role {
+        if let Err(e) = write_state(ctx, keys::ACCOUNT_ROLE, role.as_str()) {
+            tracing::warn!(error = %e, "role refresh: persist role failed");
+        }
+    }
+    match me.peer_device_id.as_deref() {
+        Some(peer) => {
+            if let Err(e) = write_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID, peer) {
+                tracing::warn!(error = %e, "role refresh: persist peer failed");
+            }
+        }
+        None => {
+            let _ = clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID);
+        }
+    }
+    tracing::info!(device_id = %device_id, "persisted role/peer refreshed from hub after sign-in");
 }
 
 /// This device's account state — resolvable offline from the keychain + settings.
@@ -318,8 +372,61 @@ pub async fn set_machine_role(
         .map_err(|e| map_authed_err(ctx, &cfg, e))?;
 
     write_state(ctx, keys::ACCOUNT_ROLE, role.as_str())?;
+    // Persist the paired peer so the sync peer-resolver (task M1) can look up the
+    // primary's pubkey; a `primary`/unassigned role or a cleared peer wipes it.
+    match (role, peer_device_id.as_deref()) {
+        (DeviceRole::Capture, Some(peer)) => write_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID, peer)?,
+        _ => clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?,
+    }
     tracing::info!(hub = %cfg.hub_host, device_id = %device_id, role = %role.as_str(), "machine role set");
     build_status(ctx, &cfg)
+}
+
+// ── sync peer/relay resolution seam (task M1) ───────────────────────────────
+//
+// The app's capture-role sender resolves its peer + relays through
+// `crate::sync::pairing`, exactly like Perseus. These helpers gather the
+// settings/keychain inputs that resolver needs; they live here (not in
+// `api::sync`) because they read the same `AccountConfig` + `TokenStore` the
+// account commands use.
+
+/// The signed-in hub credentials `(hub_url, token)`, or `None` when signed out.
+/// Used to fetch the relay map for the sync transport.
+pub fn hub_credentials(ctx: &ServiceContext) -> Result<Option<(String, String)>, ApiError> {
+    let cfg = resolve_config(ctx)?;
+    let token = cfg
+        .token_store()
+        .load()
+        .map_err(|e| ApiError::Internal(format!("load token: {e:#}")))?;
+    Ok(token.map(|t| (cfg.hub_url.clone(), t)))
+}
+
+/// The account-pairing inputs for the sync peer resolver: `Some` only when this
+/// device is signed in, has role `capture`, and has a persisted paired primary.
+/// `None` otherwise (the resolver then falls through to the dev-ticket path).
+pub fn account_pairing(
+    ctx: &ServiceContext,
+) -> Result<Option<crate::sync::AccountPairing>, ApiError> {
+    let cfg = resolve_config(ctx)?;
+    let Some(token) = cfg
+        .token_store()
+        .load()
+        .map_err(|e| ApiError::Internal(format!("load token: {e:#}")))?
+    else {
+        return Ok(None);
+    };
+    let role = read_state(ctx, keys::ACCOUNT_ROLE)?.and_then(|s| DeviceRole::parse(&s));
+    if role != Some(DeviceRole::Capture) {
+        return Ok(None);
+    }
+    let Some(peer_device_id) = read_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)? else {
+        return Ok(None);
+    };
+    Ok(Some(crate::sync::AccountPairing {
+        hub_url: cfg.hub_url,
+        token,
+        peer_device_id,
+    }))
 }
 
 #[cfg(test)]

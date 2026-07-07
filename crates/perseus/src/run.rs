@@ -24,7 +24,6 @@ use athenaeum_core::sync::{
     SyncEngine, SyncEngineHandle,
 };
 use chrono::{DateTime, Utc};
-use iroh::RelayMode;
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -212,30 +211,36 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Start a production agent: persistent device key, iroh transport (default
-    /// relays), peer derived from the pairing ticket. `watch` arms the capture
-    /// watcher (true for `run`, false for `enqueue-backlog`).
+    /// Start a production agent: persistent device key, iroh transport, and the
+    /// peer + relays resolved via the shared resolver (task M1) — account pairing
+    /// (primary from the hub device list) → dev ticket → error. `watch` arms the
+    /// capture watcher (true for `run`, false for `enqueue-backlog`).
     pub async fn start(config: Config, watch: bool) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
-        // Parse the pairing ticket exactly once: derive both the peer NodeId
-        // and its dialable address, then register the address directly via
-        // `add_peer` — `add_peer_ticket` would re-parse the same string.
-        let ticket = parse_ticket(&config.pairing_ticket)?;
-        let peer_addr = ticket.endpoint_addr().clone();
-        let peer: NodeId = *peer_addr.id.as_bytes();
+        // Resolve the peer + relay map before binding the transport: account
+        // pairing when signed in (offline cache fallback), else the dev ticket.
+        let resolved = crate::account::resolve_pairing(&config).await?;
 
         let secret = load_or_create_device_key(&config.device_key_path())?;
 
         let transport = IrohTransport::new(
             secret,
-            RelayMode::Default,
+            resolved.relay_mode,
             BlobStore::Fs(config.data_dir.clone()),
         )
         .await
         .context("build iroh transport")?;
-        transport.add_peer(peer_addr);
+        // On the ticket path, register the peer's full dialable address from the
+        // ticket. On the account path the peer is a bare node id — the transport
+        // reaches it via the resolved relays / discovery.
+        if let Some(ticket) = &resolved.ticket {
+            transport
+                .add_peer_ticket(ticket)
+                .context("register peer address from pairing ticket")?;
+        }
+        let peer = resolved.peer;
         let node_id = transport.node_id();
         tracing::info!(
             node_id = %node_id_hex(&node_id),

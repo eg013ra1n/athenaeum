@@ -1,12 +1,25 @@
 //! Perseus TOML configuration: parse + validate.
 //!
-//! The binding contract is the `perseus.toml` shape from the task brief:
+//! The binding contract is the `perseus.toml` shape from the task brief. As of
+//! task M1 there are two pairing routes — an **account** (the primary is resolved
+//! from the hub device list) or a **dev ticket** — and at least one must be
+//! present:
 //!
 //! ```toml
 //! capture_dir = "/data/capture"
 //! data_dir = "/var/lib/perseus"
-//! pairing_ticket = "<paste from primary Settings → Sync (dev)>"
 //! mode = "auto"                             # only value in MVP
+//!
+//! # Route A — account pairing (recommended). Sign in with `perseus login`; the
+//! # device token lands in a 0600 file in data_dir (NEVER in this TOML).
+//! [account]
+//! hub_url = "https://projects.artfrom.space"
+//! email = "me@example.com"                  # optional; prompted at login if absent
+//! primary_device_id = "dev-abc"             # optional; auto-picks the single primary
+//!
+//! # Route B — dev ticket (offline dev / tests). Optional now that [account] exists.
+//! pairing_ticket = "<paste from primary Settings → Sync (dev)>"
+//!
 //! [retention]
 //! policy = "keep_everything"                # keep_everything | on_confirm | keep_days | disk_pct
 //! dry_run = true                            # MUST stay true until M-Perseus-MVP sign-off
@@ -14,9 +27,8 @@
 //!
 //! Two optional tuning fields are additive (defaulted, absent from the contract
 //! sample): `stability_secs` (write-stability quiet window, default 10) and
-//! `poll_interval_secs` (re-stat cadence, default 2). Everything else is
-//! required; validation errors are actionable — they name the offending field
-//! and the accepted values.
+//! `poll_interval_secs` (re-stat cadence, default 2). Validation errors are
+//! actionable — they name the offending field and the accepted values.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -141,12 +153,52 @@ impl RetentionConfig {
     }
 }
 
+/// Default hub base URL — matches the app's `account.hub_url` default so a
+/// bare `[account]` table (email only) points at the production hub.
+pub const DEFAULT_HUB_URL: &str = "https://projects.artfrom.space";
+
+fn default_hub_url() -> String {
+    DEFAULT_HUB_URL.to_string()
+}
+
+/// The `[account]` table (task M1). Present when Perseus pairs via the hub account
+/// (a `perseus login` device token) rather than a raw pairing ticket. The token
+/// itself is NEVER in TOML — it lives in a 0600 file in `data_dir`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountConfig {
+    /// Hub base URL (defaults to the production hub).
+    #[serde(default = "default_hub_url")]
+    pub hub_url: String,
+    /// Account email. Optional in the file — `perseus login` prompts when absent.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The paired primary's hub device id. Optional — when absent, Perseus
+    /// auto-picks the account's single `primary` device.
+    #[serde(default)]
+    pub primary_device_id: Option<String>,
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self {
+            hub_url: default_hub_url(),
+            email: None,
+            primary_device_id: None,
+        }
+    }
+}
+
 /// Parsed + validated Perseus configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub capture_dir: PathBuf,
     pub data_dir: PathBuf,
-    pub pairing_ticket: String,
+    /// Dev-ticket pairing route (task M1: optional now that `[account]` exists).
+    #[serde(default)]
+    pub pairing_ticket: Option<String>,
+    /// Account-pairing route (task M1).
+    #[serde(default)]
+    pub account: Option<AccountConfig>,
     pub mode: Mode,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -171,9 +223,9 @@ impl Config {
         let cfg: Config = toml::from_str(text).map_err(|e| {
             anyhow::anyhow!(
                 "could not parse config TOML: {e}. Expected keys: capture_dir, \
-                 data_dir, pairing_ticket, mode = \"auto\", and a [retention] table \
-                 with policy = keep_everything|on_confirm|keep_days|disk_pct and \
-                 dry_run = true"
+                 data_dir, mode = \"auto\", a pairing route (either an [account] \
+                 table or pairing_ticket), and a [retention] table with policy = \
+                 keep_everything|on_confirm|keep_days|disk_pct and dry_run = true"
             )
         })?;
         cfg.validate()?;
@@ -197,11 +249,35 @@ impl Config {
         if self.data_dir.as_os_str().is_empty() {
             bail!("data_dir must not be empty");
         }
-        if self.pairing_ticket.trim().is_empty() {
+        // Pairing route (task M1): at least one of [account] or pairing_ticket.
+        let has_account = self.account.is_some();
+        let ticket_present = self
+            .pairing_ticket
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty());
+        if !has_account && !ticket_present {
             bail!(
-                "pairing_ticket must not be empty — paste the ticket from the \
+                "no pairing route configured — add an [account] table (then run \
+                 `perseus login`) or set pairing_ticket to the ticket from the \
                  primary's Settings → Sync (dev)"
             );
+        }
+        // A present-but-blank pairing_ticket is a misconfiguration, not "absent".
+        if self.pairing_ticket.as_ref().is_some_and(|t| t.trim().is_empty()) {
+            bail!(
+                "pairing_ticket is present but empty — remove it to use [account] \
+                 pairing, or paste a real ticket"
+            );
+        }
+        if let Some(account) = &self.account {
+            if account.hub_url.trim().is_empty() {
+                bail!("[account].hub_url must not be empty");
+            }
+            if let Some(email) = &account.email {
+                if email.trim().is_empty() {
+                    bail!("[account].email is present but empty — remove it or set a real address");
+                }
+            }
         }
         // `mode` is an enum, so any non-`auto` value already failed to parse.
         // Hard invariant: no deletion path exists before A8; refuse to run with
@@ -298,7 +374,8 @@ dry_run = true
         let cfg = Config::from_toml_str(&good_toml(capture.path())).expect("valid config");
         assert_eq!(cfg.capture_dir, capture.path());
         assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/perseus"));
-        assert_eq!(cfg.pairing_ticket, "ticket-abc");
+        assert_eq!(cfg.pairing_ticket.as_deref(), Some("ticket-abc"));
+        assert!(cfg.account.is_none(), "no [account] table in the ticket-only contract shape");
         assert_eq!(cfg.mode, Mode::Auto);
         assert_eq!(cfg.retention.policy, RetentionPolicy::KeepEverything);
         assert!(cfg.retention.dry_run);
@@ -397,6 +474,73 @@ mode = "auto"
         assert!(
             err.chain().any(|c| c.to_string().contains("pairing_ticket")),
             "error should mention pairing_ticket: {err:#}"
+        );
+    }
+
+    /// Task M1: an `[account]` table alone is a valid pairing route — no
+    /// `pairing_ticket` required. `hub_url` defaults to the production hub.
+    #[test]
+    fn account_only_config_parses_without_ticket() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"
+capture_dir = "{}"
+data_dir = "/d"
+mode = "auto"
+[account]
+email = "me@example.com"
+[retention]
+policy = "keep_everything"
+dry_run = true
+"#,
+            capture.path().display()
+        );
+        let cfg = Config::from_toml_str(&text).expect("account-only config is valid");
+        assert!(cfg.pairing_ticket.is_none(), "no ticket needed with [account]");
+        let account = cfg.account.expect("account table present");
+        assert_eq!(account.hub_url, DEFAULT_HUB_URL, "hub_url defaults to the production hub");
+        assert_eq!(account.email.as_deref(), Some("me@example.com"));
+        assert!(account.primary_device_id.is_none(), "primary auto-picked when omitted");
+    }
+
+    /// Task M1: account + explicit hub_url + primary_device_id all parse.
+    #[test]
+    fn account_config_with_all_fields_parses() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            r#"
+capture_dir = "{}"
+data_dir = "/d"
+mode = "auto"
+[account]
+hub_url = "https://staging.example.org"
+email = "me@example.com"
+primary_device_id = "dev-primary-1"
+[retention]
+policy = "keep_everything"
+dry_run = true
+"#,
+            capture.path().display()
+        );
+        let account = Config::from_toml_str(&text).unwrap().account.unwrap();
+        assert_eq!(account.hub_url, "https://staging.example.org");
+        assert_eq!(account.primary_device_id.as_deref(), Some("dev-primary-1"));
+    }
+
+    /// Task M1: neither a pairing route present → rejected with an actionable
+    /// message naming both routes.
+    #[test]
+    fn no_pairing_route_is_rejected() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"/d\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            capture.path().display()
+        );
+        let err = Config::from_toml_str(&text).expect_err("no pairing route must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pairing") && (msg.contains("account") || msg.contains("pairing_ticket")),
+            "error should name the pairing routes: {msg}"
         );
     }
 

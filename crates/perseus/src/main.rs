@@ -1,6 +1,8 @@
 //! Perseus binary entry point: clap CLI over the [`perseus`] agent library.
 //!
 //! Subcommands:
+//! - `login` — interactive account sign-in (email → OTP); stores the device
+//!   token and registers this node as a capture device (task M1).
 //! - `run` — watch the capture dir and auto-send new frames (the service mode).
 //! - `status` — print a one-shot human summary of config + in-flight transfers.
 //! - `enqueue-backlog <dir>` — enqueue FITS/XISF already on disk before the
@@ -31,6 +33,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Sign in to the account (interactive email + one-time code) and register
+    /// this node as a capture device paired to the account's primary.
+    Login,
     /// Watch the capture directory and auto-send new frames (runs until Ctrl-C).
     Run,
     /// Print a one-shot status summary (config + in-flight transfers).
@@ -52,6 +57,7 @@ async fn main() -> Result<()> {
     let _log_guard = init_logging(&config.log_dir())?;
 
     match cli.command {
+        Command::Login => perseus::account::login(&config).await,
         Command::Run => cmd_run(config).await,
         Command::Status => cmd_status(config).await,
         Command::EnqueueBacklog { dir } => cmd_enqueue_backlog(config, dir).await,
@@ -83,14 +89,18 @@ async fn cmd_status(config: Config) -> Result<()> {
     println!("Perseus status");
     println!("  capture_dir       : {}", config.capture_dir.display());
     println!("  data_dir          : {}", config.data_dir.display());
-    println!(
-        "  pairing_ticket    : {}",
-        if config.pairing_ticket.trim().is_empty() {
-            "(missing)"
-        } else {
-            "configured"
+    let pairing_route = match &config.account {
+        Some(a) => format!("account (hub {})", a.hub_url),
+        None if config
+            .pairing_ticket
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty()) =>
+        {
+            "dev pairing ticket".to_string()
         }
-    );
+        None => "(none configured)".to_string(),
+    };
+    println!("  pairing_route     : {pairing_route}");
     println!("  mode              : {:?}", config.mode);
     println!("  retention.policy  : {:?}", config.retention.policy);
     println!(
