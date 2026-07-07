@@ -6,6 +6,7 @@ import { revealItemInDir, openPath } from '../api/desktop';
 import { CalibrationMatchingConfig } from '../components/calibration';
 import LoggingSettings from '../components/settings/LoggingSettings';
 import AccountSection from '../components/settings/AccountSection';
+import SyncSection from '../components/settings/SyncSection';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
@@ -620,6 +621,21 @@ export default function Settings() {
               Optional — every feature works without an account.
             </p>
             <AccountSection />
+          </div>
+
+          {/* Sync — machine role, auto-send, receiver status. Placed right after
+              Account (task M2b); self-contained like AccountSection, works
+              signed-out (quiet empty state). */}
+          <div className="mb-6 bg-surface-elevated rounded-lg p-6">
+            <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+              <RefreshCw size={20} />
+              Sync
+            </h3>
+            <p className="text-xs text-content-muted mb-4">
+              Send frames between your machines. A Capture device queues its frames to a paired
+              Primary; the Primary receives and ingests them.
+            </p>
+            <SyncSection />
           </div>
 
           <div className="bg-surface-elevated rounded-lg p-6 space-y-6">
