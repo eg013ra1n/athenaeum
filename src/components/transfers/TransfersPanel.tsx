@@ -45,6 +45,32 @@ function shortPeer(hex: string): string {
 }
 
 /**
+ * Duration + throughput for a finished history row, e.g. `4.2s · 18.7 MB/s`.
+ * Returns `null` for in-flight rows (`finishedAt` null) or unparseable/negative
+ * spans, so the caller can omit the line entirely.
+ */
+function transferStats(r: HistoryRow): string | null {
+  if (!r.finishedAt) return null;
+  const ms = new Date(r.finishedAt).getTime() - new Date(r.startedAt).getTime();
+  if (!isFinite(ms) || ms < 0) return null;
+  const secs = ms / 1000;
+  const dur = secs >= 60 ? `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s` : `${secs.toFixed(1)}s`;
+  const mbs = r.bytes > 0 && secs > 0 ? ` · ${(r.bytes / 1048576 / secs).toFixed(1)} MB/s` : '';
+  return `${dur}${mbs}`;
+}
+
+/**
+ * A sender history row the peer confirmed it received — `ingested` (newly
+ * stored) or `duplicate` (already had it). Either way the local copy is safe to
+ * delete. Written only by the sender's `append_confirmed_history`; failed /
+ * cancelled sends carry other outcomes and never qualify. Kept in lockstep with
+ * the Perseus web page's "safe to delete" chip predicate.
+ */
+function isDelivered(r: HistoryRow): boolean {
+  return r.direction === 'sent' && (r.outcome === 'ingested' || r.outcome === 'duplicate');
+}
+
+/**
  * Transfers slide-over (task M3) — mounted at app root (NotificationPanel
  * pattern), opened from `TransferIndicator`. Active tab lists the shared
  * `useSyncStatus` in-flight rows; History tab queries `list_sync_history`
@@ -55,6 +81,7 @@ export function TransfersPanel() {
   const { open, closePanel, status, active, refresh } = useTransfers();
   const [tab, setTab] = useState<Tab>('active');
   const [history, setHistory] = useState<HistoryRow[]>([]);
+  const [deviceNames, setDeviceNames] = useState<Record<string, string>>({});
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [search, setSearch] = useState('');
   const [dirFilter, setDirFilter] = useState<DirFilter>('all');
@@ -93,6 +120,23 @@ export function TransfersPanel() {
     if (!open || tab !== 'history') return;
     fetchHistory();
   }, [open, tab, fetchHistory]);
+
+  // Load the hub's node-id → device-name map once per panel open (NOT per poll
+  // tick). Degrades to shortPeer hex on any failure / empty map (signed out or
+  // hub unreachable) — the render falls back automatically.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    api
+      .invoke<Record<string, string>>('get_sync_device_names')
+      .then((names) => {
+        if (!cancelled && mounted.current) setDeviceNames(names ?? {});
+      })
+      .catch((err) => console.error('[TransfersPanel] get_sync_device_names failed:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   // Escape closes the panel (mirrors NotificationPanel), focus the close button.
   useEffect(() => {
@@ -143,9 +187,10 @@ export function TransfersPanel() {
       (r) =>
         r.filename.toLowerCase().includes(q) ||
         (r.object ?? '').toLowerCase().includes(q) ||
-        r.peerDevice.toLowerCase().includes(q),
+        r.peerDevice.toLowerCase().includes(q) ||
+        (deviceNames[r.peerDevice] ?? '').toLowerCase().includes(q),
     );
-  }, [history, search]);
+  }, [history, search, deviceNames]);
 
   return (
     <>
@@ -218,6 +263,7 @@ export function TransfersPanel() {
           ) : (
             <HistoryTab
               rows={filteredHistory}
+              deviceNames={deviceNames}
               loading={loadingHistory}
               search={search}
               onSearch={setSearch}
@@ -259,6 +305,7 @@ function ActiveTab({ active }: { active: OutboundSummary[] }) {
 
 interface HistoryTabProps {
   rows: HistoryRow[];
+  deviceNames: Record<string, string>;
   loading: boolean;
   search: string;
   onSearch: (v: string) => void;
@@ -266,7 +313,15 @@ interface HistoryTabProps {
   onDirFilter: (d: DirFilter) => void;
 }
 
-function HistoryTab({ rows, loading, search, onSearch, dirFilter, onDirFilter }: HistoryTabProps) {
+function HistoryTab({
+  rows,
+  deviceNames,
+  loading,
+  search,
+  onSearch,
+  dirFilter,
+  onDirFilter,
+}: HistoryTabProps) {
   const chips: DirFilter[] = ['all', 'sent', 'received'];
   return (
     <div>
@@ -308,28 +363,41 @@ function HistoryTab({ rows, loading, search, onSearch, dirFilter, onDirFilter }:
         <p className="px-4 py-10 text-center text-sm text-content-muted">No transfer history</p>
       ) : (
         <ul className="divide-y divide-border">
-          {rows.map((r, i) => (
-            <li key={`${r.frameUuid}-${r.startedAt}-${i}`} className="px-4 py-2.5">
-              <div className="flex items-center gap-2">
-                {r.direction === 'sent' ? (
-                  <ArrowUp size={12} className="shrink-0 text-content-muted" />
-                ) : (
-                  <Inbox size={12} className="shrink-0 text-content-muted" />
+          {rows.map((r, i) => {
+            const peerLabel = deviceNames[r.peerDevice] ?? shortPeer(r.peerDevice);
+            const stats = transferStats(r);
+            const delivered = isDelivered(r);
+            return (
+              <li key={`${r.frameUuid}-${r.startedAt}-${i}`} className="px-4 py-2.5">
+                <div className="flex items-center gap-2">
+                  {r.direction === 'sent' ? (
+                    <ArrowUp size={12} className="shrink-0 text-content-muted" />
+                  ) : (
+                    <Inbox size={12} className="shrink-0 text-content-muted" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate text-xs text-content-secondary" title={r.filename}>
+                    {r.filename}
+                  </span>
+                  <span className={`shrink-0 text-[11px] font-medium ${outcomeTone(r.outcome)}`}>
+                    {r.outcome}
+                  </span>
+                </div>
+                <p className="mt-0.5 flex items-center gap-2 pl-5 text-[10px] text-content-muted">
+                  {r.object && <span className="truncate">{r.object}</span>}
+                  <span title={r.peerDevice}>{peerLabel}</span>
+                  <span className="ml-auto shrink-0">{formatTimestamp(r.startedAt)}</span>
+                </p>
+                {(delivered || stats) && (
+                  <p className="mt-0.5 flex items-center gap-2 pl-5 text-[10px] text-content-muted">
+                    {delivered && (
+                      <span className="font-medium text-success">✓ delivered — safe to delete</span>
+                    )}
+                    {stats && <span className="ml-auto shrink-0 tabular-nums">{stats}</span>}
+                  </p>
                 )}
-                <span className="min-w-0 flex-1 truncate text-xs text-content-secondary" title={r.filename}>
-                  {r.filename}
-                </span>
-                <span className={`shrink-0 text-[11px] font-medium ${outcomeTone(r.outcome)}`}>
-                  {r.outcome}
-                </span>
-              </div>
-              <p className="mt-0.5 flex items-center gap-2 pl-5 text-[10px] text-content-muted">
-                {r.object && <span className="truncate">{r.object}</span>}
-                <span title={r.peerDevice}>{shortPeer(r.peerDevice)}</span>
-                <span className="ml-auto shrink-0">{formatTimestamp(r.startedAt)}</span>
-              </p>
-            </li>
-          ))}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>
