@@ -5281,6 +5281,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.2",
+ "toml_edit 0.23.7",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -7969,6 +7970,7 @@ dependencies = [
  "indexmap 2.12.0",
  "toml_datetime 0.7.3",
  "toml_parser",
+ "toml_writer",
  "winnow 0.7.13",
 ]
 

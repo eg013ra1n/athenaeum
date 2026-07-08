@@ -25,11 +25,11 @@ use athenaeum_core::sync::{
 };
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{Config, RetentionConfig};
 use crate::seen::{SeenStore, SourceLink};
 use crate::watcher::{self, WatcherHandle};
 
@@ -201,6 +201,14 @@ pub struct Agent {
     watchers: Vec<WatcherHandle>,
     enqueue_task: Option<JoinHandle<()>>,
     retention_task: Option<JoinHandle<()>>,
+    /// Live-edit channel for the retention config (task 8). The retention loop
+    /// holds the matching receiver and re-borrows it every pass, so a `send`
+    /// here takes effect on the next tick without an agent restart. The web
+    /// settings page (tasks 9/10) obtains a clone via [`Agent::retention_tx`]
+    /// and sends the re-validated config returned by
+    /// [`crate::config_edit::apply_retention_edit`]. Dropping this sender (agent
+    /// shutdown) is the retention loop's second, graceful exit path.
+    retention_tx: watch::Sender<RetentionConfig>,
 }
 
 impl Agent {
@@ -305,6 +313,13 @@ impl Agent {
             "retention active"
         );
 
+        // Live-edit channel for the retention config (task 8). Seeded with the
+        // startup config; the retention loop re-borrows it every pass. Created
+        // unconditionally so `retention_tx()` is always available — when `watch`
+        // is false there is no receiver (retention doesn't run in
+        // enqueue-backlog), so a send is a harmless no-op.
+        let (retention_tx, retention_rx) = watch::channel(config.retention.clone());
+
         let (watchers, enqueue_task, retention_task) = if watch {
             let (stable_tx, stable_rx) = mpsc::channel::<PathBuf>(64);
             // One watcher per configured capture directory; each gets its own
@@ -334,9 +349,13 @@ impl Agent {
                 Arc::clone(&store),
                 Arc::clone(&seen),
                 config.clone(),
+                retention_rx,
             );
             (watchers, Some(enqueue_task), Some(retention_task))
         } else {
+            // No retention loop in enqueue-backlog mode: drop the receiver so the
+            // channel has none (the sender is still held for API symmetry).
+            drop(retention_rx);
             (Vec::new(), None, None)
         };
 
@@ -349,6 +368,7 @@ impl Agent {
             watchers,
             enqueue_task,
             retention_task,
+            retention_tx,
         })
     }
 
@@ -380,11 +400,23 @@ impl Agent {
         &self.origin_device
     }
 
+    /// A clone of the retention live-edit sender (task 8). The web settings page
+    /// (tasks 9/10) sends the re-validated [`RetentionConfig`] returned by
+    /// [`crate::config_edit::apply_retention_edit`] here to have the running
+    /// retention loop adopt it on its next pass — no agent restart. When the
+    /// agent was started without `watch` there is no receiver, so a send is an
+    /// intentional no-op.
+    pub fn retention_tx(&self) -> watch::Sender<RetentionConfig> {
+        self.retention_tx.clone()
+    }
+
     /// Gracefully stop the watcher, drain the enqueue consumer, and shut the
     /// engine down (awaiting its worker).
     pub async fn shutdown(self) {
-        // The retention loop is an independent timer task with no channel to
-        // close; abort it directly (it holds only Arc clones, nothing to drain).
+        // The retention loop is an independent timer task; abort it directly (it
+        // holds only Arc clones + a watch receiver, nothing to drain). Dropping
+        // `self.retention_tx` at end of scope would also break it via
+        // `rx.changed()` erroring, but the explicit abort is immediate.
         if let Some(t) = self.retention_task {
             t.abort();
         }
@@ -706,28 +738,58 @@ pub fn run_retention_once(
     evaluate_and_apply(store, &policy, dry_run, now, disk_probe, &mut deleter)
 }
 
-/// Spawn the hourly (config-driven) retention timer. Each tick runs a full
+/// Spawn the config-driven retention timer. Each tick runs a full
 /// evaluate-and-apply pass on a blocking thread (SQLite + fs), then logs the
-/// outcome. Aborted on shutdown; holds only `Arc` clones, so there is nothing to
-/// drain.
+/// outcome.
+///
+/// The retention config is sourced from the [`watch`] receiver every pass
+/// (`rx.borrow().clone()`), so a live edit pushed via [`Agent::retention_tx`]
+/// (tasks 9/10) takes effect on the next tick without an agent restart — the new
+/// interval, policy, and dry-run flag are all picked up. Only the retention knobs
+/// live on the channel; the capture directories to disk-probe are fixed for the
+/// process lifetime, so they are resolved once up front.
+///
+/// Two exit paths: aborted on [`Agent::shutdown`] (holds only `Arc` clones, so
+/// there is nothing to drain), or — gracefully — the loop breaks when the
+/// `retention_tx` sender is dropped (`rx.changed()` errors).
 fn spawn_retention_task(
     store: Arc<StandaloneSyncStore>,
     seen: Arc<SeenStore>,
     config: Config,
+    mut retention_rx: watch::Receiver<RetentionConfig>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let interval = config.retention.interval();
+        // Capture volumes are static across retention edits; resolve once.
+        let capture_dirs = config.capture_dirs_resolved();
         loop {
-            tokio::time::sleep(interval).await;
+            let retention = retention_rx.borrow().clone();
+            let interval = retention.interval();
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                changed = retention_rx.changed() => {
+                    if changed.is_err() {
+                        // Sender dropped = agent shutting down.
+                        tracing::debug!("retention loop stopped (sender dropped)");
+                        break;
+                    }
+                    tracing::info!("retention config updated; applying on next pass");
+                    continue; // re-borrow the new config at the top of the loop
+                }
+            }
+
+            // One pass with the current retention config. `run_retention_once`
+            // reads its policy/dry-run from the config's `retention` table, so
+            // splice the live retention knobs onto the static base config.
             let store = Arc::clone(&store);
             let seen = Arc::clone(&seen);
-            let config = config.clone();
+            let mut pass_config = config.clone();
+            pass_config.retention = retention;
+            let dirs = capture_dirs.clone();
             let res = tokio::task::spawn_blocking(move || {
                 // Probe every capture volume and take the MAX usage: disk
                 // pressure on any one watched directory should trigger the gate.
-                let dirs = config.capture_dirs_resolved();
                 let disk_probe = move || dirs.iter().map(|d| disk_usage_pct(d)).max().unwrap_or(0);
-                run_retention_once(&config, &store, &seen, Utc::now(), &disk_probe)
+                run_retention_once(&pass_config, &store, &seen, Utc::now(), &disk_probe)
             })
             .await;
             match res {

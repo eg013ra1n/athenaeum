@@ -13,6 +13,8 @@
 //! # Module map
 //!
 //! - [`config`] — the `perseus.toml` contract: parse + actionable validation.
+//! - [`config_edit`] — comment-preserving `[retention]` write-back for the web
+//!   settings page (`toml_edit`), re-validated before an atomic replace.
 //! - [`account`] — hub account pairing (task M1): the `perseus login` OTP flow,
 //!   the pairing cache, and the run-time peer/relay resolution.
 //! - [`watcher`] — `notify` watcher + the pure, clock-injectable
@@ -25,6 +27,7 @@
 
 pub mod account;
 pub mod config;
+pub mod config_edit;
 pub mod run;
 pub mod seen;
 pub mod watcher;
