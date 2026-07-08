@@ -5,30 +5,274 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Perseus — capture node</title>
     <style>
-      body {
-        font-family: system-ui, -apple-system, sans-serif;
-        max-width: 40rem;
-        margin: 4rem auto;
-        padding: 0 1.5rem;
-        line-height: 1.5;
-        color: #1a1a1a;
-        background: #fafafa;
+      :root {
+        --bg: #0e1116; --surface: #171b22; --surface2: #1e242d; --border: #2a313c;
+        --text: #e6edf3; --muted: #8b949e; --accent: #4c8dff;
+        --ok: #3fb950; --warn: #d29922; --err: #f85149;
       }
-      code { background: #eee; padding: 0.1rem 0.3rem; border-radius: 3px; }
-      .muted { color: #666; }
+      * { box-sizing: border-box; }
+      body {
+        font-family: system-ui, -apple-system, sans-serif; margin: 0;
+        background: var(--bg); color: var(--text); line-height: 1.5; font-size: 14px;
+      }
+      header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); display: flex; align-items: baseline; gap: 1rem; }
+      header h1 { margin: 0; font-size: 1.15rem; }
+      header .sub { color: var(--muted); font-size: 0.85rem; }
+      main { max-width: 68rem; margin: 0 auto; padding: 1.5rem; }
+      section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+      section h2 { margin: 0 0 0.75rem; font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
+      th { color: var(--muted); font-weight: 600; font-size: 0.8rem; }
+      td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
+      .chip { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+      .chip.queued, .chip.announced, .chip.transferring { background: #1f3a5f; color: #79c0ff; }
+      .chip.confirmed { background: #12341c; color: var(--ok); }
+      .chip.failed { background: #3d1417; color: var(--err); }
+      .chip.safe { background: #12341c; color: var(--ok); }
+      .stat-row { display: flex; gap: 2rem; flex-wrap: wrap; }
+      .stat { display: flex; flex-direction: column; }
+      .stat .n { font-size: 1.6rem; font-weight: 700; }
+      .stat .l { color: var(--muted); font-size: 0.8rem; }
+      button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 0.35rem 0.75rem; cursor: pointer; font-size: 0.82rem; }
+      button.ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+      button.danger { background: #b62324; }
+      button:disabled { opacity: 0.4; cursor: not-allowed; }
+      input, select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.5rem; font-size: 0.82rem; }
+      label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8rem; color: var(--muted); }
+      .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.75rem; align-items: end; }
+      .row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+      .muted { color: var(--muted); }
+      .flash { margin-top: 0.5rem; font-size: 0.82rem; min-height: 1.1em; }
+      .flash.ok { color: var(--ok); } .flash.err { color: var(--err); }
+      .tablewrap { overflow-x: auto; }
+      .empty { color: var(--muted); font-style: italic; padding: 0.5rem; }
+      .indicators { display: flex; gap: 1.5rem; margin: 0.5rem 0 0.75rem; flex-wrap: wrap; }
+      .ind { font-size: 0.82rem; } .ind b { color: var(--text); }
+      .logline { border-bottom: 1px solid var(--border); padding: 0.35rem 0; font-size: 0.8rem; }
+      ul.log { list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y: auto; }
     </style>
   </head>
   <body>
-    <h1>Perseus</h1>
-    <p>Headless capture-node agent — status page.</p>
-    <p class="muted">
-      The interactive dashboard arrives in Task 10. For now the read-only JSON
-      API is live:
-    </p>
-    <ul>
-      <li><code>GET /api/status</code> — capture dirs, in-flight transfers, retention, counts</li>
-      <li><code>GET /api/sent</code> — outbound packages (optional <code>?state=</code>)</li>
-      <li><code>GET /api/history</code> — transfer history (optional <code>?query=</code>, <code>?direction=</code>)</li>
-    </ul>
+    <header>
+      <h1>Perseus</h1>
+      <span class="sub">headless capture node</span>
+      <span class="sub" id="conn"></span>
+    </header>
+    <main>
+      <section id="status">
+        <h2>Status</h2>
+        <div class="mono muted" id="captureDirs"></div>
+        <div class="stat-row" style="margin:0.75rem 0;">
+          <div class="stat"><span class="n" id="cQueued">–</span><span class="l">queued</span></div>
+          <div class="stat"><span class="n" id="cConfirmed">–</span><span class="l">confirmed (recent)</span></div>
+          <div class="stat"><span class="n" id="cFailed">–</span><span class="l">failed (recent)</span></div>
+        </div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>in-flight package</th><th>state</th><th>created</th></tr></thead>
+          <tbody id="inflight"></tbody>
+        </table></div>
+      </section>
+
+      <section id="sent">
+        <h2>Sent</h2>
+        <div class="row" style="margin-bottom:0.5rem;">
+          <button id="delSelected" class="danger" disabled>Delete selected</button>
+          <span class="muted">deletes source capture files of confirmed packages only</span>
+        </div>
+        <div class="tablewrap"><table>
+          <thead><tr><th></th><th>package</th><th>state</th><th>created</th><th>confirmed</th><th></th></tr></thead>
+          <tbody id="senttbody"></tbody>
+        </table></div>
+        <div class="flash" id="delflash"></div>
+      </section>
+
+      <section id="history">
+        <h2>History</h2>
+        <div class="row" style="margin-bottom:0.5rem;">
+          <input id="q" placeholder="exact filename…" size="28" />
+          <button id="search" class="ghost">Search</button>
+          <span class="muted">exact filename match only</span>
+        </div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>file</th><th>object</th><th>peer</th><th>dir</th><th>size</th><th>duration</th><th>outcome</th></tr></thead>
+          <tbody id="histtbody"></tbody>
+        </table></div>
+      </section>
+
+      <section id="retention">
+        <h2>Retention</h2>
+        <div class="indicators">
+          <span class="ind">soak opt-in: <b id="iSoak">–</b></span>
+          <span class="ind">live deletion: <b id="iLive">–</b></span>
+          <span class="muted">Live deletion is enabled in perseus.toml only</span>
+        </div>
+        <div class="form-grid">
+          <label>policy
+            <select id="fPolicy">
+              <option value="keep_everything">keep_everything</option>
+              <option value="on_confirm">on_confirm</option>
+              <option value="keep_days">keep_days</option>
+              <option value="disk_pct">disk_pct</option>
+            </select>
+          </label>
+          <label>keep_days<input id="fKeepDays" type="number" min="1" /></label>
+          <label>disk_max_pct<input id="fDiskPct" type="number" min="1" max="100" /></label>
+          <label>interval_secs<input id="fInterval" type="number" min="1" /></label>
+          <label>dry-run<select id="fDryRun"><option value="true">true</option><option value="false">false</option></select></label>
+          <button id="saveRet">Save</button>
+        </div>
+        <div class="flash" id="retflash"></div>
+        <h2 style="margin-top:1rem;">Recent retention passes</h2>
+        <ul class="log" id="retlog"><li class="empty">no passes recorded yet</li></ul>
+      </section>
+    </main>
+
+    <script>
+      let token = localStorage.getItem('perseusToken') || '';
+      const $ = (id) => document.getElementById(id);
+      const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+
+      async function api(path, opts = {}) {
+        const headers = Object.assign({}, opts.headers || {});
+        if (token) headers['Authorization'] = 'Bearer ' + token;
+        let res = await fetch(path, Object.assign({}, opts, { headers }));
+        if (res.status === 401) {
+          const t = window.prompt('Bearer token required for this Perseus node:');
+          if (t) { token = t; localStorage.setItem('perseusToken', t); return api(path, opts); }
+        }
+        return res;
+      }
+      async function getJson(path) { const r = await api(path); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+
+      const shortHex = (h) => (h || '').slice(0, 8);
+      const fmtSize = (b) => { if (b == null) return '–'; const u = ['B','KB','MB','GB','TB']; let i = 0, n = b; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
+      const fmtDur = (s) => (s == null ? '–' : s.toFixed(1) + 's');
+
+      async function refreshStatus() {
+        try {
+          const s = await getJson('/api/status');
+          $('conn').textContent = 'connected';
+          $('conn').className = 'sub';
+          $('captureDirs').innerHTML = s.captureDirs.map(esc).join('<br>') || '<i>no capture dirs</i>';
+          $('cQueued').textContent = s.counts.queued;
+          $('cConfirmed').textContent = s.counts.confirmedTotal;
+          $('cFailed').textContent = s.counts.failedTotal;
+          $('inflight').innerHTML = s.inFlight.length
+            ? s.inFlight.map((r) => `<tr><td class="mono">${esc(r.packageRef)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span></td><td class="mono">${esc(r.createdAt)}</td></tr>`).join('')
+            : '<tr><td colspan="3" class="empty">nothing in flight</td></tr>';
+        } catch (e) { $('conn').textContent = 'offline: ' + e.message; }
+      }
+
+      function updateDelSelected() {
+        const any = document.querySelectorAll('.rowsel:checked').length > 0;
+        $('delSelected').disabled = !any;
+      }
+
+      async function refreshSent() {
+        try {
+          const rows = await getJson('/api/sent');
+          $('senttbody').innerHTML = rows.length
+            ? rows.map((r) => {
+                const sel = r.deletable ? `<input type="checkbox" class="rowsel" data-id="${r.id}" />` : '';
+                const del = r.deletable ? `<button class="danger" data-del="${r.id}">Delete</button>` : '';
+                return `<tr><td>${sel}</td><td class="mono">${esc(r.packageRef)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span></td><td class="mono">${esc(r.createdAt)}</td><td class="mono">${esc(r.confirmedAt || '–')}</td><td>${del}</td></tr>`;
+              }).join('')
+            : '<tr><td colspan="6" class="empty">nothing sent yet</td></tr>';
+          document.querySelectorAll('.rowsel').forEach((c) => c.addEventListener('change', updateDelSelected));
+          document.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => doDelete([Number(b.dataset.del)])));
+          updateDelSelected();
+        } catch (e) { $('senttbody').innerHTML = `<tr><td colspan="6" class="empty">error: ${esc(e.message)}</td></tr>`; }
+      }
+
+      async function doDelete(ids) {
+        if (!ids.length) return;
+        if (!window.confirm(`Delete source capture file(s) for ${ids.length} confirmed package(s)? This cannot be undone.`)) return;
+        try {
+          const r = await api('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
+          if (!r.ok) throw new Error(await r.text());
+          const rep = await r.json();
+          const parts = [];
+          if (rep.deleted.length) parts.push(`deleted ${rep.deleted.length}`);
+          rep.rejected.forEach((x) => parts.push(`#${x.id}: ${x.reason}`));
+          const f = $('delflash'); f.textContent = parts.join(' · ') || 'nothing to do';
+          f.className = 'flash ' + (rep.rejected.length ? 'err' : 'ok');
+          refreshSent();
+        } catch (e) { const f = $('delflash'); f.textContent = 'delete failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      async function searchHistory() {
+        const q = $('q').value.trim();
+        try {
+          const rows = await getJson('/api/history' + (q ? '?query=' + encodeURIComponent(q) : ''));
+          $('histtbody').innerHTML = rows.length
+            ? rows.map((r) => {
+                const peer = r.peerName ? esc(r.peerName) : `<span class="mono">${esc(shortHex(r.peerDevice))}</span>`;
+                // A confirmed send = a sent row the peer accepted (ingested or a
+                // duplicate it already had) — i.e. the frame is safe to delete
+                // locally. A started ("sent") or "rejected" row is not.
+                const safe = (r.direction === 'sent' && (r.outcome === 'ingested' || r.outcome === 'duplicate')) ? ' <span class="chip safe">✓ safe to delete</span>' : '';
+                return `<tr><td class="mono">${esc(r.filename)}</td><td>${esc(r.object || '–')}</td><td>${peer}</td><td>${esc(r.direction)}</td><td>${fmtSize(r.bytes)}</td><td>${fmtDur(r.durationSecs)}</td><td>${esc(r.outcome)}${safe}</td></tr>`;
+              }).join('')
+            : '<tr><td colspan="7" class="empty">no matching history</td></tr>';
+        } catch (e) { $('histtbody').innerHTML = `<tr><td colspan="7" class="empty">error: ${esc(e.message)}</td></tr>`; }
+      }
+
+      async function loadPolicy() {
+        try {
+          const p = await getJson('/api/retention/policy');
+          $('fPolicy').value = p.policy;
+          $('fKeepDays').value = p.keepDays;
+          $('fDiskPct').value = p.diskMaxPct;
+          $('fInterval').value = p.intervalSecs;
+          $('fDryRun').value = String(p.dryRun);
+          $('iSoak').textContent = p.soakOptIn ? 'yes' : 'no';
+          $('iLive').textContent = p.liveDeletionPossible ? 'ACTIVE' : 'off (dry-run)';
+          $('iLive').style.color = p.liveDeletionPossible ? 'var(--err)' : 'var(--muted)';
+        } catch (e) { const f = $('retflash'); f.textContent = 'load failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      async function savePolicy() {
+        const edit = {
+          policy: $('fPolicy').value,
+          keepDays: Number($('fKeepDays').value),
+          diskMaxPct: Number($('fDiskPct').value),
+          intervalSecs: Number($('fInterval').value),
+          dryRun: $('fDryRun').value === 'true',
+        };
+        const f = $('retflash');
+        try {
+          const r = await api('/api/retention/policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(edit) });
+          if (r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }
+          if (!r.ok) throw new Error(await r.text());
+          f.textContent = 'saved'; f.className = 'flash ok';
+          loadPolicy();
+        } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      async function refreshLog() {
+        try {
+          const rows = await getJson('/api/retention/log');
+          $('retlog').innerHTML = rows.length
+            ? rows.map((r) => {
+                const bits = [`${r.dryRun ? 'dry-run' : 'LIVE'}`, `${r.policy}`, `deleted ${r.deleted.length}`, `eligible ${r.wouldDelete.length}`];
+                if (r.errors.length) bits.push('⚠ ' + r.errors.map(esc).join('; '));
+                return `<li class="logline"><span class="mono muted">${esc(r.at)}</span> — ${bits.map(esc).join(' · ')}</li>`;
+              }).join('')
+            : '<li class="empty">no passes recorded yet</li>';
+        } catch (e) { $('retlog').innerHTML = `<li class="empty">error: ${esc(e.message)}</li>`; }
+      }
+
+      $('delSelected').addEventListener('click', () => doDelete([...document.querySelectorAll('.rowsel:checked')].map((c) => Number(c.dataset.id))));
+      $('search').addEventListener('click', searchHistory);
+      $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchHistory(); });
+      $('saveRet').addEventListener('click', savePolicy);
+
+      // Initial load; poll status + sent + retention log every 2 s. History and
+      // the policy form are on demand (the form is not clobbered while editing).
+      loadPolicy(); searchHistory();
+      function tick() { refreshStatus(); refreshSent(); refreshLog(); }
+      tick(); setInterval(tick, 2000);
+    </script>
   </body>
 </html>

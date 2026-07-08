@@ -7,8 +7,9 @@
 //! in-process loopback transport and a known peer, exercising the exact same
 //! enqueue/package/engine path without a network.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use athenaeum_core::fits_parser::{parse_fits_with_header, parse_xisf};
@@ -21,7 +22,7 @@ use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
 use athenaeum_core::sync::{
     evaluate_and_apply, node_id_hex, DeleteOutcome, Direction, HistoryRow, OutboundRow,
-    RetentionOutcome, SyncEngine, SyncEngineHandle,
+    OutboundState, RetentionOutcome, SyncEngine, SyncEngineHandle,
 };
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
@@ -32,6 +33,7 @@ use uuid::Uuid;
 use crate::config::{Config, RetentionConfig};
 use crate::seen::{SeenStore, SourceLink};
 use crate::watcher::{self, WatcherHandle};
+use crate::web::RetentionRunRecord;
 
 /// Parse a pairing ticket string into its `EndpointTicket`. Factored out so the
 /// string is only ever parsed once per call site: [`Agent::start`] derives both
@@ -213,6 +215,12 @@ pub struct Agent {
     /// [`crate::config_edit::apply_retention_edit`]. Dropping this sender (agent
     /// shutdown) is the retention loop's second, graceful exit path.
     retention_tx: watch::Sender<RetentionConfig>,
+    /// Rolling record (cap 50, newest-first) of the retention loop's recent
+    /// passes. The loop push-fronts each pass here; the web status page (task 10)
+    /// reads a clone into [`WebState`](crate::web::WebState) at
+    /// [`spawn_web_server`](Self::spawn_web_server) and serves it read-only at
+    /// `GET /api/retention/log`. Empty on the non-`watch` path (no retention loop).
+    retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
 }
 
 impl Agent {
@@ -310,6 +318,8 @@ impl Agent {
             retention_tx: self.retention_tx.clone(),
             device_names: std::collections::HashMap::new(),
             capture_dirs: self.config.capture_dirs_resolved(),
+            seen: Arc::clone(&self.seen),
+            retention_log: Arc::clone(&self.retention_log),
         });
         let router = crate::web::build_router(web_state, token);
         self.web_task = bind_and_spawn_web(&self.config.web_bind, router).await;
@@ -370,6 +380,12 @@ impl Agent {
         // enqueue-backlog), so a send is a harmless no-op.
         let (retention_tx, retention_rx) = watch::channel(config.retention.clone());
 
+        // Rolling record of retention passes for the web status page (task 10).
+        // Created unconditionally so the field is always present; only the
+        // retention loop (below, `watch` path) ever writes to it.
+        let retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+
         let (watchers, enqueue_task, retention_task) = if watch {
             let (stable_tx, stable_rx) = mpsc::channel::<PathBuf>(64);
             // One watcher per configured capture directory; each gets its own
@@ -400,6 +416,7 @@ impl Agent {
                 Arc::clone(&seen),
                 config.clone(),
                 retention_rx,
+                Arc::clone(&retention_log),
             );
             (watchers, Some(enqueue_task), Some(retention_task))
         } else {
@@ -422,6 +439,7 @@ impl Agent {
             // on the transport-injection path this constructor serves.
             web_task: None,
             retention_tx,
+            retention_log,
         })
     }
 
@@ -654,7 +672,17 @@ fn source_stat_unchanged(link: &SourceLink, current_size: u64, current_mtime_ms:
 /// can't be read (or is unexpectedly empty) this falls back to one minimal row
 /// (blank identity fields, `bytes` from the live file stat) — a degraded audit
 /// beats no audit at all, but there is always at least one row to persist.
-fn build_retention_history_rows(pkg_ref: &Path, source: &Path, byte_size: u64) -> Vec<HistoryRow> {
+///
+/// `outcome` is the audit tag stamped on every row — `retention_deleted` for an
+/// automatic retention pass, `deleted_manual` for the web "Delete selected"
+/// action ([`delete_confirmed_packages`]). Both take the exact same deletion
+/// path; only this tag distinguishes them in the history log.
+fn build_retention_history_rows(
+    pkg_ref: &Path,
+    source: &Path,
+    byte_size: u64,
+    outcome: &str,
+) -> Vec<HistoryRow> {
     let records = match read_manifest(pkg_ref) {
         Ok(records) => records,
         Err(error) => {
@@ -682,7 +710,7 @@ fn build_retention_history_rows(pkg_ref: &Path, source: &Path, byte_size: u64) -
             bytes: byte_size,
             started_at: now_iso(),
             finished_at: Some(now_iso()),
-            outcome: "retention_deleted".to_string(),
+            outcome: outcome.to_string(),
         }];
     }
 
@@ -703,7 +731,7 @@ fn build_retention_history_rows(pkg_ref: &Path, source: &Path, byte_size: u64) -
                 bytes: r.byte_size,
                 started_at: now_iso(),
                 finished_at: Some(now_iso()),
-                outcome: "retention_deleted".to_string(),
+                outcome: outcome.to_string(),
             }
         })
         .collect()
@@ -732,10 +760,16 @@ fn build_retention_history_rows(pkg_ref: &Path, source: &Path, byte_size: u64) -
 /// `store` is `&dyn SyncStore` (not the concrete `StandaloneSyncStore`) purely
 /// for testability: it lets a test inject a store whose `append_history`
 /// deliberately fails, proving the audit-before-delete refusal.
+///
+/// `outcome` is the audit tag (`retention_deleted` for a retention pass,
+/// `deleted_manual` for a web delete) — the deletion path is byte-for-byte
+/// identical either way, so the two share this one function and the same
+/// safety contract.
 fn retention_delete_source(
     store: &dyn SyncStore,
     seen: &SeenStore,
     pkg_ref: &Path,
+    outcome: &str,
 ) -> Result<DeleteOutcome> {
     let pkg_ref_str = pkg_ref.to_string_lossy();
 
@@ -783,7 +817,7 @@ fn retention_delete_source(
     // ── Audit BEFORE the destructive action ─────────────────────────────────
     // If even the fallback row can't be persisted, the `?` propagates and the
     // delete is refused entirely this tick — `source` is never touched.
-    let history_rows = build_retention_history_rows(pkg_ref, &source, current_meta.len());
+    let history_rows = build_retention_history_rows(pkg_ref, &source, current_meta.len(), outcome);
     for h in &history_rows {
         store
             .append_history(h.clone())
@@ -825,8 +859,91 @@ pub fn run_retention_once(
 ) -> Result<RetentionOutcome> {
     let policy = config.retention.to_core_policy();
     let dry_run = config.retention.dry_run;
-    let mut deleter = |pkg_ref: &Path| retention_delete_source(store, seen, pkg_ref);
+    let mut deleter =
+        |pkg_ref: &Path| retention_delete_source(store, seen, pkg_ref, "retention_deleted");
     evaluate_and_apply(store, &policy, dry_run, now, disk_probe, &mut deleter)
+}
+
+/// The outcome of a manual [`delete_confirmed_packages`] call: the ids actually
+/// deleted, and the ids rejected (each with a human reason). Serialized directly
+/// as the `POST /api/delete` response (task 10).
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteReport {
+    /// Outbound-row ids whose source capture file was removed from disk.
+    pub deleted: Vec<i64>,
+    /// Ids that were not deleted, each with the reason (not confirmed, unknown,
+    /// no live source, or a delete error).
+    pub rejected: Vec<DeleteRejection>,
+}
+
+/// One rejected id from [`delete_confirmed_packages`], with a human-readable
+/// reason for the web UI to surface next to the row.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteRejection {
+    pub id: i64,
+    pub reason: String,
+}
+
+/// Delete the source capture files for a set of CONFIRMED outbound packages, by
+/// outbound-row id — the web "Delete selected" action's chokepoint (task 10).
+///
+/// Shares the EXACT per-package deleter retention uses
+/// ([`retention_delete_source`]); the only difference is the audit outcome tag
+/// (`deleted_manual` here vs `retention_deleted`). Each id is verified to be in
+/// state `confirmed` BEFORE anything is touched — an unknown or non-confirmed id
+/// is rejected with a reason and never reaches disk. Deletion of anything not
+/// `confirmed` is impossible by construction: the same invariant retention
+/// relies on, enforced here at the id-lookup gate. Every safety property of the
+/// shared deleter (audit-before-delete, TOCTOU stat guard, honest no-op vs real
+/// removal) applies unchanged.
+pub fn delete_confirmed_packages(
+    store: &StandaloneSyncStore,
+    seen: &SeenStore,
+    ids: &[i64],
+) -> Result<DeleteReport> {
+    let mut report = DeleteReport::default();
+    for &id in ids {
+        let Some(row) = store.get_outbound(id)? else {
+            report.rejected.push(DeleteRejection {
+                id,
+                reason: "unknown package".to_string(),
+            });
+            continue;
+        };
+        if row.state != OutboundState::Confirmed {
+            report.rejected.push(DeleteRejection {
+                id,
+                reason: "not confirmed".to_string(),
+            });
+            continue;
+        }
+        let pkg_ref = PathBuf::from(&row.package_ref);
+        match retention_delete_source(store, seen, &pkg_ref, "deleted_manual") {
+            Ok(DeleteOutcome::Removed) => {
+                tracing::info!(id, package_ref = %row.package_ref, "manual delete removed confirmed source");
+                report.deleted.push(id);
+            }
+            Ok(DeleteOutcome::SkippedNoop) => {
+                // The row is confirmed, but there is no live source to remove
+                // (already deleted, superseded by a re-enqueue, or gone
+                // out-of-band). Honest no-op, surfaced as a per-id reject.
+                report.rejected.push(DeleteRejection {
+                    id,
+                    reason: "no live source to delete (already removed or superseded)".to_string(),
+                });
+            }
+            Err(error) => {
+                tracing::error!(id, %error, "manual delete failed for confirmed package");
+                report.rejected.push(DeleteRejection {
+                    id,
+                    reason: format!("delete failed: {error}"),
+                });
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Spawn the config-driven retention timer. Each tick runs a full
@@ -848,6 +965,7 @@ fn spawn_retention_task(
     seen: Arc<SeenStore>,
     config: Config,
     mut retention_rx: watch::Receiver<RetentionConfig>,
+    retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Capture volumes are static across retention edits; resolve once.
@@ -871,6 +989,10 @@ fn spawn_retention_task(
             // One pass with the current retention config. `run_retention_once`
             // reads its policy/dry-run from the config's `retention` table, so
             // splice the live retention knobs onto the static base config.
+            // Snapshot the policy label + dry-run before the config is moved into
+            // the blocking closure, so the pass record can name them either way.
+            let policy_label = crate::config_edit::policy_str(&retention.policy).to_string();
+            let dry_run_cfg = retention.dry_run;
             let store = Arc::clone(&store);
             let seen = Arc::clone(&seen);
             let mut pass_config = config.clone();
@@ -883,16 +1005,66 @@ fn spawn_retention_task(
                 run_retention_once(&pass_config, &store, &seen, Utc::now(), &disk_probe)
             })
             .await;
-            match res {
-                Ok(Ok(outcome)) => tracing::info!(
-                    dry_run = outcome.dry_run,
-                    eligible = outcome.eligible.len(),
-                    deleted = outcome.deleted.len(),
-                    would_warn_disk_pressure = outcome.would_warn_disk_pressure,
-                    "retention tick complete"
-                ),
-                Ok(Err(error)) => tracing::error!(%error, "retention tick failed"),
-                Err(error) => tracing::error!(%error, "retention tick task panicked"),
+            // Log AND record the pass for the web status page (task 10). The
+            // record maps `RetentionOutcome`'s path Vecs verbatim; a failed /
+            // panicked tick records its error into `errors` with empty lists.
+            let record = match res {
+                Ok(Ok(outcome)) => {
+                    tracing::info!(
+                        dry_run = outcome.dry_run,
+                        eligible = outcome.eligible.len(),
+                        deleted = outcome.deleted.len(),
+                        would_warn_disk_pressure = outcome.would_warn_disk_pressure,
+                        "retention tick complete"
+                    );
+                    let mut errors = Vec::new();
+                    if outcome.would_warn_disk_pressure {
+                        errors.push("disk still at/over cap after pass".to_string());
+                    }
+                    RetentionRunRecord {
+                        at: now_iso(),
+                        dry_run: outcome.dry_run,
+                        policy: policy_label,
+                        deleted: outcome
+                            .deleted
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect(),
+                        would_delete: outcome
+                            .eligible
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect(),
+                        errors,
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "retention tick failed");
+                    RetentionRunRecord {
+                        at: now_iso(),
+                        dry_run: dry_run_cfg,
+                        policy: policy_label,
+                        deleted: Vec::new(),
+                        would_delete: Vec::new(),
+                        errors: vec![format!("retention tick failed: {error}")],
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "retention tick task panicked");
+                    RetentionRunRecord {
+                        at: now_iso(),
+                        dry_run: dry_run_cfg,
+                        policy: policy_label,
+                        deleted: Vec::new(),
+                        would_delete: Vec::new(),
+                        errors: vec![format!("retention tick task panicked: {error}")],
+                    }
+                }
+            };
+            {
+                let mut log = retention_log.lock().expect("retention_log mutex poisoned");
+                log.push_front(record);
+                log.truncate(50);
             }
         }
     })
@@ -1326,7 +1498,7 @@ mod retention_tests {
         store.confirm(id1, &[]).unwrap();
 
         let failing = FailingAppendHistoryStore(&store);
-        let result = retention_delete_source(&failing, &seen, &pkg1);
+        let result = retention_delete_source(&failing, &seen, &pkg1, "retention_deleted");
 
         assert!(result.is_err(), "an unpersistable audit must refuse the delete");
         assert!(s1.exists(), "the source survives when the audit can't be written");

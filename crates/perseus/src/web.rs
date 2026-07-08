@@ -26,16 +26,16 @@
 //! retention-run log (`retention_log` / `RetentionRunRecord`) is intentionally
 //! **not** here yet — no read DTO needs it — and is left to Task 10.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::{Query, Request, State},
     http::{header, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use tokio::sync::watch;
@@ -46,6 +46,9 @@ use athenaeum_core::sync::{
 };
 
 use crate::config::{Config, RetentionConfig};
+use crate::config_edit::{apply_retention_edit, RetentionEdit};
+use crate::run::{delete_confirmed_packages, DeleteReport};
+use crate::seen::SeenStore;
 
 /// Default cap for `GET /api/sent` when the caller supplies no `?limit=`.
 const DEFAULT_SENT_LIMIT: u32 = 500;
@@ -82,6 +85,35 @@ pub struct WebState {
     pub device_names: HashMap<String, String>,
     /// The capture directories this node watches (for the status banner).
     pub capture_dirs: Vec<PathBuf>,
+    /// Perseus's stat-aware seen store (source-file linkage). The manual-delete
+    /// endpoint (`POST /api/delete`) resolves a confirmed package back to its
+    /// source capture file through this, via the exact same deleter retention
+    /// uses ([`delete_confirmed_packages`](crate::run::delete_confirmed_packages)).
+    pub seen: Arc<SeenStore>,
+    /// Rolling record (cap 50, newest-first) of the retention loop's recent
+    /// passes, surfaced read-only at `GET /api/retention/log`. The retention loop
+    /// in [`crate::run`] push-fronts each pass; this task is read-only.
+    pub retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
+}
+
+/// One recorded retention pass, for `GET /api/retention/log`. Built by the
+/// retention loop ([`crate::run`]) from the pass's `RetentionOutcome` and
+/// push-fronted into [`WebState::retention_log`] (cap 50, newest-first).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionRunRecord {
+    /// RFC3339 timestamp of when the pass completed.
+    pub at: String,
+    /// Whether the pass ran in dry-run mode (deleted nothing).
+    pub dry_run: bool,
+    /// The policy label in force for the pass (same snake_case string as TOML).
+    pub policy: String,
+    /// Source files actually removed this pass (empty in dry-run).
+    pub deleted: Vec<String>,
+    /// Confirmed candidates the policy deemed eligible this pass.
+    pub would_delete: Vec<String>,
+    /// Pass-level failures / warnings (a failed tick, or disk still over cap).
+    pub errors: Vec<String>,
 }
 
 /// `GET /api/status` payload: the operator's one-screen picture of the node.
@@ -167,6 +199,12 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/sent", get(api_sent))
         .route("/api/history", get(api_history))
+        .route(
+            "/api/retention/policy",
+            get(api_get_retention_policy).put(api_put_retention_policy),
+        )
+        .route("/api/retention/log", get(api_retention_log))
+        .route("/api/delete", post(api_delete))
         .with_state(state)
         .layer(axum::middleware::from_fn(move |req, next| {
             auth_layer(token.clone(), req, next)
@@ -327,6 +365,112 @@ async fn api_history(
     Ok(Json(dtos))
 }
 
+/// `GET`/`PUT /api/retention/policy` payload: the writable retention knobs plus
+/// the read-only two-key soak gate. `soakOptIn`/`liveDeletionPossible` mirror
+/// the config's soak state and are **never** writable here — [`RetentionEdit`]
+/// carries no soak field, so live deletion can only ever be enabled by
+/// hand-editing `perseus.toml`. That guarantee is the whole point of the
+/// separate read-only surface.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PolicyDto {
+    policy: String,
+    keep_days: u32,
+    disk_max_pct: u8,
+    interval_secs: u64,
+    dry_run: bool,
+    /// The operator's typed soak acknowledgement (`i_have_verified_the_soak`,
+    /// a `perseus.toml`-only key). Read-only here.
+    soak_opt_in: bool,
+    /// Whether confirmed sources are actually being deleted right now — the soak
+    /// opt-in is set AND the pass is live (not dry-run). Derived, read-only.
+    live_deletion_possible: bool,
+}
+
+impl PolicyDto {
+    fn from_retention(r: &RetentionConfig) -> Self {
+        Self {
+            policy: crate::config_edit::policy_str(&r.policy).to_string(),
+            keep_days: r.keep_days,
+            disk_max_pct: r.disk_max_pct,
+            interval_secs: r.interval_secs,
+            dry_run: r.dry_run,
+            soak_opt_in: r.i_have_verified_the_soak,
+            live_deletion_possible: r.i_have_verified_the_soak && !r.dry_run,
+        }
+    }
+}
+
+/// `POST /api/delete` request body.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteRequest {
+    /// Outbound-row ids to delete. Non-confirmed / unknown ids are rejected
+    /// per-id in the [`DeleteReport`] response, never deleted.
+    ids: Vec<i64>,
+}
+
+/// `GET /api/retention/policy` — current retention config + read-only soak gate.
+async fn api_get_retention_policy(State(state): State<Arc<WebState>>) -> Json<PolicyDto> {
+    let retention = state.config.read().await.retention.clone();
+    Json(PolicyDto::from_retention(&retention))
+}
+
+/// `PUT /api/retention/policy` — apply a whitelisted [`RetentionEdit`] to
+/// `perseus.toml` (comment-preserving, re-validated, atomic), then adopt it live.
+///
+/// [`apply_retention_edit`] does the file write on an in-memory copy and only
+/// swaps it in after re-validation, so a rejected edit (notably an attempt to
+/// enable live deletion without the `perseus.toml`-only soak opt-in) leaves the
+/// file byte-identical and returns `422`. On success the new config is adopted
+/// both in the live web state and on the retention watch channel — the running
+/// retention loop picks it up on its next pass, no restart.
+async fn api_put_retention_policy(
+    State(state): State<Arc<WebState>>,
+    Json(edit): Json<RetentionEdit>,
+) -> Result<Json<PolicyDto>, (StatusCode, String)> {
+    let new_cfg = apply_retention_edit(&state.config_path, &edit).map_err(|e| {
+        // Validation failure (e.g. the soak gate) or any file error: the file is
+        // left untouched by construction. Surface the actionable text as 422.
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web retention edit rejected");
+        (StatusCode::UNPROCESSABLE_ENTITY, msg)
+    })?;
+    // The file was already rewritten by `apply_retention_edit`. Adopt the new
+    // config in the live web state, and push it onto the retention watch channel
+    // so the running loop re-borrows it next pass. A send with no receiver (an
+    // agent started without `watch`) is a harmless no-op — discard the SendError.
+    let retention = new_cfg.retention.clone();
+    *state.config.write().await = new_cfg;
+    let _ = state.retention_tx.send(retention.clone());
+    Ok(Json(PolicyDto::from_retention(&retention)))
+}
+
+/// `GET /api/retention/log` — the retention-run ring buffer, newest-first.
+async fn api_retention_log(State(state): State<Arc<WebState>>) -> Json<Vec<RetentionRunRecord>> {
+    let log = state
+        .retention_log
+        .lock()
+        .expect("retention_log mutex poisoned");
+    Json(log.iter().cloned().collect())
+}
+
+/// `POST /api/delete` — delete the source capture files of the given CONFIRMED
+/// packages. Verifies each id is `confirmed` before touching disk; non-confirmed
+/// / unknown ids come back in `rejected` with a reason. Shares the same
+/// confirmed-only deleter as retention (audit-before-delete, TOCTOU guard).
+async fn api_delete(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<DeleteRequest>,
+) -> Result<Json<DeleteReport>, (StatusCode, String)> {
+    let report = delete_confirmed_packages(&state.store, &state.seen, &req.ids).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web manual delete failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+    Ok(Json(report))
+}
+
 /// Map an [`OutboundRow`] to its wire DTO. `deletable` is the single
 /// safe-to-delete predicate: only `confirmed` packages.
 fn to_sent_dto(r: &OutboundRow) -> SentDto {
@@ -389,6 +533,8 @@ mod tests {
     async fn test_state() -> (Arc<WebState>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        // Perseus's seen store shares the same db file under WAL (production wiring).
+        let seen = Arc::new(crate::seen::SeenStore::open(tmp.path().join("sync.db")).unwrap());
 
         // Spawn the engine on the empty store (nothing to resume), then seed.
         let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
@@ -430,15 +576,22 @@ mod tests {
             })
             .unwrap();
 
-        let config = Config::from_toml_str(&sample_toml(tmp.path())).unwrap();
+        // Materialize the config on disk too, so the PUT-policy handler (which
+        // rewrites `config_path` via `apply_retention_edit`) has a real file.
+        let toml_str = sample_toml(tmp.path());
+        let config_path = tmp.path().join("perseus.toml");
+        std::fs::write(&config_path, &toml_str).unwrap();
+        let config = Config::from_toml_str(&toml_str).unwrap();
         let state = Arc::new(WebState {
             store,
             engine,
-            config_path: tmp.path().join("perseus.toml"),
+            config_path,
             config: tokio::sync::RwLock::new(config.clone()),
             retention_tx: watch::channel(config.retention.clone()).0,
             device_names: HashMap::new(),
             capture_dirs: config.capture_dirs_resolved(),
+            seen,
+            retention_log: Arc::new(Mutex::new(VecDeque::new())),
         });
         (state, tmp)
     }
@@ -655,5 +808,206 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ── Task 10: manual delete, retention policy GET/PUT, retention log ───────
+
+    /// Manual delete is the same confirmed()-only chokepoint retention uses: a
+    /// confirmed package's source is removed (with a `deleted_manual` audit row),
+    /// while a non-confirmed id is rejected with a reason and never touched.
+    #[tokio::test]
+    async fn delete_rejects_non_confirmed() {
+        let (state, tmp) = test_state().await;
+
+        // Register a real on-disk source file for the seeded confirmed package.
+        let source = tmp.path().join("light-A.fits");
+        std::fs::write(&source, b"confirmed-source-bytes").unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        let mtime = crate::seen::mtime_millis(meta.modified().ok());
+        state
+            .seen
+            .mark_enqueued(&source, meta.len(), mtime, "pkg-confirmed")
+            .unwrap();
+
+        // Resolve the two seeded outbound ids by state.
+        let rows = state.store.all_outbound(100).unwrap();
+        let a = rows.iter().find(|r| r.state == OutboundState::Confirmed).unwrap().id;
+        let b = rows.iter().find(|r| r.state == OutboundState::Transferring).unwrap().id;
+
+        let store = Arc::clone(&state.store);
+        let app = build_router(state, None);
+        let body = serde_json::json!({ "ids": [a, b] });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/delete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+
+        let deleted = v["deleted"].as_array().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].as_i64().unwrap(), a, "only the confirmed package is deleted");
+
+        let rejected = v["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["id"].as_i64().unwrap(), b);
+        assert_eq!(rejected[0]["reason"], "not confirmed");
+
+        assert!(!source.exists(), "the confirmed package's source is removed from disk");
+
+        let hist = store
+            .search_history(HistoryQuery {
+                filename: None,
+                object: None,
+                direction: None,
+                peer: None,
+                limit: 1000,
+            })
+            .unwrap();
+        assert_eq!(
+            hist.iter().filter(|h| h.outcome == "deleted_manual").count(),
+            1,
+            "exactly one deleted_manual audit row for the confirmed package"
+        );
+    }
+
+    /// GET returns the live policy + read-only soak indicators; a valid PUT is
+    /// adopted (watch receiver + file rewritten); a `dry_run = false` PUT is
+    /// refused 422 and leaves the file byte-identical (the web can never enable
+    /// live deletion — `RetentionEdit` has no soak field).
+    #[tokio::test]
+    async fn retention_policy_roundtrip() {
+        let (state, _tmp) = test_state().await;
+        // A live receiver so the PUT's watch send is both observable and succeeds.
+        let mut rx = state.retention_tx.subscribe();
+        let config_path = state.config_path.clone();
+        let app = build_router(state, None);
+
+        // GET — current values + read-only soak gate.
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/retention/policy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["policy"], "keep_days");
+        assert_eq!(v["keepDays"], 21);
+        assert_eq!(v["dryRun"], true);
+        assert_eq!(v["soakOptIn"], false, "soak opt-in is read-only and off");
+        assert_eq!(v["liveDeletionPossible"], false);
+
+        // PUT a valid edit.
+        let edit = crate::config_edit::RetentionEdit {
+            policy: crate::config::RetentionPolicy::KeepDays,
+            keep_days: 14,
+            disk_max_pct: 90,
+            interval_secs: 1800,
+            dry_run: true,
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/retention/policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&edit).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "a valid edit is accepted");
+
+        assert_eq!(
+            rx.borrow_and_update().keep_days,
+            14,
+            "the running retention loop's watch receiver adopts the edit"
+        );
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(text.contains("keep_days = 14"), "the config file was rewritten: {text}");
+
+        // PUT dry_run = false with no soak opt-in in the file → 422, file untouched.
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let bad = crate::config_edit::RetentionEdit {
+            policy: crate::config::RetentionPolicy::KeepDays,
+            keep_days: 14,
+            disk_max_pct: 90,
+            interval_secs: 1800,
+            dry_run: false,
+        };
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/retention/policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&bad).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the web can never enable live deletion"
+        );
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(after, before, "a rejected edit leaves the file byte-identical");
+    }
+
+    /// The retention-run log endpoint serializes the ring buffer newest-first.
+    #[tokio::test]
+    async fn retention_log_returns_ring_buffer() {
+        let (state, _tmp) = test_state().await;
+        {
+            let mut log = state.retention_log.lock().unwrap();
+            // Push oldest first; each push_front puts the newest at the head.
+            log.push_front(RetentionRunRecord {
+                at: "2026-07-08T10:00:00.000Z".into(),
+                dry_run: true,
+                policy: "keep_days".into(),
+                deleted: vec![],
+                would_delete: vec!["/cap/a.fits".into()],
+                errors: vec![],
+            });
+            log.push_front(RetentionRunRecord {
+                at: "2026-07-08T11:00:00.000Z".into(),
+                dry_run: true,
+                policy: "keep_days".into(),
+                deleted: vec!["/cap/b.fits".into()],
+                would_delete: vec![],
+                errors: vec![],
+            });
+        }
+        let app = build_router(state, None);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/retention/log")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["at"], "2026-07-08T11:00:00.000Z", "newest first");
+        assert_eq!(rows[0]["deleted"][0], "/cap/b.fits");
+        assert_eq!(rows[1]["wouldDelete"][0], "/cap/a.fits");
     }
 }
