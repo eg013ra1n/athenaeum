@@ -37,6 +37,7 @@
       button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 0.35rem 0.75rem; cursor: pointer; font-size: 0.82rem; }
       button.ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
       button.danger { background: #b62324; }
+      button.warn { background: var(--warn); color: #1b1300; }
       button:disabled { opacity: 0.4; cursor: not-allowed; }
       input, select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.5rem; font-size: 0.82rem; }
       label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8rem; color: var(--muted); }
@@ -183,11 +184,15 @@
             ? rows.map((r) => {
                 const sel = r.deletable ? `<input type="checkbox" class="rowsel" data-id="${r.id}" />` : '';
                 const del = r.deletable ? `<button class="danger" data-del="${r.id}">Delete</button>` : '';
-                return `<tr><td>${sel}</td><td class="mono">${esc(r.packageRef)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span></td><td class="mono">${esc(r.createdAt)}</td><td class="mono">${esc(r.confirmedAt || '–')}</td><td>${del}</td></tr>`;
+                // A failed package can be re-sent: retry re-enqueues its still-on-disk
+                // payload as a fresh package (the old failed row is left as-is).
+                const retry = r.state === 'failed' ? `<button class="warn" data-retry="${r.id}">Retry</button>` : '';
+                return `<tr><td>${sel}</td><td class="mono">${esc(r.packageRef)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span></td><td class="mono">${esc(r.createdAt)}</td><td class="mono">${esc(r.confirmedAt || '–')}</td><td>${del}${retry}</td></tr>`;
               }).join('')
             : '<tr><td colspan="6" class="empty">nothing sent yet</td></tr>';
           document.querySelectorAll('.rowsel').forEach((c) => c.addEventListener('change', updateDelSelected));
           document.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => doDelete([Number(b.dataset.del)])));
+          document.querySelectorAll('[data-retry]').forEach((b) => b.addEventListener('click', () => doRetry([Number(b.dataset.retry)])));
           updateDelSelected();
         } catch (e) { $('senttbody').innerHTML = `<tr><td colspan="6" class="empty">error: ${esc(e.message)}</td></tr>`; }
       }
@@ -211,6 +216,21 @@
           updateDelSelected();
           refreshSent();
         } catch (e) { const f = $('delflash'); f.textContent = 'delete failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      async function doRetry(ids) {
+        if (!ids.length) return;
+        try {
+          const r = await api('/api/retry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
+          if (!r.ok) throw new Error(await r.text());
+          const rep = await r.json();
+          const parts = [];
+          if (rep.retried.length) parts.push(`re-enqueued ${rep.retried.length}`);
+          rep.rejected.forEach((x) => parts.push(`#${x.id}: ${x.reason}`));
+          const f = $('delflash'); f.textContent = parts.join(' · ') || 'nothing to do';
+          f.className = 'flash ' + (rep.rejected.length ? 'err' : 'ok');
+          refreshSent();
+        } catch (e) { const f = $('delflash'); f.textContent = 'retry failed: ' + e.message; f.className = 'flash err'; }
       }
 
       async function searchHistory() {

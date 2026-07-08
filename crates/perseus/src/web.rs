@@ -33,7 +33,7 @@
 //! the middleware trivial (no shared mutable auth state).
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -46,6 +46,7 @@ use axum::{
 };
 use tokio::sync::watch;
 
+use athenaeum_core::package::MANIFEST_FILENAME;
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
     Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState, SyncEngineHandle, SyncStore,
@@ -216,6 +217,7 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         )
         .route("/api/retention/log", get(api_retention_log))
         .route("/api/delete", post(api_delete))
+        .route("/api/retry", post(api_retry))
         .layer(axum::middleware::from_fn(move |req, next| {
             auth_layer(token.clone(), req, next)
         }));
@@ -482,6 +484,137 @@ async fn api_delete(
         tracing::error!(error = %msg, "web manual delete failed");
         (StatusCode::INTERNAL_SERVER_ERROR, msg)
     })?;
+    Ok(Json(report))
+}
+
+/// `POST /api/retry` request body.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryRequest {
+    /// Outbound-row ids to re-enqueue. Only `failed` rows with intact package
+    /// data are retried; everything else comes back per-id in `rejected`.
+    ids: Vec<i64>,
+}
+
+/// `POST /api/retry` response: the ids re-enqueued (old→new mapping) and the
+/// ids rejected (each with a human reason).
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RetryReport {
+    /// One entry per package re-enqueued: the original (still-`failed`) row id
+    /// and the brand-new queued row id the receiver will drive.
+    retried: Vec<RetryPair>,
+    /// Ids not retried, each with the reason (unknown, not failed, or the
+    /// package data is gone).
+    rejected: Vec<RetryRejection>,
+}
+
+/// One re-enqueued package: the original failed row id and its new queued row.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryPair {
+    old_id: i64,
+    new_id: i64,
+}
+
+/// One rejected id from `POST /api/retry`, with a reason for the UI to surface.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryRejection {
+    id: i64,
+    reason: String,
+}
+
+/// True iff `dir` holds `manifest.ndjson` AND at least one non-manifest regular
+/// file — i.e. there is real payload left to re-serve. A confirmed-then-cleaned
+/// dir is manifest-only (task 1) and a vanished dir fails `read_dir`; both
+/// return `false` so the retry handler can reject them honestly as "package
+/// data missing" rather than enqueueing an empty package.
+fn package_has_payload(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut has_manifest = false;
+    let mut has_payload = false;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        if entry.file_name() == std::ffi::OsStr::new(MANIFEST_FILENAME) {
+            has_manifest = true;
+        } else {
+            has_payload = true;
+        }
+    }
+    has_manifest && has_payload
+}
+
+/// `POST /api/retry` — re-enqueue failed packages. For each id: look up the
+/// outbound row, require `state == failed`, require the package dir to still
+/// hold its manifest + payload, then `enqueue_package` it — the sanctioned retry
+/// model. Re-enqueueing the same package dir mints a NEW durable row (the
+/// receiver dedups by frame uuid); the original `failed` row is left untouched.
+/// Unknown / non-failed / data-missing ids are rejected per-id, never enqueued.
+async fn api_retry(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RetryRequest>,
+) -> Result<Json<RetryReport>, (StatusCode, String)> {
+    let mut report = RetryReport::default();
+    for &id in &req.ids {
+        // A genuine store read failure is a 500 (the request failed), not a
+        // per-id reject — mirror the delete handler's error philosophy.
+        let row = match state.store.get_outbound(id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                report.rejected.push(RetryRejection {
+                    id,
+                    reason: "unknown package".to_string(),
+                });
+                continue;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(id, error = %msg, "web retry: outbound lookup failed");
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+            }
+        };
+        // State check first: only a terminal `failed` row is retryable. (A
+        // confirmed id is manifest-only after task-1 cleanup, but it never
+        // reaches the payload gate — it is "not failed" here.)
+        if row.state != OutboundState::Failed {
+            report.rejected.push(RetryRejection {
+                id,
+                reason: "not failed".to_string(),
+            });
+            continue;
+        }
+        let dir = Path::new(&row.package_ref);
+        if !package_has_payload(dir) {
+            report.rejected.push(RetryRejection {
+                id,
+                reason: "package data missing".to_string(),
+            });
+            continue;
+        }
+        match state.engine.enqueue_package(dir).await {
+            Ok(new_id) => {
+                tracing::info!(old_id = id, new_id, "failed package re-enqueued via web");
+                report.retried.push(RetryPair {
+                    old_id: id,
+                    new_id,
+                });
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(old_id = id, error = %msg, "web retry: re-enqueue failed");
+                report.rejected.push(RetryRejection {
+                    id,
+                    reason: format!("re-enqueue failed: {msg}"),
+                });
+            }
+        }
+    }
     Ok(Json(report))
 }
 
@@ -1036,5 +1169,126 @@ mod tests {
         assert_eq!(rows[0]["at"], "2026-07-08T11:00:00.000Z", "newest first");
         assert_eq!(rows[0]["deleted"][0], "/cap/b.fits");
         assert_eq!(rows[1]["wouldDelete"][0], "/cap/a.fits");
+    }
+
+    // ── Task 2 (S1.5.1): retry failed packages ───────────────────────────────
+
+    /// Build a real package dir under `base`: a `manifest.ndjson` plus, unless
+    /// `manifest_only`, one payload file — the shape task 1 preserves for a
+    /// non-confirmed package (confirmed dirs are cleaned to manifest-only).
+    fn make_package_dir(base: &std::path::Path, name: &str, manifest_only: bool) -> PathBuf {
+        let pkg = base.join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("manifest.ndjson"), b"{}\n").unwrap();
+        if !manifest_only {
+            std::fs::write(pkg.join("frame-0001.fits"), b"payload-bytes").unwrap();
+        }
+        pkg
+    }
+
+    async fn post_retry(app: Router, ids: &[i64]) -> serde_json::Value {
+        let body = serde_json::json!({ "ids": ids });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/retry")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        body_json(res).await
+    }
+
+    /// A failed package whose dir still holds its manifest + payload (task 1
+    /// keeps non-confirmed payloads) re-enqueues: a brand-new outbound row is
+    /// created for the same package dir, the response maps old→new id, and the
+    /// original failed row is left untouched (the sanctioned retry model — the
+    /// old row stays failed, the new row lives its own lifecycle).
+    #[tokio::test]
+    async fn retry_reenqueues_failed_with_intact_payload() {
+        let (state, tmp) = test_state().await;
+        let pkg = make_package_dir(tmp.path(), "pkg-failed-intact", false);
+        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        state.store.set_state(old_id, OutboundState::Failed).unwrap();
+
+        let store = Arc::clone(&state.store);
+        let app = build_router(state, None);
+        let v = post_retry(app, &[old_id]).await;
+
+        let retried = v["retried"].as_array().unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0]["oldId"].as_i64().unwrap(), old_id);
+        let new_id = retried[0]["newId"].as_i64().unwrap();
+        assert_ne!(new_id, old_id, "a brand-new row id, not the old one");
+        assert!(v["rejected"].as_array().unwrap().is_empty());
+
+        // A real new row exists for the same package dir…
+        let new_row = store.get_outbound(new_id).unwrap().expect("new row exists");
+        assert_eq!(new_row.package_ref, pkg.to_string_lossy());
+        // …and the original failed row is untouched.
+        assert_eq!(
+            store.get_outbound(old_id).unwrap().unwrap().state,
+            OutboundState::Failed,
+            "the old failed row is left as-is"
+        );
+    }
+
+    /// A non-failed id (here: the seeded `transferring` package) is rejected
+    /// "not failed" and never re-enqueued — no new row is created.
+    #[tokio::test]
+    async fn retry_rejects_non_failed() {
+        let (state, _tmp) = test_state().await;
+        let before = state.store.all_outbound(100).unwrap();
+        let transferring = before
+            .iter()
+            .find(|r| r.state == OutboundState::Transferring)
+            .unwrap()
+            .id;
+
+        let store = Arc::clone(&state.store);
+        let app = build_router(state, None);
+        let v = post_retry(app, &[transferring]).await;
+
+        assert!(v["retried"].as_array().unwrap().is_empty());
+        let rejected = v["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["id"].as_i64().unwrap(), transferring);
+        assert_eq!(rejected[0]["reason"], "not failed");
+        assert_eq!(
+            store.all_outbound(100).unwrap().len(),
+            before.len(),
+            "no new row created for a rejected retry"
+        );
+    }
+
+    /// A failed package whose dir was cleaned to manifest-only (the task-1
+    /// confirmed-then-cleaned shape) has nothing left to re-send: rejected
+    /// "package data missing", honestly — no new row.
+    #[tokio::test]
+    async fn retry_rejects_missing_payload() {
+        let (state, tmp) = test_state().await;
+        let pkg = make_package_dir(tmp.path(), "pkg-manifest-only", true);
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        state.store.set_state(id, OutboundState::Failed).unwrap();
+
+        let store = Arc::clone(&state.store);
+        let before = store.all_outbound(100).unwrap().len();
+        let app = build_router(state, None);
+        let v = post_retry(app, &[id]).await;
+
+        assert!(v["retried"].as_array().unwrap().is_empty());
+        let rejected = v["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["id"].as_i64().unwrap(), id);
+        assert_eq!(rejected[0]["reason"], "package data missing");
+        assert_eq!(
+            store.all_outbound(100).unwrap().len(),
+            before,
+            "no new row created for a data-missing reject"
+        );
     }
 }
