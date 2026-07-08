@@ -282,6 +282,37 @@ async fn release_deletes_package_tags_on_both_sides() {
 }
 
 // ---------------------------------------------------------------------------
+// 1c. Startup sweep: every tag present when a process starts is stale by
+//     construction, so `start()` deletes them all before anything is served.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn start_sweeps_stale_tags() {
+    use super::package_tag;
+
+    // Persistent store so tags survive the restart (pattern from
+    // iroh_resume_after_endpoint_restart, tests.rs:211).
+    let home = tempfile::tempdir().unwrap();
+    let t1 = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Fs(home.path().to_path_buf()))
+        .await
+        .unwrap();
+    t1.start().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let (dir, announce) = build_package(tmp.path(), "uuid-sweep-1", "s.fits", "M1", 2048);
+    t1.serve(&announce, &dir).await.unwrap();
+    t1.shutdown().await;
+
+    // New process over the same store: the old tag must be gone after start().
+    let t2 = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Fs(home.path().to_path_buf()))
+        .await
+        .unwrap();
+    t2.start().await.unwrap();
+    let tag = package_tag(&announce.package_id);
+    assert!(t2.store.tags().get(tag.as_bytes()).await.unwrap().is_none());
+    t2.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 2. Resume after endpoint restart over a persistent blob store.
 // ---------------------------------------------------------------------------
 

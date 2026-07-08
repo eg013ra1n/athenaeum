@@ -305,6 +305,18 @@ impl IrohTransport {
 #[async_trait]
 impl SharingTransport for IrohTransport {
     async fn start(&self) -> Result<StartInfo> {
+        // Startup sweep: every tag in this store is stale — PackageIds are
+        // per-process (crash-resume re-announces with fresh ids and re-serves
+        // from source dirs), and receiver fetch-tags never outlive an ack.
+        // Also retires the pre-Stage-1.5 auto-named tags on existing stores.
+        match self.store.tags().delete_all().await {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(count = removed, "blob store startup sweep removed stale tags")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "blob store startup sweep failed"),
+        }
+
         // With a relay configured, wait (bounded) for it to connect so the addr
         // carries a relay url for NAT traversal. With the relay disabled there is
         // no home relay — `online()` would hang — and the direct addresses bound
