@@ -313,6 +313,61 @@ async fn start_sweeps_stale_tags() {
 }
 
 // ---------------------------------------------------------------------------
+// 1d. Split sender/receiver blob dirs: a lazily-started second transport (the
+//     sender half, over `blobs_out`) must NOT wipe the first's (the receiver
+//     half, over `blobs`) live tags. Two `FsStore`s over ONE dir would: the
+//     sender's startup `delete_all` sweep clears the receiver's pinned
+//     `pkg/<id>`. Distinct dirs keep the two stores fully independent.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn split_blob_dirs_prevent_startup_sweep_interference() {
+    use super::package_tag;
+
+    let parent = tempfile::tempdir().unwrap();
+    // The receiver half, over the production `blobs` dir.
+    let receiver = IrohTransport::new(
+        random_secret(),
+        RelayMode::Disabled,
+        BlobStore::Fs(parent.path().join("blobs")),
+    )
+    .await
+    .unwrap();
+    receiver.start().await.unwrap();
+
+    // Serve a package on the receiver-half store so it pins a live `pkg/<id>`.
+    let tmp = tempfile::tempdir().unwrap();
+    let (dir, announce) = build_package(tmp.path(), "uuid-split-1", "split.fits", "M1", 2048);
+    receiver.serve(&announce, &dir).await.unwrap();
+    let tag = package_tag(&announce.package_id);
+    assert!(
+        receiver.store.tags().get(tag.as_bytes()).await.unwrap().is_some(),
+        "receiver-half store pinned the package tag"
+    );
+
+    // The lazily-started sender half over the SEPARATE `blobs_out` dir. Its
+    // startup sweep must only ever touch its own store.
+    let sender = IrohTransport::new(
+        random_secret(),
+        RelayMode::Disabled,
+        BlobStore::Fs(parent.path().join("blobs_out")),
+    )
+    .await
+    .unwrap();
+    sender.start().await.unwrap();
+
+    // The receiver's live tag SURVIVES the sender's startup delete_all sweep —
+    // this is the exact interference the dir split prevents.
+    assert!(
+        receiver.store.tags().get(tag.as_bytes()).await.unwrap().is_some(),
+        "the sender half's startup sweep must not wipe the receiver half's live pkg tag"
+    );
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 2. Resume after endpoint restart over a persistent blob store.
 // ---------------------------------------------------------------------------
 

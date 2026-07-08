@@ -1,30 +1,36 @@
-//! Perseus embedded web status page — router, auth, and read endpoints.
+//! Perseus embedded web status page — router, auth, read + write endpoints.
 //!
 //! A tiny [`axum`] server, bound to [`Config::web_bind`](crate::config::Config)
-//! (loopback by default), that lets an operator inspect a headless capture node
-//! from a browser. This task (9) lands the skeleton:
+//! (loopback by default), that lets an operator inspect and lightly manage a
+//! headless capture node from a browser. The page ([`index_html`]) renders four
+//! sections — status banner, sent packages, transfer history, and the retention
+//! panel (policy editor + recent-pass log) — over these endpoints:
 //!
-//! - `GET /` — a placeholder HTML page ([`index_html`]); the interactive
-//!   dashboard is Task 10.
+//! - `GET /` — the static, data-free HTML/JS page shell. **Auth-exempt** (see
+//!   below) so a browser can load it and then prompt for the token.
 //! - `GET /api/status` — capture dirs, live in-flight transfers, the current
 //!   retention policy, and coarse package counts ([`StatusDto`]).
 //! - `GET /api/sent` — outbound packages, newest first, optionally filtered by
 //!   `?state=` ([`SentDto`]).
 //! - `GET /api/history` — the transfer audit log, optionally filtered by
 //!   `?query=` (filename) and `?direction=` ([`HistoryDto`]).
-//! - Bearer-token auth ([`auth_layer`]): when a token is configured every
-//!   request must present `Authorization: Bearer <token>`.
+//! - `GET`/`PUT /api/retention/policy` — read the live retention config +
+//!   read-only soak gate ([`PolicyDto`]); a whitelisted [`RetentionEdit`] is
+//!   applied to `perseus.toml` and adopted live. Live deletion can never be
+//!   enabled here (the edit carries no soak field).
+//! - `GET /api/retention/log` — the recent retention-pass ring buffer
+//!   ([`RetentionRunRecord`], newest-first).
+//! - `POST /api/delete` — delete the source capture files of CONFIRMED packages
+//!   through the same confirmed-only deleter retention uses ([`DeleteReport`]).
 //!
-//! # Contract for Task 10
+//! # Auth
 //!
-//! [`build_router`] and [`WebState`] are the seam Task 10 extends with write
-//! handlers (retention edit, package delete). The auth `token` is **snapshotted
-//! at spawn** — changing it needs an agent restart, which keeps the middleware
-//! trivial (no shared mutable auth state). [`WebState`] already carries the
-//! fields Task 10 needs (`config_path`, `config`, `retention_tx`) so the spawn
-//! site in [`run`](crate::run) does not change when those handlers land. The
-//! retention-run log (`retention_log` / `RetentionRunRecord`) is intentionally
-//! **not** here yet — no read DTO needs it — and is left to Task 10.
+//! Bearer-token auth ([`auth_layer`]): when a token is configured, every
+//! `/api/*` request must present `Authorization: Bearer <token>`. `GET /` is the
+//! sole exemption — the static page shell must load without a token so the
+//! browser's JS can then supply one on the `/api/*` calls. The `token` is
+//! **snapshotted at spawn** — changing it needs an agent restart, which keeps
+//! the middleware trivial (no shared mutable auth state).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -194,8 +200,13 @@ struct HistoryDto {
 /// needs an agent restart, which keeps [`auth_layer`] free of shared mutable
 /// state. Task 10 adds write routes onto this same router + [`WebState`].
 pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
-    Router::new()
-        .route("/", get(index_html))
+    // `GET /` is the static, data-free page shell — it is deliberately EXEMPT
+    // from the bearer layer. On any token-protected (non-loopback) deployment a
+    // browser navigation must be able to load the page so its JS token prompt
+    // can run; gating `/` would 401 that navigation before any JS loads, making
+    // the README's documented flow dead on arrival. Every `/api/*` route (which
+    // carries actual node data) stays behind [`auth_layer`].
+    let api = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/sent", get(api_sent))
         .route("/api/history", get(api_history))
@@ -205,10 +216,13 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         )
         .route("/api/retention/log", get(api_retention_log))
         .route("/api/delete", post(api_delete))
-        .with_state(state)
         .layer(axum::middleware::from_fn(move |req, next| {
             auth_layer(token.clone(), req, next)
-        }))
+        }));
+    Router::new()
+        .route("/", get(index_html))
+        .merge(api)
+        .with_state(state)
 }
 
 /// Bearer-token gate. With `token = None` (the loopback default) every request
@@ -655,6 +669,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        // `GET /` (the static page shell) is EXEMPT even when a token is set: it
+        // must load without a token so the browser can run its JS token prompt.
+        let root = app
+            .clone()
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            root.status(),
+            StatusCode::OK,
+            "GET / must load without a token even when one is configured"
+        );
 
         let auth = app
             .oneshot(

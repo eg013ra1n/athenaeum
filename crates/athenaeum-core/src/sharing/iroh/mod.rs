@@ -365,9 +365,11 @@ impl SharingTransport for IrohTransport {
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
 
         // Pin the downloaded collection under the same deterministic name the
-        // provider used, so it survives GC until this receiver releases it
-        // (post-ack). Task 3 wires that release; until then GC reclaims it after
-        // the slack interval if nothing pins it.
+        // provider used, so it survives GC until this receiver releases it. The
+        // receiver releases the tag once it has acked ingestion, so a completed
+        // transfer drops it promptly; a fetch or ingest that fails before the
+        // ack leaves the tag pinned until the next process-startup sweep
+        // (`start`'s `delete_all`) clears it as stale.
         let tag = package_tag(&pkg.package_id);
         blobs::fetch_collection_to_dir(
             &self.store,

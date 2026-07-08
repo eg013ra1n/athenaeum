@@ -140,8 +140,11 @@ pub struct HistoryRow {
     pub bytes: u64,
     pub started_at: String,
     pub finished_at: Option<String>,
-    /// Short outcome tag: `sent`, `ingested`, `duplicate`, `rejected`, `failed`,
-    /// or `cancelled`.
+    /// Short outcome tag: `sent`, `ingested`, `duplicate`, `rejected`, `failed`
+    /// (or the composite `failed: rejected frame(s) <uuids>`), or `cancelled`.
+    /// Retention / manual-deletion audit rows reuse this column too:
+    /// `retention_deleted` (an automatic retention pass) and `deleted_manual`
+    /// (the web "Delete selected" action).
     pub outcome: String,
 }
 

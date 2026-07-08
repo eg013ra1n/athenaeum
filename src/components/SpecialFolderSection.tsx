@@ -31,6 +31,27 @@ interface SpecialFolderSectionProps {
 }
 
 /**
+ * Map the two dead-end backend Conflict messages the `set_*` command can return
+ * into an actionable instruction. Everything else falls through to the verbatim
+ * backend text — an unknown error is never hidden.
+ *
+ * - the per-kind uniqueness Conflict ("…already exists — only one is allowed"):
+ *   the folder is already designated, so tell the user to remove it first;
+ * - the scan-root overlap Conflict (message contains "overlap"): the picked
+ *   folder is inside/contains a monitored directory, so tell them to pick one
+ *   outside their monitored directories.
+ */
+function friendlyConflict(msg: string): string {
+  if (msg.includes('overlap')) {
+    return 'This folder is inside (or contains) a monitored directory — pick a folder outside your monitored directories.';
+  }
+  if (msg.includes('already exists') || msg.includes('only one is allowed')) {
+    return 'Remove the current folder first (trash icon), then choose the new one.';
+  }
+  return msg;
+}
+
+/**
  * Generic "special folder" designator section for the File Manager's Monitored
  * Directories tab — a parameterized clone of {@link CalibrationFolderSection}
  * used for the sync-incoming and collaboration folders (Stage 1.5 sync
@@ -91,10 +112,11 @@ export function SpecialFolderSection({
       await load();
       onRootsChanged();
     } catch (e) {
-      // Surface the backend error verbatim — the overlap/uniqueness Conflicts
-      // ("overlaps an existing scan root", "only one is allowed") are the whole
-      // point of the message, so don't paraphrase them.
-      const msg = typeof e === 'string' ? e : String(e);
+      // Remap the two dead-end backend Conflicts (per-kind uniqueness, scan-root
+      // overlap) into actionable instructions; anything else falls back to the
+      // verbatim backend text (never hide an unknown error). Log the raw error.
+      const raw = typeof e === 'string' ? e : String(e);
+      const msg = friendlyConflict(raw);
       setError(msg);
       console.error(`[SpecialFolderSection:${kind}] ${setCommand} failed:`, e);
       notify({

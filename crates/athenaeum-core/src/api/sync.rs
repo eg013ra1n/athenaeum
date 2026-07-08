@@ -650,10 +650,18 @@ pub async fn ensure_sender_engine(
     .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
     .secret_bytes();
 
+    // The sender's blob store is DISTINCT from the receiver's (`blobs`). Both
+    // halves can run in one process (dev-flag / loopback-validation configs;
+    // production role-gating otherwise keeps them mutually exclusive), and a
+    // second `FsStore` over the receiver's live dir would either fail on the
+    // redb lock or — worse — the sender's startup `delete_all` sweep would wipe
+    // the receiver's live `pkg/<id>` tags. A separate `blobs_out` dir keeps the
+    // two stores fully independent. (Receiver keeps `blobs` — existing primary
+    // deployments already have receiver data there.)
     let transport = crate::sharing::iroh::IrohTransport::new(
         secret,
         relay_mode,
-        crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs")),
+        crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs_out")),
     )
     .await
     .map_err(|e| ApiError::Internal(format!("build iroh transport for sender: {e:#}")))?;

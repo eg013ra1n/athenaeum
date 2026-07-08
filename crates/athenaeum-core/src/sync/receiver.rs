@@ -349,6 +349,10 @@ impl SyncRuntime {
             &crate::account::keys::device_key_path(&sync_dir),
         )?
         .secret_bytes();
+        // The receiver's blob store is `blobs`; the sender's is a SEPARATE
+        // `blobs_out` (see `api::sync::ensure_sender_engine`). Both halves may
+        // run in one process, and one `FsStore` per dir keeps the sender's
+        // startup `delete_all` sweep from ever wiping this receiver's live tags.
         let transport = crate::sharing::iroh::IrohTransport::new(
             secret,
             relay_mode,

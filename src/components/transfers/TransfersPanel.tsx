@@ -54,7 +54,10 @@ function transferStats(r: HistoryRow): string | null {
   const ms = new Date(r.finishedAt).getTime() - new Date(r.startedAt).getTime();
   if (!isFinite(ms) || ms < 0) return null;
   const secs = ms / 1000;
-  const dur = secs >= 60 ? `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s` : `${secs.toFixed(1)}s`;
+  // Round total seconds BEFORE splitting into m/s, else e.g. 119.7s renders as
+  // "1m 60s" (Math.round(59.7) = 60). Sub-minute keeps the one-decimal form.
+  const s = Math.round(secs);
+  const dur = s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${secs.toFixed(1)}s`;
   const mbs = r.bytes > 0 && secs > 0 ? ` · ${(r.bytes / 1048576 / secs).toFixed(1)} MB/s` : '';
   return `${dur}${mbs}`;
 }

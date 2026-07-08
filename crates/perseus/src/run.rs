@@ -204,8 +204,10 @@ pub struct Agent {
     enqueue_task: Option<JoinHandle<()>>,
     retention_task: Option<JoinHandle<()>>,
     /// The embedded web status-page server task (task 9), when armed. `None` on
-    /// the transport-injection path (tests) and when `web_bind` is empty. Aborted
-    /// on shutdown — it holds only `Arc` clones + a bound listener.
+    /// the transport-injection path (tests), when `web_bind` is empty, and when
+    /// the runtime bind fails (a port conflict is non-fatal — see
+    /// [`bind_and_spawn_web`], which logs-and-continues). Aborted on shutdown —
+    /// it holds only `Arc` clones + a bound listener.
     web_task: Option<JoinHandle<()>>,
     /// Live-edit channel for the retention config (task 8). The retention loop
     /// holds the matching receiver and re-borrows it every pass, so a `send`
@@ -476,11 +478,12 @@ impl Agent {
     }
 
     /// A clone of the retention live-edit sender (task 8). The web settings page
-    /// (tasks 9/10) sends the re-validated [`RetentionConfig`] returned by
+    /// sends the re-validated [`RetentionConfig`] returned by
     /// [`crate::config_edit::apply_retention_edit`] here to have the running
     /// retention loop adopt it on its next pass — no agent restart. When the
-    /// agent was started without `watch` there is no receiver, so a send is an
-    /// intentional no-op.
+    /// agent was started without `watch` no receiver exists (a non-watch agent
+    /// has no retention loop), so `send()` returns `Err(SendError)`; callers
+    /// discard it.
     pub fn retention_tx(&self) -> watch::Sender<RetentionConfig> {
         self.retention_tx.clone()
     }
