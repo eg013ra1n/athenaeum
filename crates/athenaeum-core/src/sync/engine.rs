@@ -537,6 +537,22 @@ impl Worker {
         }
     }
 
+    /// Fire-and-forget blob release for a package that has reached a terminal
+    /// state (confirmed / failed / cancelled). Runs on a detached task over a
+    /// clone of the transport `Arc`, so a release failure can never block or
+    /// fail the synchronous state transition ([`handle_event`](Self::handle_event)
+    /// is deliberately non-async) that triggered it — it only logs. `release`
+    /// is idempotent, so a double-fire (e.g. a resumed-then-cancelled row) is
+    /// harmless.
+    fn spawn_release(&self, package_id: PackageId) {
+        let transport = Arc::clone(&self.transport);
+        tokio::spawn(async move {
+            if let Err(e) = transport.release(&package_id).await {
+                tracing::warn!(package_id = %package_id.0, error = %format!("{e:#}"), "blob release failed");
+            }
+        });
+    }
+
     /// Dispatch a transport event. Synchronous — no `.await` — so a package can
     /// never be confirmed twice by interleaving.
     fn handle_event(&mut self, ev: TransportEvent) -> Result<()> {
@@ -613,6 +629,11 @@ impl Worker {
             .confirm(pending.id, &receipts)
             .context("confirm outbound")?;
         self.append_confirmed_history(&pending, &receipts)?;
+        // Terminal: the package is confirmed; drop its served blobs so they do
+        // not outlive the transfer. `package_id` is the id the ack correlated
+        // against (== pending.announce.package_id). Fire-and-forget, never fails
+        // the confirm.
+        self.spawn_release(package_id);
         tracing::info!(package_id = pending.id, state = "confirmed", "sync state");
         self.emit_finished(pending.id, "confirmed", receipts.len() as u32, Vec::new());
         Ok(())
@@ -657,11 +678,17 @@ impl Worker {
     /// receiver's rejection, not just an unreachable peer.
     fn fail_package(&mut self, id: i64) -> Result<()> {
         let removed = self.pending.remove(&id);
-        let (dir, last_rejected) = match removed {
-            Some(p) => (Some(p.dir), p.last_rejected),
-            None => (None, Vec::new()),
+        let (dir, last_rejected, pkg_id) = match removed {
+            Some(p) => (Some(p.dir), p.last_rejected, p.announce.map(|a| a.package_id)),
+            None => (None, Vec::new(), None),
         };
         self.store.set_state(id, OutboundState::Failed)?;
+        // Terminal: release any served blobs (fire-and-forget). `pkg_id` is
+        // `None` when the package never minted+served an announce (a pre-serve
+        // failure) — nothing to release in that case.
+        if let Some(pid) = pkg_id {
+            self.spawn_release(pid);
+        }
         tracing::error!(package_id = id, state = "failed", rejected = ?last_rejected, "sync state");
         let outcome = if last_rejected.is_empty() {
             "failed".to_string()
@@ -679,15 +706,21 @@ impl Worker {
     /// no-op if the package is already terminal / unknown.
     fn cancel_package(&mut self, id: i64) -> Result<()> {
         // Resolve the package dir: prefer the in-flight entry, else a live row.
-        // Removing the slot also ensures no later timeout fires for this id.
-        let dir = if let Some(p) = self.pending.remove(&id) {
-            Some(p.dir)
+        // Removing the slot also ensures no later timeout fires for this id. The
+        // in-flight entry also carries the minted announce whose blobs need
+        // releasing; a row resolved only from the store was never served this
+        // session, so there is nothing to release (`pkg_id` stays `None`).
+        let (dir, pkg_id) = if let Some(p) = self.pending.remove(&id) {
+            (Some(p.dir), p.announce.map(|a| a.package_id))
         } else {
-            self.store
-                .non_terminal()?
-                .into_iter()
-                .find(|r| r.id == id)
-                .map(|r| PathBuf::from(r.package_ref))
+            (
+                self.store
+                    .non_terminal()?
+                    .into_iter()
+                    .find(|r| r.id == id)
+                    .map(|r| PathBuf::from(r.package_ref)),
+                None,
+            )
         };
 
         let Some(dir) = dir else {
@@ -696,6 +729,10 @@ impl Worker {
         };
 
         self.store.set_state(id, OutboundState::Failed)?;
+        // Terminal: release any served blobs (fire-and-forget).
+        if let Some(pid) = pkg_id {
+            self.spawn_release(pid);
+        }
         tracing::info!(
             package_id = id,
             state = "failed",

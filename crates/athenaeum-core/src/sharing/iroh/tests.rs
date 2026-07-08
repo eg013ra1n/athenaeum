@@ -31,7 +31,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
-use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome, TransportEvent};
+use crate::sharing::types::{FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent};
 use crate::sharing::SharingTransport;
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
@@ -408,9 +408,18 @@ async fn iroh_resume_after_endpoint_restart() {
 // ---------------------------------------------------------------------------
 
 /// Spawn a reactive receiver over `receiver`: for each `AnnounceReceived`, fetch
-/// into a fresh dir and ack every manifest frame as `Ingested` (twice when
-/// `duplicate_ack`). Mirrors the loopback engine tests' receiver.
-fn spawn_iroh_receiver(receiver: Arc<IrohTransport>, dest_root: PathBuf, duplicate_ack: bool) {
+/// into a fresh dir, ack every manifest frame as `Ingested` (twice when
+/// `duplicate_ack`), then **release** the fetched blobs — mirroring the
+/// production receiver ([`SyncReceiver`](crate::sync)'s post-ack release, task 3)
+/// so the receiver's blob store returns to empty. Returns a slot holding the
+/// last-seen package id so a caller can assert on its released tag.
+fn spawn_iroh_receiver(
+    receiver: Arc<IrohTransport>,
+    dest_root: PathBuf,
+    duplicate_ack: bool,
+) -> Arc<std::sync::Mutex<Option<PackageId>>> {
+    let captured: Arc<std::sync::Mutex<Option<PackageId>>> = Arc::new(std::sync::Mutex::new(None));
+    let captured_ret = captured.clone();
     tokio::spawn(async move {
         let mut events = receiver.events().await;
         let mut n = 0usize;
@@ -418,6 +427,7 @@ fn spawn_iroh_receiver(receiver: Arc<IrohTransport>, dest_root: PathBuf, duplica
             let TransportEvent::AnnounceReceived { from, announce } = ev else {
                 continue;
             };
+            *captured.lock().unwrap() = Some(announce.package_id.clone());
             n += 1;
             let dest = dest_root.join(format!("fetch-{n}"));
             if receiver.fetch(from, &announce, &dest).await.is_ok() {
@@ -437,9 +447,12 @@ fn spawn_iroh_receiver(receiver: Arc<IrohTransport>, dest_root: PathBuf, duplica
                 for _ in 0..deliveries {
                     let _ = receiver.ack(from, &announce.package_id, receipts.clone()).await;
                 }
+                // Post-ack release (idempotent), mirroring the real receiver.
+                let _ = receiver.release(&announce.package_id).await;
             }
         }
     });
+    captured_ret
 }
 
 #[tokio::test]
@@ -450,7 +463,7 @@ async fn engine_suite_over_iroh() {
     let (_sender_info, receiver_info) = start_and_pair(&sender, &receiver).await;
     let receiver_id = receiver_info.node_id;
 
-    spawn_iroh_receiver(receiver.clone(), tmp.path().join("recv"), false);
+    let captured = spawn_iroh_receiver(receiver.clone(), tmp.path().join("recv"), false);
 
     let (pkg_dir, _announce) =
         build_package(&tmp.path().join("src"), "uuid-e1", "frame_e1.fits", "M42", 256 * 1024);
@@ -494,6 +507,51 @@ async fn engine_suite_over_iroh() {
         .iter()
         .any(|h| h.finished_at.is_some() && h.outcome == "ingested"));
 
+    // Spec §6: after a confirmed transfer both blob stores are released — the
+    // sender via the engine's confirm hook (fire-and-forget), the receiver via
+    // its post-ack hook. Poll until the package tag is gone on both sides, then
+    // assert nothing else remains (zero tags total).
+    let pid = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("receiver must have captured the package id");
+    let tag = super::package_tag(&pid);
+    let deadline = Instant::now() + IROH_WAIT;
+    loop {
+        let sender_has = sender
+            .store
+            .tags()
+            .get(tag.as_bytes())
+            .await
+            .unwrap()
+            .is_some();
+        let receiver_has = receiver
+            .store
+            .tags()
+            .get(tag.as_bytes())
+            .await
+            .unwrap()
+            .is_some();
+        if !sender_has && !receiver_has {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("package tags not released after confirm: sender_has={sender_has} receiver_has={receiver_has}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        sender.store.tags().delete_all().await.unwrap(),
+        0,
+        "sender blob store must hold zero tags after confirm"
+    );
+    assert_eq!(
+        receiver.store.tags().delete_all().await.unwrap(),
+        0,
+        "receiver blob store must hold zero tags after confirm"
+    );
+
     engine.shutdown().await;
 }
 
@@ -506,7 +564,7 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
     let receiver_id = receiver_info.node_id;
 
     // Receiver acks twice (at-least-once): the engine must confirm exactly once.
-    spawn_iroh_receiver(receiver.clone(), tmp.path().join("recv"), true);
+    let _captured = spawn_iroh_receiver(receiver.clone(), tmp.path().join("recv"), true);
 
     let (pkg_dir, _announce) =
         build_package(&tmp.path().join("src"), "uuid-e2", "frame_e2.fits", "M13", 128 * 1024);

@@ -170,6 +170,12 @@ async fn handle_announce(
             .await
             .context("ack (replayed)")?;
         tracing::info!(package_id = %package_id, count = satisfied_count, "sync receiver replayed ack from receipt log");
+        // Terminal for the receiver: drop the fetched blobs. A lost-ack resend
+        // may have re-downloaded them; release is idempotent. Never fails the
+        // (successful) receive — log-and-continue on error.
+        if let Err(e) = transport.release(&announce.package_id).await {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
+        }
         emit_event(emitter, "sync-finished", &SyncFinishedEvent {
             package_id,
             direction: super::Direction::Received,
@@ -222,6 +228,12 @@ async fn handle_announce(
         .ack(from, &announce.package_id, outcome.receipts.clone())
         .await
         .with_context(|| format!("ack package {package_id}"))?;
+
+    // Terminal for the receiver: the package is acked, so drop the fetched
+    // blobs. Never fails the (successful) receive — log-and-continue on error.
+    if let Err(e) = transport.release(&announce.package_id).await {
+        tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
+    }
 
     // Best-effort staging cleanup — a leftover staging dir is harmless but tidy.
     if let Err(e) = std::fs::remove_dir_all(&staging) {

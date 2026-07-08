@@ -21,7 +21,7 @@ use tokio::time::Instant;
 
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
-use crate::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
+use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome, TransportEvent};
 use crate::sharing::SharingTransport;
 
 use super::store::{StandaloneSyncStore, SyncStore};
@@ -198,6 +198,99 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
             .any(|h| h.finished_at.is_some() && h.outcome == "ingested"),
         "expected an 'ingested' confirm event"
     );
+
+    engine.shutdown().await;
+}
+
+/// Task 3: once a package reaches `Confirmed`, the sender must **release** its
+/// served blobs — a fresh fetch of the same announce from the sender then fails
+/// with "not served". Release is fire-and-forget (a detached task off the
+/// synchronous confirm), so the assertion polls until it lands.
+#[tokio::test]
+async fn confirmed_package_is_released_from_transport() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Receiver that captures the announce it sees (so we can re-fetch it after
+    // confirm) and acks every frame as ingested.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let captured: Arc<std::sync::Mutex<Option<PackageAnnounce>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let receiver = receiver.clone();
+        let captured = captured.clone();
+        let dest_root = tmp.path().join("recv");
+        tokio::spawn(async move {
+            let mut events = receiver.events().await;
+            let mut n = 0usize;
+            while let Some(event) = events.recv().await {
+                let TransportEvent::AnnounceReceived { from, announce } = event else {
+                    continue;
+                };
+                *captured.lock().unwrap() = Some(announce.clone());
+                n += 1;
+                let dest = dest_root.join(format!("fetch-{n}"));
+                if receiver.fetch(from, &announce, &dest).await.is_ok() {
+                    let Ok(records) = package::read_manifest(&dest) else {
+                        continue;
+                    };
+                    let receipts: Vec<FrameReceipt> = records
+                        .iter()
+                        .map(|r| FrameReceipt {
+                            frame_uuid: r.frame_uuid.clone(),
+                            xxh3: r.xxh3.clone(),
+                            outcome: ReceiptOutcome::Ingested,
+                        })
+                        .collect();
+                    let _ = receiver.ack(from, &announce.package_id, receipts).await;
+                }
+            }
+        });
+    }
+
+    let pkg = build_package(&tmp.path().join("src_rel"), "uuid-rel", "rel.fits", "M42", 4096);
+
+    // Keep the sender endpoint so we know its node id (it is moved into the
+    // engine as a trait object; the clone here shares the same registry entry).
+    let sender_ep = Arc::new(net.endpoint());
+    let sender_node = sender_ep.node_id();
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        sender_ep as Arc<dyn SharingTransport>,
+        receiver_id,
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    let captured_announce = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("receiver must have seen the announce");
+
+    // After confirm the sender must have released: a fresh fetch of the same
+    // announce from the sender now fails "not served". Poll (release is spawned).
+    let dest = tempdir().unwrap();
+    let deadline = Instant::now() + WAIT;
+    let err = loop {
+        match receiver
+            .fetch(sender_node, &captured_announce, dest.path())
+            .await
+        {
+            Err(e) => break e,
+            Ok(()) => {
+                if Instant::now() >= deadline {
+                    panic!("sender still serves the package after confirm (release did not fire)");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    assert!(err.to_string().contains("not served"), "got: {err}");
 
     engine.shutdown().await;
 }
